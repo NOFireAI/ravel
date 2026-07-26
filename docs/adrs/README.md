@@ -13,3 +13,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0007](0007-promql-approach.md) | promql-parser crate for parsing, own evaluator, differential testing gate | Accepted |
 | [0008](0008-object-store-crate.md) | Wrap `object_store` crate behind our ObjectStoreBackend trait | Accepted |
 | [0009](0009-tenant-isolation.md) | Tenant-hashed prefixes, gateway auth, dev-mode header tenancy behind flag | Accepted |
+| [0010](0010-spec-amendments-review-1.md) | Spec amendments from the first adversarial design review | Accepted |

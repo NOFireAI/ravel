@@ -62,6 +62,9 @@ impl MemoryStore {
                 Ok(data.slice(start as usize..end as usize))
             }
             GetRange::Suffix(n) => {
+                if n == 0 {
+                    return Err(StoreError::InvalidRange("zero-length suffix".into()));
+                }
                 let n = n.min(len);
                 Ok(data.slice((len - n) as usize..))
             }
@@ -226,6 +229,8 @@ mod tests {
             .await
             .expect("clamped");
         assert_eq!(oversize_suffix.data.len(), 10);
+        let zero_suffix = store.get("k", GetRange::Suffix(0)).await;
+        assert!(matches!(zero_suffix, Err(StoreError::InvalidRange(_))));
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
 # RSEG v1: Ravel Segment Format (metrics)
 
-Persistent contract. Any change bumps the version. Parsers treat every offset,
-length, and count as untrusted input: bounds-check everything, fuzz all
-decoders. No `unsafe`.
+Persistent contract (amended by ADR-0010 before first ship). Any change
+bumps the version. Parsers treat every offset, length, and count as
+untrusted input: bounds-check everything, fuzz all decoders. No `unsafe`.
 
 All integers little-endian. "varint" means protobuf-style LEB128; signed
 values use zigzag.
@@ -15,7 +15,7 @@ values use zigzag.
 | footer: FooterProto bytes                  |
 | trailer (16 bytes):                        |
 |   footer_len:   u32                        |
-|   footer_crc32c:u32   (over FooterProto)   |
+|   footer_crc32c:u32                        |
 |   version:      u16   (= 1)                |
 |   signal:       u8    (1 = metrics)        |
 |   reserved:     u8    (= 0)                |
@@ -23,9 +23,18 @@ values use zigzag.
 +--------------------------------------------+
 ```
 
-Reader: suffix-GET 64 KiB (or whole object if smaller). Verify magic,
-version, signal. If 16 + footer_len exceeds the suffix, issue one more ranged
-GET. Verify footer_crc32c before decoding FooterProto.
+`footer_crc32c` is computed over: FooterProto bytes, then footer_len (u32
+LE), version (u16 LE), signal, reserved, magic. Every trailer byte except
+the crc field itself is covered (ADR-0010 §4).
+
+Reader protocol:
+1. Reject objects smaller than 16 bytes as Corrupted.
+2. Suffix-GET 64 KiB (or the whole object if smaller). Verify magic,
+   version, signal, reserved.
+3. Require `footer_len > 0` and `16 + footer_len <= total_size`; otherwise
+   Corrupted. If the suffix does not cover the footer, issue one more
+   ranged GET.
+4. Verify footer_crc32c (over the bytes defined above) before decoding.
 
 ## FooterProto
 
@@ -37,6 +46,16 @@ Defined in `proto/ravel/segment.proto` (`ravel.segment.v1.Footer`). Fields:
 - `sections`: repeated Section { `kind`, `offset`, `len`, `crc32c`,
   `comp` (0=none, 1=lz4, 2=zstd), `uncompressed_len` }
 - unknown section kinds MUST be skipped by readers (forward compatibility)
+
+Validation (all violations are Corrupted, never panics):
+- At most one section per known kind; LABEL_DICT, SERIES_TABLE, TS_PAGES,
+  VAL_PAGES are all mandatory in v1.
+- Every section `[offset, offset+len)` must lie within
+  `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
+- `uncompressed_len` is capped by config (default 1 GiB per section,
+  64 MiB per page) and the decompressed size must equal it exactly.
+- Identity fields (tenant_hash, shard, writer_id, epoch, seq) MUST match
+  the commit record the reader resolved the segment from (ADR-0010 §7).
 
 Section kinds v1:
 
@@ -59,6 +78,7 @@ count: u32
 count strings: len:varint bytes (UTF-8)
 ```
 Ordinal = position. Ordinal 0 is always the metric name string "__name__".
+Readers reject out-of-range ordinals and non-UTF-8 strings.
 
 ## SERIES_TABLE (uncompressed form)
 
@@ -75,46 +95,51 @@ count entries:
   val_page: (offset: varint, len: varint)   relative to VAL_PAGES section start
 ```
 
-Entries sorted by series_id bytes. One page pair per series in v1 (L0 objects
-are small; multi-page chunking is a v2 concern and the format leaves room:
-readers locate pages only through these offsets).
+Entries sorted by series_id bytes. One page pair per series in v1 (L0
+objects are small; multi-page chunking is a v2 concern and the format
+leaves room: readers locate pages only through these offsets).
 
 ## Page format (TS and VAL)
 
 ```
 enc:  u8      encoding of the uncompressed payload
 comp: u8      0=none, 1=lz4 (block format with u32 uncompressed-size prefix)
-crc:  u32     crc32c over the stored payload bytes (after compression)
+crc:  u32     crc32c over: series_id (16 bytes) || enc || comp || stored payload
 payload
 ```
+
+The crc includes the owning series_id as a prefix (ADR-0010 §4): a page
+read through a mis-planned range or attributed to the wrong series fails
+closed, and a flipped enc/comp byte cannot cause silent misdecoding.
 
 Encodings:
 
 | enc | payload |
 |---|---|
-| 1 TS_DELTA_VARINT | first ts_ns as varint-zigzag from 0; then deltas varint-zigzag. Handles irregular and out-of-order deltas. |
-| 16 VAL_GORILLA | Gorilla XOR bit stream: first f64 raw 64 bits; then XOR with previous, classic (11,52... control-bit scheme per the Gorilla paper §4.1.2), padded to byte with zero bits. |
+| 1 TS_DELTA_VARINT | first ts_ns as varint-zigzag from 0; then deltas varint-zigzag. Handles irregular and out-of-order deltas. Accumulation is overflow-checked; each decoded ts must lie within the series entry's [min_ts_ns, max_ts_ns]. |
+| 16 VAL_GORILLA | Gorilla XOR bit stream: first f64 raw 64 bits; then XOR with previous, classic control-bit scheme per the Gorilla paper 4.1.2, padded to byte with zero bits. Pure bit manipulation: NaN payloads, -0.0, denormals round-trip exactly. |
 | 17 VAL_RAW_F64 | count * f64 LE. Fallback when XOR encodes larger than raw. |
 
 Writers choose VAL encoding per page by encoded size (raw fallback rule:
 emit GORILLA unless size >= 8*count bytes). Record whichever was used.
 
-Sample order within a page: ascending (ts, insertion order for equal ts).
-Writers sort per series before encoding. Duplicate timestamps are preserved
-at L0 (dedup is a compaction/query concern; PromQL evaluation takes the last
-value for a timestamp).
+Sample order within a page: ascending ts; ties keep insertion order, which
+requires a STABLE sort in the writer. Duplicate timestamps are preserved at
+L0. Cross-segment dedup order is defined in docs/catalog-and-mvcc.md;
+values compare by f64 bit pattern everywhere.
 
 ## Checksums
 
-- Whole-object blake3 hash is computed by the writer and recorded in the
-  commit record, not inside the object.
-- footer_crc32c guards the footer; Section.crc32c guards each section;
-  page crc guards each page. A reader verifies exactly the bytes it touches.
+- Whole-object blake3 is computed by the writer and recorded in the commit
+  record; the first 16 hex chars are embedded in the data key.
+- footer_crc32c guards footer + trailer; Section.crc32c guards each
+  section; the page crc guards series binding, enc, comp, and payload. A
+  reader verifies exactly the bytes it touches.
 
 ## Size targets
 
 L0: 8 to 64 MiB nominal (adaptive batching); tests use tiny objects.
 Suffix fetch default 64 KiB covers footers for expected L0 series counts
 (footer size is ~40 bytes per section entry + fixed fields; SERIES_TABLE
-lives in a section, not the footer, so footer stays small even at high
+lives in a section, not the footer, so the footer stays small even at high
 cardinality).

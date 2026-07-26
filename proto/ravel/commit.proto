@@ -30,4 +30,7 @@ message CommitRecord {
   sfixed64 max_ingest_ts_ns = 16;
   uint32 segment_format_version = 17;
   sfixed64 created_unix_ns = 18;
+  // Pinned at flush open (unix hours); names the commit key's hour bucket.
+  // Never recomputed on retry (ADR-0010).
+  uint32 ingest_hour_bucket = 19;
 }

@@ -8,8 +8,10 @@ document disagree, one of them is a bug and the fix updates both.
 Strict mode (default):
 - An OTLP export is acknowledged only after every batch it contributed to has
   (a) its L0 data object durably stored and (b) its commit record created.
-- The response carries a commit token (header `x-ravel-commit-token`; the
-  max token across flushes the request participated in, per shard).
+- The response carries a commit token set (header `x-ravel-commit-token`,
+  comma-separated): one token per shard the request's points flushed
+  through. Tokens are v2 and self-locating (they embed the ingest-hour
+  bucket; ADR-0010 §2).
 - After a strict ack, no crash of any Ravel process may lose that data.
   Object-store durability is the floor: data survives anything the object
   store survives.
@@ -36,10 +38,11 @@ rejected point counts and reasons.
 
 ## Read-your-write
 
-- A caller holding commit token T sees the referenced commit by passing
-  `min_commit_token=T` to query APIs. The catalog re-lists until the commit
-  is included (bounded retries; then `unsatisfiable token` error rather than
-  silently serving stale data).
+- A caller holding commit tokens sees the referenced commits by passing
+  `min_commit_token` (repeatable) to query APIs. Each token fully
+  determines its commit-record key; the catalog GETs those keys directly
+  and includes the segments, or fails with `unsatisfiable token` rather
+  than silently serving stale data.
 - Without a token, queries see some recent consistent snapshot; freshness is
   bounded by listing behavior, not guaranteed.
 
@@ -70,6 +73,11 @@ rejected point counts and reasons.
   ingest hour; event-time bounds ride along for pruning. Late data is always
   discoverable; queries bound their listing by `max_ingest_lag` plus catalog
   snapshots (Phase 2) for anything older.
+- Admission bounds event-time skew (ADR-0010 §8): points with
+  `event_ts > ingest_ts + max_future_skew` (default 10 m) or
+  `event_ts < ingest_ts - max_ingest_lag` (default 2 h) are rejected with a
+  partial-success reason. These bounds are what make the catalog listing
+  window sound.
 
 ## Crash matrix (strict mode)
 
@@ -85,8 +93,14 @@ rejected point counts and reasons.
 - Deletion is a durable tombstone transaction, then logical exclusion from
   new snapshots, then physical removal via GC.
 - GC deletes an object only when all hold: unreachable from any snapshot
-  within the protection horizon, not lease-protected, grace period expired.
-- Orphan GC (data objects with no commit record) uses last_modified age >
-  grace period (default 24 h) and verifies commit-record absence at delete
-  time, in that order (list commits, then delete), relying on strongly
-  consistent listing.
+  within the protection horizon (>= max_query_duration + grace), not
+  lease-protected, grace period expired.
+- Orphan GC (data objects with no commit record) considers only objects
+  with last_modified age > grace (default 24 h) + max_flush_lifetime
+  (default 1 h), and re-verifies commit-record absence immediately before
+  each delete, relying on strongly consistent listing. Writers abandon any
+  flush older than max_flush_lifetime and never publish it afterward; the
+  interlock is what makes orphan deletion safe (ADR-0010 §11).
+- A store NotFound on a segment pinned by a running query surfaces as
+  SnapshotInvalidated; the frontend re-resolves and retries once before
+  failing the query.

@@ -25,6 +25,9 @@ from request bodies.
 
 ## Consequences
 
-- Tenant enumeration via bucket listing is impossible without the config map.
+- Tenant names are not readable from object keys. The default hash is
+  unkeyed, so anyone with bucket-list access can confirm a guessed tenant
+  id offline; deployments needing enumeration resistance configure the
+  keyed tenant hash (ADR-0010 §13).
 - Static token maps are a stopgap; ADR to follow for OIDC when the gateway
   hardens (tracked in issues).

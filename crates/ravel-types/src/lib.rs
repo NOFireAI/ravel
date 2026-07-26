@@ -128,6 +128,11 @@ impl SeriesId {
     /// Compute the canonical series id. `labels` may include
     /// [`METRIC_NAME_LABEL`]; it is skipped (the name is hashed separately).
     ///
+    /// Any component longer than `u16::MAX` bytes, or more than `u16::MAX`
+    /// labels, is an error: silent truncation would create a collision
+    /// vector in a persistent hash contract (ADR-0010 §6). Admission limits
+    /// keep real inputs orders of magnitude below these bounds.
+    ///
     /// Canonical encoding (persistent contract, ADR-0005):
     /// ```text
     /// "ravel-series-v1\0"
@@ -136,24 +141,29 @@ impl SeriesId {
     /// u16_le(label_count)
     /// per label sorted by name: u16_le(len(k)) k u16_le(len(v)) v
     /// ```
-    pub fn compute(tenant: &TenantId, metric_name: &str, labels: &LabelSet) -> Self {
+    pub fn compute(
+        tenant: &TenantId,
+        metric_name: &str,
+        labels: &LabelSet,
+    ) -> Result<Self, TypeError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"ravel-series-v1\0");
-        update_len_prefixed(&mut hasher, tenant.as_str());
-        update_len_prefixed(&mut hasher, metric_name);
+        update_len_prefixed(&mut hasher, tenant.as_str())?;
+        update_len_prefixed(&mut hasher, metric_name)?;
         let count = labels
             .iter()
             .filter(|l| l.name != METRIC_NAME_LABEL)
             .count();
-        hasher.update(&(count as u16).to_le_bytes());
+        let count = u16::try_from(count).map_err(|_| TypeError::OversizedSeriesComponent)?;
+        hasher.update(&count.to_le_bytes());
         for label in labels.iter().filter(|l| l.name != METRIC_NAME_LABEL) {
-            update_len_prefixed(&mut hasher, &label.name);
-            update_len_prefixed(&mut hasher, &label.value);
+            update_len_prefixed(&mut hasher, &label.name)?;
+            update_len_prefixed(&mut hasher, &label.value)?;
         }
         let digest = hasher.finalize();
         let mut out = [0u8; 16];
         out.copy_from_slice(&digest.as_bytes()[..16]);
-        SeriesId(out)
+        Ok(SeriesId(out))
     }
 
     pub fn to_hex(&self) -> String {
@@ -161,12 +171,11 @@ impl SeriesId {
     }
 }
 
-fn update_len_prefixed(hasher: &mut blake3::Hasher, s: &str) {
-    // Admission limits keep label/name lengths far below u16::MAX; saturate
-    // rather than truncate silently if that invariant is ever violated.
-    let len = u16::try_from(s.len()).unwrap_or(u16::MAX);
+fn update_len_prefixed(hasher: &mut blake3::Hasher, s: &str) -> Result<(), TypeError> {
+    let len = u16::try_from(s.len()).map_err(|_| TypeError::OversizedSeriesComponent)?;
     hasher.update(&len.to_le_bytes());
-    hasher.update(&s.as_bytes()[..usize::from(len)]);
+    hasher.update(s.as_bytes());
+    Ok(())
 }
 
 /// One metric sample. Nanosecond timestamps throughout the system.
@@ -199,21 +208,27 @@ pub fn shard_for(series_id: &SeriesId, shard_count: u32) -> u32 {
     (u64::from_le_bytes(prefix) % u64::from(shard_count.max(1))) as u32
 }
 
-/// Commit token returned on strict-mode acks; callers pass it back as
+/// Commit token returned on strict-mode acks; callers pass tokens back as
 /// `min_commit_token` for read-your-write (docs/catalog-and-mvcc.md).
+///
+/// v2 (ADR-0010 §2): carries the pinned ingest-hour bucket so the token
+/// fully determines its commit-record key; the catalog resolves it by an
+/// exact GET, never by listing. Acks return one token per shard flushed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitToken {
     pub shard: u32,
     pub writer_id: uuid::Uuid,
     pub epoch: u64,
     pub seq: u64,
+    /// Unix hours, pinned at flush open (ADR-0010 §1).
+    pub ingest_hour_bucket: u32,
 }
 
 impl CommitToken {
     pub fn encode(&self) -> String {
         let raw = format!(
-            "v1:{}:{}:{}:{}",
-            self.shard, self.writer_id, self.epoch, self.seq
+            "v2:{}:{}:{}:{}:{}",
+            self.shard, self.writer_id, self.epoch, self.seq, self.ingest_hour_bucket
         );
         URL_SAFE_NO_PAD.encode(raw.as_bytes())
     }
@@ -224,7 +239,8 @@ impl CommitToken {
             .map_err(|_| TypeError::InvalidCommitToken)?;
         let raw = String::from_utf8(raw).map_err(|_| TypeError::InvalidCommitToken)?;
         let mut parts = raw.split(':');
-        let (Some("v1"), Some(shard), Some(writer), Some(epoch), Some(seq), None) = (
+        let (Some("v2"), Some(shard), Some(writer), Some(epoch), Some(seq), Some(hour), None) = (
+            parts.next(),
             parts.next(),
             parts.next(),
             parts.next(),
@@ -239,6 +255,7 @@ impl CommitToken {
             writer_id: writer.parse().map_err(|_| TypeError::InvalidCommitToken)?,
             epoch: epoch.parse().map_err(|_| TypeError::InvalidCommitToken)?,
             seq: seq.parse().map_err(|_| TypeError::InvalidCommitToken)?,
+            ingest_hour_bucket: hour.parse().map_err(|_| TypeError::InvalidCommitToken)?,
         })
     }
 }
@@ -251,6 +268,8 @@ pub enum TypeError {
     InvalidTenantHash,
     #[error("invalid commit token")]
     InvalidCommitToken,
+    #[error("series identity component exceeds u16::MAX bytes or labels")]
+    OversizedSeriesComponent,
 }
 
 #[cfg(test)]
@@ -278,12 +297,14 @@ mod tests {
             &tenant,
             "http_requests_total",
             &labels(&[("a", "1"), ("b", "2")]),
-        );
+        )
+        .expect("id");
         let b = SeriesId::compute(
             &tenant,
             "http_requests_total",
             &labels(&[("b", "2"), ("a", "1")]),
-        );
+        )
+        .expect("id");
         let c = SeriesId::compute(
             &tenant,
             "http_requests_total",
@@ -292,7 +313,8 @@ mod tests {
                 ("b", "2"),
                 (METRIC_NAME_LABEL, "http_requests_total"),
             ]),
-        );
+        )
+        .expect("id");
         assert_eq!(a, b);
         assert_eq!(a, c);
     }
@@ -300,9 +322,19 @@ mod tests {
     #[test]
     fn series_id_differs_across_tenants() {
         let l = labels(&[("a", "1")]);
-        let a = SeriesId::compute(&TenantId::new("t1"), "m", &l);
-        let b = SeriesId::compute(&TenantId::new("t2"), "m", &l);
+        let a = SeriesId::compute(&TenantId::new("t1"), "m", &l).expect("id");
+        let b = SeriesId::compute(&TenantId::new("t2"), "m", &l).expect("id");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn series_id_rejects_oversized_components() {
+        let tenant = TenantId::new("acme");
+        let long = "x".repeat(usize::from(u16::MAX) + 1);
+        let err = SeriesId::compute(&tenant, &long, &labels(&[]));
+        assert_eq!(err, Err(TypeError::OversizedSeriesComponent));
+        let err = SeriesId::compute(&tenant, "m", &labels(&[("k", long.as_str())]));
+        assert_eq!(err, Err(TypeError::OversizedSeriesComponent));
     }
 
     #[test]
@@ -312,11 +344,13 @@ mod tests {
             writer_id: uuid::Uuid::new_v4(),
             epoch: 1_753_500_000,
             seq: 42,
+            ingest_hour_bucket: 495_972,
         };
         assert_eq!(
             CommitToken::decode(&token.encode()).expect("decodes"),
             token
         );
+        assert!(CommitToken::decode("not-a-token").is_err());
     }
 
     #[test]
