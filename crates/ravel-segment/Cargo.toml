@@ -1,0 +1,25 @@
+[package]
+name = "ravel-segment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+zstd = { workspace = true }
+lz4_flex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ravel-test-util = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

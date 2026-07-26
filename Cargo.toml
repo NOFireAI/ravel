@@ -1,0 +1,95 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "services/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97"
+repository = "https://github.com/NOFireAI/ravel"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[workspace.dependencies]
+# internal crates
+ravel-types = { path = "crates/ravel-types" }
+ravel-proto = { path = "crates/ravel-proto" }
+ravel-object-store = { path = "crates/ravel-object-store" }
+ravel-segment = { path = "crates/ravel-segment" }
+ravel-commit = { path = "crates/ravel-commit" }
+ravel-catalog = { path = "crates/ravel-catalog" }
+ravel-otlp = { path = "crates/ravel-otlp" }
+ravel-ingest = { path = "crates/ravel-ingest" }
+ravel-promql = { path = "crates/ravel-promql" }
+ravel-query = { path = "crates/ravel-query" }
+ravel-test-util = { path = "crates/ravel-test-util" }
+
+# async runtime / rpc / http
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+axum = "0.8"
+tower = "0.5"
+hyper = "1.11"
+futures = "0.3"
+async-trait = "0.1"
+
+# telemetry protocol types
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }
+
+# object storage
+object_store = { version = "0.14", features = ["aws"] }
+
+# encoding / compression / hashing
+bytes = "1"
+blake3 = "1.8"
+crc32c = "0.6"
+zstd = "0.13"
+lz4_flex = "0.14"
+snap = "1.1"
+
+# query
+promql-parser = "0.10"
+
+# serde for control-plane/config docs only (never for on-object formats)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# util
+thiserror = "2"
+anyhow = "1"
+parking_lot = "0.12"
+rand = "0.10"
+uuid = { version = "1.24", features = ["v4"] }
+hex = "0.4"
+base64 = "0.23"
+clap = { version = "4.6", features = ["derive"] }
+humantime = "2"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# build
+prost-build = "0.14"
+protox = "0.9"
+
+# test / bench
+proptest = "1.11"
+criterion = "0.8"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"

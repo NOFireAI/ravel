@@ -1,0 +1,19 @@
+[package]
+name = "ravel-otlp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+opentelemetry-proto = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ravel-test-util = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

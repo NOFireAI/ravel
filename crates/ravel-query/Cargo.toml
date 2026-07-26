@@ -1,0 +1,26 @@
+[package]
+name = "ravel-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-promql = { workspace = true }
+ravel-object-store = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ravel-test-util = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

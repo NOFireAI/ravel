@@ -1,0 +1,33 @@
+// Immutable commit records. Persistent contract: field numbers are frozen.
+syntax = "proto3";
+
+package ravel.commit.v1;
+
+enum Signal {
+  SIGNAL_UNSPECIFIED = 0;
+  SIGNAL_METRICS = 1;
+  SIGNAL_LOGS = 2;
+  SIGNAL_SPANS = 3;
+  SIGNAL_PROFILES = 4;
+}
+
+message CommitRecord {
+  uint32 format_version = 1;  // = 1
+  bytes tenant_hash = 2;      // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  string writer_id = 5;       // uuid
+  uint64 writer_epoch = 6;
+  uint64 writer_seq = 7;
+  string object_key = 8;
+  uint64 object_size = 9;
+  bytes content_hash = 10;    // blake3, 32 bytes
+  uint64 sample_count = 11;
+  uint64 series_count = 12;
+  sfixed64 min_event_ts_ns = 13;
+  sfixed64 max_event_ts_ns = 14;
+  sfixed64 min_ingest_ts_ns = 15;
+  sfixed64 max_ingest_ts_ns = 16;
+  uint32 segment_format_version = 17;
+  sfixed64 created_unix_ns = 18;
+}

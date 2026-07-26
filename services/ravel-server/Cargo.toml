@@ -1,0 +1,29 @@
+[package]
+name = "ravel-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-ingest = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-query = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+axum = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

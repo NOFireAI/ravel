@@ -1,0 +1,44 @@
+// RSEG footer metadata. Persistent contract: field numbers are frozen.
+// Unknown fields and unknown section kinds must be preserved/skipped by readers.
+syntax = "proto3";
+
+package ravel.segment.v1;
+
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_LZ4 = 1;
+  COMPRESSION_ZSTD = 2;
+}
+
+// Section kinds; values are part of the format. See docs/segment-format.md.
+enum SectionKind {
+  SECTION_KIND_UNSPECIFIED = 0;
+  SECTION_KIND_LABEL_DICT = 1;
+  SECTION_KIND_SERIES_TABLE = 2;
+  SECTION_KIND_TS_PAGES = 3;
+  SECTION_KIND_VAL_PAGES = 4;
+}
+
+message Section {
+  uint32 kind = 1;            // SectionKind; unknown kinds skipped
+  uint64 offset = 2;          // from object start
+  uint64 len = 3;             // stored (possibly compressed) length
+  fixed32 crc32c = 4;         // over stored bytes
+  Compression comp = 5;
+  uint64 uncompressed_len = 6;
+}
+
+message Footer {
+  bytes tenant_hash = 1;      // 16 bytes
+  uint32 shard = 2;
+  string writer_id = 3;       // uuid
+  uint64 writer_epoch = 4;
+  uint64 writer_seq = 5;
+  sfixed64 min_event_ts_ns = 6;
+  sfixed64 max_event_ts_ns = 7;
+  sfixed64 min_ingest_ts_ns = 8;
+  sfixed64 max_ingest_ts_ns = 9;
+  uint64 sample_count = 10;
+  uint64 series_count = 11;
+  repeated Section sections = 12;
+}
