@@ -2072,6 +2072,7 @@ dependencies = [
  "proptest",
  "ravel-test-util",
  "ravel-types",
+ "regex",
  "thiserror",
  "tokio",
 ]
