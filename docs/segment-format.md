@@ -66,6 +66,9 @@ Section kinds v1:
 | 3 | TS_PAGES | timestamp pages container |
 | 4 | VAL_PAGES | value pages container |
 
+Writers emit sections physically in that order (readers must rely only on
+footer offsets; placement is self-describing).
+
 LABEL_DICT and SERIES_TABLE are compressed as whole sections (zstd level 3
 default). TS_PAGES / VAL_PAGES containers are NOT compressed as a unit; the
 pages inside are individually compressed so one series is readable alone.
@@ -77,8 +80,15 @@ Section crc32c covers the stored (compressed) bytes.
 count: u32
 count strings: len:varint bytes (UTF-8)
 ```
-Ordinal = position. Ordinal 0 is always the metric name string "__name__".
-Readers reject out-of-range ordinals and non-UTF-8 strings.
+Ordinal = position. Ordinal 0 is always the metric name string "__name__";
+remaining distinct strings follow in sorted lexicographic order. Readers
+reject out-of-range ordinals and non-UTF-8 strings.
+
+Writer edge rules: zero-sample series are dropped (a page cannot encode
+zero values); duplicate series ids across input entries are a writer
+error; an empty segment records min_event_ts_ns = max_event_ts_ns = 0.
+The raw-fallback rule means a 1-sample series always stores VAL as enc 17
+(Gorilla's first value alone is exactly 8 bytes, which is not smaller).
 
 ## SERIES_TABLE (uncompressed form)
 
