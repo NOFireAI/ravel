@@ -9,6 +9,13 @@ rust-version.workspace = true
 ravel-types = { workspace = true }
 promql-parser = { workspace = true }
 thiserror = { workspace = true }
+# Not in [workspace.dependencies]: promql-parser depends on regex itself (for
+# its own compiled Matcher::Re/NotRe) but does not re-export it, so our own
+# MatchOp::Re/Nre needs a direct dependency to name the type. Pinning "1"
+# lets cargo unify with promql-parser's own regex dependency instead of
+# vendoring a second copy. Candidate for hoisting to workspace deps if a
+# second crate needs regex directly.
+regex = "1"
 
 [dev-dependencies]
 ravel-test-util = { workspace = true }
