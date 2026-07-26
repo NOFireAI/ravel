@@ -2049,6 +2049,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "crc32c",
  "futures",
  "object_store",
  "parking_lot",

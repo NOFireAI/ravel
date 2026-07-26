@@ -16,6 +16,7 @@ object_store = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
+crc32c = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -5,7 +5,9 @@
 //! [`ObjectStoreBackend`], never against a vendor SDK. [`memory::MemoryStore`]
 //! is the semantics oracle used by tests.
 
+pub mod fault;
 pub mod memory;
+pub mod s3;
 
 use bytes::Bytes;
 
