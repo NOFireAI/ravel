@@ -1,4 +1,5 @@
-//! Object store contract for Ravel (docs/object-store-contract.md, ADR-0008).
+//! Object store contract for Ravel (docs/object-store-contract.md, ADR-0008,
+//! amended by ADR-0010 §12).
 //!
 //! Every durability argument in the system is made against
 //! [`ObjectStoreBackend`], never against a vendor SDK. [`memory::MemoryStore`]
@@ -8,10 +9,23 @@ pub mod memory;
 
 use bytes::Bytes;
 
-/// Opaque entity tag. Memory backend uses monotonic counters; S3 uses real
-/// etags. Only equality and CAS preconditions are defined on it.
+/// Content identity: used only for equality assertions between reads of the
+/// same immutable object. Never used as a CAS precondition (that is
+/// [`Version`]). The two coincide on S3 and differ on GCS/Azure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Etag(pub String);
+
+/// Opaque precondition token for CAS puts: S3 etag, GCS generation, Azure
+/// etag. Only the backend that issued it can interpret it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version(pub String);
+
+/// Checksum the caller computed locally and the backend verifies on upload.
+/// Transport-integrity only; blake3 identity lives in commit records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadChecksum {
+    Crc32c(u32),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutMode {
@@ -19,42 +33,60 @@ pub enum PutMode {
     Overwrite,
     /// Fail with [`StoreError::AlreadyExists`] if the key exists.
     CreateIfAbsent,
-    /// Replace only if the current etag matches, else
+    /// Replace only if the current version matches, else
     /// [`StoreError::PreconditionFailed`].
-    CasEtag(Etag),
+    CasVersion(Version),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutOptions {
     pub mode: PutMode,
+    pub checksum: Option<UploadChecksum>,
 }
 
 impl Default for PutOptions {
     fn default() -> Self {
         PutOptions {
             mode: PutMode::Overwrite,
+            checksum: None,
         }
+    }
+}
+
+impl PutOptions {
+    pub fn create_if_absent() -> Self {
+        PutOptions {
+            mode: PutMode::CreateIfAbsent,
+            checksum: None,
+        }
+    }
+
+    pub fn with_checksum(mut self, checksum: UploadChecksum) -> Self {
+        self.checksum = Some(checksum);
+        self
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GetRange {
     Full,
-    /// Half-open byte range `[start, end)`.
+    /// Half-open byte range `[start, end)`. Zero-length is `InvalidRange`.
     Range(u64, u64),
-    /// Last `n` bytes.
+    /// Last `n` bytes, `n > 0` (`Suffix(0)` is `InvalidRange`).
     Suffix(u64),
 }
 
 #[derive(Debug, Clone)]
 pub struct PutOutcome {
     pub etag: Etag,
+    pub version: Version,
 }
 
 #[derive(Debug, Clone)]
 pub struct GetOutcome {
     pub data: Bytes,
     pub etag: Etag,
+    pub version: Version,
     /// Total object size, regardless of the range requested.
     pub total_size: u64,
 }
@@ -64,15 +96,45 @@ pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
     pub etag: Etag,
+    pub version: Version,
+    /// May have 1-second granularity on real backends. GC age checks only;
+    /// never order commits by it.
     pub last_modified_unix_ms: i64,
 }
 
+/// Opaque listing continuation token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageToken(pub String);
+
+/// One page of listing results. Cross-page guarantee (see contract doc):
+/// keys created before the first page request are always returned; keys
+/// created during the scan may or may not appear; a key MAY appear more than
+/// once across pages and callers MUST dedup by key.
+#[derive(Debug, Clone)]
+pub struct ListPage {
+    pub objects: Vec<ObjectMeta>,
+    pub next: Option<PageToken>,
+}
+
+/// One-level listing: objects directly under the prefix plus common
+/// sub-prefixes (S3 delimiter semantics).
+#[derive(Debug, Clone)]
+pub struct DelimitedList {
+    pub objects: Vec<ObjectMeta>,
+    pub common_prefixes: Vec<String>,
+}
+
+/// Capability flags mirroring the mandatory-capability table in the
+/// contract doc. Production startup fails if a mandatory flag is false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
-    pub create_if_absent: bool,
-    pub cas_etag: bool,
-    pub suffix_range: bool,
+    pub consistent_read: bool,
     pub consistent_list: bool,
+    pub create_if_absent: bool,
+    pub cas_version: bool,
+    pub suffix_range: bool,
+    pub upload_checksum: bool,
+    pub prefix_list: bool,
     pub multipart: bool,
 }
 
@@ -80,19 +142,25 @@ impl Capabilities {
     /// Everything Ravel's commit protocol and catalog require in production.
     pub fn mandatory() -> Self {
         Capabilities {
-            create_if_absent: true,
-            cas_etag: true,
-            suffix_range: true,
+            consistent_read: true,
             consistent_list: true,
-            multipart: false, // required from Phase 2 (large L1/L2 segments)
+            create_if_absent: true,
+            cas_version: true,
+            suffix_range: true,
+            upload_checksum: true,
+            prefix_list: true,
+            multipart: false, // mandatory from Phase 2 (large L1/L2 segments)
         }
     }
 
     pub fn satisfies(&self, required: &Capabilities) -> bool {
-        (!required.create_if_absent || self.create_if_absent)
-            && (!required.cas_etag || self.cas_etag)
-            && (!required.suffix_range || self.suffix_range)
+        (!required.consistent_read || self.consistent_read)
             && (!required.consistent_list || self.consistent_list)
+            && (!required.create_if_absent || self.create_if_absent)
+            && (!required.cas_version || self.cas_version)
+            && (!required.suffix_range || self.suffix_range)
+            && (!required.upload_checksum || self.upload_checksum)
+            && (!required.prefix_list || self.prefix_list)
             && (!required.multipart || self.multipart)
     }
 }
@@ -100,6 +168,8 @@ impl Capabilities {
 /// Error taxonomy sized for callers' retry decisions. `Throttled`, `Timeout`,
 /// and `Transient` are retryable with jittered exponential backoff.
 /// `AlreadyExists` under `CreateIfAbsent` is a protocol signal (ADR-0002).
+/// Adapters MUST map conditional-put failures by mode: `AlreadyExists` under
+/// `CreateIfAbsent`, `PreconditionFailed` under `CasVersion`.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("object not found")]
@@ -108,6 +178,8 @@ pub enum StoreError {
     AlreadyExists,
     #[error("precondition failed")]
     PreconditionFailed,
+    #[error("access denied: {0}")]
+    AccessDenied(String),
     #[error("throttled, retry after {retry_after_ms} ms")]
     Throttled { retry_after_ms: u64 },
     #[error("timeout")]
@@ -143,11 +215,39 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError>;
 
-    /// Recursive prefix listing in lexicographic key order.
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError>;
+    /// Paginated recursive prefix listing in lexicographic key order.
+    /// Pass `None` for the first page; follow `ListPage::next` until `None`.
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError>;
+
+    /// One-level listing with delimiter `/`.
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError>;
 
     /// Idempotent: deleting a missing key succeeds.
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
 
     fn capabilities(&self) -> Capabilities;
+}
+
+/// Drain every page of a listing, deduplicating by key per the cross-page
+/// guarantee. Convenience for callers with bounded prefixes.
+pub async fn list_all(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+) -> Result<Vec<ObjectMeta>, StoreError> {
+    let mut out: Vec<ObjectMeta> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut page_token = None;
+    loop {
+        let page = store.list(prefix, page_token).await?;
+        for meta in page.objects {
+            if seen.insert(meta.key.clone()) {
+                out.push(meta);
+            }
+        }
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    Ok(out)
 }
