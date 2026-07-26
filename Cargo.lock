@@ -1972,6 +1972,8 @@ dependencies = [
 name = "ravel-catalog"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bytes",
  "parking_lot",
  "proptest",
  "prost",
@@ -1983,6 +1985,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2005,9 +2008,13 @@ dependencies = [
 name = "ravel-commit"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
+ "crc32c",
+ "hex",
  "proptest",
  "prost",
+ "rand 0.10.2",
  "ravel-object-store",
  "ravel-proto",
  "ravel-test-util",

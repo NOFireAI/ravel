@@ -12,13 +12,17 @@ ravel-object-store = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
+hex = { workspace = true }
+crc32c = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 ravel-test-util = { workspace = true }
 proptest = { workspace = true }
-tokio = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true
