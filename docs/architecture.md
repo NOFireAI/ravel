@@ -1,0 +1,55 @@
+# Architecture (Phase 1 scope)
+
+Read the ADRs for the reasoning behind each choice. This file is the map.
+
+```
+OTLP gRPC / OTLP HTTP-protobuf
+        |
+        v
+  gateway (auth, tenant, limits)          services/ravel-server --mode all
+        |
+        v
+  ingest router: hash(tenant, series_id) % shards
+        |
+        v
+  shard actors (single-threaded, bounded mpsc)
+        |  buffer -> RSEG L0 build -> blake3
+        v
+  ObjectStoreBackend  (memory | fault-injecting | S3/MinIO)
+        |   data PUT + commit PUT (create-if-absent)
+        v
+  commit records  <---- catalog resolve (LIST per shard/hour) ----+
+                                                                  |
+  query frontend: /api/v1/query, /query_range, /labels, /series  -+
+        |
+        v
+  segment reader: suffix GET footer -> prune series via SERIES_TABLE
+                  -> ranged GETs for needed pages -> sample iterators
+        |
+        v
+  PromQL evaluator (selectors + lookback, Phase 1)
+```
+
+Crate dependency order (no cycles):
+
+```
+ravel-types
+  <- ravel-proto (prost-generated footer/commit messages)
+  <- ravel-object-store
+  <- ravel-segment      (types, proto)
+  <- ravel-commit       (types, proto, object-store)
+  <- ravel-catalog      (commit)
+  <- ravel-otlp         (types; opentelemetry-proto)
+  <- ravel-ingest       (segment, commit, object-store, otlp)
+  <- ravel-promql       (types)
+  <- ravel-query        (catalog, segment, promql)
+  <- services/ravel-server, services/ravel-cli
+ravel-test-util (types, object-store) used by all dev-deps
+```
+
+Phase 1 runs every service as modes of one binary (`ravel-server --mode
+all|gateway|query`). Crate boundaries keep the split honest so later phases
+can deploy them separately.
+
+Signals other than metrics, compaction, catalog snapshots, Remote Write,
+RavelQL, Sigma/OCSF: later phases. See the spec docs as they land.
