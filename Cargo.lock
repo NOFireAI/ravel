@@ -3539,6 +3539,7 @@ dependencies = [
  "criterion",
  "lz4_flex 0.14.0",
  "parquet",
+ "proptest",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",

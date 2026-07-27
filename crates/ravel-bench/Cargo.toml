@@ -42,6 +42,7 @@ parquet-baseline = ["dep:arrow", "dep:parquet"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
 
 [lib]
 # Only the criterion `[[bench]]` targets below understand `cargo bench`'s
@@ -53,6 +54,11 @@ bench = false
 [[bin]]
 name = "ingest_bench"
 path = "src/bin/ingest_bench.rs"
+bench = false
+
+[[bin]]
+name = "codec_bakeoff"
+path = "src/bin/codec_bakeoff.rs"
 bench = false
 
 [[bin]]
@@ -84,6 +90,11 @@ bench = false
 [[test]]
 name = "alignment_measurement"
 path = "tests/alignment_measurement.rs"
+bench = false
+
+[[test]]
+name = "codec_roundtrip"
+path = "tests/codec_roundtrip.rs"
 bench = false
 
 [[bench]]
