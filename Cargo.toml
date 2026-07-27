@@ -95,6 +95,12 @@ proptest = "1.11"
 criterion = "0.8"
 tempfile = "3"
 
+[profile.dev]
+# Shrink debug info in dev and test binaries to keep the workspace's total
+# on-disk build size within CI runner limits (Fixes: #101). profile.test
+# inherits from profile.dev, so this covers every test binary too.
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
