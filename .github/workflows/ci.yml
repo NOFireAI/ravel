@@ -33,4 +33,14 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Measure coverage
-        run: cargo llvm-cov --workspace --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          cargo llvm-cov --workspace --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov --workspace --summary-only --json --output-path coverage.json
+      # Updates the badge data gist read by the README's shields.io endpoint
+      # badge. Only on pushes to main, since the badge reflects main's state
+      # and pull_request runs (including from forks) never see GIST_PAT.
+      - name: Update coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GIST_PAT: ${{ secrets.GIST_PAT }}
+        run: python3 scripts/update-coverage-badge.py
