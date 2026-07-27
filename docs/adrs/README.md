@@ -21,3 +21,5 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0015](0015-remote-write-ingest.md) | Prometheus Remote Write 1.0/2.0 ingest surface | Accepted |
 | [0016](0016-otlp-classic-histogram-summary-explosion.md) | OTLP explicit-bounds histograms and summaries explode to Prometheus-convention series | Accepted |
 | [0017](0017-native-histograms-rseg-v3.md) | Native exponential histograms: span-based value model, RSEG v3 after RSEG v2 phase 6 closes | Accepted |
+| [0018](0018-l0-l1-compaction.md) | L0 to L1 compaction: verbatim rewrite of sealed ingest-hour buckets | Accepted |
+| [0019](0019-age-based-retention.md) | Age-based retention via bucket tombstones and horizon-gated sweep | Accepted |
