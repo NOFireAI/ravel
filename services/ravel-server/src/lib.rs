@@ -1,0 +1,167 @@
+//! ravel-server: gateway + ingest + query in one binary for development
+//! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
+
+pub mod config;
+pub mod ingest;
+pub mod otlp_grpc;
+pub mod otlp_http;
+pub mod query;
+pub mod store;
+pub mod tenant;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Router;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
+use ravel_ingest::{IngestConfig, IngestRouter, SystemClock};
+use ravel_object_store::ObjectStoreBackend;
+use ravel_otlp::IngestLimits;
+use ravel_query::http::TenantResolver;
+use ravel_types::Signal;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+pub use config::{Cli, Mode, StoreKind};
+
+const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
+
+pub struct ServerConfig {
+    pub mode: Mode,
+    pub listen_http: SocketAddr,
+    pub listen_grpc: SocketAddr,
+    pub shard_count: u32,
+    pub tenant_resolver: Arc<dyn TenantResolver>,
+}
+
+/// A running server instance. Dropping this without calling [`Running::shutdown`]
+/// leaves the background listener tasks detached; always shut down explicitly.
+pub struct Running {
+    pub http_addr: SocketAddr,
+    pub grpc_addr: Option<SocketAddr>,
+    http_shutdown: oneshot::Sender<()>,
+    http_task: JoinHandle<anyhow::Result<()>>,
+    grpc_shutdown: Option<oneshot::Sender<()>>,
+    grpc_task: Option<JoinHandle<anyhow::Result<()>>>,
+    ingest_router: Option<Arc<IngestRouter>>,
+}
+
+impl Running {
+    /// Stops accepting new connections, waits for both listeners to drain,
+    /// then flushes and joins every ingest shard actor.
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        let _ = self.http_shutdown.send(());
+        self.http_task.await??;
+
+        if let Some(tx) = self.grpc_shutdown {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.grpc_task {
+            task.await??;
+        }
+
+        if let Some(router) = self.ingest_router {
+            match Arc::try_unwrap(router) {
+                Ok(router) => router.shutdown().await,
+                Err(_) => {
+                    tracing::warn!(
+                        "ingest router still has outstanding references; shard actors not drained"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn gateway_state(
+    ingest_router: &Arc<IngestRouter>,
+    tenant_resolver: Arc<dyn TenantResolver>,
+) -> Arc<otlp_http::GatewayState> {
+    Arc::new(otlp_http::GatewayState {
+        tenant_resolver,
+        ingest: ingest::IngestState {
+            router: ingest_router.clone(),
+            limits: IngestLimits::default(),
+            ack_deadline: DEFAULT_ACK_DEADLINE,
+        },
+    })
+}
+
+/// Binds both listeners (as configured by `mode`) and starts serving in the
+/// background. Returns immediately; call [`Running::shutdown`] to stop.
+pub async fn start(
+    config: ServerConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+) -> anyhow::Result<Running> {
+    let ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+        Some(Arc::new(IngestRouter::new(
+            IngestConfig {
+                shard_count: config.shard_count,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Signal::Metrics,
+            Arc::new(SystemClock),
+        )))
+    } else {
+        None
+    };
+
+    let mut http_router = Router::new();
+    if let Some(router) = &ingest_router {
+        let state = gateway_state(router, config.tenant_resolver.clone());
+        http_router = http_router.merge(otlp_http::router(state));
+    }
+    if matches!(config.mode, Mode::All | Mode::Query) {
+        let app_state = query::build_app_state(
+            store.clone(),
+            config.shard_count,
+            config.tenant_resolver.clone(),
+        )?;
+        http_router = http_router.merge(ravel_query::http::router(app_state));
+    }
+
+    let listener = tokio::net::TcpListener::bind(config.listen_http).await?;
+    let http_addr = listener.local_addr()?;
+    let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel::<()>();
+    let http_task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        axum::serve(listener, http_router)
+            .with_graceful_shutdown(async {
+                let _ = http_shutdown_rx.await;
+            })
+            .await?;
+        Ok(())
+    });
+
+    let (grpc_addr, grpc_shutdown, grpc_task) = if let Some(router) = &ingest_router {
+        let state = gateway_state(router, config.tenant_resolver.clone());
+        let service = otlp_grpc::GrpcMetricsService::new(state);
+        let (tx, rx) = oneshot::channel::<()>();
+        let addr = config.listen_grpc;
+        let task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(MetricsServiceServer::new(service))
+                .serve_with_shutdown(addr, async {
+                    let _ = rx.await;
+                })
+                .await?;
+            Ok(())
+        });
+        (Some(addr), Some(tx), Some(task))
+    } else {
+        (None, None, None)
+    };
+
+    Ok(Running {
+        http_addr,
+        grpc_addr,
+        http_shutdown: http_shutdown_tx,
+        http_task,
+        grpc_shutdown,
+        grpc_task,
+        ingest_router,
+    })
+}

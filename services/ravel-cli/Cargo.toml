@@ -11,11 +11,13 @@ ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-commit = { workspace = true }
+ravel-catalog = { workspace = true }
 prost = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+hex = { workspace = true }
 
 [lints]
 workspace = true
