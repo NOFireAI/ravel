@@ -63,8 +63,9 @@ and passes through bit-exactly (issue #75).
 ## Budgets (Phase 1: static config)
 
 Per query: max segments touched (1024), max concurrent GETs (8), max
-matched series (10k), max samples (10M), wall deadline (server maximum,
-default 30 s). The `timeout` param can only lower the deadline: values
+matched series (10k), max samples (10M), max range-evaluation points
+per query (11,000, matching the Prometheus resolution limit; issue #77),
+wall deadline (server maximum, default 30 s). The `timeout` param can only lower the deadline: values
 above the server maximum are clamped to it (issue #58). Exceeding a
 budget returns a Prometheus-style error, never a partial silent result.
 
