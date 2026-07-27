@@ -50,6 +50,11 @@ path = "src/bin/profile_hotspots.rs"
 bench = false
 
 [[bin]]
+name = "section_bytes_report"
+path = "src/bin/section_bytes_report.rs"
+bench = false
+
+[[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
 bench = false
