@@ -22,7 +22,8 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::collect;
+use datafusion::physical_plan::{collect, displayable};
+use datafusion::prelude::{SessionConfig, SessionContext};
 use proptest::prelude::*;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
@@ -333,6 +334,80 @@ async fn golden_multi_segment_overlap_each_field_decides() {
         },
     ];
     assert_pipeline_matches_oracle(specs, None).await;
+}
+
+/// Regression for the Opus checkpoint finding on B1 (issue #20): every other
+/// test in this file calls `provider.plan(n)` and hands the hand-built plan
+/// straight to `collect()`, which never runs the DataFusion optimizer. Only
+/// the `SessionContext`/`DataFrame` path does, and without
+/// `RsegDedupExec::required_input_distribution`/`required_input_ordering`
+/// the optimizer struck `SortPreservingMergeExec` outright (not even
+/// replacing it with `CoalescePartitionsExec`), so only one scan partition
+/// was ever read: silent, unflagged data loss on the crate's documented
+/// table-provider entry point. This asserts both the physical plan shape
+/// and the full row count, with more than one partition actually in play.
+#[tokio::test]
+async fn optimizer_path_preserves_sort_preserving_merge_and_full_rows() {
+    let specs = vec![
+        SegSpec {
+            created_unix_ns: 10,
+            writer_epoch: 1,
+            writer_seq: 1,
+            series: vec![SeriesSpec {
+                metric: "m".into(),
+                samples: vec![(100, 1.0), (200, 2.0)],
+            }],
+        },
+        SegSpec {
+            created_unix_ns: 20,
+            writer_epoch: 1,
+            writer_seq: 1,
+            series: vec![SeriesSpec {
+                metric: "m".into(),
+                samples: vec![(100, 111.0)],
+            }],
+        },
+        SegSpec {
+            created_unix_ns: 10,
+            writer_epoch: 2,
+            writer_seq: 1,
+            series: vec![SeriesSpec {
+                metric: "m".into(),
+                samples: vec![(200, 222.0)],
+            }],
+        },
+    ];
+    let (store, snapshot) = build_snapshot(&specs, None).await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let want = oracle(Arc::clone(&backend), &snapshot).await;
+
+    // target_partitions=4 against 3 segments: RsegScanExec.new's
+    // `n = target_partitions.min(segments.len())` gives 3 real partitions,
+    // so a stripped merge would read one of three segments, not all.
+    let config = SessionConfig::new().with_target_partitions(4);
+    let ctx = SessionContext::new_with_config(config);
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend));
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
+    ctx.register_table("samples", Arc::new(provider))
+        .expect("register table");
+
+    let df = ctx.table("samples").await.expect("table");
+    let physical = df.create_physical_plan().await.expect("physical plan");
+    let plan_str = displayable(physical.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("SortPreservingMergeExec"),
+        "optimizer must not strip the required merge; got:\n{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("CoalescePartitionsExec"),
+        "merge must never be replaced by an unordered coalesce; got:\n{plan_str}"
+    );
+
+    let batches = collect(physical, Arc::new(TaskContext::default()))
+        .await
+        .expect("collect via optimized plan");
+    let got = reduce_batches(&batches);
+    assert_reduced_eq(&got, &want);
 }
 
 #[tokio::test]

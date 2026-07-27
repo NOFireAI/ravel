@@ -28,7 +28,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::col;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    Distribution, EquivalenceProperties, LexOrdering, OrderingRequirements, PhysicalSortExpr,
+};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -50,6 +52,19 @@ pub struct RsegDedupExec {
     schema: SchemaRef,
     max_samples: usize,
     properties: Arc<PlanProperties>,
+    /// The (series_id, ts) ordering this operator requires of its input,
+    /// expressed over the *input's* schema (internal, with provenance
+    /// columns) rather than this operator's own output schema. Without
+    /// declaring this, the DataFusion optimizer sees no required
+    /// distribution or ordering on the sole child and is free to strip
+    /// `SortPreservingMergeExec` entirely (`EnforceDistribution` only
+    /// re-adds what is required), collapsing the scan's partitions away
+    /// without even a `CoalescePartitionsExec` in its place -- silently
+    /// executing only one scan partition. Found by Opus checkpoint review
+    /// of B1 (issue #20): reproduced via `SessionContext`/`DataFrame`,
+    /// which runs the optimizer, vs. the crate's own tests, which all call
+    /// `collect()` directly on a hand-built plan and never exercise it.
+    input_ordering: OrderingRequirements,
 }
 
 impl RsegDedupExec {
@@ -72,11 +87,25 @@ impl RsegDedupExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+
+        // Same (series_id, ts) ordering, but resolved against the child's
+        // schema (internal, still carrying provenance columns) since this
+        // is a requirement on the input, not a promise about our output.
+        let input_schema = input.schema();
+        let input_sort_exprs = ["series_id", "ts"]
+            .into_iter()
+            .map(|name| Ok(PhysicalSortExpr::new(col(name, &input_schema)?, asc)))
+            .collect::<DFResult<Vec<_>>>()?;
+        let input_ordering = LexOrdering::new(input_sort_exprs)
+            .ok_or_else(|| DataFusionError::Internal("empty dedup input ordering".into()))?
+            .into();
+
         Ok(RsegDedupExec {
             input,
             schema,
             max_samples,
             properties,
+            input_ordering,
         })
     }
 }
@@ -98,6 +127,20 @@ impl ExecutionPlan for RsegDedupExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    // Single-partition dedup state (`pending` in `DedupStream`) is only
+    // correct if every row for a given (series_id, ts) actually reaches
+    // this one partition, in order. Without these two overrides the
+    // defaults (`UnspecifiedDistribution`, no required ordering) tell the
+    // optimizer this operator has no requirements, so `EnforceDistribution`
+    // drops `SortPreservingMergeExec` outright instead of enforcing it.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![Some(self.input_ordering.clone())]
     }
 
     fn with_new_children(
