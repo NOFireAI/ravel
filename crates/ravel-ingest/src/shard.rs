@@ -198,7 +198,31 @@ impl ShardActor {
                             let _ = done.send(());
                             break;
                         }
-                        None => break,
+                        None => {
+                            // Every `mpsc::Sender` was dropped: the router was
+                            // dropped without `shutdown()` (services/ravel-server
+                            // lib.rs reaches this when `Arc::try_unwrap` fails or
+                            // `Running::shutdown` returns early). A graceful
+                            // teardown is not a crash, and buffered-mode points
+                            // are only permitted to be lost to a crash
+                            // (docs/consistency-model.md "Buffered mode"). Flush
+                            // before breaking so acknowledged points are not
+                            // silently discarded; log first so the close is
+                            // observable even if the flush itself is abandoned
+                            // and counted (docs/ingest.md "Shard actor" step 5).
+                            if !self.tenants.is_empty() {
+                                let (tenant_count, buffered_points) = self.buffered_summary();
+                                tracing::warn!(
+                                    shard = self.shard,
+                                    tenant_count,
+                                    buffered_points,
+                                    "shard actor channel closed without shutdown; \
+                                     flushing buffered tenants before stopping"
+                                );
+                            }
+                            self.flush_all(FlushTrigger::Manual).await;
+                            break;
+                        }
                     }
                 }
                 _ = ticker.tick() => {
@@ -269,6 +293,19 @@ impl ShardActor {
                 self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
             }
         }
+    }
+
+    /// Returns `(tenant_count, buffered_point_count)` across every currently
+    /// buffered tenant, for the channel-close log line. Point count is the
+    /// sum of all buffered samples, matching `record_buffered`'s point unit.
+    fn buffered_summary(&self) -> (usize, u64) {
+        let points: u64 = self
+            .tenants
+            .values()
+            .flat_map(|buf| buf.series.values())
+            .map(|accum| accum.samples.len() as u64)
+            .sum();
+        (self.tenants.len(), points)
     }
 
     async fn flush_all(&mut self, trigger: FlushTrigger) {
