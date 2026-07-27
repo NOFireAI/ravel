@@ -2661,6 +2661,7 @@ dependencies = [
  "arrow",
  "arrow-ipc",
  "bytes",
+ "opentelemetry-proto",
  "proptest",
  "prost",
  "prost-build",

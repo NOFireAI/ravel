@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, DictionaryArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, UInt8Type};
-use ravel_otap::encode::{AttrRow, DataPointRow, MetricRow, MetricsStreamEncoder};
+use ravel_otap::encode::{
+    AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
+};
 use ravel_otap::proto::experimental::arrow::v1::{
     ArrowPayload, ArrowPayloadType, BatchArrowRecords,
 };
@@ -16,7 +18,7 @@ use ravel_otap::stream::{BatchError, DecodeError, StreamConfig, StreamError, Str
 fn metric(name: &str, points: Vec<DataPointRow>) -> MetricRow {
     MetricRow {
         name: name.to_string(),
-        metric_type: 1,
+        kind: MetricKind::Gauge,
         data_points: points,
     }
 }
@@ -29,7 +31,7 @@ fn point(time_unix_nano: i64, value: f64, attrs: Vec<(&str, &str)>) -> DataPoint
             .into_iter()
             .map(|(key, value)| AttrRow {
                 key: key.to_string(),
-                value: value.to_string(),
+                value: AttrValue::Str(value.to_string()),
             })
             .collect(),
     }
