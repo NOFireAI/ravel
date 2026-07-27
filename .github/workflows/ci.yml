@@ -23,6 +23,26 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Supply-chain gate (finding a11-F01). deny.toml encodes an advisory,
+  # license, ban, and source policy that `make audit` runs locally but no
+  # CI job enforced, so a new advisory, banned license, or unknown source
+  # could merge to main undetected while CI signalled "clean". This job
+  # runs `cargo deny check`, which covers all four sub-checks; the
+  # advisories check subsumes cargo-audit, so cargo-audit is not run
+  # separately. cargo-deny is provisioned from a pinned action rather than
+  # `cargo install` to avoid a from-source build on every run. The gate
+  # passes because deny.toml is green (F06-F08 fixed): the bincode
+  # advisory is scoped-ignored, tiny-keccak's CC0-1.0 is a scoped license
+  # exception, and internal path deps are version-pinned.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
+
   # Corrupt-input mutation fuzzing for the byte parsers (issue #82, audit
   # finding a11-F05). Runs the stable-only proptest mutation targets for the
   # RSEG codecs (varint, gorilla, delta-varint), the RSEG footer/section
