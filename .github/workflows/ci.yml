@@ -23,6 +23,32 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Corrupt-input mutation fuzzing for the byte parsers (issue #82, audit
+  # finding a11-F05). Runs the stable-only proptest mutation targets for the
+  # RSEG codecs (varint, gorilla, delta-varint), the RSEG footer/section
+  # reader, and the OTAP Arrow IPC decode path with an elevated but bounded
+  # case count for deeper exploration than the default `check` run. These
+  # decoders read untrusted stored bytes and must return typed errors, never
+  # panic. cargo-fuzz/libfuzzer need nightly and are deliberately not used;
+  # this stays on the pinned stable toolchain.
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      # Bounded case count keeps wall-clock in check while exploring far more
+      # of the corrupt-input space than the 256-case default.
+      PROPTEST_CASES: 4096
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Fuzz RSEG codecs (varint, gorilla, delta-varint)
+        run: cargo test -p ravel-segment --lib fuzz_mutation
+      - name: Fuzz RSEG footer/section reader
+        run: cargo test -p ravel-segment --test fuzz_mutation
+      - name: Fuzz OTAP Arrow IPC decode
+        run: cargo test -p ravel-otap --test fuzz_mutation
+
   # Runs the object-store contract suite (docs/object-store-contract.md)
   # against a real MinIO endpoint. Without this job the `minio_contract`
   # test in crates/ravel-object-store/tests/contract.rs early-returns

@@ -432,3 +432,101 @@ mod tests {
         }
     }
 }
+
+/// Corrupt-input mutation harness (issue #82, audit finding a11-F05). The
+/// Gorilla decoder reads an untrusted XOR bit stream; the contract is a
+/// typed error or a valid decode, never a panic and never wrong data
+/// (docs/segment-format.md, CLAUDE.md testing patterns). The hand-vectors
+/// above pin chosen malformed control sequences; these proptests explore
+/// the arbitrary/mutated byte space on the pinned stable toolchain
+/// (proptest, no cargo-fuzz).
+///
+/// `count` is bounded to a realistic range on purpose: it is a separate
+/// decode input (the reader derives it from `sample_count`) and the
+/// production decoder pre-reserves `count` slots, so these targets fuzz the
+/// *bit-stream grammar* rather than a decoder's reaction to an absurd
+/// count. Case count honours `PROPTEST_CASES`.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod fuzz_mutation {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn mutate(bytes: &[u8], bit: usize, truncate_to: usize) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        if !out.is_empty() {
+            let byte = (bit / 8) % out.len();
+            out[byte] ^= 1u8 << (bit % 8);
+        }
+        let cut = if out.is_empty() {
+            0
+        } else {
+            truncate_to % (out.len() + 1)
+        };
+        out.truncate(cut);
+        out
+    }
+
+    fn decode(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> {
+        let mut out = Vec::new();
+        decode_gorilla_into(bytes, count, &mut out)?;
+        Ok(out)
+    }
+
+    fn value_bits_eq(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    prop_compose! {
+        /// f64 values biased toward the special payloads the codec must
+        /// preserve bit-exactly, mixed with arbitrary bit patterns.
+        fn any_f64()(choice in 0u8..7, raw in any::<u64>()) -> f64 {
+            match choice {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f64::NAN,
+                3 => f64::INFINITY,
+                4 => f64::NEG_INFINITY,
+                5 => f64::from_bits(raw),
+                _ => (raw as i64 as f64) * 0.5,
+            }
+        }
+    }
+
+    proptest! {
+        /// Decoding arbitrary bytes with an arbitrary (bounded) count must
+        /// yield a typed error or a valid decode, never a panic.
+        #[test]
+        fn decode_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..256),
+            count in 0usize..1024,
+        ) {
+            let _ = decode(&bytes, count);
+        }
+
+        /// Any value sequence round-trips bit-exactly, including NaN
+        /// payloads and signed zero (no-wrong-data on the valid space).
+        #[test]
+        fn roundtrips_arbitrary_values(values in proptest::collection::vec(any_f64(), 0..96)) {
+            let encoded = encode_gorilla(&values);
+            let decoded = decode(&encoded, values.len()).expect("valid stream decodes");
+            prop_assert!(value_bits_eq(&decoded, &values));
+        }
+
+        /// A valid stream with a single bit flipped or truncated, decoded at
+        /// the original count or a nearby wrong count, must only yield a
+        /// typed error or a valid decode, never a panic.
+        #[test]
+        fn seed_mutation_never_panics(
+            values in proptest::collection::vec(any_f64(), 1..48),
+            bit in any::<usize>(),
+            truncate_to in any::<usize>(),
+            count_delta in 0usize..8,
+        ) {
+            let encoded = encode_gorilla(&values);
+            let corrupt = mutate(&encoded, bit, truncate_to);
+            let _ = decode(&corrupt, values.len().saturating_add(count_delta));
+            let _ = decode(&corrupt, values.len().saturating_sub(count_delta));
+        }
+    }
+}
