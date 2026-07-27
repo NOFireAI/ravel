@@ -25,6 +25,7 @@ ravel-segment = { path = "crates/ravel-segment" }
 ravel-commit = { path = "crates/ravel-commit" }
 ravel-catalog = { path = "crates/ravel-catalog" }
 ravel-otlp = { path = "crates/ravel-otlp" }
+ravel-otap = { path = "crates/ravel-otap" }
 ravel-ingest = { path = "crates/ravel-ingest" }
 ravel-promql = { path = "crates/ravel-promql" }
 ravel-query = { path = "crates/ravel-query" }
@@ -46,6 +47,10 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 
 # object storage
 object_store = { version = "0.14", features = ["aws"] }
+
+# arrow (isolated to ravel-otap for now; Phase 3 query work reuses it)
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow-ipc = { version = "59", features = ["zstd"] }
 
 # encoding / compression / hashing
 bytes = "1"
@@ -79,6 +84,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # build
 prost-build = "0.14"
+tonic-prost-build = "0.14"
 protox = "0.9"
 
 # test / bench
