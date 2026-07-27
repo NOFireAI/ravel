@@ -208,16 +208,27 @@ impl Default for GcWindow {
     }
 }
 
-/// Test utility standing in for a not-yet-built `ravel-gc` crate: sweeps L0
-/// data objects for one (tenant, signal, shard) that have no commit record,
-/// deleting only those older than `grace + max_flush_lifetime` and
-/// re-verifying commit-record absence immediately before each delete
-/// (docs/consistency-model.md "Deletion and GC", ADR-0010 SS11). Relies on
-/// `MemoryStore`'s strongly consistent listing, exactly as the real GC path
-/// is documented to.
+/// SPECIFICATION MODEL, NOT PRODUCTION CODE. This is an executable
+/// restatement of the orphan-GC rule from docs/consistency-model.md
+/// "Deletion and GC" (grace + max_flush_lifetime horizon, re-verify
+/// commit-record absence immediately before each delete) and ADR-0010 SS11.
+/// It exists only to document the intended behavior; no shipped GC path
+/// calls it, and no production orphan-sweep symbol exists yet (Phase 2
+/// roadmap; the future crate is referred to as `ravel-gc`). A test driving
+/// this helper proves a property of the model, NOT of Ravel: the assertion
+/// and the code under assertion are the same logic. See finding a11-F04
+/// (docs/reviews/2026-07-27-storage-engine-quality-audit/a11-tests-ci-deps.md)
+/// and issue #81. When the production GC lands, delete this helper and point
+/// the crash-row assertions at the real symbol.
+///
+/// Sweeps L0 data objects for one (tenant, signal, shard) that have no commit
+/// record, deleting only those older than `grace + max_flush_lifetime` and
+/// re-verifying commit-record absence immediately before each delete. Relies
+/// on `MemoryStore`'s strongly consistent listing, exactly as the real GC
+/// path is documented to.
 ///
 /// Returns the keys of every data object actually deleted.
-pub async fn sweep_orphans(
+pub async fn spec_model_sweep_orphans(
     store: &MemoryStore,
     tenant_hash: TenantHash,
     signal: Signal,
