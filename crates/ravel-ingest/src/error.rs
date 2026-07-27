@@ -7,8 +7,16 @@
 /// waiter of that flush.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WriteError {
-    /// The shard actor's channel is closed (actor task gone). Not retryable:
-    /// the router itself is shutting down or has panicked.
+    /// The shard actor's channel is closed: the router observed either its
+    /// send half or a strict-mode ack fail because the actor task is gone.
+    /// This means the router is shutting down, or an individual shard actor
+    /// task ended without shutdown (e.g. it panicked mid-flush); the latter
+    /// leaves the router serving the surviving shards while every series
+    /// hashing to the dead shard fails here. The router counts each distinct
+    /// shard death (`IngestMetricsSnapshot::shard_deaths`) so the degraded
+    /// state is observable rather than silent (a8-F03). Retryable at the
+    /// client, but points routed to a dead shard keep failing until the
+    /// process is restarted.
     #[error("shard actor unavailable")]
     ShardUnavailable,
     /// A strict-mode ack did not arrive within the caller's `ack_deadline`.

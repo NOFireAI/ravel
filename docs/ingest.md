@@ -37,9 +37,21 @@ Single task per shard. No locks on the hot path; all state actor-local:
 Loop over `select!`:
 - message received: merge points, push `ack` to waiters (strict) or reply
   immediately (buffered), flush if `est_bytes >= target_bytes` (default
-  8 MiB).
+  8 MiB). Before merging, each point's series_id is checked against the
+  canonical label set that id already claims in the buffer; a mismatch
+  (hash collision) rejects the point with a typed error and increments
+  the series_id_collisions counter instead of silently merging
+  (ADR-0005 fail-loud rule; issue #63).
 - flush tick (interval default 200 ms): flush if `oldest_ns` older than
   `max_flush_delay` (default 500 ms) and buffer non-empty.
+- channel closed (router dropped): flush the remaining buffer before
+  exiting rather than discarding it; points that still fail to flush are
+  counted, never silently lost (issue #64).
+
+Shard-actor death is observable: the router marks a shard dead when its
+channel closes or an ack receiver fails, routes subsequent points for
+that shard to a typed shard-unavailable error, and increments a
+shard_deaths counter. Surviving shards keep working (issue #65).
 
 Flush (still inside the actor; ingest-ordering per shard is the point):
 1. Build RSEG via `ravel-segment::SegmentWriter` (one segment per tenant in
