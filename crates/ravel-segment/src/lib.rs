@@ -18,8 +18,9 @@ pub use error::{SegmentError, WriteError};
 pub use format::ReaderLimits;
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
-    FooterLocation, FooterOutcome, PlannedRange, SeriesEntry, decode_catalog, decode_pages,
-    open_from_full, open_from_suffix, parse_footer, plan_ranges, select, validate_sections,
+    FooterLocation, FooterOutcome, PlannedRange, SeriesEntry, ValPageKind, decode_catalog,
+    decode_pages, decode_pages_soa, open_from_full, open_from_suffix, parse_footer, plan_ranges,
+    select, validate_sections,
 };
 pub use writer::{
     IngestBounds, SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput, WrittenSegment,

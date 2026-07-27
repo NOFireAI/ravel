@@ -65,6 +65,51 @@ fn full_decode(
     Ok(out)
 }
 
+/// Same pipeline as [`full_decode`], but through `decode_pages_soa`
+/// (`Vec<i64>`/`Vec<f64>`) instead of `decode_pages` (`Vec<Sample>`),
+/// reusing one scratch/timestamps/values buffer set across every series
+/// exactly as a `SegmentFetcher::fetch_soa`-style caller would, then
+/// zipping into `Sample`s so the result is directly comparable to
+/// `full_decode`'s output.
+fn full_decode_soa(
+    bytes: &[u8],
+) -> Result<Vec<(SeriesId, LabelSet, Vec<Sample>)>, ravel_segment::SegmentError> {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits)?;
+    let label_dict_bytes = section_bytes(bytes, &loc.footer, 1);
+    let series_table_bytes = section_bytes(bytes, &loc.footer, 2);
+    let entries =
+        ravel_segment::decode_catalog(&loc.footer, label_dict_bytes, series_table_bytes, limits)?;
+
+    let selected: Vec<&SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges(&loc.footer, &selected)?;
+
+    let mut scratch = Vec::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (entry, range) in entries.iter().zip(ranges.iter()) {
+        let ts_bytes = slice_range(bytes, range.ts_range);
+        let val_bytes = slice_range(bytes, range.val_range);
+        let mut timestamps = Vec::new();
+        let mut values = Vec::new();
+        ravel_segment::decode_pages_soa(
+            entry,
+            ts_bytes,
+            val_bytes,
+            limits,
+            &mut scratch,
+            &mut timestamps,
+            &mut values,
+        )?;
+        let samples = timestamps
+            .into_iter()
+            .zip(values)
+            .map(|(ts_ns, value)| Sample { ts_ns, value })
+            .collect();
+        out.push((entry.series_id, entry.labels.clone(), samples));
+    }
+    Ok(out)
+}
+
 /// Normalizes decoded output for exact (including NaN payload and -0.0)
 /// comparison: values compare by bit pattern, entries sorted by series_id.
 fn normalize(entries: &[(SeriesId, LabelSet, Vec<Sample>)]) -> Vec<NormalizedSeries> {
@@ -608,5 +653,11 @@ proptest! {
                 samples.iter().map(|s| (s.ts_ns, s.value.to_bits())).collect();
             prop_assert_eq!(&got, exp_samples);
         }
+
+        // decode_pages_soa (AoS's SoA sibling, ticket A1a) must decode the
+        // same bytes to bit-identical timestamps and values, including
+        // NaN payloads and -0.0 (sample_value_strategy covers both).
+        let decoded_soa = full_decode_soa(&written.bytes).expect("soa decode succeeds");
+        prop_assert_eq!(normalize(&decoded), normalize(&decoded_soa));
     }
 }

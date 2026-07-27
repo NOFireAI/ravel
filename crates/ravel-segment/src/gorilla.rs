@@ -145,15 +145,22 @@ pub fn encode_gorilla(values: &[f64]) -> Vec<u8> {
     w.finish()
 }
 
-/// Decodes exactly `count` Gorilla-encoded values from `bytes`. Rejects any
-/// malformed control sequence (out-of-range window arithmetic, truncated
-/// stream) as [`SegmentError::CorruptGorilla`] or [`SegmentError::Truncated`];
-/// never panics.
-pub fn decode_gorilla(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> {
-    let mut out = Vec::with_capacity(count);
+/// Decodes exactly `count` Gorilla-encoded values from `bytes` into a
+/// caller-supplied buffer: `out` is cleared, then filled (on error, its
+/// contents are unspecified), reusable across pages instead of allocating
+/// fresh per page. Rejects any malformed control sequence (out-of-range
+/// window arithmetic, truncated stream) as [`SegmentError::CorruptGorilla`]
+/// or [`SegmentError::Truncated`]; never panics.
+pub fn decode_gorilla_into(
+    bytes: &[u8],
+    count: usize,
+    out: &mut Vec<f64>,
+) -> Result<(), SegmentError> {
+    out.clear();
     if count == 0 {
-        return Ok(out);
+        return Ok(());
     }
+    out.reserve(count);
     let mut r = BitReader::new(bytes);
     let mut prev = r.read_bits(64)?;
     out.push(f64::from_bits(prev));
@@ -192,13 +199,19 @@ pub fn decode_gorilla(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentErr
             window = Some((lead, trail));
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn decode_gorilla(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> {
+        let mut out = Vec::new();
+        decode_gorilla_into(bytes, count, &mut out)?;
+        Ok(out)
+    }
 
     fn bits(values: &[f64]) -> Vec<u64> {
         values.iter().map(|v| v.to_bits()).collect()
