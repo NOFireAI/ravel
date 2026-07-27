@@ -4,21 +4,33 @@
 //! test-side counterpart to `stream.rs`'s decoder, not a production
 //! exporter. It emits exactly the subset of the OTAP metrics data model
 //! (proto/otel-arrow/docs/data_model.md) that `StreamState` decodes and
-//! that Part 2's normalizer will consume:
+//! that the columnar normalizer (`normalize.rs`) consumes:
 //!
-//! - `UNIVARIATE_METRICS` (root): `id` (UInt16), `metric_type` (UInt8,
-//!   opaque placeholder -- OTLP metric-kind interpretation is the
-//!   normalizer's job), `name` (Dictionary<UInt8, Utf8>).
+//! - `UNIVARIATE_METRICS` (root): `id` (UInt16), `metric_type` (UInt8, see
+//!   [`normalize::METRIC_TYPE_GAUGE`](crate::normalize::METRIC_TYPE_GAUGE)
+//!   and friends), `name` (Dictionary<UInt8, Utf8>), `aggregation_temporality`
+//!   (Int32, nullable, meaningful only for `metric_type == METRIC_TYPE_SUM`),
+//!   `is_monotonic` (Boolean, nullable, same condition). The data model
+//!   marks these last two "optional" as nullable columns on the shared
+//!   METRICS table, not as omitted columns -- unlike the AnyValue arms
+//!   below, a `Gauge` row simply carries nulls in them.
 //! - `NUMBER_DATA_POINTS`: `id` (UInt32, populated whenever the point has
 //!   attrs, so `NUMBER_DP_ATTRS` has something to reference), `parent_id`
 //!   (UInt16, FK to the root table's `id`), `time_unix_nano`
 //!   (Timestamp(Nanosecond)), `double_value` (Float64).
 //! - `NUMBER_DP_ATTRS`: `parent_id` (UInt32, FK to `NUMBER_DATA_POINTS.id`),
-//!   `key` (Utf8), `type` (UInt8, always `1` = string), `str` (Utf8). Only
-//!   the string-valued arm of the AnyValue union (otap-spec.md section
-//!   5.5.1) is emitted; the other value columns are omitted entirely, per
-//!   OTAP's adaptive-schema rule that absent optional columns mean "no data
-//!   of that shape" (otap-spec.md section 4.2).
+//!   `key` (Utf8), `type` (UInt8, an AnyValue discriminant per otap-spec.md
+//!   section 5.5.1: 1=String, 2=Bool, 3=Int, 4=Double; `AttrValue::Complex`
+//!   uses 6=Array purely as a marker with no populated value column, to
+//!   exercise the normalizer's `ComplexAttributeValue` rejection path),
+//!   `str`/`bool`/`int`/`double` (nullable, one populated per row per its
+//!   `type`). A real exporter would omit whichever of these four columns no
+//!   row in a given schema generation ever populates (otap-spec.md section
+//!   4.2's adaptive-schema rule); this encoder always includes all four
+//!   because one Arrow IPC schema is fixed for the life of a `schema_id`
+//!   and our tests exercise every AnyValue shape across calls on the same
+//!   stream. The normalizer must not infer a value's shape from column
+//!   presence alone -- only `type` is authoritative.
 //!
 //! All `id`/`parent_id` columns are emitted as plain absolute values (no
 //! delta or quasi-delta transport encoding, see otap-spec.md section 6.4):
@@ -48,18 +60,35 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow::array::{
-    Float64Array, RecordBatch, StringArray, StringDictionaryBuilder, TimestampNanosecondArray,
-    UInt8Array, UInt16Array, UInt32Array,
+    BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StringDictionaryBuilder, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UInt8Type};
 use arrow_ipc::writer::StreamWriter;
 
+use crate::normalize::{
+    ANY_VALUE_TYPE_ARRAY, ANY_VALUE_TYPE_BOOL, ANY_VALUE_TYPE_DOUBLE, ANY_VALUE_TYPE_INT,
+    ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE, METRIC_TYPE_SUM,
+};
 use crate::proto::experimental::arrow::v1::{ArrowPayload, ArrowPayloadType, BatchArrowRecords};
 
-/// A single data-point attribute (string-valued only, see module docs).
+/// A data-point attribute's value, mirroring the AnyValue arms this encoder
+/// can emit (see module docs for the `type` discriminant mapping). `Complex`
+/// stands in for the Array/KVList/Bytes arms, none of which this encoder
+/// gives a real column: it exists only to produce a `type` discriminant the
+/// normalizer must reject.
+pub enum AttrValue {
+    Str(String),
+    Bool(bool),
+    Int(i64),
+    Double(f64),
+    Complex,
+}
+
+/// A single data-point attribute.
 pub struct AttrRow {
     pub key: String,
-    pub value: String,
+    pub value: AttrValue,
 }
 
 /// One data point on a metric.
@@ -69,10 +98,22 @@ pub struct DataPointRow {
     pub attrs: Vec<AttrRow>,
 }
 
+/// A metric's kind and, for `Sum`, the fields the METRICS table carries
+/// alongside it (otap-spec.md's `aggregation_temporality` and
+/// `is_monotonic` columns; `temporality` uses the same ordinals as OTLP's
+/// `AggregationTemporality` enum: 0=Unspecified, 1=Delta, 2=Cumulative).
+pub enum MetricKind {
+    Gauge,
+    Sum {
+        temporality: i32,
+        is_monotonic: bool,
+    },
+}
+
 /// One metric and its data points, as fed to [`MetricsStreamEncoder`].
 pub struct MetricRow {
     pub name: String,
-    pub metric_type: u8,
+    pub kind: MetricKind,
     pub data_points: Vec<DataPointRow>,
 }
 
@@ -117,6 +158,8 @@ fn root_schema() -> Schema {
             DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
             false,
         ),
+        Field::new("aggregation_temporality", DataType::Int32, true),
+        Field::new("is_monotonic", DataType::Boolean, true),
     ])
 }
 
@@ -138,7 +181,10 @@ fn attrs_schema() -> Schema {
         plain_encoding_field("parent_id", DataType::UInt32, false),
         Field::new("key", DataType::Utf8, false),
         Field::new("type", DataType::UInt8, false),
-        Field::new("str", DataType::Utf8, false),
+        Field::new("str", DataType::Utf8, true),
+        Field::new("bool", DataType::Boolean, true),
+        Field::new("int", DataType::Int64, true),
+        Field::new("double", DataType::Float64, true),
     ])
 }
 
@@ -245,6 +291,8 @@ impl MetricsStreamEncoder {
         let mut root_ids = Vec::new();
         let mut root_types = Vec::new();
         let mut root_names = Vec::new();
+        let mut root_temporalities: Vec<Option<i32>> = Vec::new();
+        let mut root_monotonic: Vec<Option<bool>> = Vec::new();
 
         let mut dp_ids = Vec::new();
         let mut dp_parent_ids = Vec::new();
@@ -254,14 +302,31 @@ impl MetricsStreamEncoder {
         let mut attr_parent_ids = Vec::new();
         let mut attr_keys = Vec::new();
         let mut attr_types = Vec::new();
-        let mut attr_values = Vec::new();
+        let mut attr_strs: Vec<Option<String>> = Vec::new();
+        let mut attr_bools: Vec<Option<bool>> = Vec::new();
+        let mut attr_ints: Vec<Option<i64>> = Vec::new();
+        let mut attr_doubles: Vec<Option<f64>> = Vec::new();
 
         for metric in metrics {
             let metric_id = self.next_metric_id;
             self.next_metric_id = self.next_metric_id.wrapping_add(1);
             root_ids.push(metric_id);
-            root_types.push(metric.metric_type);
             root_names.push(metric.name.clone());
+            match metric.kind {
+                MetricKind::Gauge => {
+                    root_types.push(METRIC_TYPE_GAUGE);
+                    root_temporalities.push(None);
+                    root_monotonic.push(None);
+                }
+                MetricKind::Sum {
+                    temporality,
+                    is_monotonic,
+                } => {
+                    root_types.push(METRIC_TYPE_SUM);
+                    root_temporalities.push(Some(temporality));
+                    root_monotonic.push(Some(is_monotonic));
+                }
+            }
 
             for dp in &metric.data_points {
                 let dp_id = self.next_dp_id;
@@ -274,8 +339,20 @@ impl MetricsStreamEncoder {
                 for attr in &dp.attrs {
                     attr_parent_ids.push(dp_id);
                     attr_keys.push(attr.key.clone());
-                    attr_types.push(1u8); // AnyValue discriminant: string
-                    attr_values.push(attr.value.clone());
+                    let (ty, str_v, bool_v, int_v, double_v) = match &attr.value {
+                        AttrValue::Str(s) => {
+                            (ANY_VALUE_TYPE_STRING, Some(s.clone()), None, None, None)
+                        }
+                        AttrValue::Bool(b) => (ANY_VALUE_TYPE_BOOL, None, Some(*b), None, None),
+                        AttrValue::Int(i) => (ANY_VALUE_TYPE_INT, None, None, Some(*i), None),
+                        AttrValue::Double(d) => (ANY_VALUE_TYPE_DOUBLE, None, None, None, Some(*d)),
+                        AttrValue::Complex => (ANY_VALUE_TYPE_ARRAY, None, None, None, None),
+                    };
+                    attr_types.push(ty);
+                    attr_strs.push(str_v);
+                    attr_bools.push(bool_v);
+                    attr_ints.push(int_v);
+                    attr_doubles.push(double_v);
                 }
             }
         }
@@ -290,6 +367,8 @@ impl MetricsStreamEncoder {
                 Arc::new(UInt16Array::from(root_ids)),
                 Arc::new(UInt8Array::from(root_types)),
                 Arc::new(name_builder.finish()),
+                Arc::new(Int32Array::from(root_temporalities)),
+                Arc::new(BooleanArray::from(root_monotonic)),
             ],
         )?;
 
@@ -309,7 +388,10 @@ impl MetricsStreamEncoder {
                 Arc::new(UInt32Array::from(attr_parent_ids)),
                 Arc::new(StringArray::from(attr_keys)),
                 Arc::new(UInt8Array::from(attr_types)),
-                Arc::new(StringArray::from(attr_values)),
+                Arc::new(StringArray::from(attr_strs)),
+                Arc::new(BooleanArray::from(attr_bools)),
+                Arc::new(Int64Array::from(attr_ints)),
+                Arc::new(Float64Array::from(attr_doubles)),
             ],
         )?;
 

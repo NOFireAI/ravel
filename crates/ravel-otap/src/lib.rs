@@ -5,6 +5,7 @@
 //! decoder is written against docs/otap-spec.md and data_model.md there.
 
 pub mod encode;
+pub mod normalize;
 pub mod stream;
 
 pub mod proto {

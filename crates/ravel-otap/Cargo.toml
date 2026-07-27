@@ -28,6 +28,7 @@ protox = { workspace = true }
 ravel-test-util = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
+opentelemetry-proto = { workspace = true }
 
 [lints]
 workspace = true
