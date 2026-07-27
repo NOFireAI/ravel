@@ -21,6 +21,29 @@ use ravel_bench::segment_support::{
 use ravel_segment::{ReaderLimits, SegmentWriter, SeriesInput, decode_pages, plan_ranges, select};
 use ravel_types::{Label, LabelSet, SeriesId, TenantId};
 
+/// FNV-1a, mirroring the writer's private interner hasher.
+#[derive(Default)]
+struct Fnv(u64);
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+}
+
 fn time<R>(label: &str, mut f: impl FnMut() -> R) -> R {
     let start = Instant::now();
     let out = f();
@@ -251,11 +274,86 @@ fn profile_encode() {
         acc
     });
 
+    // Current-pipeline stages (post issue-16 rework): FNV interner pass,
+    // prefix-key sort of distinct strings, ordinal remap.
+    let (distinct, occ) = time("interner pass: FNV map + occurrence ids", || {
+        let mut interner: HashMap<&str, u32, std::hash::BuildHasherDefault<Fnv>> =
+            HashMap::with_capacity_and_hasher(
+                series.len() * 10,
+                std::hash::BuildHasherDefault::default(),
+            );
+        let mut distinct: Vec<&str> = Vec::new();
+        let mut occ: Vec<u32> = Vec::with_capacity(series.len() * 10);
+        for s in &series {
+            for label in s.labels.iter() {
+                for text in [label.name.as_str(), label.value.as_str()] {
+                    let id = match interner.entry(text) {
+                        std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let id = distinct.len() as u32;
+                            distinct.push(text);
+                            e.insert(id);
+                            id
+                        }
+                    };
+                    occ.push(id);
+                }
+            }
+        }
+        (distinct, occ)
+    });
+    let order = time("prefix-key sort of distinct strings", || {
+        let mut order: Vec<(u64, u32)> = distinct
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let b = s.as_bytes();
+                let mut k = [0u8; 8];
+                let n = b.len().min(8);
+                k[..n].copy_from_slice(&b[..n]);
+                (u64::from_be_bytes(k), i as u32)
+            })
+            .collect();
+        order.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| distinct[a.1 as usize].cmp(distinct[b.1 as usize]))
+        });
+        order
+    });
+    time("rank assign + occurrence remap", || {
+        let mut rank = vec![0u32; distinct.len()];
+        for (i, &(_, id)) in order.iter().enumerate() {
+            rank[id as usize] = i as u32 + 1;
+        }
+        occ.iter()
+            .map(|&id| u64::from(rank[id as usize]))
+            .sum::<u64>()
+    });
+
     // Real section payloads for zstd/blake3 attribution.
     let written = SegmentWriter::write(clone_inputs(&inputs), bench_identity(), bench_bounds())
         .expect("write");
     let bytes = written.bytes.clone();
     println!("    (object size: {} bytes)", bytes.len());
+    let footer = ravel_segment::open_from_full(&bytes, ReaderLimits::default())
+        .expect("open")
+        .footer;
+    for (kind, name) in [(LABEL_DICT, "LABEL_DICT"), (SERIES_TABLE, "SERIES_TABLE")] {
+        let section = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == kind)
+            .expect("section");
+        let stored = section_bytes(&bytes, &footer, kind);
+        let raw = zstd::bulk::decompress(stored, section.uncompressed_len as usize).expect("zstd");
+        println!("    ({name} raw {} bytes)", raw.len());
+        time(&format!("zstd -3 compress {name}"), || {
+            zstd::bulk::compress(&raw, 3).expect("zstd").len()
+        });
+    }
+    time("crc32c of full page sections (~7 MB)", || {
+        crc32c::crc32c(&bytes)
+    });
     time("blake3 of whole object", || {
         *blake3::hash(&bytes).as_bytes()
     });

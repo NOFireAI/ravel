@@ -2517,7 +2517,9 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "crc32c",
  "criterion",
+ "lz4_flex",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
@@ -2532,6 +2534,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
