@@ -125,6 +125,15 @@ stay discoverable via the `now`-anchored upper bound.
 
 ## Cross-segment duplicate samples
 
-Queries dedup by (series_id, ts) under the total order
+Queries dedup by (series_id, ts) under the provenance order
 (commit created_unix_ns, writer_epoch, writer_seq, in-page index); the
 greatest wins. Values compare by f64 bit pattern (ADR-0010 §5).
+
+That provenance order is not total across segments: two same-shard segments
+from different writers can tie on (created_unix_ns, writer_epoch, writer_seq)
+because seq is monotonic only per (writer_id, epoch, shard) (ADR-0010 §3). To
+make the resolved snapshot's segment order a deterministic total order, the
+catalog sort appends shard then writer_id as final tiebreaks after the
+provenance components. writer_id is a per-segment identity component, so no
+two distinct segments can tie on the full key; the order never depends on
+arrival, insertion, or map iteration order.
