@@ -97,8 +97,8 @@ tempfile = "3"
 
 [profile.dev]
 # Shrink debug info in dev and test binaries to keep the workspace's total
-# on-disk build size within CI runner limits (Fixes: #101). profile.test
-# inherits from profile.dev, so this covers every test binary too.
+# on-disk build size within CI runner limits. profile.test inherits from
+# profile.dev, so this covers every test binary too.
 debug = "line-tables-only"
 
 [profile.release]
