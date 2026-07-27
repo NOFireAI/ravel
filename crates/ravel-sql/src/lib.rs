@@ -20,18 +20,24 @@
 //! re-export so this crate is internally version-consistent regardless of
 //! the workspace `arrow` pin.
 
+mod config;
 mod dedup;
 mod error;
 mod labels;
+mod memory;
 mod provider;
+mod pushdown;
 mod scan;
 mod schema;
 mod udf;
 
+pub use config::{DEFAULT_MAX_QUERY_BYTES, SqlConfig};
 pub use error::SqlError;
+pub use memory::{TenantDelegatingPool, TenantMemoryAccountant};
 pub use provider::RavelTableProvider;
+pub use pushdown::Pushdown;
 pub use schema::{internal_schema, public_schema};
-pub use udf::label_udf;
+pub use udf::{label_match_udf, label_udf};
 
 /// The internal provenance column names, in scan-output order after the
 /// four public columns. Consumed by [`dedup::RsegDedupExec`] and dropped
