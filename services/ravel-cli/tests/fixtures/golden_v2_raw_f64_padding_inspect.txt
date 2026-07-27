@@ -1,0 +1,28 @@
+total_size: 417
+trailer_offset: 401
+version: 2
+footer_offset: 248
+tenant_hash: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+shard: 11
+writer_id: golden-v2-writer
+writer_epoch: 5
+writer_seq: 200
+min_event_ts_ns: 0
+max_event_ts_ns: 60
+min_ingest_ts_ns: -2000
+max_ingest_ts_ns: 9000
+sample_count: 9
+series_count (footer): 3
+sections:
+  kind=1 name=LABEL_DICT offset=0 len=54 uncompressed_len=45 comp=2
+  kind=5 name=SERIES_IDS offset=54 len=52 uncompressed_len=52 comp=0
+  kind=6 name=SERIES_META offset=106 len=55 uncompressed_len=46 comp=2
+  kind=3 name=TS_PAGES offset=161 len=27 uncompressed_len=27 comp=0
+  kind=4 name=VAL_PAGES offset=192 len=56 uncompressed_len=56 comp=0
+schema_count (derived): 1
+  schema[0]: __name__
+series_count (decoded): 3
+series:
+  series_id=01010101010101010101010101010101 labels=__name__=smooth_metric sample_count=7 min_ts_ns=0 max_ts_ns=60 ts_range=[161, 174) val_range=[192, 214)
+  series_id=02020202020202020202020202020202 labels=__name__=single_a sample_count=1 min_ts_ns=5 max_ts_ns=5 ts_range=[174, 181) val_range=[218, 232) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=4)
+  series_id=03030303030303030303030303030303 labels=__name__=single_b sample_count=1 min_ts_ns=9 max_ts_ns=9 ts_range=[181, 188) val_range=[234, 248) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=2)

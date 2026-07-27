@@ -1,0 +1,21 @@
+total_size: 768
+trailer_offset: 752
+version: 1
+footer_offset: 606
+tenant_hash: abababababababababababababababab
+shard: 7
+writer_id: golden-writer
+writer_epoch: 3
+writer_seq: 99
+min_event_ts_ns: -200
+max_event_ts_ns: 1900
+min_ingest_ts_ns: -1000
+max_ingest_ts_ns: 5000
+sample_count: 67
+series_count (footer): 4
+sections:
+  kind=1 offset=0 len=103 uncompressed_len=102 comp=2
+  kind=2 offset=103 len=115 uncompressed_len=193 comp=2
+  kind=3 offset=218 len=115 uncompressed_len=115 comp=0
+  kind=4 offset=333 len=273 uncompressed_len=273 comp=0
+series_count (decoded): 4
