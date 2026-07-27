@@ -1,6 +1,14 @@
-//! Crash-matrix rows 1 and 2 (docs/consistency-model.md "Crash matrix"),
-//! plus the orphan GC sweep it prescribes (docs/catalog-and-mvcc.md "MVCC
-//! rules"; ADR-0010 SS11).
+//! Crash-matrix rows 1 and 2 (docs/consistency-model.md "Crash matrix").
+//!
+//! Row 2's orphan-CREATION half (a killed commit PUT leaves a live data
+//! object) exercises real production ingest. Its orphan-GC half does NOT:
+//! no production orphan-sweep symbol exists yet (Phase 2 roadmap), so those
+//! assertions drive `common::spec_model_sweep_orphans`, an executable
+//! restatement of the GC rule from docs/consistency-model.md "Deletion and
+//! GC" and ADR-0010 SS11. A green GC-half run is evidence about the spec
+//! model, NOT about a shipped GC path. See finding a11-F04
+//! (docs/reviews/2026-07-27-storage-engine-quality-audit/a11-tests-ci-deps.md)
+//! and issue #81.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -8,7 +16,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{GcWindow, TestClock, make_point, sweep_orphans, tenant};
+use common::{GcWindow, TestClock, make_point, spec_model_sweep_orphans, tenant};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
@@ -103,11 +111,15 @@ async fn crash_before_data_put_leaves_nothing_stored_or_visible() {
 }
 
 /// Crash-matrix row 2: data PUT lands, commit PUT is permanently killed, so
-/// the data object is an orphan. GC must not touch it before
-/// `grace + max_flush_lifetime`, must re-verify commit absence, and only
-/// then delete it.
+/// the data object is an orphan. The orphan-creation half is real production
+/// coverage. The GC half asserts the intended sweep behavior (no delete
+/// before `grace + max_flush_lifetime`, re-verify commit absence, then
+/// delete) against `spec_model_sweep_orphans`, a SPECIFICATION MODEL — no
+/// production GC exists yet (Phase 2). The test name carries `spec_model_gc`
+/// so a green run is never read as production-GC coverage. See a11-F04 /
+/// issue #81; when the real GC lands, retarget these assertions at it.
 #[tokio::test]
-async fn crash_after_data_put_before_commit_orphans_then_gcs_after_grace() {
+async fn crash_after_data_put_before_commit_orphans_then_spec_model_gc_sweeps_after_grace() {
     let plan = FaultPlan::empty().with_rule(
         Rule::new(
             Op::Put,
@@ -182,13 +194,17 @@ async fn crash_after_data_put_before_commit_orphans_then_gcs_after_grace() {
 
     router.shutdown().await;
 
+    // Everything below drives `spec_model_sweep_orphans`, NOT production
+    // code: it checks the GC rule against an executable restatement of that
+    // same rule, so it validates the model and cannot catch a real GC that
+    // is built with different timing or a missing re-verify (a11-F04, #81).
     let window = GcWindow::default();
     let tenant_hash = tid.hash();
 
     // Not yet within the grace window: nothing to delete.
     let boundary_ms = window.grace_ms + window.max_flush_lifetime_ms;
     fault_store.inner().set_clock_ms(boundary_ms as u64);
-    let deleted = sweep_orphans(
+    let deleted = spec_model_sweep_orphans(
         fault_store.inner(),
         tenant_hash,
         Signal::Metrics,
@@ -208,7 +224,7 @@ async fn crash_after_data_put_before_commit_orphans_then_gcs_after_grace() {
     // absence is re-verified immediately before delete.
     let now_ms = boundary_ms + 1;
     fault_store.inner().set_clock_ms(now_ms as u64);
-    let deleted = sweep_orphans(
+    let deleted = spec_model_sweep_orphans(
         fault_store.inner(),
         tenant_hash,
         Signal::Metrics,
