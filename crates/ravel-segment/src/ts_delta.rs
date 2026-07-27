@@ -160,3 +160,105 @@ mod tests {
         );
     }
 }
+
+/// Corrupt-input mutation harness (issue #82, audit finding a11-F05). The
+/// TS_DELTA_VARINT decoder reads untrusted stored bytes; the contract is a
+/// typed error or a valid decode, never a panic and never wrong data
+/// (docs/segment-format.md, CLAUDE.md testing patterns). The hand-vectors
+/// above pin chosen cases; these proptests explore the arbitrary/mutated
+/// byte space on the pinned stable toolchain (proptest, no cargo-fuzz).
+///
+/// `count` is bounded to a realistic range here on purpose: it is a
+/// separate decode input (the reader derives it from `sample_count`, itself
+/// cross-checked against page bytes elsewhere), so these targets fuzz the
+/// *byte grammar* rather than the pre-allocation behaviour of an absurd
+/// count. Case count honours `PROPTEST_CASES`.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod fuzz_mutation {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn mutate(bytes: &[u8], bit: usize, truncate_to: usize) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        if !out.is_empty() {
+            let byte = (bit / 8) % out.len();
+            out[byte] ^= 1u8 << (bit % 8);
+        }
+        let cut = if out.is_empty() {
+            0
+        } else {
+            truncate_to % (out.len() + 1)
+        };
+        out.truncate(cut);
+        out
+    }
+
+    fn decode(bytes: &[u8], count: usize, min: i64, max: i64) -> Result<Vec<i64>, SegmentError> {
+        let mut out = Vec::new();
+        decode_ts_deltas_into(bytes, count, min, max, &mut out)?;
+        Ok(out)
+    }
+
+    proptest! {
+        /// Arbitrary bytes with an arbitrary (bounded) count and arbitrary
+        /// bounds must yield a typed error or a valid decode, never a panic.
+        #[test]
+        fn decode_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..256),
+            count in 0usize..1024,
+            min in any::<i64>(),
+            max in any::<i64>(),
+        ) {
+            let (min, max) = if min <= max { (min, max) } else { (max, min) };
+            let _ = decode(&bytes, count, min, max);
+        }
+
+        /// Ascending timestamps within wide bounds round-trip exactly
+        /// (no-wrong-data on the valid input space).
+        #[test]
+        fn roundtrips_ascending_timestamps(
+            deltas in proptest::collection::vec(0i64..1_000_000, 0..64),
+            base in -1_000_000_000i64..1_000_000_000,
+        ) {
+            // Build a strictly-derived ascending-ish series from a base and
+            // non-negative deltas (stays well inside i64).
+            let mut ts = Vec::with_capacity(deltas.len());
+            let mut acc = base;
+            for (i, d) in deltas.iter().enumerate() {
+                acc = if i == 0 { base } else { acc + d };
+                ts.push(acc);
+            }
+            let encoded = encode_ts_deltas(&ts).expect("no overflow for bounded deltas");
+            let (min, max) = ts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &t| {
+                (lo.min(t), hi.max(t))
+            });
+            let (min, max) = if ts.is_empty() { (0, 0) } else { (min, max) };
+            let decoded = decode(&encoded, ts.len(), min, max).expect("valid stream decodes");
+            prop_assert_eq!(decoded, ts);
+        }
+
+        /// A valid encoding with a single bit flipped or truncated must
+        /// still only yield a typed error or a valid decode, never a panic.
+        /// Deltas are bounded so the seed always encodes without overflow;
+        /// the point is to fuzz the *decoder* over a mutated valid stream.
+        #[test]
+        fn seed_mutation_never_panics(
+            deltas in proptest::collection::vec(-1_000_000i64..1_000_000, 0..48),
+            base in -1_000_000_000i64..1_000_000_000,
+            bit in any::<usize>(),
+            truncate_to in any::<usize>(),
+            count in 0usize..1024,
+        ) {
+            let mut ts = Vec::with_capacity(deltas.len());
+            let mut acc = base;
+            for (i, d) in deltas.iter().enumerate() {
+                acc = if i == 0 { base } else { acc + d };
+                ts.push(acc);
+            }
+            let encoded = encode_ts_deltas(&ts).expect("bounded deltas never overflow");
+            let corrupt = mutate(&encoded, bit, truncate_to);
+            let _ = decode(&corrupt, count, i64::MIN, i64::MAX);
+        }
+    }
+}

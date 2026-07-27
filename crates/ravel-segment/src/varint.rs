@@ -177,3 +177,108 @@ mod tests {
         }
     }
 }
+
+/// Corrupt-input mutation harness (issue #82, audit finding a11-F05): the
+/// fixed hand-vectors above pin a handful of chosen corruptions; these
+/// proptest targets explore the arbitrary/mutated byte space. The LEB128
+/// reader decodes untrusted stored bytes, so the contract is "typed error
+/// or a valid decode, never a panic and never wrong data"
+/// (docs/segment-format.md, CLAUDE.md testing patterns).
+///
+/// Runs on the pinned stable toolchain via proptest (no nightly/cargo-fuzz).
+/// Case count honours the `PROPTEST_CASES` env var; the CI fuzz job raises
+/// it for deeper exploration.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod fuzz_mutation {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Single-bit and truncation mutations of a byte buffer, the seed-corpus
+    /// mutation operators the finding calls for.
+    fn mutate(bytes: &[u8], bit: usize, truncate_to: usize) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        if !out.is_empty() {
+            let byte = (bit / 8) % out.len();
+            out[byte] ^= 1u8 << (bit % 8);
+        }
+        let cut = if out.is_empty() {
+            0
+        } else {
+            truncate_to % (out.len() + 1)
+        };
+        out.truncate(cut);
+        out
+    }
+
+    proptest! {
+        /// Reading a uvarint from arbitrary bytes at an arbitrary position
+        /// must never panic; on success the position advances by 1..=10
+        /// in-bounds bytes.
+        #[test]
+        fn read_uvarint_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+            start in 0usize..80,
+        ) {
+            let start = if bytes.is_empty() { 0 } else { start % (bytes.len() + 1) };
+            let mut pos = start;
+            match read_uvarint(&bytes, &mut pos) {
+                Ok(_) => {
+                    prop_assert!(pos > start && pos <= start + MAX_VARINT_BYTES);
+                    prop_assert!(pos <= bytes.len());
+                }
+                Err(SegmentError::Truncated) | Err(SegmentError::BadVarint) => {}
+                Err(other) => prop_assert!(false, "unexpected error variant: {other:?}"),
+            }
+        }
+
+        /// Any u64 round-trips exactly and consumes exactly its encoding
+        /// (no-wrong-data on the valid input space).
+        #[test]
+        fn uvarint_roundtrips_any_u64(value in any::<u64>()) {
+            let mut buf = Vec::new();
+            write_uvarint(&mut buf, value);
+            let mut pos = 0;
+            let decoded = read_uvarint(&buf, &mut pos).expect("valid encoding decodes");
+            prop_assert_eq!(decoded, value);
+            prop_assert_eq!(pos, buf.len());
+        }
+
+        /// A valid encoding with a single bit flipped or truncated must
+        /// still only ever yield a typed error or a (possibly different)
+        /// valid value, never a panic.
+        #[test]
+        fn uvarint_seed_mutation_never_panics(
+            value in any::<u64>(),
+            bit in any::<usize>(),
+            truncate_to in any::<usize>(),
+        ) {
+            let mut buf = Vec::new();
+            write_uvarint(&mut buf, value);
+            let corrupt = mutate(&buf, bit, truncate_to);
+            let mut pos = 0;
+            let _ = read_uvarint(&corrupt, &mut pos);
+        }
+
+        /// Any i64 round-trips exactly through zigzag-varint.
+        #[test]
+        fn zigzag_varint_roundtrips_any_i64(value in any::<i64>()) {
+            let mut buf = Vec::new();
+            write_zigzag_varint(&mut buf, value);
+            let mut pos = 0;
+            let decoded = read_zigzag_varint(&buf, &mut pos).expect("valid encoding decodes");
+            prop_assert_eq!(decoded, value);
+            prop_assert_eq!(pos, buf.len());
+        }
+
+        /// Zigzag decode over arbitrary bytes never panics: it is a total
+        /// function of whatever `read_uvarint` returns.
+        #[test]
+        fn read_zigzag_varint_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let mut pos = 0;
+            let _ = read_zigzag_varint(&bytes, &mut pos);
+        }
+    }
+}
