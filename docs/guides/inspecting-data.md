@@ -77,10 +77,10 @@ max_ingest_ts_ns: 1732400060050000000
 sample_count: 120
 series_count (footer): 3
 sections:
-  kind=1 offset=0 len=64 uncompressed_len=64 comp=None
-  kind=2 offset=64 len=512 uncompressed_len=512 comp=None
-  kind=3 offset=576 len=1200 uncompressed_len=1200 comp=None
-  kind=4 offset=1776 len=6336 uncompressed_len=6336 comp=None
+  kind=1 offset=0 len=64 uncompressed_len=64 comp=2
+  kind=2 offset=64 len=512 uncompressed_len=512 comp=2
+  kind=3 offset=576 len=1200 uncompressed_len=1200 comp=0
+  kind=4 offset=1776 len=6336 uncompressed_len=6336 comp=0
 series_count (decoded): 3
 ```
 
@@ -111,8 +111,13 @@ Field by field:
   per series: its label set, sample count, timestamp span, and where its
   data pages live), `kind=3` is `TS_PAGES` (delta-encoded timestamps),
   `kind=4` is `VAL_PAGES` (Gorilla-encoded or raw f64 values, whichever is
-  smaller for that series). `comp` is the section's compression, if any
-  (`None`, `Lz4`, or `Zstd`).
+  smaller for that series). `comp` is the section's compression as the raw
+  wire integer (`ravel.segment.v1.Compression`: `0` none, `1` lz4, `2`
+  zstd) -- `ravel-cli` prints the field as stored, not the resolved enum
+  name. LABEL_DICT and SERIES_TABLE (v1) or SERIES_META (v2) are zstd by
+  writer policy (`comp=2`); TS_PAGES/VAL_PAGES containers are never
+  compressed as a whole section (`comp=0`), since the pages inside are
+  individually compressed instead.
 - `series_count (decoded)`: series count from actually decoding
   `LABEL_DICT` + `SERIES_TABLE`, not just trusting the footer's claimed
   count. Matching `series_count (footer)` means the segment is internally
