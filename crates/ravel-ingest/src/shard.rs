@@ -72,7 +72,44 @@ impl TenantBuf {
     /// Merges `points` into this buffer, returning the estimated byte cost
     /// added (samples * 16 plus label bytes the first time a series is
     /// seen), per docs/ingest.md's `est_bytes` rule.
-    fn merge(&mut self, points: Vec<NormalizedPoint>, arrival_ns: i64) -> usize {
+    ///
+    /// Fails loud on a series-id collision (ADR-0005): before mutating the
+    /// buffer, every incoming point's `series_id` is checked against the
+    /// canonical label set that id already claims, whether from a series
+    /// already buffered for this tenant or from an earlier point in this same
+    /// batch. Two distinct label sets under one id return
+    /// [`WriteError::SeriesIdCollision`] and the buffer is left untouched, so
+    /// the accepted stream for non-colliding series is unaffected. Without
+    /// this check a collision would silently merge the losing series' samples
+    /// under the winning label set (the id-keyed `HashMap` below cannot tell
+    /// them apart), which ADR-0005 forbids.
+    fn merge(
+        &mut self,
+        points: Vec<NormalizedPoint>,
+        arrival_ns: i64,
+    ) -> Result<usize, WriteError> {
+        let mut batch_labels: HashMap<SeriesId, &LabelSet> = HashMap::new();
+        for point in &points {
+            let claimed = self
+                .series
+                .get(&point.series_id)
+                .map(|accum| &accum.labels)
+                .or_else(|| batch_labels.get(&point.series_id).copied());
+            match claimed {
+                Some(labels) if *labels != point.labels => {
+                    return Err(WriteError::SeriesIdCollision(format!(
+                        "series_id {:?} maps to two distinct label sets in one shard buffer",
+                        point.series_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    batch_labels.insert(point.series_id, &point.labels);
+                }
+            }
+        }
+        drop(batch_labels);
+
         self.note_arrival(arrival_ns);
         let mut bytes_added = 0usize;
         for point in points {
@@ -96,7 +133,7 @@ impl TenantBuf {
             bytes_added += 16;
         }
         self.est_bytes += bytes_added;
-        bytes_added
+        Ok(bytes_added)
     }
 }
 
@@ -185,10 +222,23 @@ impl ShardActor {
         let target_bytes = self.config.target_bytes;
 
         let buf = self.tenants.entry(tenant.clone()).or_default();
+        // Merge before enqueuing the waiter: a series-id collision rejects
+        // the whole batch fail-loud (ADR-0005) and leaves the buffer
+        // untouched, so its ack must carry the error rather than ride the
+        // next flush of the surviving series.
+        let bytes_added = match buf.merge(points, arrival_ns) {
+            Ok(bytes_added) => bytes_added,
+            Err(err) => {
+                self.metrics.record_series_id_collision();
+                if let Some(ack) = ack {
+                    self.ack_waiters(vec![ack], Err(err));
+                }
+                return;
+            }
+        };
         if let Some(ack) = ack {
             buf.waiters.push(ack);
         }
-        let bytes_added = buf.merge(points, arrival_ns);
         self.metrics.record_buffered(bytes_added as u64, points_len);
 
         let should_flush = self

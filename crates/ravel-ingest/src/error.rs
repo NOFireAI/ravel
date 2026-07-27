@@ -24,6 +24,13 @@ pub enum WriteError {
     /// oversized batch); retrying identical input will fail again.
     #[error("segment build failed: {0}")]
     SegmentBuild(String),
+    /// Two points in one shard buffer carried the same `series_id` but
+    /// distinct canonical label sets: a series-id collision (ADR-0005). The
+    /// batch is rejected fail-loud rather than silently merging the losing
+    /// label set into the winning one. Not retryable: identical input
+    /// reproduces the same collision.
+    #[error("series id collision: {0}")]
+    SeriesIdCollision(String),
 }
 
 impl WriteError {
@@ -45,6 +52,11 @@ mod tests {
     #[test]
     fn segment_build_is_not_retryable() {
         assert!(!WriteError::SegmentBuild("bad input".into()).is_retryable());
+    }
+
+    #[test]
+    fn series_id_collision_is_not_retryable() {
+        assert!(!WriteError::SeriesIdCollision("collision".into()).is_retryable());
     }
 
     #[test]
