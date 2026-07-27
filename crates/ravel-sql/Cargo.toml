@@ -14,6 +14,7 @@ ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-query = { workspace = true }
+ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
@@ -29,3 +30,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 uuid = { workspace = true }
+bytes = { workspace = true }
