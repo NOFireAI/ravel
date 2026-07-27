@@ -55,6 +55,34 @@ rejected point counts and reasons.
   new snapshots; both sets remain physically present until GC clears the
   inputs after the protection horizon.
 
+## Compaction protocol (ADR-0018)
+
+- Publish-then-supersede: a compaction run writes its L1 parts, then
+  publishes one `CompactionRecord` with `PutMode::CreateIfAbsent`. The
+  record names its exact input set (sorted `(writer_id, writer_epoch,
+  writer_seq)` list, hashed as `input_set_hash`); nothing about the inputs
+  is mutated or removed at publish time. The only ordering the protocol
+  depends on is that the record becomes visible before any input is
+  physically removed, and that removal is a separate, later, horizon-gated
+  step (see "Deletion and GC" below).
+- Overlap harmlessness is what makes every intermediate state
+  query-correct without locking: as long as a compaction record's parts
+  contain every sample of every input it names, a resolved snapshot that
+  includes both the record's parts and (some or all of) its listed inputs
+  produces the same query result as one that includes only the parts,
+  because query-time dedup (see "Cross-segment duplicate samples" above)
+  collapses the duplicate candidates. Concretely this means: no dedup runs
+  at compaction time, and a reader may transiently see an L0 input and its
+  L1 replacement together and still get exact answers.
+- Racing compactors over the same sealed bucket are resolved by
+  `CreateIfAbsent` picking one record as the winner; a losing compactor's
+  parts are simply unreferenced objects that age out under the
+  unreferenced-part rule. Two records that legitimately name different
+  input sets (rare: concurrent partial seals) are not reconciled
+  automatically; the resolver includes both parts sets plus any L0 input
+  uncovered by either (harmless per the property above) and raises an
+  alarm metric for a human to investigate.
+
 ## Duplicates and idempotency
 
 - Delivery model is at-least-once. A client retry after a lost ack re-ingests
@@ -90,17 +118,51 @@ rejected point counts and reasons.
 
 ## Deletion and GC
 
-- Deletion is a durable tombstone transaction, then logical exclusion from
-  new snapshots, then physical removal via GC.
-- GC deletes an object only when all hold: unreachable from any snapshot
-  within the protection horizon (>= max_query_duration + grace), not
-  lease-protected, grace period expired.
+Deletion is always a durable transaction first (tombstone or compaction
+record), then logical exclusion from new snapshots, then physical removal
+via a sweeper. One sweeper component implements all rules below; all are
+stateless per pass, restartable from zero, anchored on durable timestamps
+(never wall-clock at sweep time), and every delete is idempotent. Reader
+leases are not implemented: the "not lease-protected" precondition is
+vacuously satisfied everywhere below, via a `LeaseCheck` hook that is a
+constant "unprotected" (a seam for future slow-consumer work, not a
+correctness dependency today). `protection_horizon >= max_query_duration +
+grace` and `grace` (default 24 h) are shared across all four rules.
+
+| rule | targets | preconditions (ALL must hold) | anchor |
+|---|---|---|---|
+| orphan (first implementation, ADR-0010 §11) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified immediately before delete | object last_modified |
+| superseded input (ADR-0018) | L0 commit records + data objects named in a compaction record's input list | now >= record.created_unix_ns + protection_horizon | compaction record created_unix_ns |
+| unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record exists for the bucket; age > grace + max_compaction_lifetime; non-reference re-verified immediately before delete | part last_modified |
+| retention (ADR-0019) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
+
 - Orphan GC (data objects with no commit record) considers only objects
-  with last_modified age > grace (default 24 h) + max_flush_lifetime
-  (default 1 h), and re-verifies commit-record absence immediately before
-  each delete, relying on strongly consistent listing. Writers abandon any
-  flush older than max_flush_lifetime and never publish it afterward; the
-  interlock is what makes orphan deletion safe (ADR-0010 §11).
+  with last_modified age > grace + max_flush_lifetime, and re-verifies
+  commit-record absence immediately before each delete, relying on
+  strongly consistent listing. Writers abandon any flush older than
+  max_flush_lifetime and never publish it afterward; the interlock is what
+  makes orphan deletion safe (ADR-0010 §11).
+- Superseded-input and unreferenced-part deletion never depend on reader
+  leases or on removing an input before its compaction record is durable;
+  the horizon alone bounds how long a pinned query can still need an
+  input, and orphan-GC-style convergence handles crash remnants (a
+  compactor that died mid-publish leaves record-less parts, which the
+  unreferenced-part rule collects once old enough).
+- Retention sweep deletes in a fixed order: L0 commit records, compaction
+  records, L0 data objects, L1 parts, then the tombstone last, after a
+  verifying LIST of both `c/<shard>/<hour>/` (must contain only the
+  tombstone by then) and `l1/<shard>/<hour>/` (must be empty). Any
+  residue found by that LIST: leave the tombstone in place and retry on
+  the next pass. Expiry evaluation reuses the bucket's already-decoded
+  commit and compaction records (no footer reads needed), taking
+  max(max_event_ts) across both.
+- Observing a tombstone invalidates that bucket's cached commit and
+  compaction records (the trigger ADR-0010 §10 promises).
+- Retention is durable and irreversible: raising a tenant's retention
+  window after a bucket is tombstoned never resurrects it. A token whose
+  bucket is tombstoned resolves as satisfied with zero segments, not as
+  `unsatisfiable token`; the data was retired on purpose, not lost to a
+  race.
 - A store NotFound on a segment pinned by a running query surfaces as
   SnapshotInvalidated; the frontend re-resolves and retries once before
   failing the query.

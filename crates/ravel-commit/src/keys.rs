@@ -12,10 +12,26 @@ use uuid::Uuid;
 
 use crate::signal;
 
-/// Data object suffix (RSEG v1).
+/// Data object suffix (RSEG v1). L1 parts share this suffix (ADR-0018 §2):
+/// the page grammar is unchanged, only the trailer version and catalog
+/// differ.
 pub const DATA_SUFFIX: &str = "rseg";
-/// Commit record object suffix.
+/// Commit record object suffix. Compaction records share this suffix
+/// (docs/compaction-retention-plan.md §3.1): they live in the same `c/`
+/// prefix and are told apart from L0 commit records by filename shape.
 pub const COMMIT_SUFFIX: &str = "cmt";
+/// Retention tombstone object suffix.
+pub const TOMBSTONE_SUFFIX: &str = "tmb";
+/// L1 part key directory segment.
+pub const L1_DIR: &str = "l1";
+/// Compaction record filename tag: `l1.<input_set_hash16>.cmt`.
+pub const COMPACTION_RECORD_TAG: &str = "l1";
+/// Retention tombstone filename: `retire.tmb`, fixed per bucket.
+pub const TOMBSTONE_FILENAME: &str = "retire.tmb";
+/// Advisory maintenance-cursor directory segment.
+pub const MAINT_DIR: &str = "maint";
+/// Advisory maintenance-cursor filename, fixed per (tenant, signal, shard).
+pub const CURSOR_FILENAME: &str = "cursor";
 
 /// Errors building or parsing a key. All are caller-input problems (bad
 /// shard, malformed key text); none indicate a system fault.
@@ -35,6 +51,14 @@ pub enum KeyError {
     InvalidContentHashLen(usize),
     #[error("invalid ingest hour bucket text {0:?}")]
     InvalidIngestHour(String),
+    #[error("part index {0} exceeds the 4-digit key width (max 9999)")]
+    PartIndexOutOfRange(u32),
+    #[error("invalid hash16 {0:?}: expected 16 lowercase hex chars")]
+    InvalidHash16(String),
+    #[error(
+        "key {0:?} matches no known bucket-entry shape (commit record, compaction record, tombstone)"
+    )]
+    UnknownBucketEntryShape(String),
 }
 
 /// Fatal: the record's `object_key` field does not match the key
@@ -68,6 +92,34 @@ fn content_hash_from_bytes(bytes: &[u8]) -> Result<[u8; 32], KeyError> {
     bytes
         .try_into()
         .map_err(|_| KeyError::InvalidContentHashLen(bytes.len()))
+}
+
+fn format_part_index(part_index: u32) -> Result<String, KeyError> {
+    if part_index > 9999 {
+        return Err(KeyError::PartIndexOutOfRange(part_index));
+    }
+    Ok(format!("{part_index:04}"))
+}
+
+/// Validate a caller-supplied hash16 argument to a key builder (as opposed
+/// to [`parse_hash16_component`], which validates one already-split
+/// filename component while parsing).
+fn validate_hash16_arg(s: &str) -> Result<(), KeyError> {
+    if s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(KeyError::InvalidHash16(s.to_string()))
+    }
+}
+
+fn parse_hash16_component(key: &str, s: &str) -> Result<String, KeyError> {
+    if s.len() != 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(malformed(
+            key,
+            format!("hash16 component {s:?} is not 16 hex chars"),
+        ));
+    }
+    Ok(s.to_string())
 }
 
 /// Days since the Unix epoch (1970-01-01) for a given proleptic Gregorian
@@ -448,6 +500,442 @@ pub fn verify_object_key(
     }
 }
 
+// --- Compaction and retention key shapes (docs/compaction-retention-plan.md
+// §3.1, ADR-0018, ADR-0019). All four are additive: new prefixes only,
+// existing key shapes above are untouched. ---
+
+/// Build the L1 part key for a compacted sealed bucket (plan §3.1).
+///
+/// `t/<tenant_hash_hex>/<signal>/l1/<shard>/<ingest_hour>/<input_set_hash16>.<part:04>.<hash16>.rseg`
+pub fn l1_part_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    ingest_hour_bucket: u32,
+    input_set_hash16: &str,
+    part_index: u32,
+    hash16: &str,
+) -> Result<String, KeyError> {
+    validate_hash16_arg(input_set_hash16)?;
+    validate_hash16_arg(hash16)?;
+    let shard_s = format_shard(shard)?;
+    let part_s = format_part_index(part_index)?;
+    Ok(format!(
+        "t/{}/{}/{}/{}/{}/{}.{}.{}.{}",
+        tenant_hash.to_hex(),
+        signal.key_prefix(),
+        L1_DIR,
+        shard_s,
+        ingest_hour_string(ingest_hour_bucket),
+        input_set_hash16,
+        part_s,
+        hash16,
+        DATA_SUFFIX
+    ))
+}
+
+/// Build the compaction record key for a sealed bucket (plan §3.1).
+///
+/// `t/<tenant_hash_hex>/<signal>/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt`
+pub fn compaction_record_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    ingest_hour_bucket: u32,
+    input_set_hash16: &str,
+) -> Result<String, KeyError> {
+    validate_hash16_arg(input_set_hash16)?;
+    let prefix = commit_shard_hour_prefix(tenant_hash, signal, shard, ingest_hour_bucket)?;
+    Ok(format!(
+        "{prefix}{COMPACTION_RECORD_TAG}.{input_set_hash16}.{COMMIT_SUFFIX}"
+    ))
+}
+
+/// Build the retention tombstone key for a sealed bucket (ADR-0019 §Decision 2).
+///
+/// `t/<tenant_hash_hex>/<signal>/c/<shard>/<ingest_hour>/retire.tmb`
+pub fn retention_tombstone_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    ingest_hour_bucket: u32,
+) -> Result<String, KeyError> {
+    let prefix = commit_shard_hour_prefix(tenant_hash, signal, shard, ingest_hour_bucket)?;
+    Ok(format!("{prefix}{TOMBSTONE_FILENAME}"))
+}
+
+/// Build the advisory maintenance-scan cursor key (ADR-0018 §Decision 7).
+/// CAS-updated mutable state, exempt from the immutability rule the same
+/// way the ADR-0003 catalog HEAD pointer is: losing or corrupting it costs
+/// a rescan, never correctness.
+///
+/// `t/<tenant_hash_hex>/<signal>/maint/<shard>/cursor`
+pub fn maint_cursor_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<String, KeyError> {
+    let shard_s = format_shard(shard)?;
+    Ok(format!(
+        "t/{}/{}/{}/{}/{}",
+        tenant_hash.to_hex(),
+        signal.key_prefix(),
+        MAINT_DIR,
+        shard_s,
+        CURSOR_FILENAME
+    ))
+}
+
+/// Parsed form of an L1 part key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedL1PartKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+    pub input_set_hash16: String,
+    pub part_index: u32,
+    pub hash16: String,
+}
+
+/// Parse an L1 part key produced by [`l1_part_key`], validating every
+/// component.
+pub fn parse_l1_part_key(key: &str) -> Result<ParsedL1PartKey, KeyError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [root, tenant_hex, signal_s, l1, shard_s, hour_s, filename] = parts.as_slice() else {
+        return Err(malformed(key, "expected 7 path segments"));
+    };
+    if *root != "t" {
+        return Err(malformed(key, "expected key to start with \"t/\""));
+    }
+    if *l1 != L1_DIR {
+        return Err(malformed(key, format!("expected {L1_DIR:?} segment")));
+    }
+    let tenant_hash = TenantHash::from_hex(tenant_hex)
+        .map_err(|_| KeyError::InvalidTenantHash(tenant_hex.to_string()))?;
+    let signal =
+        signal::from_prefix(signal_s).map_err(|_| KeyError::UnknownSignal(signal_s.to_string()))?;
+    let shard = parse_shard_component(key, shard_s)?;
+    let ingest_hour_bucket = parse_ingest_hour_string(hour_s)?;
+
+    let file_parts: Vec<&str> = filename.split('.').collect();
+    let [input_set_hash16, part_s, hash16, suffix] = file_parts.as_slice() else {
+        return Err(malformed(
+            key,
+            "expected \"input_set_hash16.part.hash16.rseg\" filename",
+        ));
+    };
+    if *suffix != DATA_SUFFIX {
+        return Err(malformed(key, format!("expected suffix {DATA_SUFFIX:?}")));
+    }
+    let input_set_hash16 = parse_hash16_component(key, input_set_hash16)?;
+    let hash16 = parse_hash16_component(key, hash16)?;
+    if part_s.len() != 4 || !part_s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(malformed(
+            key,
+            format!("part component {part_s:?} is not 4 digits"),
+        ));
+    }
+    let part_index: u32 = part_s
+        .parse()
+        .map_err(|_| malformed(key, "part component overflow"))?;
+
+    Ok(ParsedL1PartKey {
+        tenant_hash,
+        signal,
+        shard,
+        ingest_hour_bucket,
+        input_set_hash16,
+        part_index,
+        hash16,
+    })
+}
+
+/// Parsed form of a compaction record key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCompactionRecordKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+    pub input_set_hash16: String,
+}
+
+/// Parse a compaction record key produced by [`compaction_record_key`],
+/// validating every component.
+pub fn parse_compaction_record_key(key: &str) -> Result<ParsedCompactionRecordKey, KeyError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [root, tenant_hex, signal_s, c, shard_s, hour_s, filename] = parts.as_slice() else {
+        return Err(malformed(key, "expected 7 path segments"));
+    };
+    if *root != "t" {
+        return Err(malformed(key, "expected key to start with \"t/\""));
+    }
+    if *c != "c" {
+        return Err(malformed(key, "expected \"c\" segment"));
+    }
+    let tenant_hash = TenantHash::from_hex(tenant_hex)
+        .map_err(|_| KeyError::InvalidTenantHash(tenant_hex.to_string()))?;
+    let signal =
+        signal::from_prefix(signal_s).map_err(|_| KeyError::UnknownSignal(signal_s.to_string()))?;
+    let shard = parse_shard_component(key, shard_s)?;
+    let ingest_hour_bucket = parse_ingest_hour_string(hour_s)?;
+
+    let file_parts: Vec<&str> = filename.split('.').collect();
+    let [tag, hash16, suffix] = file_parts.as_slice() else {
+        return Err(malformed(key, "expected \"l1.hash16.cmt\" filename"));
+    };
+    if *tag != COMPACTION_RECORD_TAG {
+        return Err(malformed(
+            key,
+            format!("expected tag {COMPACTION_RECORD_TAG:?}"),
+        ));
+    }
+    if *suffix != COMMIT_SUFFIX {
+        return Err(malformed(key, format!("expected suffix {COMMIT_SUFFIX:?}")));
+    }
+    let input_set_hash16 = parse_hash16_component(key, hash16)?;
+
+    Ok(ParsedCompactionRecordKey {
+        tenant_hash,
+        signal,
+        shard,
+        ingest_hour_bucket,
+        input_set_hash16,
+    })
+}
+
+/// Parsed form of a retention tombstone key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRetentionTombstoneKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+}
+
+/// Parse a retention tombstone key produced by [`retention_tombstone_key`],
+/// validating every component.
+pub fn parse_retention_tombstone_key(key: &str) -> Result<ParsedRetentionTombstoneKey, KeyError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [root, tenant_hex, signal_s, c, shard_s, hour_s, filename] = parts.as_slice() else {
+        return Err(malformed(key, "expected 7 path segments"));
+    };
+    if *root != "t" {
+        return Err(malformed(key, "expected key to start with \"t/\""));
+    }
+    if *c != "c" {
+        return Err(malformed(key, "expected \"c\" segment"));
+    }
+    if *filename != TOMBSTONE_FILENAME {
+        return Err(malformed(
+            key,
+            format!("expected filename {TOMBSTONE_FILENAME:?}"),
+        ));
+    }
+    let tenant_hash = TenantHash::from_hex(tenant_hex)
+        .map_err(|_| KeyError::InvalidTenantHash(tenant_hex.to_string()))?;
+    let signal =
+        signal::from_prefix(signal_s).map_err(|_| KeyError::UnknownSignal(signal_s.to_string()))?;
+    let shard = parse_shard_component(key, shard_s)?;
+    let ingest_hour_bucket = parse_ingest_hour_string(hour_s)?;
+
+    Ok(ParsedRetentionTombstoneKey {
+        tenant_hash,
+        signal,
+        shard,
+        ingest_hour_bucket,
+    })
+}
+
+/// Parsed form of an advisory maintenance-scan cursor key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMaintCursorKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub shard: u32,
+}
+
+/// Parse a maintenance cursor key produced by [`maint_cursor_key`],
+/// validating every component.
+pub fn parse_maint_cursor_key(key: &str) -> Result<ParsedMaintCursorKey, KeyError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [root, tenant_hex, signal_s, maint, shard_s, filename] = parts.as_slice() else {
+        return Err(malformed(key, "expected 6 path segments"));
+    };
+    if *root != "t" {
+        return Err(malformed(key, "expected key to start with \"t/\""));
+    }
+    if *maint != MAINT_DIR {
+        return Err(malformed(key, format!("expected {MAINT_DIR:?} segment")));
+    }
+    if *filename != CURSOR_FILENAME {
+        return Err(malformed(
+            key,
+            format!("expected filename {CURSOR_FILENAME:?}"),
+        ));
+    }
+    let tenant_hash = TenantHash::from_hex(tenant_hex)
+        .map_err(|_| KeyError::InvalidTenantHash(tenant_hex.to_string()))?;
+    let signal =
+        signal::from_prefix(signal_s).map_err(|_| KeyError::UnknownSignal(signal_s.to_string()))?;
+    let shard = parse_shard_component(key, shard_s)?;
+
+    Ok(ParsedMaintCursorKey {
+        tenant_hash,
+        signal,
+        shard,
+    })
+}
+
+/// The compaction record's own key, reconstructed from its identity fields.
+/// Never trust a stored key string for this (ADR-0010 §7 discipline);
+/// callers verify it against the key they listed or fetched from with
+/// [`verify_compaction_record_key`].
+pub fn compaction_record_key_for(
+    record: &ravel_proto::commit::v1::CompactionRecord,
+) -> Result<String, KeyError> {
+    let tenant_hash = tenant_hash_from_bytes(&record.tenant_hash)?;
+    let signal = signal::from_proto(record.signal)
+        .map_err(|_| KeyError::UnknownSignal(record.signal.to_string()))?;
+    let input_set_hash = content_hash_from_bytes(&record.input_set_hash)?;
+    let hash16 = hex::encode(&input_set_hash[..8]);
+    compaction_record_key(
+        &tenant_hash,
+        signal,
+        record.shard,
+        record.ingest_hour_bucket,
+        &hash16,
+    )
+}
+
+/// Verify an observed key (the key a `CompactionRecord` was listed or
+/// fetched at) against the key reconstructed from its own identity fields.
+/// Any mismatch is a fatal invariant breach, never silently preferred
+/// either way (ADR-0010 §7).
+pub fn verify_compaction_record_key(
+    record: &ravel_proto::commit::v1::CompactionRecord,
+    observed_key: &str,
+) -> Result<String, ReconstructionError> {
+    let expected = compaction_record_key_for(record)?;
+    if expected == observed_key {
+        Ok(expected)
+    } else {
+        Err(ReconstructionError::ObjectKeyMismatch {
+            expected,
+            actual: observed_key.to_string(),
+        })
+    }
+}
+
+/// The retention tombstone's own key, reconstructed from its identity
+/// fields. Never trust a stored key string for this; callers verify it
+/// against the key they listed or fetched from with
+/// [`verify_retention_tombstone_key`].
+pub fn retention_tombstone_key_for(
+    record: &ravel_proto::commit::v1::RetentionTombstone,
+) -> Result<String, KeyError> {
+    let tenant_hash = tenant_hash_from_bytes(&record.tenant_hash)?;
+    let signal = signal::from_proto(record.signal)
+        .map_err(|_| KeyError::UnknownSignal(record.signal.to_string()))?;
+    retention_tombstone_key(
+        &tenant_hash,
+        signal,
+        record.shard,
+        record.ingest_hour_bucket,
+    )
+}
+
+/// Verify an observed key (the key a `RetentionTombstone` was listed or
+/// fetched at) against the key reconstructed from its own identity fields.
+pub fn verify_retention_tombstone_key(
+    record: &ravel_proto::commit::v1::RetentionTombstone,
+    observed_key: &str,
+) -> Result<String, ReconstructionError> {
+    let expected = retention_tombstone_key_for(record)?;
+    if expected == observed_key {
+        Ok(expected)
+    } else {
+        Err(ReconstructionError::ObjectKeyMismatch {
+            expected,
+            actual: observed_key.to_string(),
+        })
+    }
+}
+
+/// Reconstruct one part's key from its parent `CompactionRecord`'s identity
+/// fields plus the part's own `part_index` and `content_hash`. Never trust
+/// a stored key string for this (plan §3.5: "reconstruct the part key
+/// ADR-0010 §7 style"); callers verify it against an observed key with
+/// [`verify_l1_part_key`].
+pub fn reconstruct_l1_part_key(
+    record: &ravel_proto::commit::v1::CompactionRecord,
+    part: &ravel_proto::commit::v1::CompactionPart,
+) -> Result<String, KeyError> {
+    let tenant_hash = tenant_hash_from_bytes(&record.tenant_hash)?;
+    let signal = signal::from_proto(record.signal)
+        .map_err(|_| KeyError::UnknownSignal(record.signal.to_string()))?;
+    let input_set_hash = content_hash_from_bytes(&record.input_set_hash)?;
+    let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+    let content_hash = content_hash_from_bytes(&part.content_hash)?;
+    let hash16 = hex::encode(&content_hash[..8]);
+    l1_part_key(
+        &tenant_hash,
+        signal,
+        record.shard,
+        record.ingest_hour_bucket,
+        &input_set_hash16,
+        part.part_index,
+        &hash16,
+    )
+}
+
+/// Verify an observed key (the key one part object was found at) against
+/// the key reconstructed from its parent record's and its own identity
+/// fields.
+pub fn verify_l1_part_key(
+    record: &ravel_proto::commit::v1::CompactionRecord,
+    part: &ravel_proto::commit::v1::CompactionPart,
+    observed_key: &str,
+) -> Result<String, ReconstructionError> {
+    let expected = reconstruct_l1_part_key(record, part)?;
+    if expected == observed_key {
+        Ok(expected)
+    } else {
+        Err(ReconstructionError::ObjectKeyMismatch {
+            expected,
+            actual: observed_key.to_string(),
+        })
+    }
+}
+
+/// One key from a `c/<shard>/<hour>/` bucket listing, classified by shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BucketEntry {
+    CommitRecord(ParsedCommitKey),
+    CompactionRecord(ParsedCompactionRecordKey),
+    Tombstone(ParsedRetentionTombstoneKey),
+}
+
+/// Classify one key from a `c/<shard>/<hour>/` bucket listing by filename
+/// shape. Name patterns are disjoint by construction (plan §3.1): a
+/// tombstone is exactly `retire.tmb`, a compaction record's filename starts
+/// with `l1.` where an L0 commit record's filename is always a UUID (never
+/// `l1`). An unrecognized shape is a hard error, never silently skipped, so
+/// layout drift surfaces to metrics instead of vanishing.
+pub fn partition_bucket_entry(key: &str) -> Result<BucketEntry, KeyError> {
+    let filename = key.rsplit('/').next().unwrap_or(key);
+    if filename == TOMBSTONE_FILENAME {
+        parse_retention_tombstone_key(key).map(BucketEntry::Tombstone)
+    } else if filename.starts_with("l1.") && filename.ends_with(".cmt") {
+        parse_compaction_record_key(key).map(BucketEntry::CompactionRecord)
+    } else if filename.ends_with(".cmt") {
+        parse_commit_key(key).map(BucketEntry::CommitRecord)
+    } else {
+        Err(KeyError::UnknownBucketEntryShape(key.to_string()))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -751,5 +1239,359 @@ mod tests {
             commit_shard_hour_prefix(&th, Signal::Metrics, 1, hour_bucket).expect("prefix");
         assert!(key.starts_with(&shard_prefix));
         assert!(key.starts_with(&shard_hour_prefix));
+    }
+
+    fn hash16_hex(byte: u8) -> String {
+        hex::encode([byte; 8])
+    }
+
+    #[test]
+    fn l1_part_key_round_trips() {
+        let th = tenant_hash();
+        let hour_bucket = 495_734u32;
+        let input_set_hash16 = hash16_hex(0x11);
+        let hash16 = hash16_hex(0x22);
+        let key = l1_part_key(
+            &th,
+            Signal::Metrics,
+            7,
+            hour_bucket,
+            &input_set_hash16,
+            3,
+            &hash16,
+        )
+        .expect("build");
+        assert_eq!(
+            key,
+            format!(
+                "t/{}/m/l1/0007/{}/{}.0003.{}.rseg",
+                th.to_hex(),
+                ingest_hour_string(hour_bucket),
+                input_set_hash16,
+                hash16
+            )
+        );
+        let parsed = parse_l1_part_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Metrics);
+        assert_eq!(parsed.shard, 7);
+        assert_eq!(parsed.ingest_hour_bucket, hour_bucket);
+        assert_eq!(parsed.input_set_hash16, input_set_hash16);
+        assert_eq!(parsed.part_index, 3);
+        assert_eq!(parsed.hash16, hash16);
+    }
+
+    #[test]
+    fn l1_part_key_rejects_bad_input() {
+        let th = tenant_hash();
+        assert_eq!(
+            l1_part_key(&th, Signal::Metrics, 1, 0, "not-hex", 0, &hash16_hex(1)),
+            Err(KeyError::InvalidHash16("not-hex".to_string()))
+        );
+        assert_eq!(
+            l1_part_key(
+                &th,
+                Signal::Metrics,
+                1,
+                0,
+                &hash16_hex(1),
+                10_000,
+                &hash16_hex(1)
+            ),
+            Err(KeyError::PartIndexOutOfRange(10_000))
+        );
+    }
+
+    #[test]
+    fn parse_l1_part_key_rejects_malformed_input() {
+        let th = tenant_hash();
+        let good = l1_part_key(
+            &th,
+            Signal::Metrics,
+            1,
+            0,
+            &hash16_hex(1),
+            2,
+            &hash16_hex(2),
+        )
+        .expect("build");
+
+        assert!(parse_l1_part_key("t/only/three").is_err());
+        assert!(parse_l1_part_key(&format!("{good}/extra")).is_err());
+        let bad_dir = good.replacen("/l1/", "/l0/", 1);
+        assert!(parse_l1_part_key(&bad_dir).is_err());
+        let bad_suffix = good.replacen(".rseg", ".cmt", 1);
+        assert!(parse_l1_part_key(&bad_suffix).is_err());
+        let bad_part = good.replacen(".0002.", "..", 1);
+        assert!(parse_l1_part_key(&bad_part).is_err());
+    }
+
+    #[test]
+    fn compaction_record_key_round_trips() {
+        let th = tenant_hash();
+        let hour_bucket = 495_734u32;
+        let input_set_hash16 = hash16_hex(0x33);
+        let key = compaction_record_key(&th, Signal::Logs, 3, hour_bucket, &input_set_hash16)
+            .expect("build");
+        assert_eq!(
+            key,
+            format!(
+                "t/{}/l/c/0003/{}/l1.{}.cmt",
+                th.to_hex(),
+                ingest_hour_string(hour_bucket),
+                input_set_hash16
+            )
+        );
+        let parsed = parse_compaction_record_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Logs);
+        assert_eq!(parsed.shard, 3);
+        assert_eq!(parsed.ingest_hour_bucket, hour_bucket);
+        assert_eq!(parsed.input_set_hash16, input_set_hash16);
+    }
+
+    #[test]
+    fn parse_compaction_record_key_rejects_malformed_input() {
+        let th = tenant_hash();
+        let good = compaction_record_key(&th, Signal::Logs, 3, 0, &hash16_hex(4)).expect("build");
+
+        assert!(parse_compaction_record_key("t/only/three").is_err());
+        let bad_tag = good.replacen("l1.", "l2.", 1);
+        assert!(parse_compaction_record_key(&bad_tag).is_err());
+        let bad_suffix = good.replacen(".cmt", ".rseg", 1);
+        assert!(parse_compaction_record_key(&bad_suffix).is_err());
+        // Looks like an L0 commit key instead (four dot components).
+        assert!(parse_compaction_record_key(&good.replacen("l1.", "", 1)).is_err());
+    }
+
+    #[test]
+    fn retention_tombstone_key_round_trips() {
+        let th = tenant_hash();
+        let hour_bucket = 495_734u32;
+        let key = retention_tombstone_key(&th, Signal::Spans, 9, hour_bucket).expect("build");
+        assert_eq!(
+            key,
+            format!(
+                "t/{}/s/c/0009/{}/retire.tmb",
+                th.to_hex(),
+                ingest_hour_string(hour_bucket)
+            )
+        );
+        let parsed = parse_retention_tombstone_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Spans);
+        assert_eq!(parsed.shard, 9);
+        assert_eq!(parsed.ingest_hour_bucket, hour_bucket);
+    }
+
+    #[test]
+    fn parse_retention_tombstone_key_rejects_malformed_input() {
+        let th = tenant_hash();
+        let good = retention_tombstone_key(&th, Signal::Spans, 9, 0).expect("build");
+        assert!(parse_retention_tombstone_key("t/only/three").is_err());
+        let bad_filename = good.replacen("retire.tmb", "retire.cmt", 1);
+        assert!(parse_retention_tombstone_key(&bad_filename).is_err());
+        let bad_c = good.replacen("/c/", "/l0/", 1);
+        assert!(parse_retention_tombstone_key(&bad_c).is_err());
+    }
+
+    #[test]
+    fn maint_cursor_key_round_trips() {
+        let th = tenant_hash();
+        let key = maint_cursor_key(&th, Signal::Profiles, 2).expect("build");
+        assert_eq!(key, format!("t/{}/p/maint/0002/cursor", th.to_hex()));
+        let parsed = parse_maint_cursor_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Profiles);
+        assert_eq!(parsed.shard, 2);
+    }
+
+    #[test]
+    fn parse_maint_cursor_key_rejects_malformed_input() {
+        let th = tenant_hash();
+        let good = maint_cursor_key(&th, Signal::Profiles, 2).expect("build");
+        assert!(parse_maint_cursor_key("t/only/three").is_err());
+        let bad_dir = good.replacen("/maint/", "/l0/", 1);
+        assert!(parse_maint_cursor_key(&bad_dir).is_err());
+        let bad_filename = good.replacen("cursor", "cursors", 1);
+        assert!(parse_maint_cursor_key(&bad_filename).is_err());
+    }
+
+    fn sample_compaction_record(
+        th: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour_bucket: u32,
+        input_set_hash: [u8; 32],
+        part_content_hash: [u8; 32],
+    ) -> ravel_proto::commit::v1::CompactionRecord {
+        ravel_proto::commit::v1::CompactionRecord {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: signal::to_proto(signal) as i32,
+            shard,
+            ingest_hour_bucket: hour_bucket,
+            level: 1,
+            inputs: vec![],
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![ravel_proto::commit::v1::CompactionPart {
+                part_index: 0,
+                first_series_id: vec![0; 16],
+                last_series_id: vec![0xff; 16],
+                content_hash: part_content_hash.to_vec(),
+                object_size: 0,
+                sample_count: 0,
+                series_count: 0,
+                run_count: 0,
+                min_event_ts_ns: 0,
+                max_event_ts_ns: 0,
+                segment_format_version: 3,
+            }],
+            created_unix_ns: 0,
+        }
+    }
+
+    #[test]
+    fn compaction_record_key_for_matches_compaction_record_key() {
+        let th = tenant_hash();
+        let input_set_hash = hash32(0x55);
+        let record =
+            sample_compaction_record(&th, Signal::Metrics, 1, 0, input_set_hash, hash32(0x66));
+        let expected = compaction_record_key(
+            &th,
+            Signal::Metrics,
+            1,
+            0,
+            &hex::encode(&input_set_hash[..8]),
+        )
+        .expect("build");
+        assert_eq!(
+            compaction_record_key_for(&record).expect("reconstruct"),
+            expected
+        );
+        assert_eq!(
+            verify_compaction_record_key(&record, &expected).expect("verified"),
+            expected
+        );
+    }
+
+    #[test]
+    fn verify_compaction_record_key_detects_mismatch() {
+        let th = tenant_hash();
+        let record =
+            sample_compaction_record(&th, Signal::Metrics, 1, 0, hash32(0x77), hash32(0x88));
+        let err = verify_compaction_record_key(&record, "t/wrong/key")
+            .expect_err("must be fatal mismatch");
+        assert!(matches!(err, ReconstructionError::ObjectKeyMismatch { .. }));
+    }
+
+    #[test]
+    fn reconstruct_l1_part_key_matches_l1_part_key() {
+        let th = tenant_hash();
+        let input_set_hash = hash32(0x99);
+        let part_content_hash = hash32(0xaa);
+        let record =
+            sample_compaction_record(&th, Signal::Logs, 4, 0, input_set_hash, part_content_hash);
+        let expected = l1_part_key(
+            &th,
+            Signal::Logs,
+            4,
+            0,
+            &hex::encode(&input_set_hash[..8]),
+            0,
+            &hex::encode(&part_content_hash[..8]),
+        )
+        .expect("build");
+        let part = &record.parts[0];
+        assert_eq!(
+            reconstruct_l1_part_key(&record, part).expect("reconstruct"),
+            expected
+        );
+        assert_eq!(
+            verify_l1_part_key(&record, part, &expected).expect("verified"),
+            expected
+        );
+    }
+
+    fn sample_tombstone(
+        th: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour_bucket: u32,
+    ) -> ravel_proto::commit::v1::RetentionTombstone {
+        ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: signal::to_proto(signal) as i32,
+            shard,
+            ingest_hour_bucket: hour_bucket,
+            retired_at_ns: 0,
+            retention_window_ns: 0,
+            record_count_observed: 0,
+        }
+    }
+
+    #[test]
+    fn retention_tombstone_key_for_matches_retention_tombstone_key() {
+        let th = tenant_hash();
+        let record = sample_tombstone(&th, Signal::Spans, 5, 495_734);
+        let expected = retention_tombstone_key(&th, Signal::Spans, 5, 495_734).expect("build");
+        assert_eq!(
+            retention_tombstone_key_for(&record).expect("reconstruct"),
+            expected
+        );
+        assert_eq!(
+            verify_retention_tombstone_key(&record, &expected).expect("verified"),
+            expected
+        );
+    }
+
+    #[test]
+    fn verify_retention_tombstone_key_detects_mismatch() {
+        let th = tenant_hash();
+        let record = sample_tombstone(&th, Signal::Spans, 5, 495_734);
+        let err = verify_retention_tombstone_key(&record, "t/wrong/key")
+            .expect_err("must be fatal mismatch");
+        assert!(matches!(err, ReconstructionError::ObjectKeyMismatch { .. }));
+    }
+
+    #[test]
+    fn partition_bucket_entry_classifies_each_shape() {
+        let th = tenant_hash();
+        let writer_id = Uuid::new_v4();
+        let hour_bucket = 495_734u32;
+
+        let commit = commit_key(&th, Signal::Metrics, 1, hour_bucket, writer_id, 0, 0)
+            .expect("build commit key");
+        assert!(matches!(
+            partition_bucket_entry(&commit).expect("classify"),
+            BucketEntry::CommitRecord(_)
+        ));
+
+        let compaction =
+            compaction_record_key(&th, Signal::Metrics, 1, hour_bucket, &hash16_hex(1))
+                .expect("build compaction key");
+        assert!(matches!(
+            partition_bucket_entry(&compaction).expect("classify"),
+            BucketEntry::CompactionRecord(_)
+        ));
+
+        let tombstone = retention_tombstone_key(&th, Signal::Metrics, 1, hour_bucket)
+            .expect("build tombstone key");
+        assert!(matches!(
+            partition_bucket_entry(&tombstone).expect("classify"),
+            BucketEntry::Tombstone(_)
+        ));
+    }
+
+    #[test]
+    fn partition_bucket_entry_fails_loud_on_unknown_shape() {
+        let th = tenant_hash();
+        let hour_bucket = 495_734u32;
+        let prefix =
+            commit_shard_hour_prefix(&th, Signal::Metrics, 1, hour_bucket).expect("prefix");
+        let err = partition_bucket_entry(&format!("{prefix}unexpected.file"))
+            .expect_err("unknown shape must be an error, never silently skipped");
+        assert!(matches!(err, KeyError::UnknownBucketEntryShape(_)));
     }
 }
