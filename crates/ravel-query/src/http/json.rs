@@ -46,7 +46,11 @@ pub fn format_value(v: f64) -> String {
     if v.is_nan() {
         "NaN".to_string()
     } else if v.is_infinite() {
-        if v > 0.0 { "+Inf".to_string() } else { "-Inf".to_string() }
+        if v > 0.0 {
+            "+Inf".to_string()
+        } else {
+            "-Inf".to_string()
+        }
     } else {
         format!("{v}")
     }
@@ -94,5 +98,8 @@ pub fn range_matrix_to_json(matrix: RangeMatrix) -> QueryData {
 }
 
 pub fn series_to_json(series: Vec<(SeriesId, LabelSet)>) -> Vec<HashMap<String, String>> {
-    series.into_iter().map(|(_, labels)| labels_to_map(&labels)).collect()
+    series
+        .into_iter()
+        .map(|(_, labels)| labels_to_map(&labels))
+        .collect()
 }

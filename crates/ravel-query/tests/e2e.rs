@@ -34,7 +34,9 @@ const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
 /// timestamp is an exact-second value (avoids float precision concerns
 /// when round-tripping through the `time`/`start`/`end` query params).
 fn now_ns() -> i64 {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock before epoch");
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch");
     let ns = i64::try_from(dur.as_nanos()).expect("time overflow");
     (ns / NS_PER_SEC) * NS_PER_SEC
 }
@@ -44,9 +46,15 @@ fn tenant(name: &str) -> TenantId {
 }
 
 fn make_labels(metric: &str, extra: &[(&str, &str)]) -> LabelSet {
-    let mut pairs = vec![Label { name: "__name__".to_string(), value: metric.to_string() }];
+    let mut pairs = vec![Label {
+        name: "__name__".to_string(),
+        value: metric.to_string(),
+    }];
     for (k, v) in extra {
-        pairs.push(Label { name: (*k).to_string(), value: (*v).to_string() });
+        pairs.push(Label {
+            name: (*k).to_string(),
+            value: (*v).to_string(),
+        });
     }
     LabelSet::new(pairs).expect("valid labels")
 }
@@ -62,7 +70,13 @@ fn series_input(
     SeriesInput {
         series_id,
         labels: label_set,
-        samples: samples.iter().map(|(ts_ns, value)| Sample { ts_ns: *ts_ns, value: *value }).collect(),
+        samples: samples
+            .iter()
+            .map(|(ts_ns, value)| Sample {
+                ts_ns: *ts_ns,
+                value: *value,
+            })
+            .collect(),
     }
 }
 
@@ -89,8 +103,12 @@ async fn publish_segment(
         writer_epoch: footer_epoch,
         writer_seq,
     };
-    let bounds = IngestBounds { min_ingest_ts_ns: 0, max_ingest_ts_ns: 0 };
-    let written: WrittenSegment = SegmentWriter::write(series, identity, bounds).expect("write segment");
+    let bounds = IngestBounds {
+        min_ingest_ts_ns: 0,
+        max_ingest_ts_ns: 0,
+    };
+    let written: WrittenSegment =
+        SegmentWriter::write(series, identity, bounds).expect("write segment");
 
     let new_record = NewCommitRecord {
         tenant_hash,
@@ -113,8 +131,12 @@ async fn publish_segment(
     };
     let rec = record::build(new_record).expect("valid commit record");
     let data_key = keys::reconstruct_data_key(&rec).expect("data key");
-    publish::put_data_object(store, &data_key, written.bytes).await.expect("put data object");
-    let token = publish::publish(store, &rec, &RetryPolicy::default()).await.expect("publish");
+    publish::put_data_object(store, &data_key, written.bytes)
+        .await
+        .expect("put data object");
+    let token = publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
     (token, data_key)
 }
 
@@ -125,7 +147,9 @@ fn encode_query_param(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -148,7 +172,12 @@ fn build_app(
     router(state)
 }
 
-fn one_tenant_app(store: Arc<MemoryStore>, engine_config: EngineConfig, tenant_id: &TenantId, token: &str) -> Router {
+fn one_tenant_app(
+    store: Arc<MemoryStore>,
+    engine_config: EngineConfig,
+    tenant_id: &TenantId,
+    token: &str,
+) -> Router {
     let mut tokens = HashMap::new();
     tokens.insert(token.to_string(), tenant_id.clone());
     build_app(store, CatalogConfig::default(), engine_config, tokens)
@@ -160,15 +189,23 @@ async fn call(app: &Router, uri: &str, auth: Option<&str>) -> (StatusCode, Value
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
     let request = builder.body(Body::empty()).expect("build request");
-    let response = app.clone().oneshot(request).await.expect("oneshot is infallible");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("oneshot is infallible");
     let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
     let json: Value = serde_json::from_slice(&body).expect("parse response json");
     (status, json)
 }
 
 fn vector_results(body: &Value) -> &Vec<Value> {
-    body["data"]["result"].as_array().expect("vector result array")
+    body["data"]["result"]
+        .as_array()
+        .expect("vector result array")
 }
 
 fn value_string(sample: &Value) -> &str {
@@ -184,14 +221,39 @@ async fn instant_query_returns_expected_value() {
     let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
 
     let series = vec![
-        series_input(&tid, "http_requests_total", &[("method", "get")], &[(now - NS_PER_MIN, 42.0)]),
-        series_input(&tid, "http_requests_total", &[("method", "post")], &[(now - NS_PER_MIN, 7.0)]),
+        series_input(
+            &tid,
+            "http_requests_total",
+            &[("method", "get")],
+            &[(now - NS_PER_MIN, 42.0)],
+        ),
+        series_input(
+            &tid,
+            "http_requests_total",
+            &[("method", "post")],
+            &[(now - NS_PER_MIN, 7.0)],
+        ),
     ];
-    publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, series).await;
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
 
     let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
     let query = encode_query_param("http_requests_total{method=\"get\"}");
-    let uri = format!("/api/v1/query?query={query}&time={}", (now - NS_PER_MIN) / NS_PER_SEC);
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -216,21 +278,38 @@ async fn range_query_returns_expected_grid() {
         &[],
         &[(now - 4 * NS_PER_MIN, 10.0), (now - 2 * NS_PER_MIN, 20.0)],
     )];
-    publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, series).await;
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
 
     let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
     let query = encode_query_param("queue_depth");
     let start = (now - 4 * NS_PER_MIN) / NS_PER_SEC;
-    let end = (now - 1 * NS_PER_MIN) / NS_PER_SEC;
+    let end = (now - NS_PER_MIN) / NS_PER_SEC;
     let uri = format!("/api/v1/query_range?query={query}&start={start}&end={end}&step=60s");
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
-    let results = body["data"]["result"].as_array().expect("matrix result array");
+    let results = body["data"]["result"]
+        .as_array()
+        .expect("matrix result array");
     assert_eq!(results.len(), 1);
     let values = results[0]["values"].as_array().expect("values array");
-    let observed: Vec<&str> = values.iter().map(|v| v[1].as_str().expect("value string")).collect();
+    let observed: Vec<&str> = values
+        .iter()
+        .map(|v| v[1].as_str().expect("value string"))
+        .collect();
     assert_eq!(observed, vec!["10", "10", "20", "20"]);
 }
 
@@ -244,17 +323,54 @@ async fn lookback_finds_sample_in_an_earlier_segment() {
 
     // Segment A (earlier flush): the only sample at or before the query
     // instant.
-    let seg_a = vec![series_input(&tid, "cpu_seconds", &[], &[(now - 4 * NS_PER_MIN, 1.0)])];
-    publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, seg_a).await;
+    let seg_a = vec![series_input(
+        &tid,
+        "cpu_seconds",
+        &[],
+        &[(now - 4 * NS_PER_MIN, 1.0)],
+    )];
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        seg_a,
+    )
+    .await;
 
     // Segment B (a later, separate flush): its sample is after the query
     // instant, so lookback must not pick it.
-    let seg_b = vec![series_input(&tid, "cpu_seconds", &[], &[(now - 30 * NS_PER_SEC, 99.0)])];
-    publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, seg_b).await;
+    let seg_b = vec![series_input(
+        &tid,
+        "cpu_seconds",
+        &[],
+        &[(now - 30 * NS_PER_SEC, 99.0)],
+    )];
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        seg_b,
+    )
+    .await;
 
     let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
     let query = encode_query_param("cpu_seconds");
-    let uri = format!("/api/v1/query?query={query}&time={}", (now - 2 * NS_PER_MIN) / NS_PER_SEC);
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - 2 * NS_PER_MIN) / NS_PER_SEC
+    );
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -303,14 +419,19 @@ async fn min_commit_token_finds_segment_outside_the_listing_window() {
     // ingest_hour_bucket 0 (1970-01-01T00) is nowhere near the catalog's
     // real-time-based listing window, so ordinary listing will never find
     // this commit record; only an explicit min_commit_token GET can.
-    let (token, _) =
-        publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, 0, now, vec![series_input(
-            &tid,
-            "delayed_metric",
-            &[],
-            &[(ts, 55.0)],
-        )])
-        .await;
+    let (token, _) = publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        0,
+        now,
+        vec![series_input(&tid, "delayed_metric", &[], &[(ts, 55.0)])],
+    )
+    .await;
 
     let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
     let query = encode_query_param("delayed_metric");
@@ -318,7 +439,11 @@ async fn min_commit_token_finds_segment_outside_the_listing_window() {
     let without_token = format!("/api/v1/query?query={query}&time={}", ts / NS_PER_SEC);
     let (status, body) = call(&app, &without_token, Some("secret-a")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(vector_results(&body).len(), 0, "must not be visible without the token");
+    assert_eq!(
+        vector_results(&body).len(),
+        0,
+        "must not be visible without the token"
+    );
 
     let with_token = format!(
         "/api/v1/query?query={query}&time={}&min_commit_token={}",
@@ -328,7 +453,11 @@ async fn min_commit_token_finds_segment_outside_the_listing_window() {
     let (status, body) = call(&app, &with_token, Some("secret-a")).await;
     assert_eq!(status, StatusCode::OK);
     let results = vector_results(&body);
-    assert_eq!(results.len(), 1, "must be visible with the read-your-write token");
+    assert_eq!(
+        results.len(),
+        1,
+        "must be visible with the read-your-write token"
+    );
     assert_eq!(value_string(&results[0]), "55");
 }
 
@@ -344,12 +473,30 @@ async fn exceeding_max_series_budget_returns_422() {
         series_input(&tid, "up", &[("instance", "a")], &[(now - NS_PER_MIN, 1.0)]),
         series_input(&tid, "up", &[("instance", "b")], &[(now - NS_PER_MIN, 1.0)]),
     ];
-    publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, series).await;
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
 
-    let config = EngineConfig { max_series: 1, ..EngineConfig::default() };
+    let config = EngineConfig {
+        max_series: 1,
+        ..EngineConfig::default()
+    };
     let app = one_tenant_app(store, config, &tid, "secret-a");
     let query = encode_query_param("up");
-    let uri = format!("/api/v1/query?query={query}&time={}", (now - NS_PER_MIN) / NS_PER_SEC);
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -365,15 +512,35 @@ async fn identity_mismatch_between_commit_record_and_footer_returns_503() {
     let now = now_ns();
     let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
 
-    let series = vec![series_input(&tid, "mismatched_metric", &[], &[(now - NS_PER_MIN, 1.0)])];
+    let series = vec![series_input(
+        &tid,
+        "mismatched_metric",
+        &[],
+        &[(now - NS_PER_MIN, 1.0)],
+    )];
     // Footer declares writer_epoch 7; the published commit record declares
     // writer_epoch 9. The fetcher must detect this and fail hard rather
     // than return wrong data.
-    publish_segment(&store, th, 0, Uuid::new_v4(), 7, 9, 1, hour_bucket, now, series).await;
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        7,
+        9,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
 
     let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
     let query = encode_query_param("mismatched_metric");
-    let uri = format!("/api/v1/query?query={query}&time={}", (now - NS_PER_MIN) / NS_PER_SEC);
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -389,22 +556,47 @@ async fn corrupt_segment_bytes_return_503_not_wrong_data() {
     let now = now_ns();
     let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
 
-    let series = vec![series_input(&tid, "corrupt_metric", &[], &[(now - NS_PER_MIN, 1.0)])];
-    let (_, data_key) =
-        publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, series).await;
+    let series = vec![series_input(
+        &tid,
+        "corrupt_metric",
+        &[],
+        &[(now - NS_PER_MIN, 1.0)],
+    )];
+    let (_, data_key) = publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
 
     // Flip the last byte of the object: the trailer's final 4 bytes are
     // the RSEG magic, so this deterministically fails footer parsing
     // (`SegmentError::BadMagic`) regardless of internal layout details.
-    let existing = store.get(&data_key, GetRange::Full).await.expect("get object");
+    let existing = store
+        .get(&data_key, GetRange::Full)
+        .await
+        .expect("get object");
     let mut corrupted = existing.data.to_vec();
     let last = corrupted.len() - 1;
     corrupted[last] ^= 0xFF;
-    store.put(&data_key, Bytes::from(corrupted), PutOptions::default()).await.expect("overwrite object");
+    store
+        .put(&data_key, Bytes::from(corrupted), PutOptions::default())
+        .await
+        .expect("overwrite object");
 
     let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
     let query = encode_query_param("corrupt_metric");
-    let uri = format!("/api/v1/query?query={query}&time={}", (now - NS_PER_MIN) / NS_PER_SEC);
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -438,20 +630,49 @@ async fn cross_tenant_data_is_isolated() {
     let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
 
     // Only tenant B has data.
-    let series = vec![series_input(&tenant_b, "secret_metric", &[], &[(now - NS_PER_MIN, 9.0)])];
-    publish_segment(&store, tenant_b.hash(), 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, series).await;
+    let series = vec![series_input(
+        &tenant_b,
+        "secret_metric",
+        &[],
+        &[(now - NS_PER_MIN, 9.0)],
+    )];
+    publish_segment(
+        &store,
+        tenant_b.hash(),
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
 
     let mut tokens = HashMap::new();
     tokens.insert("token-a".to_string(), tenant_a);
     tokens.insert("token-b".to_string(), tenant_b);
-    let app = build_app(store, CatalogConfig::default(), EngineConfig::default(), tokens);
+    let app = build_app(
+        store,
+        CatalogConfig::default(),
+        EngineConfig::default(),
+        tokens,
+    );
 
     let query = encode_query_param("secret_metric");
-    let uri = format!("/api/v1/query?query={query}&time={}", (now - NS_PER_MIN) / NS_PER_SEC);
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
 
     let (status, body) = call(&app, &uri, Some("token-a")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(vector_results(&body).len(), 0, "tenant A must not see tenant B's series");
+    assert_eq!(
+        vector_results(&body).len(),
+        0,
+        "tenant A must not see tenant B's series"
+    );
 
     let (status, body) = call(&app, &uri, Some("token-b")).await;
     assert_eq!(status, StatusCode::OK);
@@ -469,10 +690,32 @@ async fn series_endpoint_reflects_published_labels() {
     let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
 
     let series = vec![
-        series_input(&tid, "http_requests_total", &[("method", "get")], &[(now - NS_PER_MIN, 1.0)]),
-        series_input(&tid, "http_requests_total", &[("method", "post")], &[(now - NS_PER_MIN, 1.0)]),
+        series_input(
+            &tid,
+            "http_requests_total",
+            &[("method", "get")],
+            &[(now - NS_PER_MIN, 1.0)],
+        ),
+        series_input(
+            &tid,
+            "http_requests_total",
+            &[("method", "post")],
+            &[(now - NS_PER_MIN, 1.0)],
+        ),
     ];
-    publish_segment(&store, th, 0, Uuid::new_v4(), 1, 1, 1, hour_bucket, now, series).await;
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
 
     let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
     let matcher = encode_query_param("http_requests_total");
@@ -482,7 +725,10 @@ async fn series_endpoint_reflects_published_labels() {
     assert_eq!(status, StatusCode::OK);
     let results = body["data"].as_array().expect("series result array");
     assert_eq!(results.len(), 2);
-    let mut methods: Vec<&str> = results.iter().map(|s| s["method"].as_str().expect("method label")).collect();
+    let mut methods: Vec<&str> = results
+        .iter()
+        .map(|s| s["method"].as_str().expect("method label"))
+        .collect();
     methods.sort_unstable();
     assert_eq!(methods, vec!["get", "post"]);
 }

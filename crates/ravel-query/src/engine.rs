@@ -7,14 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
-use promql_parser::parser::{Expr, Offset, VectorSelector};
+use promql_parser::parser::{Expr, Offset};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
     Evaluator, InstantVector, LabelMatcher, RangeMatrix, SeriesData, SeriesSource, SourceError,
     from_ast_matchers, has_or_group, matches_series, ms_to_ns,
 };
-use ravel_types::{CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange};
+use ravel_types::{
+    CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
+};
 
 use crate::config::EngineConfig;
 use crate::error::QueryError;
@@ -78,7 +80,9 @@ impl QueryEngine {
     ) -> Result<InstantVector, QueryError> {
         let (matchers, offset_ns) = parse_selector(query)?;
         let t_ns = ms_to_ns(t_ms)?;
-        let sel_ts_ns = t_ns.checked_sub(offset_ns).ok_or(QueryError::TimeOverflow)?;
+        let sel_ts_ns = t_ns
+            .checked_sub(offset_ns)
+            .ok_or(QueryError::TimeOverflow)?;
         let window = TimeRange {
             start_ns: sel_ts_ns
                 .checked_sub(DEFAULT_LOOKBACK_NS)
@@ -105,7 +109,15 @@ impl QueryEngine {
     ) -> Result<RangeMatrix, QueryError> {
         tokio::time::timeout(
             deadline,
-            self.range_inner(tenant_hash, query, start_ms, end_ms, step_ms, min_tokens, now_ns),
+            self.range_inner(
+                tenant_hash,
+                query,
+                start_ms,
+                end_ms,
+                step_ms,
+                min_tokens,
+                now_ns,
+            ),
         )
         .await
         .map_err(|_| QueryError::DeadlineExceeded { deadline })?
@@ -167,7 +179,9 @@ impl QueryEngine {
         now_ns: i64,
     ) -> Result<Vec<(SeriesId, LabelSet)>, QueryError> {
         let attempt = |snapshot: Snapshot| async move {
-            let fetched = self.fetch_all_series(tenant_hash, &snapshot, matchers).await?;
+            let fetched = self
+                .fetch_all_series(tenant_hash, &snapshot, matchers)
+                .await?;
             let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();
             for segment_entries in fetched {
                 for entry in segment_entries {
@@ -198,7 +212,9 @@ impl QueryEngine {
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
         let attempt = |snapshot: Snapshot| async move {
-            let fetched = self.fetch_all_samples(tenant_hash, &snapshot, matchers).await?;
+            let fetched = self
+                .fetch_all_samples(tenant_hash, &snapshot, matchers)
+                .await?;
             let series = merge_segments(fetched, max_series, max_samples)?;
             Ok(MaterializedSource { series })
         };
@@ -224,7 +240,9 @@ impl QueryEngine {
         F: FnMut(Snapshot) -> Fut,
         Fut: std::future::Future<Output = Result<T, QueryError>>,
     {
-        let first = self.resolve_bounded(tenant_hash, window, min_tokens, now_ns).await?;
+        let first = self
+            .resolve_bounded(tenant_hash, window, min_tokens, now_ns)
+            .await?;
         match attempt(first).await {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
@@ -272,9 +290,18 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Vec<FetchedSeries>>, QueryError> {
         let concurrency = self.config.fetch_concurrency.max(1);
+        let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let results: Vec<Result<Vec<FetchedSeries>, FetchError>> =
-            stream::iter(snapshot.segments.iter())
-                .map(|seg_ref| async move { self.fetcher.fetch(tenant_hash, seg_ref, matchers).await })
+            stream::iter(snapshot.segments.iter().cloned())
+                .map(|seg_ref| {
+                    let fetcher = self.fetcher.clone();
+                    let matchers = Arc::clone(&matchers);
+                    async move {
+                        fetcher
+                            .fetch(tenant_hash, &seg_ref, matchers.as_slice())
+                            .await
+                    }
+                })
                 .buffer_unordered(concurrency)
                 .collect()
                 .await;
@@ -292,10 +319,17 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
         let concurrency = self.config.fetch_concurrency.max(1);
+        let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let results: Vec<Result<Vec<ravel_segment::SeriesEntry>, FetchError>> =
-            stream::iter(snapshot.segments.iter())
-                .map(|seg_ref| async move {
-                    self.fetcher.fetch_series(tenant_hash, seg_ref, matchers).await
+            stream::iter(snapshot.segments.iter().cloned())
+                .map(|seg_ref| {
+                    let fetcher = self.fetcher.clone();
+                    let matchers = Arc::clone(&matchers);
+                    async move {
+                        fetcher
+                            .fetch_series(tenant_hash, &seg_ref, matchers.as_slice())
+                            .await
+                    }
                 })
                 .buffer_unordered(concurrency)
                 .collect()
@@ -314,12 +348,22 @@ fn range_fetch_window(
     step_ns: i64,
     offset_ns: i64,
 ) -> Result<TimeRange, QueryError> {
-    let span = end_ns.checked_sub(start_ns).ok_or(QueryError::TimeOverflow)?;
+    let span = end_ns
+        .checked_sub(start_ns)
+        .ok_or(QueryError::TimeOverflow)?;
     let num_steps = span / step_ns;
-    let step_span = num_steps.checked_mul(step_ns).ok_or(QueryError::TimeOverflow)?;
-    let last_grid_ns = start_ns.checked_add(step_span).ok_or(QueryError::TimeOverflow)?;
-    let sel_start = start_ns.checked_sub(offset_ns).ok_or(QueryError::TimeOverflow)?;
-    let sel_end = last_grid_ns.checked_sub(offset_ns).ok_or(QueryError::TimeOverflow)?;
+    let step_span = num_steps
+        .checked_mul(step_ns)
+        .ok_or(QueryError::TimeOverflow)?;
+    let last_grid_ns = start_ns
+        .checked_add(step_span)
+        .ok_or(QueryError::TimeOverflow)?;
+    let sel_start = start_ns
+        .checked_sub(offset_ns)
+        .ok_or(QueryError::TimeOverflow)?;
+    let sel_end = last_grid_ns
+        .checked_sub(offset_ns)
+        .ok_or(QueryError::TimeOverflow)?;
     Ok(TimeRange {
         start_ns: sel_start
             .checked_sub(DEFAULT_LOOKBACK_NS)
@@ -431,7 +475,12 @@ fn merge_segments(
                 let candidate = Candidate {
                     ts_ns: sample.ts_ns,
                     value: sample.value,
-                    priority: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq, in_page_index),
+                    priority: (
+                        fs.created_unix_ns,
+                        fs.writer_epoch,
+                        fs.writer_seq,
+                        in_page_index,
+                    ),
                 };
                 entry
                     .1

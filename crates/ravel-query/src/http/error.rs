@@ -32,16 +32,17 @@ impl From<AuthError> for ApiError {
 impl From<QueryError> for ApiError {
     fn from(e: QueryError) -> Self {
         match &e {
-            QueryError::Parse(_) | QueryError::NonPositiveStep { .. } | QueryError::InvalidRange { .. } | QueryError::TimeOverflow => {
-                ApiError::BadData(e.to_string())
-            }
+            QueryError::Parse(_)
+            | QueryError::NonPositiveStep { .. }
+            | QueryError::InvalidRange { .. }
+            | QueryError::TimeOverflow => ApiError::BadData(e.to_string()),
             QueryError::Unsupported { .. } => ApiError::Unsupported(e.to_string()),
             QueryError::Catalog(_) | QueryError::Fetch(_) | QueryError::SnapshotInvalidated => {
                 ApiError::Unavailable(e.to_string())
             }
-            QueryError::TooManySegments { .. } | QueryError::TooManySeries { .. } | QueryError::TooManySamples { .. } => {
-                ApiError::Unsupported(e.to_string())
-            }
+            QueryError::TooManySegments { .. }
+            | QueryError::TooManySeries { .. }
+            | QueryError::TooManySamples { .. } => ApiError::Unsupported(e.to_string()),
             QueryError::DeadlineExceeded { .. } => ApiError::Timeout(e.to_string()),
             QueryError::Eval(inner) => from_eval_error(inner, e.to_string()),
         }
@@ -73,7 +74,10 @@ impl IntoResponse for ApiError {
                 "authentication required".to_string(),
             ),
         };
-        let body: ApiResponse<()> = ApiResponse::Error { error_type, error: message };
+        let body: ApiResponse<()> = ApiResponse::Error {
+            error_type,
+            error: message,
+        };
         (status, Json(body)).into_response()
     }
 }

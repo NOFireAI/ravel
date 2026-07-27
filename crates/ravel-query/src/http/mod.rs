@@ -11,7 +11,7 @@ pub mod tenant;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::get;
 
 pub use tenant::{AuthError, DevHeaderTenantResolver, StaticBearerTokenResolver, TenantResolver};
 
@@ -35,9 +35,15 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/query", get(handlers::query).post(handlers::query))
-        .route("/api/v1/query_range", get(handlers::query_range).post(handlers::query_range))
+        .route(
+            "/api/v1/query_range",
+            get(handlers::query_range).post(handlers::query_range),
+        )
         .route("/api/v1/labels", get(handlers::labels))
         .route("/api/v1/label/{name}/values", get(handlers::label_values))
-        .route("/api/v1/series", get(handlers::series).post(handlers::series))
+        .route(
+            "/api/v1/series",
+            get(handlers::series).post(handlers::series),
+        )
         .with_state(state)
 }

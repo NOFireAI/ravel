@@ -31,7 +31,9 @@ impl StaticBearerTokenResolver {
 
 impl TenantResolver for StaticBearerTokenResolver {
     fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
-        let raw = headers.get(axum::http::header::AUTHORIZATION).ok_or(AuthError)?;
+        let raw = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .ok_or(AuthError)?;
         let raw = raw.to_str().map_err(|_| AuthError)?;
         let token = raw.strip_prefix("Bearer ").ok_or(AuthError)?;
         self.tokens.get(token).cloned().ok_or(AuthError)

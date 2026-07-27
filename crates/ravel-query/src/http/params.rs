@@ -34,7 +34,10 @@ impl Params {
     }
 
     pub fn first(&self, key: &str) -> Option<&str> {
-        self.values.get(key).and_then(|v| v.first()).map(String::as_str)
+        self.values
+            .get(key)
+            .and_then(|v| v.first())
+            .map(String::as_str)
     }
 
     pub fn all(&self, key: &str) -> &[String] {
@@ -100,12 +103,20 @@ pub fn parse_timestamp_ms(name: &'static str, s: &str) -> Result<i64, ParamError
     if let Ok(secs) = s.parse::<f64>() {
         return seconds_to_ms(name, s, secs);
     }
-    let system_time = humantime::parse_rfc3339(s)
-        .map_err(|_| ParamError::Invalid { name, value: s.to_string() })?;
+    let system_time = humantime::parse_rfc3339(s).map_err(|_| ParamError::Invalid {
+        name,
+        value: s.to_string(),
+    })?;
     let dur = system_time
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ParamError::Invalid { name, value: s.to_string() })?;
-    i64::try_from(dur.as_millis()).map_err(|_| ParamError::Invalid { name, value: s.to_string() })
+        .map_err(|_| ParamError::Invalid {
+            name,
+            value: s.to_string(),
+        })?;
+    i64::try_from(dur.as_millis()).map_err(|_| ParamError::Invalid {
+        name,
+        value: s.to_string(),
+    })
 }
 
 /// Prometheus duration syntax (`30s`, `5m`) or bare float seconds.
@@ -113,18 +124,29 @@ pub fn parse_duration_ms(name: &'static str, s: &str) -> Result<i64, ParamError>
     if let Ok(secs) = s.parse::<f64>() {
         return seconds_to_ms(name, s, secs);
     }
-    let dur = humantime::parse_duration(s)
-        .map_err(|_| ParamError::Invalid { name, value: s.to_string() })?;
-    i64::try_from(dur.as_millis()).map_err(|_| ParamError::Invalid { name, value: s.to_string() })
+    let dur = humantime::parse_duration(s).map_err(|_| ParamError::Invalid {
+        name,
+        value: s.to_string(),
+    })?;
+    i64::try_from(dur.as_millis()).map_err(|_| ParamError::Invalid {
+        name,
+        value: s.to_string(),
+    })
 }
 
 fn seconds_to_ms(name: &'static str, raw: &str, secs: f64) -> Result<i64, ParamError> {
     if !secs.is_finite() {
-        return Err(ParamError::Invalid { name, value: raw.to_string() });
+        return Err(ParamError::Invalid {
+            name,
+            value: raw.to_string(),
+        });
     }
     let ms = secs * 1000.0;
     if ms < i64::MIN as f64 || ms > i64::MAX as f64 {
-        return Err(ParamError::Invalid { name, value: raw.to_string() });
+        return Err(ParamError::Invalid {
+            name,
+            value: raw.to_string(),
+        });
     }
     Ok(ms as i64)
 }
@@ -145,7 +167,10 @@ pub fn parse_deadline(params: &Params, default: Duration) -> Result<Duration, Pa
         Some(s) => {
             let ms = parse_duration_ms("timeout", s)?;
             if ms <= 0 {
-                return Err(ParamError::Invalid { name: "timeout", value: s.to_string() });
+                return Err(ParamError::Invalid {
+                    name: "timeout",
+                    value: s.to_string(),
+                });
             }
             Ok(Duration::from_millis(ms as u64))
         }

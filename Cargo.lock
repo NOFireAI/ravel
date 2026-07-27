@@ -2103,18 +2103,26 @@ dependencies = [
 name = "ravel-query"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "futures",
+ "humantime",
+ "promql-parser",
  "proptest",
  "ravel-catalog",
+ "ravel-commit",
  "ravel-object-store",
  "ravel-promql",
  "ravel-segment",
  "ravel-test-util",
  "ravel-types",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

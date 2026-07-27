@@ -1,7 +1,6 @@
 //! Prometheus-compatible HTTP handlers (docs/query-engine.md "HTTP API").
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
 
 use axum::extract::{Path, Request, State};
 use axum::http::{Method, StatusCode};
@@ -13,7 +12,9 @@ use ravel_types::{LabelSet, SeriesId, TimeRange};
 
 use crate::engine::parse_match_selector;
 use crate::http::error::ApiError;
-use crate::http::json::{ApiResponse, instant_vector_to_json, range_matrix_to_json, series_to_json};
+use crate::http::json::{
+    ApiResponse, instant_vector_to_json, range_matrix_to_json, series_to_json,
+};
 use crate::http::params::{Params, decode_commit_tokens, parse_deadline, parse_timestamp_ms};
 use crate::http::{AppState, ONE_HOUR_NS};
 
@@ -35,7 +36,10 @@ async fn read_params(req: Request<Body>) -> Result<Params, ApiError> {
     } else {
         None
     };
-    Ok(Params::parse(query_string.as_deref(), body_bytes.as_deref()))
+    Ok(Params::parse(
+        query_string.as_deref(),
+        body_bytes.as_deref(),
+    ))
 }
 
 fn now_ns() -> i64 {
@@ -112,7 +116,16 @@ async fn handle_query_range(
 
     let matrix = state
         .engine
-        .range(tenant_hash, query, start_ms, end_ms, step_ms, &min_tokens, now, deadline)
+        .range(
+            tenant_hash,
+            query,
+            start_ms,
+            end_ms,
+            step_ms,
+            &min_tokens,
+            now,
+            deadline,
+        )
         .await?;
     Ok(range_matrix_to_json(matrix))
 }
@@ -189,7 +202,9 @@ async fn handle_series(
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
     if params.all("match[]").is_empty() {
-        return Err(ApiError::BadData("missing required parameter \"match[]\"".to_string()));
+        return Err(ApiError::BadData(
+            "missing required parameter \"match[]\"".to_string(),
+        ));
     }
     let series = resolve_matched_series(state, tenant_hash, &params).await?;
     Ok(series_to_json(series))

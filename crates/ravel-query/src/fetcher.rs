@@ -18,7 +18,9 @@ use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 mod section_kind {
     pub const LABEL_DICT: u32 = 1;
     pub const SERIES_TABLE: u32 = 2;
+    #[allow(dead_code)] // completeness with the format doc; reads go via SeriesEntry offsets
     pub const TS_PAGES: u32 = 3;
+    #[allow(dead_code)]
     pub const VAL_PAGES: u32 = 4;
 }
 
@@ -89,7 +91,7 @@ impl FetchedRegions {
             if *s <= offset && end <= s.saturating_add(b.len() as u64) {
                 let start_rel = usize::try_from(offset - s).ok()?;
                 let end_rel = usize::try_from(end - s).ok()?;
-                b.get(start_rel..end_rel).map(|s| Bytes::copy_from_slice(s))
+                b.get(start_rel..end_rel).map(Bytes::copy_from_slice)
             } else {
                 None
             }
@@ -104,11 +106,11 @@ fn coalesce_ranges(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)>
     ranges.sort_by_key(|r| r.0);
     let mut out: Vec<(u64, u64)> = Vec::new();
     for (start, end) in ranges {
-        if let Some(last) = out.last_mut() {
-            if start <= last.1.saturating_add(max_gap) {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && start <= last.1.saturating_add(max_gap)
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         out.push((start, end));
     }
@@ -126,6 +128,7 @@ fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
 /// Fetches and decodes one segment at a time: suffix-GET the footer, verify
 /// identity, prune series by matchers, plan and coalesce page ranges, decode
 /// selected pages. See docs/query-engine.md "Flow" for the full contract.
+#[derive(Clone)]
 pub struct SegmentFetcher {
     store: std::sync::Arc<dyn ObjectStoreBackend>,
     suffix_len: u64,
@@ -255,11 +258,20 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<SeriesEntry>, FetchError> {
-        let (ld_off, ld_len) = section_range(footer, section_kind::LABEL_DICT)
-            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::MissingSection("LABEL_DICT")))?;
-        let (st_off, st_len) = section_range(footer, section_kind::SERIES_TABLE).ok_or_else(|| {
-            corrupt(key, ravel_segment::SegmentError::MissingSection("SERIES_TABLE"))
-        })?;
+        let (ld_off, ld_len) =
+            section_range(footer, section_kind::LABEL_DICT).ok_or_else(|| {
+                corrupt(
+                    key,
+                    ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+                )
+            })?;
+        let (st_off, st_len) =
+            section_range(footer, section_kind::SERIES_TABLE).ok_or_else(|| {
+                corrupt(
+                    key,
+                    ravel_segment::SegmentError::MissingSection("SERIES_TABLE"),
+                )
+            })?;
         self.ensure_ranges(
             key,
             suffix_etag,
