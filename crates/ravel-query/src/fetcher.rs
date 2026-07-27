@@ -8,14 +8,16 @@ use ravel_object_store::{Etag, GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
     ExpectedIdentity, Footer, FooterOutcome, ReaderLimits, SeriesEntry, ValPageKind,
-    check_identity, decode_catalog, decode_pages, decode_pages_soa, open_from_suffix, plan_ranges,
-    select,
+    check_identity, decode_catalog, decode_catalog_v2, decode_pages, decode_pages_soa,
+    open_from_suffix, plan_ranges, select,
 };
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 
 /// Section kinds from docs/segment-format.md. Not exported by `ravel-segment`
 /// (its `format` module is private); these values are a persistent,
 /// documented part of the on-disk contract, not an implementation detail.
+/// Kinds 1-4 are v1 (SERIES_TABLE only exists in v1 objects); 5/6 are v2
+/// only (docs/segment-format.md "RSEG v2 amendment", ADR-0014).
 mod section_kind {
     pub const LABEL_DICT: u32 = 1;
     pub const SERIES_TABLE: u32 = 2;
@@ -23,6 +25,8 @@ mod section_kind {
     pub const TS_PAGES: u32 = 3;
     #[allow(dead_code)]
     pub const VAL_PAGES: u32 = 4;
+    pub const SERIES_IDS: u32 = 5;
+    pub const SERIES_META: u32 = 6;
 }
 
 /// Default suffix length fetched on the first GET of a segment object.
@@ -231,12 +235,16 @@ impl SegmentFetcher {
     }
 
     /// Opens a segment: suffix-GET, chase `NeedRange` for the footer if
-    /// necessary, and verify identity against `expected`.
+    /// necessary, and verify identity against `expected`. Returns the
+    /// trailer `version` (1 or 2) alongside the footer so callers can
+    /// dispatch `decode_selected` on it (docs/segment-format.md "RSEG v2
+    /// amendment": v1 and v2 objects coexist indefinitely, no compactor
+    /// exists yet to retire v1 objects).
     async fn open_segment(
         &self,
         key: &str,
         expected: &ExpectedIdentity,
-    ) -> Result<(Footer, Etag, FetchedRegions), FetchError> {
+    ) -> Result<(Footer, u16, Etag, FetchedRegions), FetchError> {
         let first = self
             .store
             .get(key, GetRange::Suffix(self.suffix_len))
@@ -251,10 +259,10 @@ impl SegmentFetcher {
         let first_start = total_size.saturating_sub(first.data.len() as u64);
         regions.insert(first_start, first.data.clone());
 
-        let footer = match open_from_suffix(&first.data, total_size, self.limits)
+        let (footer, version) = match open_from_suffix(&first.data, total_size, self.limits)
             .map_err(|source| corrupt(key, source))?
         {
-            FooterOutcome::Ready(loc) => loc.footer,
+            FooterOutcome::Ready(loc) => (loc.footer, loc.version),
             FooterOutcome::NeedRange { offset, len } => {
                 let got = self
                     .store
@@ -273,7 +281,7 @@ impl SegmentFetcher {
                 match open_from_suffix(&got.data, total_size, self.limits)
                     .map_err(|source| corrupt(key, source))?
                 {
-                    FooterOutcome::Ready(loc) => loc.footer,
+                    FooterOutcome::Ready(loc) => (loc.footer, loc.version),
                     FooterOutcome::NeedRange { .. } => {
                         return Err(corrupt(key, ravel_segment::SegmentError::Truncated));
                     }
@@ -282,50 +290,117 @@ impl SegmentFetcher {
         };
 
         check_identity(&footer, expected).map_err(|source| corrupt(key, source))?;
-        Ok((footer, suffix_etag, regions))
+        Ok((footer, version, suffix_etag, regions))
     }
 
-    /// Decodes LABEL_DICT/SERIES_TABLE and returns the series matching
-    /// `matchers`, fetching whatever byte ranges are not already covered by
-    /// `regions`.
+    /// Decodes the catalog and returns the series matching `matchers`,
+    /// fetching whatever byte ranges are not already covered by `regions`.
+    /// Version-dispatched (docs/segment-format.md "RSEG v2 amendment"): v1
+    /// fetches LABEL_DICT+SERIES_TABLE and decodes via `decode_catalog`,
+    /// unchanged from before v2 existed; v2 fetches
+    /// LABEL_DICT+SERIES_IDS+SERIES_META and decodes via `decode_catalog_v2`.
+    /// Both produce the same `SeriesEntry` shape, so everything downstream
+    /// of this function (`select`, `plan_ranges`, page decode) is
+    /// version-blind.
     async fn decode_selected(
         &self,
         key: &str,
         footer: &Footer,
+        version: u16,
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<SeriesEntry>, FetchError> {
-        let (ld_off, ld_len) =
-            section_range(footer, section_kind::LABEL_DICT).ok_or_else(|| {
-                corrupt(
+        let entries = match version {
+            1 => {
+                let (ld_off, ld_len) =
+                    section_range(footer, section_kind::LABEL_DICT).ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+                        )
+                    })?;
+                let (st_off, st_len) = section_range(footer, section_kind::SERIES_TABLE)
+                    .ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("SERIES_TABLE"),
+                        )
+                    })?;
+                self.ensure_ranges(
                     key,
-                    ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+                    suffix_etag,
+                    &[(ld_off, ld_off + ld_len), (st_off, st_off + st_len)],
+                    regions,
                 )
-            })?;
-        let (st_off, st_len) =
-            section_range(footer, section_kind::SERIES_TABLE).ok_or_else(|| {
-                corrupt(
+                .await?;
+                let label_dict_bytes = regions
+                    .slice(ld_off, ld_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let series_table_bytes = regions
+                    .slice(st_off, st_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                decode_catalog(footer, &label_dict_bytes, &series_table_bytes, self.limits)
+                    .map_err(|source| corrupt(key, source))?
+            }
+            2 => {
+                let (ld_off, ld_len) =
+                    section_range(footer, section_kind::LABEL_DICT).ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+                        )
+                    })?;
+                let (si_off, si_len) =
+                    section_range(footer, section_kind::SERIES_IDS).ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
+                        )
+                    })?;
+                let (sm_off, sm_len) = section_range(footer, section_kind::SERIES_META)
+                    .ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("SERIES_META"),
+                        )
+                    })?;
+                self.ensure_ranges(
                     key,
-                    ravel_segment::SegmentError::MissingSection("SERIES_TABLE"),
+                    suffix_etag,
+                    &[
+                        (ld_off, ld_off + ld_len),
+                        (si_off, si_off + si_len),
+                        (sm_off, sm_off + sm_len),
+                    ],
+                    regions,
                 )
-            })?;
-        self.ensure_ranges(
-            key,
-            suffix_etag,
-            &[(ld_off, ld_off + ld_len), (st_off, st_off + st_len)],
-            regions,
-        )
-        .await?;
-        let label_dict_bytes = regions
-            .slice(ld_off, ld_len)
-            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-        let series_table_bytes = regions
-            .slice(st_off, st_len)
-            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-
-        let entries = decode_catalog(footer, &label_dict_bytes, &series_table_bytes, self.limits)
-            .map_err(|source| corrupt(key, source))?;
+                .await?;
+                let label_dict_bytes = regions
+                    .slice(ld_off, ld_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let series_ids_bytes = regions
+                    .slice(si_off, si_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let series_meta_bytes = regions
+                    .slice(sm_off, sm_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                decode_catalog_v2(
+                    footer,
+                    &label_dict_bytes,
+                    &series_ids_bytes,
+                    &series_meta_bytes,
+                    self.limits,
+                )
+                .map_err(|source| corrupt(key, source))?
+            }
+            other => {
+                return Err(corrupt(
+                    key,
+                    ravel_segment::SegmentError::UnsupportedVersion(other),
+                ));
+            }
+        };
         let predicate: &dyn Fn(&LabelSet) -> bool = &|labels| matches_series(matchers, labels);
         Ok(select(&entries, &[], Some(predicate))
             .into_iter()
@@ -344,8 +419,8 @@ impl SegmentFetcher {
     ) -> Result<Vec<SeriesEntry>, FetchError> {
         let key = &seg_ref.data_object_key;
         let expected = expected_identity(tenant_hash, seg_ref);
-        let (footer, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
-        self.decode_selected(key, &footer, &suffix_etag, &mut regions, matchers)
+        let (footer, version, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
+        self.decode_selected(key, &footer, version, &suffix_etag, &mut regions, matchers)
             .await
     }
 
@@ -359,9 +434,9 @@ impl SegmentFetcher {
     ) -> Result<Vec<FetchedSeries>, FetchError> {
         let key = &seg_ref.data_object_key;
         let expected = expected_identity(tenant_hash, seg_ref);
-        let (footer, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
+        let (footer, version, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
         let entries = self
-            .decode_selected(key, &footer, &suffix_etag, &mut regions, matchers)
+            .decode_selected(key, &footer, version, &suffix_etag, &mut regions, matchers)
             .await?;
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -418,9 +493,9 @@ impl SegmentFetcher {
     ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
         let key = &seg_ref.data_object_key;
         let expected = expected_identity(tenant_hash, seg_ref);
-        let (footer, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
+        let (footer, version, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
         let entries = self
-            .decode_selected(key, &footer, &suffix_etag, &mut regions, matchers)
+            .decode_selected(key, &footer, version, &suffix_etag, &mut regions, matchers)
             .await?;
         if entries.is_empty() {
             return Ok((Vec::new(), FetchStats::default()));
@@ -636,5 +711,225 @@ mod tests {
         // raw-f64 bytes (6-byte header + 2 * 8-byte values).
         assert_eq!(stats.raw_f64_pages, 1);
         assert_eq!(stats.raw_f64_bytes, 6 + 2 * 8);
+    }
+
+    // --- RSEG v2 fetch tests (docs/segment-format.md "RSEG v2 amendment",
+    // docs/rseg-v2-plan.md phase P3, issue #31): same MemoryStore-backed
+    // pattern as the v1 tests above, constructing the object via
+    // `SegmentWriter::write_v2` instead of `write`. `fetch`/`fetch_soa`
+    // never branch on version explicitly (only `open_segment` and
+    // `decode_selected` do), so these tests are the proof that dispatch
+    // actually reaches `decode_catalog_v2` for a real v2 object end to end
+    // (suffix GET -> footer -> section GETs -> catalog decode -> page
+    // decode), not just that `ravel-segment`'s decoder works in isolation.
+
+    /// Builds a real RSEG v2 object (same two-series shape as
+    /// `write_test_segment`: one Gorilla-friendly series, one that forces
+    /// VAL_RAW_F64) and its matching `SegmentRef`, without putting it on
+    /// any store -- callers choose the backend (plain `MemoryStore`,
+    /// `MemoryStore::with_page_size`, or a `FaultStore`-wrapped one).
+    fn build_v2_segment() -> (bytes::Bytes, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([7u8; 16]);
+        let writer_id = Uuid::from_u128(2);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let smooth = series(
+            "smooth_metric",
+            &[(1_000 * NS, 1.0), (1_001 * NS, 1.0), (1_002 * NS, 1.0)],
+        );
+        let chaotic = series(
+            "chaotic_metric",
+            &[(1_000 * NS, 0.0), (1_001 * NS, f64::from_bits(u64::MAX))],
+        );
+        let written = SegmentWriter::write_v2(vec![smooth, chaotic], identity, bounds)
+            .expect("write v2 segment");
+
+        let key = "test/segment_v2.rseg";
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 42,
+        };
+        (written.bytes, tenant_hash, seg_ref)
+    }
+
+    /// Asserts the shape `write_test_segment`/`build_v2_segment` both
+    /// produce: two series ("smooth_metric" Gorilla-coded, "chaotic_metric"
+    /// forced to VAL_RAW_F64), decoded correctly regardless of which
+    /// section kinds backed the catalog.
+    fn assert_two_metric_fetch(fetched: &mut [FetchedSeries]) {
+        assert_eq!(fetched.len(), 2);
+        fetched.sort_by_key(|s| s.labels.get("__name__").map(str::to_string));
+        assert_eq!(fetched[0].labels.get("__name__"), Some("chaotic_metric"));
+        assert_eq!(fetched[0].samples.len(), 2);
+        assert_eq!(
+            fetched[0].samples[1].value.to_bits(),
+            f64::from_bits(u64::MAX).to_bits()
+        );
+        assert_eq!(fetched[1].labels.get("__name__"), Some("smooth_metric"));
+        assert_eq!(fetched[1].samples.len(), 3);
+        for s in &fetched[1].samples {
+            assert_eq!(s.value.to_bits(), 1.0f64.to_bits());
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_decodes_v2_segments_via_memory_store() {
+        let (bytes, tenant_hash, seg_ref) = build_v2_segment();
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(&seg_ref.data_object_key, bytes, PutOptions::default())
+            .await
+            .expect("put v2 segment object");
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        let mut fetched = fetcher
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch v2 segment");
+        assert_two_metric_fetch(&mut fetched);
+
+        // fetch_series (labels-only, no page GETs) must agree on identity
+        // and label sets with the full fetch above.
+        let mut series_only = fetcher
+            .fetch_series(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_series v2 segment");
+        series_only.sort_by_key(|e| e.series_id.0);
+        let mut full_ids: Vec<_> = fetched.iter().map(|f| f.series_id).collect();
+        full_ids.sort_by_key(|id| id.0);
+        assert_eq!(
+            series_only.iter().map(|e| e.series_id).collect::<Vec<_>>(),
+            full_ids
+        );
+
+        // fetch_soa must decode the same bytes to the same values and
+        // still count the VAL_RAW_F64 page.
+        let (mut soa, stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa v2 segment");
+        assert_eq!(soa.len(), 2);
+        soa.sort_by_key(|s| s.labels.get("__name__").map(str::to_string));
+        assert_eq!(soa[0].labels.get("__name__"), Some("chaotic_metric"));
+        assert_eq!(soa[1].labels.get("__name__"), Some("smooth_metric"));
+        assert_eq!(stats.raw_f64_pages, 1);
+        assert_eq!(stats.raw_f64_bytes, 6 + 2 * 8);
+    }
+
+    /// `MemoryStore::with_page_size` shrinks the store's *listing* page
+    /// size; the fetch path here never calls `list`/`list_delimited` (it
+    /// resolves the object purely by key, via suffix and range GETs), so
+    /// this knob is a no-op for `SegmentFetcher`. Included because the
+    /// ticket asks for it explicitly; the assertions are the same as the
+    /// plain-`MemoryStore` test above, run against a store constructed
+    /// with a tiny page size to document that it makes no difference here.
+    #[tokio::test]
+    async fn fetch_decodes_v2_segments_with_small_store_page_size() {
+        let (bytes, tenant_hash, seg_ref) = build_v2_segment();
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        store
+            .put(&seg_ref.data_object_key, bytes, PutOptions::default())
+            .await
+            .expect("put v2 segment object");
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        let mut fetched = fetcher
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch v2 segment");
+        assert_two_metric_fetch(&mut fetched);
+    }
+
+    /// Fault injection targeted at the v2 catalog section GET specifically,
+    /// not just "some GET on this object". With `with_suffix_len(64)` (well
+    /// under this fixture's ~400-byte object size), a successful
+    /// `fetch_series` (no page GETs, isolating `open_segment` +
+    /// `decode_selected`) makes exactly 3 `Get` calls: (1) the initial
+    /// suffix, (2) `open_segment`'s `NeedRange` chase for the footer, (3)
+    /// `decode_selected`'s v2-branch GET for LABEL_DICT+SERIES_IDS+
+    /// SERIES_META (coalesced into one range, since v2 writes them
+    /// contiguously). Verified empirically (not assumed) by sweeping
+    /// `Occurrence::Nth(1..=6)` against this exact fixture: Nth(1..=3) each
+    /// independently caused the fetch to fail, Nth(4)+ never fired. `Nth(3)`
+    /// is therefore the call that only happens once the v2 catalog decode
+    /// path has been reached -- unlike `Occurrence::Always`, which would
+    /// equally fail on call 1 (the footer suffix GET) and prove nothing
+    /// v2-specific. A control run with the same `with_suffix_len(64)` and
+    /// no fault plan confirms the multi-GET sequence is real and would
+    /// otherwise succeed, so the failure below is attributable to the
+    /// injected fault, not some other reason the 3rd GET might fail.
+    #[tokio::test]
+    async fn fetch_v2_segment_catalog_get_fault_is_surfaced_and_counted() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+
+        let (bytes, tenant_hash, seg_ref) = build_v2_segment();
+
+        // Control: same multi-GET setup, no fault, must succeed -- proves
+        // call #3 exists and is reachable absent the injected fault.
+        let control_inner = MemoryStore::new();
+        control_inner
+            .put(
+                &seg_ref.data_object_key,
+                bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2 segment object");
+        let control_backend: Arc<dyn ObjectStoreBackend> = Arc::new(control_inner);
+        let control_fetcher = SegmentFetcher::new(control_backend).with_suffix_len(64);
+        control_fetcher
+            .fetch_series(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("control fetch (no fault) must succeed");
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
+                .with_key_contains(seg_ref.data_object_key.clone())
+                .with_occurrence(Occurrence::Nth(3)),
+        );
+        let inner = MemoryStore::new();
+        inner
+            .put(&seg_ref.data_object_key, bytes, PutOptions::default())
+            .await
+            .expect("put v2 segment object");
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SegmentFetcher::new(backend).with_suffix_len(64);
+
+        let result = fetcher.fetch_series(tenant_hash, &seg_ref, &[]).await;
+        assert!(
+            matches!(result, Err(FetchError::Store { .. })),
+            "expected a store error, got {result:?}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "expected the injected fault to have fired exactly once"
+        );
     }
 }

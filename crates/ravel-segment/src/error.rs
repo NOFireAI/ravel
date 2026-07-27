@@ -98,4 +98,32 @@ pub enum SegmentError {
     Labels(#[from] ravel_types::TypeError),
     #[error("identity mismatch on field {0}")]
     IdentityMismatch(&'static str),
+
+    // --- RSEG v2 only (ADR-0014, docs/segment-format.md "RSEG v2
+    // amendment"): SERIES_IDS / SERIES_META decode. v1 objects never
+    // produce these. ---
+    #[error("SERIES_IDS entries are not strictly ascending by series_id bytes")]
+    SeriesIdsUnsorted,
+    #[error(
+        "series count mismatch: SERIES_IDS={series_ids} SERIES_META={series_meta} footer={footer}"
+    )]
+    SeriesCountMismatch {
+        series_ids: u64,
+        series_meta: u64,
+        footer: u64,
+    },
+    #[error("SERIES_META column block does not consume exactly its declared block_len")]
+    BadBlockLen,
+    #[error("SERIES_META schema_ref {0} out of range")]
+    SchemaRefOutOfRange(u64),
+    #[error("SERIES_META schema name_count {0} exceeds 65535")]
+    SchemaNameCountTooLarge(u64),
+    #[error(
+        "SERIES_META schema name_ord sequence is not strictly ascending by referenced name bytes"
+    )]
+    SchemaNamesUnsorted,
+    #[error("SERIES_META sample_count is zero")]
+    ZeroSampleCount,
+    #[error("SERIES_META timestamp bounds arithmetic overflowed i64")]
+    TimestampBoundsOverflow,
 }
