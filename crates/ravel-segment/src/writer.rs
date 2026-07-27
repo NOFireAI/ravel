@@ -468,6 +468,38 @@ impl Hasher for FnvHasher {
     }
 }
 
+/// Capacity hint for the schema-keyed name memo (issue #95). The distinct
+/// schema count is not known up front; it is bounded by the series count but
+/// is usually far smaller (a handful of shared label-name lists). Cap the
+/// reservation so the common few-schema case does not over-allocate while
+/// still avoiding rehash growth for realistic schema counts; beyond the cap
+/// the map grows on its own, which is cheap relative to the interner pass.
+fn schema_memo_capacity(series: &[SeriesInput]) -> usize {
+    series.len().min(1024)
+}
+
+/// Interns one string into the v1 dictionary interner, returning its
+/// distinct index (the pre-rank ordinal). New strings are appended to
+/// `distinct` in first-occurrence order; the final sorted ranks are assigned
+/// later. Extracted so the schema-memo fast path and slow path share one
+/// probe implementation.
+#[inline]
+fn intern_distinct<'a>(
+    interner: &mut HashMap<&'a str, u32, BuildHasherDefault<FnvHasher>>,
+    distinct: &mut Vec<&'a str>,
+    text: &'a str,
+) -> Result<u32, WriteError> {
+    match interner.entry(text) {
+        std::collections::hash_map::Entry::Occupied(e) => Ok(*e.get()),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let id = u32::try_from(distinct.len()).map_err(|_| WriteError::TooManyDictStrings)?;
+            distinct.push(text);
+            e.insert(id);
+            Ok(id)
+        }
+    }
+}
+
 /// Dictionary build result: the ordinal-ordered strings and the
 /// pre-resolved ordinal of every label-string occurrence in series
 /// iteration order (name, then value, per label).
@@ -491,28 +523,64 @@ struct Dictionary<'a> {
 /// distinct strings are sorted (with a big-endian 8-byte prefix key to
 /// keep most comparisons integer-sized), instead of feeding every
 /// occurrence through a BTreeSet.
+///
+/// Schema-keyed name interning (issue #95): a series' ordered label-name
+/// list is memoized to the distinct-index list it resolved to. A series
+/// whose name list was already seen does one memo lookup instead of one
+/// interner probe per name. Because `write` sorts the batch by series id,
+/// equal schemas are not adjacent, so the memo is a map keyed by the
+/// name-list content, not a last-seen check. v1 output is order-independent
+/// (the distinct set is sorted below regardless of insertion order), so the
+/// memo cannot change the emitted bytes; it only removes redundant probes.
 fn build_dictionary(series: &[SeriesInput]) -> Result<Dictionary<'_>, WriteError> {
     let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
+    // `interner` is pre-sized to the occurrence upper bound (distinct count
+    // <= occurrences) and `occurrence_ordinals` to the exact occurrence count.
+    // `distinct` is left to grow: its final length is the distinct-string
+    // count, well below `total_strings`, so reserving the upper bound commits
+    // far more pages than it fills and costs more than the doubling reallocs
+    // it would avoid (measured on the bench host, issue #95). `schema_memo` is
+    // pre-sized to a bounded estimate of the distinct schema count.
     let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
         HashMap::with_capacity_and_hasher(total_strings, BuildHasherDefault::default());
     let mut distinct: Vec<&str> = Vec::new();
     let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
+    let mut schema_memo: HashMap<Vec<&str>, Vec<u32>, BuildHasherDefault<FnvHasher>> =
+        HashMap::with_capacity_and_hasher(
+            schema_memo_capacity(series),
+            BuildHasherDefault::default(),
+        );
+    let mut name_key: Vec<&str> = Vec::new();
 
     for s in series {
-        for label in s.labels.iter() {
-            for text in [label.name.as_str(), label.value.as_str()] {
-                let id = match interner.entry(text) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let id = u32::try_from(distinct.len())
-                            .map_err(|_| WriteError::TooManyDictStrings)?;
-                        distinct.push(text);
-                        e.insert(id);
-                        id
-                    }
-                };
-                occurrence_ordinals.push(id);
+        name_key.clear();
+        name_key.extend(s.labels.iter().map(|l| l.name.as_str()));
+
+        if let Some(name_ords) = schema_memo.get(name_key.as_slice()) {
+            // Fast path: every name in this schema is already interned (the
+            // schema appeared on an earlier series), so only the values need
+            // probing. Emitting the memoized name indices while interning the
+            // values in the same interleaved order leaves the distinct set,
+            // and therefore the sorted output, byte-identical to the slow
+            // path below.
+            for (label, &name_id) in s.labels.iter().zip(name_ords.iter()) {
+                occurrence_ordinals.push(name_id);
+                let value_id = intern_distinct(&mut interner, &mut distinct, label.value.as_str())?;
+                occurrence_ordinals.push(value_id);
             }
+        } else {
+            // Slow path: first sighting of this schema. Intern name and value
+            // interleaved exactly as the original single-pass loop did, and
+            // record the resolved name indices for later repeats.
+            let mut name_ords: Vec<u32> = Vec::with_capacity(s.labels.len());
+            for label in s.labels.iter() {
+                let name_id = intern_distinct(&mut interner, &mut distinct, label.name.as_str())?;
+                let value_id = intern_distinct(&mut interner, &mut distinct, label.value.as_str())?;
+                occurrence_ordinals.push(name_id);
+                occurrence_ordinals.push(value_id);
+                name_ords.push(name_id);
+            }
+            schema_memo.insert(name_key.clone(), name_ords);
         }
     }
 
@@ -760,31 +828,75 @@ struct DictionaryV2<'a> {
 /// as v1 does with its sort-then-rank pass.
 fn build_dictionary_v2(series: &[SeriesInput]) -> Result<DictionaryV2<'_>, WriteError> {
     let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
+    // Pre-size the interner to the occurrence upper bound (`+1` for the
+    // preseeded __name__) and the schema memo to a bounded distinct-schema
+    // estimate, to avoid rehash growth (issue #95). `order` is left to grow:
+    // it holds one entry per distinct string, well below `total_strings`, so
+    // reserving the upper bound commits far more pages than it fills and costs
+    // more than the doubling reallocs it would avoid (measured on the bench
+    // host).
     let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
         HashMap::with_capacity_and_hasher(total_strings + 1, BuildHasherDefault::default());
     interner.insert(METRIC_NAME_LABEL, 0);
+
+    // Schema-keyed name interning (issue #95): a series' ordered label-name
+    // list is memoized to the ordinals it resolved to, so a repeat schema
+    // does one map lookup instead of one interner probe per name. `write_v2`
+    // sorts the batch by series id, so equal schemas are not adjacent; the
+    // memo is a content-keyed map, never a last-seen check.
+    //
+    // First-occurrence ordinal order is the v2 LABEL_DICT order and MUST stay
+    // byte-identical. The fast path is only taken when the schema was seen
+    // before, which means every one of its names is already interned, so it
+    // assigns no new name ordinals; it interns the values in the same
+    // interleaved order the slow path uses. The sequence of newly assigned
+    // ordinals is therefore identical to the original single-pass loop.
+    let mut schema_memo: HashMap<Vec<&str>, Vec<u32>, BuildHasherDefault<FnvHasher>> =
+        HashMap::with_capacity_and_hasher(
+            schema_memo_capacity(series),
+            BuildHasherDefault::default(),
+        );
+    let mut name_key: Vec<&str> = Vec::new();
 
     let mut order: Vec<&str> = Vec::new();
     let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
     let mut next_ordinal: u32 = 1;
 
     for s in series {
-        for label in s.labels.iter() {
-            for text in [label.name.as_str(), label.value.as_str()] {
-                let id = match interner.entry(text) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let id = next_ordinal;
-                        next_ordinal = next_ordinal
-                            .checked_add(1)
-                            .ok_or(WriteError::TooManyDictStrings)?;
-                        order.push(text);
-                        e.insert(id);
-                        id
-                    }
-                };
-                occurrence_ordinals.push(id);
+        name_key.clear();
+        name_key.extend(s.labels.iter().map(|l| l.name.as_str()));
+
+        if let Some(name_ords) = schema_memo.get(name_key.as_slice()) {
+            for (label, &name_ord) in s.labels.iter().zip(name_ords.iter()) {
+                occurrence_ordinals.push(name_ord);
+                let value_id = intern_v2(
+                    &mut interner,
+                    &mut order,
+                    &mut next_ordinal,
+                    label.value.as_str(),
+                )?;
+                occurrence_ordinals.push(value_id);
             }
+        } else {
+            let mut name_ords: Vec<u32> = Vec::with_capacity(s.labels.len());
+            for label in s.labels.iter() {
+                let name_id = intern_v2(
+                    &mut interner,
+                    &mut order,
+                    &mut next_ordinal,
+                    label.name.as_str(),
+                )?;
+                let value_id = intern_v2(
+                    &mut interner,
+                    &mut order,
+                    &mut next_ordinal,
+                    label.value.as_str(),
+                )?;
+                occurrence_ordinals.push(name_id);
+                occurrence_ordinals.push(value_id);
+                name_ords.push(name_id);
+            }
+            schema_memo.insert(name_key.clone(), name_ords);
         }
     }
 
@@ -793,6 +905,33 @@ fn build_dictionary_v2(series: &[SeriesInput]) -> Result<DictionaryV2<'_>, Write
         occurrence_ordinals,
         count: next_ordinal,
     })
+}
+
+/// Interns one string into the v2 dictionary interner, returning its on-disk
+/// ordinal. New strings are appended to `order` (first-occurrence order,
+/// which is the v2 LABEL_DICT order) and assigned the next ordinal.
+/// `__name__` is preseeded to ordinal 0 by the caller, so it is never
+/// appended here. Extracted so the schema-memo fast and slow paths share one
+/// probe implementation.
+#[inline]
+fn intern_v2<'a>(
+    interner: &mut HashMap<&'a str, u32, BuildHasherDefault<FnvHasher>>,
+    order: &mut Vec<&'a str>,
+    next_ordinal: &mut u32,
+    text: &'a str,
+) -> Result<u32, WriteError> {
+    match interner.entry(text) {
+        std::collections::hash_map::Entry::Occupied(e) => Ok(*e.get()),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let id = *next_ordinal;
+            *next_ordinal = next_ordinal
+                .checked_add(1)
+                .ok_or(WriteError::TooManyDictStrings)?;
+            order.push(text);
+            e.insert(id);
+            Ok(id)
+        }
+    }
 }
 
 /// Grammar identical to v1's `encode_label_dict` (count:u32, then
@@ -939,18 +1078,26 @@ fn build_series_meta_v2(
 ) -> Result<Vec<u8>, WriteError> {
     let count = u32::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
 
-    let mut schema_index: HashMap<Vec<u32>, u32> = HashMap::new();
-    let mut schemas: Vec<Vec<u32>> = Vec::new();
+    // Pre-size the schema dedup structures and every column buffer from input
+    // statistics (series count, one value ordinal per label) so the per-series
+    // loop below never triggers a rehash or a buffer realloc (issue #95).
+    // Per-series columns hold one varint per series (most are a single byte);
+    // the value-ordinal column holds one varint per label pair.
+    let series_len = series.len();
+    let value_ord_count = occurrence_ordinals.len() / 2;
+    let mut schema_index: HashMap<Vec<u32>, u32> =
+        HashMap::with_capacity(schema_memo_capacity(series));
+    let mut schemas: Vec<Vec<u32>> = Vec::with_capacity(schema_memo_capacity(series));
 
-    let mut col_schema_ref: Vec<u8> = Vec::new();
-    let mut col_value_ord: Vec<u8> = Vec::new();
-    let mut col_sample_count: Vec<u8> = Vec::new();
-    let mut col_min_ts_delta: Vec<u8> = Vec::new();
-    let mut col_ts_span: Vec<u8> = Vec::new();
-    let mut col_ts_page_gap: Vec<u8> = Vec::new();
-    let mut col_ts_page_len: Vec<u8> = Vec::new();
-    let mut col_val_page_gap: Vec<u8> = Vec::new();
-    let mut col_val_page_len: Vec<u8> = Vec::new();
+    let mut col_schema_ref: Vec<u8> = Vec::with_capacity(series_len);
+    let mut col_value_ord: Vec<u8> = Vec::with_capacity(value_ord_count * 2);
+    let mut col_sample_count: Vec<u8> = Vec::with_capacity(series_len);
+    let mut col_min_ts_delta: Vec<u8> = Vec::with_capacity(series_len * 2);
+    let mut col_ts_span: Vec<u8> = Vec::with_capacity(series_len * 2);
+    let mut col_ts_page_gap: Vec<u8> = Vec::with_capacity(series_len);
+    let mut col_ts_page_len: Vec<u8> = Vec::with_capacity(series_len);
+    let mut col_val_page_gap: Vec<u8> = Vec::with_capacity(series_len);
+    let mut col_val_page_len: Vec<u8> = Vec::with_capacity(series_len);
 
     let mut ts_scratch: Vec<i64> = Vec::new();
     let mut val_scratch: Vec<f64> = Vec::new();
@@ -1460,6 +1607,116 @@ mod v2_tests {
             &vec![ord("a1"), ord("r1"), ord("z2")],
             "value_ord must stay positionally paired with its own schema name, in the \
              same name-byte order"
+        );
+    }
+
+    /// Two series sharing an identical label-name list must resolve to the
+    /// same name ordinals through the schema memo (issue #95), even when a
+    /// series with a different name list sits between them so the shared
+    /// schema is not adjacent. This is the map-not-last-seen requirement: a
+    /// last-seen check would miss series C's repeat of series A's schema.
+    #[test]
+    fn shared_name_list_resolves_to_identical_ordinals_via_memo() {
+        let mk = |id: u8, labels: Vec<Label>, val: f64| SeriesInput {
+            series_id: SeriesId([id; 16]),
+            labels: LabelSet::new(labels).expect("valid labels"),
+            samples: vec![Sample {
+                ts_ns: 0,
+                value: val,
+            }],
+        };
+        // A and C share names {__name__, region, zone}; B breaks adjacency
+        // with a different name list. Values differ throughout so the shared
+        // ordinals cannot come from the series being trivially identical.
+        let series = vec![
+            mk(
+                0x01,
+                vec![
+                    Label {
+                        name: METRIC_NAME_LABEL.to_string(),
+                        value: "m_a".to_string(),
+                    },
+                    Label {
+                        name: "region".to_string(),
+                        value: "r_a".to_string(),
+                    },
+                    Label {
+                        name: "zone".to_string(),
+                        value: "z_a".to_string(),
+                    },
+                ],
+                1.0,
+            ),
+            mk(
+                0x02,
+                vec![
+                    Label {
+                        name: METRIC_NAME_LABEL.to_string(),
+                        value: "m_b".to_string(),
+                    },
+                    Label {
+                        name: "app".to_string(),
+                        value: "a_b".to_string(),
+                    },
+                ],
+                2.0,
+            ),
+            mk(
+                0x03,
+                vec![
+                    Label {
+                        name: METRIC_NAME_LABEL.to_string(),
+                        value: "m_c".to_string(),
+                    },
+                    Label {
+                        name: "region".to_string(),
+                        value: "r_c".to_string(),
+                    },
+                    Label {
+                        name: "zone".to_string(),
+                        value: "z_c".to_string(),
+                    },
+                ],
+                3.0,
+            ),
+        ];
+
+        // Fed in id order directly (this exercises the interner helper, not
+        // the full write): A interns the schema, B is a different schema, C
+        // must hit the memo for A's schema.
+        let dict = build_dictionary_v2(&series).expect("dictionary builds");
+
+        // occurrence_ordinals is [name, value] per label, per series in order.
+        // A occupies 6 entries (3 labels), B 4 (2 labels), C 6 (3 labels).
+        // Names sit at even offsets within each series' block; LabelSet sorts
+        // both A and C to [__name__, region, zone].
+        let a_names = [
+            dict.occurrence_ordinals[0],
+            dict.occurrence_ordinals[2],
+            dict.occurrence_ordinals[4],
+        ];
+        let c_base = 6 + 4; // A's 6 entries + B's 4 entries
+        let c_names = [
+            dict.occurrence_ordinals[c_base],
+            dict.occurrence_ordinals[c_base + 2],
+            dict.occurrence_ordinals[c_base + 4],
+        ];
+        assert_eq!(
+            a_names, c_names,
+            "a shared name list must resolve to identical name ordinals"
+        );
+
+        // __name__ is ordinal 0; region and zone got distinct ordinals.
+        assert_eq!(a_names[0], 0, "__name__ is always ordinal 0");
+        assert_ne!(a_names[1], a_names[2]);
+
+        // The values, by contrast, are all distinct strings and must NOT
+        // collapse: A's and C's value ordinals differ.
+        let a_region_value = dict.occurrence_ordinals[3];
+        let c_region_value = dict.occurrence_ordinals[c_base + 3];
+        assert_ne!(
+            a_region_value, c_region_value,
+            "distinct label values must still get distinct ordinals"
         );
     }
 
