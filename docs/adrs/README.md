@@ -17,3 +17,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0011](0011-otap-arrow-ingest.md) | OTAP (OpenTelemetry Arrow) ingest, not generic Arrow Flight | Accepted |
 | [0012](0012-simd-policy.md) | SIMD policy: dependencies and autovectorization first, explicit SIMD behind benchmark-gated review | Accepted |
 | [0013](0013-arrow-zero-copy-and-datafusion.md) | Targeted Arrow zero-copy, DataFusion for SQL and relational operators only | Accepted |
+| [0014](0014-rseg-v2-series-catalog.md) | RSEG v2: compact columnar series catalog, raw-f64 page alignment | Accepted |
