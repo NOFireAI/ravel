@@ -14,3 +14,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0008](0008-object-store-crate.md) | Wrap `object_store` crate behind our ObjectStoreBackend trait | Accepted |
 | [0009](0009-tenant-isolation.md) | Tenant-hashed prefixes, gateway auth, dev-mode header tenancy behind flag | Accepted |
 | [0010](0010-spec-amendments-review-1.md) | Spec amendments from the first adversarial design review | Accepted |
+| [0011](0011-otap-arrow-ingest.md) | OTAP (OpenTelemetry Arrow) ingest, not generic Arrow Flight | Accepted |
