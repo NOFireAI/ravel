@@ -78,6 +78,7 @@ pub enum FaultKind {
     DuplicateDelivery,
     NotFoundBlip,
     CorruptRange,
+    EtagChange,
     Transient,
     Permanent,
 }
@@ -110,6 +111,17 @@ pub enum ScriptedFault {
     /// `get` only: the wrapped `get` is called for real and every byte of
     /// the returned data is bit-flipped before being handed back.
     CorruptRange,
+    /// `get` only: the wrapped `get` is called for real and its bytes are
+    /// returned unchanged, but the etag is replaced with a deterministic
+    /// value distinct from any this store would otherwise produce. Models a
+    /// concurrent overwrite landing between two reads of one segment: the
+    /// second read sees fresh bytes under a new etag, so a caller pinning a
+    /// snapshot by etag (the fetcher's `EtagChanged` guard) must abort rather
+    /// than mix bytes from two object versions. Scripting it as one step of a
+    /// [`Sequence`] (a passthrough first read, then this on a later read) is
+    /// the only way to drive that guard deterministically, since a real
+    /// re-`put` cannot be interleaved inside a single in-memory fetch.
+    EtagChange,
     Transient(String),
     Permanent(String),
 }
@@ -124,6 +136,7 @@ impl ScriptedFault {
             ScriptedFault::DuplicateDelivery => FaultKind::DuplicateDelivery,
             ScriptedFault::NotFoundBlip => FaultKind::NotFoundBlip,
             ScriptedFault::CorruptRange => FaultKind::CorruptRange,
+            ScriptedFault::EtagChange => FaultKind::EtagChange,
             ScriptedFault::Transient(_) => FaultKind::Transient,
             ScriptedFault::Permanent(_) => FaultKind::Permanent,
         }
@@ -352,6 +365,7 @@ fn applicable_kinds(op: Op) -> &'static [FaultKind] {
             Throttled,
             NotFoundBlip,
             CorruptRange,
+            EtagChange,
             DuplicateDelivery,
             Transient,
             Permanent,
@@ -379,6 +393,7 @@ fn default_fault(kind: FaultKind) -> ScriptedFault {
         FaultKind::DuplicateDelivery => ScriptedFault::DuplicateDelivery,
         FaultKind::NotFoundBlip => ScriptedFault::NotFoundBlip,
         FaultKind::CorruptRange => ScriptedFault::CorruptRange,
+        FaultKind::EtagChange => ScriptedFault::EtagChange,
         FaultKind::Transient => ScriptedFault::Transient("fault: random transient".into()),
         FaultKind::Permanent => ScriptedFault::Permanent("fault: random permanent".into()),
     }
@@ -566,7 +581,9 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
             Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
             Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
             Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
-            Some(ScriptedFault::CorruptRange) => Err(not_applicable("put")),
+            Some(ScriptedFault::CorruptRange | ScriptedFault::EtagChange) => {
+                Err(not_applicable("put"))
+            }
         }
     }
 
@@ -578,6 +595,11 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
                 let mut outcome = self.inner.get(key, range).await?;
                 let flipped: Vec<u8> = outcome.data.iter().map(|b| b ^ 0xFF).collect();
                 outcome.data = Bytes::from(flipped);
+                Ok(outcome)
+            }
+            Some(ScriptedFault::EtagChange) => {
+                let mut outcome = self.inner.get(key, range).await?;
+                outcome.etag = crate::Etag("fault: etag changed between reads".into());
                 Ok(outcome)
             }
             Some(ScriptedFault::DuplicateDelivery) => {
@@ -613,7 +635,8 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
             Some(
                 ScriptedFault::PartialWriteThenError
                 | ScriptedFault::FailedConditionalWrite
-                | ScriptedFault::CorruptRange,
+                | ScriptedFault::CorruptRange
+                | ScriptedFault::EtagChange,
             ) => Err(not_applicable("head")),
         }
     }
@@ -820,6 +843,79 @@ mod tests {
         let clean = store.get("k", GetRange::Full).await.expect("get");
         assert_eq!(&clean.data[..], b"hello");
         assert_eq!(store.fault_count(Op::Get, FaultKind::CorruptRange), 1);
+    }
+
+    #[tokio::test]
+    async fn etag_change_returns_real_bytes_under_a_new_etag() {
+        let inner = MemoryStore::new();
+        inner
+            .put("k", Bytes::from_static(b"hello"), PutOptions::default())
+            .await
+            .expect("seed");
+        let clean_etag = inner.get("k", GetRange::Full).await.expect("seed get").etag;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::EtagChange).with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        // First read: rule has not fired, real etag and bytes pass through.
+        let first = store.get("k", GetRange::Full).await.expect("get");
+        assert_eq!(&first.data[..], b"hello");
+        assert_eq!(first.etag, clean_etag);
+
+        // Second read: bytes are still real, but the etag has changed, so a
+        // snapshot-pinning caller can detect the concurrent overwrite.
+        let second = store.get("k", GetRange::Full).await.expect("get");
+        assert_eq!(&second.data[..], b"hello");
+        assert_ne!(second.etag, clean_etag);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::EtagChange), 1);
+    }
+
+    #[tokio::test]
+    async fn etag_change_in_a_sequence_flips_only_the_scripted_read() {
+        // The shape the fetcher's EtagChanged guard needs: first read pins an
+        // etag (passthrough), a later read returns fresh bytes under a new
+        // etag (the concurrent overwrite).
+        let inner = MemoryStore::new();
+        inner
+            .put("seg", Bytes::from_static(b"payload"), PutOptions::default())
+            .await
+            .expect("seed");
+        let pinned = inner
+            .get("seg", GetRange::Full)
+            .await
+            .expect("seed get")
+            .etag;
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains("seg")
+                .then_passthrough()
+                .then_fault(ScriptedFault::EtagChange),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let a = store.get("seg", GetRange::Full).await.expect("get");
+        assert_eq!(a.etag, pinned);
+        assert_eq!(store.sequence_progress(0), 1);
+        let b = store.get("seg", GetRange::Full).await.expect("get");
+        assert_ne!(b.etag, pinned, "the scripted read must change the etag");
+        assert_eq!(&b.data[..], b"payload", "but keep the real bytes");
+        assert_eq!(store.sequence_progress(0), 2);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::EtagChange), 1);
+    }
+
+    #[tokio::test]
+    async fn etag_change_is_not_applicable_to_non_get_ops() {
+        let plan = FaultPlan::empty().with_rule(Rule::new(Op::Head, ScriptedFault::EtagChange));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store
+            .put("k", Bytes::from_static(b"v"), PutOptions::default())
+            .await
+            .expect("seed");
+        assert!(matches!(
+            store.head("k").await,
+            Err(StoreError::Permanent(_))
+        ));
     }
 
     #[tokio::test]
