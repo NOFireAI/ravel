@@ -1,0 +1,31 @@
+[package]
+name = "ravel-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-query = { workspace = true }
+ravel-object-store = { workspace = true }
+
+# DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
+# so this crate never depends on the workspace `arrow` pin directly. See the
+# module docs and the B1 report for the arrow 58 vs workspace-59 pinning note.
+datafusion = { version = "54", default-features = false }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+uuid = { workspace = true }
