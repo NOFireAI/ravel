@@ -19,8 +19,9 @@ pub use format::ReaderLimits;
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
     FooterLocation, FooterOutcome, PlannedRange, SeriesEntry, ValPageKind, decode_catalog,
-    decode_catalog_matching, decode_pages, decode_pages_soa, open_from_full, open_from_suffix,
-    parse_footer, plan_ranges, select, validate_sections,
+    decode_catalog_matching, decode_catalog_matching_v2, decode_catalog_v2, decode_pages,
+    decode_pages_soa, open_from_full, open_from_suffix, parse_footer, plan_ranges, select,
+    validate_sections,
 };
 pub use writer::{
     IngestBounds, SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput, WrittenSegment,
