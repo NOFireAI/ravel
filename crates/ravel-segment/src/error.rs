@@ -25,6 +25,8 @@ pub enum WriteError {
     FooterTooLarge,
     #[error("internal invariant violated: label ordinal missing from dictionary")]
     DictionaryInvariant,
+    #[error("more than u32::MAX distinct label-name schemas in one segment")]
+    TooManySchemas,
 }
 
 /// Errors that can occur while parsing or decoding a segment. All violations

@@ -11,10 +11,8 @@ pub const VERSION: u16 = 1;
 
 /// RSEG v2 trailer version (ADR-0014, docs/rseg-v2-plan.md). Same magic and
 /// trailer layout as v1; only the catalog section set and LABEL_DICT
-/// ordering rule change. Not yet written or read by this crate; consumed
-/// starting with the phase 2 writer (issue #30) and phase 3 reader
-/// (issue #31).
-#[allow(dead_code)]
+/// ordering rule change. Written by `SegmentWriter::write_v2` (issue #30);
+/// not yet read by this crate's reader (phase 3, issue #31).
 pub const VERSION_V2: u16 = 2;
 
 /// Signal byte for metric segments.
@@ -35,13 +33,11 @@ pub mod section_kind {
     pub const SERIES_TABLE: u32 = 2;
     pub const TS_PAGES: u32 = 3;
     pub const VAL_PAGES: u32 = 4;
-    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Consumed
-    /// starting with the phase 2 writer (issue #30).
-    #[allow(dead_code)]
+    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Emitted by
+    /// `SegmentWriter::write_v2` (issue #30).
     pub const SERIES_IDS: u32 = 5;
-    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Consumed
-    /// starting with the phase 2 writer (issue #30).
-    #[allow(dead_code)]
+    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Emitted by
+    /// `SegmentWriter::write_v2` (issue #30).
     pub const SERIES_META: u32 = 6;
 }
 
