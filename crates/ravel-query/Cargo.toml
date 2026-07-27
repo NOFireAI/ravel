@@ -29,6 +29,15 @@ proptest = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "fetch_soa_vs_fetch"
+harness = false
+
+[[bench]]
+name = "bytes_slice_vs_copy"
+harness = false
 
 [lints]
 workspace = true

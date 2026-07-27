@@ -650,13 +650,23 @@ fn split_page_header<'a>(
     Ok((enc, comp, payload))
 }
 
-fn decompress_page_payload(
+/// Decompresses one page payload into a caller-supplied buffer: `out` is
+/// cleared, then filled. On error `out`'s contents are unspecified. Lets a
+/// caller decoding many pages (one segment fetch) reuse one `Vec<u8>`
+/// scratch buffer across pages instead of allocating a fresh decompression
+/// buffer per page.
+fn decompress_page_payload_into(
     comp: u8,
     payload: &[u8],
     limits: ReaderLimits,
-) -> Result<Vec<u8>, SegmentError> {
+    out: &mut Vec<u8>,
+) -> Result<(), SegmentError> {
     match comp {
-        page_comp::NONE => Ok(payload.to_vec()),
+        page_comp::NONE => {
+            out.clear();
+            out.extend_from_slice(payload);
+            Ok(())
+        }
         page_comp::LZ4 => {
             if payload.len() < 4 {
                 return Err(SegmentError::Truncated);
@@ -668,58 +678,82 @@ fn decompress_page_payload(
                     cap: limits.max_page_uncompressed_bytes,
                 });
             }
-            let decompressed = lz4_flex::decompress_size_prepended(payload)
+            let expected = to_usize(u64::from(prefix))?;
+            out.clear();
+            out.resize(expected, 0);
+            let n = lz4_flex::decompress_into(&payload[4..], out)
                 .map_err(|e| SegmentError::Decompress(e.to_string()))?;
-            if decompressed.len() as u64 != u64::from(prefix) {
+            if n != expected {
                 return Err(SegmentError::DecompressedLenMismatch {
                     expected: u64::from(prefix),
-                    actual: decompressed.len() as u64,
+                    actual: n as u64,
                 });
             }
-            Ok(decompressed)
+            Ok(())
         }
         other => Err(SegmentError::InvalidCompression(other)),
     }
 }
 
-fn decode_ts_page(
+fn decode_ts_page_into(
     entry: &SeriesEntry,
     page: &[u8],
     limits: ReaderLimits,
-) -> Result<Vec<i64>, SegmentError> {
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<i64>,
+) -> Result<(), SegmentError> {
     let (enc, comp, payload) = split_page_header(&entry.series_id, page)?;
     if enc != page_enc::TS_DELTA_VARINT {
         return Err(SegmentError::InvalidEncoding(enc));
     }
-    let raw = decompress_page_payload(comp, payload, limits)?;
+    decompress_page_payload_into(comp, payload, limits, scratch)?;
     let count = to_usize(u64::from(entry.sample_count))?;
-    crate::ts_delta::decode_ts_deltas(&raw, count, entry.min_ts_ns, entry.max_ts_ns)
+    crate::ts_delta::decode_ts_deltas_into(scratch, count, entry.min_ts_ns, entry.max_ts_ns, out)
 }
 
-fn decode_raw_f64(bytes: &[u8], count: usize) -> Result<Vec<f64>, SegmentError> {
+fn decode_raw_f64_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result<(), SegmentError> {
     let expected_len = count.checked_mul(8).ok_or(SegmentError::FieldOverflow)?;
     if bytes.len() != expected_len {
         return Err(SegmentError::Truncated);
     }
-    let mut out = Vec::new();
+    out.clear();
+    out.reserve(count);
     for chunk in bytes.chunks_exact(8) {
         let arr: [u8; 8] = chunk.try_into().map_err(|_| SegmentError::Truncated)?;
         out.push(f64::from_le_bytes(arr));
     }
-    Ok(out)
+    Ok(())
 }
 
-fn decode_val_page(
+/// Which encoding a VAL page was actually stored with. Surfaced by the SoA
+/// decode path so callers can account for encoding mix
+/// (docs/arrow-datafusion-plan.md hop 7: the RSEG v2 alignment decision
+/// needs a measured raw-f64 fraction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValPageKind {
+    Gorilla,
+    RawF64,
+}
+
+fn decode_val_page_into(
     entry: &SeriesEntry,
     page: &[u8],
     limits: ReaderLimits,
-) -> Result<Vec<f64>, SegmentError> {
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<f64>,
+) -> Result<ValPageKind, SegmentError> {
     let (enc, comp, payload) = split_page_header(&entry.series_id, page)?;
-    let raw = decompress_page_payload(comp, payload, limits)?;
+    decompress_page_payload_into(comp, payload, limits, scratch)?;
     let count = to_usize(u64::from(entry.sample_count))?;
     match enc {
-        page_enc::VAL_GORILLA => crate::gorilla::decode_gorilla(&raw, count),
-        page_enc::VAL_RAW_F64 => decode_raw_f64(&raw, count),
+        page_enc::VAL_GORILLA => {
+            crate::gorilla::decode_gorilla_into(scratch, count, out)?;
+            Ok(ValPageKind::Gorilla)
+        }
+        page_enc::VAL_RAW_F64 => {
+            decode_raw_f64_into(scratch, count, out)?;
+            Ok(ValPageKind::RawF64)
+        }
         other => Err(SegmentError::InvalidEncoding(other)),
     }
 }
@@ -734,14 +768,64 @@ pub fn decode_pages(
     val_page_bytes: &[u8],
     limits: ReaderLimits,
 ) -> Result<Vec<Sample>, SegmentError> {
-    let timestamps = decode_ts_page(entry, ts_page_bytes, limits)?;
-    let values = decode_val_page(entry, val_page_bytes, limits)?;
-    if timestamps.len() != values.len() {
-        return Err(SegmentError::Truncated);
-    }
+    let mut scratch = Vec::new();
+    let mut timestamps = Vec::new();
+    let mut values = Vec::new();
+    decode_pages_soa(
+        entry,
+        ts_page_bytes,
+        val_page_bytes,
+        limits,
+        &mut scratch,
+        &mut timestamps,
+        &mut values,
+    )?;
     Ok(timestamps
         .into_iter()
         .zip(values)
         .map(|(ts_ns, value)| Sample { ts_ns, value })
         .collect())
+}
+
+/// Decodes one series' TS and VAL pages directly into separate
+/// timestamp/value vecs (SoA) instead of `Vec<Sample>` (AoS). Same
+/// validation contract as [`decode_pages`] (page crc, enc/comp validity,
+/// overflow- and bounds-checked timestamp accumulation, on-disk order
+/// including duplicate timestamps preserved) and produces bit-identical
+/// output to it for the same input (verified by proptest in this crate's
+/// test suite).
+///
+/// `scratch` is an internal decompression buffer, cleared and refilled for
+/// the TS page and again for the VAL page; its contents never outlive one
+/// call, so a caller decoding many series in one segment fetch should pass
+/// the same `scratch` buffer to every call and let it reuse its allocation
+/// instead of allocating a fresh decompression buffer per page.
+/// `timestamps`/`values` are the per-series decode *output*: they are
+/// cleared, then filled by this call, and the caller owns them from
+/// there (typically moving them into that series' result) rather than
+/// reusing them across series. On error, `timestamps`/`values` contents
+/// are unspecified.
+///
+/// This is a committed public API: crates/ravel-sql (Phase B of
+/// docs/arrow-datafusion-plan.md) and later consumers build Arrow arrays
+/// directly off `timestamps`/`values` by buffer adoption, so its signature
+/// and semantics are stable.
+///
+/// Returns the [`ValPageKind`] the VAL page was actually encoded with, for
+/// fetch-stats accounting.
+pub fn decode_pages_soa(
+    entry: &SeriesEntry,
+    ts_page_bytes: &[u8],
+    val_page_bytes: &[u8],
+    limits: ReaderLimits,
+    scratch: &mut Vec<u8>,
+    timestamps: &mut Vec<i64>,
+    values: &mut Vec<f64>,
+) -> Result<ValPageKind, SegmentError> {
+    decode_ts_page_into(entry, ts_page_bytes, limits, scratch, timestamps)?;
+    let val_kind = decode_val_page_into(entry, val_page_bytes, limits, scratch, values)?;
+    if timestamps.len() != values.len() {
+        return Err(SegmentError::Truncated);
+    }
+    Ok(val_kind)
 }
