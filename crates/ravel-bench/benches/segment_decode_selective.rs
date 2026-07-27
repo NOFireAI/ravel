@@ -7,7 +7,9 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};
-use ravel_bench::segment_support::{build_segment, decode_entries, slice_range};
+use ravel_bench::segment_support::{
+    build_segment, decode_entries, decode_matching_entries, slice_range,
+};
 use ravel_segment::{ReaderLimits, decode_pages, plan_ranges, select};
 
 const SERIES_COUNT: usize = 10_000;
@@ -40,6 +42,25 @@ fn bench_segment_decode_selective(c: &mut Criterion) {
             let limits = ReaderLimits::default();
             let (footer, entries) = decode_entries(&bytes);
             let selected = select(&entries, &[("label_000", "v0_0")], None);
+            let ranges = plan_ranges(&footer, &selected).expect("plan ranges");
+            let mut decoded_samples = 0usize;
+            for (entry, range) in selected.iter().zip(ranges.iter()) {
+                let ts_bytes = slice_range(&bytes, range.ts_range);
+                let val_bytes = slice_range(&bytes, range.val_range);
+                let samples = decode_pages(entry, ts_bytes, val_bytes, limits).expect("decode");
+                decoded_samples += samples.len();
+            }
+            assert_eq!(selected.len(), SERIES_COUNT / DISTINCT_GROUPS);
+            decoded_samples
+        });
+    });
+    // Same segment and matcher through the lazy ordinal-matching path
+    // (decode_catalog_matching): only matched series materialize labels.
+    group.bench_function("select_1pct_lazy", |b| {
+        b.iter(|| {
+            let limits = ReaderLimits::default();
+            let (footer, entries) = decode_matching_entries(&bytes, &[("label_000", "v0_0")]);
+            let selected: Vec<_> = entries.iter().collect();
             let ranges = plan_ranges(&footer, &selected).expect("plan ranges");
             let mut decoded_samples = 0usize;
             for (entry, range) in selected.iter().zip(ranges.iter()) {

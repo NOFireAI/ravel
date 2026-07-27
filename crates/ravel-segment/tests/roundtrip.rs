@@ -384,6 +384,97 @@ fn select_filters_by_equality_and_predicate_then_plans_a_subset() {
     );
 }
 
+/// Asserts two entry lists are field-for-field identical (SeriesEntry has
+/// no PartialEq).
+fn assert_entries_eq(a: &[&SeriesEntry], b: &[SeriesEntry]) {
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.series_id, y.series_id);
+        assert_eq!(x.labels, y.labels);
+        assert_eq!(x.sample_count, y.sample_count);
+        assert_eq!(x.min_ts_ns, y.min_ts_ns);
+        assert_eq!(x.max_ts_ns, y.max_ts_ns);
+        assert_eq!(x.ts_page, y.ts_page);
+        assert_eq!(x.val_page, y.val_page);
+    }
+}
+
+#[test]
+fn decode_catalog_matching_agrees_with_eager_select() {
+    let bytes = build_small_segment();
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(&bytes, limits).expect("opens");
+    let label_dict_bytes = section_bytes(&bytes, &loc.footer, 1);
+    let series_table_bytes = section_bytes(&bytes, &loc.footer, 2);
+    let entries =
+        ravel_segment::decode_catalog(&loc.footer, label_dict_bytes, series_table_bytes, limits)
+            .expect("catalog");
+
+    for equals in [
+        vec![],
+        vec![("instance", "a")],
+        vec![("instance", "b")],
+        vec![(METRIC_NAME_LABEL, "http_requests_total")],
+        vec![
+            (METRIC_NAME_LABEL, "http_requests_total"),
+            ("instance", "a"),
+        ],
+        vec![("instance", "does-not-exist")],
+        vec![("no-such-name", "a")],
+        // Value exists in the dictionary but never as this name's value.
+        vec![("instance", "http_requests_total")],
+    ] {
+        let eager = ravel_segment::select(&entries, &equals, None);
+        let lazy = ravel_segment::decode_catalog_matching(
+            &loc.footer,
+            label_dict_bytes,
+            series_table_bytes,
+            &equals,
+            limits,
+        )
+        .expect("matching decode");
+        assert_entries_eq(&eager, &lazy);
+    }
+}
+
+#[test]
+fn decode_catalog_matching_still_rejects_corrupt_sections() {
+    let bytes = build_small_segment();
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(&bytes, limits).expect("opens");
+    let dict = section_bytes(&bytes, &loc.footer, 1);
+    let table = section_bytes(&bytes, &loc.footer, 2);
+
+    // Flip one byte inside each section's stored bytes: the section crc
+    // must fail closed on the lazy path exactly like the eager one, even
+    // when the matcher cannot select anything.
+    let mut bad_table = table.to_vec();
+    bad_table[0] ^= 0xFF;
+    assert!(matches!(
+        ravel_segment::decode_catalog_matching(
+            &loc.footer,
+            dict,
+            &bad_table,
+            &[("instance", "does-not-exist")],
+            limits
+        ),
+        Err(ravel_segment::SegmentError::SectionCrcMismatch)
+    ));
+
+    let mut bad_dict = dict.to_vec();
+    bad_dict[0] ^= 0xFF;
+    assert!(matches!(
+        ravel_segment::decode_catalog_matching(
+            &loc.footer,
+            &bad_dict,
+            table,
+            &[("instance", "a")],
+            limits
+        ),
+        Err(ravel_segment::SegmentError::SectionCrcMismatch)
+    ));
+}
+
 #[test]
 fn identity_check_against_real_written_footer() {
     let tenant_hash = [7u8; 16];
@@ -607,6 +698,40 @@ proptest! {
             let got: Vec<(i64, u64)> =
                 samples.iter().map(|s| (s.ts_ns, s.value.to_bits())).collect();
             prop_assert_eq!(&got, exp_samples);
+        }
+
+        // Lazy selective decode must agree with eager decode + select for a
+        // matcher drawn from real labels of the segment.
+        if let Some((_, first_labels, _)) = decoded.first()
+            && let Some(label) = first_labels.iter().next()
+        {
+            let limits = ReaderLimits::default();
+            let equals = [(label.name.as_str(), label.value.as_str())];
+            let label_dict_bytes = section_bytes(&written.bytes, &loc.footer, 1);
+            let series_table_bytes = section_bytes(&written.bytes, &loc.footer, 2);
+            let entries = ravel_segment::decode_catalog(
+                &loc.footer,
+                label_dict_bytes,
+                series_table_bytes,
+                limits,
+            )
+            .expect("catalog");
+            let eager = ravel_segment::select(&entries, &equals, None);
+            let lazy = ravel_segment::decode_catalog_matching(
+                &loc.footer,
+                label_dict_bytes,
+                series_table_bytes,
+                &equals,
+                limits,
+            )
+            .expect("matching decode");
+            prop_assert_eq!(eager.len(), lazy.len());
+            for (x, y) in eager.iter().zip(lazy.iter()) {
+                prop_assert_eq!(x.series_id, y.series_id);
+                prop_assert_eq!(&x.labels, &y.labels);
+                prop_assert_eq!(x.ts_page, y.ts_page);
+                prop_assert_eq!(x.val_page, y.val_page);
+            }
         }
     }
 }
