@@ -4,8 +4,18 @@
 /// Trailer magic bytes, last 4 bytes of every RSEG v1 object.
 pub const MAGIC: [u8; 4] = *b"RSG1";
 
-/// Format version recorded in the trailer.
+/// Format version recorded in the trailer. This is the v1 layout; the
+/// writer emits this value until the v2 writer path lands
+/// (docs/rseg-v2-plan.md phase 2).
 pub const VERSION: u16 = 1;
+
+/// RSEG v2 trailer version (ADR-0014, docs/rseg-v2-plan.md). Same magic and
+/// trailer layout as v1; only the catalog section set and LABEL_DICT
+/// ordering rule change. Not yet written or read by this crate; consumed
+/// starting with the phase 2 writer (issue #30) and phase 3 reader
+/// (issue #31).
+#[allow(dead_code)]
+pub const VERSION_V2: u16 = 2;
 
 /// Signal byte for metric segments.
 pub const SIGNAL_METRICS: u8 = 1;
@@ -25,6 +35,14 @@ pub mod section_kind {
     pub const SERIES_TABLE: u32 = 2;
     pub const TS_PAGES: u32 = 3;
     pub const VAL_PAGES: u32 = 4;
+    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Consumed
+    /// starting with the phase 2 writer (issue #30).
+    #[allow(dead_code)]
+    pub const SERIES_IDS: u32 = 5;
+    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Consumed
+    /// starting with the phase 2 writer (issue #30).
+    #[allow(dead_code)]
+    pub const SERIES_META: u32 = 6;
 }
 
 /// Section-level compression tags, matching `ravel.segment.v1.Compression`.
@@ -66,5 +84,25 @@ impl Default for ReaderLimits {
             max_section_uncompressed_bytes: 1 << 30,
             max_page_uncompressed_bytes: 64 << 20,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins every persistent-format constant's wire value. A change here is
+    /// a format change (docs/segment-format.md, ADR-0014), never a refactor.
+    #[test]
+    fn format_constants_are_pinned() {
+        assert_eq!(VERSION, 1);
+        assert_eq!(VERSION_V2, 2);
+        assert_eq!(MAGIC, *b"RSG1");
+        assert_eq!(section_kind::LABEL_DICT, 1);
+        assert_eq!(section_kind::SERIES_TABLE, 2);
+        assert_eq!(section_kind::TS_PAGES, 3);
+        assert_eq!(section_kind::VAL_PAGES, 4);
+        assert_eq!(section_kind::SERIES_IDS, 5);
+        assert_eq!(section_kind::SERIES_META, 6);
     }
 }

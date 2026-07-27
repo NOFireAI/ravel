@@ -4,6 +4,11 @@ Persistent contract (amended by ADR-0010 before first ship). Any change
 bumps the version. Parsers treat every offset, length, and count as
 untrusted input: bounds-check everything, fuzz all decoders. No `unsafe`.
 
+> RSEG v2 amendment (ADR-0014): trailer `version = 2` changes the catalog
+> section layout only. See "RSEG v2 amendment" below; everything above
+> this note is the unchanged v1 spec and stays authoritative for v1
+> objects, which remain readable indefinitely (docs/rseg-v2-plan.md §5).
+
 All integers little-endian. "varint" means protobuf-style LEB128; signed
 values use zigzag.
 
@@ -153,3 +158,173 @@ Suffix fetch default 64 KiB covers footers for expected L0 series counts
 (footer size is ~40 bytes per section entry + fixed fields; SERIES_TABLE
 lives in a section, not the footer, so the footer stays small even at high
 cardinality).
+
+## RSEG v2 amendment (ADR-0014)
+
+Persistent contract, same status as v1 above. Decision record:
+docs/adrs/0014-rseg-v2-series-catalog.md. Full derivation, measured
+numbers, and the phased implementation plan: docs/rseg-v2-plan.md. This
+section is normative for v2 objects; the v1 sections above are unchanged
+and remain normative for v1 objects. Readers dispatch on the trailer
+`version` field and must accept both 1 and 2 indefinitely (no compactor
+exists yet to retire v1 objects; docs/consistency-model.md).
+
+### Trailer and versioning
+
+Trailer layout, `footer_crc32c` computation, and reader protocol steps
+1-4 are unchanged. `version = 2`. `magic` stays `"RSG1"`: it identifies
+the format family, not a specific layout; a v1-only reader that meets a
+v2 object fails closed with `UnsupportedVersion(2)`, which is the
+correct, checksum-covered error (the version byte is covered by
+`footer_crc32c` exactly as in v1). Versions other than 1 and 2 are
+`UnsupportedVersion`.
+
+### Section kinds v2
+
+| kind | name | content | comp (writer policy) |
+|---|---|---|---|
+| 1 | LABEL_DICT | string dictionary, ordering rule relaxed (below) | zstd |
+| 3 | TS_PAGES | timestamp pages container, unchanged | none |
+| 4 | VAL_PAGES | value pages container, alignment rule added (below) | none |
+| 5 | SERIES_IDS | sorted series ids | none |
+| 6 | SERIES_META | schema dictionary + columnar per-series metadata | zstd |
+
+Kind 2 (SERIES_TABLE) is not emitted in v2 objects. Mandatory v2 section
+kinds: LABEL_DICT, SERIES_IDS, SERIES_META, TS_PAGES, VAL_PAGES; at most
+one section per known kind; unknown kinds still skipped. Writers emit
+sections physically in the order 1, 5, 6, 3, 4; readers rely only on
+footer offsets, as in v1. `comp` in the table above is writer policy;
+SERIES_IDS is deliberately never zstd-compressed (BLAKE3 ids are
+incompressible, so compressing them is pure encode cost with no size
+win). Footer validation additions for v2 objects: SERIES_IDS `count`,
+SERIES_META `count`, and FooterProto `series_count` must all be equal;
+a mismatch is Corrupted.
+
+Bytes between sections are permitted, exactly as in v1 (section
+placement has always been self-describing; readers locate every section
+through its footer offset and length, never by assuming adjacency). v2
+writers use this to 8-byte-align the VAL_PAGES section offset (see
+alignment rule below). Any inter-section bytes MUST be `0x00`; readers
+never interpret them.
+
+### LABEL_DICT ordering rule, v2
+
+Grammar is unchanged (`count: u32`, then `count` strings as
+`len:varint` + UTF-8 bytes). Ordinal 0 is still always `"__name__"`. The
+v1 rule that the remaining distinct strings follow in sorted
+lexicographic order does not apply to v2 objects: for v2, the order of
+ordinals `1..count` is unspecified, and readers MUST NOT assume any
+ordering beyond ordinal 0. (v1 objects are unaffected; their dictionary
+remains sorted and readers keep relying on that for v1 decode where they
+do today.)
+
+### SERIES_IDS (uncompressed form)
+
+```
+count: u32
+count * series_id: [u8;16]     strictly ascending by byte comparison
+```
+
+Readers reject non-ascending ids and any section length that is not
+exactly `4 + 16*count`.
+
+### SERIES_META (uncompressed form, before section-level zstd)
+
+```
+count: u32                      (must equal SERIES_IDS count)
+schema_count: u32
+schema_count schemas:
+  name_count: varint            (<= 65535, matching v1's u16 label_count domain)
+  name_count * name_ord: varint (LABEL_DICT ordinals; strictly ascending
+                                 by referenced name bytes)
+then 9 column blocks, in exactly this order, each encoded as
+  block_len: varint, then block_len bytes:
+
+  1 schema_ref:     count * varint    (< schema_count)
+  2 value_ord:      series-major: for each series, name_count(schema)
+                    varints, one value ordinal per schema name, in
+                    schema name order
+  3 sample_count:   count * varint    (must fit u32; > 0)
+  4 min_ts_delta:   count * varint    (min_ts_ns - footer.min_event_ts_ns)
+  5 ts_span:        count * varint    (max_ts_ns - min_ts_ns)
+  6 ts_page_gap:    count * varint
+  7 ts_page_len:    count * varint
+  8 val_page_gap:   count * varint
+  9 val_page_len:   count * varint
+```
+
+Semantics and validation (all violations Corrupted, never panics):
+
+- Entry `i` across all columns describes the series at `SERIES_IDS[i]`;
+  entries are sorted by series id, exactly as v1's SERIES_TABLE.
+- A series' label set is its schema's names paired positionally with its
+  value ordinals. Schema name lists are sorted by name bytes, so the
+  materialized pair order matches v1's "sorted by name bytes" rule;
+  canonical series identity (ADR-0005) is unaffected. Readers validate
+  each schema once at schema decode (ordinals in range, names strictly
+  ascending by byte comparison, therefore no duplicate names); per-series
+  materialization still goes through the existing label-set construction
+  path.
+- Timestamp bounds reconstruct as `min_ts_ns = footer.min_event_ts_ns +
+  min_ts_delta` and `max_ts_ns = min_ts_ns + ts_span`, overflow-checked
+  i64 arithmetic. Both deltas are non-negative by writer construction.
+  Reconstructed bounds feed the same per-entry TS decode bounds check as
+  v1.
+- Page locations reconstruct per column pair as: `offset_0 = gap_0;
+  offset_i = end_{i-1} + gap_i; end_i = offset_i + len_i`,
+  overflow-checked, with `end_i <=` the owning section's `len`,
+  independently for TS (blocks 6/7, over TS_PAGES) and VAL (blocks 8/9,
+  over VAL_PAGES). Gaps are 0 except where the writer inserted alignment
+  padding.
+- Each block must consume exactly `block_len` bytes; the last block must
+  end exactly at the section's uncompressed end; each block must contain
+  exactly its declared element count. Trailing bytes anywhere are
+  Corrupted.
+- Pre-allocation from `count`, `schema_count`, and any `block_len` is
+  capped by remaining input size, as the v1 reader already does for
+  corrupt counts.
+
+The decoded per-series representation for v2 is the same logical shape
+v1 readers already produce (id, label set, sample count, ts bounds, page
+ranges); consumers above the segment-format layer are version-blind.
+
+### VAL_RAW_F64 page alignment, v2
+
+- The VAL_PAGES section `offset` MUST be congruent to 0 mod 8 (writer
+  inserts zero bytes before the section as needed).
+- Within VAL_PAGES, every page whose `enc` is 17 (VAL_RAW_F64) MUST have
+  its payload start (page offset + 6) congruent to 0 mod 8 relative to
+  the section start, hence also relative to the object start. The writer
+  inserts `0x00` pad bytes before such a page's header and records them
+  in that series' `val_page_gap`. Pages with other encodings have no
+  alignment requirement.
+- TS pages are never aligned (varint payloads are decoded, never viewed
+  directly).
+
+This rule exists so VAL_RAW_F64 payloads become eligible for aligned,
+zero-copy views by consumers that need them (docs/adrs/0013); it adds no
+new reader logic beyond the gap columns SERIES_META already carries.
+
+### Checksum coverage, v2
+
+Every byte a v2 reader interprets is covered exactly as strictly as the
+corresponding v1 bytes: `footer_crc32c` covers the trailer (including the
+version byte) and FooterProto; each section's `Section.crc32c` covers
+that section's full stored bytes, verified before any of its content is
+decoded; the page crc covers series-id-bound payload, unchanged. Pad
+bytes (inter-section and intra-VAL_PAGES) are never interpreted by
+readers; they fall under the enclosing section's crc when that section
+is read in full, and under the whole-object blake3 in the commit record
+regardless. No v2 addition removes, weakens, or relocates a checksum
+that v1 has today.
+
+### Unchanged in v2
+
+Page format (header, page crc with series-id prefix binding, `enc`/`comp`
+byte values, all three page encodings and their payload grammars), the
+raw-fallback rule, sample ordering and stable-sort duplicate semantics,
+footer/trailer mechanics apart from `version`, the suffix-read protocol,
+section crc mechanics, reader resource caps, whole-object blake3 in the
+commit record, the object key layout, and series identity. The writer
+edge rules (zero-sample series dropped, duplicate ids rejected, empty
+segment bounds = 0) carry over verbatim.
