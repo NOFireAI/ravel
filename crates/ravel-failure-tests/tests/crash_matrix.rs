@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::{GcWindow, TestClock, make_point, sweep_orphans, tenant};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
-use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_types::{Signal, TimeRange};
@@ -56,6 +56,16 @@ async fn crash_before_data_put_leaves_nothing_stored_or_visible() {
         .await
         .expect_err("a data object that never lands must error the writer");
     assert!(err.is_retryable(), "client must be told to retry: {err}");
+
+    // Prove the documented crash point was actually reached: the data PUT
+    // was attempted and killed. Without this, an ingest error raised before
+    // the PUT (early admission/flush failure) would satisfy every other
+    // assertion below while never exercising the crash path this row names.
+    assert_eq!(
+        fault_store.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the data-PUT fault must have fired exactly once at the /l0/ site"
+    );
 
     let objects = list_all(store.as_ref(), "t/").await.expect("list");
     assert!(
@@ -122,6 +132,16 @@ async fn crash_after_data_put_before_commit_orphans_then_gcs_after_grace() {
         .await
         .expect_err("a commit record that never lands must error the writer");
     assert!(err.is_retryable());
+
+    // Prove the crash point was reached: the data PUT landed, then the
+    // commit PUT was attempted and killed. Without this, an error raised
+    // before the commit PUT would satisfy the orphan/visibility assertions
+    // below while never exercising the after-data/before-commit crash site.
+    assert_eq!(
+        fault_store.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the commit-PUT fault must have fired exactly once at the /c/ site"
+    );
 
     let objects = list_all(store.as_ref(), "t/").await.expect("list");
     let orphan = objects
