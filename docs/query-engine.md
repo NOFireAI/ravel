@@ -62,10 +62,13 @@ error, never a partial silent result.
 
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly
-`max + 1`. It does not count a fully materialized window before checking,
-so peak merge work is bounded by the budget itself rather than by the
-query's full deduplicated result size. The count is independent of segment
-or series iteration order, so the error is deterministic.
+`max + 1`. It does not count a fully materialized per-timestamp window
+before checking, so it does not silently pass an over-budget query that
+happens to dedup down to size. The count is independent of segment or
+series iteration order, so the error is deterministic. It bounds only the
+output size: every matched series in every matched segment is still fully
+fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
+scales with the query's matched input, not with `max_samples`.
 
 ## Caching note
 

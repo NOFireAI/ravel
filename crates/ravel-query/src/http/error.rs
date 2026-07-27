@@ -37,9 +37,10 @@ impl From<QueryError> for ApiError {
             | QueryError::InvalidRange { .. }
             | QueryError::TimeOverflow => ApiError::BadData(e.to_string()),
             QueryError::Unsupported { .. } => ApiError::Unsupported(e.to_string()),
-            QueryError::Catalog(_) | QueryError::Fetch(_) | QueryError::SnapshotInvalidated => {
-                ApiError::Unavailable(e.to_string())
-            }
+            QueryError::Catalog(_)
+            | QueryError::Fetch(_)
+            | QueryError::SnapshotInvalidated
+            | QueryError::NonMonotonicSamples { .. } => ApiError::Unavailable(e.to_string()),
             QueryError::TooManySegments { .. }
             | QueryError::TooManySeries { .. }
             | QueryError::TooManySamples { .. } => ApiError::Unsupported(e.to_string()),
