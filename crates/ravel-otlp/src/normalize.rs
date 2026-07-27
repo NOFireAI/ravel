@@ -12,8 +12,10 @@
 //! `resource.attributes["service.name"]` (namespaced by
 //! `service.namespace` when present) becomes the `job` label,
 //! `service.instance.id` becomes `instance`, and a configurable allowlist of
-//! other resource attributes is flattened with dots replaced by
-//! underscores. Instrumentation scope (name, version, attributes) is
+//! other resource attributes is flattened through the same label-name
+//! sanitization applied to data-point attributes (dots and every other
+//! character outside a valid Prometheus label name become `_`).
+//! Instrumentation scope (name, version, attributes) is
 //! ignored for series identity in Phase 1; this is a deliberate
 //! simplification, revisited when native OTel querying lands (ADR-0005).
 //!
@@ -375,7 +377,7 @@ fn build_resource_labels(
             continue;
         }
         if let Some(value) = find_attr_value(&resource.attributes, key)? {
-            push_checked(&mut labels, key.replace('.', "_"), value, limits)?;
+            push_checked(&mut labels, sanitize_label_name(key), value, limits)?;
         }
     }
 
@@ -687,6 +689,65 @@ mod tests {
         assert_eq!(labels.get("k8s_pod_name"), Some("pod-abc"));
         assert_eq!(labels.get("host_name"), Some("node1"));
         assert_eq!(labels.get("some_other_attr"), None);
+    }
+
+    #[test]
+    fn allowlisted_resource_attribute_name_is_sanitized_like_metric_attributes() {
+        // Regression for a8-F08. An allowlist entry that is invalid as a
+        // Prometheus label name (leading digit, plus a dash beyond the dots)
+        // must pass through sanitize_label_name, not merely have its dots
+        // replaced. The sanitized name must equal the one the data-point
+        // attribute path produces for the same key, and it must be what
+        // reaches the persistent series identity.
+        let limits = IngestLimits {
+            resource_attribute_allowlist: vec!["0bad-key.name".to_string()],
+            ..IngestLimits::default()
+        };
+
+        // Same logical label carried as a resource attribute (allowlist path).
+        let via_resource = resource_metrics(
+            vec![string_kv("0bad-key.name", "v")],
+            vec![gauge_metric(
+                "up",
+                vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
+            )],
+        );
+        let out_resource =
+            normalize_metrics(&tenant(), request(vec![via_resource]), &limits, 1_000);
+        assert!(
+            out_resource.rejected.is_empty(),
+            "{:?}",
+            out_resource.rejected
+        );
+        let resource_labels = &out_resource.points[0].labels;
+        // sanitize_label_name maps a leading digit to '_' and '-' to '_'.
+        assert_eq!(resource_labels.get("_bad_key_name"), Some("v"));
+        // The old dots-only replacement left an invalid name; it must be gone.
+        assert_eq!(resource_labels.get("0bad-key_name"), None);
+
+        // The same key as a data-point attribute already takes the
+        // sanitize_label_name path; it must produce the identical name.
+        let via_attr = resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "up",
+                vec![number_point(
+                    vec![string_kv("0bad-key.name", "v")],
+                    1_000,
+                    NumberValue::AsDouble(1.0),
+                )],
+            )],
+        );
+        let out_attr = normalize_metrics(&tenant(), request(vec![via_attr]), &limits, 1_000);
+        assert!(out_attr.rejected.is_empty(), "{:?}", out_attr.rejected);
+        assert_eq!(out_attr.points[0].labels.get("_bad_key_name"), Some("v"));
+
+        // The sanitized name is what reaches series identity: both paths yield
+        // the same canonical label set and therefore the same SeriesId.
+        assert_eq!(
+            out_resource.points[0].series_id,
+            out_attr.points[0].series_id
+        );
     }
 
     // --- sanitization collisions -> duplicate rejection ---
