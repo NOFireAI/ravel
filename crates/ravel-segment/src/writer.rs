@@ -1,7 +1,8 @@
 //! RSEG v1 writer: builds a complete segment object from per-series sample
 //! batches plus segment identity, per docs/segment-format.md.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use bytes::Bytes;
 use prost::Message;
@@ -108,21 +109,16 @@ impl SegmentWriter {
             max_event_ts_ns = 0;
         }
 
-        let dict = build_dictionary(&series);
-        // Validate the count fits the on-disk u32 field *before* using it to
-        // build ordinals, so a hypothetical oversized dictionary errors
-        // cleanly instead of silently wrapping via truncation.
-        u32::try_from(dict.len()).map_err(|_| WriteError::TooManyDictStrings)?;
-        let ordinal_of: HashMap<&str, u32> = dict
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.as_str(), i as u32))
-            .collect();
+        let dict = build_dictionary(&series)?;
 
         let mut ts_pages = Vec::new();
         let mut val_pages = Vec::new();
-        let series_table_raw =
-            encode_series_table(&series, &ordinal_of, &mut ts_pages, &mut val_pages)?;
+        let series_table_raw = encode_series_table(
+            &series,
+            &dict.occurrence_ordinals,
+            &mut ts_pages,
+            &mut val_pages,
+        )?;
         let label_dict_raw = encode_label_dict(&dict)?;
 
         let label_dict_compressed = zstd_compress(&label_dict_raw)?;
@@ -224,30 +220,138 @@ impl SegmentWriter {
     }
 }
 
+/// FNV-1a. Label names and values are short strings from a single,
+/// admission-limited write batch, hashed into a map that lives only for
+/// the duration of one `write` call, so a fast non-keyed hash is safe
+/// here; SipHash cost dominated dictionary construction at high series
+/// counts.
+#[derive(Default)]
+struct FnvHasher(u64);
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+}
+
+/// Dictionary build result: the ordinal-ordered strings and the
+/// pre-resolved ordinal of every label-string occurrence in series
+/// iteration order (name, then value, per label).
+struct Dictionary<'a> {
+    /// Distinct non-`__name__` strings in ordinal order (ordinals 1..).
+    sorted_non_name: Vec<&'a str>,
+    /// On-disk ordinal for every occurrence, aligned with iterating
+    /// `series` and each series' labels in order.
+    occurrence_ordinals: Vec<u32>,
+    /// Number of dictionary entries including ordinal 0 (`__name__`).
+    count: u32,
+}
+
 /// Ordinal 0 is always `"__name__"` (docs/segment-format.md); the rest of
 /// the distinct label names/values used across the batch follow in sorted
 /// order (arbitrary but deterministic -- the reader locates strings purely
 /// by ordinal).
-fn build_dictionary(series: &[SeriesInput]) -> Vec<String> {
-    let mut set: BTreeSet<&str> = BTreeSet::new();
+///
+/// Single interner pass resolves every occurrence's ordinal up front, so
+/// series-table encoding never has to hash strings again. Only the
+/// distinct strings are sorted (with a big-endian 8-byte prefix key to
+/// keep most comparisons integer-sized), instead of feeding every
+/// occurrence through a BTreeSet.
+fn build_dictionary(series: &[SeriesInput]) -> Result<Dictionary<'_>, WriteError> {
+    let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
+    let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
+        HashMap::with_capacity_and_hasher(total_strings, BuildHasherDefault::default());
+    let mut distinct: Vec<&str> = Vec::new();
+    let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
+
     for s in series {
         for label in s.labels.iter() {
-            set.insert(label.name.as_str());
-            set.insert(label.value.as_str());
+            for text in [label.name.as_str(), label.value.as_str()] {
+                let id = match interner.entry(text) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let id = u32::try_from(distinct.len())
+                            .map_err(|_| WriteError::TooManyDictStrings)?;
+                        distinct.push(text);
+                        e.insert(id);
+                        id
+                    }
+                };
+                occurrence_ordinals.push(id);
+            }
         }
     }
-    set.remove(METRIC_NAME_LABEL);
-    let mut dict = Vec::with_capacity(set.len() + 1);
-    dict.push(METRIC_NAME_LABEL.to_string());
-    dict.extend(set.into_iter().map(str::to_string));
-    dict
+
+    let mut order: Vec<(u64, u32)> = distinct
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (prefix_key(s), i as u32))
+        .collect();
+    order.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| distinct[a.1 as usize].cmp(distinct[b.1 as usize]))
+    });
+
+    let mut rank = vec![0u32; distinct.len()];
+    let mut next: u32 = 1;
+    for &(_, id) in &order {
+        if distinct[id as usize] == METRIC_NAME_LABEL {
+            rank[id as usize] = 0;
+        } else {
+            rank[id as usize] = next;
+            next = next.checked_add(1).ok_or(WriteError::TooManyDictStrings)?;
+        }
+    }
+    // `next` is now the dictionary size including the implicit ordinal 0.
+    let count = next;
+
+    let occurrence_ordinals = occurrence_ordinals
+        .into_iter()
+        .map(|id| rank[id as usize])
+        .collect();
+
+    let mut sorted_non_name: Vec<&str> = Vec::with_capacity(order.len());
+    for &(_, id) in &order {
+        let text = distinct[id as usize];
+        if text != METRIC_NAME_LABEL {
+            sorted_non_name.push(text);
+        }
+    }
+
+    Ok(Dictionary {
+        sorted_non_name,
+        occurrence_ordinals,
+        count,
+    })
 }
 
-fn encode_label_dict(dict: &[String]) -> Result<Vec<u8>, WriteError> {
+fn prefix_key(s: &str) -> u64 {
+    let bytes = s.as_bytes();
+    let mut key = [0u8; 8];
+    let n = bytes.len().min(8);
+    key[..n].copy_from_slice(&bytes[..n]);
+    u64::from_be_bytes(key)
+}
+
+fn encode_label_dict(dict: &Dictionary<'_>) -> Result<Vec<u8>, WriteError> {
     let mut buf = Vec::new();
-    let count = u32::try_from(dict.len()).map_err(|_| WriteError::TooManyDictStrings)?;
-    buf.extend_from_slice(&count.to_le_bytes());
-    for s in dict {
+    buf.extend_from_slice(&dict.count.to_le_bytes());
+    write_uvarint(&mut buf, METRIC_NAME_LABEL.len() as u64);
+    buf.extend_from_slice(METRIC_NAME_LABEL.as_bytes());
+    for s in &dict.sorted_non_name {
         let bytes = s.as_bytes();
         write_uvarint(&mut buf, bytes.len() as u64);
         buf.extend_from_slice(bytes);
@@ -257,7 +361,7 @@ fn encode_label_dict(dict: &[String]) -> Result<Vec<u8>, WriteError> {
 
 fn encode_series_table(
     series: &[SeriesInput],
-    ordinal_of: &HashMap<&str, u32>,
+    occurrence_ordinals: &[u32],
     ts_pages: &mut Vec<u8>,
     val_pages: &mut Vec<u8>,
 ) -> Result<Vec<u8>, WriteError> {
@@ -265,17 +369,18 @@ fn encode_series_table(
     let count = u32::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
     buf.extend_from_slice(&count.to_le_bytes());
 
+    let mut next_occurrence = occurrence_ordinals.iter();
     for s in series {
         buf.extend_from_slice(&s.series_id.0);
 
         let label_count = u16::try_from(s.labels.len()).map_err(|_| WriteError::TooManyLabels)?;
         buf.extend_from_slice(&label_count.to_le_bytes());
-        for label in s.labels.iter() {
-            let name_ord = *ordinal_of
-                .get(label.name.as_str())
+        for _ in 0..s.labels.len() {
+            let name_ord = *next_occurrence
+                .next()
                 .ok_or(WriteError::DictionaryInvariant)?;
-            let value_ord = *ordinal_of
-                .get(label.value.as_str())
+            let value_ord = *next_occurrence
+                .next()
                 .ok_or(WriteError::DictionaryInvariant)?;
             write_uvarint(&mut buf, u64::from(name_ord));
             write_uvarint(&mut buf, u64::from(value_ord));
