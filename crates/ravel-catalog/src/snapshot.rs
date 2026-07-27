@@ -34,10 +34,12 @@ pub struct SegmentRef {
 /// this type owns its data and holds no reference back to the store or the
 /// catalog's cache.
 ///
-/// Segments are sorted by the cross-segment dedup total order named in
+/// Segments are sorted by the cross-segment dedup provenance order named in
 /// docs/catalog-and-mvcc.md (`created_unix_ns`, `writer_epoch`,
-/// `writer_seq`), with `shard` as a final tiebreak, so iteration order is
-/// deterministic.
+/// `writer_seq`), with `shard` then `writer_id` as final tiebreaks. The
+/// `writer_id` tiebreak makes the key a total order over distinct segments,
+/// so iteration order is deterministic even when two same-shard segments from
+/// different writers tie on every provenance component.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Snapshot {
     pub segments: Vec<SegmentRef>,

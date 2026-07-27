@@ -92,9 +92,23 @@ impl Catalog {
         }
 
         let mut segments: Vec<SegmentRef> = segments.into_values().collect();
-        // Deterministic order: the cross-segment dedup total order named in
-        // docs/catalog-and-mvcc.md, with shard as a final tiebreak.
-        segments.sort_by_key(|s| (s.created_unix_ns, s.writer_epoch, s.writer_seq, s.shard));
+        // Deterministic total order: the cross-segment dedup provenance order
+        // named in docs/catalog-and-mvcc.md (created_unix_ns, writer_epoch,
+        // writer_seq), with shard then writer_id as final tiebreaks. writer_id
+        // makes the key total over distinct segments: two same-shard segments
+        // from different writers can tie on (created_unix_ns, writer_epoch,
+        // writer_seq) (seq is monotonic only per (writer_id, epoch, shard),
+        // ADR-0010 §3), and without an identity tiebreak the stable sort would
+        // otherwise leave them in randomized HashMap iteration order (a4-F01).
+        segments.sort_by_key(|s| {
+            (
+                s.created_unix_ns,
+                s.writer_epoch,
+                s.writer_seq,
+                s.shard,
+                s.writer_id,
+            )
+        });
         Ok(Snapshot { segments })
     }
 
