@@ -7,8 +7,9 @@ use ravel_catalog::SegmentRef;
 use ravel_object_store::{Etag, GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
-    ExpectedIdentity, Footer, FooterOutcome, ReaderLimits, SeriesEntry, check_identity,
-    decode_catalog, decode_pages, open_from_suffix, plan_ranges, select,
+    ExpectedIdentity, Footer, FooterOutcome, ReaderLimits, SeriesEntry, ValPageKind,
+    check_identity, decode_catalog, decode_pages, decode_pages_soa, open_from_suffix, plan_ranges,
+    select,
 };
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 
@@ -65,6 +66,39 @@ pub struct FetchedSeries {
     pub writer_seq: u64,
 }
 
+/// SoA counterpart to `FetchedSeries` (docs/arrow-datafusion-plan.md ticket
+/// A1a): timestamps and values as separate vecs, ready for zero-copy Arrow
+/// buffer adoption in `ravel-sql` (Phase B). Same provenance fields, same
+/// per-segment on-disk order and in-page-index tiebreak (index into
+/// `timestamps`/`values`) as `FetchedSeries`.
+#[derive(Debug, Clone)]
+pub struct FetchedSeriesSoa {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f64>,
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+}
+
+/// Page-kind counters accumulated over one `fetch_soa` call, for issue #25
+/// (X1) to consume later. Currently tracks VAL_RAW_F64 pages only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchStats {
+    pub raw_f64_pages: u64,
+    pub raw_f64_bytes: u64,
+}
+
+impl FetchStats {
+    fn record_val_page(&mut self, kind: ValPageKind, bytes: usize) {
+        if kind == ValPageKind::RawF64 {
+            self.raw_f64_pages += 1;
+            self.raw_f64_bytes += bytes as u64;
+        }
+    }
+}
+
 /// Byte ranges already fetched from a segment object, keyed by absolute
 /// offset, so later planned ranges that fall inside an already-fetched
 /// buffer (typically the initial suffix, for small segments) need no
@@ -91,7 +125,11 @@ impl FetchedRegions {
             if *s <= offset && end <= s.saturating_add(b.len() as u64) {
                 let start_rel = usize::try_from(offset - s).ok()?;
                 let end_rel = usize::try_from(end - s).ok()?;
-                b.get(start_rel..end_rel).map(Bytes::copy_from_slice)
+                // Refcounted slice of the already-fetched buffer, not a
+                // copy (docs/arrow-datafusion-plan.md hop 6, review F1):
+                // `b` is `Bytes`, so `slice` shares the backing allocation.
+                // `end_rel <= b.len()` holds by the range check above.
+                Some(b.slice(start_rel..end_rel))
             } else {
                 None
             }
@@ -365,6 +403,79 @@ impl SegmentFetcher {
         }
         Ok(out)
     }
+
+    /// SoA counterpart to `fetch` (docs/arrow-datafusion-plan.md ticket
+    /// A1a): decodes the same selected series but returns timestamps and
+    /// values as separate vecs per series, plus page-kind stats. Reuses one
+    /// decompression scratch buffer across every series in the segment;
+    /// `timestamps`/`values` are fresh per series, since each is returned
+    /// to the caller inside its own `FetchedSeriesSoa`.
+    pub async fn fetch_soa(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
+        let key = &seg_ref.data_object_key;
+        let expected = expected_identity(tenant_hash, seg_ref);
+        let (footer, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
+        let entries = self
+            .decode_selected(key, &footer, &suffix_etag, &mut regions, matchers)
+            .await?;
+        if entries.is_empty() {
+            return Ok((Vec::new(), FetchStats::default()));
+        }
+
+        let selected_refs: Vec<&SeriesEntry> = entries.iter().collect();
+        let planned =
+            plan_ranges(&footer, &selected_refs).map_err(|source| corrupt(key, source))?;
+        let page_ranges: Vec<(u64, u64)> = planned
+            .iter()
+            .flat_map(|p| {
+                [
+                    (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                    (p.val_range.0, p.val_range.0 + p.val_range.1),
+                ]
+            })
+            .collect();
+        self.ensure_ranges(key, &suffix_etag, &page_ranges, &mut regions)
+            .await?;
+
+        let mut stats = FetchStats::default();
+        let mut scratch = Vec::new();
+        let mut out = Vec::with_capacity(entries.len());
+        for (entry, plan) in entries.iter().zip(planned.iter()) {
+            let ts_bytes = regions
+                .slice(plan.ts_range.0, plan.ts_range.1)
+                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+            let val_bytes = regions
+                .slice(plan.val_range.0, plan.val_range.1)
+                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+            let mut timestamps = Vec::new();
+            let mut values = Vec::new();
+            let val_kind = decode_pages_soa(
+                entry,
+                &ts_bytes,
+                &val_bytes,
+                self.limits,
+                &mut scratch,
+                &mut timestamps,
+                &mut values,
+            )
+            .map_err(|source| corrupt(key, source))?;
+            stats.record_val_page(val_kind, val_bytes.len());
+            out.push(FetchedSeriesSoa {
+                series_id: entry.series_id,
+                labels: entry.labels.clone(),
+                timestamps,
+                values,
+                created_unix_ns: seg_ref.created_unix_ns,
+                writer_epoch: seg_ref.writer_epoch,
+                writer_seq: seg_ref.writer_seq,
+            });
+        }
+        Ok((out, stats))
+    }
 }
 
 fn expected_identity(tenant_hash: TenantHash, seg_ref: &SegmentRef) -> ExpectedIdentity {
@@ -381,5 +492,149 @@ fn corrupt(key: &str, source: ravel_segment::SegmentError) -> FetchError {
     FetchError::Corrupt {
         key: key.to_string(),
         source,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use ravel_catalog::SegmentRef;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet};
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn labels(metric: &str) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    fn series(metric: &str, samples: &[(i64, f64)]) -> SeriesInput {
+        let label_set = labels(metric);
+        let tenant_id = ravel_types::TenantId::new("t".to_string());
+        let series_id =
+            ravel_types::SeriesId::compute(&tenant_id, metric, &label_set).expect("series id");
+        SeriesInput {
+            series_id,
+            labels: label_set,
+            samples: samples
+                .iter()
+                .map(|(ts_ns, value)| ravel_types::Sample {
+                    ts_ns: *ts_ns,
+                    value: *value,
+                })
+                .collect(),
+        }
+    }
+
+    /// Writes a real RSEG segment with two series: one whose values Gorilla
+    /// compresses well (identical values -> VAL_GORILLA) and one whose
+    /// values are maximally incompressible (two samples with disjoint bit
+    /// patterns -> VAL_RAW_F64, since the writer falls back to raw once the
+    /// Gorilla encoding is not smaller than 8 bytes/sample). Puts the bytes
+    /// directly on a `MemoryStore` and returns a matching `SegmentRef`.
+    async fn write_test_segment() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([7u8; 16]);
+        let writer_id = Uuid::from_u128(1);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let smooth = series(
+            "smooth_metric",
+            &[(1_000 * NS, 1.0), (1_001 * NS, 1.0), (1_002 * NS, 1.0)],
+        );
+        let chaotic = series(
+            "chaotic_metric",
+            &[(1_000 * NS, 0.0), (1_001 * NS, f64::from_bits(u64::MAX))],
+        );
+        let written =
+            SegmentWriter::write(vec![smooth, chaotic], identity, bounds).expect("write segment");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/segment.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment object");
+
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 42,
+        };
+        (store, tenant_hash, seg_ref)
+    }
+
+    #[tokio::test]
+    async fn fetch_soa_matches_fetch_and_counts_raw_f64_pages() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        let mut aos = fetcher
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch");
+        let (mut soa, stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+
+        aos.sort_by_key(|s| s.series_id.0);
+        soa.sort_by_key(|s| s.series_id.0);
+
+        assert_eq!(aos.len(), 2);
+        assert_eq!(soa.len(), 2);
+        for (a, s) in aos.iter().zip(soa.iter()) {
+            assert_eq!(a.series_id, s.series_id);
+            assert_eq!(a.labels, s.labels);
+            assert_eq!(a.created_unix_ns, s.created_unix_ns);
+            assert_eq!(a.writer_epoch, s.writer_epoch);
+            assert_eq!(a.writer_seq, s.writer_seq);
+            assert_eq!(a.samples.len(), s.timestamps.len());
+            assert_eq!(s.timestamps.len(), s.values.len());
+            for (sample, (ts, val)) in a
+                .samples
+                .iter()
+                .zip(s.timestamps.iter().zip(s.values.iter()))
+            {
+                assert_eq!(sample.ts_ns, *ts);
+                assert_eq!(sample.value.to_bits(), val.to_bits());
+            }
+        }
+
+        // "chaotic_metric" (2 maximally-differing samples) must have forced
+        // VAL_RAW_F64; "smooth_metric" (identical values) must have stayed
+        // VAL_GORILLA. Exactly one raw page, exactly one page's worth of
+        // raw-f64 bytes (6-byte header + 2 * 8-byte values).
+        assert_eq!(stats.raw_f64_pages, 1);
+        assert_eq!(stats.raw_f64_bytes, 6 + 2 * 8);
     }
 }
