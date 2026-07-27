@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="950" viewBox="0 0 1500 950" font-family="system-ui, sans-serif">
+  <rect x="0" y="0" width="1500" height="950" fill="#f4f5f7"/>
+
+  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Tenancy key layout — bucket key tree under t/&lt;tenant_hash&gt;/</text>
+  <text x="30" y="48" font-size="12" fill="#4a4f57">docs/catalog-and-mvcc.md key layout + ADR-0009 tenant isolation + ADR-0010 §3/§13</text>
+
+  <!-- legend -->
+  <rect x="1200" y="15" width="270" height="112" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+  <rect x="1212" y="24" width="14" height="14" rx="3" fill="#dde1e7" stroke="#454b54" stroke-width="1.5"/>
+  <text x="1232" y="35" font-size="10" fill="#17191c">fixed literal path segment</text>
+  <rect x="1212" y="44" width="14" height="14" rx="3" fill="#a9c9e6" stroke="#1f4e79" stroke-width="1.5"/>
+  <text x="1232" y="55" font-size="10" fill="#17191c">variable identifier component</text>
+  <rect x="1212" y="64" width="14" height="14" rx="3" fill="#f4c869" stroke="#8a5a10" stroke-width="1.5"/>
+  <text x="1232" y="75" font-size="10" fill="#17191c">full key = an immutable object</text>
+  <rect x="1212" y="84" width="14" height="14" rx="3" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="1232" y="95" font-size="10" fill="#17191c">checksum-derived component</text>
+  <rect x="1212" y="104" width="14" height="14" rx="3" fill="#dde1e7" stroke="#454b54" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="1232" y="115" font-size="10" fill="#17191c">reserved / planned (later)</text>
+
+  <!-- R0 root -->
+  <rect x="40" y="150" width="70" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="75" y="174" font-size="12" text-anchor="middle" fill="#17191c">t/</text>
+
+  <!-- R1 tenant_hash -->
+  <line x1="110" y1="170" x2="150" y2="170" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="150" y="150" width="260" height="40" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="280" y="174" font-size="12" text-anchor="middle" fill="#17191c">&lt;tenant_hash&gt;/</text>
+  <text x="150" y="204" font-size="9.5" fill="#4a4f57">32 hex chars. unkeyed BLAKE3 by default; deployment-keyed</text>
+  <text x="150" y="216" font-size="9.5" fill="#4a4f57">variant available via config for enumeration resistance (ADR-0010 §13)</text>
+
+  <!-- R2 m/ -->
+  <line x1="410" y1="170" x2="450" y2="170" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="450" y="150" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="535" y="174" font-size="12" text-anchor="middle" fill="#17191c">m/  (metrics)</text>
+
+  <!-- R3 l0/ -->
+  <line x1="620" y1="170" x2="660" y2="170" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="660" y="150" width="120" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="720" y="174" font-size="12" text-anchor="middle" fill="#17191c">l0/</text>
+
+  <!-- R4 shard -->
+  <line x1="780" y1="170" x2="820" y2="170" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="820" y="150" width="170" height="40" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="905" y="174" font-size="12" text-anchor="middle" fill="#17191c">&lt;shard&gt;/</text>
+  <text x="820" y="204" font-size="9.5" fill="#4a4f57">zero-padded 4-digit decimal. shard_count immutable per</text>
+  <text x="820" y="216" font-size="9.5" fill="#4a4f57">(tenant, signal) in v1 — changing it is a forbidden, data-loss operation</text>
+
+  <!-- R5 data leaf -->
+  <line x1="990" y1="170" x2="1030" y2="170" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="1030" y="150" width="430" height="40" rx="6" fill="#f4c869" stroke="#8a5a10" stroke-width="2.5"/>
+  <text x="1245" y="174" font-size="11.5" text-anchor="middle" fill="#17191c">&lt;writer_id&gt;.&lt;epoch&gt;.&lt;seq&gt;.&lt;hash16&gt;.rseg</text>
+
+  <!-- data leaf note -->
+  <rect x="660" y="205" width="800" height="80" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+  <text x="674" y="222" font-size="10.5" fill="#17191c">writer_id: uuidv4, freshly random per process start — never derived from hostname, pod name, shard index, or config</text>
+  <text x="674" y="238" font-size="10.5" fill="#17191c">epoch: u64 unix seconds at process startup — informational only, not used for ordering</text>
+  <text x="674" y="254" font-size="10.5" fill="#17191c">seq: u64 monotonic per (writer_id, epoch, shard), 20-digit zero-padded so lexicographic = numeric order;</text>
+  <text x="674" y="268" font-size="10.5" fill="#17191c">gaps are permitted (abandoned flushes) and carry no meaning</text>
+  <rect x="674" y="274" width="290" height="20" rx="10" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="819" y="288" font-size="9.5" text-anchor="middle" fill="#17191c">hash16 = first 16 hex chars of blake3 (checksum)</text>
+
+  <!-- R6 c/ -->
+  <line x1="535" y1="190" x2="535" y2="340" stroke="#7a808a" stroke-width="1.5"/>
+  <line x1="535" y1="340" x2="660" y2="340" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="660" y="320" width="120" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="720" y="344" font-size="12" text-anchor="middle" fill="#17191c">c/</text>
+
+  <!-- R7 shard -->
+  <line x1="780" y1="340" x2="820" y2="340" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="820" y="320" width="170" height="40" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="905" y="344" font-size="12" text-anchor="middle" fill="#17191c">&lt;shard&gt;/</text>
+
+  <!-- R8 ingest_hour -->
+  <line x1="990" y1="340" x2="1030" y2="340" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="1030" y="320" width="230" height="40" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="1145" y="344" font-size="12" text-anchor="middle" fill="#17191c">&lt;ingest_hour&gt;/</text>
+
+  <!-- R9 commit leaf -->
+  <line x1="1260" y1="340" x2="1290" y2="340" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="1290" y="320" width="180" height="40" rx="6" fill="#f4c869" stroke="#8a5a10" stroke-width="2.5"/>
+  <text x="1380" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">&lt;writer_id&gt;.&lt;epoch&gt;.</text>
+  <text x="1380" y="352" font-size="10.5" text-anchor="middle" fill="#17191c">&lt;seq&gt;.cmt</text>
+
+  <!-- commit branch note -->
+  <rect x="660" y="375" width="810" height="80" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+  <text x="674" y="392" font-size="10.5" fill="#17191c">ingest_hour = YYYYMMDDTHH UTC, formatted from the pinned ingest_hour_bucket (unix hours) at flush open;</text>
+  <text x="674" y="407" font-size="10.5" fill="#17191c">never recomputed on retry</text>
+  <text x="674" y="425" font-size="10.5" fill="#17191c">writer_id, epoch, seq: the same identity fields as the data key, pinned once for the whole flush</text>
+  <text x="674" y="441" font-size="10.5" fill="#17191c">.cmt fixed suffix — no content-hash component; commit-record existence is the sole visibility truth</text>
+
+  <!-- Reserved signals -->
+  <line x1="280" y1="190" x2="280" y2="520" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="280" y1="520" x2="450" y2="520" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <rect x="450" y="500" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="535" y="524" font-size="12" text-anchor="middle" fill="#17191c">l/  (logs, reserved)</text>
+
+  <line x1="280" y1="520" x2="280" y2="560" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="280" y1="560" x2="450" y2="560" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <rect x="450" y="540" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="535" y="564" font-size="12" text-anchor="middle" fill="#17191c">s/  (spans, reserved)</text>
+
+  <line x1="280" y1="560" x2="280" y2="600" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="280" y1="600" x2="450" y2="600" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <rect x="450" y="580" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="535" y="604" font-size="12" text-anchor="middle" fill="#17191c">p/  (profiles, reserved)</text>
+
+  <!-- catalog (future) -->
+  <line x1="280" y1="600" x2="280" y2="660" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="280" y1="660" x2="450" y2="660" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <rect x="450" y="640" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="535" y="664" font-size="12" text-anchor="middle" fill="#17191c">catalog/  (later)</text>
+
+  <line x1="620" y1="660" x2="660" y2="660" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <rect x="660" y="640" width="330" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="825" y="664" font-size="11.5" text-anchor="middle" fill="#17191c">snap/&lt;snapshot_id&gt;.snap  (catalog snapshot, later)</text>
+
+  <line x1="535" y1="680" x2="535" y2="710" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="535" y1="710" x2="660" y2="710" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <rect x="660" y="690" width="330" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="825" y="714" font-size="11.5" text-anchor="middle" fill="#17191c">HEAD  (mutable pointer to current snapshot, later)</text>
+
+  <!-- bottom notes -->
+  <rect x="30" y="770" width="1440" height="150" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+  <text x="46" y="790" font-size="12" font-weight="bold" fill="#17191c">Notes</text>
+  <text x="46" y="810" font-size="11" fill="#17191c">Readers never trust CommitRecord.object_key: the data key is reconstructed from (tenant_hash, signal, shard, writer_id, epoch, seq, content_hash);</text>
+  <text x="46" y="826" font-size="11" fill="#17191c">a mismatch with the stored object_key is a fatal invariant breach (ADR-0010 §7).</text>
+  <text x="46" y="846" font-size="11" fill="#17191c">Commit token v2 = base64url of "v2:&lt;shard&gt;:&lt;writer_id&gt;:&lt;epoch&gt;:&lt;seq&gt;:&lt;ingest_hour_bucket&gt;" — it fully determines the commit-record key above,</text>
+  <text x="46" y="862" font-size="11" fill="#17191c">so read-your-write resolves by exact GET, never by re-listing.</text>
+  <text x="46" y="882" font-size="11" fill="#17191c">Signal prefixes l/, s/, p/ and the catalog/ subtree are reserved names, not yet written by any code path; they are shown here to fix the namespace early.</text>
+  <text x="46" y="902" font-size="11" fill="#17191c">Data objects use PutMode::CreateIfAbsent; AlreadyExists is success because the key embeds the content hash, so a retry always names the same bytes.</text>
+</svg>

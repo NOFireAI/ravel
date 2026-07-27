@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1150" viewBox="0 0 1320 1150" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>
+    </marker>
+    <marker id="arrowamber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a5a10"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1320" height="1150" fill="#f4f5f7"/>
+
+  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">Query path — from PromQL request to JSON response</text>
+  <text x="30" y="48" font-size="12" fill="#4a4f57">docs/query-engine.md + docs/catalog-and-mvcc.md snapshot resolution + docs/segment-format.md reader protocol</text>
+
+  <!-- legend -->
+  <rect x="1150" y="15" width="150" height="112" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+  <rect x="1160" y="24" width="14" height="14" rx="3" fill="#a9c9e6" stroke="#1f4e79" stroke-width="1.5"/>
+  <text x="1180" y="35" font-size="9.5" fill="#17191c">step / service</text>
+  <rect x="1160" y="44" width="14" height="14" rx="3" fill="#f4c869" stroke="#8a5a10" stroke-width="1.5"/>
+  <text x="1180" y="55" font-size="9.5" fill="#17191c">immutable object</text>
+  <rect x="1160" y="64" width="14" height="14" rx="3" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="1180" y="75" font-size="9.5" fill="#17191c">checksum-verified</text>
+  <rect x="1160" y="84" width="14" height="14" rx="3" fill="#dde1e7" stroke="#454b54" stroke-width="1.5"/>
+  <text x="1180" y="95" font-size="9.5" fill="#17191c">container / envelope</text>
+  <line x1="1160" y1="108" x2="1174" y2="108" stroke="#8a5a10" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="1180" y="112" font-size="9.5" fill="#17191c">object store read</text>
+
+  <!-- Request -->
+  <rect x="60" y="140" width="1080" height="50" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="600" y="162" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">HTTP request: /api/v1/query, /query_range, /labels, /series</text>
+  <text x="600" y="178" font-size="10.5" text-anchor="middle" fill="#17191c">PromQL selectors + time range + optional min_commit_token(s), after auth + tenant resolve</text>
+
+  <line x1="600" y1="190" x2="600" y2="208" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Catalog resolve container -->
+  <rect x="60" y="210" width="1080" height="260" rx="8" fill="#f4f7fa" stroke="#1f4e79" stroke-width="2"/>
+  <text x="76" y="228" font-size="13" font-weight="bold" fill="#17191c">Catalog::resolve(tenant, signal, padded_range, min_tokens, now_ns) -&gt; Snapshot</text>
+
+  <rect x="76" y="235" width="1000" height="50" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="90" y="252" font-size="11" font-weight="bold" fill="#17191c">1. listing window</text>
+  <text x="90" y="267" font-size="10" fill="#17191c">for each shard × ingest_hour overlapping [range.start - max_ingest_lag, now + clock_skew_allowance]:</text>
+  <text x="90" y="279" font-size="10" fill="#17191c">LIST t/&lt;tenant_hash&gt;/m/c/&lt;shard&gt;/&lt;hour&gt;/ (paginated; caller dedups keys)</text>
+
+  <line x1="576" y1="285" x2="576" y2="298" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="76" y="298" width="1000" height="42" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="90" y="315" font-size="11" font-weight="bold" fill="#17191c">2. decode + cache commit records</text>
+  <text x="90" y="330" font-size="10" fill="#17191c">keyed by full object key (LRU); filter by [min_event_ts,max_event_ts] overlap with padded_range</text>
+
+  <line x1="576" y1="340" x2="576" y2="353" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="76" y="353" width="1000" height="50" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="90" y="370" font-size="11" font-weight="bold" fill="#17191c">3. resolve min_commit_token(s)</text>
+  <text x="90" y="385" font-size="10" fill="#17191c">reconstruct exact commit key from the token -&gt; GET directly (never by re-listing);</text>
+  <text x="90" y="397" font-size="10" fill="#17191c">include in snapshot for read-your-write; absent after one retry -&gt; "unsatisfiable token" (5xx)</text>
+
+  <line x1="576" y1="403" x2="576" y2="416" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="200" y="416" width="750" height="42" rx="6" fill="#f4c869" stroke="#8a5a10" stroke-width="2.5"/>
+  <text x="575" y="440" font-size="12" font-weight="bold" text-anchor="middle" fill="#17191c">Snapshot = pinned segment set for the query's lifetime</text>
+
+  <line x1="600" y1="470" x2="600" y2="498" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Per-segment container -->
+  <rect x="60" y="500" width="1080" height="280" rx="8" fill="#f4f7fa" stroke="#1f4e79" stroke-width="2"/>
+  <text x="76" y="518" font-size="13" font-weight="bold" fill="#17191c">per snapshot segment (concurrency-bounded, default 8; budget: max 1024 segments/query)</text>
+
+  <rect x="76" y="528" width="1000" height="42" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="90" y="545" font-size="11" font-weight="bold" fill="#17191c">a. suffix GET (64 KiB)</text>
+  <text x="90" y="560" font-size="10" fill="#17191c">Reader::parse -&gt; footer; one more ranged GET only if the suffix misses the footer</text>
+
+  <line x1="576" y1="570" x2="576" y2="583" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="76" y="583" width="1000" height="50" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="90" y="600" font-size="11" font-weight="bold" fill="#17191c">b. prune series</text>
+  <text x="90" y="615" font-size="10" fill="#17191c">SERIES_TABLE ts bounds vs padded_range, then matchers vs LABEL_DICT: equality by dictionary</text>
+  <text x="90" y="627" font-size="10" fill="#17191c">ordinal compare (resolve once); regex / negative matchers evaluate on materialized label sets</text>
+
+  <line x1="576" y1="633" x2="576" y2="646" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="76" y="646" width="1000" height="42" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="90" y="663" font-size="11" font-weight="bold" fill="#17191c">c. plan + coalesce page ranges</text>
+  <text x="90" y="678" font-size="10" fill="#17191c">per surviving series; coalesce adjacent ranges (gap &lt;= 64 KiB) into few ranged GETs</text>
+
+  <line x1="576" y1="688" x2="576" y2="701" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="76" y="701" width="1000" height="50" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="90" y="718" font-size="11" font-weight="bold" fill="#17191c">d. decode pages -&gt; per-series (ts, value) samples</text>
+  <rect x="90" y="726" width="130" height="20" rx="10" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="155" y="740" font-size="9" text-anchor="middle" fill="#17191c">page crc32c verified</text>
+
+  <text x="1076" y="770" font-size="10" text-anchor="end" fill="#4a4f57">v1: one page pair per series; nothing further to prune at page level</text>
+
+  <line x1="600" y1="780" x2="600" y2="808" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Merge / dedup -->
+  <rect x="60" y="810" width="1080" height="90" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="600" y="830" font-size="12" font-weight="bold" text-anchor="middle" fill="#17191c">merge samples per series id across segments — sort by ts</text>
+  <text x="600" y="848" font-size="10.5" text-anchor="middle" fill="#17191c">cross-segment duplicate (series_id, ts): dedup under the total order</text>
+  <text x="600" y="864" font-size="10.5" text-anchor="middle" fill="#17191c">(commit created_unix_ns, writer_epoch, writer_seq, in-page index) — greatest wins</text>
+  <text x="600" y="880" font-size="10.5" text-anchor="middle" fill="#17191c">values compare by f64 bit pattern everywhere (NaN payload and -0.0 are significant)</text>
+
+  <line x1="600" y1="900" x2="600" y2="918" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Evaluator -->
+  <rect x="60" y="920" width="1080" height="60" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="600" y="944" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">SeriesSource -&gt; ravel-promql Evaluator</text>
+  <text x="600" y="962" font-size="10.5" text-anchor="middle" fill="#17191c">selectors + lookback (5 m default, extended by largest selector offset) -&gt; instant vector / range matrix</text>
+
+  <line x1="600" y1="980" x2="600" y2="998" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- JSON envelope -->
+  <rect x="60" y="1000" width="1080" height="60" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="600" y="1024" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">Prometheus JSON envelope</text>
+  <text x="600" y="1042" font-size="10.5" text-anchor="middle" fill="#17191c">{status, data:{resultType, result}, warnings} — errors use status:"error", errorType, error + correct HTTP code</text>
+
+  <!-- Object store band -->
+  <rect x="1180" y="210" width="80" height="570" rx="8" fill="#fbe6b9" stroke="#8a5a10" stroke-width="2.5"/>
+  <text x="1220" y="203" font-size="11" font-weight="bold" text-anchor="middle" fill="#17191c">OBJECT STORE</text>
+
+  <line x1="1180" y1="260" x2="1140" y2="260" stroke="#8a5a10" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arrowamber)"/>
+  <text x="1176" y="253" font-size="9" text-anchor="end" fill="#17191c">LIST</text>
+
+  <line x1="1180" y1="378" x2="1140" y2="378" stroke="#8a5a10" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arrowamber)"/>
+  <text x="1176" y="371" font-size="9" text-anchor="end" fill="#17191c">GET token key</text>
+
+  <line x1="1180" y1="549" x2="1140" y2="549" stroke="#8a5a10" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arrowamber)"/>
+  <text x="1176" y="542" font-size="9" text-anchor="end" fill="#17191c">suffix GET</text>
+
+  <line x1="1180" y1="667" x2="1140" y2="667" stroke="#8a5a10" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arrowamber)"/>
+  <text x="1176" y="660" font-size="9" text-anchor="end" fill="#17191c">ranged GETs</text>
+
+  <!-- Bottom notes -->
+  <text x="30" y="1085" font-size="11" fill="#4a4f57">Budgets (Phase 1, static config): max 1024 segments touched, max 8 concurrent GETs, max 10k matched series, max 10M samples materialized, 30 s wall deadline (timeout param can lower it).</text>
+  <text x="30" y="1101" font-size="11" fill="#4a4f57">Exceeding a budget returns a Prometheus-style error, never a partial silent result. Caching: Phase 1 caches only decoded commit records and parsed footers, keyed by (object key, etag), in-memory LRU.</text>
+  <text x="30" y="1117" font-size="11" fill="#4a4f57">padded_range = query range extended left by the lookback delta plus the largest selector offset, so lookback never misses samples stored only in an earlier segment.</text>
+  <text x="30" y="1133" font-size="11" fill="#4a4f57">A store NotFound on a pinned segment surfaces as SnapshotInvalidated; the frontend re-resolves and retries the query once.</text>
+</svg>
