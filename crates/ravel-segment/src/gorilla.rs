@@ -259,6 +259,69 @@ mod tests {
     }
 
     #[test]
+    fn window_reuse_hand_vector() {
+        // Independent known-answer vector for the "10" window-reuse control
+        // path (gorilla.rs:133-141 encode, :184-194 decode). Oracle source:
+        // docs/reviews/2026-07-27-storage-engine-quality-audit/
+        // a2-segment-codecs.md finding a2-F01. Bytes hand-computed from enc 16
+        // and re-derived here, independent of the encoder.
+        //
+        //   values: [0.0, from_bits(0x0F00_0000_0000_0000),
+        //                 from_bits(0x0800_0000_0000_0000)]
+        //
+        //   v0 = 0.0                      -> 64 raw zero bits (8 x 0x00)
+        //   v1: xor = 0x0F00_0000_0000_0000, real_lead=4, trail=56, mlen=4.
+        //       "new block" 11 | lead=4 (00100) | mlen-1=3 (000011)
+        //       | meaningful=1111. window := (4, 56).
+        //   v2: xor = 0x0700_0000_0000_0000, real_lead=5>=4, trail=56>=56, so
+        //       the window is reused: "10" | meaningful=(xor>>56)&0xF = 0111.
+        //   Control bits: 11 00100 000011 1111 10 0111, padded with one 0 bit
+        //   -> 0xC8, 0x1F, 0xCE.
+        let values = [
+            0.0,
+            f64::from_bits(0x0F00_0000_0000_0000),
+            f64::from_bits(0x0800_0000_0000_0000),
+        ];
+        let expected = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC8, 0x1F, 0xCE,
+        ];
+        // Decode direction: bytes -> values, independent of the encoder.
+        let decoded = decode_gorilla(&expected, values.len()).expect("decodes");
+        assert_eq!(bits(&decoded), bits(&values));
+        // Encode direction: values -> bytes, pinned against the same oracle so
+        // both directions are checked against an external reference, not each
+        // other.
+        assert_eq!(encode_gorilla(&values), expected);
+    }
+
+    #[test]
+    fn clamped_leading_hand_vector() {
+        // Independent known-answer vector for the clamped leading-zero path
+        // (real_lead > 31, clamped to 31 by gorilla.rs:143). Oracle source:
+        // a2-F01 in the A2 audit report; bytes hand-computed from enc 16 and
+        // re-derived here, independent of the encoder.
+        //
+        //   values: [0.0, from_bits(0x0000_0000_0010_0000)]
+        //
+        //   v0 = 0.0                      -> 64 raw zero bits (8 x 0x00)
+        //   v1: xor = 0x0000_0000_0010_0000 (bit 20 only), real_lead=43 which
+        //       clamps to lead=31, trail=20, meaningful_len = 64-31-20 = 13.
+        //       "new block" 11 | lead=31 (11111) | mlen-1=12 (001100)
+        //       | meaningful = (xor>>20)&0x1FFF = 1 (13 bits: ...0000001).
+        //   Control bits: 11 11111 001100 0000000000001, padded with six 0
+        //   bits -> 0xFE, 0x60, 0x00, 0x40.
+        let values = [0.0, f64::from_bits(0x0000_0000_0010_0000)];
+        let expected = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x60, 0x00, 0x40,
+        ];
+        // Decode direction: bytes -> values, independent of the encoder.
+        let decoded = decode_gorilla(&expected, values.len()).expect("decodes");
+        assert_eq!(bits(&decoded), bits(&values));
+        // Encode direction: values -> bytes, pinned against the same oracle.
+        assert_eq!(encode_gorilla(&values), expected);
+    }
+
+    #[test]
     fn empty_series_encodes_to_empty_stream() {
         assert_eq!(encode_gorilla(&[]), Vec::<u8>::new());
         assert_eq!(decode_gorilla(&[], 0).expect("decodes"), Vec::<f64>::new());
