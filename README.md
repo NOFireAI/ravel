@@ -1,5 +1,9 @@
 # Ravel
 
+[![CI](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml/badge.svg)](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.97.1-orange.svg)](rust-toolchain.toml)
+
 Ravel is an OpenTelemetry-native observability database. It stores metrics
 (logs, traces, and profiles are planned) directly on S3-compatible object
 storage, with no local disk state and no coordination service. A query talks
