@@ -194,9 +194,21 @@ impl MemoryPool for TenantDelegatingPool {
     }
 
     fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
-        // The trait requires this to be infallible; both budgets grow
-        // unconditionally. DataFusion uses this only after a successful
-        // reservation, so it never crosses a ceiling in practice.
+        // The trait requires this to be infallible, and both budgets grow
+        // unconditionally -- this is not only reachable after a validated
+        // try_grow. datafusion 54.1.0's MemoryReservation::resize() and at
+        // least the nested-loop and sort-merge join operators call grow
+        // directly with a delta that was never checked against either
+        // ceiling (confirmed against the pinned datafusion source; matches
+        // upstream GreedyMemoryPool::grow, which has the same shape). Do
+        // not "fix" this by clamping or declining here: MemoryReservation
+        // itself does `pool.grow` then an unconditional local size
+        // increment, so a pool that grows a different amount than it was
+        // asked desyncs the reservation's own accounting, and the eventual
+        // `free()` on drop would then over-release into shrink's
+        // saturating floor, undercounting the tenant. Both budgets are
+        // therefore best-effort ceilings once joins reach this pool (B3+),
+        // not hard caps against every DataFusion-internal growth path.
         self.query_used.fetch_add(additional, Ordering::AcqRel);
         self.tenant.grow(additional);
     }
