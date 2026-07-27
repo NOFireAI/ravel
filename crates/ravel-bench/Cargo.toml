@@ -28,6 +28,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 stats_alloc = "0.1.10"
+# Gated behind `parquet-baseline` (off by default). arrow reuses the
+# workspace pin (identical to ravel-otap's); parquet is pinned lockstep to
+# the same major and is a new external dependency (see issue #97 report).
+arrow = { workspace = true, optional = true }
+parquet = { version = "59", optional = true }
+
+[features]
+# Write-side Parquet baseline harness (issue #97 phase a). Off by default:
+# the standard build and gates never compile arrow/parquet or the
+# parquet_baseline bin.
+parquet-baseline = ["dep:arrow", "dep:parquet"]
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -57,6 +68,12 @@ bench = false
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
+bench = false
+
+[[bin]]
+name = "parquet_baseline"
+path = "src/bin/parquet_baseline.rs"
+required-features = ["parquet-baseline"]
 bench = false
 
 [[test]]
