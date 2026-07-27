@@ -2026,6 +2026,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-failure-tests"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "opentelemetry-proto",
+ "rand 0.10.2",
+ "ravel-catalog",
+ "ravel-commit",
+ "ravel-ingest",
+ "ravel-object-store",
+ "ravel-otlp",
+ "ravel-promql",
+ "ravel-query",
+ "ravel-segment",
+ "ravel-types",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "ravel-ingest"
 version = "0.1.0"
 dependencies = [
