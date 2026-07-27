@@ -13,4 +13,4 @@ pub use config::{
 };
 pub use engine::QueryEngine;
 pub use error::QueryError;
-pub use fetcher::{FetchError, FetchedSeries, SegmentFetcher};
+pub use fetcher::{FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SegmentFetcher};

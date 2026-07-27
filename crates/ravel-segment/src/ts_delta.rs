@@ -21,18 +21,21 @@ pub fn encode_ts_deltas(timestamps: &[i64]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decodes exactly `count` timestamps with overflow-checked accumulation;
-/// each decoded value is validated against `[min_ts_ns, max_ts_ns]`
-/// (docs/segment-format.md). Rejects trailing bytes past the declared
-/// count.
-pub fn decode_ts_deltas(
+/// Decodes exactly `count` timestamps with overflow-checked accumulation
+/// into a caller-supplied buffer (`out` is cleared, then filled; on error
+/// its contents are unspecified, reusable across pages instead of
+/// allocating fresh per page); each decoded value is validated against
+/// `[min_ts_ns, max_ts_ns]` (docs/segment-format.md). Rejects trailing
+/// bytes past the declared count.
+pub fn decode_ts_deltas_into(
     bytes: &[u8],
     count: usize,
     min_ts_ns: i64,
     max_ts_ns: i64,
-) -> Result<Vec<i64>, SegmentError> {
+    out: &mut Vec<i64>,
+) -> Result<(), SegmentError> {
+    out.clear();
     let mut pos = 0usize;
-    let mut out = Vec::new();
     let mut accum = 0i64;
     for i in 0..count {
         let delta = read_zigzag_varint(bytes, &mut pos)?;
@@ -55,13 +58,24 @@ pub fn decode_ts_deltas(
     if pos != bytes.len() {
         return Err(SegmentError::TrailingBytes);
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn decode_ts_deltas(
+        bytes: &[u8],
+        count: usize,
+        min_ts_ns: i64,
+        max_ts_ns: i64,
+    ) -> Result<Vec<i64>, SegmentError> {
+        let mut out = Vec::new();
+        decode_ts_deltas_into(bytes, count, min_ts_ns, max_ts_ns, &mut out)?;
+        Ok(out)
+    }
 
     #[test]
     fn hand_vector_ascending_with_duplicate_and_gap() {

@@ -20,6 +20,11 @@ thiserror = { workspace = true }
 ravel-test-util = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "decode_soa_vs_aos"
+harness = false
 
 [lints]
 workspace = true
