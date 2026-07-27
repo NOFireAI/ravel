@@ -80,5 +80,9 @@ harness = false
 name = "series_id_hash"
 harness = false
 
+[[bench]]
+name = "matcher_scaling"
+harness = false
+
 [lints]
 workspace = true
