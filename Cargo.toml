@@ -18,18 +18,21 @@ expect_used = "warn"
 
 [workspace.dependencies]
 # internal crates
-ravel-types = { path = "crates/ravel-types" }
-ravel-proto = { path = "crates/ravel-proto" }
-ravel-object-store = { path = "crates/ravel-object-store" }
-ravel-segment = { path = "crates/ravel-segment" }
-ravel-commit = { path = "crates/ravel-commit" }
-ravel-catalog = { path = "crates/ravel-catalog" }
-ravel-otlp = { path = "crates/ravel-otlp" }
-ravel-otap = { path = "crates/ravel-otap" }
-ravel-ingest = { path = "crates/ravel-ingest" }
-ravel-promql = { path = "crates/ravel-promql" }
-ravel-query = { path = "crates/ravel-query" }
-ravel-test-util = { path = "crates/ravel-test-util" }
+# Version fields pin each path dependency so cargo-deny does not count them as
+# wildcards (a11-F07). allow-wildcard-paths is not usable here because these
+# crates are not marked publish = false, so it does not exempt them.
+ravel-types = { path = "crates/ravel-types", version = "0.1.0" }
+ravel-proto = { path = "crates/ravel-proto", version = "0.1.0" }
+ravel-object-store = { path = "crates/ravel-object-store", version = "0.1.0" }
+ravel-segment = { path = "crates/ravel-segment", version = "0.1.0" }
+ravel-commit = { path = "crates/ravel-commit", version = "0.1.0" }
+ravel-catalog = { path = "crates/ravel-catalog", version = "0.1.0" }
+ravel-otlp = { path = "crates/ravel-otlp", version = "0.1.0" }
+ravel-otap = { path = "crates/ravel-otap", version = "0.1.0" }
+ravel-ingest = { path = "crates/ravel-ingest", version = "0.1.0" }
+ravel-promql = { path = "crates/ravel-promql", version = "0.1.0" }
+ravel-query = { path = "crates/ravel-query", version = "0.1.0" }
+ravel-test-util = { path = "crates/ravel-test-util", version = "0.1.0" }
 
 # async runtime / rpc / http
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
