@@ -174,19 +174,34 @@ pub fn normalize_decoded(
             continue;
         }
 
-        let mut raw: Vec<(String, RawCell)> = range
+        let raw: Vec<(String, RawCell)> = range
             .iter()
             .map(|&i| {
                 let a = &flat_attrs[i as usize];
                 (a.key.to_string(), raw_cell(a))
             })
             .collect();
-        raw.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Per-label admission (complex value, then sanitized-name length,
+        // then value length) runs in the attributes' input order with the
+        // first violation winning, exactly as ravel_otlp::build_point checks a
+        // data point's attributes in wire order. Attribute order is not part
+        // of series identity, so the canonical grouping key below is sorted;
+        // this pre-check is the only place attribute order is observable, and
+        // it must line up with the OTLP oracle or the two paths class the same
+        // input differently (ADR-0011; a9-F01 mechanism b).
+        if let Err(rejection) = check_attrs_in_input_order(&raw, limits) {
+            rejected.push(rejection);
+            continue;
+        }
+
+        let mut group_key = raw;
+        group_key.sort_by(|a, b| a.0.cmp(&b.0));
 
         let metric_name = &decision.name;
         let metric_cache = group_cache.entry(dp.parent_id as u32).or_default();
         let outcome = metric_cache
-            .entry(raw)
+            .entry(group_key)
             .or_insert_with_key(|raw_key| build_group(raw_key, metric_name, tenant, limits));
 
         match outcome {
@@ -531,17 +546,26 @@ fn build_metric_decisions(
                     temporality,
                     is_monotonic,
                 } => {
+                    // Mirror ravel_otlp::normalize_metric's order: the metric
+                    // name is validated (MetricNameTooLong, then
+                    // EmptyMetricName) before the Sum temporality check, so a
+                    // delta Sum with a rejected name is classed on the name,
+                    // not on temporality. Reversing this diverged the two
+                    // ingest paths' rejection classes (ADR-0011 identical-
+                    // rejection-class contract; a9-F01 mechanism a).
+                    let Some(name) = process_metric_name(&entry.name, limits, count, rejected)
+                    else {
+                        continue;
+                    };
                     if *temporality != AGGREGATION_TEMPORALITY_CUMULATIVE {
                         rejected.push(Rejection::UnsupportedTemporality { count });
                         continue;
                     }
-                    if let Some(name) = process_metric_name(&entry.name, limits, count, rejected) {
-                        decisions[id] = Some(MetricDecision {
-                            name,
-                            is_sum: true,
-                            is_monotonic: *is_monotonic,
-                        });
-                    }
+                    decisions[id] = Some(MetricDecision {
+                        name,
+                        is_sum: true,
+                        is_monotonic: *is_monotonic,
+                    });
                 }
             },
         }
@@ -584,6 +608,56 @@ fn attr_range_for<'a>(attrs: &[FlatAttr], order: &'a [u32], parent_id: u32) -> &
     &order[start..end]
 }
 
+/// Render a decoded attribute cell to its label-value string, rejecting a
+/// complex (array/map/bytes) value. Shared by [`check_attrs_in_input_order`]
+/// and [`build_group`] so value formatting and the `ComplexAttributeValue`
+/// rejection never drift between the ordered admission pass and the canonical
+/// group build.
+fn raw_cell_value(cell: &RawCell) -> Result<String, Rejection> {
+    Ok(match cell {
+        RawCell::Str(s) => s.clone(),
+        RawCell::Bool(b) => b.to_string(),
+        RawCell::Int(i) => i.to_string(),
+        RawCell::Double(bits) => f64::from_bits(*bits).to_string(),
+        RawCell::Complex => return Err(Rejection::ComplexAttributeValue),
+    })
+}
+
+/// Apply the per-label admission checks to a point's attributes in input
+/// order, returning the first violation. This mirrors the per-attribute loop
+/// in `ravel_otlp::build_point` (complex-value check, then the sanitized-name
+/// length check, then the value length check, first violation winning). The
+/// columnar path groups attributes by a sorted key for series identity, so
+/// this ordered pass is the only place the two paths' attribute order is
+/// observable; keeping it identical is what preserves the ADR-0011 identical-
+/// rejection-class contract (a9-F01 mechanism b). The length bounds here
+/// intentionally match [`push_checked`], which the canonical build applies to
+/// the sorted set; because a set that passes in input order also passes in any
+/// order, the sorted build only ever surfaces the order-independent
+/// `DuplicateLabelName` / `OversizedSeriesComponent` rejections.
+fn check_attrs_in_input_order(
+    raw: &[(String, RawCell)],
+    limits: &IngestLimits,
+) -> Result<(), Rejection> {
+    for (raw_key, cell) in raw {
+        let name = sanitize_label_name(raw_key);
+        let value = raw_cell_value(cell)?;
+        if name.len() > limits.max_label_name_len {
+            return Err(Rejection::LabelNameTooLong {
+                len: name.len(),
+                max: limits.max_label_name_len,
+            });
+        }
+        if value.len() > limits.max_label_value_len {
+            return Err(Rejection::LabelValueTooLong {
+                len: value.len(),
+                max: limits.max_label_value_len,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Build the `(LabelSet, SeriesId)` for one distinct attribute-set group
 /// under one metric; called at most once per distinct group thanks to the
 /// caller's memoizing `HashMap` (see module docs).
@@ -600,13 +674,7 @@ fn build_group(
     });
     for (raw_key, cell) in raw {
         let name = sanitize_label_name(raw_key);
-        let value = match cell {
-            RawCell::Str(s) => s.clone(),
-            RawCell::Bool(b) => b.to_string(),
-            RawCell::Int(i) => i.to_string(),
-            RawCell::Double(bits) => f64::from_bits(*bits).to_string(),
-            RawCell::Complex => return Err(Rejection::ComplexAttributeValue),
-        };
+        let value = raw_cell_value(cell)?;
         push_checked(&mut labels, name, value, limits)?;
     }
     let label_set = LabelSet::new(labels).map_err(|err| match err {
