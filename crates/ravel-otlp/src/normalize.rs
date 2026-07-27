@@ -207,8 +207,9 @@ fn normalize_metric(
                 is_sum: false,
                 is_monotonic: false,
             };
+            let mut memo = SeriesIdMemo::new();
             for dp in &gauge.data_points {
-                match build_point(&ctx, dp) {
+                match build_point(&ctx, dp, &mut memo) {
                     Ok(p) => points.push(p),
                     Err(r) => rejected.push(r),
                 }
@@ -232,8 +233,9 @@ fn normalize_metric(
                 is_sum: true,
                 is_monotonic: sum.is_monotonic,
             };
+            let mut memo = SeriesIdMemo::new();
             for dp in &sum.data_points {
-                match build_point(&ctx, dp) {
+                match build_point(&ctx, dp, &mut memo) {
                     Ok(p) => points.push(p),
                     Err(r) => rejected.push(r),
                 }
@@ -269,7 +271,52 @@ struct PointContext<'a> {
     is_monotonic: bool,
 }
 
-fn build_point(ctx: &PointContext, dp: &NumberDataPoint) -> Result<NormalizedPoint, Rejection> {
+/// Last-seen memo for `SeriesId::compute`, scoped to one `Metric`.
+///
+/// Within a metric `tenant` and `metric_name` are constant, and the built
+/// `LabelSet` (which carries `__name__`) fully determines the canonical
+/// series identity (ADR-0005), so an equal `LabelSet` always yields a
+/// bit-identical `SeriesId`. The realistic OTLP shape is a single series
+/// sampled over time: one metric holding many data points with identical
+/// attributes, emitted consecutively. A one-entry last-seen memo turns the
+/// per-point BLAKE3 hash into one pointer compare across such a run while
+/// staying correct for interleaved or single-point metrics (a mismatch just
+/// recomputes). Fixed capacity of one entry; dropped when the metric's loop
+/// ends, so memory is bounded to a single label set.
+struct SeriesIdMemo {
+    last: Option<(LabelSet, SeriesId)>,
+}
+
+impl SeriesIdMemo {
+    fn new() -> Self {
+        SeriesIdMemo { last: None }
+    }
+
+    /// Return the id for `labels`, reusing the last computation when the
+    /// label set is unchanged and otherwise computing and caching it. The
+    /// returned id is identical to calling `SeriesId::compute` directly.
+    fn series_id(
+        &mut self,
+        tenant: &TenantId,
+        metric_name: &str,
+        labels: &LabelSet,
+    ) -> Result<SeriesId, TypeError> {
+        if let Some((last_labels, last_id)) = &self.last
+            && last_labels == labels
+        {
+            return Ok(*last_id);
+        }
+        let id = SeriesId::compute(tenant, metric_name, labels)?;
+        self.last = Some((labels.clone(), id));
+        Ok(id)
+    }
+}
+
+fn build_point(
+    ctx: &PointContext,
+    dp: &NumberDataPoint,
+    memo: &mut SeriesIdMemo,
+) -> Result<NormalizedPoint, Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
             attribute_count: dp.attributes.len(),
@@ -331,7 +378,8 @@ fn build_point(ctx: &PointContext, dp: &NumberDataPoint) -> Result<NormalizedPoi
         _ => Rejection::DuplicateLabelName(String::new()),
     })?;
 
-    let series_id = SeriesId::compute(ctx.tenant, ctx.metric_name, &label_set)
+    let series_id = memo
+        .series_id(ctx.tenant, ctx.metric_name, &label_set)
         .map_err(|_| Rejection::OversizedSeriesComponent)?;
 
     Ok(NormalizedPoint {
@@ -1575,5 +1623,137 @@ mod tests {
         let ids_forward: HashSet<_> = out_forward.points.iter().map(|p| p.series_id).collect();
         let ids_reversed: HashSet<_> = out_reversed.points.iter().map(|p| p.series_id).collect();
         assert_eq!(ids_forward, ids_reversed);
+    }
+
+    // --- series-id memoization (issue #96) ---
+
+    #[test]
+    fn memoized_and_recomputed_series_ids_are_bit_identical() {
+        // Consecutive run of series "/a" (the memo hits), switch to "/b" (a
+        // miss), then back to "/a" (a miss again, since the one-entry memo now
+        // holds "/b"). Every emitted id must equal a direct SeriesId::compute
+        // over the same label set: the memo is an optimization, never an
+        // aliasing change.
+        let base_ts: i64 = 1_700_000_000_000_000_000;
+        let mut pts = Vec::new();
+        for i in 0..4i64 {
+            pts.push(number_point(
+                vec![string_kv("path", "/a")],
+                base_ts + i,
+                NumberValue::AsInt(i),
+            ));
+        }
+        for i in 0..3i64 {
+            pts.push(number_point(
+                vec![string_kv("path", "/b")],
+                base_ts + 10 + i,
+                NumberValue::AsInt(i),
+            ));
+        }
+        pts.push(number_point(
+            vec![string_kv("path", "/a")],
+            base_ts + 20,
+            NumberValue::AsInt(0),
+        ));
+        let rm = resource_metrics(
+            vec![string_kv("service.name", "svc")],
+            vec![gauge_metric("widgets", pts)],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            base_ts + 1_000_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 8);
+
+        for p in &out.points {
+            let recomputed =
+                SeriesId::compute(&tenant(), "widgets", &p.labels).expect("compute id");
+            assert_eq!(
+                p.series_id, recomputed,
+                "memoized id must be bit-identical to a fresh compute"
+            );
+        }
+        // The two "/a" runs (positions 0..4 and 7) share an id: reuse is by
+        // label set, not position. They differ from the "/b" run (position 4),
+        // so the one-entry memo never aliases distinct series.
+        assert_eq!(out.points[0].series_id, out.points[7].series_id);
+        assert_ne!(out.points[0].series_id, out.points[4].series_id);
+    }
+
+    #[test]
+    fn memo_throughput_before_after() {
+        // Realistic ingest shape: many series, each sampled 100 times in a
+        // consecutive run within one metric (one series over time). This is
+        // the shape the last-seen memo targets. The assertion is deterministic
+        // (memo path bit-identical to full recompute); the timing is
+        // informational and printed under `--nocapture`.
+        const SERIES: usize = 50;
+        const POINTS_PER_SERIES: usize = 100;
+        let base_ts: i64 = 1_700_000_000_000_000_000;
+
+        let mut pts = Vec::with_capacity(SERIES * POINTS_PER_SERIES);
+        for s in 0..SERIES {
+            let path = format!("/api/v{s}");
+            for i in 0..POINTS_PER_SERIES {
+                pts.push(number_point(
+                    vec![string_kv("path", &path), string_kv("method", "GET")],
+                    base_ts + i as i64,
+                    NumberValue::AsInt(i as i64),
+                ));
+            }
+        }
+        let rm = resource_metrics(
+            vec![string_kv("service.name", "svc")],
+            vec![gauge_metric("http_requests_total", pts)],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            base_ts + 1_000_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), SERIES * POINTS_PER_SERIES);
+
+        let label_sets: Vec<LabelSet> = out.points.iter().map(|p| p.labels.clone()).collect();
+        let name = "http_requests_total";
+
+        // before: recompute the id for every point (pre-memo behavior).
+        let t0 = std::time::Instant::now();
+        let mut before_ids = Vec::with_capacity(label_sets.len());
+        for ls in &label_sets {
+            before_ids.push(SeriesId::compute(&tenant(), name, ls).expect("compute id"));
+        }
+        let before = t0.elapsed();
+
+        // after: last-seen memo over the same order.
+        let t1 = std::time::Instant::now();
+        let mut memo = SeriesIdMemo::new();
+        let mut after_ids = Vec::with_capacity(label_sets.len());
+        for ls in &label_sets {
+            after_ids.push(memo.series_id(&tenant(), name, ls).expect("compute id"));
+        }
+        let after = t1.elapsed();
+
+        // Deterministic: the memo path is bit-identical to full recompute, and
+        // to the ids normalize embedded in the points.
+        assert_eq!(before_ids, after_ids);
+        for (p, id) in out.points.iter().zip(&after_ids) {
+            assert_eq!(p.series_id, *id);
+        }
+
+        let n = label_sets.len() as f64;
+        let before_thr = n / before.as_secs_f64();
+        let after_thr = n / after.as_secs_f64();
+        println!(
+            "series-id memo: {SERIES} series x {POINTS_PER_SERIES} pts = {} points",
+            label_sets.len()
+        );
+        println!("  before (recompute each): {before_thr:>12.0} ids/s ({before:?})");
+        println!("  after  (last-seen memo): {after_thr:>12.0} ids/s ({after:?})");
+        println!("  speedup: {:.2}x", after_thr / before_thr);
     }
 }
