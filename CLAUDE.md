@@ -23,6 +23,13 @@ executors.
   editing files directly in the dispatching session's working tree, or
   two subagents sharing one tree, corrupts both in-flight edits and any
   concurrent `cargo` build cache. One worktree per unit of work, always.
+- Exception: fleet executors working in a dedicated clone. The clone is
+  already the isolated workspace; commit directly on the dispatched
+  checkout's HEAD (detached HEAD is fine). Do not create a side worktree
+  or branch: the fleet harness collects only the dispatched checkout's
+  HEAD as the result, and work committed anywhere else is lost when the
+  workdir is destroyed (this happened; see the 2026-07-27 audit report,
+  section 10).
 
 ## Invariants (violating these is never a valid trade-off)
 
