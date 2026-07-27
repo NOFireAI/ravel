@@ -18,8 +18,11 @@ above it is disposable and stateless.
 
 Illustrates: docs/architecture.md, docs/adrs/0001-object-native-l0.md.
 
-Last verified against the code: 2026-07-27 (against the spec docs, no
-implementation exists yet for OTAP or the query path).
+Updated 2026-07-27 to add the SQL query path (ravel-sql, DataFusion, ADR-0013):
+in progress, not yet wired to a service endpoint. Last verified against the
+code: 2026-07-27 (Phase 1 -- OTLP ingest, commit, catalog, PromQL selector
+queries -- is complete and running end to end; OTAP ingest is scaffolded but
+not wired into the gateway).
 
 ## ingest-commit-sequence.svg
 
@@ -34,8 +37,8 @@ duplicate.
 Illustrates: docs/ingest.md, docs/catalog-and-mvcc.md (commit sequence),
 docs/consistency-model.md (crash matrix), docs/adrs/0002-commit-protocol.md.
 
-Last verified against the code: 2026-07-27 (against the spec docs; ingest
-and commit crates are not yet implemented).
+Last verified against the code: 2026-07-27 (Phase 1 complete; ingest and
+commit crates match this sequence end to end against MinIO/S3).
 
 ## rseg-layout.svg
 
@@ -49,8 +52,11 @@ cover.
 Illustrates: docs/segment-format.md, docs/adrs/0004-rseg-format.md,
 docs/adrs/0010-spec-amendments-review-1.md (§4, checksum coverage).
 
-Last verified against the code: 2026-07-27 (against the spec docs; the
-segment writer and reader are not yet implemented).
+Last verified against the code: 2026-07-27 (Phase 1 complete; the RSEG v1
+writer/reader match this layout, proved byte-identical by the golden-bytes
+test. RSEG v2, adding a schema-dictionary catalog and 8-byte VAL_RAW_F64
+alignment, is in progress under ADR-0014 and not reflected in this diagram
+yet).
 
 ## query-path.svg
 
@@ -64,8 +70,11 @@ Prometheus JSON envelope.
 Illustrates: docs/query-engine.md, docs/catalog-and-mvcc.md (snapshot
 resolution, dedup order), docs/segment-format.md (reader protocol).
 
-Last verified against the code: 2026-07-27 (against the spec docs; the
-query crate is not yet implemented).
+Last verified against the code: 2026-07-27 (Phase 1 complete; this is the
+live `/api/v1` PromQL path. A second, SQL query path over the same segments
+now exists in `ravel-sql` -- see architecture.svg's SQL query path panel --
+but it is not yet wired to a request-response diagram of its own since it
+has no HTTP/Flight endpoint yet).
 
 ## tenancy-key-layout.svg
 
@@ -80,5 +89,5 @@ read directly; referenced by docs/catalog-and-mvcc.md for tenant_hash),
 docs/adrs/0010-spec-amendments-review-1.md (§3 writer identity, §13 tenant
 hash).
 
-Last verified against the code: 2026-07-27 (against the spec docs; no
-object-store key writer exists yet).
+Last verified against the code: 2026-07-27 (Phase 1 complete; this is the
+live object-store key layout).

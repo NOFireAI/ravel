@@ -47,6 +47,11 @@ code, not just using it.
 - [otap-ingest.md](otap-ingest.md): plan for OTAP (OpenTelemetry Arrow)
   ingest. Describes a feature-gated crate and gateway wiring; not yet
   wired into `ravel-server`.
+- [arrow-datafusion-plan.md](arrow-datafusion-plan.md): the SQL query path
+  (ADR-0013): `ravel-sql`'s DataFusion scan/merge/dedup pipeline, pushdown
+  under the pruning-soundness invariant, and the planned HTTP/Flight SQL
+  endpoints. In progress; see [reviews/2026-07-27-arrow-datafusion-plan-review.md](reviews/2026-07-27-arrow-datafusion-plan-review.md)
+  for the adversarial review that redesigned it before implementation.
 - [benchmarking.md](benchmarking.md): benchmarking methodology. See
   [BENCHMARKS.md](../BENCHMARKS.md) for the actual measured numbers.
 

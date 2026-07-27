@@ -53,6 +53,10 @@ What is planned, not built:
   before listing-based discovery runs out of headroom.
 - OTAP (OpenTelemetry Arrow) ingest, scaffolded but not wired into the
   gateway.
+- SQL over the metrics data: a `ravel-sql` crate (DataFusion) implementing
+  the scan -> sort-preserving-merge -> dedup pipeline, matching PromQL's
+  duplicate-sample resolution bit-for-bit. In progress; not yet wired to an
+  HTTP or Flight SQL endpoint. See [ADR-0013](docs/adrs/0013-arrow-zero-copy-and-datafusion.md).
 
 ## Quickstart
 
@@ -113,7 +117,8 @@ built this way.
 ## Repository layout
 
 - `crates/`: libraries (types, object store, segment format, commit
-  protocol, catalog, OTLP/OTAP decode, ingest actors, PromQL, query engine)
+  protocol, catalog, OTLP/OTAP decode, ingest actors, PromQL, query engine,
+  and `ravel-sql`, a DataFusion-backed SQL pipeline, in progress)
 - `services/`: `ravel-server` (gateway + ingest + query, dev binary) and
   `ravel-cli` (segment/commit/catalog inspector)
 - `docs/`: specs, ADRs, diagrams, and the user guides in `docs/guides/`
