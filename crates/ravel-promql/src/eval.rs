@@ -17,6 +17,17 @@
 //! evaluator does not call it internally (every ns value it produces is
 //! already an exact multiple of `1_000_000`), but it is exported as the one
 //! correct implementation of that rule.
+//!
+//! ## Range-query resolution budget
+//!
+//! The evaluation grid of a range query is sized by the caller's `start_ms`,
+//! `end_ms` and `step_ms`, so it is query-controlled allocation. The step
+//! count is computed and checked against [`Evaluator::max_range_points`]
+//! (default [`DEFAULT_MAX_RANGE_POINTS`]) *before* any grid is built:
+//! over-budget requests return [`Error::TooManyPoints`] having allocated
+//! nothing and having touched neither the parser nor the
+//! [`SeriesSource`]. This is a hard limit, never a truncation; the query
+//! fails rather than silently returning a coarser or shorter matrix.
 
 use ravel_types::{LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
 
@@ -74,10 +85,27 @@ pub enum Error {
     NonPositiveStep { step_ms: i64 },
     #[error("range start {start_ms} ms is after end {end_ms} ms")]
     InvalidRange { start_ms: i64, end_ms: i64 },
+    #[error(
+        "range query resolution of {points} evaluation points exceeds the maximum of {max}; widen step_ms or narrow the range"
+    )]
+    TooManyPoints { points: u64, max: usize },
 }
 
 /// Default PromQL lookback: 5 minutes, in nanoseconds.
 const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
+
+/// Default cap on the number of evaluation points (grid steps) a single
+/// range query may produce, counting both endpoints when the range is
+/// step-aligned. 11,000 matches Prometheus' own `query_range` resolution
+/// limit, so a dashboard that Prometheus accepts is accepted here and one
+/// Prometheus rejects is rejected here with the same shape of error.
+///
+/// This bounds evaluator allocation from query-controlled input: the grid is
+/// at most this many `(i64, i64)` pairs (176 KiB at the default), and each
+/// output series holds at most this many samples. It is independent of the
+/// engine's `max_samples` budget, which counts samples yielded by storage and
+/// does not constrain the grid.
+pub const DEFAULT_MAX_RANGE_POINTS: usize = 11_000;
 
 /// Prometheus staleness marker: the exact NaN bit pattern a scrape/rule
 /// engine writes to signal that a series has ended. Per Prometheus lookback
@@ -89,16 +117,18 @@ const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 /// PromQL evaluator for a single vector selector. Stateless besides its
-/// lookback configuration; safe to share across queries.
+/// lookback and resolution configuration; safe to share across queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Evaluator {
     lookback_delta_ns: i64,
+    max_range_points: usize,
 }
 
 impl Default for Evaluator {
     fn default() -> Self {
         Evaluator {
             lookback_delta_ns: DEFAULT_LOOKBACK_NS,
+            max_range_points: DEFAULT_MAX_RANGE_POINTS,
         }
     }
 }
@@ -113,6 +143,20 @@ impl Evaluator {
         self.lookback_delta_ns =
             i64::try_from(lookback.as_nanos()).map_err(|_| Error::TimeOverflow)?;
         Ok(self)
+    }
+
+    /// Override the default range-query resolution cap
+    /// ([`DEFAULT_MAX_RANGE_POINTS`]). A cap of 0 rejects every range query,
+    /// including a single-point one; that is the caller's choice, not a
+    /// special case here.
+    pub fn with_max_range_points(mut self, max_range_points: usize) -> Self {
+        self.max_range_points = max_range_points;
+        self
+    }
+
+    /// The configured range-query resolution cap, in evaluation points.
+    pub fn max_range_points(&self) -> usize {
+        self.max_range_points
     }
 
     /// Evaluate `query` as an instant vector at `t_ms`.
@@ -161,6 +205,10 @@ impl Evaluator {
     /// range is an exact multiple of `step` from `start`, and excluded
     /// otherwise). The same per-step lookback rule as [`Self::instant`]
     /// applies at each instant.
+    ///
+    /// The number of evaluation points is checked against
+    /// [`Self::max_range_points`] before anything is parsed or allocated;
+    /// an over-budget request returns [`Error::TooManyPoints`].
     pub fn range(
         &self,
         source: &dyn SeriesSource,
@@ -176,16 +224,31 @@ impl Evaluator {
             return Err(Error::InvalidRange { start_ms, end_ms });
         }
 
-        let vs = parse_vector_selector(query)?;
-        let selector_matchers = build_matchers(&vs)?;
-        let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
-
         let start_ns = ms_to_ns(start_ms)?;
         let end_ns = ms_to_ns(end_ms)?;
         let step_ns = ms_to_ns(step_ms)?;
 
-        // Evaluation grid: (reported ts, offset-shifted lookup ts).
-        let mut grid: Vec<(i64, i64)> = Vec::new();
+        // Resolution budget first: the grid below is sized by caller-supplied
+        // range and step, so it must be bounded before it is built (and
+        // before the parser runs, mirroring Prometheus, which rejects the
+        // resolution in its API layer ahead of query construction).
+        let points = step_count(start_ns, end_ns, step_ns);
+        if points > u64::try_from(self.max_range_points).unwrap_or(u64::MAX) {
+            return Err(Error::TooManyPoints {
+                points,
+                max: self.max_range_points,
+            });
+        }
+
+        let vs = parse_vector_selector(query)?;
+        let selector_matchers = build_matchers(&vs)?;
+        let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
+
+        // Evaluation grid: (reported ts, offset-shifted lookup ts). `points`
+        // is now known to be within the budget, so this is a single bounded
+        // allocation.
+        let capacity = usize::try_from(points).unwrap_or(self.max_range_points);
+        let mut grid: Vec<(i64, i64)> = Vec::with_capacity(capacity);
         let mut t = start_ns;
         while t <= end_ns {
             let sel_ts = t.checked_sub(offset_ns).ok_or(Error::TimeOverflow)?;
@@ -223,6 +286,22 @@ impl Evaluator {
         }
         Ok(out)
     }
+}
+
+/// Number of evaluation instants in `start_ns..=end_ns` stepping by
+/// `step_ns`, i.e. `floor((end - start) / step) + 1`. Requires
+/// `start_ns <= end_ns` and `step_ns > 0` (both already checked by the
+/// caller), so the result is at least 1.
+///
+/// The span is computed in `i128` because `end_ns - start_ns` overflows
+/// `i64` for extreme-but-representable endpoints, and the whole point of
+/// this function is to answer for exactly those inputs without panicking or
+/// wrapping. `step_ns` is at least one millisecond (`step_ms >= 1`), so the
+/// quotient is at most about `1.9e13` and always fits `u64`.
+fn step_count(start_ns: i64, end_ns: i64, step_ns: i64) -> u64 {
+    let span = i128::from(end_ns) - i128::from(start_ns);
+    let steps = span / i128::from(step_ns) + 1;
+    u64::try_from(steps).unwrap_or(u64::MAX)
 }
 
 /// Pick the most recent sample in `(sel_ts - lookback, sel_ts]`. `samples`
@@ -628,5 +707,184 @@ mod tests {
             .range(&source, "up", minutes(1), 0, minutes(1))
             .expect_err("must reject start > end");
         assert!(matches!(err, Error::InvalidRange { .. }));
+    }
+
+    /// Wraps a [`TestSource`] and counts `query` calls, so a test can prove a
+    /// request was rejected before any storage work (and, since the grid is
+    /// built after the budget check and before `query`, before any grid
+    /// allocation).
+    #[derive(Debug, Default)]
+    struct CountingSource {
+        inner: TestSource,
+        queries: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSource {
+        fn new(inner: TestSource) -> Self {
+            CountingSource {
+                inner,
+                queries: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn query_count(&self) -> usize {
+            self.queries.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl crate::source::SeriesSource for CountingSource {
+        fn query(
+            &self,
+            matchers: &[LabelMatcher],
+            window: TimeRange,
+        ) -> Result<Vec<crate::source::SeriesData>, SourceError> {
+            self.queries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.query(matchers, window)
+        }
+    }
+
+    fn one_series_source() -> CountingSource {
+        CountingSource::new(
+            TestSource::new()
+                .with_series(&[("__name__", "up")], &[(0, 1.0)])
+                .expect("valid series"),
+        )
+    }
+
+    #[test]
+    fn range_at_the_point_budget_boundary_is_evaluated() {
+        // start=0, end=2m, step=1m is exactly 3 evaluation points.
+        let source = one_series_source();
+        let matrix = Evaluator::new()
+            .with_max_range_points(3)
+            .range(&source, "up", 0, minutes(2), minutes(1))
+            .expect("a request at exactly the cap must succeed");
+        assert_eq!(matrix.len(), 1);
+        assert_eq!(
+            source.query_count(),
+            1,
+            "boundary request must reach storage"
+        );
+    }
+
+    #[test]
+    fn range_one_point_over_the_budget_is_rejected() {
+        // Same start/step, one more step: 4 points against a cap of 3.
+        let source = one_series_source();
+        let err = Evaluator::new()
+            .with_max_range_points(3)
+            .range(&source, "up", 0, minutes(3), minutes(1))
+            .expect_err("one point over the cap must be rejected");
+        let Error::TooManyPoints { points, max } = err else {
+            panic!("expected TooManyPoints, got {err:?}");
+        };
+        assert_eq!(points, 4);
+        assert_eq!(max, 3);
+        assert_eq!(
+            source.query_count(),
+            0,
+            "rejection must happen before the grid is built and storage is touched"
+        );
+    }
+
+    #[test]
+    fn default_point_budget_matches_prometheus_resolution_limit() {
+        assert_eq!(DEFAULT_MAX_RANGE_POINTS, 11_000);
+        assert_eq!(Evaluator::new().max_range_points(), 11_000);
+
+        let source = one_series_source();
+        let evaluator = Evaluator::new();
+        // 11_000 points: 0, 1m, ..., 10_999m.
+        let last = minutes(DEFAULT_MAX_RANGE_POINTS as i64 - 1);
+        evaluator
+            .range(&source, "up", 0, last, minutes(1))
+            .expect("11_000 points is within the default budget");
+
+        let err = evaluator
+            .range(&source, "up", 0, last + minutes(1), minutes(1))
+            .expect_err("11_001 points exceeds the default budget");
+        assert!(matches!(
+            err,
+            Error::TooManyPoints {
+                points: 11_001,
+                max: 11_000
+            }
+        ));
+    }
+
+    #[test]
+    fn pathological_range_is_rejected_without_building_a_grid() {
+        // The a10-F03 reproducer: the widest representable span at the
+        // finest step. Unbounded, this asks for ~9.2e12 grid entries
+        // (~1.5e14 bytes) and OOMs the process; bounded, it is arithmetic.
+        // That this test terminates at all is the assertion that no grid was
+        // allocated; the query counter pins that storage was never reached.
+        let source = one_series_source();
+        let max_ms = i64::MAX / NS_PER_MS;
+        let err = Evaluator::new()
+            .range(&source, "up", 0, max_ms, 1)
+            .expect_err("an unbounded-grid request must be rejected");
+        let Error::TooManyPoints { points, max } = err else {
+            panic!("expected TooManyPoints, got {err:?}");
+        };
+        assert_eq!(points, u64::try_from(max_ms).expect("positive") + 1);
+        assert_eq!(max, DEFAULT_MAX_RANGE_POINTS);
+        assert_eq!(source.query_count(), 0);
+    }
+
+    #[test]
+    fn point_budget_is_checked_before_the_query_is_parsed() {
+        // An over-budget request is rejected on its resolution even when the
+        // query itself would fail to parse: the cheap arithmetic guard runs
+        // first, so no caller-controlled parsing or regex compilation is done
+        // for a request that cannot be served. This mirrors Prometheus, which
+        // rejects the resolution in its API layer before building the query.
+        let source = one_series_source();
+        let err = Evaluator::new()
+            .range(&source, "sum(up", 0, i64::MAX / NS_PER_MS, 1)
+            .expect_err("must be rejected");
+        assert!(matches!(err, Error::TooManyPoints { .. }));
+    }
+
+    #[test]
+    fn zero_point_budget_rejects_every_range_query() {
+        let source = one_series_source();
+        let err = Evaluator::new()
+            .with_max_range_points(0)
+            .range(&source, "up", 0, 0, minutes(1))
+            .expect_err("a cap of 0 rejects even a single-point range");
+        assert!(matches!(err, Error::TooManyPoints { points: 1, max: 0 }));
+        assert_eq!(source.query_count(), 0);
+    }
+
+    #[test]
+    fn point_budget_does_not_apply_to_instant_queries() {
+        // Instant queries evaluate one point by construction; the cap must
+        // not leak into them.
+        let source = one_series_source();
+        let result = Evaluator::new()
+            .with_max_range_points(0)
+            .instant(&source, "up", 0)
+            .expect("instant queries are unaffected by the range budget");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn step_count_is_exact_and_does_not_overflow() {
+        assert_eq!(step_count(0, 0, NS_PER_MS), 1);
+        assert_eq!(step_count(0, 2 * NS_PER_MS, NS_PER_MS), 3);
+        // Not step-aligned: the trailing partial step is not a point.
+        assert_eq!(step_count(0, 2 * NS_PER_MS + 1, NS_PER_MS), 3);
+        // Widest representable span: `end - start` overflows i64, the
+        // i128 computation does not.
+        let widest = step_count(i64::MIN, i64::MAX, NS_PER_MS);
+        assert_eq!(
+            widest,
+            u64::try_from(
+                (i128::from(i64::MAX) - i128::from(i64::MIN)) / i128::from(NS_PER_MS) + 1
+            )
+            .expect("fits u64")
+        );
     }
 }

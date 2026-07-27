@@ -10,7 +10,8 @@ mod source;
 pub mod testsource;
 
 pub use eval::{
-    Error, Evaluator, InstantSample, InstantVector, RangeMatrix, ms_to_ns, ns_to_ms_floor,
+    DEFAULT_MAX_RANGE_POINTS, Error, Evaluator, InstantSample, InstantVector, RangeMatrix,
+    ms_to_ns, ns_to_ms_floor,
 };
 pub use matchers::{from_ast_matcher, from_ast_matchers, has_or_group, matches_series};
 pub use source::{LabelMatcher, MatchOp, MatcherError, SeriesData, SeriesSource, SourceError};
