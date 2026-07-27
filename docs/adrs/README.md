@@ -16,3 +16,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0010](0010-spec-amendments-review-1.md) | Spec amendments from the first adversarial design review | Accepted |
 | [0011](0011-otap-arrow-ingest.md) | OTAP (OpenTelemetry Arrow) ingest, not generic Arrow Flight | Accepted |
 | [0012](0012-simd-policy.md) | SIMD policy: dependencies and autovectorization first, explicit SIMD behind benchmark-gated review | Accepted |
+| [0013](0013-arrow-zero-copy-and-datafusion.md) | Targeted Arrow zero-copy, DataFusion for SQL and relational operators only | Accepted |
