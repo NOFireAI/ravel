@@ -15,6 +15,14 @@ pub const VERSION: u16 = 1;
 /// not yet read by this crate's reader (phase 3, issue #31).
 pub const VERSION_V2: u16 = 2;
 
+/// RSEG v3 trailer version (ADR-0017, docs/rseg-v3-plan.md). Strict
+/// superset of v2: adds the HIST_PAGES section, a HIST_SPANS page
+/// encoding, and three SERIES_META column blocks for native-histogram
+/// values. Same magic and trailer layout as v1/v2. Not yet written or read
+/// by this crate (writer: docs/rseg-v3-plan.md C3; reader: C4).
+#[allow(dead_code)] // wired into writer/reader in C3/C4; pinned by the constants test until then
+pub const VERSION_V3: u16 = 3;
+
 /// Signal byte for metric segments.
 pub const SIGNAL_METRICS: u8 = 1;
 
@@ -39,6 +47,11 @@ pub mod section_kind {
     /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Emitted by
     /// `SegmentWriter::write_v2` (issue #30).
     pub const SERIES_META: u32 = 6;
+    /// RSEG v3 only (ADR-0017); v1/v2 objects never emit this kind.
+    /// Histogram-value pages, one per histogram series
+    /// (docs/segment-format.md "RSEG v3 amendment").
+    #[allow(dead_code)] // wired into writer/reader in C3/C4; pinned by the constants test until then
+    pub const HIST_PAGES: u32 = 7;
 }
 
 /// Section-level compression tags, matching `ravel.segment.v1.Compression`.
@@ -53,6 +66,10 @@ pub mod page_enc {
     pub const TS_DELTA_VARINT: u8 = 1;
     pub const VAL_GORILLA: u8 = 16;
     pub const VAL_RAW_F64: u8 = 17;
+    /// RSEG v3 only (ADR-0017); native-histogram record grammar
+    /// (docs/segment-format.md "RSEG v3 amendment", HIST_PAGES).
+    #[allow(dead_code)] // wired into writer/reader in C3/C4; pinned by the constants test until then
+    pub const HIST_SPANS: u8 = 32;
 }
 
 /// Page-level compression byte (independent numbering from the section
@@ -93,6 +110,7 @@ mod tests {
     fn format_constants_are_pinned() {
         assert_eq!(VERSION, 1);
         assert_eq!(VERSION_V2, 2);
+        assert_eq!(VERSION_V3, 3);
         assert_eq!(MAGIC, *b"RSG1");
         assert_eq!(section_kind::LABEL_DICT, 1);
         assert_eq!(section_kind::SERIES_TABLE, 2);
@@ -100,5 +118,7 @@ mod tests {
         assert_eq!(section_kind::VAL_PAGES, 4);
         assert_eq!(section_kind::SERIES_IDS, 5);
         assert_eq!(section_kind::SERIES_META, 6);
+        assert_eq!(section_kind::HIST_PAGES, 7);
+        assert_eq!(page_enc::HIST_SPANS, 32);
     }
 }
