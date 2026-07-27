@@ -24,6 +24,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+stats_alloc = "0.1.10"
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -38,6 +39,11 @@ bench = false
 [[bin]]
 name = "ingest_bench"
 path = "src/bin/ingest_bench.rs"
+bench = false
+
+[[bin]]
+name = "segment_alloc_profile"
+path = "src/bin/segment_alloc_profile.rs"
 bench = false
 
 [[test]]

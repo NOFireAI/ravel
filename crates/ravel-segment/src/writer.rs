@@ -293,26 +293,28 @@ fn encode_series_table(
         buf.extend_from_slice(&max_ts_ns.to_le_bytes());
 
         let ts_page_offset = ts_pages.len() as u64;
-        let ts_page_bytes = build_ts_page(&s.series_id, &s.samples)?;
-        let ts_page_len = ts_page_bytes.len() as u64;
-        ts_pages.extend_from_slice(&ts_page_bytes);
+        build_ts_page(ts_pages, &s.series_id, &s.samples)?;
+        let ts_page_len = ts_pages.len() as u64 - ts_page_offset;
         write_uvarint(&mut buf, ts_page_offset);
         write_uvarint(&mut buf, ts_page_len);
 
         let val_page_offset = val_pages.len() as u64;
-        let val_page_bytes = build_val_page(&s.series_id, &s.samples);
-        let val_page_len = val_page_bytes.len() as u64;
-        val_pages.extend_from_slice(&val_page_bytes);
+        build_val_page(val_pages, &s.series_id, &s.samples);
+        let val_page_len = val_pages.len() as u64 - val_page_offset;
         write_uvarint(&mut buf, val_page_offset);
         write_uvarint(&mut buf, val_page_len);
     }
     Ok(buf)
 }
 
+/// Encodes the TS page for `samples` straight into `ts_pages` (offset
+/// `ts_pages.len()` before the call): header (enc, comp, crc) followed by
+/// the compressed payload, with no intermediate whole-page buffer.
 fn build_ts_page(
+    ts_pages: &mut Vec<u8>,
     series_id: &SeriesId,
     samples: &[ravel_types::Sample],
-) -> Result<Vec<u8>, WriteError> {
+) -> Result<(), WriteError> {
     let timestamps: Vec<i64> = samples.iter().map(|s| s.ts_ns).collect();
     let raw = encode_ts_deltas(&timestamps).ok_or(WriteError::TimestampDeltaOverflow)?;
     let compressed = lz4_flex::compress_prepend_size(&raw);
@@ -320,15 +322,17 @@ fn build_ts_page(
     let comp = page_comp::LZ4;
     let crc = page_crc(&series_id.0, enc, comp, &compressed);
 
-    let mut page = Vec::with_capacity(6 + compressed.len());
-    page.push(enc);
-    page.push(comp);
-    page.extend_from_slice(&crc.to_le_bytes());
-    page.extend_from_slice(&compressed);
-    Ok(page)
+    ts_pages.reserve(6 + compressed.len());
+    ts_pages.push(enc);
+    ts_pages.push(comp);
+    ts_pages.extend_from_slice(&crc.to_le_bytes());
+    ts_pages.extend_from_slice(&compressed);
+    Ok(())
 }
 
-fn build_val_page(series_id: &SeriesId, samples: &[ravel_types::Sample]) -> Vec<u8> {
+/// Encodes the VAL page for `samples` straight into `val_pages`, mirroring
+/// [`build_ts_page`]'s direct-write shape.
+fn build_val_page(val_pages: &mut Vec<u8>, series_id: &SeriesId, samples: &[ravel_types::Sample]) {
     let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
     let count = values.len() as u64;
     let gorilla = encode_gorilla(&values);
@@ -340,12 +344,11 @@ fn build_val_page(series_id: &SeriesId, samples: &[ravel_types::Sample]) -> Vec<
     let comp = page_comp::NONE;
     let crc = page_crc(&series_id.0, enc, comp, &payload);
 
-    let mut page = Vec::with_capacity(6 + payload.len());
-    page.push(enc);
-    page.push(comp);
-    page.extend_from_slice(&crc.to_le_bytes());
-    page.extend_from_slice(&payload);
-    page
+    val_pages.reserve(6 + payload.len());
+    val_pages.push(enc);
+    val_pages.push(comp);
+    val_pages.extend_from_slice(&crc.to_le_bytes());
+    val_pages.extend_from_slice(&payload);
 }
 
 fn encode_raw_f64(values: &[f64]) -> Vec<u8> {
