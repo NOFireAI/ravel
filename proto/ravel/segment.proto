@@ -13,6 +13,7 @@ enum Compression {
 // Section kinds; values are part of the format. See docs/segment-format.md.
 // SERIES_IDS and SERIES_META are RSEG v2 only (ADR-0014); v1 objects use
 // SERIES_TABLE instead and never emit these two.
+// HIST_PAGES is RSEG v3 only (ADR-0017); v1/v2 objects never emit it.
 enum SectionKind {
   SECTION_KIND_UNSPECIFIED = 0;
   SECTION_KIND_LABEL_DICT = 1;
@@ -21,6 +22,7 @@ enum SectionKind {
   SECTION_KIND_VAL_PAGES = 4;
   SECTION_KIND_SERIES_IDS = 5;
   SECTION_KIND_SERIES_META = 6;
+  SECTION_KIND_HIST_PAGES = 7;
 }
 
 message Section {

@@ -8,6 +8,13 @@ untrusted input: bounds-check everything, fuzz all decoders. No `unsafe`.
 > section layout only. See "RSEG v2 amendment" below; everything above
 > this note is the unchanged v1 spec and stays authoritative for v1
 > objects, which remain readable indefinitely (docs/rseg-v2-plan.md §5).
+>
+> RSEG v3 amendment (ADR-0017): trailer `version = 3` adds one section
+> (HIST_PAGES, native-histogram values), one SERIES_META extension, and
+> one page encoding, as a strict superset of v2. See "RSEG v3 amendment"
+> below; v1 and v2 text above stays unchanged and authoritative for v1
+> and v2 objects, which remain readable indefinitely
+> (docs/rseg-v3-plan.md §5).
 
 All integers little-endian. "varint" means protobuf-style LEB128; signed
 values use zigzag.
@@ -347,3 +354,274 @@ section crc mechanics, reader resource caps, whole-object blake3 in the
 commit record, the object key layout, and series identity. The writer
 edge rules (zero-sample series dropped, duplicate ids rejected, empty
 segment bounds = 0) carry over verbatim.
+
+## RSEG v3 amendment (ADR-0017)
+
+Persistent contract, same status as v1 and v2 above. Decision record:
+docs/adrs/0017-native-histograms-rseg-v3.md. Full derivation, value
+model discussion, measured-size reasoning, and the phased implementation
+plan: docs/rseg-v3-plan.md. This section is normative for v3 objects;
+the v1 and v2 sections above are unchanged and remain normative for v1
+and v2 objects. Readers dispatch on the trailer `version` field and must
+accept 1, 2, and 3 indefinitely (no compactor exists yet to retire v1 or
+v2 objects; docs/consistency-model.md).
+
+v3 is a strict superset of v2: v2's catalog grammar, page format, and
+section semantics are unchanged; v3 adds one section kind, one page
+encoding, and three SERIES_META column blocks, for storing native
+(exponential) histogram samples losslessly alongside scalar samples.
+
+### Value model
+
+A native histogram sample is span-based, the superset of OTLP's
+contiguous shape and Prometheus's sparse shape:
+
+- `scale`: signed, `>= -53`; `-53` means custom bucket boundaries via
+  `custom_values` (Prometheus-only; no OTLP equivalent).
+- `zero_count`, `zero_threshold`.
+- `count`: total population; `sum`: optional.
+- `reset_hint`: unknown / yes / no / gauge.
+- Int/float duality: `zero_count`, `count`, and every bucket count are
+  all u64 absolutes (integer histograms) or all f64 absolutes (float
+  histograms) for one sample, never mixed within a sample.
+- Per side (positive, negative): a list of `(offset, run of counts)`
+  spans. `offset` is relative to the end of the previous span on that
+  side (relative to index 0 for the first span). Gaps between spans are
+  implicit zero-population buckets, never materialized.
+
+Not carried: `min`/`max` (dropped at ingest, symmetric with classic-shape
+handling); exemplars (out of scope for v3, docs/rseg-v3-plan.md §6).
+
+### Trailer and versioning
+
+Trailer layout, `footer_crc32c` computation, and reader protocol steps
+1-4 are unchanged. `version = 3`. `magic` stays `"RSG1"`: it identifies
+the format family, not a specific layout; a v1- or v2-only reader that
+meets a v3 object fails closed with `UnsupportedVersion(3)`, checksum-
+covered exactly as the v2 case. Versions other than 1, 2, 3 are
+`UnsupportedVersion`.
+
+### Section kinds v3
+
+| kind | name | v3 content | comp (writer policy) |
+|---|---|---|---|
+| 1 | LABEL_DICT | unchanged from v2 | zstd |
+| 3 | TS_PAGES | unchanged from v2; shared by scalar and histogram series | none |
+| 4 | VAL_PAGES | unchanged from v2; scalar series only | none |
+| 5 | SERIES_IDS | unchanged from v2 | none |
+| 6 | SERIES_META | v2 grammar plus 3 column blocks (below) | zstd |
+| 7 | HIST_PAGES | new: histogram-value pages, one page per histogram series (below) | none (pages self-compressed, same principle as VAL_PAGES) |
+
+Kind 2 (SERIES_TABLE) is not emitted in v3, same as v2. Mandatory v3
+kinds: LABEL_DICT, SERIES_IDS, SERIES_META, TS_PAGES, and at least one of
+VAL_PAGES / HIST_PAGES (a segment with zero scalar series omits
+VAL_PAGES; a segment with zero histogram series omits HIST_PAGES; a
+segment cannot have zero series at all, per the existing empty-segment
+rule). At most one section per known kind; unknown kinds still skipped.
+Writers emit sections physically in the order 1, 5, 6, 3, 4, 7 (VAL_PAGES
+before HIST_PAGES; HIST_PAGES is the new tail). v3 writers 8-byte-align
+VAL_PAGES exactly as v2 ("VAL_RAW_F64 page alignment, v2" above).
+HIST_PAGES has no alignment requirement: histogram payloads are never
+viewed as a fixed-width Arrow buffer, only decoded field-by-field.
+
+Footer validation additions for v3 objects, on top of v2's: SERIES_IDS
+`count`, SERIES_META `count`, and FooterProto `series_count` must all be
+equal (unchanged from v2); additionally, the count of series with
+`value_kind = VAL_SCALAR` (below) must equal the number of non-empty
+entries addressable in VAL_PAGES via `val_page_len != 0`, and
+symmetrically for `value_kind = HIST_SPANS` against `hist_page_len != 0`
+-- both violations Corrupted. If a segment has zero scalar series,
+VAL_PAGES MUST be absent from `sections` (not merely present-and-empty);
+symmetrically for HIST_PAGES and zero histogram series. A `sections`
+entry for a kind whose mandatory-count is zero is Corrupted.
+
+### LABEL_DICT, SERIES_IDS in v3
+
+Unchanged from v2 (LABEL_DICT ordering rule and SERIES_IDS grammar
+above).
+
+### SERIES_META in v3
+
+v2's grammar (`count`, `schema_count`, schemas, then column blocks 1-9:
+`schema_ref`, `value_ord`, `sample_count`, `min_ts_delta`, `ts_span`,
+`ts_page_gap`, `ts_page_len`, `val_page_gap`, `val_page_len`) is
+unchanged, verbatim, including every validation rule in the v2 amendment
+above. v3 appends three more column blocks, in this order, using the
+same `block_len: varint` prefix framing as blocks 1-9:
+
+```
+10 value_kind:    count * u8      (0 = VAL_SCALAR, 1 = HIST_SPANS; any
+                                    other byte value Corrupted)
+11 hist_page_gap: count * varint
+12 hist_page_len: count * varint
+```
+
+Semantics and validation, additive to v2's (all violations Corrupted,
+never panics):
+
+- Entry `i` in `value_kind` describes the series at `SERIES_IDS[i]`,
+  same positional rule as every other column.
+- `value_kind[i] = VAL_SCALAR` (0): `val_page_gap[i]`/`val_page_len[i]`
+  (blocks 8/9) reconstruct that series' VAL page exactly as in v2;
+  `hist_page_gap[i]` and `hist_page_len[i]` MUST both be `0`. A nonzero
+  `hist_page_len[i]` on a scalar-kind series is Corrupted.
+- `value_kind[i] = HIST_SPANS` (1): `val_page_gap[i]` and
+  `val_page_len[i]` MUST both be `0` (a histogram series has no VAL
+  page); `hist_page_gap[i]`/`hist_page_len[i]` reconstruct its HIST page
+  the same running-sum way v2 reconstructs VAL page ranges: `offset_0 =
+  hist_page_gap_0; offset_i = end_{i-1} + hist_page_gap_i; end_i =
+  offset_i + hist_page_len_i`, overflow-checked, `end_i <=` the
+  HIST_PAGES section's `len`. `hist_page_len[i] = 0` is Corrupted (a
+  histogram series with a declared HIST_SPANS kind must have a
+  non-empty page, same "zero-sample series dropped" principle as v1's
+  VAL rule).
+- `sample_count[i]`, `min_ts_delta[i]`, `ts_span[i]`, and the TS page
+  columns (blocks 4-7) apply identically regardless of `value_kind`:
+  every series, scalar or histogram, has exactly one TS page and the
+  same timestamp-bounds reconstruction. A histogram series' `k`-th
+  timestamp in its TS page corresponds positionally to its `k`-th
+  histogram-value record in its HIST page, the same positional pairing
+  v1/v2 use between a series' TS and VAL pages.
+- Each of the three new blocks must consume exactly `block_len` bytes
+  and contain exactly `count` elements; the last block (12) must end
+  exactly at SERIES_META's uncompressed end. Trailing bytes anywhere are
+  Corrupted.
+- Pre-allocation from the new blocks' declared sizes is capped by
+  remaining input size, same discipline as every existing count/length
+  field.
+
+Readers that only need v2-shape data parse blocks 1-9 exactly as today
+and can skip blocks 10-12 wholesale via their `block_len` prefixes, at
+zero cost -- the same lazy-skip property v2's column framing already
+gives per-block for matcher-driven decode.
+
+### HIST_PAGES (new section, uncompressed page-container form)
+
+Container framing is byte-for-byte the same as TS_PAGES/VAL_PAGES: a
+concatenation of pages located only through the SERIES_META gap/len
+columns above, each page framed exactly per this document's "Page
+format" (`enc: u8`, `comp: u8`, `crc: u32` over `series_id || enc ||
+comp || payload`, then `payload`). HIST pages reuse the identical
+container mechanics as VAL pages, adding only a new `enc` value and its
+payload grammar.
+
+New page encoding:
+
+```
+enc = 32   HIST_SPANS
+```
+
+(`page_enc` values 1 = TS_DELTA_VARINT, 16 = VAL_GORILLA, 17 =
+VAL_RAW_F64 are unchanged; 32 is unused before v3. `comp` for HIST_SPANS
+pages is always `0` in the v3 writer -- span/count data does not benefit
+from per-page lz4 the way Gorilla-vs-raw tradeoffs do, and leaving `comp`
+writer-chosen keeps the door open without a grammar change later.)
+
+One HIST_SPANS page holds every histogram-value sample of its series, in
+the same ascending-ts, insertion-order-preserving-ties order as the
+series' TS page ("Sample order within a page" above). The page's record
+count is implicit: it equals the series' `sample_count` from
+SERIES_META, exactly as VAL pages today never restate their own count.
+Payload is `sample_count` histogram records back to back:
+
+```
+one histogram record:
+  flags:          u8
+    bit 0   count_kind        0 = integer (u64 absolute), 1 = float (f64 absolute)
+    bit 1   has_sum           1 = sum field present below
+    bits 2-3 reset_hint       0 = UNKNOWN, 1 = YES, 2 = NO, 3 = GAUGE
+    bits 4-7 reserved, writer MUST emit 0, reader MUST reject nonzero
+  scale:          sint32 varint            (>= -53; -53 = custom boundaries)
+  zero_threshold: f64 LE (8 bytes)
+  zero_count:     varint (count_kind=0) | f64 LE (count_kind=1)
+  count:          varint (count_kind=0) | f64 LE (count_kind=1)
+  sum:            f64 LE, present iff has_sum
+  custom_values:            present iff scale == -53
+    custom_values_count: varint
+    custom_values_count * f64 LE     (ascending boundaries)
+  positive side:
+    span_count: varint
+    span_count * (offset: sint32 varint, length: varint)   length > 0
+    bucket_counts: sum(length) entries, each
+                   varint (count_kind=0) | f64 LE (count_kind=1)
+  negative side: identical grammar to positive side
+```
+
+Validation, all violations Corrupted, never panics:
+
+- `scale < -53` is Corrupted (only `-53` is the custom-boundaries
+  sentinel; there is no meaning below it).
+- `custom_values` is present if and only if `scale == -53`; a nonzero
+  `custom_values_count` with `scale != -53`, or `scale == -53` with
+  `custom_values_count == 0`, is Corrupted. Boundaries MUST be strictly
+  ascending; non-ascending is Corrupted.
+- `length` in every span MUST be `> 0` (a zero-length span is equivalent
+  to a larger offset on the next span and is not a legal encoding).
+- `span_count` and every `length` are capped by remaining input size
+  before allocation, the existing count/length pre-allocation discipline
+  applied to the new fields.
+- `count` MUST be `>= zero_count` and `>= sum(all bucket_counts, both
+  sides)`; both additions are overflow-checked in the count's kind (u64
+  checked-add, or f64 accumulation using the same bit-pattern-exact
+  accumulation the encoder used -- readers only bounds-check `count` for
+  internal consistency, they do not recompute a canonical sum. NaN/Inf
+  sums are legal float-histogram payloads and pass through unchanged,
+  matching the Gorilla page's NaN/-0.0 transparency rule).
+- Reading exactly `sample_count` records and ending exactly at the
+  page's payload end (`page_len` from SERIES_META) is required; trailing
+  bytes are Corrupted, short reads are Corrupted.
+- `reserved` flag bits nonzero: Corrupted (forward-incompatibility is
+  handled by the format-change procedure and a version bump, never by
+  silently accepting unknown flag bits within one version).
+
+Design notes: the flags byte carries `has_sum` and `count_kind`
+per-record rather than hoisting them into SERIES_META because both can
+legitimately differ sample-to-sample for one series (unlike `value_kind`,
+which is fixed for a series' whole lifetime in a segment). Spans use
+`offset`/`length` pairs rather than a bitmap so cost is `O(populated
+buckets + span count)`, never `O(index range)`. Positive and negative
+sides are fully independent lists (no shared span list with a sign bit)
+because a value can have positive bucket 5 populated and negative bucket
+5 empty; a shared list would need a sign field per span anyway. Full
+rationale: docs/rseg-v3-plan.md §3.5.
+
+### Protobuf changes (proto/ravel/segment.proto, additive only)
+
+- `SectionKind` gains `SECTION_KIND_HIST_PAGES = 7`. Additive; no field
+  numbers change, no existing value renumbered or reused (same pattern
+  as v2's `SERIES_IDS = 5` / `SERIES_META = 6` addition).
+- `Footer` message: no new fields, same as v2 -- everything v3 needs
+  (section list, series_count, min_event_ts_ns) already exists.
+- proto/ravel/commit.proto: no change. `CommitRecord.segment_format_version`
+  (field 17) already carries `2` for v2 writes; v3 writes stamp it `3`
+  (docs/rseg-v3-plan.md C8). The field is `uint32`, already wide enough.
+
+### Checksum coverage, v3
+
+Every byte a v3 reader interprets is covered exactly as strictly as the
+corresponding v1/v2 bytes: `footer_crc32c` covers the trailer (including
+the version byte) and FooterProto, including the new HIST_PAGES section
+entry; SERIES_META's three new blocks (10-12) ride the section's
+existing `Section.crc32c`, verified before any column (old or new) is
+decoded, identical to how v2 added blocks 1-9 under the same crc that
+v1's SERIES_TABLE used; HIST_PAGES pages are covered exactly as VAL_PAGES
+pages are, by a per-page crc binding series_id, enc, comp, and payload,
+checked on first touch. The HIST_SPANS `enc = 32` byte itself is covered
+by the page crc it is an input to (a flipped byte fails the crc, not a
+silent misdecode). HIST_PAGES pads nothing (no alignment rule), so there
+is no new uncovered-on-selective-path byte class. No checksum is
+weakened, removed, or moved. Full review: docs/rseg-v3-plan.md §4.
+
+### Unchanged in v3
+
+Page format (header, page crc with series-id prefix binding, `enc`/`comp`
+byte values and grammars for TS_DELTA_VARINT/VAL_GORILLA/VAL_RAW_F64),
+the raw-fallback rule, sample ordering and stable-sort duplicate
+semantics, footer/trailer mechanics apart from `version`, the
+suffix-read protocol, section crc mechanics, reader resource caps,
+whole-object blake3 in the commit record, the object key layout, series
+identity, LABEL_DICT/SERIES_IDS grammars, VAL_RAW_F64 page alignment, and
+SERIES_META columns 1-9. The writer edge rules (zero-sample series
+dropped, duplicate ids rejected, empty segment bounds = 0) carry over
+verbatim and extend naturally to histogram series (a histogram series
+with zero samples is dropped the same as a scalar one).
