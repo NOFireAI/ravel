@@ -9,6 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_client(true) // test-side encoder drives the service in-process
         .build_server(true)
+        // Decode ArrowPayload.record as bytes::Bytes so tonic's frame bytes
+        // are sub-sliced with refcounting instead of copied into a Vec<u8>
+        // (docs/arrow-datafusion-plan.md hop 1, issue #18).
+        .bytes("opentelemetry.proto.experimental.arrow.v1.ArrowPayload.record")
         .compile_fds(descriptors)?;
     Ok(())
 }
