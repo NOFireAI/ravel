@@ -29,6 +29,13 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
 largest selector offset, so lookback never misses samples stored in an
 earlier-only segment.
 
+Staleness: the evaluator recognizes the Prometheus staleness marker (the
+exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via
+`f64::to_bits()`, never `is_nan()`). A selector whose newest in-window
+sample is the marker treats the series as absent at that instant; range
+windows exclude marker samples. Every other NaN payload is a live value
+and passes through bit-exactly (issue #75).
+
 ## Time-range and matcher pruning order
 
 1. Segment level: commit-record event-time bounds vs padded range (already
@@ -56,9 +63,10 @@ earlier-only segment.
 ## Budgets (Phase 1: static config)
 
 Per query: max segments touched (1024), max concurrent GETs (8), max
-matched series (10k), max samples (10M), wall deadline (default 30 s,
-`timeout` param can lower it). Exceeding a budget returns a Prometheus-style
-error, never a partial silent result.
+matched series (10k), max samples (10M), wall deadline (server maximum,
+default 30 s). The `timeout` param can only lower the deadline: values
+above the server maximum are clamped to it (issue #58). Exceeding a
+budget returns a Prometheus-style error, never a partial silent result.
 
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly
