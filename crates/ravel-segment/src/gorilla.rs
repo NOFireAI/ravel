@@ -14,17 +14,18 @@
 
 use crate::error::SegmentError;
 
-/// MSB-first bit packer, zero-padded to a byte boundary on `finish`.
-struct BitWriter {
-    buf: Vec<u8>,
+/// MSB-first bit packer appending to a borrowed buffer, zero-padded to a
+/// byte boundary on `finish`.
+struct BitWriter<'a> {
+    buf: &'a mut Vec<u8>,
     cur: u8,
     nbits: u8,
 }
 
-impl BitWriter {
-    fn new() -> Self {
+impl<'a> BitWriter<'a> {
+    fn new(buf: &'a mut Vec<u8>) -> Self {
         BitWriter {
-            buf: Vec::new(),
+            buf,
             cur: 0,
             nbits: 0,
         }
@@ -48,12 +49,11 @@ impl BitWriter {
         }
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(mut self) {
         if self.nbits > 0 {
             self.cur <<= 8 - self.nbits;
             self.buf.push(self.cur);
         }
-        self.buf
     }
 }
 
@@ -99,8 +99,19 @@ fn mask64(nbits: u32) -> u64 {
 }
 
 /// Encodes `values` as a Gorilla XOR bit stream, byte-padded with zeros.
+/// Test-only convenience; production encoding goes through
+/// [`encode_gorilla_into`] with a reused buffer.
+#[cfg(test)]
 pub fn encode_gorilla(values: &[f64]) -> Vec<u8> {
-    let mut w = BitWriter::new();
+    let mut out = Vec::new();
+    encode_gorilla_into(values, &mut out);
+    out
+}
+
+/// Appends the Gorilla encoding of `values` to `out` without allocating,
+/// so the writer can reuse one scratch buffer across series.
+pub fn encode_gorilla_into(values: &[f64], out: &mut Vec<u8>) {
+    let mut w = BitWriter::new(out);
     let mut iter = values.iter();
     let Some(first) = iter.next() else {
         return w.finish();
@@ -305,12 +316,13 @@ mod tests {
     fn decode_rejects_reuse_without_prior_window() {
         // First value raw (any 8 bytes), then bits `1 0` (reuse) with no
         // window ever established: must error, not panic or underflow.
-        let mut w = BitWriter::new();
+        let mut bytes = Vec::new();
+        let mut w = BitWriter::new(&mut bytes);
         w.write_bits(0u64, 64);
         w.write_bit(true);
         w.write_bit(false);
         w.write_bits(0, 10);
-        let bytes = w.finish();
+        w.finish();
         assert_eq!(decode_gorilla(&bytes, 2), Err(SegmentError::CorruptGorilla));
     }
 
@@ -318,14 +330,15 @@ mod tests {
     fn decode_rejects_new_block_overflowing_bit_budget() {
         // lead=31 (max 5-bit value), meaningful_len=64 (mlen_minus1=63, max
         // 6-bit value): lead + meaningful_len = 95 > 64, must error cleanly.
-        let mut w = BitWriter::new();
+        let mut bytes = Vec::new();
+        let mut w = BitWriter::new(&mut bytes);
         w.write_bits(0u64, 64);
         w.write_bit(true);
         w.write_bit(true);
         w.write_bits(31, 5);
         w.write_bits(63, 6);
         w.write_bits(0, 64);
-        let bytes = w.finish();
+        w.finish();
         assert_eq!(decode_gorilla(&bytes, 2), Err(SegmentError::CorruptGorilla));
     }
 
@@ -333,9 +346,10 @@ mod tests {
     fn bit_writer_reader_roundtrip_all_widths() {
         for nbits in 0..=64u32 {
             let value = mask64(nbits);
-            let mut w = BitWriter::new();
+            let mut bytes = Vec::new();
+            let mut w = BitWriter::new(&mut bytes);
             w.write_bits(value, nbits);
-            let bytes = w.finish();
+            w.finish();
             let mut r = BitReader::new(&bytes);
             let got = r.read_bits(nbits).expect("reads");
             assert_eq!(got, value, "nbits={nbits}");

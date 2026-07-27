@@ -15,8 +15,8 @@ use crate::format::{
     MAGIC, RESERVED, SIGNAL_METRICS, VERSION, ZSTD_LEVEL, compression, page_comp, page_enc,
     section_kind,
 };
-use crate::gorilla::encode_gorilla;
-use crate::ts_delta::encode_ts_deltas;
+use crate::gorilla::encode_gorilla_into;
+use crate::ts_delta::encode_ts_deltas_into;
 use crate::varint::write_uvarint;
 
 /// One series' identity, labels (including `__name__`), and samples.
@@ -80,14 +80,16 @@ impl SegmentWriter {
         }
         series.retain(|s| !s.samples.is_empty());
 
+        // Ids are unique after the duplicate check below, so an unstable
+        // sort is equivalent; sorting first lets the check run on adjacent
+        // entries without a second ids-only sort.
+        series.sort_unstable_by_key(|s| s.series_id.0);
+        if series
+            .windows(2)
+            .any(|w| w[0].series_id.0 == w[1].series_id.0)
         {
-            let mut ids: Vec<[u8; 16]> = series.iter().map(|s| s.series_id.0).collect();
-            ids.sort();
-            if ids.windows(2).any(|w| w[0] == w[1]) {
-                return Err(WriteError::DuplicateSeriesId);
-            }
+            return Err(WriteError::DuplicateSeriesId);
         }
-        series.sort_by_key(|s| s.series_id.0);
 
         let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
         let mut sample_count: u64 = 0;
@@ -111,8 +113,13 @@ impl SegmentWriter {
 
         let dict = build_dictionary(&series)?;
 
-        let mut ts_pages = Vec::new();
-        let mut val_pages = Vec::new();
+        let total_samples =
+            usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
+        // Rough per-page upper bounds: 6-byte header plus delta varints
+        // (ts) or near-raw f64s (val). Over-reserving trades a little
+        // memory for zero reallocation during the append-only build.
+        let mut ts_pages = Vec::with_capacity(series.len() * 16 + total_samples * 4);
+        let mut val_pages = Vec::with_capacity(series.len() * 16 + total_samples * 9);
         let series_table_raw = encode_series_table(
             &series,
             &dict.occurrence_ordinals,
@@ -365,9 +372,16 @@ fn encode_series_table(
     ts_pages: &mut Vec<u8>,
     val_pages: &mut Vec<u8>,
 ) -> Result<Vec<u8>, WriteError> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(4 + series.len() * 46 + occurrence_ordinals.len() * 3);
     let count = u32::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
     buf.extend_from_slice(&count.to_le_bytes());
+
+    // Scratch buffers reused across every series: page building previously
+    // allocated four fresh Vecs per series, which dominated tiny-page
+    // segments at high cardinality.
+    let mut ts_scratch: Vec<i64> = Vec::new();
+    let mut val_scratch: Vec<f64> = Vec::new();
+    let mut payload_scratch: Vec<u8> = Vec::new();
 
     let mut next_occurrence = occurrence_ordinals.iter();
     for s in series {
@@ -398,67 +412,104 @@ fn encode_series_table(
         buf.extend_from_slice(&max_ts_ns.to_le_bytes());
 
         let ts_page_offset = ts_pages.len() as u64;
-        let ts_page_bytes = build_ts_page(&s.series_id, &s.samples)?;
-        let ts_page_len = ts_page_bytes.len() as u64;
-        ts_pages.extend_from_slice(&ts_page_bytes);
+        append_ts_page(
+            &s.series_id,
+            &s.samples,
+            &mut ts_scratch,
+            &mut payload_scratch,
+            ts_pages,
+        )?;
+        let ts_page_len = ts_pages.len() as u64 - ts_page_offset;
         write_uvarint(&mut buf, ts_page_offset);
         write_uvarint(&mut buf, ts_page_len);
 
         let val_page_offset = val_pages.len() as u64;
-        let val_page_bytes = build_val_page(&s.series_id, &s.samples);
-        let val_page_len = val_page_bytes.len() as u64;
-        val_pages.extend_from_slice(&val_page_bytes);
+        append_val_page(
+            &s.series_id,
+            &s.samples,
+            &mut val_scratch,
+            &mut payload_scratch,
+            val_pages,
+        );
+        let val_page_len = val_pages.len() as u64 - val_page_offset;
         write_uvarint(&mut buf, val_page_offset);
         write_uvarint(&mut buf, val_page_len);
     }
     Ok(buf)
 }
 
-fn build_ts_page(
+/// Writer policy, not format: timestamp payloads below this size skip the
+/// lz4 attempt and are stored with `comp = 0`, which the page grammar
+/// explicitly permits. lz4's per-call setup dominates such pages, and the
+/// 4-byte size prefix plus framing means compression cannot win there.
+const LZ4_MIN_TS_PAYLOAD_BYTES: usize = 64;
+
+/// Encodes one series' TS page directly into `ts_pages` (6-byte header
+/// plus payload), reusing the caller's scratch buffers. lz4 is applied
+/// only when the raw payload reaches the size floor and compression
+/// actually shrinks it; otherwise the page is stored uncompressed.
+fn append_ts_page(
     series_id: &SeriesId,
     samples: &[ravel_types::Sample],
-) -> Result<Vec<u8>, WriteError> {
-    let timestamps: Vec<i64> = samples.iter().map(|s| s.ts_ns).collect();
-    let raw = encode_ts_deltas(&timestamps).ok_or(WriteError::TimestampDeltaOverflow)?;
-    let compressed = lz4_flex::compress_prepend_size(&raw);
-    let enc = page_enc::TS_DELTA_VARINT;
-    let comp = page_comp::LZ4;
-    let crc = page_crc(&series_id.0, enc, comp, &compressed);
+    ts_scratch: &mut Vec<i64>,
+    payload_scratch: &mut Vec<u8>,
+    ts_pages: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    ts_scratch.clear();
+    ts_scratch.extend(samples.iter().map(|s| s.ts_ns));
+    payload_scratch.clear();
+    encode_ts_deltas_into(payload_scratch, ts_scratch).ok_or(WriteError::TimestampDeltaOverflow)?;
 
-    let mut page = Vec::with_capacity(6 + compressed.len());
-    page.push(enc);
-    page.push(comp);
-    page.extend_from_slice(&crc.to_le_bytes());
-    page.extend_from_slice(&compressed);
-    Ok(page)
+    let enc = page_enc::TS_DELTA_VARINT;
+    let compressed = if payload_scratch.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
+        let candidate = lz4_flex::compress_prepend_size(payload_scratch);
+        (candidate.len() < payload_scratch.len()).then_some(candidate)
+    } else {
+        None
+    };
+    let (comp, payload): (u8, &[u8]) = match &compressed {
+        Some(candidate) => (page_comp::LZ4, candidate),
+        None => (page_comp::NONE, payload_scratch),
+    };
+    let crc = page_crc(&series_id.0, enc, comp, payload);
+    ts_pages.push(enc);
+    ts_pages.push(comp);
+    ts_pages.extend_from_slice(&crc.to_le_bytes());
+    ts_pages.extend_from_slice(payload);
+    Ok(())
 }
 
-fn build_val_page(series_id: &SeriesId, samples: &[ravel_types::Sample]) -> Vec<u8> {
-    let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
-    let count = values.len() as u64;
-    let gorilla = encode_gorilla(&values);
-    let (enc, payload) = if (gorilla.len() as u64) >= 8 * count {
-        (page_enc::VAL_RAW_F64, encode_raw_f64(&values))
+/// Encodes one series' VAL page directly into `val_pages`, reusing the
+/// caller's scratch buffers. Encoding choice is unchanged: Gorilla unless
+/// it fails to beat raw f64 (docs/segment-format.md raw-fallback rule).
+fn append_val_page(
+    series_id: &SeriesId,
+    samples: &[ravel_types::Sample],
+    val_scratch: &mut Vec<f64>,
+    payload_scratch: &mut Vec<u8>,
+    val_pages: &mut Vec<u8>,
+) {
+    val_scratch.clear();
+    val_scratch.extend(samples.iter().map(|s| s.value));
+    payload_scratch.clear();
+    encode_gorilla_into(val_scratch, payload_scratch);
+
+    let count = val_scratch.len() as u64;
+    let enc = if (payload_scratch.len() as u64) >= 8 * count {
+        payload_scratch.clear();
+        for v in val_scratch.iter() {
+            payload_scratch.extend_from_slice(&v.to_le_bytes());
+        }
+        page_enc::VAL_RAW_F64
     } else {
-        (page_enc::VAL_GORILLA, gorilla)
+        page_enc::VAL_GORILLA
     };
     let comp = page_comp::NONE;
-    let crc = page_crc(&series_id.0, enc, comp, &payload);
-
-    let mut page = Vec::with_capacity(6 + payload.len());
-    page.push(enc);
-    page.push(comp);
-    page.extend_from_slice(&crc.to_le_bytes());
-    page.extend_from_slice(&payload);
-    page
-}
-
-fn encode_raw_f64(values: &[f64]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(values.len() * 8);
-    for v in values {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    buf
+    let crc = page_crc(&series_id.0, enc, comp, payload_scratch);
+    val_pages.push(enc);
+    val_pages.push(comp);
+    val_pages.extend_from_slice(&crc.to_le_bytes());
+    val_pages.extend_from_slice(payload_scratch);
 }
 
 fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, WriteError> {
