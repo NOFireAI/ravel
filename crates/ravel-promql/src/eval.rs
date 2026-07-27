@@ -79,6 +79,15 @@ pub enum Error {
 /// Default PromQL lookback: 5 minutes, in nanoseconds.
 const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 
+/// Prometheus staleness marker: the exact NaN bit pattern a scrape/rule
+/// engine writes to signal that a series has ended. Per Prometheus lookback
+/// semantics (ADR-0007) and ADR-0010 §5, when this is the most recent sample
+/// in the lookback window the series is **absent** at that instant, not a
+/// NaN value. Detection is an exact-bits comparison, never `is_nan()`: every
+/// other NaN payload is a live, observable value and passes through
+/// bit-for-bit (`f64::to_bits` exactness is a frozen invariant).
+const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
 /// PromQL evaluator for a single vector selector. Stateless besides its
 /// lookback configuration; safe to share across queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +229,11 @@ impl Evaluator {
 /// must be sorted ascending by `ts_ns` (the `SeriesSource` contract); among
 /// duplicate timestamps, the one later in the vec wins, which falls out of
 /// `partition_point` for free given that ordering.
+///
+/// If the selected sample is a Prometheus staleness marker
+/// ([`STALE_NAN_BITS`]) the series is absent from that sample forward, so
+/// this returns `None`. A later real sample supersedes the marker and is
+/// picked normally; markers older than the selected sample are irrelevant.
 fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Option<f64> {
     let idx = samples.partition_point(|s| s.ts_ns <= sel_ts_ns);
     if idx == 0 {
@@ -227,11 +241,13 @@ fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Op
     }
     let candidate = &samples[idx - 1];
     let window_start = sel_ts_ns.checked_sub(lookback_delta_ns)?;
-    if candidate.ts_ns > window_start {
-        Some(candidate.value)
-    } else {
-        None
+    if candidate.ts_ns <= window_start {
+        return None;
     }
+    if candidate.value.to_bits() == STALE_NAN_BITS {
+        return None;
+    }
+    Some(candidate.value)
 }
 
 /// Parse `query` and reject every AST node except a bare vector selector
