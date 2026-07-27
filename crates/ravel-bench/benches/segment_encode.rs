@@ -17,6 +17,12 @@ use ravel_segment::{SegmentWriter, SeriesInput};
 
 const TOTAL_SAMPLES: usize = 200_000;
 
+/// Axis-sweep cells (issue #98): samples-per-series x labels-per-series at a
+/// fixed ~200k total sample budget. Existing `segment_encode` cases above are
+/// frozen (BENCHMARKS.md); these are new ids in their own group.
+const AXIS_SAMPLES_PER_SERIES: [usize; 3] = [2, 60, 500];
+const AXIS_LABELS_PER_SERIES: [usize; 2] = [5, 15];
+
 fn series_inputs(series_count: usize) -> Vec<SeriesInput> {
     let samples_per_series = (TOTAL_SAMPLES / series_count).max(1);
     let config = WorkloadConfig {
@@ -86,5 +92,59 @@ fn bench_segment_encode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_segment_encode);
+fn axis_inputs(samples_per_series: usize, labels_per_series: usize) -> Vec<SeriesInput> {
+    let config = WorkloadConfig::axis_sweep(samples_per_series, labels_per_series);
+    generate_raw(&config)
+        .expect("generate axis workload")
+        .into_iter()
+        .map(|(series_id, labels, samples)| SeriesInput {
+            series_id,
+            labels,
+            samples,
+        })
+        .collect()
+}
+
+/// samples-per-series x labels-per-series sweep for encode, v1 and v2 each
+/// (issue #98). Case ids are `s{samples}_l{labels}_v1` / `_v2`. Same untimed
+/// clone-in-setup pattern as `bench_segment_encode` (a12-F01): the deep
+/// fixture clone is charged to setup, only the write is timed.
+fn bench_segment_encode_axis_sweep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("segment_encode_axis_sweep");
+    for &samples_per_series in &AXIS_SAMPLES_PER_SERIES {
+        for &labels_per_series in &AXIS_LABELS_PER_SERIES {
+            let inputs = axis_inputs(samples_per_series, labels_per_series);
+            let actual_samples: usize = inputs.iter().map(|s| s.samples.len()).sum();
+            group.throughput(Throughput::Elements(actual_samples as u64));
+            let stem = format!("s{samples_per_series}_l{labels_per_series}");
+            group.bench_function(format!("{stem}_v1"), |b| {
+                b.iter_batched(
+                    || clone_inputs(&inputs),
+                    |series| {
+                        SegmentWriter::write(series, bench_identity(), bench_bounds())
+                            .expect("encode")
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+            group.bench_function(format!("{stem}_v2"), |b| {
+                b.iter_batched(
+                    || clone_inputs(&inputs),
+                    |series| {
+                        SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
+                            .expect("encode v2")
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_segment_encode,
+    bench_segment_encode_axis_sweep
+);
 criterion_main!(benches);

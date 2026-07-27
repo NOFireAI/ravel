@@ -40,6 +40,17 @@ impl CardinalityProfile {
             labels_per_set: 4,
         }
     }
+
+    /// [`many_small`](Self::many_small) with an explicit base-label count
+    /// instead of the fixed 4, for the label-count axis sweep (issue #98).
+    /// The generator always appends one uniquifying `series_idx` label, so a
+    /// series built from this profile carries `labels_per_set + 1` labels.
+    pub fn many_small_with_labels(series_count: usize, labels_per_set: usize) -> Self {
+        CardinalityProfile {
+            distinct_sets: series_count.max(1),
+            labels_per_set,
+        }
+    }
 }
 
 /// Batch sizes drawn uniformly from `[min, max]`.
@@ -95,6 +106,39 @@ pub struct WorkloadConfig {
     pub counter_fraction: f64,
     pub cardinality: CardinalityProfile,
     pub batch_size: BatchSizeDistribution,
+}
+
+/// Total sample budget the axis-sweep cells hold fixed (issue #98): every
+/// cell derives its series count as `AXIS_SWEEP_TOTAL_SAMPLES /
+/// samples_per_series`, so encode/decode work is compared at a constant total
+/// sample count while samples-per-series and label-count vary independently.
+pub const AXIS_SWEEP_TOTAL_SAMPLES: usize = 200_000;
+
+impl WorkloadConfig {
+    /// One cell of the samples-per-series x labels-per-series axis sweep
+    /// (issue #98). Fixes the total sample count at [`AXIS_SWEEP_TOTAL_SAMPLES`]
+    /// by deriving `series_count = AXIS_SWEEP_TOTAL_SAMPLES /
+    /// samples_per_series` (so the product is exactly the budget when it
+    /// divides evenly, otherwise the largest whole-series total at or below
+    /// it), and sets a `many_small` cardinality whose series each carry
+    /// exactly `labels_per_series` labels (the profile holds
+    /// `labels_per_series - 1` base labels; the generator appends one
+    /// uniquifying `series_idx` label). Every other knob keeps its
+    /// [`Default`] value, so this is additive: existing entry points and
+    /// callers that build `WorkloadConfig` directly are untouched.
+    pub fn axis_sweep(samples_per_series: usize, labels_per_series: usize) -> Self {
+        let samples_per_series = samples_per_series.max(1);
+        let series_count = (AXIS_SWEEP_TOTAL_SAMPLES / samples_per_series).max(1);
+        // series_idx is always appended by the generator, so the base label
+        // count is one less than the requested per-series total.
+        let labels_per_set = labels_per_series.max(1) - 1;
+        WorkloadConfig {
+            series_count,
+            samples_per_series,
+            cardinality: CardinalityProfile::many_small_with_labels(series_count, labels_per_set),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for WorkloadConfig {
@@ -366,6 +410,49 @@ mod tests {
         let batches = generate_batches(&config).expect("generate");
         let batched_total: usize = batches.iter().map(|b| b.len()).sum();
         assert_eq!(batched_total, normalized.len());
+    }
+
+    #[test]
+    fn axis_sweep_honors_series_count_and_total_samples() {
+        // Each cell fixes the total sample budget and derives series count.
+        for &spp in &[2usize, 60, 500] {
+            let config = WorkloadConfig::axis_sweep(spp, 5);
+            let expected_series = AXIS_SWEEP_TOTAL_SAMPLES / spp;
+            assert_eq!(
+                config.series_count, expected_series,
+                "series_count for spp={spp}"
+            );
+            assert_eq!(config.samples_per_series, spp);
+
+            let raw = generate_raw(&config).expect("generate");
+            // No churn by default, so one physical series per logical series.
+            assert_eq!(raw.len(), expected_series, "raw series for spp={spp}");
+            let total: usize = raw.iter().map(|(_, _, samples)| samples.len()).sum();
+            assert_eq!(total, expected_series * spp, "total samples for spp={spp}");
+            // The budget is honored to within one series' worth of samples
+            // (exact when spp divides the budget: 2 and 500 do, 60 leaves a
+            // sub-series remainder).
+            assert!(
+                AXIS_SWEEP_TOTAL_SAMPLES - total < spp,
+                "total {total} within one series of budget for spp={spp}"
+            );
+        }
+    }
+
+    #[test]
+    fn axis_sweep_honors_label_count() {
+        for &labels in &[5usize, 15] {
+            let config = WorkloadConfig::axis_sweep(60, labels);
+            let raw = generate_raw(&config).expect("generate");
+            assert!(!raw.is_empty());
+            for (_, label_set, _) in &raw {
+                assert_eq!(
+                    label_set.len(),
+                    labels,
+                    "each series carries exactly {labels} labels"
+                );
+            }
+        }
     }
 
     #[test]
