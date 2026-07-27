@@ -162,7 +162,15 @@ pub fn decode_commit_tokens(raw: &[String]) -> Result<Vec<CommitToken>, ParamErr
         .collect()
 }
 
-pub fn parse_deadline(params: &Params, default: Duration) -> Result<Duration, ParamError> {
+/// Resolves the per-query wall deadline from the client `timeout` parameter.
+///
+/// `max` is the configured server wall-deadline (`EngineConfig::deadline`)
+/// and is a hard ceiling per the resource-limit contract
+/// (docs/query-engine.md "Budgets": the `timeout` param can only *lower* the
+/// deadline). When `timeout` is absent the server maximum applies. When it is
+/// present the parsed value is clamped to `max`, so a client can shorten its
+/// own deadline but never extend it past the server budget (finding a7-F01).
+pub fn parse_deadline(params: &Params, max: Duration) -> Result<Duration, ParamError> {
     match params.first("timeout") {
         Some(s) => {
             let ms = parse_duration_ms("timeout", s)?;
@@ -172,8 +180,65 @@ pub fn parse_deadline(params: &Params, default: Duration) -> Result<Duration, Pa
                     value: s.to_string(),
                 });
             }
-            Ok(Duration::from_millis(ms as u64))
+            Ok(Duration::from_millis(ms as u64).min(max))
         }
-        None => Ok(default),
+        None => Ok(max),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    const SERVER_MAX: Duration = Duration::from_secs(30);
+
+    fn params_with_timeout(timeout: &str) -> Params {
+        Params::parse(Some(&format!("timeout={timeout}")), None)
+    }
+
+    /// a7-F01 regression: a client `timeout` above the configured server
+    /// wall-deadline is clamped to that maximum, never honored verbatim. The
+    /// effective deadline is the observable: before the fix this returned the
+    /// full 3600 s; after it, the 30 s server budget.
+    #[test]
+    fn timeout_above_server_max_is_clamped_to_max() {
+        let params = params_with_timeout("3600");
+        let deadline = parse_deadline(&params, SERVER_MAX).expect("valid timeout");
+        assert_eq!(
+            deadline, SERVER_MAX,
+            "an over-default timeout must be clamped to the server maximum"
+        );
+    }
+
+    #[test]
+    fn timeout_below_server_max_is_honored() {
+        let params = params_with_timeout("5");
+        let deadline = parse_deadline(&params, SERVER_MAX).expect("valid timeout");
+        assert_eq!(
+            deadline,
+            Duration::from_secs(5),
+            "a client value under the server maximum must be honored exactly"
+        );
+    }
+
+    #[test]
+    fn timeout_equal_to_server_max_is_honored() {
+        let params = params_with_timeout("30");
+        let deadline = parse_deadline(&params, SERVER_MAX).expect("valid timeout");
+        assert_eq!(deadline, SERVER_MAX);
+    }
+
+    #[test]
+    fn absent_timeout_uses_server_max() {
+        let params = Params::parse(None, None);
+        let deadline = parse_deadline(&params, SERVER_MAX).expect("no timeout");
+        assert_eq!(deadline, SERVER_MAX);
+    }
+
+    #[test]
+    fn non_positive_timeout_is_rejected() {
+        let params = params_with_timeout("0");
+        assert!(parse_deadline(&params, SERVER_MAX).is_err());
     }
 }
