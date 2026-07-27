@@ -184,7 +184,18 @@ impl Catalog {
             return Ok(());
         }
 
-        let mut retried = false;
+        // Independent retry budgets for the two distinct failure modes. A
+        // transient store fault (Throttled/Timeout/Transient) and a NotFound
+        // (a real record not yet propagated) are unrelated, so they must not
+        // draw from one shared budget: if they did, a transient blip would
+        // spend the single NotFound-propagation retry the spec grants
+        // (docs/catalog-and-mvcc.md step 4: "Absent after one retry"), so a
+        // real but briefly-unpropagated commit would surface as a spurious
+        // UnsatisfiableToken, violating read-your-write (a4-F02). NotFound
+        // keeps exactly one retry (two probes) as documented; transient
+        // errors keep their own independent single retry.
+        let mut notfound_retries: u32 = 1;
+        let mut transient_retries: u32 = 1;
         loop {
             match self.store.get(&key, GetRange::Full).await {
                 Ok(got) => {
@@ -201,15 +212,15 @@ impl Catalog {
                     out.insert(key, segment_ref);
                     return Ok(());
                 }
-                Err(StoreError::NotFound) if !retried => {
-                    retried = true;
+                Err(StoreError::NotFound) if notfound_retries > 0 => {
+                    notfound_retries -= 1;
                     tokio::time::sleep(MIN_TOKEN_RETRY_DELAY).await;
                 }
                 Err(StoreError::NotFound) => {
                     return Err(unsatisfiable_token(token));
                 }
-                Err(e) if e.is_retryable() && !retried => {
-                    retried = true;
+                Err(e) if e.is_retryable() && transient_retries > 0 => {
+                    transient_retries -= 1;
                     tokio::time::sleep(MIN_TOKEN_RETRY_DELAY).await;
                 }
                 Err(e) => return Err(CatalogError::Store(e)),
@@ -337,6 +348,9 @@ mod tests {
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::NewCommitRecord;
     use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence,
+    };
     use ravel_object_store::memory::MemoryStore;
 
     use super::*;
@@ -850,5 +864,151 @@ mod tests {
         assert!(found.contains(&keys::reconstruct_data_key(&at_start_hour).expect("k1")));
         assert!(found.contains(&keys::reconstruct_data_key(&at_end_hour).expect("k2")));
         assert!(!found.contains(&keys::reconstruct_data_key(&just_outside).expect("k3")));
+    }
+
+    /// a4-F02 regression: the exact-`min_token` GET must give transient
+    /// store faults and NotFound propagation blips independent retry
+    /// budgets. A transient blip followed by a NotFound blip against a real,
+    /// acked commit must still resolve (read-your-write), not surface as
+    /// `UnsatisfiableToken`. The `#[92]` `FaultStore` sequencing API scripts
+    /// the two distinct faults on one key that a single `Rule` cannot.
+    #[tokio::test]
+    async fn min_token_transient_then_notfound_still_resolves_the_real_commit() {
+        let inner = MemoryStore::new();
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        // Skewed bucket well outside the listing window, so the only GET on
+        // the token key comes from the exact-token resolve path (never the
+        // listing pass).
+        let skewed_bucket = 500_000 - 10;
+        let skewed_created = i64::from(skewed_bucket) * NS_PER_HOUR + 10 * 60_000_000_000;
+        let record = publish_segment(
+            &inner,
+            0,
+            1,
+            skewed_bucket,
+            skewed_created,
+            skewed_created,
+            skewed_created + 1_000,
+        )
+        .await;
+        let token = record::token_for(&record).expect("token");
+        let key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("key");
+
+        // Script the token GET: first a transient blip, then a NotFound blip,
+        // then a scripted pass-through that returns the real record. Under
+        // the shared-budget defect the transient consumed the single retry
+        // and the NotFound surfaced as UnsatisfiableToken on the second call.
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains(key)
+                .then_fault(ScriptedFault::Transient("token get blip".into()))
+                .then_fault(ScriptedFault::NotFoundBlip)
+                .then_passthrough(),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let snapshot = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+            .await
+            .expect("valid token must resolve despite a transient then a NotFound blip");
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(
+            snapshot.segments[0].data_object_key,
+            keys::reconstruct_data_key(&record).expect("key")
+        );
+
+        // All three scripted steps fired: the transient retry and the
+        // NotFound retry drew from independent budgets, then the record read
+        // succeeded.
+        assert_eq!(store.sequence_progress(0), 3, "all three steps consumed");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "transient blip fired once"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "NotFound blip fired once"
+        );
+    }
+
+    /// The NotFound propagation budget stays at exactly one retry (two
+    /// probes) as documented (docs/catalog-and-mvcc.md step 4: "Absent after
+    /// one retry"). Two scripted NotFound blips exhaust the budget and
+    /// surface `UnsatisfiableToken` as its own typed outcome, even though a
+    /// third probe would have found the (present) record. This proves the
+    /// fix did not widen the NotFound budget.
+    #[tokio::test]
+    async fn min_token_two_notfound_blips_surface_unsatisfiable_not_over_probing() {
+        let inner = MemoryStore::new();
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        let skewed_bucket = 500_000 - 10;
+        let skewed_created = i64::from(skewed_bucket) * NS_PER_HOUR + 10 * 60_000_000_000;
+        let record = publish_segment(
+            &inner,
+            0,
+            1,
+            skewed_bucket,
+            skewed_created,
+            skewed_created,
+            skewed_created + 1_000,
+        )
+        .await;
+        let token = record::token_for(&record).expect("token");
+        let key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("key");
+
+        // Two NotFound blips then a pass-through. One retry is documented, so
+        // the second NotFound is terminal: the pass-through (step index 2) is
+        // never reached even though the record is present.
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains(key)
+                .then_fault(ScriptedFault::NotFoundBlip)
+                .then_fault(ScriptedFault::NotFoundBlip)
+                .then_passthrough(),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let err = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+            .await
+            .expect_err("two NotFound probes must surface UnsatisfiableToken");
+        assert!(matches!(err, CatalogError::UnsatisfiableToken { .. }));
+
+        // Exactly two probes (one retry) fired; the third step was not
+        // consumed, proving the NotFound budget was not widened.
+        assert_eq!(
+            store.sequence_progress(0),
+            2,
+            "only two NotFound probes; pass-through never reached"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            2,
+            "both NotFound blips fired"
+        );
     }
 }
