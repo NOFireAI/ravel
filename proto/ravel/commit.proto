@@ -34,3 +34,59 @@ message CommitRecord {
   // Never recomputed on retry (ADR-0010).
   uint32 ingest_hour_bucket = 19;
 }
+
+// One input segment identity folded into a CompactionRecord's input list
+// (ADR-0018 §Decision 4). Mirrors the identity fields a CommitRecord is
+// keyed by, sorted canonically by (writer_id, writer_epoch, writer_seq).
+message CompactionInputIdentity {
+  string writer_id = 1;    // uuid
+  uint64 writer_epoch = 2;
+  uint64 writer_seq = 3;
+}
+
+// One RSEG v3 output object of a compaction run (docs/compaction-retention-plan.md §3.1).
+message CompactionPart {
+  uint32 part_index = 1;
+  bytes first_series_id = 2;   // 16 bytes, inclusive
+  bytes last_series_id = 3;    // 16 bytes, inclusive
+  bytes content_hash = 4;      // blake3, 32 bytes
+  uint64 object_size = 5;
+  uint64 sample_count = 6;
+  uint64 series_count = 7;
+  uint64 run_count = 8;
+  sfixed64 min_event_ts_ns = 9;
+  sfixed64 max_event_ts_ns = 10;
+  uint32 segment_format_version = 11;  // = 3
+}
+
+// L0 to L1 compaction record (ADR-0018). Additive; lives in the same key
+// prefix as CommitRecord (docs/catalog-and-mvcc.md) so the existing one
+// LIST per bucket discovers both. Immutable once published.
+message CompactionRecord {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  uint32 ingest_hour_bucket = 5;
+  uint32 level = 6;            // = 1
+  // Sorted canonically by (writer_id, writer_epoch, writer_seq).
+  repeated CompactionInputIdentity inputs = 7;
+  bytes input_set_hash = 8;    // blake3 over the sorted inputs, 32 bytes
+  repeated CompactionPart parts = 9;
+  sfixed64 created_unix_ns = 10;
+}
+
+// Age-based retention tombstone for one sealed ingest-hour bucket
+// (ADR-0019). Additive; written once, CreateIfAbsent, to a fixed key in
+// the same prefix as CommitRecord. Durable and irreversible: raising the
+// retention window later never resurrects a tombstoned bucket.
+message RetentionTombstone {
+  uint32 format_version = 1;         // = 1
+  bytes tenant_hash = 2;             // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  uint32 ingest_hour_bucket = 5;
+  sfixed64 retired_at_ns = 6;
+  uint64 retention_window_ns = 7;    // the R applied
+  uint64 record_count_observed = 8;
+}
