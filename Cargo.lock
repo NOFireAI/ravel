@@ -3437,6 +3437,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "lz4_flex 0.14.0",
+ "proptest",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
