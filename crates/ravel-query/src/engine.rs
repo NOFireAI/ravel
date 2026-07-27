@@ -898,4 +898,255 @@ mod merge_tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].samples.is_empty());
     }
+
+    // --- Randomized independent-oracle coverage (issue #56, a6-F01) ---
+    //
+    // The dedup total order (ADR-0010 §5; docs/catalog-and-mvcc.md
+    // "Cross-segment duplicate samples") is the crown-jewel invariant: a
+    // wrong per-(series, ts) winner is silent wrong data. The hand-picked
+    // point tests above pin one tiebreak level each; the property tests
+    // below drive the *production* merge on randomized multi-segment inputs
+    // and compare it against a reference oracle written fresh here. The
+    // oracle is an independent implementation of the order itself — not the
+    // heap merge under test, not the standalone copies in
+    // benches/merge_kway_vs_materialized.rs — so agreement is evidence, not
+    // a tautology.
+
+    use proptest::prelude::*;
+
+    /// Full ADR-0010 §5 ordering prefix plus per-sample in-page index:
+    /// `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`.
+    type PriorityKey = (i64, u64, u64, u32);
+    /// Complete winner-comparison key: the priority tuple, tie-broken by
+    /// `value.to_bits()`.
+    type OrderKey = (PriorityKey, u64);
+
+    /// Independent reference for the ADR-0010 §5 order. For every
+    /// (series_id, ts) it gathers *every* candidate sample across all
+    /// segments/runs, tags each with the full ordering key
+    /// `(created_unix_ns, writer_epoch, writer_seq, in_page_index)` and the
+    /// raw `value.to_bits()`, then keeps the single greatest key by plain
+    /// tuple comparison and emits per series ascending by ts. No heap, no
+    /// cursor drain, no `is_greater`, no `Candidate`: a straight
+    /// sort-by-full-key-then-take-greatest. `in_page_index` is the sample's
+    /// position within its run's `timestamps` (the field's definition), the
+    /// same way production reads it; that is the meaning of the field, not a
+    /// copy of the merge algorithm. Grouping is by `series_id` to mirror the
+    /// production merge's real grouping key; output is re-keyed by labels
+    /// because `merge_soa_runs` yields `SeriesData` carrying labels, not id.
+    fn oracle(segments: &[Vec<FetchedSeriesSoa>]) -> HashMap<LabelSet, Vec<(i64, u64)>> {
+        let mut labels_of: HashMap<SeriesId, LabelSet> = HashMap::new();
+        let mut best: HashMap<(SeriesId, i64), OrderKey> = HashMap::new();
+        for segment in segments {
+            for r in segment {
+                labels_of
+                    .entry(r.series_id)
+                    .or_insert_with(|| r.labels.clone());
+                for (pos, (&ts, &val)) in r.timestamps.iter().zip(&r.values).enumerate() {
+                    let in_page_index = u32::try_from(pos).unwrap_or(u32::MAX);
+                    let key = (
+                        (
+                            r.created_unix_ns,
+                            r.writer_epoch,
+                            r.writer_seq,
+                            in_page_index,
+                        ),
+                        val.to_bits(),
+                    );
+                    best.entry((r.series_id, ts))
+                        .and_modify(|cur| {
+                            if key > *cur {
+                                *cur = key;
+                            }
+                        })
+                        .or_insert(key);
+                }
+            }
+        }
+        // Seed every series that appeared in the input, including runs with
+        // zero samples: production groups by series id before draining, so an
+        // empty run still yields a `SeriesData` with an empty sample vec.
+        let mut per_series: HashMap<SeriesId, Vec<(i64, u64)>> =
+            labels_of.keys().map(|&id| (id, Vec::new())).collect();
+        for ((series_id, ts), (_prio, bits)) in best {
+            per_series.entry(series_id).or_default().push((ts, bits));
+        }
+        let mut out = HashMap::new();
+        for (series_id, mut samples) in per_series {
+            samples.sort_by_key(|&(ts, _)| ts);
+            out.insert(labels_of[&series_id].clone(), samples);
+        }
+        out
+    }
+
+    /// Runs the production merge with unbounded budgets and projects the
+    /// result to the same label-keyed `(ts, value.to_bits())` shape as
+    /// [`oracle`], for a bit-exact, order-independent comparison.
+    fn production_map(segments: &[Vec<FetchedSeriesSoa>]) -> HashMap<LabelSet, Vec<(i64, u64)>> {
+        let out = merge_soa_runs(segments.to_vec(), usize::MAX, usize::MAX).expect("merge");
+        out.into_iter()
+            .map(|s| {
+                let samples = s
+                    .samples
+                    .iter()
+                    .map(|x| (x.ts_ns, x.value.to_bits()))
+                    .collect();
+                (s.labels, samples)
+            })
+            .collect()
+    }
+
+    /// Deterministic in-place Fisher-Yates over whole runs, driven by a
+    /// proptest-supplied seed through a self-contained LCG. Shuffles runs
+    /// only, never samples *within* a run: a run is one decoded RSEG page in
+    /// ascending on-disk order and its in-page index is load-bearing, so its
+    /// internal order is not a free permutation.
+    fn shuffle_runs(mut v: Vec<FetchedSeriesSoa>, seed: u64) -> Vec<FetchedSeriesSoa> {
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        for i in (1..v.len()).rev() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = ((state >> 33) as usize) % (i + 1);
+            v.swap(i, j);
+        }
+        v
+    }
+
+    /// A random value with frequent ties and every significant bit pattern
+    /// the storage path treats as distinct: NaN payloads, -0.0, infinities,
+    /// and a small integer band so duplicate `to_bits()` are common.
+    fn value_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            8 => (-3i8..=3).prop_map(f64::from),
+            1 => Just(0.0f64),
+            1 => Just(-0.0f64),
+            1 => Just(f64::NAN),
+            1 => Just(-f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(f64::NEG_INFINITY),
+        ]
+    }
+
+    /// One decoded per-segment run. Small domains for series id, provenance
+    /// prefix, and timestamps force cross-run and within-run duplicate
+    /// timestamps, shared provenance prefixes, and provenance ties — so the
+    /// value tiebreak is exercised, not merely reachable. Timestamps are
+    /// sorted ascending (RSEG page order; duplicates preserved) so the merge
+    /// never trips its `NonMonotonicSamples` guard, which is not under test
+    /// here.
+    fn run_strategy() -> impl Strategy<Value = FetchedSeriesSoa> {
+        (
+            0u8..3,
+            0i64..3,
+            0u64..3,
+            0u64..3,
+            prop::collection::vec((0i64..4, value_strategy()), 0..6),
+        )
+            .prop_map(|(series, created, epoch, seq, mut pairs)| {
+                pairs.sort_by_key(|&(ts, _)| ts);
+                let ts: Vec<i64> = pairs.iter().map(|&(t, _)| t).collect();
+                let vals: Vec<f64> = pairs.iter().map(|&(_, v)| v).collect();
+                run(series, &ts, &vals, created, epoch, seq)
+            })
+    }
+
+    fn segments_strategy() -> impl Strategy<Value = Vec<Vec<FetchedSeriesSoa>>> {
+        prop::collection::vec(prop::collection::vec(run_strategy(), 0..4), 0..4)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The production merge equals the independent oracle on random
+        /// multi-segment, multi-series inputs with duplicate (series, ts)
+        /// samples of varied provenance and value bit patterns. Mutating any
+        /// comparison in `is_greater` or the drain loop breaks this.
+        #[test]
+        fn merge_matches_independent_oracle(segments in segments_strategy()) {
+            let want = oracle(&segments);
+            let got = production_map(&segments);
+            prop_assert_eq!(got, want);
+        }
+
+        /// The merge output (as an order-independent map) is identical
+        /// whether the runs arrive in generated order or an arbitrary
+        /// shuffle. Winner selection must depend on the total order alone,
+        /// never on arrival/heap-insertion order.
+        #[test]
+        fn merge_is_order_independent(
+            segments in segments_strategy(),
+            seed in any::<u64>(),
+        ) {
+            let base = production_map(&segments);
+            let runs: Vec<FetchedSeriesSoa> = segments.into_iter().flatten().collect();
+            let shuffled = shuffle_runs(runs, seed);
+            // Re-group into a different segment boundary as well, so both the
+            // run order and the segment partition differ from the original.
+            let mid = shuffled.len() / 2;
+            let (a, b) = shuffled.split_at(mid);
+            let regrouped = vec![a.to_vec(), b.to_vec()];
+            prop_assert_eq!(production_map(&regrouped), base);
+        }
+
+        /// Each provenance field, in isolation, decides the winner. The
+        /// candidate that should win by the field carries the *minimum*
+        /// possible value bits (0.0) and the other the *maximum*
+        /// (`from_bits(u64::MAX)`), so if the merge ignored the deciding
+        /// field and fell through to the value tiebreak, the loser would
+        /// win. A winning value of bits 0 proves the field alone decided.
+        #[test]
+        fn each_provenance_field_independently_decides(
+            created in 0i64..5,
+            epoch in 0u64..5,
+            seq in 0u64..5,
+            ts in 0i64..10,
+        ) {
+            let win = 0.0f64; // to_bits() == 0, the minimum
+            let lose = f64::from_bits(u64::MAX); // to_bits() == u64::MAX, the maximum
+
+            // created_unix_ns decides (epoch, seq, index all tie).
+            let w = run(1, &[ts], &[win], created + 1, epoch, seq);
+            let l = run(1, &[ts], &[lose], created, epoch, seq);
+            prop_assert_eq!(winner_bits(vec![vec![l], vec![w]]), 0u64);
+
+            // writer_epoch decides (created ties).
+            let w = run(1, &[ts], &[win], created, epoch + 1, seq);
+            let l = run(1, &[ts], &[lose], created, epoch, seq);
+            prop_assert_eq!(winner_bits(vec![vec![l], vec![w]]), 0u64);
+
+            // writer_seq decides (created + epoch tie).
+            let w = run(1, &[ts], &[win], created, epoch, seq + 1);
+            let l = run(1, &[ts], &[lose], created, epoch, seq);
+            prop_assert_eq!(winner_bits(vec![vec![l], vec![w]]), 0u64);
+
+            // in_page_index decides (full provenance prefix ties): one run,
+            // two same-ts samples; the loser at index 0, the winner at
+            // index 1. Greater index wins regardless of value magnitude.
+            let r = run(1, &[ts, ts], &[lose, win], created, epoch, seq);
+            prop_assert_eq!(winner_bits(vec![vec![r]]), 0u64);
+        }
+
+        /// When the full provenance tuple ties, `value.to_bits()` (greatest)
+        /// breaks it. Every candidate shares one series, one ts, one
+        /// provenance prefix, and in_page_index 0 (each in its own
+        /// single-sample run), so the priority tuple is identical and only
+        /// the value bits distinguish them. Expected winner is the plain max
+        /// of the bit patterns.
+        #[test]
+        fn value_bits_break_full_provenance_tie(
+            created in 0i64..5,
+            epoch in 0u64..5,
+            seq in 0u64..5,
+            ts in 0i64..10,
+            values in prop::collection::vec(value_strategy(), 1..6),
+        ) {
+            let segments: Vec<Vec<FetchedSeriesSoa>> = values
+                .iter()
+                .map(|&v| vec![run(1, &[ts], &[v], created, epoch, seq)])
+                .collect();
+            let want = values.iter().map(|v| v.to_bits()).max().expect("non-empty");
+            prop_assert_eq!(winner_bits(segments), want);
+        }
+    }
 }
