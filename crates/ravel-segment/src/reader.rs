@@ -752,6 +752,16 @@ fn decompress_page_payload_into(
 ) -> Result<(), SegmentError> {
     match comp {
         page_comp::NONE => {
+            // A comp=NONE page's uncompressed size is its stored payload
+            // length. Enforce the same per-page cap the LZ4 branch applies to
+            // its declared prefix, before copying into `out`, so an oversized
+            // page is rejected rather than materialized.
+            if payload.len() as u64 > limits.max_page_uncompressed_bytes {
+                return Err(SegmentError::PageTooLarge {
+                    len: payload.len() as u64,
+                    cap: limits.max_page_uncompressed_bytes,
+                });
+            }
             out.clear();
             out.extend_from_slice(payload);
             Ok(())
