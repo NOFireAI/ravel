@@ -59,6 +59,11 @@ name = "gorilla_vs_raw"
 path = "tests/gorilla_vs_raw.rs"
 bench = false
 
+[[test]]
+name = "alignment_measurement"
+path = "tests/alignment_measurement.rs"
+bench = false
+
 [[bench]]
 name = "segment_encode"
 harness = false
