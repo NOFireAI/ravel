@@ -393,6 +393,179 @@ fn max_schemas_per_stream_is_enforced() {
     assert!(!state.is_poisoned());
 }
 
+// Per-stream dictionary-bytes budget cap (`max_stream_dictionary_bytes`,
+// docs/otap-ingest.md Safety, spec section 19: "max schemas and max
+// dictionary memory per stream"). Enforced in `decode_payload` at
+// stream.rs:382-394 by summing the `body_len` of every `DictionaryBatch` IPC
+// message and rejecting once the running per-stream total would exceed the
+// cap; the accumulation itself is stream.rs:405. This is issue #74 (a9-F02):
+// the sibling caps (decompressed-size, row-count, schema-count) each have a
+// test above, this one had none.
+//
+// The exact IPC framing size of a DictionaryBatch body is opaque (arrow-ipc
+// internals, out of scope to read), so the boundary caps below are measured,
+// not hardcoded: on a fresh stream `dictionary_bytes_used` starts at 0 and
+// the check is `used + bytes > limit`, so the smallest cap that admits a
+// fixed batch sequence equals that sequence's total dictionary bytes. The
+// encoder's root payload carries a `Dictionary<UInt8, Utf8>` name column, so
+// a batch with one metric emits exactly one DictionaryBatch; distinct names
+// across batches force a fresh DictionaryBatch each time (a changed
+// dictionary is re-sent), which is what makes the total accumulate.
+
+/// Smallest `max_stream_dictionary_bytes` that admits the given sequence of
+/// one-metric batches (one distinct metric name per batch) decoded on a
+/// single fresh stream. Equal to the cumulative DictionaryBatch body bytes
+/// those batches produce. Binary search, since the framing size is opaque.
+fn min_dict_cap_admitting(names: &[&str]) -> u64 {
+    let admits = |cap: u64| {
+        let mut encoder = MetricsStreamEncoder::new("dict-probe").expect("encoder");
+        let mut state = StreamState::new(StreamConfig {
+            max_stream_dictionary_bytes: cap,
+            ..StreamConfig::default()
+        });
+        for (i, name) in names.iter().enumerate() {
+            let batch = encoder
+                .encode_batch(i as i64, &[metric(name, vec![])])
+                .expect("encode");
+            if state.decode(batch).is_err() {
+                return false;
+            }
+        }
+        true
+    };
+    // `admits` is monotonic in `cap` (a larger budget never rejects a
+    // sequence a smaller one accepted). Anchor: `admits(0)` is false because
+    // any DictionaryBatch has a non-zero body.
+    assert!(!admits(0), "a dictionary batch must consume some bytes");
+    let mut hi = 1u64;
+    while !admits(hi) {
+        hi = hi
+            .checked_mul(2)
+            .expect("dictionary cap search overflowed u64");
+    }
+    let mut lo = 0u64;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if admits(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
+/// a9-F02 boundary: the cap fires exactly at the documented threshold
+/// (`used + bytes > limit`). A single batch is admitted when the cap equals
+/// its dictionary bytes, and rejected when the cap is one byte lower. This is
+/// deliverable 2 (a just-under-the-cap case that succeeds) paired with the
+/// smallest exceedance that trips it, pinning the boundary rather than an
+/// arbitrary tiny cap.
+#[test]
+fn dictionary_budget_cap_fires_at_exact_boundary() {
+    let one_batch_bytes = min_dict_cap_admitting(&["cpu.load.aaa"]);
+    assert!(
+        one_batch_bytes >= 1,
+        "sanity: one batch has dictionary bytes"
+    );
+
+    // Just under: cap == the batch's dictionary bytes. `used(0) + bytes` is
+    // not `> limit`, so the batch is admitted.
+    let mut encoder = MetricsStreamEncoder::new("dict-at-cap").expect("encoder");
+    let mut state = StreamState::new(StreamConfig {
+        max_stream_dictionary_bytes: one_batch_bytes,
+        ..StreamConfig::default()
+    });
+    let batch = encoder
+        .encode_batch(1, &[metric("cpu.load.aaa", vec![])])
+        .expect("encode");
+    state
+        .decode(batch)
+        .expect("batch at the exact cap must be admitted");
+    assert!(!state.is_poisoned());
+
+    // One byte over the boundary: the same batch is rejected. Uses a fresh
+    // encoder/stream so the dictionary bytes match the measured value.
+    let mut encoder = MetricsStreamEncoder::new("dict-over-cap").expect("encoder");
+    let mut state = StreamState::new(StreamConfig {
+        max_stream_dictionary_bytes: one_batch_bytes - 1,
+        ..StreamConfig::default()
+    });
+    let batch = encoder
+        .encode_batch(1, &[metric("cpu.load.aaa", vec![])])
+        .expect("encode");
+    let err = state
+        .decode(batch)
+        .expect_err("one byte below the batch's dictionary bytes must reject");
+    match err {
+        DecodeError::Batch(BatchError::DictionaryBudgetExceeded { limit }) => {
+            assert_eq!(limit, one_batch_bytes - 1);
+        }
+        other => panic!("expected DictionaryBudgetExceeded, got {other:?}"),
+    }
+    // A cap nack, like the sibling caps, must not poison the stream.
+    assert!(!state.is_poisoned());
+}
+
+/// a9-F02 accumulation: the cap is cumulative across batches, not per-batch.
+/// This is deliverable 1 -- the budget trips on a later batch once the
+/// running total crosses the cap, before dictionary memory grows unbounded.
+/// The cap is set to exactly the dictionary bytes of the first two batches,
+/// so batch 1 and batch 2 are admitted (batch 2 lands the running total right
+/// on the cap) and batch 3, adding a fresh dictionary, is rejected. A
+/// per-batch check would have admitted batch 3, so this pins the cumulative
+/// semantics.
+#[test]
+fn dictionary_budget_cap_is_cumulative_across_batches() {
+    let names = ["mem.used.aaa", "mem.used.bbb", "mem.used.ccc"];
+    // Cap = the two-batch total. Under a per-batch interpretation each batch
+    // is far under this, so a broken (per-batch) check would never trip.
+    let two_batch_bytes = min_dict_cap_admitting(&names[..2]);
+    // A third batch must actually add dictionary bytes, or "cumulative" is
+    // vacuous: three batches need a strictly larger budget than two.
+    let three_batch_bytes = min_dict_cap_admitting(&names);
+    assert!(
+        three_batch_bytes > two_batch_bytes,
+        "each distinct-name batch must contribute dictionary bytes"
+    );
+
+    let mut encoder = MetricsStreamEncoder::new("dict-cumulative").expect("encoder");
+    let mut state = StreamState::new(StreamConfig {
+        max_stream_dictionary_bytes: two_batch_bytes,
+        ..StreamConfig::default()
+    });
+
+    state
+        .decode(
+            encoder
+                .encode_batch(1, &[metric(names[0], vec![])])
+                .expect("encode batch 1"),
+        )
+        .expect("batch 1 is under the cumulative cap");
+    state
+        .decode(
+            encoder
+                .encode_batch(2, &[metric(names[1], vec![])])
+                .expect("encode batch 2"),
+        )
+        .expect("batch 2 lands the running total exactly on the cap");
+
+    let err = state
+        .decode(
+            encoder
+                .encode_batch(3, &[metric(names[2], vec![])])
+                .expect("encode batch 3"),
+        )
+        .expect_err("batch 3 pushes the cumulative total past the cap");
+    match err {
+        DecodeError::Batch(BatchError::DictionaryBudgetExceeded { limit }) => {
+            assert_eq!(limit, two_batch_bytes);
+        }
+        other => panic!("expected DictionaryBudgetExceeded, got {other:?}"),
+    }
+    assert!(!state.is_poisoned());
+}
+
 /// Regression coverage for issue #18 (A2): prost `bytes::Bytes` decode,
 /// aligned-buffer decompression, and feeding `StreamDecoder` the shared
 /// buffer must not change one decoded bit versus what was encoded. There is
