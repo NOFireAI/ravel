@@ -237,27 +237,60 @@ async fn resolve_matched_series(
     let deadline = parse_deadline(params, state.engine.config().deadline)?;
     let selectors = params.all("match[]");
 
+    // The wall deadline is a per-query budget (docs/query-engine.md
+    // "Budgets"), and one metadata request is one query. Convert the
+    // duration into a single absolute instant computed once here, then hand
+    // each resolve_series call only the time still remaining. Without this,
+    // each match[] selector would be granted the full `deadline` afresh, so
+    // N selectors would get N times the documented budget with no aggregate
+    // cap (finding a7-F03). The engine still enforces the timeout per call;
+    // sharing the remaining budget makes the whole request share one wall
+    // bound.
+    let request_deadline = tokio::time::Instant::now() + deadline;
+
     if selectors.is_empty() {
+        let remaining = remaining_budget(request_deadline, deadline)?;
         let series = state
             .engine
-            .resolve_series(tenant_hash, &[], window, &min_tokens, now, deadline)
+            .resolve_series(tenant_hash, &[], window, &min_tokens, now, remaining)
             .await?;
         return Ok(series);
     }
 
     // Deliberate deviation: each match[] selector resolves its own
     // snapshot independently, rather than one shared snapshot for the
-    // whole request (docs in the task's pre-approved deviations list).
+    // whole request (docs in the task's pre-approved deviations list). The
+    // shared wall budget above is orthogonal to that: snapshots stay
+    // per-selector, but all selectors draw down one deadline.
     let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();
     for selector in selectors {
         let matchers: Vec<LabelMatcher> = parse_match_selector(selector)?;
+        let remaining = remaining_budget(request_deadline, deadline)?;
         let series = state
             .engine
-            .resolve_series(tenant_hash, &matchers, window, &min_tokens, now, deadline)
+            .resolve_series(tenant_hash, &matchers, window, &min_tokens, now, remaining)
             .await?;
         for (id, labels) in series {
             by_id.entry(id).or_insert(labels);
         }
     }
     Ok(by_id.into_iter().collect())
+}
+
+/// Time left in the shared request wall budget, or a `DeadlineExceeded`
+/// error once it is spent. `configured` is the whole-request budget and is
+/// reported in the error so the client sees the query's deadline, not the
+/// residual slice handed to the last selector.
+fn remaining_budget(
+    request_deadline: tokio::time::Instant,
+    configured: std::time::Duration,
+) -> Result<std::time::Duration, ApiError> {
+    let remaining = request_deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(crate::QueryError::DeadlineExceeded {
+            deadline: configured,
+        }
+        .into());
+    }
+    Ok(remaining)
 }
