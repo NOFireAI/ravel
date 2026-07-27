@@ -230,7 +230,7 @@ impl PayloadStream {
         Ok(Some(ArrowPayload {
             schema_id: self.schema_id.clone(),
             r#type: self.payload_type as i32,
-            record: compressed,
+            record: compressed.into(),
         }))
     }
 }
