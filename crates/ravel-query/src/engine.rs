@@ -595,6 +595,18 @@ fn merge_series_runs(
             }
             cursors[idx] = pos;
             if let Some(&next_ts) = run.timestamps.get(pos) {
+                // A run is a decoded RSEG page and must be ascending
+                // (docs/segment-format.md "Sample order within a page"). The
+                // drain above stops only once `next_ts != ts`; if it fell
+                // below `ts` the run itself is out of order, which would
+                // otherwise re-enter the heap as a fresh, already-visited
+                // minimum and double-emit or misorder output.
+                if next_ts < ts {
+                    return Err(QueryError::NonMonotonicSamples {
+                        prev: ts,
+                        next: next_ts,
+                    });
+                }
                 heap.push(Reverse((next_ts, idx)));
             }
         }
@@ -856,6 +868,26 @@ mod merge_tests {
                 assert_eq!(max, 1);
             }
             other => panic!("expected TooManySeries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_ascending_run_is_a_typed_error_not_wrong_data() {
+        // Run A itself is not ascending (ts=[5,3]), violating the RSEG page
+        // order precondition. Without a guard this reintroduces ts=5's
+        // remainder as a fresh heap minimum after ts=3 has already been
+        // processed, silently double-emitting and misordering output
+        // instead of surfacing the corruption.
+        let a = run(1, &[5, 3], &[50.0, 30.0], 100, 0, 0);
+        let b = run(1, &[3], &[99.0], 1, 0, 0);
+        let err = merge_soa_runs(vec![vec![a], vec![b]], 10_000, usize::MAX)
+            .expect_err("non-ascending run must error, not emit reordered data");
+        match err {
+            QueryError::NonMonotonicSamples { prev, next } => {
+                assert_eq!(prev, 5);
+                assert_eq!(next, 3);
+            }
+            other => panic!("expected NonMonotonicSamples, got {other:?}"),
         }
     }
 
