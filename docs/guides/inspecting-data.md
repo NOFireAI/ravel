@@ -63,6 +63,7 @@ cargo run -p ravel-cli -- segment inspect \
 ```
 total_size: 8421
 trailer_offset: 8405
+version: 1
 footer_offset: 8112
 tenant_hash: 3f2a...
 shard: 0
@@ -90,6 +91,9 @@ Field by field:
   the very end gives the footer's length and checksum, so a reader only
   needs one suffix GET to find and validate the footer before fetching
   anything else.
+- `version`: the trailer format version, `1` here. `ravel-cli` reads both
+  RSEG v1 and v2 objects (ADR-0014); see "`segment inspect`: RSEG v2
+  objects" below for what changes when this reads `2`.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
   same identity components embedded in the object's key and in its commit
   token, which is how you confirm a segment and a commit token/record
@@ -113,6 +117,81 @@ Field by field:
   `LABEL_DICT` + `SERIES_TABLE`, not just trusting the footer's claimed
   count. Matching `series_count (footer)` means the segment is internally
   consistent.
+
+## `segment inspect`: RSEG v2 objects
+
+`segment inspect` reads a v2 object (trailer `version = 2`, ADR-0014,
+docs/segment-format.md "RSEG v2 amendment") exactly the same way, over the
+same command:
+
+```sh
+cargo run -p ravel-cli -- segment inspect \
+  "t/3f2a.../m/l0/0000/7c1e....rseg"
+```
+
+```
+total_size: 837
+trailer_offset: 821
+version: 2
+footer_offset: 656
+tenant_hash: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+shard: 11
+writer_id: golden-v2-writer
+writer_epoch: 5
+writer_seq: 200
+min_event_ts_ns: -200
+max_event_ts_ns: 1900
+min_ingest_ts_ns: -2000
+max_ingest_ts_ns: 9000
+sample_count: 67
+series_count (footer): 4
+sections:
+  kind=1 name=LABEL_DICT offset=0 len=103 uncompressed_len=102 comp=2
+  kind=5 name=SERIES_IDS offset=103 len=68 uncompressed_len=68 comp=0
+  kind=6 name=SERIES_META offset=171 len=85 uncompressed_len=76 comp=2
+  kind=3 name=TS_PAGES offset=256 len=115 uncompressed_len=115 comp=0
+  kind=4 name=VAL_PAGES offset=376 len=280 uncompressed_len=280 comp=0
+schema_count (derived): 3
+  schema[0]: __name__,instance,method
+  schema[1]: __name__
+  schema[2]: __name__,instance,region
+series_count (decoded): 4
+series:
+  series_id=11111111111111111111111111111111 labels=__name__=http_requests_total,instance=a,method=GET sample_count=40 min_ts_ns=1000 max_ts_ns=1663 ts_range=[256, 303) val_range=[376, 442)
+  series_id=22222222222222222222222222222222 labels=__name__=http_requests_total,instance=b,method=POST sample_count=6 min_ts_ns=-200 max_ts_ns=900 ts_range=[303, 319) val_range=[442, 469)
+  series_id=33333333333333333333333333333333 labels=__name__=cpu_seconds sample_count=1 min_ts_ns=42 max_ts_ns=42 ts_range=[319, 326) val_range=[474, 488) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=5)
+  series_id=44444444444444444444444444444444 labels=__name__=memory_bytes,instance=a,region=us-east sample_count=20 min_ts_ns=0 max_ts_ns=1900 ts_range=[326, 371) val_range=[490, 656) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=2)
+```
+
+What's different from v1, field by field:
+
+- `sections`: v2 objects carry `LABEL_DICT`, `SERIES_IDS`, and
+  `SERIES_META` in place of v1's `SERIES_TABLE` (`kind=2`, never emitted by
+  v2); `TS_PAGES`/`VAL_PAGES` are unchanged. Each line also carries a
+  resolved `name=` for its `kind`, which v1's `sections` output doesn't
+  print (v1's `sections` block is intentionally unchanged by v2 support;
+  see the v1 example above).
+- `schema_count (derived)` and the `schema[N]:` lines: SERIES_META groups
+  series by their distinct label-*name* sets (a "schema"); each line lists
+  that schema's label names, sorted, resolved through `LABEL_DICT`. This
+  count is derived by `ravel-cli` from the decoded per-series label sets,
+  not read directly from SERIES_META's on-disk schema dictionary (that
+  dictionary isn't part of `ravel-segment`'s public decode API) -- for any
+  segment this system's own writer produced, that's the same number,
+  since every schema it writes is referenced by at least one series.
+- `series`: one line per series, the v2 counterpart of what v1's
+  `series_count (decoded)` count represents without enumerating -- series
+  id, its resolved labels, sample count, event-timestamp bounds, and the
+  **absolute** byte ranges of its TS/VAL pages (`ts_range`/`val_range`,
+  half-open `[start, end)`), reconstructed from SERIES_META's
+  gap/length columns the same way the reader itself does before fetching
+  those bytes. A trailing `ALIGNMENT_GAP(ts_page_gap=…, val_page_gap=…)`
+  appears only when either gap is nonzero: v2 pads `VAL_PAGES` so every
+  raw-f64-encoded page starts 8-byte aligned (docs/segment-format.md
+  "VAL_RAW_F64 page alignment, v2"), and this is where that padding shows
+  up. Series `0x33...` and `0x44...` above both needed `val_page_gap`
+  padding; neither needed `ts_page_gap` padding (TS pages are never
+  aligned).
 
 ## `commit decode`: what a commit record says
 
