@@ -21,6 +21,9 @@ pub struct IngestMetrics {
     buffered_points_total: AtomicU64,
     acks_ok: AtomicU64,
     acks_err: AtomicU64,
+    /// Batches rejected because two points shared a `series_id` under
+    /// distinct canonical label sets (ADR-0005 fail-loud collision check).
+    series_id_collisions: AtomicU64,
 }
 
 /// Point-in-time copy of [`IngestMetrics`] for scraping.
@@ -35,6 +38,7 @@ pub struct IngestMetricsSnapshot {
     pub buffered_points_total: u64,
     pub acks_ok: u64,
     pub acks_err: u64,
+    pub series_id_collisions: u64,
 }
 
 impl IngestMetrics {
@@ -67,6 +71,10 @@ impl IngestMetrics {
         counter.fetch_add(count as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_series_id_collision(&self) {
+        self.series_id_collisions.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> IngestMetricsSnapshot {
         IngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -78,6 +86,7 @@ impl IngestMetrics {
             buffered_points_total: self.buffered_points_total.load(Ordering::Relaxed),
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
+            series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
         }
     }
 }
@@ -98,6 +107,7 @@ mod tests {
         metrics.record_buffered(100, 3);
         metrics.record_acks(2, true);
         metrics.record_acks(1, false);
+        metrics.record_series_id_collision();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.flushes_by_size, 1);
@@ -109,5 +119,6 @@ mod tests {
         assert_eq!(snap.buffered_points_total, 3);
         assert_eq!(snap.acks_ok, 2);
         assert_eq!(snap.acks_err, 1);
+        assert_eq!(snap.series_id_collisions, 1);
     }
 }
