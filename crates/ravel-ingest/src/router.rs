@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ravel_object_store::ObjectStoreBackend;
@@ -37,6 +38,11 @@ pub struct WriteReceipt {
 struct ShardHandle {
     tx: mpsc::Sender<ShardMsg>,
     task: JoinHandle<()>,
+    /// Set once the router first observes this shard's channel closed (send
+    /// half or a strict-mode ack failing because the actor task is gone).
+    /// The actor is never restarted, so this only ever flips false to true;
+    /// it dedups the `shard_deaths` counter to one increment per shard.
+    dead: AtomicBool,
 }
 
 /// Owns `shard_count` shard actor tasks and routes writes to them by
@@ -77,7 +83,11 @@ impl IngestRouter {
                     rx,
                 );
                 let task = tokio::spawn(actor.run());
-                ShardHandle { tx, task }
+                ShardHandle {
+                    tx,
+                    task,
+                    dead: AtomicBool::new(false),
+                }
             })
             .collect();
 
@@ -120,13 +130,18 @@ impl IngestRouter {
         let mut shard_ids: Vec<u32> = by_shard.keys().copied().collect();
         shard_ids.sort_unstable();
 
-        let mut acks = Vec::with_capacity(shard_ids.len());
+        // Parallel to `ack_rxs`: the shard each receiver belongs to, so a
+        // closed ack channel can be attributed to the right shard and counted
+        // as that shard's death.
+        let mut ack_shards = Vec::with_capacity(shard_ids.len());
+        let mut ack_rxs = Vec::with_capacity(shard_ids.len());
         for shard in shard_ids {
             let points = by_shard.remove(&shard).unwrap_or_default();
             let ack = match mode {
                 WriteMode::Strict => {
                     let (tx, rx) = oneshot::channel();
-                    acks.push(rx);
+                    ack_shards.push(shard);
+                    ack_rxs.push(rx);
                     Some(tx)
                 }
                 WriteMode::Buffered => None,
@@ -136,26 +151,51 @@ impl IngestRouter {
                 points,
                 ack,
             };
-            self.shards[shard as usize]
-                .tx
-                .send(msg)
-                .await
-                .map_err(|_| WriteError::ShardUnavailable)?;
+            if self.shards[shard as usize].tx.send(msg).await.is_err() {
+                // The actor task is gone (it never closes its own receiver
+                // while alive), so this shard is dead. Count it once and
+                // surface the typed error rather than acking as if the points
+                // landed (a8-F03).
+                self.mark_shard_dead(shard);
+                return Err(WriteError::ShardUnavailable);
+            }
         }
 
         if mode == WriteMode::Buffered {
             return Ok(WriteReceipt::default());
         }
 
-        let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(acks))
+        // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
+        let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(ack_rxs))
             .await
             .map_err(|_| WriteError::AckTimeout)?;
         let mut tokens = Vec::with_capacity(joined.len());
-        for result in joined {
-            let token = result.map_err(|_| WriteError::ShardUnavailable)??;
-            tokens.push(token);
+        for (shard, result) in ack_shards.into_iter().zip(joined) {
+            // A `RecvError` here means the actor dropped the ack sender without
+            // sending: it panicked mid-flush (a healthy actor always acks, even
+            // on abandonment). Count the death and report it as unavailable.
+            let inner = match result {
+                Ok(inner) => inner,
+                Err(_) => {
+                    self.mark_shard_dead(shard);
+                    return Err(WriteError::ShardUnavailable);
+                }
+            };
+            tokens.push(inner?);
         }
         Ok(WriteReceipt { tokens })
+    }
+
+    /// Records the first observation of a shard actor's death, deduped so a
+    /// permanently dead shard is counted once no matter how many later writes
+    /// route to it (docs/ingest.md "Metrics (self-observability)", a8-F03).
+    fn mark_shard_dead(&self, shard: u32) {
+        if !self.shards[shard as usize]
+            .dead
+            .swap(true, Ordering::Relaxed)
+        {
+            self.metrics.record_shard_death();
+        }
     }
 
     /// Forces every shard to flush all buffered tenants now, for tests and
