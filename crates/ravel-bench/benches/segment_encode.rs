@@ -10,7 +10,7 @@
 //! v2 runnable; it does not measure or claim any v1/v2 delta itself.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};
 use ravel_bench::segment_support::{bench_bounds, bench_identity};
 use ravel_segment::{SegmentWriter, SeriesInput};
@@ -57,18 +57,30 @@ fn bench_segment_encode(c: &mut Criterion) {
         let inputs = series_inputs(series_count);
         let actual_samples: usize = inputs.iter().map(|s| s.samples.len()).sum();
         group.throughput(Throughput::Elements(actual_samples as u64));
+        // The fixture clone is setup, not part of encode: `SegmentWriter::write`
+        // consumes its input, so each iteration needs a fresh copy, but the deep
+        // clone of every LabelSet and Vec<Sample> must not be charged to encode
+        // time (a12-F01). iter_batched runs the clone in the untimed setup
+        // closure and times only the write, matching the pattern in
+        // src/bin/segment_alloc_profile.rs.
         group.bench_function(format!("{series_count}_series_v1"), |b| {
-            b.iter(|| {
-                let series = clone_inputs(&inputs);
-                SegmentWriter::write(series, bench_identity(), bench_bounds()).expect("encode")
-            });
+            b.iter_batched(
+                || clone_inputs(&inputs),
+                |series| {
+                    SegmentWriter::write(series, bench_identity(), bench_bounds()).expect("encode")
+                },
+                BatchSize::SmallInput,
+            );
         });
         group.bench_function(format!("{series_count}_series_v2"), |b| {
-            b.iter(|| {
-                let series = clone_inputs(&inputs);
-                SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
-                    .expect("encode v2")
-            });
+            b.iter_batched(
+                || clone_inputs(&inputs),
+                |series| {
+                    SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
+                        .expect("encode v2")
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
