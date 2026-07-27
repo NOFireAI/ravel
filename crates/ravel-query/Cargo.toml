@@ -11,6 +11,11 @@ ravel-segment = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+promql-parser = { workspace = true }
+humantime = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -19,8 +24,11 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 ravel-test-util = { workspace = true }
+ravel-commit = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true
