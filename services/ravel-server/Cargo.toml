@@ -28,6 +28,7 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["json", "query"] }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true
