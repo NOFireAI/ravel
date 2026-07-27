@@ -40,9 +40,12 @@ ravel-types
   <- ravel-commit       (types, proto, object-store)
   <- ravel-catalog      (commit)
   <- ravel-otlp         (types; opentelemetry-proto)
+  <- ravel-otap         (types, segment; arrow, isolated to this crate)
   <- ravel-ingest       (segment, commit, object-store, otlp)
   <- ravel-promql       (types)
   <- ravel-query        (catalog, segment, promql)
+  <- ravel-sql          (query, catalog, types; arrow + datafusion, in
+                          progress -- see below)
   <- services/ravel-server, services/ravel-cli
 ravel-test-util (types, object-store) used by all dev-deps
 ```
@@ -53,3 +56,21 @@ can deploy them separately.
 
 Signals other than metrics, compaction, catalog snapshots, Remote Write,
 RavelQL, Sigma/OCSF: later phases. See the spec docs as they land.
+
+## SQL query path (in progress)
+
+`ravel-sql` (ADR-0013, docs/arrow-datafusion-plan.md) adds a second query
+path alongside PromQL: `RsegScanExec -> SortPreservingMergeExec ->
+RsegDedupExec`, a DataFusion physical pipeline over the same segments
+PromQL reads, deduplicating cross-segment duplicate samples with the exact
+same total order as `is_greater` in `ravel-query` (bit-for-bit, including
+the `value.to_bits()` tiebreak). Arrow and DataFusion stay isolated to this
+crate; PromQL numerics never lower to SQL, and vice versa.
+
+Status: the scan/merge/dedup pipeline and predicate/projection pushdown
+under a pruning-soundness invariant (pruning may only ever widen the read
+set, never narrow it) are implemented and tested against an independent
+oracle. Not yet built: the HTTP endpoint (`POST /api/v1/sql`, feature
+`sql`) and Flight SQL (feature `flight-sql`) -- both later tickets in the
+same epic, gated behind cargo features so the default build stays free of
+Arrow and DataFusion outside `ravel-otap`.
