@@ -4,6 +4,9 @@
 //! definitions live in proto/otel-arrow (pinned otel-arrow v0.50.0); the
 //! decoder is written against docs/otap-spec.md and data_model.md there.
 
+pub mod encode;
+pub mod stream;
+
 pub mod proto {
     pub mod experimental {
         pub mod arrow {
