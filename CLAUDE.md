@@ -14,6 +14,16 @@ executors.
   a crate outside your task scope, report it in your final message. Do not
   silently fix or work around it.
 
+## Workspace isolation
+
+- Always work in a dedicated git worktree, never directly on the primary
+  checkout. Create one (`git worktree add`) before making any change, and
+  remove it once your work is merged. This applies to every agent,
+  including a local subagent dispatched into this same repo: a subagent
+  editing files directly in the dispatching session's working tree, or
+  two subagents sharing one tree, corrupts both in-flight edits and any
+  concurrent `cargo` build cache. One worktree per unit of work, always.
+
 ## Invariants (violating these is never a valid trade-off)
 
 - Object storage is the source of truth. No durability may depend on local
