@@ -3549,6 +3549,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-otlp",
  "ravel-proto",
+ "ravel-query",
  "ravel-segment",
  "ravel-test-util",
  "ravel-types",

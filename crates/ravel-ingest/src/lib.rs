@@ -13,7 +13,7 @@ mod router;
 mod shard;
 
 pub use clock::{Clock, SystemClock};
-pub use config::IngestConfig;
+pub use config::{IngestConfig, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2};
 pub use error::WriteError;
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};

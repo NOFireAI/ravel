@@ -8,15 +8,24 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ravel_ingest::Clock;
+use ravel_catalog::{Catalog, CatalogConfig};
+use ravel_commit::keys;
+use ravel_commit::publish::{self, RetryPolicy};
+use ravel_commit::record::{self, NewCommitRecord};
+use ravel_ingest::{Clock, SEGMENT_FORMAT_V2};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_otlp::NormalizedPoint;
-use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+use ravel_query::{EngineConfig, QueryEngine};
+use ravel_segment::{IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_types::{
+    CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
+};
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 /// Clock whose reading is set explicitly by the test, so flush identity
 /// (ingest_hour_bucket, created_unix_ns) is deterministic and can be advanced
@@ -81,6 +90,144 @@ pub fn make_point(
         sample: Sample { ts_ns, value },
         is_monotonic_sum: false,
     }
+}
+
+/// Builds one `SeriesInput` for hand-assembled RSEG segments (tests that
+/// bypass `IngestRouter` to control commit identity, RSEG version, or exact
+/// sample timestamps directly).
+pub fn series_input(
+    tenant_id: &TenantId,
+    metric: &str,
+    extra: &[(&str, &str)],
+    samples: &[(i64, f64)],
+) -> SeriesInput {
+    let mut pairs = vec![(METRIC_NAME_LABEL, metric)];
+    pairs.extend_from_slice(extra);
+    let label_set = build_labels(&pairs);
+    let series_id = SeriesId::compute(tenant_id, metric, &label_set).expect("series id");
+    SeriesInput {
+        series_id,
+        labels: label_set,
+        samples: samples
+            .iter()
+            .map(|(ts_ns, value)| Sample {
+                ts_ns: *ts_ns,
+                value: *value,
+            })
+            .collect(),
+    }
+}
+
+/// Writes a real RSEG segment (v1 via `SegmentWriter::write`, v2 via
+/// `SegmentWriter::write_v2` depending on `segment_format_version`) and
+/// publishes its commit record directly, bypassing `IngestRouter`. Used by
+/// tests that need to pin exact commit identity (writer_seq,
+/// ingest_hour_bucket, created_unix_ns) or mix RSEG versions within one
+/// catalog snapshot, which a single `IngestRouter` cannot produce in one
+/// flush.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_segment(
+    store: &dyn ObjectStoreBackend,
+    segment_format_version: u16,
+    tenant_hash: TenantHash,
+    shard: u32,
+    writer_id: Uuid,
+    writer_epoch: u64,
+    writer_seq: u64,
+    ingest_hour_bucket: u32,
+    created_unix_ns: i64,
+    series: Vec<SeriesInput>,
+) -> (CommitToken, String) {
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard,
+        writer_id: writer_id.to_string(),
+        writer_epoch,
+        writer_seq,
+    };
+    let bounds = IngestBounds {
+        min_ingest_ts_ns: 0,
+        max_ingest_ts_ns: 0,
+    };
+    let written = if segment_format_version == SEGMENT_FORMAT_V2 {
+        SegmentWriter::write_v2(series, identity, bounds).expect("write v2 segment")
+    } else {
+        SegmentWriter::write(series, identity, bounds).expect("write v1 segment")
+    };
+
+    let new_record = NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard,
+        writer_id,
+        writer_epoch,
+        writer_seq,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: u32::from(segment_format_version),
+        created_unix_ns,
+        ingest_hour_bucket,
+    };
+    let rec = record::build(new_record).expect("valid commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(store, &data_key, written.bytes)
+        .await
+        .expect("put data object");
+    let token = publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+    (token, data_key)
+}
+
+pub fn catalog(store: Arc<dyn ObjectStoreBackend>, shard_count: u32) -> Catalog {
+    Catalog::new(
+        store,
+        CatalogConfig {
+            shard_count,
+            ..CatalogConfig::default()
+        },
+    )
+    .expect("catalog config valid")
+}
+
+pub fn engine(store: Arc<dyn ObjectStoreBackend>, catalog: Catalog) -> QueryEngine {
+    QueryEngine::new(Arc::new(catalog), store, EngineConfig::default())
+}
+
+/// Fetches the commit record a token addresses, decodes it, then fetches
+/// and opens the exact data object the record's own `object_key` names, and
+/// returns `(commit record's segment_format_version, object's own trailer
+/// version)`. Chains commit record -> `object_key` -> data object rather
+/// than guessing the data key from a prefix listing, so the two returned
+/// values are guaranteed to describe the very same object, not merely "the
+/// only object present."
+pub async fn commit_and_trailer_versions(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    token: &CommitToken,
+) -> (u32, u16) {
+    let commit_key = keys::commit_key_for_token(tenant_hash, signal, token).expect("commit key");
+    let commit_bytes = store
+        .get(&commit_key, GetRange::Full)
+        .await
+        .expect("get commit record")
+        .data;
+    let record = record::decode(&commit_bytes).expect("decode commit record");
+    let data_bytes = store
+        .get(&record.object_key, GetRange::Full)
+        .await
+        .expect("get data object")
+        .data;
+    let loc =
+        ravel_segment::open_from_full(&data_bytes, ReaderLimits::default()).expect("open segment");
+    (record.segment_format_version, loc.version)
 }
 
 /// Wraps a `MemoryStore` and stalls the `stall_on`-th `put` whose key

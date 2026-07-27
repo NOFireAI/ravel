@@ -2,6 +2,12 @@
 //! 1: "RSEG metric segment encode: samples/s, bytes/sample, by cardinality
 //! (100 / 10k / 1M series)"). 1M series is scaled down to 200k for `--quick`
 //! CI runtime; pass a higher `RAVEL_BENCH_MAX_SERIES` to widen the sweep.
+//!
+//! Covers both RSEG v1 (`SegmentWriter::write`) and v2
+//! (`SegmentWriter::write_v2`, ADR-0014) as separate bench ids within the
+//! same group (`{series_count}_series_v1` / `_v2`) so a later comparison
+//! run has matched, directly comparable numbers for both. This crate makes
+//! v2 runnable; it does not measure or claim any v1/v2 delta itself.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -51,10 +57,17 @@ fn bench_segment_encode(c: &mut Criterion) {
         let inputs = series_inputs(series_count);
         let actual_samples: usize = inputs.iter().map(|s| s.samples.len()).sum();
         group.throughput(Throughput::Elements(actual_samples as u64));
-        group.bench_function(format!("{series_count}_series"), |b| {
+        group.bench_function(format!("{series_count}_series_v1"), |b| {
             b.iter(|| {
                 let series = clone_inputs(&inputs);
                 SegmentWriter::write(series, bench_identity(), bench_bounds()).expect("encode")
+            });
+        });
+        group.bench_function(format!("{series_count}_series_v2"), |b| {
+            b.iter(|| {
+                let series = clone_inputs(&inputs);
+                SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
+                    .expect("encode v2")
             });
         });
     }
