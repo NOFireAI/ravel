@@ -21,7 +21,7 @@ use tokio::time::Duration;
 use uuid::Uuid;
 
 use crate::clock::Clock;
-use crate::config::IngestConfig;
+use crate::config::{IngestConfig, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2};
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
 
@@ -280,7 +280,21 @@ impl ShardActor {
             max_ingest_ts_ns,
         };
 
-        let written = match SegmentWriter::write(series_inputs, identity, ingest_bounds) {
+        // Resolved exactly once and reused for both the writer branch below
+        // and the commit record's `segment_format_version` stamp further
+        // down: an unrecognized config value normalizes to
+        // `SEGMENT_FORMAT_V1` here, at the single read site, so the writer
+        // call and the stamp can never disagree about which version this
+        // flush actually produced (docs/rseg-v2-plan.md P6).
+        let segment_version = match self.config.segment_format_version {
+            SEGMENT_FORMAT_V2 => SEGMENT_FORMAT_V2,
+            _ => SEGMENT_FORMAT_V1,
+        };
+        let written = match segment_version {
+            SEGMENT_FORMAT_V2 => SegmentWriter::write_v2(series_inputs, identity, ingest_bounds),
+            _ => SegmentWriter::write(series_inputs, identity, ingest_bounds),
+        };
+        let written = match written {
             Ok(w) => w,
             Err(e) => {
                 self.metrics.record_abandoned();
@@ -335,7 +349,7 @@ impl ShardActor {
             max_event_ts_ns: written.summary.max_event_ts_ns,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
-            segment_format_version: 1,
+            segment_format_version: u32::from(segment_version),
             created_unix_ns: flush_open_ns,
             ingest_hour_bucket,
         }) {

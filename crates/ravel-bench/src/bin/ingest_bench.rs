@@ -12,7 +12,9 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use ravel_bench::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
 use ravel_catalog::{Catalog, CatalogConfig};
-use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{
+    Clock, IngestConfig, IngestRouter, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2, SystemClock, WriteMode,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_object_store::{ObjectStoreBackend, list_all};
@@ -32,6 +34,26 @@ enum StoreKind {
     S3,
 }
 
+/// Which RSEG trailer version the ingest router writes for this run
+/// (`IngestConfig::segment_format_version`, docs/rseg-v2-plan.md P6). A CLI
+/// choice, not a default change: `IngestConfig::default()` still ships v1;
+/// this flag exists so the orchestrator can point this same binary at v2 on
+/// comparable hardware without a code change.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SegmentFormat {
+    V1,
+    V2,
+}
+
+impl From<SegmentFormat> for u16 {
+    fn from(f: SegmentFormat) -> u16 {
+        match f {
+            SegmentFormat::V1 => SEGMENT_FORMAT_V1,
+            SegmentFormat::V2 => SEGMENT_FORMAT_V2,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "End-to-end ravel-ingest benchmark (Phase 1, docs/benchmarking.md)")]
 struct Args {
@@ -49,6 +71,8 @@ struct Args {
     batch_size: usize,
     #[arg(long, default_value_t = 5)]
     ack_timeout_secs: u64,
+    #[arg(long, value_enum, default_value_t = SegmentFormat::V1)]
+    segment_format: SegmentFormat,
 }
 
 impl std::fmt::Display for StoreKind {
@@ -56,6 +80,15 @@ impl std::fmt::Display for StoreKind {
         match self {
             StoreKind::Memory => write!(f, "memory"),
             StoreKind::S3 => write!(f, "s3"),
+        }
+    }
+}
+
+impl std::fmt::Display for SegmentFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SegmentFormat::V1 => write!(f, "v1"),
+            SegmentFormat::V2 => write!(f, "v2"),
         }
     }
 }
@@ -130,6 +163,9 @@ struct ReportConfig {
     points_per_sec: u64,
     duration_secs: u64,
     batch_size: usize,
+    /// Which RSEG trailer version produced these numbers ("v1" or "v2"):
+    /// provenance so a later report comparing runs doesn't have to guess.
+    segment_format: String,
 }
 
 #[derive(Serialize)]
@@ -187,6 +223,7 @@ async fn run(args: &Args) -> Report {
 
     let ingest_config = IngestConfig {
         shard_count: args.shards,
+        segment_format_version: args.segment_format.into(),
         ..IngestConfig::default()
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -390,6 +427,7 @@ async fn run(args: &Args) -> Report {
             points_per_sec: args.points_per_sec,
             duration_secs: args.duration_secs,
             batch_size: args.batch_size,
+            segment_format: args.segment_format.to_string(),
         },
         accepted_points_per_sec: accepted_points as f64 / elapsed_secs,
         accepted_points,
@@ -417,6 +455,7 @@ fn print_human_table(report: &Report) {
     println!("  points_per_sec cfg: {}", report.config.points_per_sec);
     println!("  duration_secs     : {}", report.config.duration_secs);
     println!("  batch_size        : {}", report.config.batch_size);
+    println!("  segment_format    : {}", report.config.segment_format);
     println!(
         "  accepted points/s : {:.1}",
         report.accepted_points_per_sec
