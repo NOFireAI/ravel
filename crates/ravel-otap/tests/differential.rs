@@ -24,7 +24,10 @@ use proptest::prelude::*;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
 };
-use ravel_otap::normalize::{AGGREGATION_TEMPORALITY_CUMULATIVE, normalize_decoded};
+use ravel_otap::normalize::{
+    AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA,
+    AGGREGATION_TEMPORALITY_UNSPECIFIED, normalize_decoded,
+};
 use ravel_otap::proto::experimental::arrow::v1::BatchArrowRecords;
 use ravel_otap::stream::{StreamConfig, StreamState};
 use ravel_otlp::{IngestLimits, NormalizeOutput, Rejection, normalize_metrics};
@@ -56,7 +59,10 @@ struct WorkloadPoint {
 #[derive(Debug, Clone)]
 enum WorkloadKind {
     Gauge,
-    Sum { is_monotonic: bool },
+    Sum {
+        temporality: i32,
+        is_monotonic: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -67,20 +73,55 @@ struct WorkloadMetric {
 }
 
 fn attr_key_strategy() -> impl Strategy<Value = String> {
+    // The over-long key (> max_label_name_len = 256) drives the per-label
+    // LabelNameTooLong rejection. Combined with the over-long value below and
+    // the arbitrary attribute order proptest already produces, this reaches
+    // a9-F01 mechanism b: a point with a name violator and a value violator
+    // whose input order differs from key-sorted order. Its sort key ("k"...)
+    // orders it against the short keys so input vs sorted order can diverge.
     prop_oneof![
-        Just("region".to_string()),
-        Just("host".to_string()),
-        Just("shard".to_string()),
-        Just("az".to_string()),
+        8 => prop_oneof![
+            Just("region".to_string()),
+            Just("host".to_string()),
+            Just("shard".to_string()),
+            Just("az".to_string()),
+        ],
+        1 => Just("k".repeat(257)),
     ]
 }
 
 fn attr_value_strategy() -> impl Strategy<Value = WorkloadValue> {
+    // The over-long string value (> max_label_value_len = 4096) drives the
+    // per-label LabelValueTooLong rejection (a9-F01 mechanism b).
     prop_oneof![
-        "[a-z]{1,8}".prop_map(WorkloadValue::Str),
-        any::<bool>().prop_map(WorkloadValue::Bool),
-        (-1000i64..1000).prop_map(WorkloadValue::Int),
-        (-1000.0f64..1000.0).prop_map(WorkloadValue::Double),
+        8 => "[a-z]{1,8}".prop_map(WorkloadValue::Str),
+        1 => any::<bool>().prop_map(WorkloadValue::Bool),
+        1 => (-1000i64..1000).prop_map(WorkloadValue::Int),
+        1 => (-1000.0f64..1000.0).prop_map(WorkloadValue::Double),
+        1 => Just(WorkloadValue::Str("v".repeat(4097))),
+    ]
+}
+
+fn metric_name_strategy() -> impl Strategy<Value = String> {
+    // Beyond valid names, reach the two metric-name rejection classes: the
+    // empty name (EmptyMetricName) and the over-long name (> the 512-byte
+    // max_metric_name_len, MetricNameTooLong). Paired with the Sum temporality
+    // strategy below, an empty or over-long name on a delta Sum is exactly
+    // a9-F01 mechanism a: the name must be classed before temporality.
+    prop_oneof![
+        6 => "[a-z]{3,10}".prop_map(String::from),
+        1 => Just(String::new()),
+        1 => "[a-z]{513,540}".prop_map(String::from),
+    ]
+}
+
+fn sum_temporality_strategy() -> impl Strategy<Value = i32> {
+    // Only cumulative sums are supported; delta and unspecified must be
+    // classed UnsupportedTemporality on both paths.
+    prop_oneof![
+        4 => Just(AGGREGATION_TEMPORALITY_CUMULATIVE),
+        1 => Just(AGGREGATION_TEMPORALITY_DELTA),
+        1 => Just(AGGREGATION_TEMPORALITY_UNSPECIFIED),
     ]
 }
 
@@ -105,13 +146,18 @@ fn point_strategy() -> impl Strategy<Value = WorkloadPoint> {
 fn metric_kind_strategy() -> impl Strategy<Value = WorkloadKind> {
     prop_oneof![
         Just(WorkloadKind::Gauge),
-        any::<bool>().prop_map(|is_monotonic| WorkloadKind::Sum { is_monotonic }),
+        (sum_temporality_strategy(), any::<bool>()).prop_map(|(temporality, is_monotonic)| {
+            WorkloadKind::Sum {
+                temporality,
+                is_monotonic,
+            }
+        }),
     ]
 }
 
 fn metric_strategy() -> impl Strategy<Value = WorkloadMetric> {
     (
-        "[a-z]{3,10}",
+        metric_name_strategy(),
         metric_kind_strategy(),
         prop::collection::vec(point_strategy(), 1..=6),
     )
@@ -156,11 +202,14 @@ fn build_otlp_request(workload: &[WorkloadMetric]) -> ExportMetricsServiceReques
                     data: Some(MetricData::Gauge(Gauge { data_points })),
                     ..Default::default()
                 },
-                WorkloadKind::Sum { is_monotonic } => Metric {
+                WorkloadKind::Sum {
+                    temporality,
+                    is_monotonic,
+                } => Metric {
                     name: m.name.clone(),
                     data: Some(MetricData::Sum(Sum {
                         data_points,
-                        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        aggregation_temporality: *temporality,
                         is_monotonic: *is_monotonic,
                     })),
                     ..Default::default()
@@ -203,8 +252,11 @@ fn build_otap_batch(
         .map(|m| {
             let kind = match &m.kind {
                 WorkloadKind::Gauge => MetricKind::Gauge,
-                WorkloadKind::Sum { is_monotonic } => MetricKind::Sum {
-                    temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+                WorkloadKind::Sum {
+                    temporality,
+                    is_monotonic,
+                } => MetricKind::Sum {
+                    temporality: *temporality,
                     is_monotonic: *is_monotonic,
                 },
             };
