@@ -24,6 +24,13 @@ pub struct IngestMetrics {
     /// Batches rejected because two points shared a `series_id` under
     /// distinct canonical label sets (ADR-0005 fail-loud collision check).
     series_id_collisions: AtomicU64,
+    /// Distinct shard actors observed dead by the router: its send half or a
+    /// strict-mode ack found the shard channel closed, meaning the actor task
+    /// ended (e.g. panicked) without the router shutting it down. Counted
+    /// once per shard on the first observation, so it never exceeds
+    /// `shard_count` and makes a permanently degraded process observable
+    /// (docs/ingest.md "Metrics (self-observability)", a8-F03).
+    shard_deaths: AtomicU64,
 }
 
 /// Point-in-time copy of [`IngestMetrics`] for scraping.
@@ -39,6 +46,7 @@ pub struct IngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub series_id_collisions: u64,
+    pub shard_deaths: u64,
 }
 
 impl IngestMetrics {
@@ -75,6 +83,10 @@ impl IngestMetrics {
         self.series_id_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_shard_death(&self) {
+        self.shard_deaths.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> IngestMetricsSnapshot {
         IngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -87,6 +99,7 @@ impl IngestMetrics {
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
+            shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
         }
     }
 }
@@ -108,6 +121,7 @@ mod tests {
         metrics.record_acks(2, true);
         metrics.record_acks(1, false);
         metrics.record_series_id_collision();
+        metrics.record_shard_death();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.flushes_by_size, 1);
@@ -120,5 +134,6 @@ mod tests {
         assert_eq!(snap.acks_ok, 2);
         assert_eq!(snap.acks_err, 1);
         assert_eq!(snap.series_id_collisions, 1);
+        assert_eq!(snap.shard_deaths, 1);
     }
 }
