@@ -17,9 +17,11 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::io::Read;
+use std::io::{self, Read, Write};
 
-use arrow::buffer::Buffer as ArrowBuffer;
+use arrow::array::ArrayData;
+use arrow::buffer::{Buffer as ArrowBuffer, MutableBuffer};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::MessageHeader;
 use arrow_ipc::reader::StreamDecoder;
@@ -192,22 +194,98 @@ fn scan_messages(bytes: &[u8]) -> Result<Vec<ScannedMessage>, String> {
     Ok(messages)
 }
 
+/// A `std::io::Write` adapter over `MutableBuffer`, so zstd can decompress
+/// straight into arrow's 64-byte-aligned allocation instead of a plain
+/// `Vec<u8>` that would later need copying into an aligned buffer for hop 3
+/// (docs/arrow-datafusion-plan.md Hop 2).
+struct AlignedWriter<'a>(&'a mut MutableBuffer);
+
+impl Write for AlignedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Decompress `record` with a hard cap enforced before any large allocation:
 /// the decoder is bounded with `Read::take(cap + 1)` so a spoofed or absent
 /// zstd content-size header can never force growth past `cap + 1` bytes,
-/// regardless of how much data the frame actually claims or contains.
-fn decompress_capped(record: &[u8], cap: u64) -> Result<Vec<u8>, BatchError> {
+/// regardless of how much data the frame actually claims or contains. The
+/// destination is a `MutableBuffer` (64-byte aligned base allocation, see
+/// `arrow_buffer::alloc::ALIGNMENT`), so a subsequent aligned IPC body
+/// buffer can be a zero-copy view rather than requiring `StreamDecoder` to
+/// realign it.
+fn decompress_capped(record: &[u8], cap: u64) -> Result<MutableBuffer, BatchError> {
     let decoder =
         zstd::Decoder::new(record).map_err(|e| BatchError::Decompression(e.to_string()))?;
     let mut limited = decoder.take(cap + 1);
-    let mut out = Vec::new();
-    limited
-        .read_to_end(&mut out)
+    let mut out = MutableBuffer::new(0);
+    io::copy(&mut limited, &mut AlignedWriter(&mut out))
         .map_err(|e| BatchError::Decompression(e.to_string()))?;
     if out.len() as u64 > cap {
         return Err(BatchError::DecompressedPayloadTooLarge { limit: cap });
     }
     Ok(out)
+}
+
+/// Byte range `[start, end)` of one frame's aligned decompress buffer, used
+/// to tell whether a decoded array's buffer is a zero-copy view into it or
+/// a fresh allocation `StreamDecoder` made to realign misaligned data.
+type FrameRange = (usize, usize);
+
+fn frame_range_of(buffer: &ArrowBuffer) -> FrameRange {
+    let start = buffer.as_ptr() as usize;
+    (start, start + buffer.len())
+}
+
+fn buffer_in_frame(range: FrameRange, buffer: &ArrowBuffer) -> bool {
+    if buffer.is_empty() {
+        return true;
+    }
+    let start = buffer.as_ptr() as usize;
+    let end = start + buffer.len();
+    start >= range.0 && end <= range.1
+}
+
+/// Whether every buffer backing `data` is a zero-copy view into `range`.
+/// Dictionary values are excluded: they are cached on the decoder across
+/// frames (only the key buffer is decoded fresh from this frame), so
+/// checking them against this frame's range would misreport a dictionary
+/// established in an earlier frame as a copy in this one.
+fn array_data_in_frame(range: FrameRange, data: &ArrayData) -> bool {
+    if !data.buffers().iter().all(|b| buffer_in_frame(range, b)) {
+        return false;
+    }
+    if matches!(data.data_type(), DataType::Dictionary(_, _)) {
+        return true;
+    }
+    data.child_data()
+        .iter()
+        .all(|child| array_data_in_frame(range, child))
+}
+
+/// Whether decoding `batch` out of this frame's buffer required no copies:
+/// every column's array data is a zero-copy view into `range`.
+fn batch_is_zero_copy(range: FrameRange, batch: &RecordBatch) -> bool {
+    batch
+        .columns()
+        .iter()
+        .all(|col| array_data_in_frame(range, &col.to_data()))
+}
+
+/// Running counts of decoded IPC record-batch frames, split by whether
+/// `StreamDecoder` returned a zero-copy view into our aligned decompress
+/// buffer or had to allocate and copy to realign a misaligned producer
+/// buffer (docs/arrow-datafusion-plan.md Hop 3; review finding F3: this is
+/// producer-dependent and must be measured, not assumed).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeStats {
+    pub zero_copy_frames: u64,
+    pub copy_fallback_frames: u64,
 }
 
 type DecoderKey = (ArrowPayloadType, String);
@@ -220,6 +298,7 @@ pub struct StreamState {
     decoders: HashMap<DecoderKey, StreamDecoder>,
     dictionary_bytes_used: u64,
     poisoned: bool,
+    stats: DecodeStats,
 }
 
 impl StreamState {
@@ -229,6 +308,7 @@ impl StreamState {
             decoders: HashMap::new(),
             dictionary_bytes_used: 0,
             poisoned: false,
+            stats: DecodeStats::default(),
         }
     }
 
@@ -236,6 +316,12 @@ impl StreamState {
     /// [`decode`](Self::decode) call will return [`StreamError::Poisoned`].
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Cumulative zero-copy vs copy-fallback frame counts observed across
+    /// every [`decode`](Self::decode) call on this stream so far.
+    pub fn decode_stats(&self) -> DecodeStats {
+        self.stats
     }
 
     /// Decode one `BatchArrowRecords` message into the `RecordBatch`es
@@ -323,10 +409,18 @@ impl StreamState {
         let decoder = entry.or_default();
 
         let mut buffer = ArrowBuffer::from(raw);
+        let frame_range = frame_range_of(&buffer);
         let mut batches = Vec::new();
         while !buffer.is_empty() {
             match decoder.decode(&mut buffer) {
-                Ok(Some(record_batch)) => batches.push((payload_type, record_batch)),
+                Ok(Some(record_batch)) => {
+                    if batch_is_zero_copy(frame_range, &record_batch) {
+                        self.stats.zero_copy_frames += 1;
+                    } else {
+                        self.stats.copy_fallback_frames += 1;
+                    }
+                    batches.push((payload_type, record_batch));
+                }
                 Ok(None) => {}
                 Err(e) => {
                     self.decoders.remove(&key);
