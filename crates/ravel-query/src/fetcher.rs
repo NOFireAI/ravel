@@ -932,4 +932,93 @@ mod tests {
             "expected the injected fault to have fired exactly once"
         );
     }
+
+    // --- coalesce_ranges / FetchedRegions unit coverage (a5-F01).
+    // docs/query-engine.md "coalesce adjacent byte ranges": merge within the
+    // gap, split beyond it, never join unrelated regions, never overflow. The
+    // fetcher's whole multi-GET plan reduces to these two helpers, so they are
+    // pinned directly here (the end-to-end path is exercised in
+    // tests/fetch_multi_get.rs).
+
+    #[test]
+    fn coalesce_merges_within_gap_and_splits_beyond() {
+        // Unsorted input: (12,20) is within gap 5 of (0,10) -> one group
+        // spanning (0,20); (1000,1010) is far beyond the gap -> its own group.
+        // Proves both the merge and the "no unrelated join" direction.
+        let out = coalesce_ranges(vec![(1000, 1010), (0, 10), (12, 20)], 5);
+        assert_eq!(out, vec![(0, 20), (1000, 1010)]);
+    }
+
+    #[test]
+    fn coalesce_merges_overlapping_and_keeps_max_end() {
+        // Overlap (5 <= 10) merges; the wider range's end wins even when the
+        // ranges are supplied shorter-last.
+        let out = coalesce_ranges(vec![(0, 10), (5, 8), (8, 30)], 0);
+        assert_eq!(out, vec![(0, 30)]);
+    }
+
+    #[test]
+    fn coalesce_zero_gap_only_joins_touching_ranges() {
+        // gap 0: exactly-adjacent ranges (end == next start) join; a 1-byte
+        // hole splits them. This is the with_coalesce_gap(0) GET set: two GETs.
+        let ranges = vec![(0, 10), (10, 20), (21, 30)];
+        assert_eq!(coalesce_ranges(ranges.clone(), 0), vec![(0, 20), (21, 30)]);
+        // Widening the gap to bridge the 1-byte hole collapses the same three
+        // ranges to a single GET: coalescing reduces the GET set, never grows
+        // it, and never joins ranges further apart than the gap.
+        assert_eq!(coalesce_ranges(ranges, 1), vec![(0, 30)]);
+    }
+
+    #[test]
+    fn coalesce_is_overflow_safe_near_u64_max() {
+        // saturating_add on the gap must not panic (debug) or wrap (release)
+        // when last.end + max_gap would exceed u64::MAX.
+        let out = coalesce_ranges(vec![(0, 5), (u64::MAX - 2, u64::MAX)], u64::MAX);
+        assert_eq!(out, vec![(0, u64::MAX)]);
+        let out = coalesce_ranges(vec![(u64::MAX - 3, u64::MAX)], u64::MAX);
+        assert_eq!(out, vec![(u64::MAX - 3, u64::MAX)]);
+    }
+
+    #[test]
+    fn fetched_regions_slice_is_zero_copy_within_one_buffer() {
+        let mut regions = FetchedRegions::default();
+        let buf = Bytes::from(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let base = buf.as_ptr() as usize;
+        // Buffer lives at absolute offset 100, spanning [100, 110).
+        regions.insert(100, buf);
+
+        assert!(regions.covers(102, 108));
+        assert!(
+            !regions.covers(95, 105),
+            "must not claim to cover a left overhang"
+        );
+        assert!(
+            !regions.covers(105, 115),
+            "must not claim to cover a right overhang"
+        );
+
+        let s = regions.slice(103, 4).expect("sub-range is covered");
+        assert_eq!(&s[..], &[3u8, 4, 5, 6]);
+        // Zero-copy (ADR-0013, fetcher.rs FetchedRegions::slice comment): the
+        // returned Bytes points into the original allocation at base + 3, not
+        // a fresh copy. Compared as integers to avoid `unsafe` pointer math
+        // (unsafe is denied workspace-wide).
+        assert_eq!(s.as_ptr() as usize, base + 3);
+        // Out-of-range slice is rejected, never a copy of the wrong bytes.
+        assert!(regions.slice(108, 4).is_none());
+    }
+
+    #[test]
+    fn fetched_regions_does_not_cover_a_range_straddling_two_buffers() {
+        // A sub-range that spans a buffer boundary is reported uncovered, so
+        // the fetcher refetches it rather than stitching bytes from two GETs
+        // (docs/reviews .../a5-fetch-object-store.md §5 "duplicate fetches").
+        let mut regions = FetchedRegions::default();
+        regions.insert(0, Bytes::from(vec![0u8; 10]));
+        regions.insert(10, Bytes::from(vec![1u8; 10]));
+        assert!(regions.covers(2, 8));
+        assert!(regions.covers(12, 18));
+        assert!(!regions.covers(8, 12), "a straddling range is not covered");
+        assert!(regions.slice(8, 4).is_none());
+    }
 }
