@@ -1,0 +1,65 @@
+[package]
+name = "ravel-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-ingest = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-commit = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lib]
+# Only the criterion `[[bench]]` targets below understand `cargo bench`'s
+# `--quick` flag; leaving the lib's own `bench = true` default would make
+# `cargo bench -p ravel-bench -- --quick` also run its unit tests under the
+# plain libtest harness, which rejects that flag.
+bench = false
+
+[[bin]]
+name = "ingest_bench"
+path = "src/bin/ingest_bench.rs"
+bench = false
+
+[[test]]
+name = "gorilla_vs_raw"
+path = "tests/gorilla_vs_raw.rs"
+bench = false
+
+[[bench]]
+name = "segment_encode"
+harness = false
+
+[[bench]]
+name = "segment_decode_full"
+harness = false
+
+[[bench]]
+name = "segment_decode_selective"
+harness = false
+
+[[bench]]
+name = "series_id_hash"
+harness = false
+
+[lints]
+workspace = true
