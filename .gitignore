@@ -4,3 +4,4 @@
 /bench/reports/*.raw
 .DS_Store
 /minio-data
+/examples/otlp_metrics_fixture.pb
