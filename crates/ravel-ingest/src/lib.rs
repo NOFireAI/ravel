@@ -1,5 +1,19 @@
 //! Ingest pipeline: shard router, single-threaded shard actors, adaptive
 //! flush, L0 build + upload + commit, strict/buffered acknowledgement.
 //!
-//! Implementer contract: docs/architecture.md, ADR-0001, ADR-0002. Bounded
-//! mpsc everywhere; no task-per-sample; backpressure to the gateway.
+//! Implementer contract: docs/ingest.md, docs/consistency-model.md,
+//! docs/catalog-and-mvcc.md, ADR-0001, ADR-0002, ADR-0010. Bounded mpsc
+//! everywhere; no task-per-sample; backpressure to the gateway.
+
+mod clock;
+mod config;
+mod error;
+mod metrics;
+mod router;
+mod shard;
+
+pub use clock::{Clock, SystemClock};
+pub use config::IngestConfig;
+pub use error::WriteError;
+pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
+pub use router::{IngestRouter, WriteMode, WriteReceipt};

@@ -11,16 +11,21 @@ ravel-segment = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-otlp = { workspace = true }
+ravel-proto = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 ravel-test-util = { workspace = true }
+ravel-catalog = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

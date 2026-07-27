@@ -2029,11 +2029,16 @@ dependencies = [
 name = "ravel-ingest"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "futures",
  "proptest",
+ "rand 0.10.2",
+ "ravel-catalog",
  "ravel-commit",
  "ravel-object-store",
  "ravel-otlp",
+ "ravel-proto",
  "ravel-segment",
  "ravel-test-util",
  "ravel-types",
