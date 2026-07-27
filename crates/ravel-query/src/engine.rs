@@ -2,7 +2,8 @@
 //! cross-segment duplicate-sample resolution, and PromQL evaluation
 //! (docs/query-engine.md "Flow", docs/catalog-and-mvcc.md).
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use ravel_types::{
 
 use crate::config::EngineConfig;
 use crate::error::QueryError;
-use crate::fetcher::{FetchError, FetchedSeries, SegmentFetcher};
+use crate::fetcher::{FetchError, FetchedSeriesSoa, SegmentFetcher};
 
 /// Must match `ravel_promql::Evaluator`'s default lookback exactly (that
 /// constant is private): the engine needs the lookback duration to compute
@@ -90,7 +91,7 @@ impl QueryEngine {
             end_ns: sel_ts_ns,
         };
         let source = self
-            .resolve_and_materialize(tenant_hash, &matchers, window, min_tokens, now_ns)
+            .resolve_and_merge(tenant_hash, &matchers, window, min_tokens, now_ns)
             .await?;
         Ok(Evaluator::new().instant(&source, query, t_ms)?)
     }
@@ -146,7 +147,7 @@ impl QueryEngine {
         let step_ns = ms_to_ns(step_ms)?;
         let window = range_fetch_window(start_ns, end_ns, step_ns, offset_ns)?;
         let source = self
-            .resolve_and_materialize(tenant_hash, &matchers, window, min_tokens, now_ns)
+            .resolve_and_merge(tenant_hash, &matchers, window, min_tokens, now_ns)
             .await?;
         Ok(Evaluator::new().range(&source, query, start_ms, end_ms, step_ms)?)
     }
@@ -201,22 +202,22 @@ impl QueryEngine {
             .await
     }
 
-    async fn resolve_and_materialize(
+    async fn resolve_and_merge(
         &self,
         tenant_hash: TenantHash,
         matchers: &[LabelMatcher],
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
-    ) -> Result<MaterializedSource, QueryError> {
+    ) -> Result<MergedSource, QueryError> {
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
         let attempt = |snapshot: Snapshot| async move {
             let fetched = self
-                .fetch_all_samples(tenant_hash, &snapshot, matchers)
+                .fetch_all_samples_soa(tenant_hash, &snapshot, matchers)
                 .await?;
-            let series = merge_segments(fetched, max_series, max_samples)?;
-            Ok(MaterializedSource { series })
+            let series = merge_soa_runs(fetched, max_series, max_samples)?;
+            Ok(MergedSource { series })
         };
 
         self.resolve_snapshot_with_retry(tenant_hash, window, min_tokens, now_ns, attempt)
@@ -283,23 +284,29 @@ impl QueryEngine {
         Ok(snapshot)
     }
 
-    async fn fetch_all_samples(
+    /// Fetches every matched series' samples from each snapshot segment as
+    /// per-segment SoA runs (`fetch_soa`), one `Vec<FetchedSeriesSoa>` per
+    /// segment. The runs are handed to [`merge_soa_runs`] for the lazy
+    /// k-way merge; the per-segment `FetchStats` are not consumed on this
+    /// path (issue #25, X1).
+    async fn fetch_all_samples_soa(
         &self,
         tenant_hash: TenantHash,
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
-    ) -> Result<Vec<Vec<FetchedSeries>>, QueryError> {
+    ) -> Result<Vec<Vec<FetchedSeriesSoa>>, QueryError> {
         let concurrency = self.config.fetch_concurrency.max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
-        let results: Vec<Result<Vec<FetchedSeries>, FetchError>> =
+        let results: Vec<Result<Vec<FetchedSeriesSoa>, FetchError>> =
             stream::iter(snapshot.segments.iter().cloned())
                 .map(|seg_ref| {
                     let fetcher = self.fetcher.clone();
                     let matchers = Arc::clone(&matchers);
                     async move {
                         fetcher
-                            .fetch(tenant_hash, &seg_ref, matchers.as_slice())
+                            .fetch_soa(tenant_hash, &seg_ref, matchers.as_slice())
                             .await
+                            .map(|(runs, _stats)| runs)
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -443,10 +450,11 @@ fn describe_expr(expr: &Expr) -> String {
 
 /// One candidate sample for a (series, timestamp) slot, carrying the
 /// ordering tuple from ADR-0010 §5 plus the raw value, for the
-/// greatest-wins comparison in [`is_greater`].
+/// greatest-wins comparison in [`is_greater`]. The timestamp is the merge
+/// key and lives outside the candidate; only the fields that break a
+/// duplicate-timestamp tie are held here.
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
-    ts_ns: i64,
     value: f64,
     priority: (i64, u64, u64, u32),
 }
@@ -459,39 +467,64 @@ fn is_greater(a: &Candidate, b: &Candidate) -> bool {
     (a.priority, a.value.to_bits()) > (b.priority, b.value.to_bits())
 }
 
-fn merge_segments(
-    fetched: Vec<Vec<FetchedSeries>>,
+/// One decoded per-segment run of a single series, kept in on-disk order
+/// (ascending ts, duplicate timestamps preserved; docs/segment-format.md
+/// "Sample order within a page"). The run-wide prefix of the ADR-0010 §5
+/// order is shared by every sample in the run; the per-sample in-page index
+/// (position in `timestamps`) completes the tuple.
+struct SeriesRun {
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
+    prefix: (i64, u64, u64),
+}
+
+/// Counts samples as the k-way merge *yields* them (post-dedup), enforcing
+/// the max-samples budget on the yielded stream rather than on a fully
+/// materialized window. The budget trips at exactly `max + 1`, so peak work
+/// is bounded by the budget itself, not by the query's full result size
+/// (docs/query-engine.md "Budgets", count-yielded semantics).
+struct YieldBudget {
+    yielded: usize,
+    max: usize,
+}
+
+impl YieldBudget {
+    fn count_one(&mut self) -> Result<(), QueryError> {
+        self.yielded += 1;
+        if self.yielded > self.max {
+            return Err(QueryError::TooManySamples {
+                count: self.yielded,
+                max: self.max,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Groups the per-segment SoA runs by series id, then lazily k-way merges
+/// each series' runs into ascending, per-timestamp-deduplicated samples.
+/// Replaces the old materialized per-timestamp map ("merged window"): no
+/// `HashMap<ts, _>` is built and no final sort runs, because each run is
+/// already sorted ascending by ts and the merge emits in ts order. The
+/// max-samples budget is enforced by counting yielded samples
+/// ([`YieldBudget`]); duplicate timestamps resolve under the full total
+/// order in [`is_greater`].
+fn merge_soa_runs(
+    fetched: Vec<Vec<FetchedSeriesSoa>>,
     max_series: usize,
     max_samples: usize,
 ) -> Result<Vec<SeriesData>, QueryError> {
-    let mut by_series: HashMap<SeriesId, (LabelSet, HashMap<i64, Candidate>)> = HashMap::new();
+    let mut by_series: HashMap<SeriesId, (LabelSet, Vec<SeriesRun>)> = HashMap::new();
     for segment_series in fetched {
         for fs in segment_series {
             let entry = by_series
                 .entry(fs.series_id)
-                .or_insert_with(|| (fs.labels.clone(), HashMap::new()));
-            for (idx, sample) in fs.samples.iter().enumerate() {
-                let in_page_index = u32::try_from(idx).unwrap_or(u32::MAX);
-                let candidate = Candidate {
-                    ts_ns: sample.ts_ns,
-                    value: sample.value,
-                    priority: (
-                        fs.created_unix_ns,
-                        fs.writer_epoch,
-                        fs.writer_seq,
-                        in_page_index,
-                    ),
-                };
-                entry
-                    .1
-                    .entry(sample.ts_ns)
-                    .and_modify(|existing| {
-                        if is_greater(&candidate, existing) {
-                            *existing = candidate;
-                        }
-                    })
-                    .or_insert(candidate);
-            }
+                .or_insert_with(|| (fs.labels.clone(), Vec::new()));
+            entry.1.push(SeriesRun {
+                timestamps: fs.timestamps,
+                values: fs.values,
+                prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
+            });
         }
     }
 
@@ -502,37 +535,89 @@ fn merge_segments(
         });
     }
 
-    let mut total_samples: usize = 0;
+    let mut budget = YieldBudget {
+        yielded: 0,
+        max: max_samples,
+    };
     let mut out = Vec::with_capacity(by_series.len());
-    for (labels, ts_map) in by_series.into_values() {
-        total_samples = total_samples.saturating_add(ts_map.len());
-        if total_samples > max_samples {
-            return Err(QueryError::TooManySamples {
-                count: total_samples,
-                max: max_samples,
-            });
-        }
-        let mut samples: Vec<Sample> = ts_map
-            .into_values()
-            .map(|c| Sample {
-                ts_ns: c.ts_ns,
-                value: c.value,
-            })
-            .collect();
-        samples.sort_by_key(|s| s.ts_ns);
+    for (labels, runs) in by_series.into_values() {
+        let mut samples = Vec::new();
+        merge_series_runs(&runs, &mut budget, &mut samples)?;
         out.push(SeriesData { labels, samples });
     }
     Ok(out)
 }
 
-/// A `SeriesSource` over a query's already-fetched, already-merged samples
+/// Lazily k-way merges one series' per-segment `runs` into `out`, ascending
+/// by timestamp with one sample per timestamp. Each run is individually
+/// sorted ascending by ts (RSEG page order), so a min-heap keyed by ts
+/// suffices; there is no full sort. At each distinct timestamp every
+/// candidate across all runs (including duplicate timestamps within a run)
+/// is considered and the greatest under [`is_greater`] wins, never arrival
+/// order. Every emitted sample is counted through `budget`.
+fn merge_series_runs(
+    runs: &[SeriesRun],
+    budget: &mut YieldBudget,
+    out: &mut Vec<Sample>,
+) -> Result<(), QueryError> {
+    // Min-heap of each run's current head as (ts, run_idx); `Reverse` turns
+    // the max-heap into a min-heap so the smallest pending ts pops first.
+    let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    let mut cursors = vec![0usize; runs.len()];
+    for (idx, run) in runs.iter().enumerate() {
+        if let Some(&ts) = run.timestamps.first() {
+            heap.push(Reverse((ts, idx)));
+        }
+    }
+
+    while let Some(&Reverse((ts, _))) = heap.peek() {
+        // Gather the winner across every run head equal to `ts`, draining
+        // each run's consecutive equal-ts streak before advancing it.
+        let mut best: Option<Candidate> = None;
+        while let Some(Reverse((head_ts, idx))) = heap.pop() {
+            if head_ts != ts {
+                heap.push(Reverse((head_ts, idx)));
+                break;
+            }
+            let run = &runs[idx];
+            let mut pos = cursors[idx];
+            while pos < run.timestamps.len() && run.timestamps[pos] == ts {
+                let in_page_index = u32::try_from(pos).unwrap_or(u32::MAX);
+                let candidate = Candidate {
+                    value: run.values[pos],
+                    priority: (run.prefix.0, run.prefix.1, run.prefix.2, in_page_index),
+                };
+                best = match best {
+                    Some(current) if is_greater(&current, &candidate) => Some(current),
+                    _ => Some(candidate),
+                };
+                pos += 1;
+            }
+            cursors[idx] = pos;
+            if let Some(&next_ts) = run.timestamps.get(pos) {
+                heap.push(Reverse((next_ts, idx)));
+            }
+        }
+        if let Some(candidate) = best {
+            budget.count_one()?;
+            out.push(Sample {
+                ts_ns: ts,
+                value: candidate.value,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A `SeriesSource` backed by the per-series output of the lazy k-way merge
+/// ([`merge_soa_runs`]), not a materialized per-timestamp window
 /// (docs/query-engine.md / `ravel_promql::source` module doc: by the time
 /// the evaluator runs, everything is plain, synchronous, in-memory data).
-struct MaterializedSource {
+struct MergedSource {
     series: Vec<SeriesData>,
 }
 
-impl SeriesSource for MaterializedSource {
+impl SeriesSource for MergedSource {
     fn query(
         &self,
         matchers: &[LabelMatcher],
@@ -552,5 +637,233 @@ impl SeriesSource for MaterializedSource {
                     .collect(),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod merge_tests {
+    use ravel_types::{Label, LabelSet, SeriesId};
+
+    use super::*;
+    use crate::fetcher::FetchedSeriesSoa;
+
+    fn labels(series: u8) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: format!("metric_{series}"),
+        }])
+        .expect("valid labels")
+    }
+
+    /// One decoded per-segment run of `series` at the given provenance.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        series: u8,
+        ts: &[i64],
+        vals: &[f64],
+        created: i64,
+        epoch: u64,
+        seq: u64,
+    ) -> FetchedSeriesSoa {
+        assert_eq!(ts.len(), vals.len());
+        FetchedSeriesSoa {
+            series_id: SeriesId([series; 16]),
+            labels: labels(series),
+            timestamps: ts.to_vec(),
+            values: vals.to_vec(),
+            created_unix_ns: created,
+            writer_epoch: epoch,
+            writer_seq: seq,
+        }
+    }
+
+    /// Merges with generous budgets and returns the per-series output.
+    fn merge(segments: Vec<Vec<FetchedSeriesSoa>>) -> Vec<SeriesData> {
+        merge_soa_runs(segments, 10_000, usize::MAX).expect("merge")
+    }
+
+    /// Merges a single-series, single-timestamp scenario and returns the raw
+    /// bits of the one winning sample's value, so bit-exact ties are checked
+    /// without float `==`.
+    fn winner_bits(segments: Vec<Vec<FetchedSeriesSoa>>) -> u64 {
+        let mut out = merge(segments);
+        assert_eq!(out.len(), 1, "exactly one series expected");
+        let series = out.pop().expect("one series");
+        assert_eq!(series.samples.len(), 1, "exactly one timestamp expected");
+        series.samples[0].value.to_bits()
+    }
+
+    #[test]
+    fn created_unix_ns_decides_winner() {
+        // Two segments, same ts, differ only in created_unix_ns: greatest wins.
+        let older = run(1, &[5], &[1.0], 10, 0, 0);
+        let newer = run(1, &[5], &[2.0], 20, 0, 0);
+        assert_eq!(
+            winner_bits(vec![vec![older.clone()], vec![newer.clone()]]),
+            2.0f64.to_bits()
+        );
+        // Order-independent: swap the two segments, same winner.
+        assert_eq!(
+            winner_bits(vec![vec![newer], vec![older]]),
+            2.0f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn writer_epoch_decides_when_created_ties() {
+        let lo = run(1, &[5], &[1.0], 100, 1, 9);
+        let hi = run(1, &[5], &[2.0], 100, 2, 0);
+        assert_eq!(
+            winner_bits(vec![vec![lo.clone()], vec![hi.clone()]]),
+            2.0f64.to_bits()
+        );
+        assert_eq!(winner_bits(vec![vec![hi], vec![lo]]), 2.0f64.to_bits());
+    }
+
+    #[test]
+    fn writer_seq_decides_when_created_and_epoch_tie() {
+        let lo = run(1, &[5], &[1.0], 100, 3, 7);
+        let hi = run(1, &[5], &[2.0], 100, 3, 8);
+        assert_eq!(
+            winner_bits(vec![vec![lo.clone()], vec![hi.clone()]]),
+            2.0f64.to_bits()
+        );
+        assert_eq!(winner_bits(vec![vec![hi], vec![lo]]), 2.0f64.to_bits());
+    }
+
+    #[test]
+    fn in_page_index_decides_within_one_segment() {
+        // One run, duplicate ts: the later position (greater in-page index)
+        // wins even though the whole provenance prefix is identical.
+        let dup = run(1, &[5, 5], &[1.0, 2.0], 100, 3, 8);
+        assert_eq!(winner_bits(vec![vec![dup]]), 2.0f64.to_bits());
+    }
+
+    #[test]
+    fn in_page_index_decides_across_segments() {
+        // Same provenance prefix in two segments, but one run carries the
+        // sample at index 1 (a leading same-ts sample), the other at index 0.
+        // Greater index wins regardless of value magnitude.
+        let idx0 = run(1, &[5], &[100.0], 100, 3, 8);
+        let idx1 = run(1, &[5, 5], &[1.0, 2.0], 100, 3, 8);
+        // idx1's winning candidate is at position 1 (value 2.0); across the
+        // two runs it beats idx0's position-0 candidate (value 100.0).
+        assert_eq!(winner_bits(vec![vec![idx0], vec![idx1]]), 2.0f64.to_bits());
+    }
+
+    #[test]
+    fn value_bits_break_full_priority_tie() {
+        // Two segments, identical provenance, each a single index-0 sample:
+        // the full priority tuple ties, so value.to_bits() (greatest) decides.
+        // -1.0 has the sign bit set, so its bit pattern exceeds 1.0's despite
+        // being numerically smaller: proves the tiebreak is on bits, not value.
+        let pos = run(1, &[5], &[1.0], 100, 3, 8);
+        let neg = run(1, &[5], &[-1.0], 100, 3, 8);
+        assert_eq!(winner_bits(vec![vec![pos], vec![neg]]), (-1.0f64).to_bits());
+    }
+
+    #[test]
+    fn k_way_merge_yields_sorted_deduped_stream() {
+        // Interleaved timestamps across three runs, plus a cross-segment
+        // duplicate at ts=3 (newer created wins) and a within-run duplicate
+        // at ts=5 in run b.
+        let a = run(1, &[1, 4], &[10.0, 40.0], 5, 0, 0);
+        let b = run(1, &[3, 5, 5], &[3.1, 5.0, 5.9], 5, 0, 1);
+        let c = run(1, &[2, 3], &[2.0, 3.2], 9, 0, 0); // ts=3 newer created
+        let out = merge(vec![vec![a], vec![b], vec![c]]);
+        assert_eq!(out.len(), 1);
+        let s = &out[0];
+        let got: Vec<(i64, u64)> = s
+            .samples
+            .iter()
+            .map(|x| (x.ts_ns, x.value.to_bits()))
+            .collect();
+        let want: Vec<(i64, u64)> = vec![
+            (1, 10.0f64.to_bits()),
+            (2, 2.0f64.to_bits()),
+            (3, 3.2f64.to_bits()), // c's created=9 beats b's created=5
+            (4, 40.0f64.to_bits()),
+            (5, 5.9f64.to_bits()), // within-run: index 2 beats index 1
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn distinct_series_produce_distinct_output() {
+        let s1 = run(1, &[1, 2], &[1.0, 2.0], 0, 0, 0);
+        let s2 = run(2, &[3], &[3.0], 0, 0, 0);
+        let out = merge(vec![vec![s1, s2]]);
+        assert_eq!(out.len(), 2);
+        let total: usize = out.iter().map(|s| s.samples.len()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn budget_trips_at_max_plus_one_on_yield() {
+        // Three distinct samples, budget of 2: the merge must error on the
+        // third yielded sample, reporting count = max + 1 exactly.
+        let seg = vec![vec![run(1, &[1, 2, 3], &[1.0, 2.0, 3.0], 0, 0, 0)]];
+        let err = merge_soa_runs(seg, 10_000, 2).expect_err("over budget");
+        match err {
+            QueryError::TooManySamples { count, max } => {
+                assert_eq!(count, 3);
+                assert_eq!(max, 2);
+            }
+            other => panic!("expected TooManySamples, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_counts_yielded_not_materialized() {
+        // Duplicates collapse before counting: two segments each with the
+        // same three timestamps yield only three samples, within a budget of
+        // three. A count-materialized budget would have seen six.
+        let a = run(1, &[1, 2, 3], &[1.0, 2.0, 3.0], 1, 0, 0);
+        let b = run(1, &[1, 2, 3], &[9.0, 9.0, 9.0], 2, 0, 0);
+        let out = merge_soa_runs(vec![vec![a], vec![b]], 10_000, 3).expect("within budget");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].samples.len(), 3);
+    }
+
+    #[test]
+    fn budget_error_is_order_independent() {
+        // Same sample set, two segment orderings: the tripped count is
+        // identical because it counts yielded, not iteration order.
+        let a = run(1, &[1, 3], &[1.0, 3.0], 0, 0, 0);
+        let b = run(1, &[2, 4], &[2.0, 4.0], 0, 0, 0);
+        let e1 = merge_soa_runs(vec![vec![a.clone()], vec![b.clone()]], 10_000, 3)
+            .expect_err("over budget");
+        let e2 = merge_soa_runs(vec![vec![b], vec![a]], 10_000, 3).expect_err("over budget");
+        let count = |e: &QueryError| match e {
+            QueryError::TooManySamples { count, .. } => *count,
+            other => panic!("expected TooManySamples, got {other:?}"),
+        };
+        assert_eq!(count(&e1), 4);
+        assert_eq!(count(&e2), 4);
+    }
+
+    #[test]
+    fn max_series_enforced() {
+        let seg = vec![vec![
+            run(1, &[1], &[1.0], 0, 0, 0),
+            run(2, &[1], &[1.0], 0, 0, 0),
+        ]];
+        let err = merge_soa_runs(seg, 1, usize::MAX).expect_err("too many series");
+        match err {
+            QueryError::TooManySeries { count, max } => {
+                assert_eq!(count, 2);
+                assert_eq!(max, 1);
+            }
+            other => panic!("expected TooManySeries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_run_yields_empty_series() {
+        let seg = vec![vec![run(1, &[], &[], 0, 0, 0)]];
+        let out = merge(seg);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].samples.is_empty());
     }
 }

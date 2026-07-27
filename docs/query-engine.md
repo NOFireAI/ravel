@@ -15,9 +15,12 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
        -> prune series by matchers (SERIES_TABLE + LABEL_DICT)
        -> plan page ranges, coalesce adjacent (gap <= 64 KiB)
        -> ranged GETs -> decode pages -> per-series samples
-  -> merge samples per series id across segments (sort by ts; duplicates:
-     keep both, evaluator takes last-at-ts)
-  -> SeriesSource impl backed by the materialized window
+  -> lazy k-way merge of the per-segment SoA runs per series id (each run
+     already ascending by ts; the merge emits ascending, one sample per ts,
+     no final sort). Duplicate timestamps (across segments and within one
+     run) resolve under the total order in docs/catalog-and-mvcc.md, not by
+     arrival order; the max-samples budget is counted on yield (below).
+  -> SeriesSource impl backed by that merged per-series output
   -> ravel-promql Evaluator -> instant vector / range matrix
   -> Prometheus JSON envelope {status, data:{resultType, result}, warnings}
 ```
@@ -53,9 +56,16 @@ earlier-only segment.
 ## Budgets (Phase 1: static config)
 
 Per query: max segments touched (1024), max concurrent GETs (8), max
-matched series (10k), max samples materialized (10M), wall deadline
-(default 30 s, `timeout` param can lower it). Exceeding a budget returns a
-Prometheus-style error, never a partial silent result.
+matched series (10k), max samples (10M), wall deadline (default 30 s,
+`timeout` param can lower it). Exceeding a budget returns a Prometheus-style
+error, never a partial silent result.
+
+The max-samples budget is **count-yielded**: samples are counted as the
+lazy k-way merge emits them (post-dedup), and the budget trips at exactly
+`max + 1`. It does not count a fully materialized window before checking,
+so peak merge work is bounded by the budget itself rather than by the
+query's full deduplicated result size. The count is independent of segment
+or series iteration order, so the error is deterministic.
 
 ## Caching note
 
