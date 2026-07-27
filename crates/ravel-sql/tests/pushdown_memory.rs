@@ -660,13 +660,17 @@ async fn byte_budget_exceeded_returns_typed_error() {
 
 #[tokio::test]
 async fn dropped_mid_scan_stream_releases_tenant_bytes() {
+    // More than one BATCH_ROWS (8192) worth of samples: this test drops the
+    // stream after its first batch while more data remains unread, so it is
+    // genuinely mid-scan rather than a complete-then-drop of a single batch
+    // that happened to be the whole result (Opus checkpoint finding N1).
     let specs = vec![SegSpec {
         created_unix_ns: 1,
         writer_epoch: 1,
         writer_seq: 1,
         series: vec![metric_series(
             "m",
-            &(0..2000).map(|i| (i, i as f64)).collect::<Vec<_>>(),
+            &(0..20_000).map(|i| (i, i as f64)).collect::<Vec<_>>(),
         )],
     }];
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -743,5 +747,103 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
         tenant.reserved(),
         0,
         "tenant budget must be untouched at zero"
+    );
+}
+
+/// Opus checkpoint finding on B2: every existing memory test sets the tenant
+/// ceiling to `1 << 30`, so the tenant-exhausted branch in
+/// `TenantDelegatingPool::try_grow` never actually executes, and
+/// `high_cardinality_trips_query_pool_before_tenant` proves nothing about
+/// check *order* -- it would pass identically even if tenant were checked
+/// first, since the tenant limit there is unreachable. This test makes the
+/// tenant ceiling the one that actually trips, and asserts the failed
+/// tenant grow rolled the query-side counter back to exactly what it was
+/// before the call.
+#[tokio::test]
+async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
+    let specs = vec![SegSpec {
+        created_unix_ns: 1,
+        writer_epoch: 1,
+        writer_seq: 1,
+        series: vec![metric_series(
+            "m",
+            &(0..500).map(|i| (i, i as f64)).collect::<Vec<_>>(),
+        )],
+    }];
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(store.as_ref(), &specs).await;
+
+    // Query ceiling deliberately huge; tenant ceiling tiny, so the tenant
+    // budget is the one that must trip.
+    let config = SqlConfig {
+        engine: EngineConfig::default(),
+        max_query_bytes: 1 << 30,
+    };
+    let tenant = TenantMemoryAccountant::new(8);
+    let pool = config.query_pool(Arc::clone(&tenant));
+    let reserved_before = pool.reserved();
+    let rt = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()
+        .expect("runtime env");
+    let task_ctx = Arc::new(TaskContext::default().with_runtime(rt));
+
+    let fetcher = SegmentFetcher::new(Arc::clone(&store));
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let plan = provider.plan(1).expect("plan");
+    let err = collect(plan, task_ctx)
+        .await
+        .expect_err("tenant budget must trip");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("tenant memory budget exhausted"),
+        "expected the tenant-budget error, got: {msg}"
+    );
+    assert_eq!(
+        pool.reserved(),
+        reserved_before,
+        "a failed tenant grow must roll the query-side reservation back exactly, not partially"
+    );
+    assert_eq!(
+        tenant.reserved(),
+        0,
+        "the tenant accountant must reserve nothing on a failed grow"
+    );
+}
+
+/// Companion to the test above: with both ceilings equal and both reachable,
+/// the query message must still win, proving `try_grow` checks the query
+/// budget before the tenant budget rather than the two happening to differ
+/// in size in every other test.
+#[tokio::test]
+async fn query_budget_reported_first_when_both_ceilings_are_equally_reachable() {
+    let specs = vec![SegSpec {
+        created_unix_ns: 1,
+        writer_epoch: 1,
+        writer_seq: 1,
+        series: vec![metric_series(
+            "m",
+            &(0..500).map(|i| (i, i as f64)).collect::<Vec<_>>(),
+        )],
+    }];
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(store.as_ref(), &specs).await;
+
+    let config = SqlConfig {
+        engine: EngineConfig::default(),
+        max_query_bytes: 8,
+    };
+    let tenant = TenantMemoryAccountant::new(8);
+    let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
+
+    let fetcher = SegmentFetcher::new(Arc::clone(&store));
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let plan = provider.plan(1).expect("plan");
+    let err = collect(plan, task_ctx).await.expect_err("budget must trip");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("query memory pool exhausted"),
+        "with equal, equally-reachable ceilings the query check must run \
+         (and fail) first; got: {msg}"
     );
 }
