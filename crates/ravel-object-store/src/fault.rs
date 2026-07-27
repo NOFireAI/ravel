@@ -10,6 +10,15 @@
 //!   call). The first rule whose `op` and `key_contains` match a call fully
 //!   governs that call: either it fires (the scripted fault is applied) or
 //!   it passes the call through untouched. Rules never combine.
+//! - [`Sequence`]s script an ordered list of outcomes for successive matching
+//!   calls to one `(op, key)` (call 1 returns a transient error, call 2 a
+//!   `NotFound` blip, call 3 succeeds, ...). Sequences are evaluated before
+//!   rules: the first sequence with an unconsumed step whose `op` and
+//!   `key_contains` match governs the call. Once a sequence's steps are
+//!   exhausted it stops matching and the call falls through to rules and, if
+//!   configured, random mode. A single `FaultStore` never sees sequences
+//!   unless a plan carries them, so scripted-rule behavior is unchanged when
+//!   no sequence is configured.
 //! - `Op::List` matches both `list()` and `list_delimited()` calls.
 //! - If no rule matches, and a [`RandomFaultConfig`] is configured, each
 //!   fault kind applicable to the operation is tried in a fixed order
@@ -164,6 +173,96 @@ impl Rule {
     }
 }
 
+/// One outcome in a [`Sequence`]: either inject a fault or let the call pass
+/// straight through to the wrapped backend (a scripted success).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SequenceStep {
+    /// This matching call injects `fault` (exactly as a [`Rule`] would) and is
+    /// counted under its `(Op, FaultKind)` pair.
+    Fault(ScriptedFault),
+    /// This matching call is passed through to the wrapped backend untouched.
+    /// No fault counter moves; the sequence still advances by one step.
+    Passthrough,
+}
+
+/// A scripted, ordered sequence of outcomes for successive matching calls to
+/// one `(operation, key matcher)`. Each matching call consumes the next step:
+/// step 0 governs the first matching call, step 1 the second, and so on. Once
+/// every step is consumed the sequence stops matching and calls fall through
+/// to rules and random mode (see [`FaultStore`]'s module docs for precedence).
+///
+/// Use this for deterministic multi-call failure scenarios that a single
+/// [`Rule`] cannot express, where one key must return *different* outcomes on
+/// successive calls (retry-budget and fetcher retry/etag reproducers, for
+/// example). [`FaultStore::sequence_progress`] reports how many steps a
+/// sequence has consumed so a test can assert each step fired.
+///
+/// # Example
+///
+/// Script a `get` on any key containing `commit/` to fail with a transient
+/// error, then report a `NotFound` blip, then succeed. The fourth and later
+/// calls fall through to normal behavior.
+///
+/// ```
+/// use ravel_object_store::fault::{FaultPlan, Op, ScriptedFault, Sequence};
+///
+/// let plan = FaultPlan::empty().with_sequence(
+///     Sequence::new(Op::Get)
+///         .with_key_contains("commit/")
+///         .then_fault(ScriptedFault::Transient("blip".into()))
+///         .then_fault(ScriptedFault::NotFoundBlip)
+///         .then_passthrough(),
+/// );
+/// ```
+#[derive(Debug, Clone)]
+pub struct Sequence {
+    pub op: Op,
+    pub key_contains: Option<String>,
+    pub steps: Vec<SequenceStep>,
+}
+
+impl Sequence {
+    /// A new, empty sequence matching `op` on any key. Add outcomes with
+    /// [`Sequence::then_fault`] / [`Sequence::then_passthrough`], or set them
+    /// wholesale via [`Sequence::with_steps`].
+    pub fn new(op: Op) -> Self {
+        Sequence {
+            op,
+            key_contains: None,
+            steps: Vec::new(),
+        }
+    }
+
+    /// Restrict this sequence to keys containing `pattern` (same substring
+    /// semantics as [`Rule::with_key_contains`]).
+    #[must_use]
+    pub fn with_key_contains(mut self, pattern: impl Into<String>) -> Self {
+        self.key_contains = Some(pattern.into());
+        self
+    }
+
+    /// Append a fault outcome as the next step.
+    #[must_use]
+    pub fn then_fault(mut self, fault: ScriptedFault) -> Self {
+        self.steps.push(SequenceStep::Fault(fault));
+        self
+    }
+
+    /// Append a pass-through (scripted success) outcome as the next step.
+    #[must_use]
+    pub fn then_passthrough(mut self) -> Self {
+        self.steps.push(SequenceStep::Passthrough);
+        self
+    }
+
+    /// Replace the sequence's steps wholesale.
+    #[must_use]
+    pub fn with_steps(mut self, steps: Vec<SequenceStep>) -> Self {
+        self.steps = steps;
+        self
+    }
+}
+
 /// Seeded random fault mode: independent Bernoulli trials per fault kind,
 /// tried in the order given, restricted to kinds applicable to the
 /// operation being evaluated.
@@ -182,6 +281,7 @@ pub struct RandomFaultConfig {
 #[derive(Debug, Clone, Default)]
 pub struct FaultPlan {
     pub rules: Vec<Rule>,
+    pub sequences: Vec<Sequence>,
     pub random: Option<RandomFaultConfig>,
 }
 
@@ -193,6 +293,17 @@ impl FaultPlan {
     #[must_use]
     pub fn with_rule(mut self, rule: Rule) -> Self {
         self.rules.push(rule);
+        self
+    }
+
+    /// Register an ordered [`Sequence`]. Sequences are evaluated in
+    /// registration order and before any [`Rule`]; see the module docs for
+    /// precedence. Its registration index (the returned plan's
+    /// `sequences.len() - 1`) is the handle used with
+    /// [`FaultStore::sequence_progress`].
+    #[must_use]
+    pub fn with_sequence(mut self, sequence: Sequence) -> Self {
+        self.sequences.push(sequence);
         self
     }
 
@@ -208,6 +319,15 @@ struct RuleState {
     /// Count of calls that matched this rule's `op` + `key_contains`, used
     /// to evaluate `Occurrence::Nth`.
     hits: AtomicU64,
+}
+
+struct SequenceState {
+    seq: Sequence,
+    /// Count of matching calls seen so far; indexes `seq.steps`. Keeps
+    /// incrementing after the last step is consumed (harmless: `steps.get`
+    /// then returns `None` and the call falls through), so reporting clamps
+    /// it to the step count.
+    cursor: AtomicU64,
 }
 
 struct RandomState {
@@ -270,6 +390,7 @@ fn default_fault(kind: FaultKind) -> ScriptedFault {
 /// operation can panic on a lock).
 pub struct FaultStore<S> {
     inner: S,
+    sequences: Vec<SequenceState>,
     rules: Vec<RuleState>,
     random: Option<RandomState>,
     counters: RwLock<HashMap<(Op, FaultKind), u64>>,
@@ -277,6 +398,14 @@ pub struct FaultStore<S> {
 
 impl<S: ObjectStoreBackend> FaultStore<S> {
     pub fn new(inner: S, plan: FaultPlan) -> Self {
+        let sequences = plan
+            .sequences
+            .into_iter()
+            .map(|seq| SequenceState {
+                seq,
+                cursor: AtomicU64::new(0),
+            })
+            .collect();
         let rules = plan
             .rules
             .into_iter()
@@ -291,6 +420,7 @@ impl<S: ObjectStoreBackend> FaultStore<S> {
         });
         FaultStore {
             inner,
+            sequences,
             rules,
             random,
             counters: RwLock::new(HashMap::new()),
@@ -314,6 +444,19 @@ impl<S: ObjectStoreBackend> FaultStore<S> {
         self.counters.read().clone()
     }
 
+    /// How many steps the sequence registered at `index` (its
+    /// [`FaultPlan::with_sequence`] order) has consumed, clamped to the
+    /// sequence's step count. Equals the number of matching calls that
+    /// sequence governed; when it reaches the step count every step has
+    /// fired and further matching calls fall through. Returns `0` for an
+    /// out-of-range index.
+    pub fn sequence_progress(&self, index: usize) -> u64 {
+        self.sequences.get(index).map_or(0, |state| {
+            let len = state.seq.steps.len() as u64;
+            state.cursor.load(Ordering::SeqCst).min(len)
+        })
+    }
+
     fn record(&self, op: Op, kind: FaultKind) {
         *self.counters.write().entry((op, kind)).or_insert(0) += 1;
     }
@@ -321,6 +464,29 @@ impl<S: ObjectStoreBackend> FaultStore<S> {
     /// Decide whether a fault fires for this call, without performing any
     /// I/O. Returns `None` if the call should pass straight through.
     fn resolve(&self, op: Op, key: &str) -> Option<ScriptedFault> {
+        for state in &self.sequences {
+            if state.seq.op != op {
+                continue;
+            }
+            if let Some(pattern) = &state.seq.key_contains
+                && !key.contains(pattern.as_str())
+            {
+                continue;
+            }
+            // Matched by op + key. Consume the next step; an exhausted
+            // sequence (index past the last step) stops governing and the
+            // call falls through to the rule loop below.
+            let idx = state.cursor.fetch_add(1, Ordering::SeqCst) as usize;
+            match state.seq.steps.get(idx) {
+                None => continue,
+                Some(SequenceStep::Passthrough) => return None,
+                Some(SequenceStep::Fault(fault)) => {
+                    self.record(op, fault.kind());
+                    return Some(fault.clone());
+                }
+            }
+        }
+
         for state in &self.rules {
             if state.rule.op != op {
                 continue;
@@ -726,5 +892,174 @@ mod tests {
         // Not a degenerate all-same-result run (seed 42 / p=0.5 over 20 draws).
         assert!(outcomes_a.contains(&true));
         assert!(outcomes_a.contains(&false));
+    }
+
+    #[tokio::test]
+    async fn sequence_fires_outcomes_in_order_then_falls_through() {
+        // a4-F02 shape: a transient blip, then a NotFound blip, then success
+        // on the same key.
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains("commit/")
+                .then_fault(ScriptedFault::Transient("blip".into()))
+                .then_fault(ScriptedFault::NotFoundBlip)
+                .then_passthrough(),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store
+            .put("commit/1", Bytes::from_static(b"v"), PutOptions::default())
+            .await
+            .expect("seed");
+
+        assert!(matches!(
+            store.get("commit/1", GetRange::Full).await,
+            Err(StoreError::Transient(_))
+        ));
+        assert_eq!(store.sequence_progress(0), 1);
+        assert!(matches!(
+            store.get("commit/1", GetRange::Full).await,
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(store.sequence_progress(0), 2);
+        let ok = store
+            .get("commit/1", GetRange::Full)
+            .await
+            .expect("third call is the scripted passthrough");
+        assert_eq!(&ok.data[..], b"v");
+        assert_eq!(store.sequence_progress(0), 3);
+
+        // Exhausted: further calls fall through to the real backend.
+        let ok = store
+            .get("commit/1", GetRange::Full)
+            .await
+            .expect("fourth call passes through, sequence exhausted");
+        assert_eq!(&ok.data[..], b"v");
+        assert_eq!(
+            store.sequence_progress(0),
+            3,
+            "progress clamps at the step count once exhausted"
+        );
+
+        // Each fault step fired exactly once; the passthrough moved no counter.
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_sequence_falls_through_to_rules() {
+        // A sequence and a rule match the same (op, key). The sequence governs
+        // while it has steps; once exhausted the rule takes over every call.
+        let plan = FaultPlan::empty()
+            .with_sequence(Sequence::new(Op::Get).then_fault(ScriptedFault::Timeout))
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store
+            .put("k", Bytes::from_static(b"v"), PutOptions::default())
+            .await
+            .expect("seed");
+
+        assert!(matches!(
+            store.get("k", GetRange::Full).await,
+            Err(StoreError::Timeout)
+        ));
+        for _ in 0..3 {
+            assert!(matches!(
+                store.get("k", GetRange::Full).await,
+                Err(StoreError::NotFound)
+            ));
+        }
+        assert_eq!(store.sequence_progress(0), 1);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Timeout), 1);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 3);
+    }
+
+    #[tokio::test]
+    async fn sequence_key_pattern_only_scopes_matching_keys() {
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains("secret")
+                .then_fault(ScriptedFault::NotFoundBlip),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store
+            .put("secret/1", Bytes::from_static(b"a"), PutOptions::default())
+            .await
+            .expect("seed");
+        store
+            .put("public/1", Bytes::from_static(b"b"), PutOptions::default())
+            .await
+            .expect("seed");
+
+        // A non-matching key never advances the sequence.
+        assert!(store.get("public/1", GetRange::Full).await.is_ok());
+        assert_eq!(store.sequence_progress(0), 0);
+        // The matching key consumes step 0.
+        assert!(matches!(
+            store.get("secret/1", GetRange::Full).await,
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(store.sequence_progress(0), 1);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+    }
+
+    #[tokio::test]
+    async fn multiple_sequences_consume_in_registration_order() {
+        let plan = FaultPlan::empty()
+            .with_sequence(Sequence::new(Op::Head).then_fault(ScriptedFault::Timeout))
+            .with_sequence(Sequence::new(Op::Head).then_fault(ScriptedFault::NotFoundBlip));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store
+            .put("k", Bytes::from_static(b"v"), PutOptions::default())
+            .await
+            .expect("seed");
+
+        // The first-registered sequence governs until exhausted, then the next.
+        assert!(matches!(store.head("k").await, Err(StoreError::Timeout)));
+        assert!(matches!(store.head("k").await, Err(StoreError::NotFound)));
+        // Both exhausted: the call reaches the real backend.
+        assert!(store.head("k").await.is_ok());
+        assert_eq!(store.sequence_progress(0), 1);
+        assert_eq!(store.sequence_progress(1), 1);
+    }
+
+    #[tokio::test]
+    async fn sequences_default_empty_and_do_not_disturb_rules() {
+        assert!(FaultPlan::empty().sequences.is_empty());
+
+        // A Put sequence and a Get rule coexist without interfering; existing
+        // rule/occurrence semantics are unchanged by the presence of a
+        // sequence on a different operation.
+        let plan = FaultPlan::empty()
+            .with_sequence(
+                Sequence::new(Op::Put)
+                    .then_fault(ScriptedFault::Timeout)
+                    .then_passthrough(),
+            )
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+
+        // Put step 0 fires.
+        assert!(matches!(
+            store
+                .put("k", Bytes::from_static(b"v"), PutOptions::default())
+                .await,
+            Err(StoreError::Timeout)
+        ));
+        // Put step 1 passes through: the object lands.
+        store
+            .put("k", Bytes::from_static(b"v"), PutOptions::default())
+            .await
+            .expect("second put is the scripted passthrough");
+        // The Get rule fires exactly as it does without any sequence present.
+        assert!(matches!(
+            store.get("k", GetRange::Full).await,
+            Err(StoreError::NotFound)
+        ));
+
+        assert_eq!(store.sequence_progress(0), 2);
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Timeout), 1);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+        // The out-of-range index is safe and reports zero.
+        assert_eq!(store.sequence_progress(99), 0);
     }
 }
