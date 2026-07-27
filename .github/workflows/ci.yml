@@ -23,6 +23,79 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Runs the object-store contract suite (docs/object-store-contract.md)
+  # against a real MinIO endpoint. Without this job the `minio_contract`
+  # test in crates/ravel-object-store/tests/contract.rs early-returns
+  # (RAVEL_MINIO_URL unset), so the only durable backend Ravel ships against
+  # -- S3 -- gets zero CI coverage and an S3Store regression passes green
+  # (finding a11-F02). This job is required: object storage is the source of
+  # truth, so a break in the S3 adapter must fail CI, not be waved through.
+  #
+  # MinIO is launched with `docker run` rather than a GitHub Actions service
+  # container because the minio/minio image needs a `server /data` command,
+  # which the `services:` syntax cannot supply. The image and default
+  # credentials mirror deploy/docker-compose/minio.yml's role.
+  object-store-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+      - name: Wait for MinIO to be live
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live; then
+              echo "MinIO is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time"
+          docker logs minio || true
+          exit 1
+      - name: Create the contract-suite bucket
+        run: |
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/ravel-object-store-test"
+      # The contract suite's S3/MinIO case is gated on RAVEL_MINIO_URL; set it
+      # (and the credentials/bucket the docker run above provisioned) so the
+      # gated test executes instead of skipping.
+      - name: Run object-store contract suite against MinIO
+        env:
+          RAVEL_MINIO_URL: http://localhost:9000
+          RAVEL_MINIO_BUCKET: ravel-object-store-test
+          RAVEL_MINIO_ACCESS_KEY: minioadmin
+          RAVEL_MINIO_SECRET_KEY: minioadmin
+          RAVEL_MINIO_REGION: us-east-1
+        run: |
+          set -o pipefail
+          cargo test -p ravel-object-store --test contract minio_contract \
+            -- --exact --nocapture | tee contract-output.txt
+          # Prove the suite actually ran against MinIO rather than taking the
+          # RAVEL_MINIO_URL-unset early return. If the guard printed its skip
+          # line, or libtest did not report exactly one passing test, fail the
+          # job even though `cargo test` itself exited 0 on a clean skip.
+          if grep -q "skipping MinIO contract test" contract-output.txt; then
+            echo "::error::minio_contract skipped despite RAVEL_MINIO_URL set"
+            exit 1
+          fi
+          if ! grep -q "test result: ok. 1 passed" contract-output.txt; then
+            echo "::error::minio_contract did not run (expected 1 passed)"
+            exit 1
+          fi
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+
   coverage:
     runs-on: ubuntu-latest
     steps:
