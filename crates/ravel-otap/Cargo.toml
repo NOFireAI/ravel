@@ -28,6 +28,12 @@ protox = { workspace = true }
 ravel-test-util = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
+criterion = { workspace = true }
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "decode"
+harness = false
 
 [lints]
 workspace = true

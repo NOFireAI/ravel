@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, DictionaryArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, UInt8Type};
+use proptest::prelude::*;
 use ravel_otap::encode::{AttrRow, DataPointRow, MetricRow, MetricsStreamEncoder};
 use ravel_otap::proto::experimental::arrow::v1::{
     ArrowPayload, ArrowPayloadType, BatchArrowRecords,
@@ -171,7 +172,7 @@ fn decompression_bomb_rejected_before_allocation() {
         arrow_payloads: vec![ArrowPayload {
             schema_id: "bomb".to_string(),
             r#type: ArrowPayloadType::UnivariateMetrics as i32,
-            record: compressed,
+            record: compressed.into(),
         }],
         headers: Vec::new(),
     };
@@ -227,7 +228,7 @@ fn malformed_ipc_bytes_nack_batch_and_stream_survives() {
         arrow_payloads: vec![ArrowPayload {
             schema_id: "garbage".to_string(),
             r#type: ArrowPayloadType::UnivariateMetrics as i32,
-            record: zstd_wrap(b"not an arrow ipc stream at all, just noise bytes"),
+            record: zstd_wrap(b"not an arrow ipc stream at all, just noise bytes").into(),
         }],
         headers: Vec::new(),
     };
@@ -286,8 +287,8 @@ fn schema_store_corruption_yields_stream_error_and_poisons_stream() {
         .find(|p| p.r#type == ArrowPayloadType::NumberDpAttrs as i32)
         .expect("batch 2 has an attrs payload")
         .clone();
-    let raw = zstd::stream::decode_all(attrs_payload.record.as_slice())
-        .expect("decompress batch 2 attrs");
+    let raw =
+        zstd::stream::decode_all(attrs_payload.record.as_ref()).expect("decompress batch 2 attrs");
 
     let marker_at = raw
         .windows(MARKER.len())
@@ -302,7 +303,7 @@ fn schema_store_corruption_yields_stream_error_and_poisons_stream() {
     // batch 1) tries to materialize the array.
     corrupted[marker_at] = 0xff;
     let corrupted_payload = ArrowPayload {
-        record: zstd_wrap(&corrupted),
+        record: zstd_wrap(&corrupted).into(),
         ..attrs_payload
     };
     let corrupted_batch = BatchArrowRecords {
@@ -353,7 +354,7 @@ fn max_schemas_per_stream_is_enforced() {
         ArrowPayload {
             schema_id: schema_id.to_string(),
             r#type: ArrowPayloadType::UnivariateMetrics as i32,
-            record: zstd_wrap(&buf),
+            record: zstd_wrap(&buf).into(),
         }
     };
 
@@ -388,4 +389,141 @@ fn max_schemas_per_stream_is_enforced() {
     // already-admitted decoders are untouched and the stream is not
     // poisoned (a later test covers `StreamError::Poisoned` directly).
     assert!(!state.is_poisoned());
+}
+
+/// Regression coverage for issue #18 (A2): prost `bytes::Bytes` decode,
+/// aligned-buffer decompression, and feeding `StreamDecoder` the shared
+/// buffer must not change one decoded bit versus what was encoded. There is
+/// no pre-existing OTLP-vs-OTAP differential gate or fuzz target in this
+/// repo to re-run (see final report); these tests are this crate's
+/// equivalent coverage: value-preservation across the new decode path
+/// (bit-for-bit on floats, per CLAUDE.md) and corrupt-input robustness.
+mod a2_regression {
+    use super::*;
+
+    fn double_values(dp_batches: &[&RecordBatch]) -> Vec<f64> {
+        dp_batches
+            .iter()
+            .flat_map(|rb| {
+                rb.column_by_name("double_value")
+                    .expect("double_value column")
+                    .as_primitive::<arrow::datatypes::Float64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    fn point_value_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            any::<f64>(),
+            Just(f64::NAN),
+            Just(-0.0_f64),
+            Just(0.0_f64),
+            Just(f64::INFINITY),
+            Just(f64::NEG_INFINITY),
+        ]
+    }
+
+    fn point_strategy() -> impl Strategy<Value = (i64, f64)> {
+        (any::<i64>(), point_value_strategy())
+    }
+
+    fn metric_strategy() -> impl Strategy<Value = (String, Vec<(i64, f64)>)> {
+        (
+            "[a-z]{1,8}",
+            proptest::collection::vec(point_strategy(), 0..6),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Encoding then decoding through the new `Bytes`/aligned-buffer/
+        /// `StreamDecoder` path must preserve every `double_value` bit
+        /// pattern exactly, including NaN payloads and signed zero.
+        #[test]
+        fn decode_preserves_double_value_bits(
+            metrics in proptest::collection::vec(metric_strategy(), 0..4),
+        ) {
+            let rows: Vec<MetricRow> = metrics
+                .iter()
+                .map(|(name, points)| {
+                    metric(
+                        name,
+                        points
+                            .iter()
+                            .map(|(ts, value)| point(*ts, *value, vec![]))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let expected_bits: Vec<u64> = metrics
+                .iter()
+                .flat_map(|(_, points)| points.iter().map(|(_, value)| value.to_bits()))
+                .collect();
+
+            let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder construction");
+            let batch = encoder.encode_batch(1, &rows).expect("encode batch");
+            let mut state = StreamState::new(StreamConfig::default());
+            let decoded = state.decode(batch).expect("decode batch");
+
+            let dp: Vec<&RecordBatch> = dp_batches(&decoded.payloads).collect();
+            let actual_bits: Vec<u64> = double_values(&dp).into_iter().map(f64::to_bits).collect();
+            prop_assert_eq!(actual_bits, expected_bits);
+        }
+
+        /// Arbitrary bytes wrapped as a zstd-compressed `ArrowPayload.record`
+        /// must never panic the decoder: either it is rejected with a typed
+        /// error, or (vanishingly unlikely for random bytes) it happens to
+        /// parse, but `StreamState` must stay usable either way.
+        #[test]
+        fn decode_never_panics_on_arbitrary_bytes(raw in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let compressed = zstd::stream::encode_all(raw.as_slice(), 0).expect("zstd compress");
+            let mut state = StreamState::new(StreamConfig::default());
+            let batch = BatchArrowRecords {
+                batch_id: 1,
+                arrow_payloads: vec![ArrowPayload {
+                    schema_id: "fuzz".to_string(),
+                    r#type: ArrowPayloadType::UnivariateMetrics as i32,
+                    record: compressed.into(),
+                }],
+                headers: Vec::new(),
+            };
+            let _ = state.decode(batch);
+        }
+    }
+
+    /// The copy-fallback counter added for issue #18 must account for every
+    /// decoded frame exactly once: over an ordinary roundtrip, zero-copy and
+    /// copy-fallback frames must sum to the number of `RecordBatch`es
+    /// decoded, and (with our own encoder producing standard 8-byte-padded
+    /// IPC bodies into an aligned destination buffer) the frames must be
+    /// zero-copy.
+    #[test]
+    fn decode_stats_account_for_every_frame() {
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let mut state = StreamState::new(StreamConfig::default());
+
+        let batch = encoder
+            .encode_batch(
+                1,
+                &[metric(
+                    "cpu.load",
+                    vec![point(1_000, 0.5, vec![("host", "a")])],
+                )],
+            )
+            .expect("encode batch");
+        let decoded = state.decode(batch).expect("decode batch");
+        let frames = decoded.payloads.len() as u64;
+
+        let stats = state.decode_stats();
+        assert_eq!(stats.zero_copy_frames + stats.copy_fallback_frames, frames);
+        assert_eq!(
+            stats.copy_fallback_frames, 0,
+            "our own encoder's IPC bodies are 8-byte aligned into a 64-byte \
+             aligned destination buffer, so this frame must be zero-copy"
+        );
+    }
 }
