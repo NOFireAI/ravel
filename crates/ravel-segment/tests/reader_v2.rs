@@ -107,6 +107,26 @@ fn full_decode_v1(bytes: &[u8]) -> Result<Vec<(SeriesId, LabelSet, Vec<Sample>)>
     Ok(out)
 }
 
+/// Dispatches to [`full_decode_v1`]/[`full_decode_v2`] based on whichever
+/// version the trailer actually reports, for the P4 mutation/truncation
+/// tests below that must not assume up front which version (if any
+/// well-formed one at all) survives a given mutation. Never panics on the
+/// dispatch itself: `open_from_full`'s own version check already restricts
+/// `loc.version` to 1 or 2 before either helper's internal `assert_eq!` is
+/// reached, so the `unreachable!` arm is genuinely unreachable, not a
+/// disguised `expect`.
+fn full_decode_dispatch(
+    bytes: &[u8],
+) -> Result<Vec<(SeriesId, LabelSet, Vec<Sample>)>, SegmentError> {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits)?;
+    match loc.version {
+        1 => full_decode_v1(bytes),
+        2 => full_decode_v2(bytes),
+        other => unreachable!("open_from_full only ever returns version 1 or 2, got {other}"),
+    }
+}
+
 fn normalize(entries: &[(SeriesId, LabelSet, Vec<Sample>)]) -> Vec<NormalizedSeries> {
     let mut out: Vec<_> = entries
         .iter()
@@ -709,6 +729,53 @@ impl MetaSpec {
         push_block(&mut buf, &self.val_page_len);
         buf
     }
+
+    /// Same output as [`MetaSpec::build`], but also returns each of the 9
+    /// column blocks' CONTENT byte range (i.e. excluding its `block_len`
+    /// varint prefix) within the buffer, keyed by the block's name from
+    /// docs/segment-format.md's v2 amendment ("then 9 column blocks..."),
+    /// for the per-block-boundary mutation/truncation test below (P4,
+    /// issue #32). Callers should `assert_eq!` the returned bytes against
+    /// `build()`'s output so this can never silently drift out of sync
+    /// with it.
+    fn build_with_block_ranges(&self) -> (Vec<u8>, Vec<(&'static str, std::ops::Range<usize>)>) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.count.to_le_bytes());
+        buf.extend_from_slice(&(self.schemas.len() as u32).to_le_bytes());
+        for schema in &self.schemas {
+            write_uvarint(&mut buf, schema.len() as u64);
+            for n in schema {
+                write_uvarint(&mut buf, *n);
+            }
+        }
+
+        let mut ranges: Vec<(&'static str, std::ops::Range<usize>)> = Vec::new();
+        push_block_tracked(&mut buf, &self.schema_ref, "schema_ref", &mut ranges);
+
+        // value_ord's prefix is the serialized varint stream's byte length
+        // (not a value count like the other 8 blocks), but the boundary
+        // tracking is otherwise identical.
+        let mut vo_block = Vec::new();
+        for vals in &self.value_ord {
+            for v in vals {
+                write_uvarint(&mut vo_block, *v);
+            }
+        }
+        write_uvarint(&mut buf, vo_block.len() as u64);
+        let vo_start = buf.len();
+        buf.extend_from_slice(&vo_block);
+        ranges.push(("value_ord", vo_start..buf.len()));
+
+        push_block_tracked(&mut buf, &self.sample_count, "sample_count", &mut ranges);
+        push_block_tracked(&mut buf, &self.min_ts_delta, "min_ts_delta", &mut ranges);
+        push_block_tracked(&mut buf, &self.ts_span, "ts_span", &mut ranges);
+        push_block_tracked(&mut buf, &self.ts_page_gap, "ts_page_gap", &mut ranges);
+        push_block_tracked(&mut buf, &self.ts_page_len, "ts_page_len", &mut ranges);
+        push_block_tracked(&mut buf, &self.val_page_gap, "val_page_gap", &mut ranges);
+        push_block_tracked(&mut buf, &self.val_page_len, "val_page_len", &mut ranges);
+
+        (buf, ranges)
+    }
 }
 
 fn push_block(buf: &mut Vec<u8>, values: &[u64]) {
@@ -718,6 +785,26 @@ fn push_block(buf: &mut Vec<u8>, values: &[u64]) {
     }
     write_uvarint(buf, block.len() as u64);
     buf.extend_from_slice(&block);
+}
+
+/// Same as [`push_block`], but also records the pushed block's CONTENT
+/// byte range (post length-prefix) under `name` in `ranges`. Additive
+/// sibling used only by [`MetaSpec::build_with_block_ranges`]; `push_block`
+/// itself (used by every existing P3 corpus test) is untouched.
+fn push_block_tracked(
+    buf: &mut Vec<u8>,
+    values: &[u64],
+    name: &'static str,
+    ranges: &mut Vec<(&'static str, std::ops::Range<usize>)>,
+) {
+    let mut block = Vec::new();
+    for v in values {
+        write_uvarint(&mut block, *v);
+    }
+    write_uvarint(buf, block.len() as u64);
+    let start = buf.len();
+    buf.extend_from_slice(&block);
+    ranges.push((name, start..buf.len()));
 }
 
 /// Builds a complete, self-consistent (footer, LABEL_DICT bytes,
@@ -1251,4 +1338,475 @@ fn empty_v2_segment_decodes_to_zero_entries() {
     let lazy = ravel_segment::decode_catalog_matching_v2(&loc.footer, dict, ids, meta, &[], limits)
         .expect("decodes");
     assert!(lazy.is_empty());
+}
+
+// ===========================================================================
+// P4: fuzz/property hardening over both versions (docs/rseg-v2-plan.md
+// phase P4, issue #32). Sections 1-7 above (P3, issue #31) are unmodified;
+// everything below is additive. Reuses this file's existing helpers
+// (`differential_fixture`, `lazy_running_sum_fixture`, `full_decode_v1`/
+// `full_decode_v2`/`normalize`, `labelset_strategy`/`ts_strategy`/
+// `sample_value_strategy`/`samples_strategy`, `MetaSpec`/`build_scenario`)
+// rather than reinventing them, per the ticket.
+// ===========================================================================
+
+// --- 8. Generalized v1-vs-v2 differential property ----------------------
+//
+// Section 1 above is one hand-picked fixture. This extends the same
+// comparison -- catalog entries field-by-field (except val_page's OFFSET,
+// which legitimately differs under v2 alignment padding, exactly as
+// section 1 documents), then full sample decode compared bit-for-bit via
+// `normalize` -- to arbitrary generated input, reusing the label/
+// timestamp/value strategies already defined in section 5 above instead of
+// defining new ones. Exhaustive mutation loops deliberately do NOT belong
+// inside a proptest body (each of the ~200 cases would multiply by however
+// many mutations it ran); this test is pure differential comparison, no
+// mutation, so it belongs here.
+
+fn build_series_inputs_for_differential(
+    series_data: &[(LabelSet, Vec<(i64, f64)>)],
+) -> Vec<SeriesInput> {
+    series_data
+        .iter()
+        .enumerate()
+        .map(|(idx, (series_labels, samples))| {
+            let mut id_bytes = [0u8; 16];
+            id_bytes[..8].copy_from_slice(&(idx as u64).to_be_bytes());
+            SeriesInput {
+                series_id: SeriesId(id_bytes),
+                labels: series_labels.clone(),
+                samples: samples
+                    .iter()
+                    .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn v1_v2_differential_over_arbitrary_input(
+        series_data in prop::collection::vec((labelset_strategy(), samples_strategy()), 0..8),
+        tenant_hash in uniform16(any::<u8>()),
+        shard in any::<u32>(),
+        writer_id in "[a-zA-Z0-9-]{1,20}",
+        epoch in any::<u64>(),
+        seq in any::<u64>(),
+    ) {
+        // write() and write_v2() each consume their input by value and
+        // neither SeriesInput nor SegmentIdentity/IngestBounds is Clone, so
+        // build two independent (but logically identical) batches/structs
+        // rather than adding Clone derives to production types for test
+        // convenience.
+        let inputs1 = build_series_inputs_for_differential(&series_data);
+        let inputs2 = build_series_inputs_for_differential(&series_data);
+        let identity1 = SegmentIdentity {
+            tenant_hash,
+            shard,
+            writer_id: writer_id.clone(),
+            writer_epoch: epoch,
+            writer_seq: seq,
+        };
+        let identity2 = SegmentIdentity {
+            tenant_hash,
+            shard,
+            writer_id,
+            writer_epoch: epoch,
+            writer_seq: seq,
+        };
+        let bounds1 = IngestBounds {
+            min_ingest_ts_ns: -1_000_000_000,
+            max_ingest_ts_ns: 1_000_000_000,
+        };
+        let bounds2 = IngestBounds {
+            min_ingest_ts_ns: -1_000_000_000,
+            max_ingest_ts_ns: 1_000_000_000,
+        };
+
+        let v1 = SegmentWriter::write(inputs1, identity1, bounds1).expect("v1 writes");
+        let v2 = SegmentWriter::write_v2(inputs2, identity2, bounds2).expect("v2 writes");
+
+        let limits = ReaderLimits::default();
+        let loc1 = ravel_segment::open_from_full(&v1.bytes, limits).expect("v1 opens");
+        let loc2 = ravel_segment::open_from_full(&v2.bytes, limits).expect("v2 opens");
+        prop_assert_eq!(loc1.version, 1);
+        prop_assert_eq!(loc2.version, 2);
+
+        let dict1 = section_bytes(&v1.bytes, &loc1.footer, 1);
+        let table1 = section_bytes(&v1.bytes, &loc1.footer, 2);
+        let mut entries1 =
+            ravel_segment::decode_catalog(&loc1.footer, dict1, table1, limits).expect("v1 catalog");
+        entries1.sort_by_key(|e| e.series_id.0);
+
+        let dict2 = section_bytes(&v2.bytes, &loc2.footer, LABEL_DICT);
+        let ids2 = section_bytes(&v2.bytes, &loc2.footer, SERIES_IDS);
+        let meta2 = section_bytes(&v2.bytes, &loc2.footer, SERIES_META);
+        let mut entries2 = ravel_segment::decode_catalog_v2(&loc2.footer, dict2, ids2, meta2, limits)
+            .expect("v2 catalog");
+        entries2.sort_by_key(|e| e.series_id.0);
+
+        prop_assert_eq!(entries1.len(), entries2.len());
+        for (a, b) in entries1.iter().zip(entries2.iter()) {
+            prop_assert_eq!(a.series_id, b.series_id);
+            prop_assert_eq!(&a.labels, &b.labels);
+            prop_assert_eq!(a.sample_count, b.sample_count);
+            prop_assert_eq!(a.min_ts_ns, b.min_ts_ns);
+            prop_assert_eq!(a.max_ts_ns, b.max_ts_ns);
+            prop_assert_eq!(a.ts_page, b.ts_page);
+            // val_page OFFSET may legitimately differ (v2 8-byte alignment
+            // padding, see section 1's comment above); length must agree.
+            prop_assert_eq!(a.val_page.1, b.val_page.1);
+        }
+
+        // The real differential: full sample decode, bit-for-bit (NaN
+        // payload and -0.0 significant, per `sample_value_strategy`).
+        let decoded1 = full_decode_v1(&v1.bytes).expect("v1 full decode");
+        let decoded2 = full_decode_v2(&v2.bytes).expect("v2 full decode");
+        prop_assert_eq!(normalize(&decoded1), normalize(&decoded2));
+    }
+}
+
+// --- 9. Byte-level mutation fuzzing, v2: exhaustive single-byte flips --
+//
+// tests/roundtrip.rs's `corruption_every_byte_flip_errors_or_matches`
+// already does this exhaustively for v1 and finds zero uncovered bytes
+// (v1 has no padding); that test is unmodified by this ticket. v2 objects
+// legitimately contain bytes no checksum on the selective decode path
+// covers: inter-section alignment padding before VAL_PAGES, and
+// intra-VAL_PAGES padding before individual VAL_RAW_F64 pages
+// (docs/segment-format.md "Checksum coverage, v2": both listed "n/a on the
+// selective path"). So instead of requiring zero silent passes, this
+// computes the exact set of checksum-covered byte offsets for the object
+// under test (footer+trailer, the three crc-verified catalog sections, and
+// every entry's actual TS/VAL page byte range, each page fully covered by
+// its own crc per `split_page_header`) and asserts every silent pass falls
+// OUTSIDE that set -- a positive pin on the v2 checksum-coverage claim, not
+// just a tolerance for it.
+
+#[test]
+fn v2_object_byte_flip_uncovered_offsets_are_exactly_padding() {
+    // Uses `lazy_running_sum_fixture` (not `differential_fixture`): it's
+    // documented (section 3 above) to force a raw-fallback VAL_RAW_F64
+    // page, which forces nonzero alignment padding, so this sweep actually
+    // exercises the pad-byte path instead of only vacuously passing.
+    let written =
+        SegmentWriter::write_v2(lazy_running_sum_fixture(), test_identity(), test_bounds())
+            .expect("v2 writes");
+    let bytes = written.bytes.to_vec();
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(&bytes, limits).expect("opens");
+    assert_eq!(loc.version, 2);
+
+    let dict = section_bytes(&bytes, &loc.footer, LABEL_DICT);
+    let ids = section_bytes(&bytes, &loc.footer, SERIES_IDS);
+    let meta = section_bytes(&bytes, &loc.footer, SERIES_META);
+    let entries =
+        ravel_segment::decode_catalog_v2(&loc.footer, dict, ids, meta, limits).expect("catalog");
+    let ts_section = loc
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == 3)
+        .expect("ts section");
+    let val_section = loc
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == 4)
+        .expect("val section");
+
+    let n = bytes.len();
+    let mut covered = vec![false; n];
+    for b in covered.iter_mut().skip(loc.footer_offset as usize) {
+        *b = true; // footer + trailer, entirely under footer_crc32c.
+    }
+    for section in &loc.footer.sections {
+        if matches!(section.kind, LABEL_DICT | SERIES_IDS | SERIES_META) {
+            let start = section.offset as usize;
+            let end = start + section.len as usize;
+            covered[start..end].fill(true);
+        }
+    }
+    let mut had_padding = false;
+    for entry in &entries {
+        let ts_start = (ts_section.offset + entry.ts_page.0) as usize;
+        let ts_end = ts_start + entry.ts_page.1 as usize;
+        covered[ts_start..ts_end].fill(true);
+        let val_start = (val_section.offset + entry.val_page.0) as usize;
+        let val_end = val_start + entry.val_page.1 as usize;
+        covered[val_start..val_end].fill(true);
+    }
+    if !covered[..val_section.offset as usize + val_section.len as usize]
+        .iter()
+        .all(|&c| c)
+    {
+        had_padding = true;
+    }
+    assert!(
+        had_padding,
+        "test fixture must actually produce alignment padding, or this sweep \
+         is vacuous -- see lazy_running_sum_fixture's doc comment"
+    );
+
+    let original = normalize(&full_decode_v2(&bytes).expect("baseline decodes"));
+    let mut silent_passes = 0usize;
+    for offset in 0..n {
+        let mut flipped = bytes.clone();
+        flipped[offset] ^= 0xFF;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            full_decode_dispatch(&flipped)
+        }));
+        match result {
+            Err(_) => panic!("byte flip at offset {offset} caused a panic"),
+            Ok(Err(_)) => {} // fails closed: fine regardless of coverage
+            Ok(Ok(decoded)) => {
+                assert_eq!(
+                    normalize(&decoded),
+                    original,
+                    "byte flip at offset {offset} produced a DIFFERENT decode \
+                     without erroring -- silent corruption"
+                );
+                assert!(
+                    !covered[offset],
+                    "byte flip at offset {offset} passed silently but IS \
+                     checksum-covered (footer/trailer, a crc-verified section, \
+                     or a page range) -- this is exactly the gap the v2 \
+                     checksum coverage table (docs/segment-format.md) rules out"
+                );
+                silent_passes += 1;
+            }
+        }
+    }
+    eprintln!(
+        "v2 byte-flip sweep: {n} offsets, {silent_passes} passed silently \
+         (all confirmed to be alignment padding, never a checksum-covered byte)"
+    );
+}
+
+// --- 10. Byte-level mutation fuzzing: exhaustive truncation, both       ---
+// --- versions -------------------------------------------------------- ---
+//
+// tests/roundtrip.rs covers v1 byte flips but not truncation; this closes
+// that gap for v1 too, deliberately here (not in roundtrip.rs, which this
+// ticket leaves completely unmodified, per that file's own header comment)
+// since P4 explicitly hardens "both versions" together.
+
+fn assert_truncation_always_fails_closed(bytes: &[u8], label: &str) {
+    for len in 0..bytes.len() {
+        let truncated = &bytes[..len];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            full_decode_dispatch(truncated)
+        }));
+        match result {
+            Err(_) => panic!("{label}: truncation to {len} bytes caused a panic"),
+            Ok(Ok(_)) => panic!(
+                "{label}: truncation to {len} bytes decoded successfully -- \
+                 truncated data must fail closed, never decode"
+            ),
+            Ok(Err(_)) => {} // expected: typed error
+        }
+    }
+}
+
+#[test]
+fn v1_object_truncation_always_fails_closed() {
+    let written = SegmentWriter::write(differential_fixture(), test_identity(), test_bounds())
+        .expect("v1 writes");
+    assert_truncation_always_fails_closed(&written.bytes, "v1");
+}
+
+#[test]
+fn v2_object_truncation_always_fails_closed() {
+    let written = SegmentWriter::write_v2(differential_fixture(), test_identity(), test_bounds())
+        .expect("v2 writes");
+    assert_truncation_always_fails_closed(&written.bytes, "v2");
+}
+
+// --- 11. Byte-level mutation fuzzing: every SERIES_META block boundary --
+//
+// Real v2 objects store SERIES_META zstd-compressed, so wire-level
+// mutation of the compressed bytes mostly just breaks zstd decompression
+// (a generic `Decompress` error already exercised by the whole-object
+// byte-flip sweep in section 9 and by `real_object_series_meta_byte_flip_
+// is_rejected_by_section_crc` in section 6). To actually test the block-
+// boundary semantics docs/segment-format.md defines (each of the 9
+// columns' `block_len` prefix and content), this reuses the hand-crafted,
+// uncompressed (`comp = 0`) `MetaSpec`/`build_scenario` infrastructure
+// section 6 already established as a valid v2 shape, plus the section-crc
+// recompute idiom every P3 corpus test above already uses when mutating
+// bytes after construction.
+
+fn with_updated_meta_section(footer: &Footer, meta: &[u8]) -> Footer {
+    let mut footer = footer.clone();
+    let idx = footer
+        .sections
+        .iter()
+        .position(|s| s.kind == SERIES_META)
+        .expect("series meta section present");
+    footer.sections[idx].len = meta.len() as u64;
+    footer.sections[idx].uncompressed_len = meta.len() as u64;
+    footer.sections[idx].crc32c = crc32c::crc32c(meta);
+    footer
+}
+
+#[test]
+fn series_meta_block_boundary_mutations_never_panic_and_fail_closed() {
+    let ids = [[0x01; 16], [0x02; 16]];
+    let spec = MetaSpec::baseline();
+    let (footer, dict, ids_bytes, _) = build_scenario(&["app", "va", "vb"], &ids, &spec);
+    let (meta, block_ranges) = spec.build_with_block_ranges();
+    assert_eq!(
+        meta,
+        spec.build(),
+        "build_with_block_ranges must match build() byte-for-byte"
+    );
+
+    for (name, range) in &block_ranges {
+        // (a) flip the first and last content byte of this block.
+        for &pos in &[range.start, range.end.saturating_sub(1)] {
+            if range.is_empty() || pos >= meta.len() {
+                continue;
+            }
+            let mut m = meta.clone();
+            m[pos] ^= 0xFF;
+            let f = with_updated_meta_section(&footer, &m);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode(&f, &dict, &ids_bytes, &m)
+            }));
+            match outcome {
+                Err(_) => panic!("panic flipping byte {pos} in block {name}"),
+                Ok(Err(_)) => {} // fails closed: expected
+                Ok(Ok(entries)) => {
+                    // Not every content mutation is guaranteed to be
+                    // structurally invalid (a gap/len varint can flip to
+                    // another in-range value) -- but it must never panic,
+                    // and any successful decode must still be a
+                    // self-consistent SeriesEntry list of the declared size,
+                    // never garbage.
+                    assert_eq!(entries.len(), spec.count as usize, "block {name}");
+                }
+            }
+        }
+
+        // (b) truncate the whole meta buffer to end exactly at this
+        // block's content start: cuts off this block, and everything
+        // after it, entirely.
+        let m = meta[..range.start].to_vec();
+        let f = with_updated_meta_section(&footer, &m);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode(&f, &dict, &ids_bytes, &m)
+        }));
+        match outcome {
+            Err(_) => panic!("panic truncating meta before block {name}'s content"),
+            Ok(Ok(_)) => panic!("truncating meta before block {name} decoded successfully"),
+            Ok(Err(_)) => {} // expected: typed error
+        }
+
+        // (c) truncate mid-content, when the block has more than one byte.
+        if range.len() > 1 {
+            let mid = range.start + range.len() / 2;
+            let m = meta[..mid].to_vec();
+            let f = with_updated_meta_section(&footer, &m);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode(&f, &dict, &ids_bytes, &m)
+            }));
+            match outcome {
+                Err(_) => panic!("panic truncating meta mid-block {name}"),
+                Ok(Ok(_)) => panic!("truncating meta mid-block {name} decoded successfully"),
+                Ok(Err(_)) => {} // expected: typed error
+            }
+        }
+    }
+}
+
+// --- 12. Cross-version grammar confusion --------------------------------
+//
+// A real object's trailer version stamped to the OTHER version, with
+// footer_crc32c recomputed so the object is internally consistent up to
+// that point (never just a simple crc mismatch) -- the "presented under
+// the wrong trailer" case docs/rseg-v2-plan.md phase P4 calls out. This
+// goes through the real `open_from_full` entry point end to end (unlike
+// `validate_sections_v2_and_v1_mandatory_kind_sets_are_distinct` in section
+// 7 above, which calls `validate_sections` directly with a hand-picked
+// version argument to test the dispatch logic in isolation -- this test
+// instead proves an actual byte-level object with a self-consistent but
+// wrong-version trailer fails the same way when opened for real).
+
+/// Recomputes footer_crc32c the way the writer does (docs/segment-format.md:
+/// "computed over: FooterProto bytes, then footer_len (u32 LE), version
+/// (u16 LE), signal, reserved, magic"; mirrors src/crc.rs's private
+/// `footer_crc`, which isn't exported outside the crate). The only way to
+/// reach `validate_sections` -- rather than failing immediately on
+/// `FooterCrcMismatch` -- after re-stamping a real object's trailer
+/// version byte.
+fn recompute_footer_crc(bytes: &mut [u8]) {
+    let n = bytes.len();
+    let trailer_start = n - 16;
+    let footer_len =
+        u32::from_le_bytes(bytes[trailer_start..trailer_start + 4].try_into().unwrap());
+    let footer_start = trailer_start - footer_len as usize;
+    let mut input = Vec::with_capacity(footer_len as usize + 12);
+    input.extend_from_slice(&bytes[footer_start..trailer_start]); // FooterProto bytes
+    input.extend_from_slice(&bytes[trailer_start..trailer_start + 4]); // footer_len
+    input.extend_from_slice(&bytes[trailer_start + 8..trailer_start + 16]); // version, signal, reserved, magic
+    let crc = crc32c::crc32c(&input);
+    bytes[trailer_start + 4..trailer_start + 8].copy_from_slice(&crc.to_le_bytes());
+}
+
+#[test]
+fn v1_sections_under_a_v2_trailer_fail_closed() {
+    let written = SegmentWriter::write(differential_fixture(), test_identity(), test_bounds())
+        .expect("v1 writes");
+    let mut bytes = written.bytes.to_vec();
+    let n = bytes.len();
+    bytes[n - 16 + 8] = 2; // version = 2
+    bytes[n - 16 + 9] = 0;
+    recompute_footer_crc(&mut bytes);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ravel_segment::open_from_full(&bytes, ReaderLimits::default())
+    }));
+    let err = match outcome {
+        Err(_) => panic!("cross-version stamp (v1 sections, v2 trailer) caused a panic"),
+        Ok(Ok(loc)) => panic!(
+            "v1 sections under a v2 trailer opened successfully (version {}) \
+             -- must fail closed",
+            loc.version
+        ),
+        Ok(Err(e)) => e,
+    };
+    // v1 never emits SERIES_IDS (kind 5); it's the first mandatory v2-only
+    // kind validate_sections_v2 checks for (docs/segment-format.md v2
+    // mandatory set: LABEL_DICT, SERIES_IDS, SERIES_META, TS_PAGES,
+    // VAL_PAGES).
+    assert_eq!(err, SegmentError::MissingSection("SERIES_IDS"));
+}
+
+#[test]
+fn v2_sections_under_a_v1_trailer_fail_closed() {
+    let written = SegmentWriter::write_v2(differential_fixture(), test_identity(), test_bounds())
+        .expect("v2 writes");
+    let mut bytes = written.bytes.to_vec();
+    let n = bytes.len();
+    bytes[n - 16 + 8] = 1; // version = 1
+    bytes[n - 16 + 9] = 0;
+    recompute_footer_crc(&mut bytes);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ravel_segment::open_from_full(&bytes, ReaderLimits::default())
+    }));
+    let err = match outcome {
+        Err(_) => panic!("cross-version stamp (v2 sections, v1 trailer) caused a panic"),
+        Ok(Ok(loc)) => panic!(
+            "v2 sections under a v1 trailer opened successfully (version {}) \
+             -- must fail closed",
+            loc.version
+        ),
+        Ok(Err(e)) => e,
+    };
+    // v2 never emits SERIES_TABLE (kind 2); v1's mandatory set requires it.
+    assert_eq!(err, SegmentError::MissingSection("SERIES_TABLE"));
 }
