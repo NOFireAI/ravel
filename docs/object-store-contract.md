@@ -110,6 +110,13 @@ leases. MinIO: full support.
 3. `S3Store`: `object_store` crate adapter (AWS S3 + MinIO via endpoint
    override), honoring every MUST above.
 
+The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
+against all three. The `S3Store` case is gated on `RAVEL_MINIO_URL`; the CI
+`object-store-contract` job (`.github/workflows/ci.yml`) stands up MinIO,
+creates the bucket, sets that variable, and asserts the gated test executed
+rather than skipping. This job is required: S3 is the only durable backend,
+so an adapter regression must fail CI.
+
 ## Rules for callers
 
 - Never infer visibility from a successful data PUT; only commit records
