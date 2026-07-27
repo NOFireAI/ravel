@@ -265,6 +265,20 @@ Semantics and validation (all violations Corrupted, never panics):
   ascending by byte comparison, therefore no duplicate names); per-series
   materialization still goes through the existing label-set construction
   path.
+  - Writer note, stated because v2's relaxed LABEL_DICT order makes it
+    load-bearing: a schema's `name_ord` sequence MUST be derived from
+    names already sorted by byte comparison (the writer's input labels
+    are already in that order, the same invariant v1 relies on), never
+    by sorting ordinal values. In v1, LABEL_DICT was itself
+    lexicographically sorted, so ordinal order and name-byte order
+    coincided; v2 drops that dictionary invariant, so a v2 writer that
+    sorts by ordinal instead of by name would silently reorder every
+    schema's label pairs and corrupt canonical identity.
+- `__name__` is pinned to LABEL_DICT ordinal 0 by explicit writer
+  special-case, independent of any dictionary ordering rule (v1 assigns
+  it before ranking the remaining sorted strings; v2 assigns it before
+  interning the remaining strings in first-occurrence order). Neither
+  version's ordinal-0 placement depends on the sort v2 removes.
 - Timestamp bounds reconstruct as `min_ts_ns = footer.min_event_ts_ns +
   min_ts_delta` and `max_ts_ns = min_ts_ns + ts_span`, overflow-checked
   i64 arithmetic. Both deltas are non-negative by writer construction.
@@ -296,8 +310,13 @@ ranges); consumers above the segment-format layer are version-blind.
   its payload start (page offset + 6) congruent to 0 mod 8 relative to
   the section start, hence also relative to the object start. The writer
   inserts `0x00` pad bytes before such a page's header and records them
-  in that series' `val_page_gap`. Pages with other encodings have no
-  alignment requirement.
+  in that series' `val_page_gap`. This rule applies regardless of the
+  page's `comp` byte; today's writer always emits VAL pages with
+  `comp = 0` (none), so in practice the aligned bytes are always the
+  bytes a consumer would view. A future writer that ever compressed a
+  VAL_RAW_F64 page would have to align the decompressed view instead;
+  no such writer exists in v1 and none is planned for v2. Pages with
+  other encodings have no alignment requirement.
 - TS pages are never aligned (varint payloads are decoded, never viewed
   directly).
 
