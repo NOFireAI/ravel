@@ -146,24 +146,35 @@ impl SeriesId {
         metric_name: &str,
         labels: &LabelSet,
     ) -> Result<Self, TypeError> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ravel-series-v1\0");
-        update_len_prefixed(&mut hasher, tenant.as_str())?;
-        update_len_prefixed(&mut hasher, metric_name)?;
-        let count = labels
-            .iter()
-            .filter(|l| l.name != METRIC_NAME_LABEL)
-            .count();
-        let count = u16::try_from(count).map_err(|_| TypeError::OversizedSeriesComponent)?;
-        hasher.update(&count.to_le_bytes());
-        for label in labels.iter().filter(|l| l.name != METRIC_NAME_LABEL) {
-            update_len_prefixed(&mut hasher, &label.name)?;
-            update_len_prefixed(&mut hasher, &label.value)?;
+        // The canonical byte stream is built in a reused scratch buffer and
+        // hashed in one shot: many small `blake3::Hasher::update` calls cost
+        // about 2x the single-buffer hash for typical label sets, and this
+        // function sits on the per-point ingest path.
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
-        let digest = hasher.finalize();
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&digest.as_bytes()[..16]);
-        Ok(SeriesId(out))
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.extend_from_slice(b"ravel-series-v1\0");
+            push_len_prefixed(&mut buf, tenant.as_str())?;
+            push_len_prefixed(&mut buf, metric_name)?;
+            let count = labels
+                .iter()
+                .filter(|l| l.name != METRIC_NAME_LABEL)
+                .count();
+            let count = u16::try_from(count).map_err(|_| TypeError::OversizedSeriesComponent)?;
+            buf.extend_from_slice(&count.to_le_bytes());
+            for label in labels.iter().filter(|l| l.name != METRIC_NAME_LABEL) {
+                push_len_prefixed(&mut buf, &label.name)?;
+                push_len_prefixed(&mut buf, &label.value)?;
+            }
+            let digest = blake3::hash(&buf);
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&digest.as_bytes()[..16]);
+            Ok(SeriesId(out))
+        })
     }
 
     pub fn to_hex(&self) -> String {
@@ -171,10 +182,10 @@ impl SeriesId {
     }
 }
 
-fn update_len_prefixed(hasher: &mut blake3::Hasher, s: &str) -> Result<(), TypeError> {
+fn push_len_prefixed(buf: &mut Vec<u8>, s: &str) -> Result<(), TypeError> {
     let len = u16::try_from(s.len()).map_err(|_| TypeError::OversizedSeriesComponent)?;
-    hasher.update(&len.to_le_bytes());
-    hasher.update(s.as_bytes());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
     Ok(())
 }
 
@@ -317,6 +328,31 @@ mod tests {
         .expect("id");
         assert_eq!(a, b);
         assert_eq!(a, c);
+    }
+
+    #[test]
+    fn series_id_matches_documented_incremental_encoding() {
+        // The buffered one-shot implementation must produce exactly the
+        // digest of the canonical stream from ADR-0005, reconstructed here
+        // with incremental hasher updates. This pins the persistent
+        // contract independently of how `compute` builds its bytes.
+        let tenant = TenantId::new("acme");
+        let set = labels(&[("region", "eu-1"), ("zone", "a")]);
+        let id = SeriesId::compute(&tenant, "http_requests_total", &set).expect("id");
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ravel-series-v1\0");
+        for s in ["acme", "http_requests_total"] {
+            hasher.update(&(s.len() as u16).to_le_bytes());
+            hasher.update(s.as_bytes());
+        }
+        hasher.update(&2u16.to_le_bytes());
+        for s in ["region", "eu-1", "zone", "a"] {
+            hasher.update(&(s.len() as u16).to_le_bytes());
+            hasher.update(s.as_bytes());
+        }
+        let digest = hasher.finalize();
+        assert_eq!(id.0, digest.as_bytes()[..16]);
     }
 
     #[test]

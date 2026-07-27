@@ -302,7 +302,10 @@ fn take_array16(bytes: &[u8], pos: &mut usize) -> Result<[u8; 16], SegmentError>
 fn parse_label_dict(bytes: &[u8]) -> Result<Vec<String>, SegmentError> {
     let mut pos = 0usize;
     let count = take_u32_le(bytes, &mut pos)?;
-    let mut out = Vec::new();
+    // Each string costs at least its 1-byte length varint, so `count` can
+    // never validly exceed the remaining bytes; capping the pre-allocation
+    // keeps a corrupt count from forcing a huge reservation.
+    let mut out = Vec::with_capacity((count as usize).min(bytes.len()));
     for _ in 0..count {
         let len = read_uvarint(bytes, &mut pos)?;
         let len = to_usize(len)?;
@@ -316,9 +319,45 @@ fn parse_label_dict(bytes: &[u8]) -> Result<Vec<String>, SegmentError> {
     Ok(out)
 }
 
-struct RawSeriesEntry {
+/// Byte ranges of each dictionary string within the uncompressed
+/// LABEL_DICT payload, in ordinal order. Bounds are validated during the
+/// indexing pass; UTF-8 validation is deferred until a string is actually
+/// materialized.
+fn index_label_dict(bytes: &[u8]) -> Result<Vec<(usize, usize)>, SegmentError> {
+    let mut pos = 0usize;
+    let count = take_u32_le(bytes, &mut pos)?;
+    let mut out = Vec::with_capacity((count as usize).min(bytes.len()));
+    for _ in 0..count {
+        let len = read_uvarint(bytes, &mut pos)?;
+        let len = to_usize(len)?;
+        let start = pos;
+        take_bytes(bytes, &mut pos, len)?;
+        out.push((start, len));
+    }
+    if pos != bytes.len() {
+        return Err(SegmentError::TrailingBytes);
+    }
+    Ok(out)
+}
+
+fn dict_str<'a>(
+    dict_bytes: &'a [u8],
+    index: &[(usize, usize)],
+    ord: u64,
+) -> Result<&'a str, SegmentError> {
+    let i = to_usize(ord)?;
+    let (start, len) = *index.get(i).ok_or(SegmentError::BadOrdinal(ord))?;
+    let slice = dict_bytes
+        .get(start..start + len)
+        .ok_or(SegmentError::Truncated)?;
+    std::str::from_utf8(slice).map_err(|_| SegmentError::BadUtf8)
+}
+
+/// One SERIES_TABLE entry as scanned in place: label pairs live in a
+/// scratch buffer reused across entries.
+struct RawEntryView<'a> {
     series_id: [u8; 16],
-    label_pairs: Vec<(u64, u64)>,
+    label_pairs: &'a [(u64, u64)],
     sample_count: u32,
     min_ts_ns: i64,
     max_ts_ns: i64,
@@ -326,18 +365,33 @@ struct RawSeriesEntry {
     val_page: (u64, u64),
 }
 
-fn parse_series_table(bytes: &[u8]) -> Result<Vec<RawSeriesEntry>, SegmentError> {
+/// Walks every SERIES_TABLE entry, enforcing the structural grammar
+/// (bounds, varints, strictly ascending series ids, no trailing bytes)
+/// and handing each entry to `visit` without any per-entry allocation.
+fn scan_series_table(
+    bytes: &[u8],
+    mut visit: impl FnMut(&RawEntryView<'_>) -> Result<(), SegmentError>,
+) -> Result<(), SegmentError> {
     let mut pos = 0usize;
     let count = take_u32_le(bytes, &mut pos)?;
-    let mut out = Vec::new();
+    let mut pairs: Vec<(u64, u64)> = Vec::new();
+    let mut prev_id: Option<[u8; 16]> = None;
     for _ in 0..count {
         let series_id = take_array16(bytes, &mut pos)?;
+        if let Some(prev) = prev_id
+            && series_id <= prev
+        {
+            return Err(SegmentError::SeriesTableUnsorted);
+        }
+        prev_id = Some(series_id);
+
         let label_count = take_u16_le(bytes, &mut pos)?;
-        let mut label_pairs = Vec::new();
+        pairs.clear();
+        pairs.reserve(usize::from(label_count));
         for _ in 0..label_count {
             let name_ord = read_uvarint(bytes, &mut pos)?;
             let value_ord = read_uvarint(bytes, &mut pos)?;
-            label_pairs.push((name_ord, value_ord));
+            pairs.push((name_ord, value_ord));
         }
         let sample_count = take_u32_le(bytes, &mut pos)?;
         let min_ts_ns = take_i64_le(bytes, &mut pos)?;
@@ -346,21 +400,26 @@ fn parse_series_table(bytes: &[u8]) -> Result<Vec<RawSeriesEntry>, SegmentError>
         let ts_len = read_uvarint(bytes, &mut pos)?;
         let val_offset = read_uvarint(bytes, &mut pos)?;
         let val_len = read_uvarint(bytes, &mut pos)?;
-        out.push(RawSeriesEntry {
+        visit(&RawEntryView {
             series_id,
-            label_pairs,
+            label_pairs: &pairs,
             sample_count,
             min_ts_ns,
             max_ts_ns,
             ts_page: (ts_offset, ts_len),
             val_page: (val_offset, val_len),
-        });
+        })?;
     }
     if pos != bytes.len() {
         return Err(SegmentError::TrailingBytes);
     }
-    Ok(out)
+    Ok(())
 }
+
+/// Minimum encoded size of one SERIES_TABLE entry (id + label_count +
+/// sample_count + min/max ts + four 1-byte varints), used only to cap
+/// pre-allocations against a corrupt declared count.
+const MIN_TABLE_ENTRY_BYTES: usize = 16 + 2 + 4 + 8 + 8 + 4;
 
 /// Decodes LABEL_DICT and SERIES_TABLE (verifying section crcs) into
 /// [`SeriesEntry`] values with materialized [`LabelSet`]s.
@@ -379,20 +438,11 @@ pub fn decode_catalog(
     let table_bytes = decode_section_bytes(series_table_section, series_table_bytes, limits)?;
 
     let dict = parse_label_dict(&dict_bytes)?;
-    let raw_entries = parse_series_table(&table_bytes)?;
 
-    let mut entries = Vec::new();
-    let mut prev_id: Option<[u8; 16]> = None;
-    for raw in raw_entries {
-        if let Some(prev) = prev_id
-            && raw.series_id <= prev
-        {
-            return Err(SegmentError::SeriesTableUnsorted);
-        }
-        prev_id = Some(raw.series_id);
-
-        let mut labels = Vec::new();
-        for (name_ord, value_ord) in raw.label_pairs {
+    let mut entries = Vec::with_capacity(table_bytes.len() / MIN_TABLE_ENTRY_BYTES);
+    scan_series_table(&table_bytes, |raw| {
+        let mut labels = Vec::with_capacity(raw.label_pairs.len());
+        for &(name_ord, value_ord) in raw.label_pairs {
             let name_idx = to_usize(name_ord)?;
             let value_idx = to_usize(value_ord)?;
             let name = dict
@@ -417,7 +467,94 @@ pub fn decode_catalog(
             ts_page: raw.ts_page,
             val_page: raw.val_page,
         });
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// Decodes only the series whose labels satisfy every `(name, value)`
+/// equality in `equals`, matching on dictionary ordinals so that
+/// non-matching series never materialize a [`LabelSet`] or any `String`.
+///
+/// Semantics match [`decode_catalog`] followed by [`select`] with the same
+/// pairs (and no predicate): the whole SERIES_TABLE is still structurally
+/// validated (bounds, sortedness, trailing bytes) and both section crcs
+/// are verified, so corrupt input fails with the same typed errors. An
+/// empty `equals` selects every series. Dictionary strings of series that
+/// never match are not UTF-8-validated here, because they are never
+/// materialized; [`decode_catalog`] remains the eager, fully-validating
+/// path.
+pub fn decode_catalog_matching(
+    footer: &Footer,
+    label_dict_bytes: &[u8],
+    series_table_bytes: &[u8],
+    equals: &[(&str, &str)],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntry>, SegmentError> {
+    let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let series_table_section = find_section(footer, section_kind::SERIES_TABLE)
+        .ok_or(SegmentError::MissingSection("SERIES_TABLE"))?;
+
+    let dict_bytes = decode_section_bytes(label_dict_section, label_dict_bytes, limits)?;
+    let table_bytes = decode_section_bytes(series_table_section, series_table_bytes, limits)?;
+
+    let dict_index = index_label_dict(&dict_bytes)?;
+
+    // Resolve each matcher pair to dictionary ordinals by raw byte
+    // equality (equal bytes imply equal UTF-8). A matcher string absent
+    // from the dictionary can never match any entry.
+    let find_ordinal = |needle: &str| -> Option<u64> {
+        let needle = needle.as_bytes();
+        dict_index
+            .iter()
+            .position(|&(start, len)| {
+                dict_bytes
+                    .get(start..start + len)
+                    .is_some_and(|s| s == needle)
+            })
+            .map(|i| i as u64)
+    };
+    let mut matcher_ords: Vec<(u64, u64)> = Vec::with_capacity(equals.len());
+    let mut resolvable = true;
+    for (name, value) in equals {
+        match (find_ordinal(name), find_ordinal(value)) {
+            (Some(n), Some(v)) => matcher_ords.push((n, v)),
+            _ => {
+                resolvable = false;
+                break;
+            }
+        }
     }
+
+    let mut entries = Vec::new();
+    scan_series_table(&table_bytes, |raw| {
+        if !resolvable
+            || !matcher_ords
+                .iter()
+                .all(|needed| raw.label_pairs.contains(needed))
+        {
+            return Ok(());
+        }
+        let mut labels = Vec::with_capacity(raw.label_pairs.len());
+        for &(name_ord, value_ord) in raw.label_pairs {
+            labels.push(Label {
+                name: dict_str(&dict_bytes, &dict_index, name_ord)?.to_string(),
+                value: dict_str(&dict_bytes, &dict_index, value_ord)?.to_string(),
+            });
+        }
+        let label_set = LabelSet::new(labels)?;
+        entries.push(SeriesEntry {
+            series_id: SeriesId(raw.series_id),
+            labels: label_set,
+            sample_count: raw.sample_count,
+            min_ts_ns: raw.min_ts_ns,
+            max_ts_ns: raw.max_ts_ns,
+            ts_page: raw.ts_page,
+            val_page: raw.val_page,
+        });
+        Ok(())
+    })?;
     Ok(entries)
 }
 

@@ -18,6 +18,9 @@ ravel-commit = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 blake3 = { workspace = true }
+crc32c = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
@@ -38,6 +41,11 @@ bench = false
 [[bin]]
 name = "ingest_bench"
 path = "src/bin/ingest_bench.rs"
+bench = false
+
+[[bin]]
+name = "profile_hotspots"
+path = "src/bin/profile_hotspots.rs"
 bench = false
 
 [[test]]

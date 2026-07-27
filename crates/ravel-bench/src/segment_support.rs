@@ -10,7 +10,7 @@
 
 use ravel_segment::{
     Footer, IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesEntry, SeriesInput,
-    WrittenSegment, decode_catalog, open_from_full,
+    WrittenSegment, decode_catalog, decode_catalog_matching, open_from_full,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
 
@@ -72,6 +72,28 @@ pub fn decode_entries(bytes: &[u8]) -> (Footer, Vec<SeriesEntry>) {
     let series_table_bytes = section_bytes(bytes, &loc.footer, SERIES_TABLE);
     let entries = decode_catalog(&loc.footer, label_dict_bytes, series_table_bytes, limits)
         .expect("decode catalog");
+    (loc.footer, entries)
+}
+
+/// Opens the footer and decodes only the series matching all `equals`
+/// pairs, via the ordinal-matching lazy path
+/// (`ravel_segment::decode_catalog_matching`).
+pub fn decode_matching_entries(
+    bytes: &[u8],
+    equals: &[(&str, &str)],
+) -> (Footer, Vec<SeriesEntry>) {
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(bytes, limits).expect("open segment");
+    let label_dict_bytes = section_bytes(bytes, &loc.footer, LABEL_DICT);
+    let series_table_bytes = section_bytes(bytes, &loc.footer, SERIES_TABLE);
+    let entries = decode_catalog_matching(
+        &loc.footer,
+        label_dict_bytes,
+        series_table_bytes,
+        equals,
+        limits,
+    )
+    .expect("decode matching catalog");
     (loc.footer, entries)
 }
 

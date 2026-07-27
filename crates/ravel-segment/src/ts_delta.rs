@@ -6,19 +6,26 @@
 use crate::error::SegmentError;
 use crate::varint::{read_zigzag_varint, write_zigzag_varint};
 
-/// Encodes `timestamps` as delta-varint bytes. The writer always supplies
-/// an ascending sequence, but the encoding itself (zigzag deltas) tolerates
-/// any signed delta; returns `None` only if a delta overflows `i64`
-/// subtraction.
+/// Encodes `timestamps` as delta-varint bytes. Test-only convenience;
+/// production encoding goes through [`encode_ts_deltas_into`] with a
+/// reused buffer.
+#[cfg(test)]
 pub fn encode_ts_deltas(timestamps: &[i64]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(timestamps.len() * 2);
+    encode_ts_deltas_into(&mut out, timestamps)?;
+    Some(out)
+}
+
+/// Appends the delta-varint encoding of `timestamps` to `out` without
+/// allocating, so the writer can reuse one scratch buffer across series.
+pub fn encode_ts_deltas_into(out: &mut Vec<u8>, timestamps: &[i64]) -> Option<()> {
     let mut prev = 0i64;
     for (i, &ts) in timestamps.iter().enumerate() {
         let delta = if i == 0 { ts } else { ts.checked_sub(prev)? };
-        write_zigzag_varint(&mut out, delta);
+        write_zigzag_varint(out, delta);
         prev = ts;
     }
-    Some(out)
+    Some(())
 }
 
 /// Decodes exactly `count` timestamps with overflow-checked accumulation;
