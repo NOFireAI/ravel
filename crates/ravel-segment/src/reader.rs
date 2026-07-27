@@ -442,6 +442,61 @@ fn dict_str<'a>(
     std::str::from_utf8(slice).map_err(|_| SegmentError::BadUtf8)
 }
 
+/// Resolves LABEL_DICT ordinals to `&str`, memoizing the bounds check and
+/// UTF-8 validation so each distinct ordinal pays them at most once no
+/// matter how many series reference it.
+///
+/// The v2 catalog decoders materialize labels ordinal by ordinal through
+/// the deferred-validation LABEL_DICT index (`index_label_dict` +
+/// `dict_str`), which the lazy path needs so a matcher can reject a series
+/// without ever UTF-8-validating strings it will not return. The eager
+/// path materializes every series, so every distinct name/value string is
+/// validated anyway, but a bare `dict_str` re-validates on every one of the
+/// many references (in the 10k-series/6-label bench shape, ~120k
+/// references over ~500 distinct strings). Profiling attributed that
+/// repeated `str::from_utf8` as the RSEG v2 eager-decode regression
+/// (issue #94). Memoizing collapses it to one validation per referenced
+/// ordinal.
+///
+/// Behavior is identical to calling `dict_str` per reference: ordinals are
+/// resolved in the same order, only referenced ordinals are ever validated
+/// (an unreferenced entry with bad UTF-8 stays unvalidated, exactly as
+/// before), and the first `BadOrdinal`/`Truncated`/`BadUtf8` encountered is
+/// the same one `dict_str` would return, because a cached hit only ever
+/// replaces a repeat of an already-successful validation.
+struct DictResolver<'a> {
+    dict_bytes: &'a [u8],
+    index: &'a [(usize, usize)],
+    cache: Vec<Option<&'a str>>,
+}
+
+impl<'a> DictResolver<'a> {
+    fn new(dict_bytes: &'a [u8], index: &'a [(usize, usize)]) -> Self {
+        Self {
+            dict_bytes,
+            index,
+            cache: vec![None; index.len()],
+        }
+    }
+
+    fn get(&mut self, ord: u64) -> Result<&'a str, SegmentError> {
+        let i = to_usize(ord)?;
+        let (start, len) = *self.index.get(i).ok_or(SegmentError::BadOrdinal(ord))?;
+        // `i < index.len() == cache.len()`, so indexing `cache[i]` after a
+        // successful `index.get(i)` cannot panic.
+        if let Some(s) = self.cache[i] {
+            return Ok(s);
+        }
+        let slice = self
+            .dict_bytes
+            .get(start..start + len)
+            .ok_or(SegmentError::Truncated)?;
+        let s = std::str::from_utf8(slice).map_err(|_| SegmentError::BadUtf8)?;
+        self.cache[i] = Some(s);
+        Ok(s)
+    }
+}
+
 /// One SERIES_TABLE entry as scanned in place: label pairs live in a
 /// scratch buffer reused across entries.
 struct RawEntryView<'a> {
@@ -1100,26 +1155,35 @@ fn parse_schema_ref_block_v2(
 }
 
 /// SERIES_META block 2 (`value_ord`, docs/segment-format.md v2 amendment),
-/// eager form: decodes every series' value ordinals in full (series-major,
-/// `name_count(schema)` varints per series). Used by [`decode_catalog_v2`],
-/// which always materializes every series.
+/// eager form: decodes every series' value ordinals into one flat vector
+/// (series-major, `name_count(schema)` varints per series, concatenated).
+/// Used by [`decode_catalog_v2`], which always materializes every series.
+///
+/// Flat rather than `Vec<Vec<u64>>`: the eager path materializes all
+/// `count` series, so a per-series inner vector would be one heap
+/// allocation per series (10k allocations in the bench shape). A single
+/// flat vector, walked at materialization time with a running cursor over
+/// each series' `name_ords.len()` slice, removes those allocations while
+/// preserving the exact series-major order the block already stores. This
+/// was the residual half of the RSEG v2 eager-decode regression (issue #94)
+/// after per-reference dictionary UTF-8 revalidation was fixed.
 fn parse_value_ord_block_all_v2(
     meta_bytes: &[u8],
     pos: &mut usize,
     count: u32,
     schema_ref: &[u32],
     schemas: &[SchemaMetaV2],
-) -> Result<Vec<Vec<u64>>, SegmentError> {
+) -> Result<Vec<u64>, SegmentError> {
     let block = take_block(meta_bytes, pos)?;
     let mut bpos = 0usize;
-    let mut out = Vec::with_capacity((count as usize).min(block.len()));
+    // Each ordinal is at least one varint byte, so the flat count can never
+    // validly exceed the block length; cap the single reservation there.
+    let mut out = Vec::with_capacity(block.len());
     for &sref in schema_ref.iter().take(count as usize) {
         let schema = &schemas[sref as usize];
-        let mut vals = Vec::with_capacity(schema.name_ords.len().min(block.len()));
         for _ in 0..schema.name_ords.len() {
-            vals.push(read_uvarint(block, &mut bpos)?);
+            out.push(read_uvarint(block, &mut bpos)?);
         }
-        out.push(vals);
     }
     if bpos != block.len() {
         return Err(SegmentError::BadBlockLen);
@@ -1346,14 +1410,23 @@ pub fn decode_catalog_v2(
         parse_value_ord_block_all_v2(&meta_bytes, &mut pos, meta_count, &schema_ref, &schemas)?;
     let tail = parse_series_meta_tail_v2(&meta_bytes, &mut pos, footer, meta_count)?;
 
+    let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
     let mut entries = Vec::with_capacity(series_ids.len());
+    // Running cursor over the flat value_ord vector: series `i` owns the
+    // next `schema.name_ords.len()` ordinals, in the same series-major order
+    // the block stores. `parse_value_ord_block_all_v2` consumed exactly the
+    // sum of these lengths, so the slicing below stays in bounds for every
+    // series and ends exactly at `value_ord.len()`.
+    let mut voff = 0usize;
     for i in 0..series_ids.len() {
         let schema = &schemas[schema_ref[i] as usize];
-        let vals = &value_ord[i];
-        let mut label_pairs = Vec::with_capacity(schema.name_ords.len());
+        let n = schema.name_ords.len();
+        let vals = &value_ord[voff..voff + n];
+        voff += n;
+        let mut label_pairs = Vec::with_capacity(n);
         for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
-            let name = dict_str(&dict_bytes, &dict_index, name_ord)?;
-            let value = dict_str(&dict_bytes, &dict_index, val_ord)?;
+            let name = resolver.get(name_ord)?;
+            let value = resolver.get(val_ord)?;
             label_pairs.push(Label {
                 name: name.to_string(),
                 value: value.to_string(),
@@ -1474,6 +1547,7 @@ pub fn decode_catalog_matching_v2(
     )?;
     let tail = parse_series_meta_tail_v2(&meta_bytes, &mut pos, footer, meta_count)?;
 
+    let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
     let mut entries = Vec::new();
     for i in 0..series_ids.len() {
         let Some(vals) = &value_ord[i] else {
@@ -1492,8 +1566,8 @@ pub fn decode_catalog_matching_v2(
         }
         let mut label_pairs = Vec::with_capacity(schema.name_ords.len());
         for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
-            let name = dict_str(&dict_bytes, &dict_index, name_ord)?;
-            let value = dict_str(&dict_bytes, &dict_index, val_ord)?;
+            let name = resolver.get(name_ord)?;
+            let value = resolver.get(val_ord)?;
             label_pairs.push(Label {
                 name: name.to_string(),
                 value: value.to_string(),
@@ -1511,4 +1585,76 @@ pub fn decode_catalog_matching_v2(
         });
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod dict_resolver_tests {
+    use super::{DictResolver, dict_str, index_label_dict};
+    use crate::error::SegmentError;
+
+    /// Builds a LABEL_DICT payload (`count: u32`, then `len: varint` + bytes
+    /// per entry) so tests exercise the same index `dict_str`/`DictResolver`
+    /// consume. `entries` are raw bytes so an invalid-UTF-8 entry can be
+    /// planted directly.
+    fn build_dict(entries: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            // single-byte varint length (all test entries are short)
+            assert!(e.len() < 0x80);
+            out.push(e.len() as u8);
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    #[test]
+    fn resolver_matches_dict_str_for_valid_ordinals() {
+        let dict = build_dict(&[b"__name__", b"region", b"us-east"]);
+        let index = index_label_dict(&dict).expect("index");
+        let mut resolver = DictResolver::new(&dict, &index);
+        for ord in [0u64, 1, 2, 1, 0, 2] {
+            // Repeated ordinals exercise the cache; every hit must equal the
+            // uncached dict_str result.
+            assert_eq!(
+                resolver.get(ord).expect("resolve"),
+                dict_str(&dict, &index, ord).expect("dict_str"),
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_reports_bad_ordinal_out_of_range() {
+        let dict = build_dict(&[b"__name__"]);
+        let index = index_label_dict(&dict).expect("index");
+        let mut resolver = DictResolver::new(&dict, &index);
+        assert!(matches!(resolver.get(5), Err(SegmentError::BadOrdinal(5))));
+    }
+
+    #[test]
+    fn resolver_reports_bad_utf8_only_when_referenced() {
+        // Ordinal 1 is invalid UTF-8; ordinal 0 is valid. A resolver that
+        // only ever touches ordinal 0 must never surface the bad entry,
+        // matching the deferred-validation contract dict_str provides.
+        let dict = build_dict(&[b"ok", &[0xff, 0xfe]]);
+        let index = index_label_dict(&dict).expect("index");
+        let mut resolver = DictResolver::new(&dict, &index);
+        assert_eq!(resolver.get(0).expect("valid"), "ok");
+        assert!(matches!(resolver.get(1), Err(SegmentError::BadUtf8)));
+    }
+
+    #[test]
+    fn resolver_caches_first_success_across_repeats() {
+        // A second get of a valid ordinal returns the same bytes (cache hit
+        // path), and a valid ordinal resolved after a bad one still works:
+        // the bad-ordinal error is per-call, it does not poison the cache.
+        let dict = build_dict(&[b"a", b"bb"]);
+        let index = index_label_dict(&dict).expect("index");
+        let mut resolver = DictResolver::new(&dict, &index);
+        assert_eq!(resolver.get(1).expect("first"), "bb");
+        assert!(matches!(resolver.get(9), Err(SegmentError::BadOrdinal(9))));
+        assert_eq!(resolver.get(1).expect("cached"), "bb");
+        assert_eq!(resolver.get(0).expect("other"), "a");
+    }
 }
