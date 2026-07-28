@@ -48,6 +48,8 @@ code, not just using it.
   protocol, commit tokens, and snapshot resolution.
 - [segment-format.md](segment-format.md): the RSEG v5 on-object-store binary
   format (the only supported version pre-release, ADR-0027).
+- [log-segment-format.md](log-segment-format.md): the RLOG v1 on-object-store
+  binary format for logs (ADR-0029).
 - [object-store-contract.md](object-store-contract.md): the
   `ObjectStoreBackend` trait every storage vendor (memory, S3/MinIO) must
   satisfy, and the durability arguments made against it.
