@@ -139,7 +139,9 @@ impl QueryEngine {
         let (source, stats) = self
             .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        let value = Evaluator::new().eval_instant(&source, query, t_ms)?;
+        let evaluator =
+            Evaluator::new().with_default_step(self.config.default_evaluation_interval)?;
+        let value = evaluator.eval_instant(&source, query, t_ms)?;
         Ok((value, stats))
     }
 
@@ -231,7 +233,9 @@ impl QueryEngine {
         let (source, stats) = self
             .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        let value = Evaluator::new().eval_range(&source, query, start_ms, end_ms, step_ms)?;
+        let evaluator =
+            Evaluator::new().with_default_step(self.config.default_evaluation_interval)?;
+        let value = evaluator.eval_range(&source, query, start_ms, end_ms, step_ms)?;
         Ok((value, stats))
     }
 

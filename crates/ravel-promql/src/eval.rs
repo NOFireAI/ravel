@@ -3,9 +3,11 @@
 //! type (scalar, string, instant vector, range matrix), and [`Evaluator`]
 //! walks paren expressions, unary minus, number/string literals, vector and
 //! matrix selectors (with `offset` and the `@` modifier, including
-//! `start()`/`end()`), function calls (`crate::functions`), and binary
-//! expressions (`crate::binop`). Every other AST node (aggregation,
-//! subquery) is rejected with [`Error::Unsupported`], naming the construct.
+//! `start()`/`end()`), function calls (`crate::functions`), binary
+//! expressions (`crate::binop`), aggregations (`crate::aggregate`), and
+//! subqueries (`expr[range:step]`, recursively evaluated at epoch-aligned
+//! steps, plan section 8/P10). Every other AST node is rejected with
+//! [`Error::Unsupported`], naming the construct.
 //!
 //! ## Time precision
 //!
@@ -174,6 +176,14 @@ pub const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 /// does not constrain the grid.
 pub const DEFAULT_MAX_RANGE_POINTS: usize = 11_000;
 
+/// Default step for a subquery that does not specify its own (`expr[5m:]`),
+/// in nanoseconds: 1 minute, matching Prometheus' global `evaluation_interval`
+/// default (`NoStepSubqueryIntervalFn`). `ravel-query`'s engine config carries
+/// its own `default_evaluation_interval` knob and applies it via
+/// [`Evaluator::with_default_step`]; a bare `Evaluator::new()` (e.g. in a
+/// test, or a caller with no engine-level config) gets this default.
+pub const DEFAULT_SUBQUERY_STEP_NS: i64 = 60 * 1_000_000_000;
+
 /// Prometheus staleness marker: the exact NaN bit pattern a scrape/rule
 /// engine writes to signal that a series has ended. Per Prometheus lookback
 /// semantics (ADR-0007) and ADR-0010 §5, when this is the most recent sample
@@ -199,6 +209,7 @@ pub(crate) struct QueryWindow {
 pub struct Evaluator {
     lookback_delta_ns: i64,
     max_range_points: usize,
+    default_step_ns: i64,
 }
 
 impl Default for Evaluator {
@@ -206,6 +217,7 @@ impl Default for Evaluator {
         Evaluator {
             lookback_delta_ns: DEFAULT_LOOKBACK_NS,
             max_range_points: DEFAULT_MAX_RANGE_POINTS,
+            default_step_ns: DEFAULT_SUBQUERY_STEP_NS,
         }
     }
 }
@@ -234,6 +246,18 @@ impl Evaluator {
     /// The configured range-query resolution cap, in evaluation points.
     pub fn max_range_points(&self) -> usize {
         self.max_range_points
+    }
+
+    /// Override the default step (1 minute, [`DEFAULT_SUBQUERY_STEP_NS`]) a
+    /// subquery uses when it does not specify its own (`expr[5m:]`).
+    pub fn with_default_step(mut self, step: std::time::Duration) -> Result<Self, Error> {
+        self.default_step_ns = i64::try_from(step.as_nanos()).map_err(|_| Error::TimeOverflow)?;
+        Ok(self)
+    }
+
+    /// The configured default subquery step, in nanoseconds.
+    pub fn default_step_ns(&self) -> i64 {
+        self.default_step_ns
     }
 
     /// Evaluate `query` at `t_ms`, returning the full [`Value`] the query
@@ -421,6 +445,9 @@ impl Evaluator {
             Expr::Aggregate(a) => {
                 crate::aggregate::eval_aggregate(self, source, a, eval_ts_ns, ctx)
             }
+            Expr::Subquery(sq) => self
+                .eval_subquery_matrix(source, sq, eval_ts_ns, ctx)
+                .map(Value::Matrix),
             _ => Err(unsupported_construct_error(expr)),
         }
     }
@@ -499,6 +526,68 @@ impl Evaluator {
             }
         }
         Ok(out)
+    }
+
+    /// Evaluate a subquery (`expr[range:step]`) at one instant: the inner
+    /// `expr` re-evaluated, fully recursively, at every epoch-aligned step in
+    /// the subquery's own window (plan section 8/P10). Not reachable from a
+    /// bare top-level expression (a bare subquery is always a top-level
+    /// [`Error::WrongType`], matching Prometheus, same as a bare matrix
+    /// selector); reached through `eval_expr`'s own `Expr::Subquery` arm
+    /// (producing a top-level [`Value::Matrix`], invalid as a final result
+    /// but exercised the same way a bare matrix selector is) or through a
+    /// registered function's matrix-typed argument (`crate::functions`).
+    ///
+    /// The grid's end is the subquery's own `offset`/`@`-shifted instant
+    /// (relative to `eval_ts_ns`, the ambient step); its start is the
+    /// smallest epoch-aligned multiple of the step that is `>=
+    /// end - range` ([`align_up_to_step`]). The step count is checked
+    /// against [`Self::max_range_points`] *before* any grid is built or the
+    /// inner `expr` is evaluated even once, exactly like a top-level range
+    /// query's own budget check: a subquery nested inside a range query or
+    /// another subquery re-derives this same check at every enclosing grid
+    /// step, so an inner grid that is itself over budget is rejected on the
+    /// very first attempt to build it rather than after the outer grid has
+    /// multiplied it out (plan section 3.1: "No cross-step caching beyond
+    /// cursors in the first implementation", so this check, like every other
+    /// part of subquery evaluation, is deliberately redone from scratch at
+    /// each enclosing step rather than memoized).
+    pub(crate) fn eval_subquery_matrix(
+        &self,
+        source: &dyn SeriesSource,
+        sq: &promql_parser::parser::SubqueryExpr,
+        eval_ts_ns: i64,
+        ctx: &QueryWindow,
+    ) -> Result<RangeMatrix, Error> {
+        let end_ns = resolve_eval_ts(sq.offset.as_ref(), sq.at.as_ref(), eval_ts_ns, ctx)?;
+        let range_ns = duration_to_ns(sq.range)?;
+        let step_ns = match sq.step {
+            Some(d) => duration_to_ns(d)?,
+            None => self.default_step_ns,
+        };
+        if step_ns <= 0 {
+            return Err(Error::NonPositiveStep {
+                step_ms: ns_to_ms_floor(step_ns),
+            });
+        }
+
+        let target_ns = end_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+        let start_ns = align_up_to_step(target_ns, step_ns)?;
+        if start_ns > end_ns {
+            return Ok(Vec::new());
+        }
+
+        let points = step_count(start_ns, end_ns, step_ns);
+        if points > u64::try_from(self.max_range_points).unwrap_or(u64::MAX) {
+            return Err(Error::TooManyPoints {
+                points,
+                max: self.max_range_points,
+            });
+        }
+
+        crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+            self.eval_expr(source, &sq.expr, t, ctx)
+        })
     }
 
     /// Build the range matrix for a single top-level vector selector
@@ -700,9 +789,9 @@ enum RangeCore<'a> {
 /// Strip `Paren`/`Unary` wrappers from `expr`, returning the core construct
 /// and whether an odd number of unary minuses were applied. Any other
 /// top-level construct is a typed error: [`Error::WrongType`] for a bare
-/// matrix selector (invalid at top level, exactly like Prometheus), or
-/// [`Error::Unsupported`] naming the construct for everything this phase
-/// does not implement.
+/// matrix selector or subquery (both produce a range vector, invalid at top
+/// level, exactly like Prometheus), or [`Error::Unsupported`] naming the
+/// construct for everything this phase does not implement.
 fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'_>, bool), Error> {
     use promql_parser::parser::Expr;
     let mut negate = false;
@@ -717,7 +806,7 @@ fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'
             Expr::NumberLiteral(n) => return Ok((RangeCore::Scalar(n.val), negate)),
             Expr::StringLiteral(s) => return Ok((RangeCore::Str(&s.val), negate)),
             Expr::VectorSelector(vs) => return Ok((RangeCore::Selector(vs), negate)),
-            Expr::MatrixSelector(_) => {
+            Expr::MatrixSelector(_) | Expr::Subquery(_) => {
                 return Err(Error::WrongType {
                     expected: "scalar, instant vector, or string",
                     got: "range vector",
@@ -741,16 +830,14 @@ fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'
 /// Callers must have already handled `Paren`, `Unary`, `NumberLiteral`,
 /// `StringLiteral`, `VectorSelector`, `MatrixSelector`, `Call` (which always
 /// dispatches to `crate::functions`, producing its own "function call:
-/// {name}" [`Error::Unsupported`] for an unregistered name), `Binary`, and
-/// `Aggregate` (the last two dispatch to `crate::binop`/`crate::aggregate`);
-/// this panics on any of those (programmer error, not reachable) and covers
-/// the rest.
+/// {name}" [`Error::Unsupported`] for an unregistered name), `Binary`,
+/// `Aggregate` (dispatching to `crate::binop`/`crate::aggregate`), and
+/// `Subquery` (`eval_expr`'s own arm, or `resolve_range_core`'s
+/// [`Error::WrongType`] for one at top level of a range query); this panics
+/// on any of those (programmer error, not reachable) and covers the rest.
 fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
     use promql_parser::parser::Expr;
     match expr {
-        Expr::Subquery(_) => Error::Unsupported {
-            construct: "subquery".to_string(),
-        },
         Expr::Extension(_) => Error::Unsupported {
             construct: "extension node".to_string(),
         },
@@ -762,7 +849,8 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
         | Expr::MatrixSelector(_)
         | Expr::Call(_)
         | Expr::Binary(_)
-        | Expr::Aggregate(_) => {
+        | Expr::Aggregate(_)
+        | Expr::Subquery(_) => {
             unreachable!("caller must handle every supported construct before falling back")
         }
     }
@@ -778,8 +866,21 @@ pub(crate) fn selector_eval_ts(
     eval_ts_ns: i64,
     ctx: &QueryWindow,
 ) -> Result<i64, Error> {
-    let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
-    let base_ts_ns = resolve_at(vs.at.as_ref(), ctx.start_ns, ctx.end_ns)?.unwrap_or(eval_ts_ns);
+    resolve_eval_ts(vs.offset.as_ref(), vs.at.as_ref(), eval_ts_ns, ctx)
+}
+
+/// The general form of [`selector_eval_ts`]: `@`'s absolute instant (falling
+/// back to the ambient `eval_ts_ns`) shifted by `offset`, if any. Shared by
+/// vector/matrix selectors and subqueries, whose `offset`/`@` resolve exactly
+/// the same way (plan section 3.2).
+pub(crate) fn resolve_eval_ts(
+    offset: Option<&promql_parser::parser::Offset>,
+    at: Option<&promql_parser::parser::AtModifier>,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> Result<i64, Error> {
+    let offset_ns = signed_offset_ns(offset)?;
+    let base_ts_ns = resolve_at(at, ctx.start_ns, ctx.end_ns)?.unwrap_or(eval_ts_ns);
     base_ts_ns.checked_sub(offset_ns).ok_or(Error::TimeOverflow)
 }
 
@@ -884,6 +985,27 @@ fn step_count(start_ns: i64, end_ns: i64, step_ns: i64) -> u64 {
     let span = i128::from(end_ns) - i128::from(start_ns);
     let steps = span / i128::from(step_ns) + 1;
     u64::try_from(steps).unwrap_or(u64::MAX)
+}
+
+/// The smallest multiple of `step_ns`, measured from the Unix epoch (time
+/// zero), that is `>= target_ns`. This is Prometheus' subquery step-alignment
+/// rule (`promql/engine.go`'s `evalSubquery`): a subquery's grid is aligned to
+/// epoch-relative step boundaries (`0, step, 2*step, ...`), not to the
+/// subquery's own window start or the outer query's step boundaries, so two
+/// subqueries with the same step line up on the same instants regardless of
+/// where their windows happen to start.
+///
+/// Computed in `i128` for the same reason [`step_count`] is: `target_ns`'s
+/// floor division by `step_ns` must not overflow for extreme-but-
+/// representable inputs, and `div_euclid` (floor, not truncating) division is
+/// required so a negative `target_ns` (a window before the Unix epoch) aligns
+/// the same way Prometheus' Go integer-division-with-manual-correction does.
+fn align_up_to_step(target_ns: i64, step_ns: i64) -> Result<i64, Error> {
+    let target = i128::from(target_ns);
+    let step = i128::from(step_ns);
+    let floor = target.div_euclid(step) * step;
+    let aligned = if floor < target { floor + step } else { floor };
+    i64::try_from(aligned).map_err(|_| Error::TimeOverflow)
 }
 
 /// Pick the value at the most recent timestamp in `(sel_ts - lookback,
@@ -1271,7 +1393,6 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("sort_by_label(up)", "sort_by_label"),
             ("mad_over_time(up[5m])", "mad_over_time"),
-            ("up[5m:1m]", "subquery"),
         ];
         for (query, expected_substr) in cases {
             let err = Evaluator::new()
@@ -1303,6 +1424,130 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn bare_subquery_at_top_level_is_wrong_type() {
+        // `up[5m:1m]` parses and its grid is evaluated, but a matrix is never
+        // a valid top-level instant query result, same as a bare matrix
+        // selector.
+        let err = Evaluator::new()
+            .instant(&TestSource::new(), "up[5m:1m]", 0)
+            .expect_err("must be rejected");
+        assert!(matches!(
+            err,
+            Error::WrongType {
+                got: "range vector",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn align_up_to_step_rounds_up_to_the_next_epoch_multiple() {
+        // 90 is not a multiple of 60; the next one up is 120.
+        assert_eq!(align_up_to_step(90, 60).expect("fits"), 120);
+        // Already a multiple: unchanged.
+        assert_eq!(align_up_to_step(120, 60).expect("fits"), 120);
+    }
+
+    #[test]
+    fn align_up_to_step_floors_towards_negative_infinity_before_epoch() {
+        // -90 sits between -120 and -60; the next multiple up is -60, not
+        // -120 (a truncating, non-floor division would wrongly land there).
+        assert_eq!(align_up_to_step(-90, 60).expect("fits"), -60);
+        assert_eq!(align_up_to_step(-120, 60).expect("fits"), -120);
+    }
+
+    #[test]
+    fn subquery_grid_is_epoch_aligned_not_window_relative() {
+        // `up[3m:1m]` at t=90s: the nominal window is [-90s, 90s], but the
+        // grid start is the smallest 1m-multiple from the Unix epoch that is
+        // >= -90s, which is -60s, not the window's own start. The sample
+        // sits at -60s so every grid point (-60s, 0s, 60s) finds it within
+        // the default 5m lookback.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(-60_000_000_000, 1.0)])
+            .expect("valid series");
+        let value = Evaluator::new()
+            .eval_instant(&source, "up[3m:1m]", 90_000)
+            .expect("subquery evaluates");
+        let Value::Matrix(matrix) = value else {
+            panic!("expected a matrix, got {value:?}");
+        };
+        assert_eq!(matrix.len(), 1);
+        let (_, samples) = &matrix[0];
+        let timestamps_ms: Vec<i64> = samples.iter().map(|s| s.ts_ns / NS_PER_MS).collect();
+        assert_eq!(timestamps_ms, vec![-60_000, 0, 60_000]);
+    }
+
+    #[test]
+    fn subquery_without_its_own_step_uses_the_evaluator_default() {
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(0, 1.0)])
+            .expect("valid series");
+        let with_default = Evaluator::new()
+            .with_default_step(std::time::Duration::from_secs(30))
+            .expect("valid step")
+            .eval_instant(&source, "up[2m:]", 0)
+            .expect("subquery evaluates");
+        let with_explicit = Evaluator::new()
+            .eval_instant(&source, "up[2m:30s]", 0)
+            .expect("subquery evaluates");
+        assert_eq!(with_default, with_explicit);
+    }
+
+    #[test]
+    fn nested_subquery_recurses_through_an_intervening_function() {
+        // The inner subquery `up[2m:1m]` feeds `count_over_time`, whose
+        // instant-vector result is itself subqueried by the outer
+        // `[2m:1m]`. The single sample sits far enough in the past
+        // (-240s) that every inner grid point, at every outer step, still
+        // finds it within the default 5m lookback, so `count_over_time`
+        // over the always-3-point inner grid is 3 at every outer step.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(-240 * NS_PER_MS * 1000, 1.0)])
+            .expect("valid series");
+        let value = Evaluator::new()
+            .eval_instant(&source, "count_over_time(up[2m:1m])[2m:1m]", 0)
+            .expect("nested subquery evaluates");
+        let Value::Matrix(matrix) = value else {
+            panic!("expected a matrix, got {value:?}");
+        };
+        assert_eq!(matrix.len(), 1);
+        let (_, samples) = &matrix[0];
+        assert_eq!(samples.len(), 3);
+        assert!(samples.iter().all(|s| s.value == 3.0));
+    }
+
+    #[test]
+    fn subquery_offset_and_at_shift_the_grids_own_end() {
+        // `up[2m:1m] offset 1m` at t=0 ends its grid at -1m (the grid start
+        // is then epoch-aligned from that shifted end), not at t=0 itself.
+        // The sample sits at -180s so it is within lookback of every grid
+        // point exercised below, in both the offset and the `@` case.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(-180_000_000_000, 1.0)])
+            .expect("valid series");
+        let offset = Evaluator::new()
+            .eval_instant(&source, "up[2m:1m] offset 1m", 0)
+            .expect("subquery evaluates");
+        let Value::Matrix(matrix) = &offset else {
+            panic!("expected a matrix, got {offset:?}");
+        };
+        let (_, samples) = &matrix[0];
+        let timestamps_ms: Vec<i64> = samples.iter().map(|s| s.ts_ns / NS_PER_MS).collect();
+        assert_eq!(timestamps_ms, vec![-180_000, -120_000, -60_000]);
+
+        // `@ 0` pins the grid's end to t=0 regardless of the query's own
+        // evaluation timestamp.
+        let at = Evaluator::new()
+            .eval_instant(&source, "up[2m:1m] @ 0", 999_999)
+            .expect("subquery evaluates");
+        let bare_at_zero = Evaluator::new()
+            .eval_instant(&source, "up[2m:1m]", 0)
+            .expect("subquery evaluates");
+        assert_eq!(at, bare_at_zero, "@0 pins the grid as if evaluated at t=0");
     }
 
     #[test]
@@ -1704,6 +1949,31 @@ mod tests {
             .expect_err("a cap of 0 rejects even a single-point range");
         assert!(matches!(err, Error::TooManyPoints { points: 1, max: 0 }));
         assert_eq!(source.query_count(), 0);
+    }
+
+    #[test]
+    fn over_wide_nested_subquery_is_rejected_without_large_allocation() {
+        // Outer subquery: 61 points (1m at 1s step), each step evaluating
+        // `max_over_time(up[10d:1s])`. The inner subquery alone asks for
+        // 10 days at a 1s step: 864_001 points, far over the default
+        // 11_000 cap. The very first outer step must already trip the
+        // inner cap check before building the inner grid or touching
+        // storage, so this test terminates immediately rather than
+        // attempting an 864_001-entry allocation (repeated 61 times).
+        let source = one_series_source();
+        let err = Evaluator::new()
+            .instant(&source, "max_over_time(up[10d:1s])[1m:1s]", 0)
+            .expect_err("an over-wide nested subquery grid must be rejected");
+        let Error::TooManyPoints { points, max } = err else {
+            panic!("expected TooManyPoints, got {err:?}");
+        };
+        assert_eq!(points, 864_001);
+        assert_eq!(max, DEFAULT_MAX_RANGE_POINTS);
+        assert_eq!(
+            source.query_count(),
+            0,
+            "rejection must happen before any grid step reaches storage"
+        );
     }
 
     #[test]
