@@ -119,6 +119,13 @@ fn to_points(
     tenant: &TenantId,
     dataset: &Dataset,
 ) -> Result<Vec<NormalizedPoint>, RavelStackError> {
+    // NOTE (P11 read-path gap): `dataset.histogram_series` is intentionally
+    // NOT ingested here. `NormalizedPoint` carries a scalar `ravel_types::
+    // Sample` only, and the query read path (`ravel-query` fetcher/merge) is
+    // f64-only, so a native histogram cannot flow ingest -> storage -> query
+    // -> evaluator on the Ravel side yet. Until that lands, native-histogram
+    // corpus entries have Prometheus data but no Ravel data to compare
+    // against; see corpus/histogram_native.txt and the P11 report.
     let mut points = Vec::new();
     for series in &dataset.series {
         let labels = LabelSet::new(

@@ -81,6 +81,7 @@ use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL};
 use crate::eval::{Error, Evaluator, InstantSample, InstantVector, QueryWindow, Value};
 use crate::functions::label::is_valid_label_name;
 use crate::functions::over_time::{kahan_sum_inc, quantile};
+use crate::histogram::{FloatHistogram, avg_histograms, sum_histograms};
 use crate::source::SeriesSource;
 
 /// Evaluate an `AggregateExpr` at one instant: evaluate the inner vector,
@@ -219,15 +220,80 @@ fn eval_plain_aggregate(
     input: InstantVector,
     eval_ts_ns: i64,
 ) -> InstantVector {
-    group_by(modifier, input, |s| s.value)
+    // Group full samples (not just their float values) so `sum`/`avg` can see
+    // native-histogram members (P11).
+    group_by(modifier, input, |s| s)
         .into_iter()
-        .map(|(labels, values)| InstantSample {
-            labels,
-            ts_ns: eval_ts_ns,
-            orig_sample_ts_ns: eval_ts_ns,
-            value: reduce_group(op, &values),
-        })
+        .filter_map(|(labels, members)| reduce_group_samples(op, labels, members, eval_ts_ns))
         .collect()
+}
+
+/// Reduce one group to its output sample, or `None` to omit the group. `sum`
+/// and `avg` aggregate native histograms when the group holds them; a group
+/// mixing float and histogram members is dropped (Prometheus emits an
+/// "incompatible sample types" annotation and produces no output for it,
+/// #178). `min`/`max`/`stddev`/`stdvar` ignore histogram members (float-only
+/// in Prometheus, with an annotation), omitting a group with no float member.
+/// `count` counts every member; `group` is always 1.
+fn reduce_group_samples(
+    op: TokenId,
+    labels: LabelSet,
+    members: Vec<InstantSample>,
+    eval_ts_ns: i64,
+) -> Option<InstantSample> {
+    match op {
+        T_SUM | T_AVG => {
+            let (hists, floats): (Vec<InstantSample>, Vec<InstantSample>) =
+                members.into_iter().partition(|s| s.histogram.is_some());
+            if !hists.is_empty() && !floats.is_empty() {
+                // Mixed float/histogram group: dropped (#178 annotation).
+                return None;
+            }
+            if !hists.is_empty() {
+                let refs: Vec<&FloatHistogram> =
+                    hists.iter().filter_map(|s| s.histogram.as_ref()).collect();
+                let combined = if op == T_AVG {
+                    avg_histograms(refs.iter().copied())
+                } else {
+                    sum_histograms(refs.iter().copied())
+                }?;
+                return Some(InstantSample::histogram(
+                    labels, eval_ts_ns, eval_ts_ns, combined,
+                ));
+            }
+            let values: Vec<f64> = floats.iter().map(|s| s.value).collect();
+            let value = if op == T_AVG {
+                group_avg(&values)
+            } else {
+                group_sum(&values)
+            };
+            Some(InstantSample::scalar(labels, eval_ts_ns, eval_ts_ns, value))
+        }
+        T_COUNT => Some(InstantSample::scalar(
+            labels,
+            eval_ts_ns,
+            eval_ts_ns,
+            members.len() as f64,
+        )),
+        T_GROUP => Some(InstantSample::scalar(labels, eval_ts_ns, eval_ts_ns, 1.0)),
+        T_MIN | T_MAX | T_STDDEV | T_STDVAR => {
+            let values: Vec<f64> = members
+                .iter()
+                .filter(|s| s.histogram.is_none())
+                .map(|s| s.value)
+                .collect();
+            if values.is_empty() {
+                return None;
+            }
+            Some(InstantSample::scalar(
+                labels,
+                eval_ts_ns,
+                eval_ts_ns,
+                reduce_group(op, &values),
+            ))
+        }
+        _ => unreachable!("reduce_group_samples called with non-plain aggregator {op}"),
+    }
 }
 
 fn reduce_group(op: TokenId, values: &[f64]) -> f64 {
@@ -331,6 +397,7 @@ fn eval_quantile(
             ts_ns: eval_ts_ns,
             orig_sample_ts_ns: eval_ts_ns,
             value: quantile(q, values),
+            histogram: None,
         })
         .collect()
 }
@@ -386,6 +453,7 @@ fn eval_count_values(
                 ts_ns: s.ts_ns,
                 orig_sample_ts_ns: s.ts_ns,
                 value: s.value,
+                histogram: None,
             }
         })
         .collect();
@@ -411,6 +479,7 @@ fn eval_count_values(
             ts_ns: eval_ts_ns,
             orig_sample_ts_ns: eval_ts_ns,
             value: members.len() as f64,
+            histogram: None,
         })
         .collect();
     Ok(Value::Vector(out))
@@ -458,6 +527,7 @@ fn eval_topk_bottomk(
                 ts_ns: eval_ts_ns,
                 orig_sample_ts_ns: eval_ts_ns,
                 value: member.value,
+                histogram: None,
             });
         }
     }

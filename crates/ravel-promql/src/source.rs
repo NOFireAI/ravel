@@ -12,6 +12,8 @@
 use ravel_types::{LabelSet, Sample};
 use regex::Regex;
 
+use crate::histogram::FloatHistogram;
+
 /// One matched series: its label set and samples.
 ///
 /// `samples` MUST be sorted ascending by [`Sample::ts_ns`]. Implementors are
@@ -38,6 +40,34 @@ use regex::Regex;
 pub struct SeriesData {
     pub labels: LabelSet,
     pub samples: Vec<Sample>,
+}
+
+/// One native-histogram sample: an event timestamp paired with a native
+/// histogram value, the histogram counterpart of [`Sample`]
+/// (`ravel_segment::HistogramSample` converted to the evaluator's float
+/// working form, P11). `value` is already the float model the evaluator
+/// operates on; the read path converts integer histograms to float before
+/// building these, exactly as Prometheus does before evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSample {
+    pub ts_ns: i64,
+    pub value: FloatHistogram,
+}
+
+/// One matched native-histogram series: its label set and histogram samples,
+/// the histogram counterpart of [`SeriesData`] (P11). Kept a separate type,
+/// and surfaced through a separate [`SeriesSource::query_histograms`] method,
+/// rather than widening [`SeriesData`]: `SeriesData`'s two-field shape is a
+/// struct literal in `ravel-query`'s merge path, so adding a field there would
+/// be a cross-crate breaking change, whereas a new type and a defaulted trait
+/// method are additive.
+///
+/// `samples` MUST be sorted ascending by `ts_ns`, the same contract
+/// [`SeriesData`] carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSeriesData {
+    pub labels: LabelSet,
+    pub samples: Vec<HistogramSample>,
 }
 
 /// Prometheus label-matcher operator. `Re`/`Nre` carry the compiled,
@@ -185,4 +215,20 @@ pub trait SeriesSource: Send + Sync {
         matchers: &[LabelMatcher],
         window: ravel_types::TimeRange,
     ) -> Result<Vec<SeriesData>, SourceError>;
+
+    /// Return every native-histogram series matching all of `matchers`, with
+    /// samples restricted to `window` (P11). Defaulted to empty so existing
+    /// scalar-only sources (e.g. `ravel-query`'s `MergedSource`, which does
+    /// not decode RSEG HIST_PAGES yet) need no change; a source that carries
+    /// native histograms overrides it. A native-histogram series and a float
+    /// series never share a `(series, ts)`: storage keeps a series' value kind
+    /// fixed, so the evaluator can union the two result sets without a
+    /// tiebreak.
+    fn query_histograms(
+        &self,
+        _matchers: &[LabelMatcher],
+        _window: ravel_types::TimeRange,
+    ) -> Result<Vec<HistogramSeriesData>, SourceError> {
+        Ok(Vec::new())
+    }
 }

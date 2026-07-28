@@ -16,12 +16,17 @@
 
 use ravel_types::Sample;
 
+use crate::histogram::{self, FloatHistogram, TimedHistogram};
+
 use super::{FunctionDef, FunctionKind, RangeWindow};
 
 pub(crate) const FUNCTIONS: &[FunctionDef] = &[
     FunctionDef {
         name: "rate",
-        kind: FunctionKind::RangeVector(rate),
+        kind: FunctionKind::RangeVectorFloatOrHist {
+            float: rate,
+            hist: rate_hist,
+        },
     },
     FunctionDef {
         name: "irate",
@@ -29,11 +34,17 @@ pub(crate) const FUNCTIONS: &[FunctionDef] = &[
     },
     FunctionDef {
         name: "increase",
-        kind: FunctionKind::RangeVector(increase),
+        kind: FunctionKind::RangeVectorFloatOrHist {
+            float: increase,
+            hist: increase_hist,
+        },
     },
     FunctionDef {
         name: "delta",
-        kind: FunctionKind::RangeVector(delta),
+        kind: FunctionKind::RangeVectorFloatOrHist {
+            float: delta,
+            hist: delta_hist,
+        },
     },
     FunctionDef {
         name: "idelta",
@@ -67,6 +78,67 @@ fn increase(samples: &[Sample], w: RangeWindow) -> Option<f64> {
 
 fn delta(samples: &[Sample], w: RangeWindow) -> Option<f64> {
     extrapolated_rate(samples, w, false, false)
+}
+
+/// `rate` over a native-histogram window (P11): the counter-reset-compensated
+/// window reduction ([`histogram::histogram_rate`]) scaled by the same
+/// boundary-extrapolation-and-per-second factor the float path uses.
+fn rate_hist(samples: &[TimedHistogram], w: RangeWindow) -> Option<FloatHistogram> {
+    histogram_extrapolated_rate(samples, w, true, true)
+}
+
+/// `increase` over a native-histogram window: like [`rate_hist`] without the
+/// final per-second division.
+fn increase_hist(samples: &[TimedHistogram], w: RangeWindow) -> Option<FloatHistogram> {
+    histogram_extrapolated_rate(samples, w, true, false)
+}
+
+/// `delta` over a native-histogram (gauge) window: the plain windowed
+/// difference with boundary extrapolation, no counter-reset compensation.
+fn delta_hist(samples: &[TimedHistogram], w: RangeWindow) -> Option<FloatHistogram> {
+    histogram_extrapolated_rate(samples, w, false, false)
+}
+
+/// The native-histogram counterpart of [`extrapolated_rate`] (Prometheus'
+/// `extrapolatedRate` histogram branch): reduce the window to one histogram
+/// via [`histogram::histogram_rate`], then multiply by the identical boundary-
+/// extrapolation factor (`isRate` also dividing by the range in seconds). The
+/// counter zero-floor clamp is float-only in Prometheus and is not applied
+/// here.
+fn histogram_extrapolated_rate(
+    samples: &[TimedHistogram],
+    w: RangeWindow,
+    is_counter: bool,
+    is_rate: bool,
+) -> Option<FloatHistogram> {
+    let mut reduced = histogram::histogram_rate(samples, is_counter)?;
+
+    let first_ts = samples[0].0;
+    let last_ts = samples[samples.len() - 1].0;
+
+    let duration_to_start = ns_diff_to_seconds(first_ts, w.start_ns);
+    let duration_to_end = ns_diff_to_seconds(w.end_ns, last_ts);
+    let sampled_interval = ns_diff_to_seconds(last_ts, first_ts);
+    let average_duration_between_samples = sampled_interval / (samples.len() - 1) as f64;
+
+    let extrapolation_threshold = average_duration_between_samples * 1.1;
+    let mut extrapolate_to_interval = sampled_interval;
+    if duration_to_start < extrapolation_threshold {
+        extrapolate_to_interval += duration_to_start;
+    } else {
+        extrapolate_to_interval += average_duration_between_samples / 2.0;
+    }
+    if duration_to_end < extrapolation_threshold {
+        extrapolate_to_interval += duration_to_end;
+    } else {
+        extrapolate_to_interval += average_duration_between_samples / 2.0;
+    }
+    let mut factor = extrapolate_to_interval / sampled_interval;
+    if is_rate {
+        factor /= w.range_ns as f64 / 1_000_000_000.0;
+    }
+    reduced.mul(factor);
+    Some(reduced)
 }
 
 fn irate(samples: &[Sample], _w: RangeWindow) -> Option<f64> {

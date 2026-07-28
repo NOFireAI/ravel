@@ -88,6 +88,7 @@ fn vector_fn(
         ts_ns: eval_ts_ns,
         orig_sample_ts_ns: eval_ts_ns,
         value: s,
+        histogram: None,
     }]))
 }
 
@@ -120,6 +121,7 @@ fn timestamp_fn(v: InstantVector) -> InstantVector {
             ts_ns: s.ts_ns,
             orig_sample_ts_ns: s.ts_ns,
             value: ns_to_seconds(s.orig_sample_ts_ns),
+            histogram: None,
         })
         .collect()
 }
@@ -224,6 +226,7 @@ fn calendar_call(
             ts_ns: eval_ts_ns,
             orig_sample_ts_ns: eval_ts_ns,
             value: ns_to_seconds(eval_ts_ns),
+            histogram: None,
         }]
     } else {
         vector_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?
@@ -237,6 +240,7 @@ fn calendar_call(
                 ts_ns: s.ts_ns,
                 orig_sample_ts_ns: s.ts_ns,
                 value: field(&f),
+                histogram: None,
             }
         })
         .collect();
