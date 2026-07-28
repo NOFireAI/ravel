@@ -9,6 +9,7 @@ mod catalog;
 mod config;
 mod error;
 mod snapshot;
+mod snapshot_format;
 
 pub use catalog::Catalog;
 pub use config::{
@@ -17,3 +18,7 @@ pub use config::{
 };
 pub use error::CatalogError;
 pub use snapshot::{SegmentRef, Snapshot};
+pub use snapshot_format::{
+    DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, HEAD_FORMAT_VERSION, MAGIC, PartLimits,
+    SnapshotFormatError, VERSION, decode_head, decode_part, encode_head, encode_part,
+};
