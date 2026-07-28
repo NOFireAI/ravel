@@ -31,11 +31,12 @@ use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest, CommandGetCatalogs,
     CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
-    CommandPreparedStatementQuery, CommandStatementQuery, TicketStatementQuery,
+    CommandPreparedStatementQuery, CommandStatementQuery, ProstMessageExt, TicketStatementQuery,
 };
 use arrow_flight::{FlightDescriptor, Ticket};
 use datafusion::arrow::array::RecordBatch;
 use futures::StreamExt;
+use prost::Message;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
@@ -45,7 +46,7 @@ use tonic::metadata::MetadataMap;
 use util::flight_harness::{
     Harness, TOKEN_KEY, TestAuth, collect, insert, merged, specs, statement_ticket,
 };
-use util::{NOW_NS, SegSpec, SeriesSpec, request, tenant_id};
+use util::{NOW_NS, SegSpec, SeriesSpec, StallingStore, request, tenant_id};
 
 const QUERY: &str = "SELECT ts, value FROM samples ORDER BY series_id, ts";
 
@@ -211,12 +212,124 @@ async fn the_ticket_deadline_is_bounded_by_the_gc_protection_horizon() {
         .get_flight_info("acme", QUERY)
         .await
         .expect("flight info");
-    let decoded =
-        FlightTicket::decode(&statement_ticket(&ticket).statement_handle).expect("ticket decodes");
+    let decoded = FlightTicket::decode(
+        &statement_ticket(&ticket).statement_handle,
+        harness.service.ticket_key(),
+    )
+    .expect("ticket decodes");
     assert_eq!(decoded.deadline_ns, NOW_NS + 5_000_000_000);
     assert_eq!(decoded.tenant, tenant.hash());
     assert_eq!(decoded.now_ns, NOW_NS);
     assert!(!decoded.segments.is_empty());
+}
+
+/// Issue #185: a ticket tampered with after minting -- here, its deadline
+/// extended -- and re-signed under a key an attacker does not have (they
+/// cannot have the server's in-process secret, so any key they pick stands
+/// in for that) is refused at `DoGet` with a MAC mismatch, never silently
+/// honored.
+#[tokio::test]
+async fn a_tampered_ticket_is_rejected_by_do_get() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    let mut decoded = FlightTicket::decode(
+        &statement_ticket(&ticket).statement_handle,
+        harness.service.ticket_key(),
+    )
+    .expect("ticket decodes");
+
+    // Tamper with the pinned deadline, then re-encode under a key that is
+    // not the server's: an attacker without the in-process secret cannot
+    // reproduce the real MAC over the modified bytes.
+    decoded.deadline_ns += 1_000_000_000_000;
+    let attacker_key = [0xAAu8; ravel_sql::TICKET_KEY_LEN];
+    let forged = decoded.encode(&attacker_key).expect("encode");
+    let forged_ticket = Ticket::new(
+        TicketStatementQuery {
+            statement_handle: forged.into(),
+        }
+        .as_any()
+        .encode_to_vec(),
+    );
+
+    let status = harness
+        .do_get("acme", &forged_ticket)
+        .await
+        .expect_err("tampered ticket is refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+/// Issue #186: a ticket honestly carrying a deadline far beyond this
+/// deployment's GC protection horizon -- re-signed with the real key, not
+/// tampered -- must not hand `DoGet` a multi-hour wall budget. The read never
+/// completes ([`StallingStore`]), so the only way this call can end is a
+/// deadline firing; before the fix, `DoGet` trusted the ticket's own
+/// `deadline_ns` verbatim and this would have hung far past any reasonable
+/// test bound. The fix re-derives the deployment's own horizon-bounded budget
+/// at redemption and takes the minimum with the ticket's value, so the
+/// embedded deadline can only ever shorten the effective budget, never
+/// lengthen it past what this deployment allows today.
+#[tokio::test]
+async fn do_get_bounds_a_stalled_read_to_the_gc_horizon_not_the_tickets_own_deadline() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+
+    // Publish through a plain store...
+    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let plain = Harness::build(Arc::clone(&inner), &[(&tenant, &seg_specs)]).await;
+    drop(plain);
+
+    // ...then redeem through a wrapper whose segment reads never complete, so
+    // the only possible outcome is a deadline firing, not a race against how
+    // fast an in-memory read happens to be.
+    let stalling: Arc<dyn ObjectStoreBackend> = StallingStore::new(inner);
+    let mut harness = Harness::build(stalling, &[]).await;
+    harness.service = RavelFlightSqlService::new(
+        Arc::clone(&harness.executor),
+        TestAuth::new(&[("acme", &tenant)]),
+        Arc::clone(&harness.clock) as Arc<dyn FlightClock>,
+        FlightSqlConfig {
+            max_deadline: Duration::from_secs(30),
+            gc_protection_horizon: Duration::from_millis(50),
+            ..FlightSqlConfig::default()
+        },
+    );
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    let mut decoded = FlightTicket::decode(
+        &statement_ticket(&ticket).statement_handle,
+        harness.service.ticket_key(),
+    )
+    .expect("ticket decodes");
+    // Honestly far beyond the 50 ms horizon -- simulates a ticket this same
+    // server signed under a looser policy than the one redemption enforces
+    // today.
+    decoded.deadline_ns = NOW_NS + 3_600_000_000_000;
+    let re_encoded = decoded
+        .encode(harness.service.ticket_key())
+        .expect("re-encode under the real key");
+    let far_future_ticket = Ticket::new(
+        TicketStatementQuery {
+            statement_handle: re_encoded.into(),
+        }
+        .as_any()
+        .encode_to_vec(),
+    );
+
+    let status = harness
+        .do_get("acme", &far_future_ticket)
+        .await
+        .expect_err("bounded by the gc horizon, not the ticket's own deadline");
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
 }
 
 // ---------------------------------------------------------------------------
