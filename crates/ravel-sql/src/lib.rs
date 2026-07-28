@@ -20,24 +20,43 @@
 //! re-export so this crate is internally version-consistent regardless of
 //! the workspace `arrow` pin.
 
+//! Ticket B3 (issue #22) adds the request-handling half: the read-only
+//! single-statement gate (`validate`), the fresh per-query single-tenant
+//! session (`session`), the resolve/plan/execute driver with the snapshot
+//! retry contract (`executor`), the two wire encodings (`output`), and the
+//! error-to-client redaction boundary (`error`). The HTTP surface itself
+//! lives in services/ravel-server behind its `sql` feature; nothing here
+//! links axum, and nothing there links datafusion.
+
 mod config;
 mod dedup;
 mod error;
+mod executor;
 mod labels;
 mod memory;
+mod output;
 mod provider;
 mod pushdown;
 mod scan;
 mod schema;
+mod session;
 mod udf;
+mod validate;
 
 pub use config::{DEFAULT_MAX_QUERY_BYTES, SqlConfig};
-pub use error::SqlError;
+pub use error::{
+    ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_UNAVAILABLE,
+    MSG_UNSATISFIABLE, SqlError,
+};
+pub use executor::{SqlExecutor, SqlOutcome, SqlRequest, SqlStats};
 pub use memory::{TenantDelegatingPool, TenantMemoryAccountant};
+pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
 pub use schema::{internal_schema, public_schema};
+pub use session::{EmptyObjectStoreRegistry, SAMPLES_TABLE, build_session, session_config};
 pub use udf::{label_match_udf, label_udf};
+pub use validate::{ValidationError, validate};
 
 /// The internal provenance column names, in scan-output order after the
 /// four public columns. Consumed by [`dedup::RsegDedupExec`] and dropped

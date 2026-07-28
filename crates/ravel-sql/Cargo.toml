@@ -20,14 +20,35 @@ ravel-object-store = { workspace = true }
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the
 # module docs and the B1 report for the arrow 58 vs workspace-59 pinning note.
-datafusion = { version = "54", default-features = false }
+#
+# `sql` is the only feature enabled on top of `default-features = false`: it is
+# what supplies `datafusion-sql` (the sqlparser front end and the SQL-to-
+# LogicalPlan planner) that the `/api/v1/sql` endpoint parses and plans with.
+# Everything the default feature set would otherwise add stays off, and that is
+# deliberate: no parquet/csv/avro/json file formats, no compression codecs, no
+# nested/regex/crypto expression packs. A file-format factory that is not linked
+# cannot be reached by a `CREATE EXTERNAL TABLE` that slipped a parse gate
+# (docs/arrow-datafusion-plan.md section 2 security invariant 1, review F16).
+datafusion = { version = "54", default-features = false, features = ["sql"] }
+
+# `url::Url` appears in the `ObjectStoreRegistry` trait signature, which
+# ravel-sql implements to install a registry that holds no stores at all
+# (security invariant 1: "the SQL RuntimeEnv registers no object store").
+# datafusion does not re-export `url`, so it is named directly here; the crate
+# is already in the workspace lockfile as a transitive dependency of
+# object_store, so this adds no new supply-chain surface.
+url = "2"
 
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+# The endpoint-level tests drive a real `Catalog`, so they publish real
+# commit records rather than hand-building `Snapshot`s.
+ravel-commit = { workspace = true }

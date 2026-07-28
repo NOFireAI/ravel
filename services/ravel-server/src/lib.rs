@@ -7,6 +7,8 @@ pub mod otlp_grpc;
 pub mod otlp_http;
 pub mod query;
 pub mod remote_write;
+#[cfg(feature = "sql")]
+pub mod sql;
 pub mod store;
 pub mod tenant;
 
@@ -137,6 +139,18 @@ pub async fn start(
             config.shard_count,
             config.tenant_resolver.clone(),
         )?;
+        #[cfg(feature = "sql")]
+        {
+            // Mounted alongside the Prometheus-shaped routes on the same
+            // listener, sharing the catalog and object store but nothing
+            // else: the SQL path builds its own session per query.
+            let sql_state = query::build_sql_state(
+                store.clone(),
+                config.shard_count,
+                config.tenant_resolver.clone(),
+            )?;
+            http_router = http_router.merge(sql::router(sql_state));
+        }
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }
 
