@@ -23,6 +23,15 @@ pub const VERSION_V2: u16 = 2;
 /// this crate's reader (C4).
 pub const VERSION_V3: u16 = 3;
 
+/// RSEG v4 trailer version (ADR-0018, docs/compaction-retention-plan.md).
+/// Strict superset of v3: SERIES_META's per-series run columns become
+/// run-major (a series may carry more than one run), and the Footer gains
+/// additive compaction-provenance fields. No new section kind or page
+/// encoding; HIST_PAGES bytes from v3 inputs are copied verbatim per run.
+/// Same magic and trailer layout as v1/v2/v3. Written by
+/// `SegmentWriter::write_v4`; not yet read by this crate's reader (P3).
+pub const VERSION_V4: u16 = 4;
+
 /// Signal byte for metric segments.
 pub const SIGNAL_METRICS: u8 = 1;
 
@@ -111,6 +120,7 @@ mod tests {
         assert_eq!(VERSION, 1);
         assert_eq!(VERSION_V2, 2);
         assert_eq!(VERSION_V3, 3);
+        assert_eq!(VERSION_V4, 4);
         assert_eq!(MAGIC, *b"RSG1");
         assert_eq!(section_kind::LABEL_DICT, 1);
         assert_eq!(section_kind::SERIES_TABLE, 2);

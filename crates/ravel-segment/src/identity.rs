@@ -59,6 +59,7 @@ mod tests {
             sample_count: 0,
             series_count: 0,
             sections: vec![],
+            ..Default::default()
         }
     }
 

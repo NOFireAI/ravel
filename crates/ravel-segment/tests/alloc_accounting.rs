@@ -366,6 +366,7 @@ fn hostile_series_ids_count_fails_fast_without_huge_allocation() {
                 uncompressed_len: 0,
             },
         ],
+        ..Default::default()
     };
 
     let start = std::time::Instant::now();
