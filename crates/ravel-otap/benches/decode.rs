@@ -50,6 +50,7 @@ fn build_batch() -> BatchArrowRecords {
                 .map(|p| DataPointRow {
                     time_unix_nano: p as i64 * 1_000_000,
                     value: p as f64 * 0.5,
+                    flags: 0,
                     attrs: (0..ATTRS_PER_POINT)
                         .map(|a| AttrRow {
                             key: format!("k{a}"),

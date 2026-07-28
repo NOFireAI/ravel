@@ -28,6 +28,7 @@ fn point(time_unix_nano: i64, value: f64, attrs: Vec<(&str, &str)>) -> DataPoint
     DataPointRow {
         time_unix_nano,
         value,
+        flags: 0,
         attrs: attrs
             .into_iter()
             .map(|(key, value)| AttrRow {
