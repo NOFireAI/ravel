@@ -38,6 +38,7 @@
 //! (review F18), and checking the metadata-resolved tenant against the
 //! ticket's own before redeeming it.
 
+mod avg;
 mod config;
 mod dedup;
 mod error;

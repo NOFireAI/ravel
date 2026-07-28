@@ -224,6 +224,20 @@ pub fn sum_sequential(values: &[f64]) -> Option<f64> {
     Some(values.iter().fold(0.0f64, |acc, v| acc + v))
 }
 
+/// `avg`: the sequential-fold UDAF's reference (crate::avg, ADR-0022 decisions
+/// 3, 4). The numerator is a plain f64 left fold *seeded with the first value*
+/// (not a `0.0` seed, so all-`-0.0` folds to `-0.0`) over the non-null values
+/// in input order, divided by the non-null count in one IEEE division. Empty
+/// input is SQL NULL; a zero count never yields NaN or infinity. This is
+/// independent of [`sum_sequential`]: it owns its own numerator fold and does
+/// not divide `sum_sequential` by a count.
+pub fn avg_sequential(values: &[f64]) -> Option<f64> {
+    let mut it = values.iter().copied();
+    let first = it.next()?;
+    let numerator = it.fold(first, |acc, v| acc + v);
+    Some(numerator / values.len() as f64)
+}
+
 // ---------------------------------------------------------------------------
 // The reference executor
 // ---------------------------------------------------------------------------
@@ -242,6 +256,12 @@ pub enum Shape {
     Sum,
     /// `SELECT series_id, sum(value) ... GROUP BY series_id ORDER BY series_id`
     GroupedSum,
+    /// `SELECT avg(value) ...`. The sequential-fold UDAF (crate::avg) takes the
+    /// full float pool, ungrouped included, because it is bit-identical to
+    /// [`avg_sequential`] rather than to arrow's lane-parallel batch sum.
+    Avg,
+    /// `SELECT series_id, avg(value) ... GROUP BY series_id ORDER BY series_id`
+    GroupedAvg,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +291,11 @@ impl Query {
             Shape::Sum => format!("SELECT sum(value) FROM samples {where_clause}"),
             Shape::GroupedSum => format!(
                 "SELECT series_id, sum(value) FROM samples {where_clause} \
+                 GROUP BY series_id ORDER BY series_id"
+            ),
+            Shape::Avg => format!("SELECT avg(value) FROM samples {where_clause}"),
+            Shape::GroupedAvg => format!(
+                "SELECT series_id, avg(value) FROM samples {where_clause} \
                  GROUP BY series_id ORDER BY series_id"
             ),
         }
@@ -318,6 +343,19 @@ impl Query {
                     vec![
                         Cell::Bytes(sid.to_vec()),
                         optional_float(sum_sequential(&values)),
+                    ]
+                })
+                .collect(),
+            Shape::Avg => {
+                let values: Vec<f64> = kept.iter().map(|r| r.value).collect();
+                vec![vec![optional_float(avg_sequential(&values))]]
+            }
+            Shape::GroupedAvg => group_by_series(&kept)
+                .into_iter()
+                .map(|(sid, values)| {
+                    vec![
+                        Cell::Bytes(sid.to_vec()),
+                        optional_float(avg_sequential(&values)),
                     ]
                 })
                 .collect(),
