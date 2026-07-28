@@ -32,6 +32,8 @@ mod config;
 mod dedup;
 mod error;
 mod executor;
+#[cfg(feature = "flight-sql")]
+pub mod flight;
 mod labels;
 mod memory;
 mod output;
