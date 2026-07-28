@@ -15,6 +15,7 @@
 pub mod bloom;
 pub mod encoding;
 pub mod error;
+pub mod page;
 pub mod tokenizer;
 pub mod varint;
 
