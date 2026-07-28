@@ -8,14 +8,15 @@
 //! which pushes **many** batches through the pool releases all of them.
 //!
 //! The distinction matters. `RsegScanExec` grows its reservation once per
-//! emitted batch and releases the whole thing when the stream drops, so a
-//! single-batch test passes for either a correct implementation or one whose
-//! release path only ever covers the last batch. Every test here therefore
-//! forces more than one batch (over `RsegScanExec`'s 8192-row batch size),
-//! checks that the reserved figure actually grew *across* batches, and only
-//! then asserts the return to zero. A per-batch `shrink` that leaked
-//! everything but the final batch would show a non-zero residual here and
-//! nowhere else.
+//! fetched/decoded segment and again per emitted batch (issue #188; see
+//! crate::scan module doc), and releases the whole thing when the stream
+//! drops, so a single-batch test passes for either a correct implementation
+//! or one whose release path only ever covers the last batch. Every test
+//! here therefore forces more than one batch (over `RsegScanExec`'s
+//! 8192-row batch size), checks that the reserved figure actually grew
+//! *across* batches, and only then asserts the return to zero. A per-batch
+//! `shrink` that leaked everything but the final batch would show a
+//! non-zero residual here and nowhere else.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -216,19 +217,23 @@ async fn the_executor_returns_tenant_bytes_after_a_multi_batch_query() {
     );
 }
 
-/// A per-query byte ceiling smaller than the multi-batch working set trips
-/// with the pool's typed error, and still leaves the tenant accountant at
-/// zero: a failed query must not leak either budget.
+/// A per-query byte ceiling smaller than the working set trips with the
+/// pool's typed error, and still leaves the tenant accountant at zero: a
+/// failed query must not leak either budget.
+///
+/// Issue #188 moved the reservation's first growth from the batch phase into
+/// the fetch/decode phase (`prepare_partition`): the single segment's
+/// decoded run alone (30,000 rows, 64 bytes each = ~1.9 MiB) already exceeds
+/// this test's 1.4 MiB ceiling, so the trip now happens before the scan ever
+/// builds its first `RecordBatch`. That is the intended, earlier rejection
+/// the issue asked for, not a regression: zero batches is now the correct
+/// outcome for a byte ceiling this far below the decoded input size.
 #[tokio::test]
 async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
     let tenant = tenant_id("acme");
     let specs = big_segment();
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
-    // The scan emits the internal schema (four public columns plus four
-    // provenance columns), so one 8192-row batch measures roughly 512 KiB.
-    // A 1.4 MiB ceiling therefore admits two batches and trips on the third:
-    // the failure lands after real emission, not on the first batch.
     let config = SqlConfig {
         engine: util::engine_config(),
         max_query_bytes: 1_400_000,
@@ -270,9 +275,10 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
     drop(stream);
 
     assert!(failed, "the query pool must trip");
-    assert!(
-        batches >= 1,
-        "the failure must come after at least one successful batch"
+    assert_eq!(
+        batches, 0,
+        "the fetch/decode-phase charge (issue #188) must reject this query \
+         before its one segment's decoded run ever reaches the batch phase"
     );
     assert_eq!(
         accountant.reserved(),

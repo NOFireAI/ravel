@@ -26,12 +26,52 @@
 //! label-only; segment-level ts pruning happens one level up in the provider.
 //! Every prune is widen-only (see crate::pushdown).
 //!
-//! Memory (review F10/F13): each partition registers a `MemoryConsumer` against
-//! the `TaskContext`'s pool and grows its `MemoryReservation` by the measured
-//! `RecordBatch::get_array_memory_size` of each batch it emits. The reservation
-//! is owned by the stream, so a dropped or cancelled stream frees it (the pool
-//! forwards the drop-time shrink to the tenant accountant), and a query that
-//! outgrows its byte budget fails with the pool's `ResourcesExhausted`.
+//! Memory (review F10/F13; issue #188): each partition registers a
+//! `MemoryConsumer` against the `TaskContext`'s pool and grows one
+//! `MemoryReservation` in two phases:
+//!
+//! - Fetch/decode phase (`prepare_partition`): after each segment's
+//!   `fetch_soa` call returns, the reservation grows by that segment's
+//!   decoded run size (`runs` entries, `size_of::<ScanRow>()` each) plus
+//!   `FetchStats::raw_f64_bytes` (the one fetched-buffer byte figure
+//!   `SegmentFetcher` already exposes without a ravel-query API change --
+//!   see the crate module doc's context-discipline note). A `try_grow`
+//!   failure here returns before the next segment is fetched at all.
+//! - Batch phase (`ScanStream::poll_next`, `ScanState::Merging`): the
+//!   existing per-batch grow by `RecordBatch::get_array_memory_size`.
+//!
+//! These two phases charge disjoint, simultaneously-live allocations, not the
+//! same bytes twice: the decoded `ScanRow` runs stay allocated in `Merger` for
+//! the whole partition (batches only advance a cursor into them, they never
+//! free the run), while each built `RecordBatch` is a separate Arrow-array
+//! allocation constructed from a slice of those rows. Both are real,
+//! concurrently resident memory at the point a batch is emitted, so charging
+//! both is the correct accounting, not double-counting. docs/arrow-
+//! datafusion-plan.md's "Session config, memory pool, budgets" section
+//! describes only the shrink-per-yielded-batch half of this; it does not yet
+//! describe the fetch/decode charge added here (see the note added there).
+//!
+//! Each partition's reservation is threaded through `prepare_partition` (the
+//! fetch/decode phase owns it first) and back into `ScanStream` (the batch
+//! phase continues growing the same reservation), so a dropped or cancelled
+//! stream at any point frees the one reservation via `Drop` (the pool forwards
+//! the shrink to the tenant accountant), and a query that outgrows its byte
+//! budget fails with the pool's `ResourcesExhausted`.
+//!
+//! `max_series` (issue #187) is enforced the same way: `prepare_partition`
+//! tracks the distinct `series_id` count in the `labels` map it is already
+//! building, and fails with `SqlError::TooManySeries` the moment a new
+//! series pushes that count past `max_series`, before decoding that series'
+//! samples or fetching any further segment. This is a per-partition count,
+//! not a cross-partition global one: `RsegScanExec` partitions by segment
+//! (round-robin), not by series, so a series repeated across many segments
+//! can be counted independently by more than one partition's stream. A true
+//! global cap would need a distinct-series set shared across a partition's
+//! concurrently-executing sibling streams, which is a larger change than this
+//! ticket's scope; the per-partition cap is the enforced approximation, and
+//! it still turns an unbounded-cardinality query into a bounded one per
+//! partition, failing before that partition's remaining segments are
+//! fetched.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -115,6 +155,9 @@ pub struct RsegScanExec {
     /// Optional `series_id` allow-set applied as a post-fetch row filter.
     /// `None` means unconstrained.
     series_ids: Option<Arc<HashSet<[u8; 16]>>>,
+    /// Per-partition distinct-series_id budget (issue #187); see the module
+    /// doc for why this is per-partition, not a cross-partition total.
+    max_series: usize,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -122,7 +165,8 @@ pub struct RsegScanExec {
 impl RsegScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given
-    /// pushdown matchers and optional `series_id` allow-set.
+    /// pushdown matchers, optional `series_id` allow-set, and per-partition
+    /// `max_series` budget (issue #187).
     pub fn new(
         tenant_hash: TenantHash,
         fetcher: SegmentFetcher,
@@ -130,6 +174,7 @@ impl RsegScanExec {
         target_partitions: usize,
         matchers: Arc<Vec<LabelMatcher>>,
         series_ids: Option<Arc<HashSet<[u8; 16]>>>,
+        max_series: usize,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -144,6 +189,7 @@ impl RsegScanExec {
             partitions,
             matchers,
             series_ids,
+            max_series,
             schema,
             properties,
         })
@@ -239,11 +285,16 @@ impl ExecutionPlan for RsegScanExec {
             .register(context.memory_pool());
 
         let fut = Box::pin(prepare_partition(
-            fetcher, tenant, segs, matchers, series_ids,
+            fetcher,
+            tenant,
+            segs,
+            matchers,
+            series_ids,
+            self.max_series,
+            reservation,
         ));
         Ok(Box::pin(ScanStream {
             schema,
-            reservation,
             state: ScanState::Fetching(fut),
         }))
     }
@@ -259,18 +310,26 @@ struct Prepared {
 /// Fetch every segment in this partition (matchers pushed into the fetcher),
 /// decode each into its own ts/provenance-sorted run, and collect per-series
 /// labels. Applies the `series_id` allow-set as a post-fetch row filter.
+///
+/// Enforces two budgets before the next segment is ever fetched: the
+/// distinct-series count against `max_series` (issue #187), and the
+/// reservation's byte budget against this segment's decoded size (issue
+/// #188). `reservation` is threaded through and returned so the caller's
+/// batch phase continues growing the same one (see module doc).
 async fn prepare_partition(
     fetcher: SegmentFetcher,
     tenant: TenantHash,
     segs: Vec<SegmentRef>,
     matchers: Arc<Vec<LabelMatcher>>,
     series_ids: Option<Arc<HashSet<[u8; 16]>>>,
-) -> DFResult<Prepared> {
+    max_series: usize,
+    reservation: MemoryReservation,
+) -> DFResult<(Prepared, MemoryReservation)> {
     let mut runs: Vec<Vec<ScanRow>> = Vec::with_capacity(segs.len());
     let mut labels: HashMap<[u8; 16], LabelSet> = HashMap::new();
 
     for seg in &segs {
-        let (series, _stats) = fetcher
+        let (series, stats) = fetcher
             .fetch_soa(tenant, seg, &matchers)
             .await
             .map_err(SqlError::from)?;
@@ -281,6 +340,13 @@ async fn prepare_partition(
                 && !allow.contains(&sid)
             {
                 continue;
+            }
+            if !labels.contains_key(&sid) && labels.len() >= max_series {
+                return Err(SqlError::TooManySeries {
+                    count: labels.len() + 1,
+                    max: max_series,
+                }
+                .into());
             }
             labels.entry(sid).or_insert_with(|| fs.labels.clone());
             for (i, (&ts, &value)) in fs.timestamps.iter().zip(fs.values.iter()).enumerate() {
@@ -295,6 +361,15 @@ async fn prepare_partition(
                 });
             }
         }
+        // Charge this segment's decoded run plus its fetched buffer bytes
+        // before fetching the next segment: a byte-budget overrun surfaces
+        // here as the pool's typed ResourcesExhausted, not after every
+        // segment in the partition has already been pulled.
+        let segment_bytes = run
+            .len()
+            .saturating_mul(std::mem::size_of::<ScanRow>())
+            .saturating_add(usize::try_from(stats.raw_f64_bytes).unwrap_or(usize::MAX));
+        reservation.try_grow(segment_bytes)?;
         // Sort this segment's rows into one run under the full total order.
         // Bounded by a single segment, never all segments at once.
         run.sort_by_key(ScanRow::sort_key);
@@ -303,7 +378,7 @@ async fn prepare_partition(
         }
     }
 
-    Ok(Prepared { runs, labels })
+    Ok((Prepared { runs, labels }, reservation))
 }
 
 /// Head-of-run entry in the merge heap: the next row's key and its run index.
@@ -355,18 +430,24 @@ impl Merger {
     }
 }
 
+/// The fetch/decode phase's future: builds `Prepared` and hands back the same
+/// reservation it charged, for the batch phase to keep growing.
+type PrepareFuture = Pin<Box<dyn Future<Output = DFResult<(Prepared, MemoryReservation)>> + Send>>;
+
 enum ScanState {
-    Fetching(Pin<Box<dyn Future<Output = DFResult<Prepared>> + Send>>),
-    Merging(Merger),
+    Fetching(PrepareFuture),
+    Merging(Merger, MemoryReservation),
     Done,
 }
 
 /// Per-partition record-batch stream: awaits the fetch, then emits merged
 /// bounded batches, growing the memory reservation by each batch's measured
-/// size.
+/// size. The reservation itself lives inside `state`: the fetch/decode phase
+/// (`prepare_partition`) owns and grows it first, then hands it back to be
+/// carried into `Merging`, so it is the same reservation for the whole
+/// partition's lifetime and frees exactly once on drop.
 struct ScanStream {
     schema: SchemaRef,
-    reservation: MemoryReservation,
     state: ScanState,
 }
 
@@ -378,8 +459,8 @@ impl Stream for ScanStream {
         loop {
             match &mut this.state {
                 ScanState::Fetching(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(prepared)) => {
-                        this.state = ScanState::Merging(Merger::new(prepared));
+                    Poll::Ready(Ok((prepared, reservation))) => {
+                        this.state = ScanState::Merging(Merger::new(prepared), reservation);
                     }
                     Poll::Ready(Err(e)) => {
                         this.state = ScanState::Done;
@@ -387,7 +468,7 @@ impl Stream for ScanStream {
                     }
                     Poll::Pending => return Poll::Pending,
                 },
-                ScanState::Merging(merger) => {
+                ScanState::Merging(merger, reservation) => {
                     let rows = merger.next_batch(BATCH_ROWS);
                     if rows.is_empty() {
                         this.state = ScanState::Done;
@@ -403,7 +484,7 @@ impl Stream for ScanStream {
                     // Grow the reservation by the batch's measured footprint.
                     // A byte-budget overrun surfaces here as the pool's typed
                     // ResourcesExhausted error, never a silent partial result.
-                    if let Err(e) = this.reservation.try_grow(batch.get_array_memory_size()) {
+                    if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
                         this.state = ScanState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
