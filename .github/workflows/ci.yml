@@ -23,12 +23,17 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --cargo-profile ci
+      # nextest does not run doctests; keep them covered separately.
+      - name: Doctests
+        run: cargo test --doc --workspace
 
   # The SQL surface (ticket B3, issue #22). Two things the `check` job cannot
   # cover:
