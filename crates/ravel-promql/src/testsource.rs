@@ -6,8 +6,11 @@
 
 use ravel_types::{Label, LabelSet, Sample, TimeRange, TypeError};
 
+use crate::histogram::FloatHistogram;
 use crate::matchers;
-use crate::source::{LabelMatcher, SeriesData, SeriesSource, SourceError};
+use crate::source::{
+    HistogramSample, HistogramSeriesData, LabelMatcher, SeriesData, SeriesSource, SourceError,
+};
 
 /// Building a [`TestSource`] from malformed literal data.
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +26,7 @@ pub enum TestSourceError {
 #[derive(Debug, Clone, Default)]
 pub struct TestSource {
     series: Vec<SeriesData>,
+    histogram_series: Vec<HistogramSeriesData>,
 }
 
 impl TestSource {
@@ -66,6 +70,41 @@ impl TestSource {
         });
         Ok(self)
     }
+
+    /// Add one native-histogram series (P11). `samples` are `(ts_ns, value)`
+    /// pairs, sorted by timestamp before storage (stably), the histogram
+    /// counterpart of [`TestSource::with_series`].
+    pub fn with_histogram_series(
+        mut self,
+        labels: &[(&str, &str)],
+        samples: &[(i64, FloatHistogram)],
+    ) -> Result<Self, TestSourceError> {
+        let label_set = LabelSet::new(
+            labels
+                .iter()
+                .map(|(name, value)| Label {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+        )
+        .map_err(TestSourceError::Labels)?;
+
+        let mut samples: Vec<HistogramSample> = samples
+            .iter()
+            .map(|(ts_ns, value)| HistogramSample {
+                ts_ns: *ts_ns,
+                value: value.clone(),
+            })
+            .collect();
+        samples.sort_by_key(|s| s.ts_ns);
+
+        self.histogram_series.push(HistogramSeriesData {
+            labels: label_set,
+            samples,
+        });
+        Ok(self)
+    }
 }
 
 impl SeriesSource for TestSource {
@@ -88,6 +127,33 @@ impl SeriesSource for TestSource {
                     .copied()
                     .collect();
                 SeriesData {
+                    labels: s.labels.clone(),
+                    samples,
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+
+    fn query_histograms(
+        &self,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+    ) -> Result<Vec<HistogramSeriesData>, SourceError> {
+        let out = self
+            .histogram_series
+            .iter()
+            .filter(|s| matchers::matches_series(matchers, &s.labels))
+            .map(|s| {
+                let samples = s
+                    .samples
+                    .iter()
+                    .filter(|sample| {
+                        sample.ts_ns >= window.start_ns && sample.ts_ns <= window.end_ns
+                    })
+                    .cloned()
+                    .collect();
+                HistogramSeriesData {
                     labels: s.labels.clone(),
                     samples,
                 }

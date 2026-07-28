@@ -180,6 +180,7 @@ fn eval_scalar_vector(
                 ts_ns: s.ts_ns,
                 orig_sample_ts_ns: s.ts_ns,
                 value,
+                histogram: None,
             });
         }
     }
@@ -336,6 +337,7 @@ fn one_to_one(
                 ts_ns: l.ts_ns,
                 orig_sample_ts_ns: l.ts_ns,
                 value,
+                histogram: None,
             });
         }
     }
@@ -390,6 +392,7 @@ fn group_match(
                 ts_ns: m.ts_ns,
                 orig_sample_ts_ns: m.ts_ns,
                 value,
+                histogram: None,
             });
         }
     }

@@ -95,6 +95,7 @@ fn label_replace(
                 ts_ns: s.ts_ns,
                 orig_sample_ts_ns: s.ts_ns,
                 value: s.value,
+                histogram: None,
             }
         })
         .collect();
@@ -132,6 +133,7 @@ fn label_join(
                 ts_ns: s.ts_ns,
                 orig_sample_ts_ns: s.ts_ns,
                 value: s.value,
+                histogram: None,
             }
         })
         .collect();
@@ -155,6 +157,7 @@ fn absent(
         ts_ns: eval_ts_ns,
         orig_sample_ts_ns: eval_ts_ns,
         value: 1.0,
+        histogram: None,
     }]))
 }
 
