@@ -3767,6 +3767,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-remote-write"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "prost",
+ "prost-build",
+ "protox",
+ "ravel-otlp",
+ "ravel-types",
+ "snap",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "ravel-segment"
 version = "0.1.0"
 dependencies = [

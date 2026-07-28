@@ -29,6 +29,7 @@ ravel-commit = { path = "crates/ravel-commit", version = "0.1.0" }
 ravel-catalog = { path = "crates/ravel-catalog", version = "0.1.0" }
 ravel-otlp = { path = "crates/ravel-otlp", version = "0.1.0" }
 ravel-otap = { path = "crates/ravel-otap", version = "0.1.0" }
+ravel-remote-write = { path = "crates/ravel-remote-write", version = "0.1.0" }
 ravel-ingest = { path = "crates/ravel-ingest", version = "0.1.0" }
 ravel-promql = { path = "crates/ravel-promql", version = "0.1.0" }
 ravel-query = { path = "crates/ravel-query", version = "0.1.0" }
