@@ -22,7 +22,7 @@ impl GrpcMetricsService {
     }
 }
 
-fn metadata_to_headers(metadata: &MetadataMap) -> HeaderMap {
+pub(crate) fn metadata_to_headers(metadata: &MetadataMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for entry in metadata.iter() {
         if let KeyAndValueRef::Ascii(key, value) = entry {
