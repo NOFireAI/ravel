@@ -4,6 +4,7 @@
 pub mod config;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
+pub mod flight_auth;
 pub mod fold;
 pub mod ingest;
 pub mod otlp_grpc;
