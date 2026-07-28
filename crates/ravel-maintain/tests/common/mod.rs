@@ -19,8 +19,8 @@ use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_segment::{
     CompactionMetaV4, ReaderLimits, RunInputV4, RunValuePageV4, SegmentIdentity, SegmentWriter,
-    SeriesEntryV4, SeriesInput, SeriesInputV4, ValueKind, decode_catalog_v5,
-    decode_run_pages_soa, open_from_full, plan_ranges_v4,
+    SeriesEntryV4, SeriesInput, SeriesInputV4, ValueKind, decode_catalog_v5, decode_run_pages_soa,
+    open_from_full, plan_ranges_v4,
 };
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use uuid::Uuid;
