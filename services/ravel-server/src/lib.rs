@@ -1,6 +1,7 @@
 //! ravel-server: gateway + ingest + query in one binary for development
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
+pub mod analytics;
 pub mod config;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
@@ -196,6 +197,16 @@ pub async fn start(
                 sql_state = Some(state);
             }
         }
+        // POST /api/v1/analytics (ADR-0028): shares the same QueryEngine as the
+        // Prometheus-shaped routes, so its range evaluation is byte-for-byte the
+        // one /api/v1/query_range runs. Not feature-gated: the analytics stage
+        // links no datafusion, only the pure ravel-analytics crate.
+        let analytics_state = analytics::AnalyticsState {
+            engine: app_state.engine.clone(),
+            tenant_resolver: config.tenant_resolver.clone(),
+            clock: Arc::new(SystemClock),
+        };
+        http_router = http_router.merge(analytics::router(analytics_state));
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }
 

@@ -13,6 +13,8 @@ ravel-ingest = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
+ravel-promql = { workspace = true }
+ravel-analytics = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
@@ -21,6 +23,7 @@ opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+humantime = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -6,11 +6,11 @@ post-evaluation analytics stage: pure per-series functions over
 dependency. Every result is a deterministic function of the input slice and
 the parameters.
 
-The `POST /api/v1/analytics` endpoint that exposes these operations over a
-range query is part 2 of issue #216 and is not yet implemented; this document
-gains its request/response schema section when that lands. What follows
-specifies the crate's two operations, which the endpoint will call once per
-series of the evaluated matrix.
+The `POST /api/v1/analytics` endpoint (issue #216 part 2, in `ravel-server`)
+exposes these operations over a range query; its request/response schema and
+error table are the [Endpoint](#endpoint) section at the end of this document.
+What follows first specifies the crate's two operations, which the endpoint
+calls once per series of the evaluated matrix.
 
 ## Why a separate stage
 
@@ -194,3 +194,158 @@ own required evidence, all in `crates/ravel-analytics`:
   `original_points` preserved.
 
 This evidence set is the merge bar for any change to the crate.
+
+## Endpoint
+
+`POST /api/v1/analytics` (ADR-0028 decision 2) runs a range evaluation and
+applies one op to each series of the result. It lives in `ravel-server`
+alongside `/api/v1/sql`, shares the query listener, and needs no cargo
+feature: the analytics stage links only the pure `ravel-analytics` crate, no
+DataFusion. The evaluation is the *same* one `/api/v1/query_range` runs
+(identical planner, budgets, staleness filtering, and wall deadline), so the
+endpoint sees exactly the matrix that endpoint would return, then converts
+each evaluated sample's timestamp to nanoseconds (the unit the crate expects)
+and calls the op once per series.
+
+### Request
+
+A JSON body (like `/api/v1/sql`, and unlike the form-encoded Prometheus-shaped
+endpoints):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `query` | string | PromQL range query. |
+| `start` | number or string | Window start: Unix float seconds or RFC3339. |
+| `end` | number or string | Window end: Unix float seconds or RFC3339. |
+| `step` | number or string | Grid step: Prometheus duration (`30s`, `5m`) or bare float seconds. |
+| `op` | object | The analytic to apply (tagged; see below). |
+| `timeout` | number, optional | Wall deadline in seconds; clamped to the server maximum, can only lower it. |
+| `min_commit_token` | array of string, optional | Read-your-write commit tokens. |
+
+`start`, `end`, and `step` accept the identical syntax `/api/v1/query_range`
+accepts. A JSON number is accepted wherever a bare-seconds string would be, so
+`30`, `"30"`, and `"30s"` all mean thirty seconds.
+
+`op` is a tagged object; `type` selects the analytic:
+
+```json
+{"type": "change_point", "downsample": false}
+{"type": "summary", "percentiles": [0.5, 0.9, 0.99]}
+```
+
+- `change_point`: `downsample` (bool, default `false`) opts in to the
+  fixed-stride bucket averaging described above for a series over the
+  2000-point cap.
+- `summary`: `percentiles` (array of f64 in `[0, 1]`, default `[]`) is the
+  list of quantiles to report, in request order.
+
+An unknown `op` type, a missing required field, or any other malformed body is
+a `400`.
+
+### Response
+
+A JSON envelope in the Prometheus response style, with one entry per series of
+the evaluated matrix:
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "analytics",
+    "result": [
+      {"metric": {"__name__": "http_requests_total", "job": "api"},
+       "result": { ... op result ... }}
+    ]
+  }
+}
+```
+
+Each entry's `metric` is the series' label set; its `result` is the op's
+result object, serialized by server-local serde structs (the crate carries no
+serde). Fields are snake_case.
+
+`change_point` result:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | string | One of `spike`, `dip`, `step_change`, `trend_change`, `distribution_change`, `stationary`, `indeterminable`. |
+| `ts_ns` | integer or null | Nanosecond timestamp of the change; null for `stationary` and `indeterminable`. |
+| `score` | number | Significance (Gaussian cost reduction in nats, or a robust z-score for spike/dip); `0.0` when no change is reported. |
+| `downsampled` | bool | Whether the series was downsampled before detection. |
+| `original_points` | integer | Non-NaN point count before any downsampling. |
+| `nan_excluded` | integer | NaN points excluded from detection. |
+
+`summary` result:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `median` | number | Exact median. |
+| `mad` | number | Median absolute deviation. |
+| `percentiles` | array | Each `{"quantile": q, "value": v}` in request order. |
+| `stddev` | number | Population standard deviation. |
+| `variance` | number | Population variance. |
+| `nan_excluded` | integer | NaN points excluded from the summary. |
+
+A non-finite statistic (for example every point NaN, so the moments are NaN)
+serializes as JSON `null`, since JSON has no literal for `NaN` or the
+infinities.
+
+### Worked examples
+
+`change_point` over a series that steps from a low to a high level halfway
+through:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/analytics \
+  -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
+  -d '{"query":"cpu_seconds","start":0,"end":600,"step":"10s",
+       "op":{"type":"change_point"}}'
+# {"status":"success","data":{"resultType":"analytics","result":[
+#   {"metric":{"__name__":"cpu_seconds"},
+#    "result":{"kind":"step_change","ts_ns":300000000000,"score":51.4,
+#              "downsampled":false,"original_points":60,"nan_excluded":0}}]}}
+```
+
+`summary` with the median, the 90th, and the 99th percentile:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/analytics \
+  -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
+  -d '{"query":"latency_ms","start":0,"end":3600,"step":"30s",
+       "op":{"type":"summary","percentiles":[0.5,0.9,0.99]}}'
+# {"status":"success","data":{"resultType":"analytics","result":[
+#   {"metric":{"__name__":"latency_ms"},
+#    "result":{"median":12.0,"mad":3.0,
+#              "percentiles":[{"quantile":0.5,"value":12.0},
+#                             {"quantile":0.9,"value":40.0},
+#                             {"quantile":0.99,"value":88.0}],
+#              "stddev":14.2,"variance":201.6,"nan_excluded":0}}]}}
+```
+
+### Status codes
+
+The endpoint keeps the exact status mapping `/api/v1/query_range` uses for
+evaluator errors (including the redaction of storage-layer faults, which would
+otherwise leak an object key or tenant hash), and adds the analytics-stage
+mappings:
+
+| Condition | Status | `errorType` |
+|---|---|---|
+| Missing/authless credentials | 401 | `unauthorized` |
+| Malformed body, unknown `op` type | 400 | `bad_data` |
+| `start`/`end`/`step`/`timeout`/`min_commit_token` parse error | 400 | `bad_data` |
+| Query result is not a range vector | 400 | `bad_data` |
+| PromQL parse error, non-positive step, inverted range, time overflow | 400 | `bad_data` |
+| Unsupported PromQL construct | 422 | `execution` |
+| Query engine budget breach (segments, series, samples, points) | 422 | `execution` |
+| Per-call series cap (over 1000 series) | 422 | `execution` |
+| `AnalyticsError::SeriesTooLong` (over 2000 points, no `downsample`) | 422 | `execution` |
+| `AnalyticsError::InvalidPercentile` (quantile outside `[0, 1]`) | 422 | `execution` |
+| `AnalyticsError::EmptySeries` | 422 | `execution` |
+| Query deadline exceeded | 504 | `timeout` |
+| Transient storage fault, unsatisfiable commit token | 503 | `unavailable` |
+| Permanent data corruption | 500 | `internal` |
+
+`AnalyticsError` messages carry only the caller's own parameters (a
+percentile, a point count) and are echoed; storage-layer faults are redacted
+to a fixed class message and logged in full server-side (a7-F02).

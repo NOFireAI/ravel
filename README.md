@@ -42,6 +42,10 @@ What exists today:
   behind `ravel-server`'s `sql` cargo feature, with a read-only `samples`
   table and the same duplicate-sample resolution as PromQL, bit-for-bit. See
   [ADR-0013](docs/adrs/0013-arrow-zero-copy-and-datafusion.md).
+- Post-evaluation analytics (`ravel-analytics`): `POST /api/v1/analytics`
+  runs a range query and applies change point detection or robust summary
+  statistics per series. See
+  [ADR-0028](docs/adrs/0028-analytics-stage.md).
 - `ravel-server` (dev binary, all roles in one process) and `ravel-cli`
   (segment/commit/catalog inspection).
 
@@ -157,6 +161,39 @@ application/vnd.apache.arrow.stream` instead of JSON for a bit-exact Arrow
 IPC stream (needed for `NaN`/`-0.0` payloads, which JSON cannot represent
 exactly). Flight SQL (the gRPC equivalent) is wired but not yet implemented
 (issue #152).
+
+### Analytics
+
+`POST /api/v1/analytics` runs a range query exactly as `/api/v1/query_range`
+does (same planner, budgets, staleness handling, and deadline), then applies
+one analytic operation to each series of the result (ADR-0028). Two ops are
+available: `change_point` (PELT change point detection, classifying spikes,
+dips, step changes, trend changes, and distribution changes) and `summary`
+(exact median, MAD, percentiles, standard deviation, and variance). It shares
+the query listener and needs no cargo feature.
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/analytics \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "query": "http_requests_total",
+        "start": 0,
+        "end": 1893456000,
+        "step": "30s",
+        "op": {"type": "change_point", "downsample": false}
+      }'
+# {"status":"success","data":{"resultType":"analytics","result":[
+#   {"metric":{"__name__":"http_requests_total"},
+#    "result":{"kind":"step_change","ts_ns":1735691400000000000,"score":42.1,
+#              "downsampled":false,"original_points":120,"nan_excluded":0}}]}}
+```
+
+`start`/`end`/`step` use the same syntax as `/api/v1/query_range`. A series
+over 2000 points needs `"downsample": true` to run `change_point`
+(approximation is opt-in and visible); a call matching over 1000 series is
+rejected. See [docs/analytics.md](docs/analytics.md) for the request and
+response schema, a worked example per op, and the error table.
 
 ## Architecture
 

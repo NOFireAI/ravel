@@ -44,6 +44,7 @@ ravel-types
   <- ravel-ingest       (segment, commit, object-store, otlp)
   <- ravel-promql       (types)
   <- ravel-query        (catalog, segment, promql)
+  <- ravel-analytics    (types only; pure post-evaluation compute stage)
   <- ravel-sql          (query, catalog, types; arrow + datafusion, in
                           progress -- see below)
   <- services/ravel-server, services/ravel-cli
@@ -80,3 +81,17 @@ oracle. Not yet built: the HTTP endpoint (`POST /api/v1/sql`, feature
 `sql`) and Flight SQL (feature `flight-sql`) -- both later tickets in the
 same epic, gated behind cargo features so the default build stays free of
 Arrow and DataFusion outside `ravel-otap`.
+
+## Analytics stage
+
+`ravel-analytics` (ADR-0028, docs/analytics.md) is a post-evaluation stage of
+pure per-series functions over `(timestamp_ns, f64)` slices: change point
+detection (PELT with a BIC penalty) and robust summary statistics. It touches
+no frozen contract -- no parser fork, no proto or format change -- and depends
+on `ravel-types` only, mirroring Elastic's placement of `CHANGE_POINT` outside
+the aggregation layer. `ravel-server` exposes it at `POST /api/v1/analytics`:
+the endpoint runs the same range evaluation `/api/v1/query_range` runs, then
+applies the requested op to each series of the matrix, capping a call at 1000
+series and each `change_point` series at 2000 points (approximation via
+`downsample` is opt-in and visible). Unlike the SQL path it needs no cargo
+feature, since it links no Arrow or DataFusion.
