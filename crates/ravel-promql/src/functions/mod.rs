@@ -366,10 +366,12 @@ pub(crate) fn eval_range_call(
             )
         }
         FunctionKind::VectorMap(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+            ctx.check_deadline()?;
             let v = vector_arg(evaluator, source, &call.args.args[0], t, ctx)?;
             Ok(Value::Vector(f(v)))
         }),
         FunctionKind::Instant(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+            ctx.check_deadline()?;
             f(evaluator, source, call, t, ctx)
         }),
     }
@@ -463,6 +465,7 @@ fn eval_matrix_arg_range_reduction(
             let mut series: Vec<(LabelSet, Vec<Sample>)> = Vec::new();
             let mut t = start_ns;
             while t <= end_ns {
+                ctx.check_deadline()?;
                 let matrix = evaluator.eval_subquery_matrix(source, sq, t, ctx)?;
                 let sel_ts_ns = resolve_eval_ts(sq.offset.as_ref(), sq.at.as_ref(), t, ctx)?;
                 let window_start_ns = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
