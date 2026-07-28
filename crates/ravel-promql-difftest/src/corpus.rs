@@ -316,4 +316,16 @@ mode: error
         assert!(entries.len() >= 15);
         assert!(entries.iter().any(|e| e.mode == ComparisonMode::Ordered));
     }
+
+    #[test]
+    fn subquery_corpus_file_parses_cleanly() {
+        let entries =
+            parse_corpus(include_str!("../corpus/subquery.txt")).expect("parse subquery corpus");
+        assert!(entries.len() >= 9);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.mode == ComparisonMode::ExpectError)
+        );
+    }
 }

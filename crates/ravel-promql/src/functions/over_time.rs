@@ -22,7 +22,7 @@ use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample};
 use crate::eval::{Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix};
 use crate::source::SeriesSource;
 
-use super::{FunctionDef, FunctionKind, RangeWindow};
+use super::{FunctionDef, FunctionKind, MatrixArg, RangeWindow};
 
 pub(crate) const FUNCTIONS: &[FunctionDef] = &[
     FunctionDef {
@@ -233,11 +233,10 @@ pub(crate) fn kahan_sum_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
 /// `absent_over_time` at one instant: unlike every other function in this
 /// family, it is not a per-series reduction of `matrix`'s rows. It reports
 /// whether the whole range vector argument matched nothing at all, and if
-/// so synthesizes exactly one output series from the selector's own
-/// equality matchers (mirroring Prometheus'
-/// `createLabelsForAbsentFunction`, ported in [`absent_labels`]).
+/// so synthesizes exactly one output series from `labels`
+/// ([`matrix_arg_absent_labels`]).
 pub(crate) fn absent_over_time_instant(
-    vs: &promql_parser::parser::VectorSelector,
+    labels: LabelSet,
     matrix: RangeMatrix,
     eval_ts_ns: i64,
 ) -> InstantVector {
@@ -245,7 +244,7 @@ pub(crate) fn absent_over_time_instant(
         return Vec::new();
     }
     vec![InstantSample {
-        labels: absent_labels(vs),
+        labels,
         ts_ns: eval_ts_ns,
         orig_sample_ts_ns: eval_ts_ns,
         value: 1.0,
@@ -256,25 +255,29 @@ pub(crate) fn absent_over_time_instant(
 /// independently at each step (exactly like every other range-call
 /// function), so the single synthesized output series carries a sample
 /// only at the steps whose window matched nothing. This re-queries the
-/// matrix selector once per grid step rather than sharing
+/// matrix-typed argument once per grid step rather than sharing
 /// [`Evaluator::eval_range_matrix_reduction`]'s single-query cursor, since
 /// that helper is built around reducing each matched series' own rows and
 /// has no notion of a synthetic series representing the matrix's
-/// emptiness.
+/// emptiness; for a subquery argument there is no single raw sample stream
+/// to cursor over in the first place.
 pub(crate) fn absent_over_time_range(
     evaluator: &Evaluator,
     source: &dyn SeriesSource,
-    ms: &promql_parser::parser::MatrixSelector,
+    arg: MatrixArg,
     start_ns: i64,
     end_ns: i64,
     step_ns: i64,
     ctx: &QueryWindow,
 ) -> Result<RangeMatrix, Error> {
-    let labels = absent_labels(&ms.vs);
+    let labels = matrix_arg_absent_labels(arg);
     let mut out_samples = Vec::new();
     let mut t = start_ns;
     while t <= end_ns {
-        let matrix = evaluator.eval_matrix_selector(source, ms, t, ctx)?;
+        let matrix = match arg {
+            MatrixArg::Selector(ms) => evaluator.eval_matrix_selector(source, ms, t, ctx)?,
+            MatrixArg::Subquery(sq) => evaluator.eval_subquery_matrix(source, sq, t, ctx)?,
+        };
         if matrix.is_empty() {
             out_samples.push(Sample {
                 ts_ns: t,
@@ -287,6 +290,33 @@ pub(crate) fn absent_over_time_range(
         Ok(Vec::new())
     } else {
         Ok(vec![(labels, out_samples)])
+    }
+}
+
+/// Derive `absent_over_time`'s synthesized label set for a matrix-typed
+/// argument ([`matrix_arg`](super::matrix_arg)'s result): a matrix selector
+/// derives it from its own selector's equality matchers, exactly Prometheus'
+/// `createLabelsForAbsentFunction` ([`absent_labels`]). A subquery has no
+/// selector of its own; when its inner expression is itself a bare vector
+/// selector (after unwrapping `Paren`), that selector's matchers are used
+/// the same way; any other inner expression (a call, a binary expression,
+/// ...) has no single selector to derive from, so no labels are synthesized
+/// (an empty set), the same fallback Prometheus applies to any
+/// argument shape it cannot derive matchers from.
+pub(crate) fn matrix_arg_absent_labels(arg: MatrixArg) -> LabelSet {
+    use promql_parser::parser::Expr;
+    match arg {
+        MatrixArg::Selector(ms) => absent_labels(&ms.vs),
+        MatrixArg::Subquery(sq) => {
+            let mut cur = &*sq.expr;
+            loop {
+                match cur {
+                    Expr::Paren(p) => cur = &p.expr,
+                    Expr::VectorSelector(vs) => return absent_labels(vs),
+                    _ => return LabelSet::default(),
+                }
+            }
+        }
     }
 }
 
