@@ -54,8 +54,8 @@ serde_json = { workspace = true }
 # Flight SQL transport. Off by default: it links arrow-flight and tonic on top
 # of datafusion, and the Flight surface is opt-in per deployment
 # (docs/arrow-datafusion-plan.md section 3, ADR-0013 structural isolation).
-# Enabling it compiles the `flight` module and nothing else; the
-# `FlightSqlService` implementation lands in it under issue #152.
+# Gates the `flight` module (the future FlightSqlService, issue #152) and the
+# `flight_ticket` module (the snapshot-pinning ticket codec, issue #150).
 #
 # The feature matrix in section 3 writes this as "flight-sql implies sql". This
 # crate has no `sql` feature to imply: its SQL surface is unconditional
