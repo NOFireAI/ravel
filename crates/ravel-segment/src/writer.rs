@@ -12,10 +12,11 @@ use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId};
 use crate::crc::{footer_crc, page_crc};
 use crate::error::WriteError;
 use crate::format::{
-    MAGIC, RESERVED, SIGNAL_METRICS, VERSION, VERSION_V2, ZSTD_LEVEL, compression, page_comp,
-    page_enc, section_kind,
+    MAGIC, RESERVED, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, ZSTD_LEVEL, compression,
+    page_comp, page_enc, section_kind,
 };
 use crate::gorilla::encode_gorilla_into;
+use crate::histogram::{HistogramValue, encode_histogram_record_into};
 use crate::ts_delta::encode_ts_deltas_into;
 use crate::varint::write_uvarint;
 
@@ -57,6 +58,76 @@ pub struct SegmentSummary {
 pub struct WrittenSegment {
     pub bytes: Bytes,
     pub summary: SegmentSummary,
+}
+
+/// One histogram sample: an event timestamp paired with a native-histogram
+/// value (docs/rseg-v3-plan.md section 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSample {
+    pub ts_ns: i64,
+    pub value: HistogramValue,
+}
+
+/// A series' sample payload for RSEG v3: exactly one of scalar or
+/// histogram samples, fixed for the series' whole life in one segment
+/// (`value_kind`, docs/rseg-v3-plan.md section 3.4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SeriesValues {
+    Scalar(Vec<ravel_types::Sample>),
+    Histogram(Vec<HistogramSample>),
+}
+
+impl SeriesValues {
+    fn len(&self) -> usize {
+        match self {
+            SeriesValues::Scalar(v) => v.len(),
+            SeriesValues::Histogram(v) => v.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Stable sort by `ts_ns`: ties keep insertion order.
+    fn sort_by_ts(&mut self) {
+        match self {
+            SeriesValues::Scalar(v) => v.sort_by_key(|s| s.ts_ns),
+            SeriesValues::Histogram(v) => v.sort_by_key(|s| s.ts_ns),
+        }
+    }
+
+    fn first_ts(&self) -> Option<i64> {
+        match self {
+            SeriesValues::Scalar(v) => v.first().map(|s| s.ts_ns),
+            SeriesValues::Histogram(v) => v.first().map(|s| s.ts_ns),
+        }
+    }
+
+    fn last_ts(&self) -> Option<i64> {
+        match self {
+            SeriesValues::Scalar(v) => v.last().map(|s| s.ts_ns),
+            SeriesValues::Histogram(v) => v.last().map(|s| s.ts_ns),
+        }
+    }
+
+    fn ts_values(&self) -> Vec<i64> {
+        match self {
+            SeriesValues::Scalar(v) => v.iter().map(|s| s.ts_ns).collect(),
+            SeriesValues::Histogram(v) => v.iter().map(|s| s.ts_ns).collect(),
+        }
+    }
+}
+
+/// One series' identity, labels, and RSEG v3 sample payload. Deliberately
+/// a separate type from [`SeriesInput`] (not a shared/extended struct): v1
+/// and v2 callers, including `ravel-ingest`, must never need to know
+/// `SeriesValues` exists.
+#[derive(Debug)]
+pub struct SeriesInputV3 {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub values: SeriesValues,
 }
 
 /// Builds RSEG v1 metric segment objects. Stateless; `write` is the entire
@@ -422,6 +493,225 @@ impl SegmentWriter {
         object.extend_from_slice(&footer_len.to_le_bytes());
         object.extend_from_slice(&crc.to_le_bytes());
         object.extend_from_slice(&VERSION_V2.to_le_bytes());
+        object.push(SIGNAL_METRICS);
+        object.push(RESERVED);
+        object.extend_from_slice(&MAGIC);
+
+        let blake3 = *blake3::hash(&object).as_bytes();
+
+        Ok(WrittenSegment {
+            bytes: Bytes::from(object),
+            summary: SegmentSummary {
+                min_event_ts_ns,
+                max_event_ts_ns,
+                sample_count,
+                series_count,
+                blake3,
+            },
+        })
+    }
+
+    /// Builds an RSEG v3 object (docs/rseg-v3-plan.md, docs/segment-format.md
+    /// "RSEG v3 amendment"): v2's sections plus HIST_PAGES and SERIES_META's
+    /// three new column blocks. VAL_PAGES is omitted entirely when no series
+    /// is scalar-kind; HIST_PAGES is omitted entirely when no series is
+    /// histogram-kind (section 3.2's conditional-mandatory-kinds rule) --
+    /// unlike v1/v2, where VAL_PAGES is always present even for a
+    /// zero-series segment.
+    pub fn write_v3(
+        mut series: Vec<SeriesInputV3>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+    ) -> Result<WrittenSegment, WriteError> {
+        for s in &mut series {
+            s.values.sort_by_ts();
+        }
+        series.retain(|s| !s.values.is_empty());
+
+        series.sort_unstable_by_key(|s| s.series_id.0);
+        if series
+            .windows(2)
+            .any(|w| w[0].series_id.0 == w[1].series_id.0)
+        {
+            return Err(WriteError::DuplicateSeriesId);
+        }
+
+        for s in &series {
+            u16::try_from(s.labels.len()).map_err(|_| WriteError::TooManyLabels)?;
+        }
+
+        let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+        let mut sample_count: u64 = 0;
+        let mut min_event_ts_ns = i64::MAX;
+        let mut max_event_ts_ns = i64::MIN;
+        for s in &series {
+            sample_count = sample_count
+                .checked_add(s.values.len() as u64)
+                .ok_or(WriteError::TooManySamples)?;
+            if let Some(first) = s.values.first_ts() {
+                min_event_ts_ns = min_event_ts_ns.min(first);
+            }
+            if let Some(last) = s.values.last_ts() {
+                max_event_ts_ns = max_event_ts_ns.max(last);
+            }
+        }
+        if series.is_empty() {
+            min_event_ts_ns = 0;
+            max_event_ts_ns = 0;
+        }
+
+        let dict = build_dictionary_v3(&series)?;
+
+        let total_samples =
+            usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
+        let mut ts_pages = Vec::with_capacity(series.len() * 16 + total_samples * 4);
+        let mut val_pages = Vec::with_capacity(series.len() * 16 + total_samples * 9);
+        let mut hist_pages = Vec::with_capacity(series.len() * 16 + total_samples * 32);
+
+        let series_meta_raw = build_series_meta_v3(
+            &series,
+            &dict.occurrence_ordinals,
+            min_event_ts_ns,
+            &mut ts_pages,
+            &mut val_pages,
+            &mut hist_pages,
+        )?;
+        let series_ids_raw = encode_series_ids_v3(&series)?;
+        let label_dict_raw = encode_label_dict_v3(&dict)?;
+
+        let label_dict_compressed = zstd_compress_v3(&label_dict_raw)?;
+        let series_meta_compressed = zstd_compress_v3(&series_meta_raw)?;
+
+        let mut object = Vec::with_capacity(
+            label_dict_compressed.len()
+                + series_ids_raw.len()
+                + series_meta_compressed.len()
+                + ts_pages.len()
+                + val_pages.len()
+                + hist_pages.len()
+                + 512,
+        );
+
+        // Physical section order 1, 5, 6, 3, 4, 7 (LABEL_DICT, SERIES_IDS,
+        // SERIES_META, TS_PAGES, VAL_PAGES, HIST_PAGES) per section 3.2.
+        let label_dict_offset = object.len() as u64;
+        object.extend_from_slice(&label_dict_compressed);
+
+        let series_ids_offset = object.len() as u64;
+        object.extend_from_slice(&series_ids_raw);
+
+        let series_meta_offset = object.len() as u64;
+        object.extend_from_slice(&series_meta_compressed);
+
+        let ts_pages_offset = object.len() as u64;
+        object.extend_from_slice(&ts_pages);
+
+        let mut sections = vec![
+            Section {
+                kind: section_kind::LABEL_DICT,
+                offset: label_dict_offset,
+                len: label_dict_compressed.len() as u64,
+                crc32c: crc32c::crc32c(&label_dict_compressed),
+                comp: compression::ZSTD,
+                uncompressed_len: label_dict_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::SERIES_IDS,
+                offset: series_ids_offset,
+                len: series_ids_raw.len() as u64,
+                crc32c: crc32c::crc32c(&series_ids_raw),
+                comp: compression::NONE,
+                uncompressed_len: series_ids_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::SERIES_META,
+                offset: series_meta_offset,
+                len: series_meta_compressed.len() as u64,
+                crc32c: crc32c::crc32c(&series_meta_compressed),
+                comp: compression::ZSTD,
+                uncompressed_len: series_meta_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::TS_PAGES,
+                offset: ts_pages_offset,
+                len: ts_pages.len() as u64,
+                crc32c: crc32c::crc32c(&ts_pages),
+                comp: compression::NONE,
+                uncompressed_len: ts_pages.len() as u64,
+            },
+        ];
+
+        // VAL_PAGES: present only when at least one series is scalar-kind
+        // (section 3.2's conditional-mandatory-kinds rule).
+        if !val_pages.is_empty() {
+            // 8-byte-align the VAL_PAGES section offset, unchanged from v2
+            // (section 3.2, "v3 writers 8-byte-align VAL_PAGES exactly as
+            // v2").
+            let val_pad = (8 - (object.len() % 8)) % 8;
+            object.extend(std::iter::repeat_n(0u8, val_pad));
+            let val_pages_offset = object.len() as u64;
+            debug_assert_eq!(
+                val_pages_offset % 8,
+                0,
+                "VAL_PAGES section must be 8-byte aligned"
+            );
+            object.extend_from_slice(&val_pages);
+            sections.push(Section {
+                kind: section_kind::VAL_PAGES,
+                offset: val_pages_offset,
+                len: val_pages.len() as u64,
+                crc32c: crc32c::crc32c(&val_pages),
+                comp: compression::NONE,
+                uncompressed_len: val_pages.len() as u64,
+            });
+        }
+
+        // HIST_PAGES: present only when at least one series is
+        // histogram-kind. No alignment requirement (section 3.2).
+        if !hist_pages.is_empty() {
+            let hist_pages_offset = object.len() as u64;
+            object.extend_from_slice(&hist_pages);
+            sections.push(Section {
+                kind: section_kind::HIST_PAGES,
+                offset: hist_pages_offset,
+                len: hist_pages.len() as u64,
+                crc32c: crc32c::crc32c(&hist_pages),
+                comp: compression::NONE,
+                uncompressed_len: hist_pages.len() as u64,
+            });
+        }
+
+        let footer = Footer {
+            tenant_hash: identity.tenant_hash.to_vec(),
+            shard: identity.shard,
+            writer_id: identity.writer_id,
+            writer_epoch: identity.writer_epoch,
+            writer_seq: identity.writer_seq,
+            min_event_ts_ns,
+            max_event_ts_ns,
+            min_ingest_ts_ns: ingest_bounds.min_ingest_ts_ns,
+            max_ingest_ts_ns: ingest_bounds.max_ingest_ts_ns,
+            sample_count,
+            series_count,
+            sections,
+        };
+
+        let footer_bytes = footer.encode_to_vec();
+        let footer_len =
+            u32::try_from(footer_bytes.len()).map_err(|_| WriteError::FooterTooLarge)?;
+        object.extend_from_slice(&footer_bytes);
+
+        let crc = footer_crc(
+            &footer_bytes,
+            footer_len,
+            VERSION_V3,
+            SIGNAL_METRICS,
+            RESERVED,
+        );
+
+        object.extend_from_slice(&footer_len.to_le_bytes());
+        object.extend_from_slice(&crc.to_le_bytes());
+        object.extend_from_slice(&VERSION_V3.to_le_bytes());
         object.push(SIGNAL_METRICS);
         object.push(RESERVED);
         object.extend_from_slice(&MAGIC);
@@ -1091,6 +1381,374 @@ fn zstd_compress_v2(data: &[u8]) -> Result<Vec<u8>, WriteError> {
     zstd::bulk::compress(data, ZSTD_LEVEL).map_err(|e| WriteError::Zstd(e.to_string()))
 }
 
+// --- RSEG v3 encode path (ADR-0017, docs/rseg-v3-plan.md, docs/segment-
+// format.md "RSEG v3 amendment"). Parallel to the v1/v2 functions above;
+// none of the v1/v2 functions are called from here and none of them are
+// edited, so the v1 and v2 paths above stay trivially provable as byte-
+// identical by inspection. LABEL_DICT/SERIES_IDS are unchanged from v2
+// (section 3.3), but still get their own copies here per that same
+// discipline. ---
+
+/// Identical grammar and first-occurrence-order rule as v2's
+/// `DictionaryV2` (section 3.3: "unchanged from v2").
+struct DictionaryV3<'a> {
+    order: Vec<&'a str>,
+    occurrence_ordinals: Vec<u32>,
+    count: u32,
+}
+
+fn build_dictionary_v3(series: &[SeriesInputV3]) -> Result<DictionaryV3<'_>, WriteError> {
+    let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
+    let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
+        HashMap::with_capacity_and_hasher(total_strings + 1, BuildHasherDefault::default());
+    interner.insert(METRIC_NAME_LABEL, 0);
+
+    let mut order: Vec<&str> = Vec::new();
+    let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
+    let mut next_ordinal: u32 = 1;
+
+    for s in series {
+        for label in s.labels.iter() {
+            for text in [label.name.as_str(), label.value.as_str()] {
+                let id = match interner.entry(text) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let id = next_ordinal;
+                        next_ordinal = next_ordinal
+                            .checked_add(1)
+                            .ok_or(WriteError::TooManyDictStrings)?;
+                        order.push(text);
+                        e.insert(id);
+                        id
+                    }
+                };
+                occurrence_ordinals.push(id);
+            }
+        }
+    }
+
+    Ok(DictionaryV3 {
+        order,
+        occurrence_ordinals,
+        count: next_ordinal,
+    })
+}
+
+/// Grammar identical to v1/v2's label-dict encode (count:u32, then
+/// len:varint + UTF-8 bytes per string, `__name__` first).
+fn encode_label_dict_v3(dict: &DictionaryV3<'_>) -> Result<Vec<u8>, WriteError> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&dict.count.to_le_bytes());
+    write_uvarint(&mut buf, METRIC_NAME_LABEL.len() as u64);
+    buf.extend_from_slice(METRIC_NAME_LABEL.as_bytes());
+    for s in &dict.order {
+        let bytes = s.as_bytes();
+        write_uvarint(&mut buf, bytes.len() as u64);
+        buf.extend_from_slice(bytes);
+    }
+    Ok(buf)
+}
+
+/// SERIES_IDS (kind 5): identical grammar to v2. `series` is already
+/// sorted by `series_id.0` bytes (`write_v3`'s preamble).
+fn encode_series_ids_v3(series: &[SeriesInputV3]) -> Result<Vec<u8>, WriteError> {
+    let count = u32::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+    let mut buf = Vec::with_capacity(4 + series.len() * 16);
+    buf.extend_from_slice(&count.to_le_bytes());
+    for s in series {
+        buf.extend_from_slice(&s.series_id.0);
+    }
+    Ok(buf)
+}
+
+/// Encodes one series' TS page directly into `ts_pages`. Identical
+/// behavior to v2's `append_ts_page_v2` (TS_PAGES is unchanged in v3,
+/// shared by scalar and histogram series, section 3.2); takes the already
+/// -sorted timestamp values directly since a v3 series' samples may be
+/// either `Sample`s or `HistogramSample`s.
+fn append_ts_page_v3(
+    series_id: &SeriesId,
+    ts_values: &[i64],
+    payload_scratch: &mut Vec<u8>,
+    ts_pages: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    payload_scratch.clear();
+    encode_ts_deltas_into(payload_scratch, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
+
+    let enc = page_enc::TS_DELTA_VARINT;
+    let compressed = if payload_scratch.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
+        let candidate = lz4_flex::compress_prepend_size(payload_scratch);
+        (candidate.len() < payload_scratch.len()).then_some(candidate)
+    } else {
+        None
+    };
+    let (comp, payload): (u8, &[u8]) = match &compressed {
+        Some(candidate) => (page_comp::LZ4, candidate),
+        None => (page_comp::NONE, payload_scratch),
+    };
+    let crc = page_crc(&series_id.0, enc, comp, payload);
+    ts_pages.push(enc);
+    ts_pages.push(comp);
+    ts_pages.extend_from_slice(&crc.to_le_bytes());
+    ts_pages.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Encodes one scalar series' VAL page directly into `val_pages`. Same
+/// encoding choice and 8-byte alignment rule as v2's `append_val_page_v2`
+/// (section 3.2: "VAL_PAGES unchanged from v2; scalar series only").
+/// Returns the pad length inserted before this page's header, recorded by
+/// the caller in that series' `val_page_gap` column.
+fn append_val_page_v3(
+    series_id: &SeriesId,
+    values: &[f64],
+    payload_scratch: &mut Vec<u8>,
+    val_pages: &mut Vec<u8>,
+) -> u64 {
+    payload_scratch.clear();
+    encode_gorilla_into(values, payload_scratch);
+
+    let count = values.len() as u64;
+    let enc = if (payload_scratch.len() as u64) >= 8 * count {
+        payload_scratch.clear();
+        for v in values {
+            payload_scratch.extend_from_slice(&v.to_le_bytes());
+        }
+        page_enc::VAL_RAW_F64
+    } else {
+        page_enc::VAL_GORILLA
+    };
+
+    let mut gap = 0u64;
+    if enc == page_enc::VAL_RAW_F64 {
+        const PAGE_HEADER_LEN: u64 = 6; // enc(1) + comp(1) + crc32c(4)
+        let unaligned_payload_start = val_pages.len() as u64 + PAGE_HEADER_LEN;
+        let rem = unaligned_payload_start % 8;
+        if rem != 0 {
+            gap = 8 - rem;
+            val_pages.extend(std::iter::repeat_n(0u8, gap as usize));
+        }
+    }
+
+    let comp = page_comp::NONE;
+    let crc = page_crc(&series_id.0, enc, comp, payload_scratch);
+    val_pages.push(enc);
+    val_pages.push(comp);
+    val_pages.extend_from_slice(&crc.to_le_bytes());
+    val_pages.extend_from_slice(payload_scratch);
+    gap
+}
+
+/// Encodes one histogram series' HIST page directly into `hist_pages`:
+/// the page container framing is identical to TS/VAL pages (section 3.5),
+/// holding `values.len()` back-to-back HIST_SPANS records. `comp` is
+/// always 0 (writer policy, section 3.5): span/count data does not
+/// benefit from per-page lz4 the way Gorilla-vs-raw does.
+fn append_hist_page_v3(
+    series_id: &SeriesId,
+    values: &[HistogramValue],
+    payload_scratch: &mut Vec<u8>,
+    hist_pages: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    payload_scratch.clear();
+    for value in values {
+        encode_histogram_record_into(payload_scratch, value)?;
+    }
+
+    let enc = page_enc::HIST_SPANS;
+    let comp = page_comp::NONE;
+    let crc = page_crc(&series_id.0, enc, comp, payload_scratch);
+    hist_pages.push(enc);
+    hist_pages.push(comp);
+    hist_pages.extend_from_slice(&crc.to_le_bytes());
+    hist_pages.extend_from_slice(payload_scratch);
+    Ok(())
+}
+
+/// SERIES_META (kind 6, uncompressed form): v2's grammar (`count`,
+/// `schema_count`, schemas, blocks 1-9) unchanged verbatim, plus three new
+/// blocks (10 `value_kind`, 11 `hist_page_gap`, 12 `hist_page_len`,
+/// section 3.4). Same schema-dictionary landmine note as
+/// `build_series_meta_v2`: a schema's name_ord sequence is read directly
+/// off `s.labels.iter()` (already sorted by name bytes by
+/// `LabelSet::new`), never re-derived by sorting ordinal values.
+fn build_series_meta_v3(
+    series: &[SeriesInputV3],
+    occurrence_ordinals: &[u32],
+    footer_min_event_ts_ns: i64,
+    ts_pages: &mut Vec<u8>,
+    val_pages: &mut Vec<u8>,
+    hist_pages: &mut Vec<u8>,
+) -> Result<Vec<u8>, WriteError> {
+    let count = u32::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+
+    let mut schema_index: HashMap<Vec<u32>, u32> = HashMap::new();
+    let mut schemas: Vec<Vec<u32>> = Vec::new();
+
+    let mut col_schema_ref: Vec<u8> = Vec::new();
+    let mut col_value_ord: Vec<u8> = Vec::new();
+    let mut col_sample_count: Vec<u8> = Vec::new();
+    let mut col_min_ts_delta: Vec<u8> = Vec::new();
+    let mut col_ts_span: Vec<u8> = Vec::new();
+    let mut col_ts_page_gap: Vec<u8> = Vec::new();
+    let mut col_ts_page_len: Vec<u8> = Vec::new();
+    let mut col_val_page_gap: Vec<u8> = Vec::new();
+    let mut col_val_page_len: Vec<u8> = Vec::new();
+    let mut col_value_kind: Vec<u8> = Vec::new();
+    let mut col_hist_page_gap: Vec<u8> = Vec::new();
+    let mut col_hist_page_len: Vec<u8> = Vec::new();
+
+    let mut payload_scratch: Vec<u8> = Vec::new();
+
+    let mut next_occurrence = occurrence_ordinals.iter();
+
+    for s in series {
+        let label_count = s.labels.len();
+        let mut name_ords: Vec<u32> = Vec::with_capacity(label_count);
+        let mut value_ords: Vec<u32> = Vec::with_capacity(label_count);
+        let mut prev_name: Option<&str> = None;
+        for label in s.labels.iter() {
+            debug_assert!(
+                prev_name.is_none_or(|prev| prev <= label.name.as_str()),
+                "LabelSet invariant violated: labels not sorted by name bytes"
+            );
+            prev_name = Some(label.name.as_str());
+
+            let name_ord = *next_occurrence
+                .next()
+                .ok_or(WriteError::DictionaryInvariant)?;
+            let value_ord = *next_occurrence
+                .next()
+                .ok_or(WriteError::DictionaryInvariant)?;
+            name_ords.push(name_ord);
+            value_ords.push(value_ord);
+        }
+
+        let schema_ref = match schema_index.get(&name_ords) {
+            Some(&idx) => idx,
+            None => {
+                let idx = u32::try_from(schemas.len()).map_err(|_| WriteError::TooManySchemas)?;
+                schema_index.insert(name_ords.clone(), idx);
+                schemas.push(name_ords);
+                idx
+            }
+        };
+        write_uvarint(&mut col_schema_ref, u64::from(schema_ref));
+        for value_ord in &value_ords {
+            write_uvarint(&mut col_value_ord, u64::from(*value_ord));
+        }
+
+        let sample_count = u32::try_from(s.values.len()).map_err(|_| WriteError::TooManySamples)?;
+        write_uvarint(&mut col_sample_count, u64::from(sample_count));
+
+        // Non-empty by construction (empty series are dropped in
+        // `write_v3`'s preamble before this function is called).
+        let min_ts_ns = s.values.first_ts().unwrap_or(0);
+        let max_ts_ns = s.values.last_ts().unwrap_or(0);
+        let min_ts_delta = (i128::from(min_ts_ns) - i128::from(footer_min_event_ts_ns)) as u64;
+        let ts_span = (i128::from(max_ts_ns) - i128::from(min_ts_ns)) as u64;
+        write_uvarint(&mut col_min_ts_delta, min_ts_delta);
+        write_uvarint(&mut col_ts_span, ts_span);
+
+        let ts_values = s.values.ts_values();
+        let ts_page_offset_before = ts_pages.len() as u64;
+        append_ts_page_v3(&s.series_id, &ts_values, &mut payload_scratch, ts_pages)?;
+        let ts_page_len = ts_pages.len() as u64 - ts_page_offset_before;
+        // TS pages are never aligned (unchanged from v2); the gap column
+        // stays 0 but is still emitted so the grammar generalizes.
+        write_uvarint(&mut col_ts_page_gap, 0);
+        write_uvarint(&mut col_ts_page_len, ts_page_len);
+
+        match &s.values {
+            SeriesValues::Scalar(samples) => {
+                col_value_kind.push(0);
+
+                let vals: Vec<f64> = samples.iter().map(|sm| sm.value).collect();
+                let val_offset_before = val_pages.len() as u64;
+                let val_gap =
+                    append_val_page_v3(&s.series_id, &vals, &mut payload_scratch, val_pages);
+                let val_total_added = val_pages.len() as u64 - val_offset_before;
+                let val_page_len = val_total_added - val_gap;
+                write_uvarint(&mut col_val_page_gap, val_gap);
+                write_uvarint(&mut col_val_page_len, val_page_len);
+
+                write_uvarint(&mut col_hist_page_gap, 0);
+                write_uvarint(&mut col_hist_page_len, 0);
+            }
+            SeriesValues::Histogram(hist_samples) => {
+                col_value_kind.push(1);
+
+                write_uvarint(&mut col_val_page_gap, 0);
+                write_uvarint(&mut col_val_page_len, 0);
+
+                let values: Vec<HistogramValue> =
+                    hist_samples.iter().map(|sm| sm.value.clone()).collect();
+                let hist_offset_before = hist_pages.len() as u64;
+                append_hist_page_v3(&s.series_id, &values, &mut payload_scratch, hist_pages)?;
+                let hist_page_len = hist_pages.len() as u64 - hist_offset_before;
+                // HIST pages are never aligned or placed with a preceding
+                // gap by this writer (section 3.2: "no alignment
+                // requirement"); the gap column stays 0 but is still
+                // emitted so the grammar generalizes.
+                write_uvarint(&mut col_hist_page_gap, 0);
+                write_uvarint(&mut col_hist_page_len, hist_page_len);
+            }
+        }
+    }
+
+    let schema_count = u32::try_from(schemas.len()).map_err(|_| WriteError::TooManySchemas)?;
+
+    let mut buf = Vec::with_capacity(
+        8 + schemas.len() * 4
+            + col_schema_ref.len()
+            + col_value_ord.len()
+            + col_sample_count.len()
+            + col_min_ts_delta.len()
+            + col_ts_span.len()
+            + col_ts_page_gap.len()
+            + col_ts_page_len.len()
+            + col_val_page_gap.len()
+            + col_val_page_len.len()
+            + col_value_kind.len()
+            + col_hist_page_gap.len()
+            + col_hist_page_len.len()
+            + 64,
+    );
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&schema_count.to_le_bytes());
+    for schema in &schemas {
+        write_uvarint(&mut buf, schema.len() as u64);
+        for name_ord in schema {
+            write_uvarint(&mut buf, u64::from(*name_ord));
+        }
+    }
+    for col in [
+        &col_schema_ref,
+        &col_value_ord,
+        &col_sample_count,
+        &col_min_ts_delta,
+        &col_ts_span,
+        &col_ts_page_gap,
+        &col_ts_page_len,
+        &col_val_page_gap,
+        &col_val_page_len,
+        &col_value_kind,
+        &col_hist_page_gap,
+        &col_hist_page_len,
+    ] {
+        write_uvarint(&mut buf, col.len() as u64);
+        buf.extend_from_slice(col);
+    }
+    Ok(buf)
+}
+
+/// Same operation as v1/v2's zstd compress; kept separate per this
+/// ticket's constraint that v1/v2 functions are never called from the v3
+/// path.
+fn zstd_compress_v3(data: &[u8]) -> Result<Vec<u8>, WriteError> {
+    zstd::bulk::compress(data, ZSTD_LEVEL).map_err(|e| WriteError::Zstd(e.to_string()))
+}
+
 /// Structural tests for the v2 encode path. No reader exists yet (phase 3 /
 /// issue #31 adds one), so these tests parse the emitted bytes directly
 /// using the same primitives the eventual reader will use (`crate::varint`,
@@ -1742,6 +2400,810 @@ mod v2_tests {
             }
             prop_assert_eq!(ts_running, ts_bytes.len() as u64);
             prop_assert_eq!(val_running, val_bytes.len() as u64);
+        }
+    }
+}
+
+/// Structural tests for the v3 encode path (docs/rseg-v3-plan.md C3). No
+/// reader exists yet (C4 adds one), so these tests parse the emitted bytes
+/// directly, the same approach `v2_tests` takes -- including a test-only
+/// HIST_SPANS record decoder mirroring the grammar in
+/// docs/rseg-v3-plan.md section 3.5. This is not "reader changes" (the
+/// ticket's scope line): it is test-only code that never ships, built
+/// purely to check the writer's own byte-exact output.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod v3_tests {
+    use std::collections::HashSet;
+
+    use proptest::prelude::*;
+    use ravel_types::{Label, Sample};
+
+    use super::*;
+    use crate::histogram::{HistogramCounts, HistogramSpan, ResetHint};
+    use crate::varint::{read_uvarint, read_zigzag_varint};
+
+    fn test_identity() -> SegmentIdentity {
+        SegmentIdentity {
+            tenant_hash: [0x5A; 16],
+            shard: 4,
+            writer_id: "v3-test-writer".to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn test_bounds() -> IngestBounds {
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 1_000,
+        }
+    }
+
+    fn decode_footer(object: &[u8]) -> Footer {
+        let n = object.len();
+        assert!(n >= 16, "object smaller than the trailer");
+        let trailer = &object[n - 16..];
+        let footer_len = u32::from_le_bytes(trailer[0..4].try_into().expect("4 bytes")) as usize;
+        let version = u16::from_le_bytes(trailer[8..10].try_into().expect("2 bytes"));
+        assert_eq!(version, VERSION_V3, "test helper only decodes v3 objects");
+        assert_eq!(&trailer[12..16], &MAGIC, "bad magic");
+        let footer_start = n - 16 - footer_len;
+        let footer_bytes = &object[footer_start..n - 16];
+        <Footer as prost::Message>::decode(footer_bytes).expect("footer decodes")
+    }
+
+    fn section<'a>(object: &'a [u8], footer: &Footer, kind: u32) -> &'a [u8] {
+        let s = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == kind)
+            .unwrap_or_else(|| panic!("missing section kind {kind}"));
+        let start = s.offset as usize;
+        let end = start + s.len as usize;
+        &object[start..end]
+    }
+
+    fn section_desc(footer: &Footer, kind: u32) -> Option<&Section> {
+        footer.sections.iter().find(|s| s.kind == kind)
+    }
+
+    fn decompress_section(stored: &[u8], uncompressed_len: u64) -> Vec<u8> {
+        zstd::bulk::decompress(stored, uncompressed_len as usize).expect("zstd decompresses")
+    }
+
+    struct ParsedSeriesMetaV3 {
+        count: u32,
+        sample_count: Vec<u32>,
+        ts_page_gap: Vec<u64>,
+        ts_page_len: Vec<u64>,
+        val_page_gap: Vec<u64>,
+        val_page_len: Vec<u64>,
+        value_kind: Vec<u8>,
+        hist_page_gap: Vec<u64>,
+        hist_page_len: Vec<u64>,
+    }
+
+    fn read_block<'a>(raw: &'a [u8], pos: &mut usize) -> &'a [u8] {
+        let block_len = read_uvarint(raw, pos).expect("block_len varint") as usize;
+        let start = *pos;
+        let end = start + block_len;
+        let slice = &raw[start..end];
+        *pos = end;
+        slice
+    }
+
+    fn read_varints(block: &[u8], n: usize) -> Vec<u64> {
+        let mut pos = 0usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(read_uvarint(block, &mut pos).expect("varint"));
+        }
+        assert_eq!(pos, block.len(), "trailing bytes in column block");
+        out
+    }
+
+    /// Parses only the columns this test module needs (schema blocks 1-2
+    /// are skipped past, not decoded, since no test here needs schema
+    /// content).
+    fn parse_series_meta_v3(raw: &[u8]) -> ParsedSeriesMetaV3 {
+        let count = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
+        let schema_count = u32::from_le_bytes(raw[4..8].try_into().expect("4 bytes"));
+        let mut pos = 8usize;
+        for _ in 0..schema_count {
+            let name_count = read_uvarint(raw, &mut pos).expect("varint") as usize;
+            for _ in 0..name_count {
+                read_uvarint(raw, &mut pos).expect("varint");
+            }
+        }
+
+        let _schema_ref_block = read_block(raw, &mut pos);
+        let _value_ord_block = read_block(raw, &mut pos);
+        let sample_count_block = read_block(raw, &mut pos);
+        let _min_ts_delta_block = read_block(raw, &mut pos);
+        let _ts_span_block = read_block(raw, &mut pos);
+        let ts_page_gap_block = read_block(raw, &mut pos);
+        let ts_page_len_block = read_block(raw, &mut pos);
+        let val_page_gap_block = read_block(raw, &mut pos);
+        let val_page_len_block = read_block(raw, &mut pos);
+        let value_kind_block = read_block(raw, &mut pos);
+        let hist_page_gap_block = read_block(raw, &mut pos);
+        let hist_page_len_block = read_block(raw, &mut pos);
+        assert_eq!(pos, raw.len(), "trailing bytes in SERIES_META");
+
+        let sample_count: Vec<u32> = read_varints(sample_count_block, count as usize)
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+        let ts_page_gap = read_varints(ts_page_gap_block, count as usize);
+        let ts_page_len = read_varints(ts_page_len_block, count as usize);
+        let val_page_gap = read_varints(val_page_gap_block, count as usize);
+        let val_page_len = read_varints(val_page_len_block, count as usize);
+        assert_eq!(
+            value_kind_block.len(),
+            count as usize,
+            "value_kind is one raw byte per series, not a varint column"
+        );
+        let value_kind = value_kind_block.to_vec();
+        let hist_page_gap = read_varints(hist_page_gap_block, count as usize);
+        let hist_page_len = read_varints(hist_page_len_block, count as usize);
+
+        ParsedSeriesMetaV3 {
+            count,
+            sample_count,
+            ts_page_gap,
+            ts_page_len,
+            val_page_gap,
+            val_page_len,
+            value_kind,
+            hist_page_gap,
+            hist_page_len,
+        }
+    }
+
+    fn parse_series_ids(raw: &[u8]) -> Vec<[u8; 16]> {
+        let count = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes")) as usize;
+        assert_eq!(raw.len(), 4 + count * 16, "SERIES_IDS length mismatch");
+        (0..count)
+            .map(|i| {
+                let start = 4 + i * 16;
+                raw[start..start + 16].try_into().expect("16 bytes")
+            })
+            .collect()
+    }
+
+    fn split_and_verify_page<'a>(series_id: &SeriesId, page: &'a [u8]) -> (u8, u8, &'a [u8]) {
+        assert!(page.len() >= 6, "page shorter than its header");
+        let enc = page[0];
+        let comp = page[1];
+        let crc = u32::from_le_bytes(page[2..6].try_into().expect("4 bytes"));
+        let payload = &page[6..];
+        assert_eq!(
+            page_crc(&series_id.0, enc, comp, payload),
+            crc,
+            "page crc mismatch"
+        );
+        (enc, comp, payload)
+    }
+
+    // --- test-only HIST_SPANS record decoder (docs/rseg-v3-plan.md
+    // section 3.5), mirroring `encode_histogram_record_into`'s grammar
+    // exactly, field for field, so a mismatch here catches a real writer
+    // bug rather than two independently-wrong implementations agreeing. ---
+
+    fn decode_spans(raw: &[u8], pos: &mut usize) -> (Vec<HistogramSpan>, usize) {
+        let span_count = read_uvarint(raw, pos).expect("span_count varint") as usize;
+        let mut spans = Vec::with_capacity(span_count);
+        let mut total_len = 0usize;
+        for _ in 0..span_count {
+            let offset = read_zigzag_varint(raw, pos).expect("offset varint") as i32;
+            let length = read_uvarint(raw, pos).expect("length varint") as u32;
+            assert!(length > 0, "decoded span length must be > 0");
+            total_len += length as usize;
+            spans.push(HistogramSpan { offset, length });
+        }
+        (spans, total_len)
+    }
+
+    fn decode_int_counts(raw: &[u8], pos: &mut usize, n: usize) -> Vec<u64> {
+        (0..n)
+            .map(|_| read_uvarint(raw, pos).expect("bucket count varint"))
+            .collect()
+    }
+
+    fn decode_float_counts(raw: &[u8], pos: &mut usize, n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|_| {
+                let v = f64::from_le_bytes(raw[*pos..*pos + 8].try_into().expect("8 bytes"));
+                *pos += 8;
+                v
+            })
+            .collect()
+    }
+
+    fn decode_histogram_record(raw: &[u8], pos: &mut usize) -> HistogramValue {
+        let flags = raw[*pos];
+        *pos += 1;
+        let count_kind = flags & 0b1;
+        let has_sum = (flags >> 1) & 0b1 == 1;
+        let reset_bits = (flags >> 2) & 0b11;
+        assert_eq!(flags >> 4, 0, "reserved flag bits must be 0");
+        let reset_hint = match reset_bits {
+            0 => ResetHint::Unknown,
+            1 => ResetHint::Yes,
+            2 => ResetHint::No,
+            _ => ResetHint::Gauge,
+        };
+
+        let scale =
+            i32::try_from(read_zigzag_varint(raw, pos).expect("scale varint")).expect("scale i32");
+        let zero_threshold = f64::from_le_bytes(raw[*pos..*pos + 8].try_into().expect("8 bytes"));
+        *pos += 8;
+
+        let (zero_count_u64, count_u64, zero_count_f64, count_f64);
+        if count_kind == 0 {
+            zero_count_u64 = read_uvarint(raw, pos).expect("zero_count varint");
+            count_u64 = read_uvarint(raw, pos).expect("count varint");
+            zero_count_f64 = 0.0;
+            count_f64 = 0.0;
+        } else {
+            zero_count_u64 = 0;
+            count_u64 = 0;
+            zero_count_f64 = f64::from_le_bytes(raw[*pos..*pos + 8].try_into().expect("8 bytes"));
+            *pos += 8;
+            count_f64 = f64::from_le_bytes(raw[*pos..*pos + 8].try_into().expect("8 bytes"));
+            *pos += 8;
+        }
+
+        let sum = if has_sum {
+            let v = f64::from_le_bytes(raw[*pos..*pos + 8].try_into().expect("8 bytes"));
+            *pos += 8;
+            Some(v)
+        } else {
+            None
+        };
+
+        let custom_values = if scale == -53 {
+            let n = read_uvarint(raw, pos).expect("custom_values_count varint") as usize;
+            let mut bounds = Vec::with_capacity(n);
+            for _ in 0..n {
+                bounds.push(f64::from_le_bytes(
+                    raw[*pos..*pos + 8].try_into().expect("8 bytes"),
+                ));
+                *pos += 8;
+            }
+            Some(bounds)
+        } else {
+            None
+        };
+
+        let (positive_spans, positive_len) = decode_spans(raw, pos);
+        let (counts, negative_spans) = if count_kind == 0 {
+            let positive = decode_int_counts(raw, pos, positive_len);
+            let (neg_spans, neg_len) = decode_spans(raw, pos);
+            let negative = decode_int_counts(raw, pos, neg_len);
+            (
+                HistogramCounts::Int {
+                    zero_count: zero_count_u64,
+                    count: count_u64,
+                    positive,
+                    negative,
+                },
+                neg_spans,
+            )
+        } else {
+            let positive = decode_float_counts(raw, pos, positive_len);
+            let (neg_spans, neg_len) = decode_spans(raw, pos);
+            let negative = decode_float_counts(raw, pos, neg_len);
+            (
+                HistogramCounts::Float {
+                    zero_count: zero_count_f64,
+                    count: count_f64,
+                    positive,
+                    negative,
+                },
+                neg_spans,
+            )
+        };
+
+        HistogramValue {
+            scale,
+            zero_threshold,
+            sum,
+            custom_values,
+            positive_spans,
+            negative_spans,
+            counts,
+            reset_hint,
+        }
+    }
+
+    /// Bit-exact comparison (CLAUDE.md: float comparisons in storage/dedup
+    /// paths use bit patterns, never `==`; NaN and -0.0 are significant).
+    fn assert_histogram_value_bit_exact(expected: &HistogramValue, actual: &HistogramValue) {
+        assert_eq!(expected.scale, actual.scale);
+        assert_eq!(
+            expected.zero_threshold.to_bits(),
+            actual.zero_threshold.to_bits()
+        );
+        assert_eq!(expected.sum.map(f64::to_bits), actual.sum.map(f64::to_bits));
+        assert_eq!(
+            expected
+                .custom_values
+                .as_ref()
+                .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()),
+            actual
+                .custom_values
+                .as_ref()
+                .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+        );
+        assert_eq!(expected.positive_spans, actual.positive_spans);
+        assert_eq!(expected.negative_spans, actual.negative_spans);
+        assert_eq!(expected.reset_hint as u8, actual.reset_hint as u8);
+        match (&expected.counts, &actual.counts) {
+            (
+                HistogramCounts::Int {
+                    zero_count: ez,
+                    count: ec,
+                    positive: ep,
+                    negative: en,
+                },
+                HistogramCounts::Int {
+                    zero_count: az,
+                    count: ac,
+                    positive: ap,
+                    negative: an,
+                },
+            ) => {
+                assert_eq!(ez, az);
+                assert_eq!(ec, ac);
+                assert_eq!(ep, ap);
+                assert_eq!(en, an);
+            }
+            (
+                HistogramCounts::Float {
+                    zero_count: ez,
+                    count: ec,
+                    positive: ep,
+                    negative: en,
+                },
+                HistogramCounts::Float {
+                    zero_count: az,
+                    count: ac,
+                    positive: ap,
+                    negative: an,
+                },
+            ) => {
+                assert_eq!(ez.to_bits(), az.to_bits());
+                assert_eq!(ec.to_bits(), ac.to_bits());
+                assert_eq!(
+                    ep.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    ap.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    en.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    an.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("count_kind mismatch between expected and decoded histogram value"),
+        }
+    }
+
+    // --- conditional VAL_PAGES/HIST_PAGES section presence (section 3.2)
+    // --- the core new v3 behavior this ticket adds. ---
+
+    #[test]
+    fn empty_segment_omits_val_and_hist_sections() {
+        let written =
+            SegmentWriter::write_v3(Vec::new(), test_identity(), test_bounds()).expect("writes");
+        let object = written.bytes.as_ref();
+        let footer = decode_footer(object);
+
+        assert_eq!(footer.series_count, 0);
+        assert_eq!(footer.sample_count, 0);
+        assert!(section_desc(&footer, section_kind::VAL_PAGES).is_none());
+        assert!(section_desc(&footer, section_kind::HIST_PAGES).is_none());
+        assert!(section_desc(&footer, section_kind::LABEL_DICT).is_some());
+        assert!(section_desc(&footer, section_kind::SERIES_IDS).is_some());
+        assert!(section_desc(&footer, section_kind::SERIES_META).is_some());
+        assert!(section_desc(&footer, section_kind::TS_PAGES).is_some());
+    }
+
+    #[test]
+    fn scalar_only_segment_omits_hist_pages_section() {
+        let series = vec![SeriesInputV3 {
+            series_id: SeriesId([0x01; 16]),
+            labels: LabelSet::new(vec![Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: "scalar_metric".to_string(),
+            }])
+            .expect("valid labels"),
+            values: SeriesValues::Scalar(vec![Sample {
+                ts_ns: 10,
+                value: 1.5,
+            }]),
+        }];
+        let written =
+            SegmentWriter::write_v3(series, test_identity(), test_bounds()).expect("writes");
+        let footer = decode_footer(written.bytes.as_ref());
+        assert!(section_desc(&footer, section_kind::VAL_PAGES).is_some());
+        assert!(section_desc(&footer, section_kind::HIST_PAGES).is_none());
+    }
+
+    #[test]
+    fn histogram_only_segment_omits_val_pages_section() {
+        let series = vec![SeriesInputV3 {
+            series_id: SeriesId([0x02; 16]),
+            labels: LabelSet::new(vec![Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: "hist_metric".to_string(),
+            }])
+            .expect("valid labels"),
+            values: SeriesValues::Histogram(vec![HistogramSample {
+                ts_ns: 10,
+                value: HistogramValue {
+                    scale: 3,
+                    zero_threshold: 0.001,
+                    sum: Some(12.5),
+                    custom_values: None,
+                    positive_spans: vec![HistogramSpan {
+                        offset: 0,
+                        length: 2,
+                    }],
+                    negative_spans: vec![],
+                    counts: HistogramCounts::Int {
+                        zero_count: 1,
+                        count: 4,
+                        positive: vec![2, 1],
+                        negative: vec![],
+                    },
+                    reset_hint: ResetHint::Unknown,
+                },
+            }]),
+        }];
+        let written =
+            SegmentWriter::write_v3(series, test_identity(), test_bounds()).expect("writes");
+        let footer = decode_footer(written.bytes.as_ref());
+        assert!(section_desc(&footer, section_kind::VAL_PAGES).is_none());
+        assert!(section_desc(&footer, section_kind::HIST_PAGES).is_some());
+    }
+
+    // --- proptest generators ---
+
+    fn label_name_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("app".to_string()),
+            Just("region".to_string()),
+            Just("zone".to_string()),
+            Just("instance".to_string()),
+            Just("method".to_string()),
+        ]
+    }
+
+    fn labelset_strategy() -> impl Strategy<Value = LabelSet> {
+        (
+            "[a-z_]{1,10}",
+            prop::collection::vec((label_name_strategy(), "[a-zA-Z0-9_]{0,8}"), 0..4),
+        )
+            .prop_map(|(metric_name, extra)| {
+                let mut ls = vec![Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: metric_name,
+                }];
+                let mut seen = HashSet::new();
+                seen.insert(METRIC_NAME_LABEL.to_string());
+                for (name, value) in extra {
+                    if seen.insert(name.clone()) {
+                        ls.push(Label { name, value });
+                    }
+                }
+                LabelSet::new(ls).expect("no duplicate names by construction")
+            })
+    }
+
+    fn ts_strategy() -> impl Strategy<Value = i64> {
+        prop_oneof![
+            3 => 0i64..300,
+            1 => -1_000_000_000_000i64..=1_000_000_000_000i64,
+        ]
+    }
+
+    fn sample_value_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            10 => any::<f64>(),
+            1 => Just(f64::NAN),
+            1 => Just(-f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(f64::NEG_INFINITY),
+            1 => Just(0.0f64),
+            1 => Just(-0.0f64),
+        ]
+    }
+
+    fn scalar_samples_strategy() -> impl Strategy<Value = Vec<Sample>> {
+        prop::collection::vec((ts_strategy(), sample_value_strategy()), 1..12).prop_map(|pairs| {
+            pairs
+                .into_iter()
+                .map(|(ts_ns, value)| Sample { ts_ns, value })
+                .collect()
+        })
+    }
+
+    fn bounded_f64_strategy() -> impl Strategy<Value = f64> {
+        -1_000_000.0f64..1_000_000.0f64
+    }
+
+    fn reset_hint_strategy() -> impl Strategy<Value = ResetHint> {
+        prop_oneof![
+            Just(ResetHint::Unknown),
+            Just(ResetHint::Yes),
+            Just(ResetHint::No),
+            Just(ResetHint::Gauge),
+        ]
+    }
+
+    fn span_strategy() -> impl Strategy<Value = HistogramSpan> {
+        (-8i32..8, 1u32..6).prop_map(|(offset, length)| HistogramSpan { offset, length })
+    }
+
+    fn spans_strategy() -> impl Strategy<Value = Vec<HistogramSpan>> {
+        prop::collection::vec(span_strategy(), 0..4)
+    }
+
+    fn scale_strategy() -> impl Strategy<Value = i32> {
+        prop_oneof![
+            5 => -4i32..8,
+            1 => Just(-53i32),
+        ]
+    }
+
+    /// Generates a structurally valid `HistogramValue`: span lengths and
+    /// bucket-count vector lengths always agree, `custom_values` presence
+    /// always matches `scale == -53` with strictly ascending boundaries --
+    /// every constraint `encode_histogram_record_into` enforces. Bucket
+    /// count *contents* are derived deterministically from position
+    /// (not independently randomized) to keep the strategy simple; this
+    /// suite tests structural round-tripping, not count-value coverage
+    /// (that belongs to C5's fuzz/property hardening).
+    fn histogram_value_strategy() -> impl Strategy<Value = HistogramValue> {
+        (
+            scale_strategy(),
+            spans_strategy(),
+            spans_strategy(),
+            any::<bool>(),
+            prop::option::of(bounded_f64_strategy()),
+            reset_hint_strategy(),
+            bounded_f64_strategy(),
+            prop::collection::vec(bounded_f64_strategy(), 0..6),
+        )
+            .prop_map(
+                |(
+                    scale,
+                    positive_spans,
+                    negative_spans,
+                    is_float,
+                    sum,
+                    reset_hint,
+                    zero_threshold,
+                    custom_seed,
+                )| {
+                    let positive_len: usize =
+                        positive_spans.iter().map(|s| s.length as usize).sum();
+                    let negative_len: usize =
+                        negative_spans.iter().map(|s| s.length as usize).sum();
+
+                    let custom_values = if scale == -53 {
+                        let mut bounds = if custom_seed.is_empty() {
+                            vec![0.0]
+                        } else {
+                            custom_seed
+                        };
+                        bounds.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+                        for i in 1..bounds.len() {
+                            if bounds[i] <= bounds[i - 1] {
+                                bounds[i] = bounds[i - 1] + 1.0;
+                            }
+                        }
+                        Some(bounds)
+                    } else {
+                        None
+                    };
+
+                    let counts = if is_float {
+                        HistogramCounts::Float {
+                            zero_count: 3.0,
+                            count: (positive_len + negative_len) as f64 + 3.0,
+                            positive: (0..positive_len).map(|i| i as f64 + 1.0).collect(),
+                            negative: (0..negative_len).map(|i| i as f64 + 1.0).collect(),
+                        }
+                    } else {
+                        HistogramCounts::Int {
+                            zero_count: 3,
+                            count: (positive_len + negative_len) as u64 + 3,
+                            positive: (0..positive_len).map(|i| i as u64 + 1).collect(),
+                            negative: (0..negative_len).map(|i| i as u64 + 1).collect(),
+                        }
+                    };
+
+                    HistogramValue {
+                        scale,
+                        zero_threshold,
+                        sum,
+                        custom_values,
+                        positive_spans,
+                        negative_spans,
+                        counts,
+                        reset_hint,
+                    }
+                },
+            )
+    }
+
+    fn histogram_samples_strategy() -> impl Strategy<Value = Vec<HistogramSample>> {
+        prop::collection::vec((ts_strategy(), histogram_value_strategy()), 1..6).prop_map(
+            |entries| {
+                entries
+                    .into_iter()
+                    .map(|(ts_ns, value)| HistogramSample { ts_ns, value })
+                    .collect()
+            },
+        )
+    }
+
+    fn series_values_strategy() -> impl Strategy<Value = SeriesValues> {
+        prop_oneof![
+            3 => scalar_samples_strategy().prop_map(SeriesValues::Scalar),
+            3 => histogram_samples_strategy().prop_map(SeriesValues::Histogram),
+        ]
+    }
+
+    fn series_batch_strategy() -> impl Strategy<Value = Vec<SeriesInputV3>> {
+        prop::collection::vec((labelset_strategy(), series_values_strategy()), 0..8).prop_map(
+            |entries| {
+                entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, (labels, values))| {
+                        let mut id = [0u8; 16];
+                        id[..8].copy_from_slice(&(idx as u64).to_be_bytes());
+                        SeriesInputV3 {
+                            series_id: SeriesId(id),
+                            labels,
+                            values,
+                        }
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Internal-consistency property: the writer's declared per-series
+        /// metadata (value_kind, sample counts, ts bounds, reconstructed
+        /// TS/VAL/HIST page ranges from the gap/len columns) is
+        /// self-consistent with what was actually written, and every
+        /// HIST_SPANS record decodes back to bit-exact the same value that
+        /// was written.
+        #[test]
+        fn series_meta_v3_matches_written_pages(series in series_batch_strategy()) {
+            let expected_values: Vec<SeriesValues> = {
+                let mut sorted = series.iter()
+                    .filter(|s| !s.values.is_empty())
+                    .map(|s| {
+                        let mut values = s.values.clone();
+                        values.sort_by_ts();
+                        (s.series_id.0, values)
+                    })
+                    .collect::<Vec<_>>();
+                sorted.sort_by_key(|(id, _)| *id);
+                sorted.into_iter().map(|(_, v)| v).collect()
+            };
+
+            let written = SegmentWriter::write_v3(series, test_identity(), test_bounds())
+                .expect("writes");
+            let object = written.bytes.as_ref();
+            let footer = decode_footer(object);
+
+            let ids = parse_series_ids(section(object, &footer, section_kind::SERIES_IDS));
+            prop_assert_eq!(ids.len() as u64, footer.series_count);
+            prop_assert_eq!(ids.len(), expected_values.len());
+            for w in ids.windows(2) {
+                prop_assert!(w[0] < w[1], "SERIES_IDS must be strictly ascending");
+            }
+
+            let meta_desc = section_desc(&footer, section_kind::SERIES_META)
+                .expect("SERIES_META is always mandatory");
+            let meta_raw = decompress_section(
+                section(object, &footer, section_kind::SERIES_META),
+                meta_desc.uncompressed_len,
+            );
+            let meta = parse_series_meta_v3(&meta_raw);
+            prop_assert_eq!(u64::from(meta.count), footer.series_count);
+
+            let ts_bytes = section(object, &footer, section_kind::TS_PAGES);
+            let val_bytes = section_desc(&footer, section_kind::VAL_PAGES)
+                .map(|_| section(object, &footer, section_kind::VAL_PAGES))
+                .unwrap_or(&[]);
+            let hist_bytes = section_desc(&footer, section_kind::HIST_PAGES)
+                .map(|_| section(object, &footer, section_kind::HIST_PAGES))
+                .unwrap_or(&[]);
+
+            let mut ts_running = 0u64;
+            let mut val_running = 0u64;
+            let mut hist_running = 0u64;
+            for (i, &id) in ids.iter().enumerate() {
+                let series_id = SeriesId(id);
+
+                let ts_offset = ts_running + meta.ts_page_gap[i];
+                let ts_len = meta.ts_page_len[i];
+                let ts_end = ts_offset + ts_len;
+                prop_assert!(ts_end <= ts_bytes.len() as u64);
+                let (ts_enc, _ts_comp, _ts_payload) = split_and_verify_page(
+                    &series_id,
+                    &ts_bytes[ts_offset as usize..ts_end as usize],
+                );
+                prop_assert_eq!(ts_enc, page_enc::TS_DELTA_VARINT);
+                ts_running = ts_end;
+
+                match &expected_values[i] {
+                    SeriesValues::Scalar(_) => {
+                        prop_assert_eq!(meta.value_kind[i], 0);
+                        prop_assert_eq!(meta.hist_page_gap[i], 0);
+                        prop_assert_eq!(meta.hist_page_len[i], 0);
+
+                        let val_offset = val_running + meta.val_page_gap[i];
+                        let val_len = meta.val_page_len[i];
+                        let val_end = val_offset + val_len;
+                        prop_assert!(val_end <= val_bytes.len() as u64);
+                        let (val_enc, val_comp, val_payload) = split_and_verify_page(
+                            &series_id,
+                            &val_bytes[val_offset as usize..val_end as usize],
+                        );
+                        prop_assert_eq!(val_comp, page_comp::NONE);
+                        prop_assert!(
+                            val_enc == page_enc::VAL_GORILLA || val_enc == page_enc::VAL_RAW_F64,
+                            "unexpected VAL page enc byte {val_enc}"
+                        );
+                        let _ = val_payload;
+                        val_running = val_end;
+                    }
+                    SeriesValues::Histogram(samples) => {
+                        prop_assert_eq!(meta.value_kind[i], 1);
+                        prop_assert_eq!(meta.val_page_gap[i], 0);
+                        prop_assert_eq!(meta.val_page_len[i], 0);
+
+                        let hist_offset = hist_running + meta.hist_page_gap[i];
+                        let hist_len = meta.hist_page_len[i];
+                        let hist_end = hist_offset + hist_len;
+                        prop_assert!(hist_len > 0, "a histogram series must have a non-empty HIST page");
+                        prop_assert!(hist_end <= hist_bytes.len() as u64);
+                        let (hist_enc, hist_comp, hist_payload) = split_and_verify_page(
+                            &series_id,
+                            &hist_bytes[hist_offset as usize..hist_end as usize],
+                        );
+                        prop_assert_eq!(hist_enc, page_enc::HIST_SPANS);
+                        prop_assert_eq!(hist_comp, page_comp::NONE);
+
+                        let mut pos = 0usize;
+                        for sample in samples {
+                            let decoded = decode_histogram_record(hist_payload, &mut pos);
+                            assert_histogram_value_bit_exact(&sample.value, &decoded);
+                        }
+                        prop_assert_eq!(
+                            pos, hist_payload.len(),
+                            "HIST page must decode exactly sample_count records with no trailing bytes"
+                        );
+                        prop_assert_eq!(samples.len() as u32, meta.sample_count[i]);
+
+                        hist_running = hist_end;
+                    }
+                }
+            }
+            prop_assert_eq!(ts_running, ts_bytes.len() as u64);
+            prop_assert_eq!(val_running, val_bytes.len() as u64);
+            prop_assert_eq!(hist_running, hist_bytes.len() as u64);
         }
     }
 }
