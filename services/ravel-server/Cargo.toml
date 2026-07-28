@@ -64,6 +64,9 @@ tonic = { workspace = true, features = ["channel"] }
 async-trait = { workspace = true }
 snap = { workspace = true }
 tower = { workspace = true }
+# Test-only: the Flight SQL tests adapt a `tonic::Streaming` into the stream
+# `arrow_flight::decode` consumes, which needs the `TryStreamExt` combinators.
+futures = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-segment = { workspace = true }
 uuid = { workspace = true }
