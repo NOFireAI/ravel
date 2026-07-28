@@ -97,18 +97,18 @@ fn predict_linear_scalar_argument_dispatches_correctly() {
 fn unregistered_function_is_rejected_in_the_instant_call_path() {
     let source = one_per_second_counter();
     let err = Evaluator::new()
-        .instant(&source, "abs(up)", 300_000)
-        .expect_err("abs is not yet registered");
+        .instant(&source, "sort_by_label(up)", 300_000)
+        .expect_err("sort_by_label is not yet registered");
     assert!(matches!(err, Error::Unsupported { .. }));
-    assert!(err.to_string().contains("abs"));
+    assert!(err.to_string().contains("sort_by_label"));
 }
 
 #[test]
 fn unregistered_function_is_rejected_in_the_range_call_path() {
     let source = one_per_second_counter();
     let err = Evaluator::new()
-        .range(&source, "abs(up)", 0, 300_000, 60_000)
-        .expect_err("abs is not yet registered");
+        .range(&source, "sort_by_label(up)", 0, 300_000, 60_000)
+        .expect_err("sort_by_label is not yet registered");
     assert!(matches!(err, Error::Unsupported { .. }));
-    assert!(err.to_string().contains("abs"));
+    assert!(err.to_string().contains("sort_by_label"));
 }

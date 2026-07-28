@@ -1,0 +1,397 @@
+# Elementwise math, clamp, sort, label, time/calendar function corpus
+# (ticket P6, docs/promql-evaluator-plan.md section 9/10/11), against
+# crates/ravel-promql-difftest/src/generator.rs's fixed dataset. Every
+# offset is relative to the dataset's base_ts_ms (1_700_000_000_000 ms,
+# i.e. 2023-11-14T22:13:20Z).
+#
+# sort/sort_desc entries are deliberately kind: instant with mode: ordered
+# only (plan section 4/9): a real Prometheus sort is not stable, so tied or
+# NaN-valued inputs would make an ordered comparison flaky. Every sort/
+# sort_desc query here selects series whose values are continuous random
+# walks (vanishingly unlikely to tie) and excludes any NaN-bearing series.
+#
+# label_replace's dst-validation and regex-compile errors are runtime
+# errors (the query parses fine on both sides, validation fails only at
+# eval time), not the syntax errors errors.txt is scoped to, so they live
+# here instead alongside the rest of P6's own semantics.
+#
+# No entry here relies on a binary expression (arithmetic or set operator:
+# `or`/`and`/`unless`, `+`, `/`, ...) or an aggregation: eval.rs does not
+# implement Expr::Binary or Expr::Aggregate yet (both return a typed
+# Unsupported error), which is a different phase's scope, not this one's.
+# Where P6's own semantics call for a NaN scalar (clamp's NaN-bound cases),
+# the bare `NaN` number literal is used instead of a `0/0` binary
+# expression, since PromQL's grammar (and this evaluator's parser) accepts
+# `NaN`/`Inf`/`-Inf` directly as number tokens.
+
+name: instant_abs_over_special_values
+query: abs(diff_special_values)
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_ceil_gauge_walk
+query: ceil(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_floor_gauge_walk
+query: floor(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_sqrt_over_special_values
+query: sqrt(diff_special_values)
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_exp_gauge_walk
+query: exp(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_ln_over_special_values
+query: ln(diff_special_values)
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_log2_over_special_values
+query: log2(diff_special_values)
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_log10_over_special_values
+query: log10(diff_special_values)
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_sgn_over_special_values
+query: sgn(diff_special_values)
+kind: instant
+time: +180s
+mode: unordered
+
+name: range_round_default_to_nearest
+query: round(diff_gauge_walk)
+kind: range
+start: +0s
+end: +300s
+step: 30s
+mode: unordered
+
+name: instant_round_to_nearest_explicit
+query: round(diff_gauge_walk, 0.5)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_sin_gauge_walk
+query: sin(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_cos_gauge_walk
+query: cos(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_tan_gauge_walk
+query: tan(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_asin_domain_clamped
+query: asin(clamp(diff_gauge_walk, -1, 1))
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_acos_domain_clamped
+query: acos(clamp(diff_gauge_walk, -1, 1))
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_atan_gauge_walk
+query: atan(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_sinh_gauge_walk
+query: sinh(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_cosh_gauge_walk
+query: cosh(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_tanh_gauge_walk
+query: tanh(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_asinh_gauge_walk
+query: asinh(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_acosh_domain_clamped
+query: acosh(clamp_min(diff_gauge_walk, 1))
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_atanh_domain_clamped
+query: atanh(clamp(diff_gauge_walk, -0.999, 0.999))
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_deg_gauge_walk
+query: deg(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_rad_gauge_walk
+query: rad(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_pi_constant
+query: pi()
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_clamp_within_bounds
+query: clamp(diff_gauge_walk, -0.5, 0.5)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_clamp_min_greater_than_max_is_empty
+query: clamp(diff_gauge_walk, 5, 1)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_clamp_with_nan_bound
+query: clamp(diff_gauge_walk, NaN, 1)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_clamp_min_gauge_walk
+query: clamp_min(diff_gauge_walk, -0.2)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_clamp_max_gauge_walk
+query: clamp_max(diff_gauge_walk, 0.2)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_clamp_max_with_nan_bound
+query: clamp_max(diff_gauge_walk, NaN)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_sort_ascending_distinct_walks
+query: sort(diff_match_left)
+kind: instant
+time: +300s
+mode: ordered
+
+name: instant_sort_desc_distinct_walks
+query: sort_desc(diff_group_left)
+kind: instant
+time: +300s
+mode: ordered
+
+name: instant_label_replace_copies_captured_group
+query: label_replace(diff_match_left, "region", "$1", "instance", "(.*)")
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_label_replace_no_match_leaves_series_unchanged
+query: label_replace(diff_match_left, "region", "$1", "instance", "nomatch-(.*)")
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_label_replace_empty_replacement_deletes_dst
+query: label_replace(diff_match_left, "job", "", "job", ".*")
+kind: instant
+time: +300s
+mode: unordered
+
+name: error_label_replace_invalid_dst_label_name
+query: label_replace(diff_match_left, "1bad", "$1", "job", "(.*)")
+kind: instant
+time: +300s
+mode: error
+
+name: error_label_replace_invalid_regex
+query: label_replace(diff_match_left, "region", "$1", "job", "(unterminated")
+kind: instant
+time: +300s
+mode: error
+
+name: instant_label_join_combines_two_labels
+query: label_join(diff_match_left, "combined", "-", "job", "instance")
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_label_join_missing_src_label_is_empty
+query: label_join(diff_match_left, "combined", "-", "job", "missing_label")
+kind: instant
+time: +300s
+mode: unordered
+
+name: error_label_join_invalid_dst_label_name
+query: label_join(diff_match_left, "1bad", "-", "job")
+kind: instant
+time: +300s
+mode: error
+
+name: instant_absent_over_present_series_is_empty
+query: absent(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_absent_bare_selector_no_matchers
+query: absent(nonexistent_series_xyz)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_absent_derives_labels_from_equality_matchers
+query: absent(nonexistent_series_xyz{job="api",instance="1"})
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_vector_wraps_a_scalar
+query: vector(42)
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_single_series
+query: scalar(diff_gauge_walk)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_scalar_multi_series_is_nan
+query: scalar(diff_match_left)
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_time_constant
+query: time()
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_timestamp_off_grid_reports_stored_sample_time
+query: timestamp(diff_gauge_walk)
+kind: instant
+time: +345s
+mode: unordered
+
+name: range_timestamp_over_a_grid
+query: timestamp(diff_gauge_walk)
+kind: range
+start: +0s
+end: +300s
+step: 45s
+mode: unordered
+
+name: instant_hour_default_to_eval_time
+query: hour()
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_minute_default_to_eval_time
+query: minute()
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_day_of_week_default_to_eval_time
+query: day_of_week()
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_day_of_month_explicit_argument
+query: day_of_month(vector(1709164800))
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_month_explicit_argument
+query: month(vector(1709164800))
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_year_explicit_argument
+query: year(vector(1709164800))
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_day_of_year_explicit_argument
+query: day_of_year(vector(1709164800))
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_days_in_month_leap_february
+query: days_in_month(vector(1709164800))
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_days_in_month_default_to_eval_time
+query: days_in_month()
+kind: instant
+time: +300s
+mode: unordered
+
+name: range_hour_over_a_grid
+query: hour(diff_gauge_walk)
+kind: range
+start: +0s
+end: +300s
+step: 60s
+mode: unordered
