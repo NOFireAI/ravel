@@ -25,5 +25,8 @@ pub mod skip_index;
 pub mod stream_dir;
 pub mod tokenizer;
 pub mod varint;
+pub mod writer;
 
 pub use error::LogSegError;
+pub use record::LogRecord;
+pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
