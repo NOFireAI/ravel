@@ -40,6 +40,16 @@ pub enum WriteError {
     HistogramSpanLengthZero,
     #[error("histogram bucket count vector length does not match its spans' total length")]
     HistogramBucketCountLenMismatch,
+
+    // --- RSEG v4 only (ADR-0018, docs/compaction-retention-plan.md
+    // section 4): multi-run verbatim-copy writer. v1/v2/v3 objects never
+    // produce these. ---
+    #[error("series has runs with more than one distinct value_kind")]
+    MixedValueKindInSeries,
+    #[error("pre-encoded run page is shorter than the 6-byte page header")]
+    RunPageTooShort,
+    #[error("more than u32::MAX runs in one segment")]
+    TooManyRuns,
 }
 
 /// Errors that can occur while parsing or decoding a segment. All violations
