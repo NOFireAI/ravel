@@ -54,6 +54,14 @@ impl Catalog {
         &self.config
     }
 
+    /// `pub(crate)`: lets `fold` (docs/metric-index-plan.md section 4) issue
+    /// its own LIST/GET/PUT calls through the same store handle, in its own
+    /// `impl Catalog` block in `fold.rs`, without duplicating the
+    /// `store`/`config`/`cache` fields in a separate type.
+    pub(crate) fn store(&self) -> &dyn ObjectStoreBackend {
+        self.store.as_ref()
+    }
+
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot
     /// resolution"):
     ///
@@ -228,7 +236,10 @@ impl Catalog {
         }
     }
 
-    async fn load_and_validate(
+    /// `pub(crate)`: also called by `fold` (docs/metric-index-plan.md
+    /// section 4) to load and validate commit records found by bucket
+    /// listing, reusing this cache-first GET+decode+validate path.
+    pub(crate) async fn load_and_validate(
         &self,
         tenant: &TenantHash,
         signal: Signal,
