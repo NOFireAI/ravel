@@ -180,7 +180,7 @@ fn quantile_over_time(q: f64, samples: &[Sample], _w: RangeWindow) -> Option<f64
 /// yet), `q` itself being NaN produces NaN, and otherwise linear
 /// interpolation between the two nearest ranks after sorting with NaN
 /// values treated as smaller than every real number.
-fn quantile(q: f64, mut values: Vec<f64>) -> f64 {
+pub(crate) fn quantile(q: f64, mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return f64::NAN;
     }
@@ -218,7 +218,7 @@ fn quantile(q: f64, mut values: Vec<f64>) -> f64 {
 /// itself is `sum`; `c` is folded back in by the caller only once, after
 /// the whole window has been accumulated (adding it at every step would
 /// just re-derive plain summation).
-fn kahan_sum_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
+pub(crate) fn kahan_sum_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
     let t = sum + inc;
     let new_c = if t.is_infinite() {
         0.0

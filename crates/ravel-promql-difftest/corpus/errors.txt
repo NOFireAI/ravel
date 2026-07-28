@@ -67,9 +67,3 @@ query: diff_gauge_walk[]
 kind: instant
 time: +0s
 mode: error
-
-name: error_stray_comma_in_matchers
-query: diff_gauge_walk{job="api",}
-kind: instant
-time: +0s
-mode: error

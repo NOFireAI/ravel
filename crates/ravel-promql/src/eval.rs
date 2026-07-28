@@ -418,6 +418,9 @@ impl Evaluator {
                 .map(Value::Matrix),
             Expr::Call(c) => crate::functions::eval_call(self, source, c, eval_ts_ns, ctx),
             Expr::Binary(b) => crate::binop::eval_binary(self, source, b, eval_ts_ns, ctx),
+            Expr::Aggregate(a) => {
+                crate::aggregate::eval_aggregate(self, source, a, eval_ts_ns, ctx)
+            }
             _ => Err(unsupported_construct_error(expr)),
         }
     }
@@ -728,6 +731,7 @@ fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'
             // would otherwise have to update this match to keep producing).
             Expr::Call(c) => return Ok((RangeCore::Call(c), negate)),
             Expr::Binary(_) => return Ok((RangeCore::Generic(expr), false)),
+            Expr::Aggregate(_) => return Ok((RangeCore::Generic(expr), false)),
             _ => return Err(unsupported_construct_error(cur)),
         }
     }
@@ -735,17 +739,15 @@ fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'
 
 /// The [`Error::Unsupported`] for an AST node this phase does not evaluate.
 /// Callers must have already handled `Paren`, `Unary`, `NumberLiteral`,
-/// `StringLiteral`, `VectorSelector`, `MatrixSelector`, and `Call` (the last
-/// always dispatches to `crate::functions`, which produces its own
-/// "function call: {name}" [`Error::Unsupported`] for an unregistered name);
+/// `StringLiteral`, `VectorSelector`, `MatrixSelector`, `Call` (which always
+/// dispatches to `crate::functions`, producing its own "function call:
+/// {name}" [`Error::Unsupported`] for an unregistered name), `Binary`, and
+/// `Aggregate` (the last two dispatch to `crate::binop`/`crate::aggregate`);
 /// this panics on any of those (programmer error, not reachable) and covers
 /// the rest.
 fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
     use promql_parser::parser::Expr;
     match expr {
-        Expr::Aggregate(a) => Error::Unsupported {
-            construct: format!("aggregation: {}", a.op),
-        },
         Expr::Subquery(_) => Error::Unsupported {
             construct: "subquery".to_string(),
         },
@@ -759,7 +761,8 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
         | Expr::VectorSelector(_)
         | Expr::MatrixSelector(_)
         | Expr::Call(_)
-        | Expr::Binary(_) => {
+        | Expr::Binary(_)
+        | Expr::Aggregate(_) => {
             unreachable!("caller must handle every supported construct before falling back")
         }
     }
@@ -1267,7 +1270,7 @@ mod tests {
     fn unsupported_constructs_name_the_rejected_node() {
         let cases: &[(&str, &str)] = &[
             ("sort_by_label(up)", "sort_by_label"),
-            ("sum(up)", "sum"),
+            ("mad_over_time(up[5m])", "mad_over_time"),
             ("up[5m:1m]", "subquery"),
         ];
         for (query, expected_substr) in cases {
