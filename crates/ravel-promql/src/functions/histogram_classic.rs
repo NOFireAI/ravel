@@ -1,0 +1,456 @@
+//! Classic-bucket histogram functions (plan section 8/P9): `histogram_quantile`
+//! and `histogram_fraction` over `le`-labeled classic bucket series, as
+//! opposed to native histograms (out of scope until P11's blocked ticket).
+//! Both group the input instant vector by every label except `le`, treat
+//! each group's series as one classic histogram's cumulative buckets, and
+//! interpolate linearly within a bucket assuming a uniform distribution of
+//! observations there (Prometheus' `bucketQuantile`/`bucketFraction`,
+//! `promql/quantile.go`).
+//!
+//! Both functions require a `+Inf` bucket (without it the total observation
+//! count, and so the top of the distribution, is unknown) and tolerate a
+//! non-monotonic cumulative count (a reset, a federation merge, or an
+//! otherwise corrupted classic histogram) by clamping each bucket to the
+//! running maximum seen so far, matching Prometheus' `ensureMonotonic`. A
+//! group failing either requirement, or with fewer than two usable buckets,
+//! or a NaN scalar argument, evaluates to `NaN` for that group rather than
+//! being omitted: the result vector always has one entry per group, exactly
+//! like Prometheus. Neither function emits the warning annotations
+//! Prometheus does for these cases: `ravel-promql`'s `Value` type carries no
+//! warnings at all yet (see this ticket's final report).
+
+use std::collections::HashMap;
+
+use ravel_types::{Label, LabelSet};
+
+use crate::eval::InstantVector;
+
+use super::{FunctionDef, FunctionKind};
+
+pub(crate) const FUNCTIONS: &[FunctionDef] = &[
+    FunctionDef {
+        name: "histogram_quantile",
+        kind: FunctionKind::HistogramQuantile(histogram_quantile),
+    },
+    FunctionDef {
+        name: "histogram_fraction",
+        kind: FunctionKind::HistogramFraction(histogram_fraction),
+    },
+];
+
+const LE_LABEL: &str = "le";
+
+/// One classic bucket within a group: its upper bound (the parsed `le`
+/// value) and cumulative observation count (the bucket series' own value).
+#[derive(Clone, Copy)]
+struct Bucket {
+    upper_bound: f64,
+    count: f64,
+}
+
+/// Groups `vector` by every label except `le` and `__name__` (Prometheus
+/// drops the metric name from any function result). A series with no `le`
+/// label, or one that does not parse as a float, is not a valid classic
+/// bucket and is dropped from the histogram entirely (the pinned Prometheus
+/// excludes it too, with its own warning annotation this crate does not yet
+/// carry, see the module doc).
+fn group_by_bucket(vector: InstantVector) -> Vec<(LabelSet, Vec<Bucket>)> {
+    let mut groups: Vec<(LabelSet, Vec<Bucket>)> = Vec::new();
+    let mut index: HashMap<LabelSet, usize> = HashMap::new();
+    for sample in vector {
+        let Some(le_str) = sample.labels.get(LE_LABEL) else {
+            continue;
+        };
+        let Ok(upper_bound) = le_str.parse::<f64>() else {
+            continue;
+        };
+        let key: Vec<Label> = sample
+            .labels
+            .iter()
+            .filter(|l| l.name != LE_LABEL && l.name != ravel_types::METRIC_NAME_LABEL)
+            .cloned()
+            .collect();
+        // Filtering an already-deduplicated `LabelSet` cannot introduce a
+        // duplicate name, so this reconstruction cannot fail.
+        let key = LabelSet::new(key).unwrap_or_default();
+        let bucket = Bucket {
+            upper_bound,
+            count: sample.value,
+        };
+        match index.get(&key) {
+            Some(&i) => groups[i].1.push(bucket),
+            None => {
+                index.insert(key.clone(), groups.len());
+                groups.push((key, vec![bucket]));
+            }
+        }
+    }
+    groups
+}
+
+/// Sorts `buckets` ascending by upper bound, requires a `+Inf` top bucket,
+/// coalesces duplicate upper bounds by summing their counts (a repeated
+/// `le` value, e.g. from a mis-scraped target), and clamps each bucket's
+/// count to the running maximum seen so far so the cumulative sequence is
+/// non-decreasing (Prometheus' `ensureMonotonic`). Returns `None` if the
+/// group has fewer than two buckets before or after coalescing, or its
+/// highest upper bound is not `+Inf`: not a well-formed classic histogram.
+fn prepare(mut buckets: Vec<Bucket>) -> Option<Vec<Bucket>> {
+    if buckets.len() < 2 {
+        return None;
+    }
+    buckets.sort_by(|a, b| a.upper_bound.total_cmp(&b.upper_bound));
+    if buckets[buckets.len() - 1].upper_bound != f64::INFINITY {
+        return None;
+    }
+
+    let mut coalesced: Vec<Bucket> = Vec::with_capacity(buckets.len());
+    for b in buckets {
+        match coalesced.last_mut() {
+            Some(last) if last.upper_bound == b.upper_bound => last.count += b.count,
+            _ => coalesced.push(b),
+        }
+    }
+    if coalesced.len() < 2 {
+        return None;
+    }
+
+    let mut running_max = coalesced[0].count;
+    for b in coalesced.iter_mut().skip(1) {
+        if b.count < running_max {
+            b.count = running_max;
+        } else {
+            running_max = b.count;
+        }
+    }
+    Some(coalesced)
+}
+
+/// Prometheus' `bucketQuantile`, applied to an already-[`prepare`]d bucket
+/// list (at least two buckets, monotonic, the last one `+Inf`). `phi` is
+/// validated by the caller before this runs.
+fn bucket_quantile(phi: f64, buckets: &[Bucket]) -> f64 {
+    let last = buckets.len() - 1;
+    let total = buckets[last].count;
+    if total == 0.0 {
+        return f64::NAN;
+    }
+    let rank = phi * total;
+    let b = buckets[..last]
+        .iter()
+        .position(|bucket| bucket.count >= rank)
+        .unwrap_or(last);
+    if b == last {
+        return buckets[last - 1].upper_bound;
+    }
+    if b == 0 && buckets[0].upper_bound <= 0.0 {
+        return buckets[0].upper_bound;
+    }
+
+    let bucket_end = buckets[b].upper_bound;
+    let (bucket_start, count, rank) = if b > 0 {
+        (
+            buckets[b - 1].upper_bound.max(0.0),
+            buckets[b].count - buckets[b - 1].count,
+            rank - buckets[b - 1].count,
+        )
+    } else {
+        (0.0, buckets[b].count, rank)
+    };
+    bucket_start + (bucket_end - bucket_start) * (rank / count)
+}
+
+/// `phi` argument edges (checked ahead of any bucket validity check,
+/// matching the pinned Prometheus): `NaN` is `NaN`, below `0` is `-Inf`,
+/// above `1` is `+Inf`.
+fn quantile_for_group(phi: f64, buckets: Vec<Bucket>) -> f64 {
+    if phi.is_nan() {
+        return f64::NAN;
+    }
+    if phi < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if phi > 1.0 {
+        return f64::INFINITY;
+    }
+    match prepare(buckets) {
+        Some(prepared) => bucket_quantile(phi, &prepared),
+        None => f64::NAN,
+    }
+}
+
+fn histogram_quantile(phi: f64, vector: InstantVector) -> Vec<(LabelSet, f64)> {
+    group_by_bucket(vector)
+        .into_iter()
+        .map(|(labels, buckets)| (labels, quantile_for_group(phi, buckets)))
+        .collect()
+}
+
+/// The observation rank (cumulative count) at value `v`, by inverting
+/// [`bucket_quantile`]'s own piecewise-linear interpolation: the rank
+/// function and the quantile function assume the same uniform-within-bucket
+/// distribution, so this is `bucket_quantile` read right-to-left.
+fn bucket_rank_at(v: f64, buckets: &[Bucket]) -> f64 {
+    let last = buckets.len() - 1;
+    let total = buckets[last].count;
+    if v == f64::INFINITY {
+        return total;
+    }
+    if v <= buckets[0].upper_bound {
+        if buckets[0].upper_bound <= 0.0 {
+            return if v < buckets[0].upper_bound {
+                0.0
+            } else {
+                buckets[0].count
+            };
+        }
+        if v <= 0.0 {
+            return 0.0;
+        }
+        return buckets[0].count * (v / buckets[0].upper_bound);
+    }
+    for i in 1..last {
+        if v <= buckets[i].upper_bound {
+            let bucket_start = buckets[i - 1].upper_bound.max(0.0);
+            let bucket_end = buckets[i].upper_bound;
+            let count = buckets[i].count - buckets[i - 1].count;
+            let start_count = buckets[i - 1].count;
+            return start_count + count * ((v - bucket_start) / (bucket_end - bucket_start));
+        }
+    }
+    total
+}
+
+fn bucket_fraction(lower: f64, upper: f64, buckets: &[Bucket]) -> f64 {
+    let total = buckets[buckets.len() - 1].count;
+    let lower_rank = bucket_rank_at(lower, buckets);
+    let upper_rank = bucket_rank_at(upper, buckets);
+    ((upper_rank - lower_rank) / total).clamp(0.0, 1.0)
+}
+
+/// `lower`/`upper` argument edges, checked ahead of any bucket validity
+/// check: either being `NaN` makes the result `NaN`; an empty or inverted
+/// range (`lower >= upper`) is `0`; the full range (`-Inf`, `+Inf`) is
+/// always `1` regardless of the histogram's own total, once it has one.
+fn fraction_for_group(lower: f64, upper: f64, buckets: Vec<Bucket>) -> f64 {
+    if lower.is_nan() || upper.is_nan() {
+        return f64::NAN;
+    }
+    let Some(prepared) = prepare(buckets) else {
+        return f64::NAN;
+    };
+    if prepared[prepared.len() - 1].count == 0.0 {
+        return f64::NAN;
+    }
+    if lower >= upper {
+        return 0.0;
+    }
+    if lower == f64::NEG_INFINITY && upper == f64::INFINITY {
+        return 1.0;
+    }
+    bucket_fraction(lower, upper, &prepared)
+}
+
+fn histogram_fraction(lower: f64, upper: f64, vector: InstantVector) -> Vec<(LabelSet, f64)> {
+    group_by_bucket(vector)
+        .into_iter()
+        .map(|(labels, buckets)| (labels, fraction_for_group(lower, upper, buckets)))
+        .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
+        LabelSet::new(
+            pairs
+                .iter()
+                .map(|(n, v)| Label {
+                    name: (*n).to_string(),
+                    value: (*v).to_string(),
+                })
+                .collect(),
+        )
+        .expect("valid labels")
+    }
+
+    fn sample(labels: &[(&str, &str)], value: f64) -> crate::eval::InstantSample {
+        crate::eval::InstantSample {
+            labels: label_set(labels),
+            ts_ns: 0,
+            value,
+        }
+    }
+
+    fn wellformed_vector() -> InstantVector {
+        vec![
+            sample(
+                &[("__name__", "http_bucket"), ("job", "a"), ("le", "0.1")],
+                10.0,
+            ),
+            sample(
+                &[("__name__", "http_bucket"), ("job", "a"), ("le", "0.5")],
+                20.0,
+            ),
+            sample(
+                &[("__name__", "http_bucket"), ("job", "a"), ("le", "1")],
+                30.0,
+            ),
+            sample(
+                &[("__name__", "http_bucket"), ("job", "a"), ("le", "+Inf")],
+                40.0,
+            ),
+        ]
+    }
+
+    #[test]
+    fn quantile_groups_by_labels_minus_le_and_drops_metric_name() {
+        let got = histogram_quantile(0.5, wellformed_vector());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, label_set(&[("job", "a")]));
+    }
+
+    #[test]
+    fn quantile_interpolates_within_the_owning_bucket() {
+        // 40 total observations, phi=0.5 -> rank 20, exactly the boundary
+        // of the (0.1, 0.5] bucket, which owns ranks (10, 20].
+        let got = histogram_quantile(0.5, wellformed_vector());
+        assert_eq!(got[0].1, 0.5);
+    }
+
+    #[test]
+    fn quantile_interpolates_the_lowest_bucket_from_zero() {
+        // rank 5 of 10 falls inside the (-Inf, 0.1] bucket, interpolated
+        // from 0 since its lower edge is <= 0.
+        let got = histogram_quantile(0.125, wellformed_vector());
+        assert_eq!(got[0].1, 0.05);
+    }
+
+    #[test]
+    fn quantile_top_of_range_is_the_highest_finite_bound() {
+        let got = histogram_quantile(1.0, wellformed_vector());
+        assert_eq!(got[0].1, 1.0);
+    }
+
+    #[test]
+    fn quantile_phi_out_of_range_returns_signed_infinity() {
+        assert_eq!(
+            histogram_quantile(-1.0, wellformed_vector())[0].1,
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            histogram_quantile(2.0, wellformed_vector())[0].1,
+            f64::INFINITY
+        );
+    }
+
+    #[test]
+    fn quantile_nan_phi_is_nan() {
+        assert!(
+            histogram_quantile(f64::NAN, wellformed_vector())[0]
+                .1
+                .is_nan()
+        );
+    }
+
+    #[test]
+    fn quantile_missing_inf_bucket_is_nan() {
+        let vector: InstantVector = wellformed_vector()
+            .into_iter()
+            .filter(|s| s.labels.get("le") != Some("+Inf"))
+            .collect();
+        let got = histogram_quantile(0.5, vector);
+        assert!(got[0].1.is_nan());
+    }
+
+    #[test]
+    fn quantile_single_bucket_is_nan() {
+        let vector = vec![sample(&[("le", "+Inf")], 10.0)];
+        assert!(histogram_quantile(0.5, vector)[0].1.is_nan());
+    }
+
+    #[test]
+    fn quantile_clamps_a_non_monotonic_bucket_to_the_running_maximum() {
+        let vector = vec![
+            sample(&[("le", "0.1")], 10.0),
+            sample(&[("le", "0.5")], 5.0), // dips below the 0.1 bucket
+            sample(&[("le", "+Inf")], 20.0),
+        ];
+        // After the monotonicity fixup, the 0.5 bucket reads as 10 (clamped
+        // up to the running max): rank 10 (phi=0.5 of a 20 total) exactly
+        // matches the 0.1 bucket's own cumulative count, so it lands on
+        // that bucket's own boundary rather than spilling into the next.
+        let got = histogram_quantile(0.5, vector);
+        assert_eq!(got[0].1, 0.1);
+    }
+
+    #[test]
+    fn quantile_unparseable_le_is_excluded() {
+        let vector = vec![
+            sample(&[("le", "not-a-number")], 10.0),
+            sample(&[("le", "1")], 10.0),
+            sample(&[("le", "+Inf")], 10.0),
+        ];
+        // Only two usable buckets remain, (1, count 10] and (+Inf, count
+        // 10]: the whole mass is at or below 1, so phi=0.5 (rank 5)
+        // interpolates halfway across the (0, 1] bucket.
+        let got = histogram_quantile(0.5, vector);
+        assert_eq!(got[0].1, 0.5);
+    }
+
+    #[test]
+    fn fraction_full_range_is_one() {
+        let got = histogram_fraction(f64::NEG_INFINITY, f64::INFINITY, wellformed_vector());
+        assert_eq!(got[0].1, 1.0);
+    }
+
+    #[test]
+    fn fraction_empty_range_is_zero() {
+        let got = histogram_fraction(1.0, 1.0, wellformed_vector());
+        assert_eq!(got[0].1, 0.0);
+
+        let got = histogram_fraction(2.0, 1.0, wellformed_vector());
+        assert_eq!(got[0].1, 0.0);
+    }
+
+    #[test]
+    fn fraction_is_the_inverse_of_quantile() {
+        // The median (phi=0.5) computed above is exactly 0.5; the fraction
+        // of observations at or below that same value should be 0.5.
+        let quantile = histogram_quantile(0.5, wellformed_vector())[0].1;
+        let got = histogram_fraction(f64::NEG_INFINITY, quantile, wellformed_vector());
+        assert_eq!(got[0].1, 0.5);
+    }
+
+    #[test]
+    fn fraction_nan_argument_is_nan() {
+        assert!(
+            histogram_fraction(f64::NAN, 1.0, wellformed_vector())[0]
+                .1
+                .is_nan()
+        );
+        assert!(
+            histogram_fraction(0.0, f64::NAN, wellformed_vector())[0]
+                .1
+                .is_nan()
+        );
+    }
+
+    #[test]
+    fn fraction_missing_inf_bucket_is_nan() {
+        let vector: InstantVector = wellformed_vector()
+            .into_iter()
+            .filter(|s| s.labels.get("le") != Some("+Inf"))
+            .collect();
+        let got = histogram_fraction(0.0, 1.0, vector);
+        assert!(got[0].1.is_nan());
+    }
+
+    #[test]
+    fn no_bucket_series_yields_an_empty_vector() {
+        assert!(histogram_quantile(0.5, Vec::new()).is_empty());
+        assert!(histogram_fraction(0.0, 1.0, Vec::new()).is_empty());
+    }
+}
