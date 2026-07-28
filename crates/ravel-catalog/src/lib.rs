@@ -23,6 +23,7 @@ pub use error::CatalogError;
 pub use fold::{FoldReport, Transaction};
 pub use snapshot::{SegmentRef, Snapshot};
 pub use snapshot_format::{
-    DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, HEAD_FORMAT_VERSION, MAGIC, PartLimits,
-    SnapshotFormatError, VERSION, decode_head, decode_part, encode_head, encode_part,
+    DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, DecodedPostings,
+    HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits, SnapshotFormatError,
+    VERSION, decode_head, decode_part, decode_postings, encode_head, encode_part, encode_postings,
 };

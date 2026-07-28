@@ -11,7 +11,7 @@
 //! falls back to full rebuild from the commit layout or returns a typed
 //! error; it never corrupts HEAD or leaves a torn snapshot visible.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
 use ravel_commit::keys::{self, BucketEntry, KeyError};
@@ -19,15 +19,78 @@ use ravel_commit::signal;
 use ravel_object_store::{
     GetRange, PutMode, PutOptions, StoreError, UploadChecksum, Version, list_all,
 };
-use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef};
+use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
 use ravel_proto::commit::v1::CommitRecord;
-use ravel_types::{Signal, TenantHash};
+use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
+use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
-use crate::snapshot_format::{self, HEAD_FORMAT_VERSION, PartLimits};
+use crate::snapshot_format::{self, HEAD_FORMAT_VERSION, NamePostings, PartLimits};
+
+/// RSEG section kinds needed to decode a segment's catalog
+/// (docs/segment-format.md `SectionKind`). Kinds 1/2 are v1
+/// (LABEL_DICT/SERIES_TABLE); 5/6 are v2 (SERIES_IDS/SERIES_META).
+/// Duplicated locally rather than imported: `ravel-segment`'s section-kind
+/// constants live in a private module, and `ravel-query`'s fetcher (the
+/// production reader of these same segments) duplicates the same constants
+/// for the same reason.
+mod section_kind {
+    pub const LABEL_DICT: u32 = 1;
+    pub const SERIES_TABLE: u32 = 2;
+    pub const SERIES_IDS: u32 = 5;
+    pub const SERIES_META: u32 = 6;
+}
+
+/// A failure while building the name-postings index for a fold. Every
+/// variant is caught by [`Catalog::build_postings`], logged, and turned into
+/// "fold succeeds without a postings ref" (docs/metric-index-plan.md P5a:
+/// "Postings build failures leave the fold successful without a postings
+/// ref") -- never surfaced as a [`CatalogError`], and never a partial or
+/// approximate postings object (ravel CLAUDE.md: "Exact semantics by
+/// default").
+#[derive(Debug, thiserror::Error)]
+enum PostingsBuildError {
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    #[error("key error: {0}")]
+    Key(#[from] KeyError),
+    #[error("segment error: {0}")]
+    Segment(#[from] SegmentError),
+    #[error("snapshot format error: {0}")]
+    Format(#[from] snapshot_format::SnapshotFormatError),
+    #[error("entry content_hash must be 32 bytes, got {0}")]
+    BadContentHashLen(usize),
+    #[error("entry writer_id must be 16 bytes, got {0}")]
+    BadWriterIdLen(usize),
+    #[error("segment series entry has no {METRIC_NAME_LABEL} label")]
+    MissingMetricName,
+    #[error("unsupported segment format version {0}")]
+    UnsupportedSegmentVersion(u16),
+    #[error("segment section lies outside the fetched object bytes")]
+    SectionOutOfBounds,
+}
+
+fn section_range(footer: &ravel_segment::Footer, kind: u32) -> Option<(u64, u64)> {
+    footer
+        .sections
+        .iter()
+        .find(|s| s.kind == kind)
+        .map(|s| (s.offset, s.len))
+}
+
+fn slice_section(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8], PostingsBuildError> {
+    let start = usize::try_from(offset).map_err(|_| PostingsBuildError::SectionOutOfBounds)?;
+    let len = usize::try_from(len).map_err(|_| PostingsBuildError::SectionOutOfBounds)?;
+    let end = start
+        .checked_add(len)
+        .ok_or(PostingsBuildError::SectionOutOfBounds)?;
+    bytes
+        .get(start..end)
+        .ok_or(PostingsBuildError::SectionOutOfBounds)
+}
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
@@ -73,6 +136,14 @@ pub struct FoldReport {
     pub list_requests: u64,
     pub get_requests: u64,
     pub put_requests: u64,
+    /// `true` if this fold successfully built and attached a name-postings
+    /// index (docs/metric-index-plan.md P5a). `false` covers both "no
+    /// postings work was needed" (a no-op fold) and "the build failed and
+    /// the fold proceeded without a postings ref".
+    pub postings_built: bool,
+    /// Encoded size of the postings object, in bytes. `0` when
+    /// `postings_built` is `false`.
+    pub postings_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -137,6 +208,21 @@ fn part_object_key(
 ) -> String {
     format!(
         "t/{}/catalog/{}/snap/{}.{}.csnap",
+        tenant.to_hex(),
+        signal.key_prefix(),
+        keys::ingest_hour_string(watermark_hour),
+        hash16
+    )
+}
+
+fn postings_object_key(
+    tenant: &TenantHash,
+    signal: Signal,
+    watermark_hour: u32,
+    hash16: &str,
+) -> String {
+    format!(
+        "t/{}/catalog/{}/idx/{}.{}.npost",
         tenant.to_hex(),
         signal.key_prefix(),
         keys::ingest_hour_string(watermark_hour),
@@ -385,6 +471,83 @@ impl Catalog {
             }
             counters.put_requests += 1;
 
+            // Postings are rebuilt from the whole entry set on every
+            // successful fold, never merged incrementally from a previous
+            // postings object: entries only ever gain a strictly greater
+            // ingest_hour_bucket than the entries a valid HEAD already
+            // covers (`incremental_buckets` only lists hours past the old
+            // watermark), so the sort above always keeps previously-covered
+            // entries at their same ordinal prefix -- but re-deriving the
+            // whole index from the segments themselves, rather than trusting
+            // that invariant to hold under a corrupt-HEAD/rebuild fallback
+            // too, is what keeps this "exact semantics, never approximate"
+            // (docs/metric-index-plan.md P5a). A build failure at any single
+            // entry aborts the whole index, never publishes a partial one.
+            let postings_names = self
+                .build_postings(tenant, signal, &entries, &mut counters)
+                .await;
+            let mut postings_built = false;
+            let mut postings_size = 0u64;
+            let postings_ref = match postings_names {
+                Some(names) => match snapshot_format::encode_postings(
+                    tenant.0,
+                    signal_num,
+                    &[*part_hash.as_bytes()],
+                    entries.len() as u64,
+                    &names,
+                ) {
+                    Ok(postings_bytes) => {
+                        let postings_crc = crc32c::crc32c(&postings_bytes);
+                        let postings_hash = blake3::hash(&postings_bytes);
+                        let postings_hash16 = &postings_hash.to_hex()[..16];
+                        let postings_key =
+                            postings_object_key(tenant, signal, watermark_hour, postings_hash16);
+                        let size = postings_bytes.len() as u64;
+                        let name_count = names.len() as u32;
+                        match self
+                            .store()
+                            .put(
+                                &postings_key,
+                                Bytes::from(postings_bytes),
+                                PutOptions::create_if_absent()
+                                    .with_checksum(UploadChecksum::Crc32c(postings_crc)),
+                            )
+                            .await
+                        {
+                            Ok(_) | Err(StoreError::AlreadyExists) => {
+                                counters.put_requests += 1;
+                                postings_built = true;
+                                postings_size = size;
+                                Some(SnapshotPostingsRef {
+                                    key: postings_key,
+                                    blake3: postings_hash.as_bytes().to_vec(),
+                                    size,
+                                    name_count,
+                                    part_blake3: vec![part_hash.as_bytes().to_vec()],
+                                })
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    "postings PUT failed, folding without a postings ref"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            tenant = %tenant.to_hex(),
+                            "postings encode failed, folding without a postings ref"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
             let new_head = SnapshotHead {
                 format_version: HEAD_FORMAT_VERSION,
                 tenant_hash: tenant.0.to_vec(),
@@ -398,6 +561,7 @@ impl Catalog {
                     entry_count: entries.len() as u64,
                     watermark_hour,
                 }],
+                postings: postings_ref,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
             };
@@ -435,6 +599,8 @@ impl Catalog {
                         list_requests: counters.list_requests,
                         get_requests: counters.get_requests,
                         put_requests: counters.put_requests,
+                        postings_built,
+                        postings_bytes: postings_size,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -514,6 +680,151 @@ impl Catalog {
         Ok(entries)
     }
 
+    /// Build the name-postings index for `entries` (docs/metric-index-plan.md
+    /// P5a): for each entry, at its position `i` in `entries`, fetch its
+    /// segment via the `ravel-segment` reader and add `i` to the postings
+    /// list of every distinct `__name__` value found among its series.
+    /// Returns `None` on any failure (a segment fetch, identity check, or
+    /// decode error, or a series missing `__name__`), logging the cause: a
+    /// postings build is all-or-nothing, never partial.
+    async fn build_postings(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        entries: &[SnapshotEntry],
+        counters: &mut RequestCounters,
+    ) -> Option<Vec<NamePostings>> {
+        let mut by_name: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (ordinal, entry) in entries.iter().enumerate() {
+            let names = match self
+                .fetch_entry_names(tenant, signal, entry, counters)
+                .await
+            {
+                Ok(names) => names,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        tenant = %tenant.to_hex(),
+                        shard = entry.shard,
+                        ingest_hour_bucket = entry.ingest_hour_bucket,
+                        "postings build aborted: segment fetch/decode failed"
+                    );
+                    return None;
+                }
+            };
+            let ordinal = ordinal as u64;
+            for name in names {
+                by_name.entry(name).or_default().push(ordinal);
+            }
+        }
+        Some(
+            by_name
+                .into_iter()
+                .map(|(name, ordinals)| NamePostings { name, ordinals })
+                .collect(),
+        )
+    }
+
+    /// Fetch one entry's segment and return the distinct `__name__` values
+    /// among its series. The segment is fetched in full (rather than the
+    /// footer-suffix-then-range-chase protocol `ravel-query`'s fetcher uses
+    /// for query-time page reads): a fold reads every newly-covered entry's
+    /// catalog exactly once and needs no page data, so the extra bytes of a
+    /// single full GET are cheaper than the extra round trips a suffix
+    /// chase would add here.
+    async fn fetch_entry_names(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        entry: &SnapshotEntry,
+        counters: &mut RequestCounters,
+    ) -> Result<HashSet<String>, PostingsBuildError> {
+        let content_hash: [u8; 32] = entry
+            .content_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| PostingsBuildError::BadContentHashLen(entry.content_hash.len()))?;
+        let writer_id_bytes: [u8; 16] = entry
+            .writer_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| PostingsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
+        let writer_id = Uuid::from_bytes(writer_id_bytes);
+        let data_key = keys::data_key(
+            tenant,
+            signal,
+            entry.shard,
+            writer_id,
+            entry.writer_epoch,
+            entry.writer_seq,
+            &content_hash,
+        )?;
+        let got = self.store().get(&data_key, GetRange::Full).await?;
+        counters.get_requests += 1;
+
+        let limits = ReaderLimits::default();
+        let location = ravel_segment::open_from_full(&got.data, limits)?;
+        let expected = ExpectedIdentity {
+            tenant_hash: tenant.0,
+            shard: entry.shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: entry.writer_epoch,
+            writer_seq: entry.writer_seq,
+        };
+        ravel_segment::check_identity(&location.footer, &expected)?;
+
+        let series = match location.version {
+            1 => {
+                let (ld_off, ld_len) = section_range(&location.footer, section_kind::LABEL_DICT)
+                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
+                        "LABEL_DICT",
+                    )))?;
+                let (st_off, st_len) = section_range(&location.footer, section_kind::SERIES_TABLE)
+                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
+                        "SERIES_TABLE",
+                    )))?;
+                let label_dict = slice_section(&got.data, ld_off, ld_len)?;
+                let series_table = slice_section(&got.data, st_off, st_len)?;
+                ravel_segment::decode_catalog(&location.footer, label_dict, series_table, limits)?
+            }
+            2 => {
+                let (ld_off, ld_len) = section_range(&location.footer, section_kind::LABEL_DICT)
+                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
+                        "LABEL_DICT",
+                    )))?;
+                let (si_off, si_len) = section_range(&location.footer, section_kind::SERIES_IDS)
+                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
+                        "SERIES_IDS",
+                    )))?;
+                let (sm_off, sm_len) = section_range(&location.footer, section_kind::SERIES_META)
+                    .ok_or(PostingsBuildError::Segment(
+                    SegmentError::MissingSection("SERIES_META"),
+                ))?;
+                let label_dict = slice_section(&got.data, ld_off, ld_len)?;
+                let series_ids = slice_section(&got.data, si_off, si_len)?;
+                let series_meta = slice_section(&got.data, sm_off, sm_len)?;
+                ravel_segment::decode_catalog_v2(
+                    &location.footer,
+                    label_dict,
+                    series_ids,
+                    series_meta,
+                    limits,
+                )?
+            }
+            other => return Err(PostingsBuildError::UnsupportedSegmentVersion(other)),
+        };
+
+        let mut names = HashSet::new();
+        for s in &series {
+            let name = s
+                .labels
+                .get(METRIC_NAME_LABEL)
+                .ok_or(PostingsBuildError::MissingMetricName)?;
+            names.insert(name.to_string());
+        }
+        Ok(names)
+    }
+
     /// Enumerate every (shard, hour) commit bucket at or before
     /// `watermark_hour` by listing the commit-hour directories directly,
     /// rather than trusting a previous snapshot (HEAD absent, corrupt, or
@@ -564,6 +875,8 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         list_requests: counters.list_requests,
         get_requests: counters.get_requests,
         put_requests: counters.put_requests,
+        postings_built: false,
+        postings_bytes: 0,
     }
 }
 
@@ -578,6 +891,8 @@ mod tests {
     use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
 
     use super::*;
     use crate::config::{
@@ -638,6 +953,84 @@ mod tests {
         .expect("valid record");
         let data_key = keys::reconstruct_data_key(&record).expect("data key");
         publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// Like `publish_segment`, but writes a real RSEG v1 segment (not a fake
+    /// payload) so that `Catalog::build_postings` has something genuine to
+    /// decode. Needed for tests that must observe postings-build behavior,
+    /// since a fake payload makes `build_postings` fail unconditionally
+    /// regardless of any fault injection under test.
+    async fn publish_real_segment(
+        store: &MemoryStore,
+        shard: u32,
+        writer_id: Uuid,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        metrics: &[&str],
+    ) -> CommitRecord {
+        let tenant_id = TenantId::new("fold-postings-fault-test");
+        let series: Vec<SeriesInput> = metrics
+            .iter()
+            .map(|metric| {
+                let labels = LabelSet::new(vec![Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: (*metric).to_string(),
+                }])
+                .expect("valid labels");
+                let series_id = SeriesId::compute(&tenant_id, metric, &labels).expect("series id");
+                SeriesInput {
+                    series_id,
+                    labels,
+                    samples: vec![Sample {
+                        ts_ns: created_unix_ns,
+                        value: 1.0,
+                    }],
+                }
+            })
+            .collect();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant().0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let min_ingest_ts_ns = created_unix_ns - 1_000;
+        let max_ingest_ts_ns = created_unix_ns;
+        let bounds = IngestBounds {
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, written.bytes)
             .await
             .expect("put data object");
         publish::publish(store, &record, &RetryPolicy::default())
@@ -811,6 +1204,59 @@ mod tests {
         assert!(second.rebuilt);
         assert_eq!(second.entry_count, 2);
         assert!(store.fault_count(Op::Get, FaultKind::Permanent) >= 1);
+    }
+
+    /// Every data-object key contains `/l0/`
+    /// (crates/ravel-commit/src/keys.rs `data_key`); no HEAD, part, postings,
+    /// or commit-record key does. This rule fails exactly the segment fetch
+    /// `Catalog::build_postings` performs mid-fold, and nothing else, so the
+    /// part and HEAD writes still succeed while the postings build is the
+    /// one thing interrupted.
+    #[tokio::test]
+    async fn segment_fetch_fault_mid_postings_build_leaves_fold_successful_without_postings() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("segment unreadable".into()),
+            )
+            .with_key_contains("/l0/"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now = now_at_seal(10);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .await
+            .expect("fold succeeds despite postings-build fault");
+
+        assert!(!report.no_op);
+        assert_eq!(report.entry_count, 1);
+        assert!(!report.postings_built);
+        assert_eq!(report.postings_bytes, 0);
+        assert!(store.fault_count(Op::Get, FaultKind::Permanent) >= 1);
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let got = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head readable");
+        let head = snapshot_format::decode_head(&got.data).expect("head decodes");
+        assert!(head.postings.is_none());
+        assert_eq!(head.parts.len(), 1);
     }
 
     #[tokio::test]
