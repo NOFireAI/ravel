@@ -21,13 +21,19 @@ use crate::catalog::Catalog;
 use crate::error::CatalogError;
 use crate::fold::head_object_key;
 use crate::snapshot::SegmentRef;
-use crate::snapshot_format::{self, DecodedPart, PartLimits};
+use crate::snapshot_format::{self, DecodedPart, DecodedPostings, PartLimits, PostingsLimits};
 
 /// A usable snapshot: its watermark and every part HEAD named, already
 /// verified and decoded.
 pub(crate) struct SnapshotWindow {
     pub(crate) watermark_hour: u32,
     parts: Vec<Arc<DecodedPart>>,
+    /// Decoded, part-bound name postings (P5b, docs/metric-index-plan.md
+    /// 5.4), or `None` when postings are absent, unreadable, corrupt, or
+    /// don't cleanly bind to `parts`. Always safe to treat as absent:
+    /// postings are a pure pruning optimization, never a correctness
+    /// dependency (`extract_into` falls back to including every entry).
+    postings: Option<Arc<DecodedPostings>>,
 }
 
 impl SnapshotWindow {
@@ -38,6 +44,19 @@ impl SnapshotWindow {
     /// hour-major within each part (docs/metric-index-plan.md 3.1), so the
     /// matching hour range is one contiguous slice found by
     /// `partition_point`.
+    ///
+    /// `name_filter`, when `Some`, is the query's equality `__name__` value
+    /// (P5b): entries this snapshot's postings provably do not carry that
+    /// name are skipped before the event-overlap check, and `*pruned` is
+    /// incremented once per skipped entry. Pruning only ever activates when
+    /// postings are present, decoded, and bound to exactly the parts this
+    /// window holds; any other case (`name_filter` is `None`, postings
+    /// absent/corrupt, or more than one covered part, which today's
+    /// single-part fold never produces but a future compaction phase might)
+    /// falls back to considering every entry, exactly as `Catalog::resolve`
+    /// always has. This can only ever narrow the result set matched by
+    /// `query_range`, never widen it: exact semantics by default.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn extract_into(
         &self,
         tenant: &TenantHash,
@@ -45,26 +64,79 @@ impl SnapshotWindow {
         lower_hour: u32,
         upper_hour: u32,
         query_range: &TimeRange,
+        name_filter: Option<&str>,
+        pruned: &mut u64,
         out: &mut HashMap<String, SegmentRef>,
     ) -> Result<(), CatalogError> {
+        let ordinals = self.postings_ordinals_for(name_filter);
         for part in &self.parts {
             let entries = &part.entries;
             let start = entries.partition_point(|e| e.ingest_hour_bucket < lower_hour);
             let end = entries.partition_point(|e| e.ingest_hour_bucket <= upper_hour);
-            for entry in &entries[start..end] {
-                let event_range = TimeRange {
-                    start_ns: entry.min_event_ts_ns,
-                    end_ns: entry.max_event_ts_ns,
-                };
-                if !event_range.overlaps(query_range) {
-                    continue;
+            match ordinals {
+                None => {
+                    for entry in &entries[start..end] {
+                        self.maybe_insert(tenant, signal, entry, query_range, out)?;
+                    }
                 }
-                let segment_ref = build_segment_ref_from_entry(tenant, signal, entry)?;
-                out.entry(segment_ref.data_object_key.clone())
-                    .or_insert(segment_ref);
+                Some(ords) => {
+                    let lo = ords.partition_point(|&o| (o as usize) < start);
+                    let hi = ords.partition_point(|&o| (o as usize) < end);
+                    *pruned += ((end - start) - (hi - lo)) as u64;
+                    for &ordinal in &ords[lo..hi] {
+                        self.maybe_insert(
+                            tenant,
+                            signal,
+                            &entries[ordinal as usize],
+                            query_range,
+                            out,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    fn maybe_insert(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        entry: &SnapshotEntry,
+        query_range: &TimeRange,
+        out: &mut HashMap<String, SegmentRef>,
+    ) -> Result<(), CatalogError> {
+        let event_range = TimeRange {
+            start_ns: entry.min_event_ts_ns,
+            end_ns: entry.max_event_ts_ns,
+        };
+        if !event_range.overlaps(query_range) {
+            return Ok(());
+        }
+        let segment_ref = build_segment_ref_from_entry(tenant, signal, entry)?;
+        out.entry(segment_ref.data_object_key.clone())
+            .or_insert(segment_ref);
+        Ok(())
+    }
+
+    /// Resolves `name_filter` to the sorted ordinal list of entries carrying
+    /// that name, or `None` if pruning cannot safely apply (no filter, no
+    /// usable postings, or more than one covered part). `Some(&[])` is a
+    /// legitimate result: the name simply does not appear in this snapshot
+    /// at all, so every candidate entry is pruned.
+    fn postings_ordinals_for(&self, name_filter: Option<&str>) -> Option<&[u64]> {
+        let name = name_filter?;
+        if self.parts.len() != 1 {
+            return None;
+        }
+        let postings = self.postings.as_ref()?;
+        match postings
+            .names
+            .binary_search_by(|np| np.name.as_str().cmp(name))
+        {
+            Ok(idx) => Some(postings.names[idx].ordinals.as_slice()),
+            Err(_) => Some(&[]),
+        }
     }
 }
 
@@ -97,10 +169,14 @@ impl Catalog {
             return Ok(None);
         };
         match self.load_snapshot_parts(tenant, &head).await {
-            PartLoadOutcome::Loaded(parts) => Ok(Some(SnapshotWindow {
-                watermark_hour: head.watermark_hour,
-                parts,
-            })),
+            PartLoadOutcome::Loaded(parts) => {
+                let postings = self.load_snapshot_postings(tenant, &head, &parts).await;
+                Ok(Some(SnapshotWindow {
+                    watermark_hour: head.watermark_hour,
+                    parts,
+                    postings,
+                }))
+            }
             PartLoadOutcome::Unusable => Ok(None),
             PartLoadOutcome::NotFoundRace => {
                 // At most one HEAD re-read (docs/metric-index-plan.md 5.1
@@ -113,14 +189,91 @@ impl Catalog {
                     return Ok(None);
                 };
                 match self.load_snapshot_parts(tenant, &fresh_head).await {
-                    PartLoadOutcome::Loaded(parts) => Ok(Some(SnapshotWindow {
-                        watermark_hour: fresh_head.watermark_hour,
-                        parts,
-                    })),
+                    PartLoadOutcome::Loaded(parts) => {
+                        let postings = self
+                            .load_snapshot_postings(tenant, &fresh_head, &parts)
+                            .await;
+                        Ok(Some(SnapshotWindow {
+                            watermark_hour: fresh_head.watermark_hour,
+                            parts,
+                            postings,
+                        }))
+                    }
                     PartLoadOutcome::Unusable | PartLoadOutcome::NotFoundRace => Ok(None),
                 }
             }
         }
+    }
+
+    /// Load and verify this HEAD's name postings through the immutable
+    /// postings cache (P5b, docs/metric-index-plan.md 5.4). Every failure
+    /// mode (no postings ref, GET error, hash mismatch, decode error,
+    /// tenant/part-binding mismatch, entry-count mismatch) degrades to
+    /// `None`: postings are a pure pruning optimization, never surfaced as
+    /// an error and never allowed to make the snapshot window itself
+    /// unusable.
+    async fn load_snapshot_postings(
+        &self,
+        tenant: &TenantHash,
+        head: &SnapshotHead,
+        parts: &[Arc<DecodedPart>],
+    ) -> Option<Arc<DecodedPostings>> {
+        let postings_ref = head.postings.as_ref()?;
+        let expected_part_blake3: Vec<[u8; 32]> = head
+            .parts
+            .iter()
+            .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
+            .collect::<Result<_, _>>()
+            .ok()?;
+
+        if let Some(cached) = self.postings_cache().get(tenant, &postings_ref.key) {
+            return Some(cached);
+        }
+
+        let got = match self.store().get(&postings_ref.key, GetRange::Full).await {
+            Ok(got) => got,
+            Err(err) => {
+                tracing::warn!(error = %err, key = %postings_ref.key, "postings GET failed, pruning disabled");
+                return None;
+            }
+        };
+        let digest = blake3::hash(&got.data);
+        if digest.as_bytes().as_slice() != postings_ref.blake3.as_slice() {
+            tracing::warn!(key = %postings_ref.key, "postings hash mismatch, pruning disabled");
+            return None;
+        }
+        let limits = PostingsLimits {
+            max_postings_bytes: self.config().max_postings_bytes,
+        };
+        let decoded = match snapshot_format::decode_postings(
+            &got.data,
+            &limits,
+            &expected_part_blake3,
+        ) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                tracing::warn!(error = %err, key = %postings_ref.key, "postings failed to decode, pruning disabled");
+                return None;
+            }
+        };
+        if decoded.header.tenant_hash.as_slice() != tenant.0.as_slice() {
+            tracing::warn!(key = %postings_ref.key, "postings tenant_hash mismatch, pruning disabled");
+            return None;
+        }
+        let total_entries: u64 = parts.iter().map(|p| p.entries.len() as u64).sum();
+        if decoded.header.entry_count != total_entries {
+            tracing::warn!(key = %postings_ref.key, "postings entry_count mismatch, pruning disabled");
+            return None;
+        }
+
+        let decoded = Arc::new(decoded);
+        self.postings_cache().insert(
+            *tenant,
+            postings_ref.key.clone(),
+            decoded.clone(),
+            self.config().postings_cache_entries,
+        );
+        Some(decoded)
     }
 
     /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure

@@ -17,7 +17,7 @@ use ravel_proto::catalog::v1::SnapshotHead;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_types::{Signal, TenantHash};
 
-use crate::snapshot_format::DecodedPart;
+use crate::snapshot_format::{DecodedPart, DecodedPostings};
 
 #[derive(Default)]
 struct TenantCache {
@@ -167,6 +167,60 @@ impl PartCache {
             .entry(tenant)
             .or_default()
             .insert(key, part, capacity);
+    }
+}
+
+#[derive(Default)]
+struct PostingsTenantCache {
+    entries: HashMap<String, Arc<DecodedPostings>>,
+    /// Insertion order, oldest first, for capacity-cap eviction.
+    order: std::collections::VecDeque<String>,
+}
+
+impl PostingsTenantCache {
+    fn insert(&mut self, key: String, postings: Arc<DecodedPostings>, capacity: usize) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key.clone(), postings);
+        self.order.push_back(key);
+        while self.order.len() > capacity.max(1) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// Decoded name-postings cache, partitioned by tenant (P5b,
+/// docs/metric-index-plan.md 5.4). Postings objects are content-addressed
+/// and immutable, so entries never need invalidating, only capacity-cap
+/// eviction, mirroring [`PartCache`].
+#[derive(Default)]
+pub(crate) struct PostingsCache {
+    tenants: Mutex<HashMap<TenantHash, PostingsTenantCache>>,
+}
+
+impl PostingsCache {
+    pub(crate) fn get(&self, tenant: &TenantHash, key: &str) -> Option<Arc<DecodedPostings>> {
+        self.tenants
+            .lock()
+            .get(tenant)
+            .and_then(|c| c.entries.get(key).cloned())
+    }
+
+    pub(crate) fn insert(
+        &self,
+        tenant: TenantHash,
+        key: String,
+        postings: Arc<DecodedPostings>,
+        capacity: usize,
+    ) {
+        self.tenants
+            .lock()
+            .entry(tenant)
+            .or_default()
+            .insert(key, postings, capacity);
     }
 }
 
@@ -320,6 +374,54 @@ mod tests {
         let a = TenantHash([10; 16]);
         let b = TenantHash([11; 16]);
         cache.insert(a, "k".to_string(), Arc::new(decoded_part(1)), 10);
+        assert!(cache.get(&a, "k").is_some());
+        assert!(cache.get(&b, "k").is_none());
+    }
+
+    fn decoded_postings() -> DecodedPostings {
+        DecodedPostings {
+            header: ravel_proto::catalog::v1::SnapshotPostingsHeader {
+                format_version: 1,
+                tenant_hash: vec![0; 16],
+                signal: ravel_proto::commit::v1::Signal::Metrics as u32,
+                part_blake3: vec![vec![0; 32]],
+                entry_count: 0,
+                name_count: 0,
+                body_uncompressed_len: 0,
+            },
+            names: vec![],
+        }
+    }
+
+    #[test]
+    fn postings_cache_miss_then_hit() {
+        let cache = PostingsCache::default();
+        let tenant = TenantHash([12; 16]);
+        assert!(cache.get(&tenant, "k").is_none());
+        cache.insert(tenant, "k".to_string(), Arc::new(decoded_postings()), 10);
+        assert!(cache.get(&tenant, "k").is_some());
+    }
+
+    #[test]
+    fn postings_cache_capacity_cap_evicts_oldest() {
+        let cache = PostingsCache::default();
+        let tenant = TenantHash([13; 16]);
+        for i in 0..5 {
+            cache.insert(tenant, format!("k{i}"), Arc::new(decoded_postings()), 3);
+        }
+        assert!(cache.get(&tenant, "k0").is_none());
+        assert!(cache.get(&tenant, "k1").is_none());
+        assert!(cache.get(&tenant, "k2").is_some());
+        assert!(cache.get(&tenant, "k3").is_some());
+        assert!(cache.get(&tenant, "k4").is_some());
+    }
+
+    #[test]
+    fn postings_cache_tenants_are_isolated() {
+        let cache = PostingsCache::default();
+        let a = TenantHash([14; 16]);
+        let b = TenantHash([15; 16]);
+        cache.insert(a, "k".to_string(), Arc::new(decoded_postings()), 10);
         assert!(cache.get(&a, "k").is_some());
         assert!(cache.get(&b, "k").is_none());
     }
