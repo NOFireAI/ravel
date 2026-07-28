@@ -55,6 +55,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use url::Url;
 
 use crate::config::SqlConfig;
+use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::provider::RavelTableProvider;
 use crate::udf::{label_match_udf, label_udf};
 
@@ -127,6 +128,15 @@ pub fn build_session(
     // form the AST walk missed cannot resolve an avg accumulator here.
     ctx.deregister_udaf("avg");
     ctx.deregister_udaf("mean");
+    // Replace the built-in min/max with the total-order UDAF (ADR-0023):
+    // `register_udaf` inserts by name and displaces the built-in entry, so
+    // grouped and ungrouped MIN/MAX over floating point both use the
+    // `f64::total_cmp` order. Non-float input delegates to the wrapped
+    // built-in, so `min(ts)` and friends are unchanged. This is the
+    // structural guard that replaced the old validation-time rejection of
+    // grouped min/max.
+    ctx.register_udaf(total_order_min_udaf());
+    ctx.register_udaf(total_order_max_udaf());
     // `with_default_features()` (inside `new_with_config_rt` above)
     // registers these unconditionally; they generate rows in memory and so
     // are not blocked by `EmptyObjectStoreRegistry`. `samples` must be the

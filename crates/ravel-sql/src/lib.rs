@@ -38,6 +38,7 @@ pub mod flight;
 mod flight_ticket;
 mod labels;
 mod memory;
+mod minmax;
 mod output;
 mod provider;
 mod pushdown;
