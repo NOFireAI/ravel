@@ -12,8 +12,8 @@
 //! snapshot `GetFlightInfo` pinned, never a re-resolution.
 //!
 //! This module is only the wire contract. It does not resolve snapshots,
-//! implement `FlightSqlService`, or compare tenants; those belong to the
-//! later C1 ticket that binds to this format.
+//! implement `FlightSqlService`, or compare tenants; those live in
+//! [`crate::flight`], which binds to this format (ticket C1d, issue #152).
 //!
 //! # Deadline and the GC protection horizon
 //!
@@ -46,10 +46,13 @@
 //!   persisted object, so it is deliberately NOT a frozen format contract in
 //!   the sense of docs (no ADR / `.proto` schema needed). A version byte
 //!   allows a future field addition without a prost schema.
-//! - It keeps `ravel-sql` free of a new `prost`/`.proto` dependency for a
-//!   handful of fields, and reuses [`ravel_types::CommitToken`]'s own canonical
-//!   string codec for the min-commit-token inputs, so no `uuid` dependency is
-//!   pulled in either.
+//! - It keeps this format out of `proto/`, where every schema is a frozen
+//!   contract, and reuses [`ravel_types::CommitToken`]'s own canonical string
+//!   codec for the min-commit-token inputs rather than restating it. (`prost`
+//!   and `uuid` did arrive in the crate later, with the `flight-sql` feature's
+//!   service and this codec's version 2 respectively; the layout stays
+//!   hand-rolled because the version byte, not a schema registry, is what
+//!   governs it.)
 //! - A trailing 64-bit checksum makes accidental corruption (a single
 //!   flipped byte anywhere) a typed decode error rather than a silently
 //!   different pin.
@@ -58,7 +61,7 @@
 //!
 //! ```text
 //! magic         4   b"RFT1"
-//! version       1   = 1
+//! version       1   = 2
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -66,40 +69,61 @@
 //!   per token:  4 + N   len-prefixed CommitToken::encode() (ASCII)
 //! seg_count     4   u32
 //!   per segment:
-//!     writer_epoch  8   u64
-//!     content_hash 32   [u8; 32]
-//!     key_len       4   u32
-//!     key           N   data_object_key (UTF-8)
+//!     writer_epoch       8   u64
+//!     writer_seq         8   u64
+//!     created_unix_ns    8   i64
+//!     object_size        8   u64
+//!     min_event_ts_ns    8   i64
+//!     max_event_ts_ns    8   i64
+//!     sample_count       8   u64
+//!     series_count       8   u64
+//!     ingest_hour_bucket 4   u32
+//!     shard              4   u32
+//!     content_hash      32   [u8; 32]
+//!     writer_id         16   Uuid bytes
+//!     key_len            4   u32
+//!     key                N   data_object_key (UTF-8)
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
 //! checksum      8   FNV-1a-64 over every preceding byte
 //! ```
 //!
-//! # Segment identity fields (the judgment call from issue #150)
+//! # Segment identity fields (the judgment call from issue #150, settled by C1)
 //!
-//! Each [`SegmentPin`] carries `data_object_key`, `writer_epoch`, and
-//! `content_hash`. The reasoning, since the issue left this open:
+//! Version 1 of this codec carried only `data_object_key`, `writer_epoch`,
+//! and `content_hash`, and left open "whether `DoGet` re-resolves the full
+//! `Snapshot` or reconstructs it from the ticket is the later C1 ticket's
+//! decision. If it chooses full reconstruction, those fields are added under
+//! a bumped `version` byte; the codec is built for that extension."
+//!
+//! C1 (issue #152) chose full reconstruction, so version 2 carries every
+//! [`SegmentRef`] field and [`SegmentPin::to_segment_ref`] rebuilds the
+//! resolved `Snapshot` exactly. The alternative -- re-resolving at `DoGet`
+//! and intersecting against the pinned keys -- would have put a catalog LIST
+//! on the redemption path and made the pin depend on a second resolve
+//! observing the same committed state, which is the coupling F18 exists to
+//! remove. The three original fields keep their original roles inside the
+//! larger set:
 //!
 //! - `data_object_key` (required): locates the immutable object to fetch.
-//! - `content_hash` (`[u8; 32]`): the primary stale/tampered-ticket signal.
-//!   Data objects are immutable, so if a segment `DoGet` fetches under a
-//!   pinned key hashes differently than the ticket recorded, the ticket is
-//!   stale or tampered and execution must reject rather than serve foreign
-//!   bytes. This is defense in depth for the pin, cheap at 32 bytes/segment.
-//! - `writer_epoch`: a cheap provenance witness (a fenced/superseded writer
-//!   epoch is a strong stale-snapshot signal) and the first component of the
-//!   cross-segment dedup total order the later executor reconstructs.
+//! - `content_hash` (`[u8; 32]`): the stale/tampered-ticket signal. Data
+//!   objects are immutable, so a segment that hashes differently than the
+//!   ticket recorded means a stale or tampered ticket.
+//! - `writer_epoch`: a provenance witness and the second component of the
+//!   cross-segment dedup total order (`created_unix_ns`, `writer_epoch`,
+//!   `writer_seq`, in-page index) the rebuilt snapshot must reproduce
+//!   byte-for-byte, which is why the remaining provenance fields are now
+//!   carried too: a snapshot missing them would dedup differently than the
+//!   HTTP path did over the same segments.
 //!
-//! The other `SegmentRef` fields (`object_size`, ts bounds, `sample_count`,
-//! `series_count`, `shard`, `writer_id`, `writer_seq`, `created_unix_ns`,
-//! `ingest_hour_bucket`) are intentionally omitted: whether `DoGet`
-//! re-resolves the full `Snapshot` or reconstructs it from the ticket is the
-//! later C1 ticket's decision. If it chooses full reconstruction, those
-//! fields are added under a bumped `version` byte; the codec is built for
-//! that extension.
+//! Version 1 tickets are rejected ([`FlightTicketError::UnsupportedVersion`]),
+//! not upgraded. They are ephemeral by construction -- no ticket outlives its
+//! `deadline_ns`, and nothing on any released path ever minted one -- so
+//! there is no compatibility window to preserve.
 
 use ravel_catalog::SegmentRef;
 use ravel_types::{CommitToken, TenantHash};
+use uuid::Uuid;
 
 /// Maximum accepted SQL statement length, in bytes. 64 KiB. Longer
 /// statements are rejected at [`FlightTicket::encode`] time and refused at
@@ -107,34 +131,96 @@ use ravel_types::{CommitToken, TenantHash};
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// Smallest possible encoded ticket: the fixed header plus the trailing
 /// checksum, with zero tokens, zero segments, and an empty statement.
 const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 8;
 
-/// One pinned segment's identity inside a [`FlightTicket`]. See the module
-/// docs for why exactly these three fields are carried.
+/// One pinned segment inside a [`FlightTicket`]: the wire mirror of a
+/// resolved [`SegmentRef`].
+///
+/// Deliberately a separate type rather than `SegmentRef` itself. This is a
+/// wire layout with its own version byte; `SegmentRef` is an in-memory
+/// catalog struct that may gain or reorder fields. Keeping them distinct
+/// means a `SegmentRef` change surfaces as a compile error in
+/// [`SegmentPin::from_segment_ref`]/[`SegmentPin::to_segment_ref`] and a
+/// deliberate version bump, never as a silently different pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentPin {
     /// Data-object key, as reconstructed by the catalog into
     /// [`SegmentRef::data_object_key`].
     pub data_object_key: String,
-    /// Writer epoch that produced the segment. Provenance witness and first
-    /// component of the dedup total order.
-    pub writer_epoch: u64,
+    /// Encoded object size in bytes.
+    pub object_size: u64,
+    /// Smallest event timestamp in the segment. Feeds segment pruning.
+    pub min_event_ts_ns: i64,
+    /// Largest event timestamp in the segment. Feeds segment pruning.
+    pub max_event_ts_ns: i64,
+    /// Ingest-hour bucket pinned at flush open (unix hours).
+    pub ingest_hour_bucket: u32,
+    /// Sample count recorded in the commit record.
+    pub sample_count: u64,
+    /// Series count recorded in the commit record.
+    pub series_count: u64,
+    /// Ingest shard that produced the segment.
+    pub shard: u32,
     /// Whole-object content hash recorded in the commit record. Verified
     /// against the fetched object to detect a stale or tampered ticket.
     pub content_hash: [u8; 32],
+    /// Writer that produced the segment. Final tiebreak of the snapshot's
+    /// deterministic iteration order.
+    pub writer_id: Uuid,
+    /// Writer epoch that produced the segment. Provenance witness and second
+    /// component of the dedup total order.
+    pub writer_epoch: u64,
+    /// Writer sequence number. Third component of the dedup total order.
+    pub writer_seq: u64,
+    /// Wall-clock the commit record was created. First component of the
+    /// dedup total order.
+    pub created_unix_ns: i64,
 }
 
 impl SegmentPin {
-    /// Project the pinned identity fields out of a resolved [`SegmentRef`].
+    /// Project a resolved [`SegmentRef`] onto the wire layout.
     pub fn from_segment_ref(seg: &SegmentRef) -> Self {
         SegmentPin {
             data_object_key: seg.data_object_key.clone(),
-            writer_epoch: seg.writer_epoch,
+            object_size: seg.object_size,
+            min_event_ts_ns: seg.min_event_ts_ns,
+            max_event_ts_ns: seg.max_event_ts_ns,
+            ingest_hour_bucket: seg.ingest_hour_bucket,
+            sample_count: seg.sample_count,
+            series_count: seg.series_count,
+            shard: seg.shard,
             content_hash: seg.content_hash,
+            writer_id: seg.writer_id,
+            writer_epoch: seg.writer_epoch,
+            writer_seq: seg.writer_seq,
+            created_unix_ns: seg.created_unix_ns,
+        }
+    }
+
+    /// Rebuild the [`SegmentRef`] this pin was projected from.
+    ///
+    /// Total and lossless: version 2 carries every `SegmentRef` field, which
+    /// is what lets `DoGet` reconstruct the resolved `Snapshot` without a
+    /// second `Catalog::resolve`.
+    pub fn to_segment_ref(&self) -> SegmentRef {
+        SegmentRef {
+            data_object_key: self.data_object_key.clone(),
+            object_size: self.object_size,
+            min_event_ts_ns: self.min_event_ts_ns,
+            max_event_ts_ns: self.max_event_ts_ns,
+            ingest_hour_bucket: self.ingest_hour_bucket,
+            sample_count: self.sample_count,
+            series_count: self.series_count,
+            shard: self.shard,
+            content_hash: self.content_hash,
+            writer_id: self.writer_id,
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+            created_unix_ns: self.created_unix_ns,
         }
     }
 }
@@ -193,7 +279,17 @@ impl FlightTicket {
         write_u32(&mut buf, u32_len(self.segments.len())?);
         for seg in &self.segments {
             buf.extend_from_slice(&seg.writer_epoch.to_le_bytes());
+            buf.extend_from_slice(&seg.writer_seq.to_le_bytes());
+            buf.extend_from_slice(&seg.created_unix_ns.to_le_bytes());
+            buf.extend_from_slice(&seg.object_size.to_le_bytes());
+            buf.extend_from_slice(&seg.min_event_ts_ns.to_le_bytes());
+            buf.extend_from_slice(&seg.max_event_ts_ns.to_le_bytes());
+            buf.extend_from_slice(&seg.sample_count.to_le_bytes());
+            buf.extend_from_slice(&seg.series_count.to_le_bytes());
+            buf.extend_from_slice(&seg.ingest_hour_bucket.to_le_bytes());
+            buf.extend_from_slice(&seg.shard.to_le_bytes());
             buf.extend_from_slice(&seg.content_hash);
+            buf.extend_from_slice(seg.writer_id.as_bytes());
             write_len_prefixed(&mut buf, seg.data_object_key.as_bytes())?;
         }
 
@@ -251,14 +347,34 @@ impl FlightTicket {
         let mut segments = Vec::new();
         for _ in 0..seg_count {
             let writer_epoch = u64::from_le_bytes(cur.read_array::<8>()?);
+            let writer_seq = u64::from_le_bytes(cur.read_array::<8>()?);
+            let created_unix_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+            let object_size = u64::from_le_bytes(cur.read_array::<8>()?);
+            let min_event_ts_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+            let max_event_ts_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+            let sample_count = u64::from_le_bytes(cur.read_array::<8>()?);
+            let series_count = u64::from_le_bytes(cur.read_array::<8>()?);
+            let ingest_hour_bucket = u32::from_le_bytes(cur.read_array::<4>()?);
+            let shard = u32::from_le_bytes(cur.read_array::<4>()?);
             let content_hash = cur.read_array::<32>()?;
+            let writer_id = Uuid::from_bytes(cur.read_array::<16>()?);
             let key = cur.read_len_prefixed()?;
             let data_object_key =
                 std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
             segments.push(SegmentPin {
                 data_object_key: data_object_key.to_owned(),
-                writer_epoch,
+                object_size,
+                min_event_ts_ns,
+                max_event_ts_ns,
+                ingest_hour_bucket,
+                sample_count,
+                series_count,
+                shard,
                 content_hash,
+                writer_id,
+                writer_epoch,
+                writer_seq,
+                created_unix_ns,
             });
         }
 
@@ -292,6 +408,22 @@ impl FlightTicket {
     /// `SnapshotInvalidated` (out of scope for this codec).
     pub fn is_expired(&self, now_ns: i64) -> bool {
         now_ns >= self.deadline_ns
+    }
+
+    /// Rebuild the resolved `Snapshot` this ticket pinned.
+    ///
+    /// This is the whole point of the pin: `DoGet` executes against the
+    /// snapshot `GetFlightInfo` resolved, never a re-resolution (review F18).
+    /// Segment order is preserved from the resolve, which is already the
+    /// catalog's deterministic provenance order.
+    pub fn snapshot(&self) -> ravel_catalog::Snapshot {
+        ravel_catalog::Snapshot {
+            segments: self
+                .segments
+                .iter()
+                .map(SegmentPin::to_segment_ref)
+                .collect(),
+        }
     }
 }
 
@@ -418,26 +550,91 @@ mod tests {
         }
     }
 
+    /// A pin whose every field is distinct, so a codec that swapped two of
+    /// them fails the round trip instead of silently agreeing.
+    fn sample_pin(seed: u64, key: &str) -> SegmentPin {
+        SegmentPin {
+            data_object_key: key.to_owned(),
+            object_size: seed * 1_000 + 1,
+            min_event_ts_ns: seed as i64 * 1_000 + 2,
+            max_event_ts_ns: seed as i64 * 1_000 + 3,
+            ingest_hour_bucket: seed as u32 + 4,
+            sample_count: seed * 1_000 + 5,
+            series_count: seed * 1_000 + 6,
+            shard: seed as u32 + 7,
+            content_hash: [(seed % 251) as u8; 32],
+            writer_id: Uuid::from_u128(u128::from(seed).wrapping_mul(0x1234_5679)),
+            writer_epoch: seed * 1_000 + 8,
+            writer_seq: seed * 1_000 + 9,
+            created_unix_ns: seed as i64 * 1_000 + 10,
+        }
+    }
+
     fn sample_ticket() -> FlightTicket {
         FlightTicket {
             tenant: TenantHash([7u8; 16]),
             statement: "SELECT * FROM samples WHERE ts >= 1 AND ts < 2".to_owned(),
             segments: vec![
-                SegmentPin {
-                    data_object_key: "t/aa/metrics/l0/0000/w.1.2.abc.rseg".to_owned(),
-                    writer_epoch: 3,
-                    content_hash: [1u8; 32],
-                },
-                SegmentPin {
-                    data_object_key: "t/aa/metrics/l0/0001/w.4.5.def.rseg".to_owned(),
-                    writer_epoch: 9,
-                    content_hash: [2u8; 32],
-                },
+                sample_pin(3, "t/aa/metrics/l0/0000/w.1.2.abc.rseg"),
+                sample_pin(9, "t/aa/metrics/l0/0001/w.4.5.def.rseg"),
             ],
             min_commit_tokens: vec![sample_token(1), sample_token(2)],
             now_ns: 1_700_000_000_000_000_000,
             deadline_ns: 1_700_000_030_000_000_000,
         }
+    }
+
+    /// The pin is the wire mirror of `SegmentRef`: projecting and rebuilding
+    /// must be lossless, or `DoGet` would execute over a snapshot that
+    /// dedups differently than the one `GetFlightInfo` resolved.
+    #[test]
+    fn segment_ref_round_trips_through_the_pin() {
+        let seg = SegmentRef {
+            data_object_key: "t/aa/metrics/l0/0000/w.1.2.abc.rseg".to_owned(),
+            object_size: 4096,
+            min_event_ts_ns: -17,
+            max_event_ts_ns: 1_700_000_000_000_000_000,
+            ingest_hour_bucket: 471_000,
+            sample_count: 9_999,
+            series_count: 12,
+            shard: 63,
+            content_hash: [0xabu8; 32],
+            writer_id: Uuid::from_u128(0x9e37_79b9_7f4a_7c15),
+            writer_epoch: 7,
+            writer_seq: 4_294_967_296,
+            created_unix_ns: 1_699_999_999_999_999_999,
+        };
+        let pin = SegmentPin::from_segment_ref(&seg);
+        assert_eq!(pin.to_segment_ref(), seg);
+
+        let ticket = FlightTicket {
+            segments: vec![pin],
+            ..sample_ticket()
+        };
+        let bytes = ticket.encode().expect("encode");
+        let decoded = FlightTicket::decode(&bytes).expect("decode");
+        assert_eq!(decoded.snapshot().segments, vec![seg]);
+    }
+
+    /// A version byte this codec does not implement is refused, never
+    /// reinterpreted under the current layout.
+    #[test]
+    fn a_foreign_version_byte_is_refused() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC);
+        body.push(VERSION.wrapping_add(1));
+        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0i64.to_le_bytes());
+        write_u32(&mut body, 0);
+        write_u32(&mut body, 0);
+        write_u32(&mut body, 0);
+        let checksum = fnv1a64(&body);
+        body.extend_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            FlightTicket::decode(&body),
+            Err(FlightTicketError::UnsupportedVersion(_))
+        ));
     }
 
     #[test]
@@ -468,15 +665,16 @@ mod tests {
         // The worst-case 1024-segment snapshot (max_segments) must round-trip
         // and stay well under gRPC's default message-size limit.
         let segments: Vec<SegmentPin> = (0..1024)
-            .map(|i| SegmentPin {
-                data_object_key: format!(
-                    "t/00112233445566778899aabbccddeeff/metrics/l0/{:04}/\
-                     3f8a1c2d-4e5f-6071-8293-a4b5c6d7e8f9.7.{:020}.0123456789abcdef.rseg",
-                    i % 256,
-                    i
-                ),
-                writer_epoch: i as u64,
-                content_hash: [(i % 251) as u8; 32],
+            .map(|i| {
+                sample_pin(
+                    i as u64,
+                    &format!(
+                        "t/00112233445566778899aabbccddeeff/metrics/l0/{:04}/\
+                         3f8a1c2d-4e5f-6071-8293-a4b5c6d7e8f9.7.{:020}.0123456789abcdef.rseg",
+                        i % 256,
+                        i
+                    ),
+                )
             })
             .collect();
         let ticket = FlightTicket {
@@ -594,13 +792,38 @@ mod tests {
     }
 
     fn segment_pin_strategy() -> impl Strategy<Value = SegmentPin> {
-        (".{0,80}", any::<u64>(), any::<[u8; 32]>()).prop_map(
-            |(data_object_key, writer_epoch, content_hash)| SegmentPin {
-                data_object_key,
-                writer_epoch,
-                content_hash,
-            },
+        (
+            ".{0,80}",
+            any::<[u8; 32]>(),
+            any::<u128>(),
+            (any::<u64>(), any::<u64>(), any::<i64>(), any::<u64>()),
+            (any::<i64>(), any::<i64>(), any::<u64>(), any::<u64>()),
+            (any::<u32>(), any::<u32>()),
         )
+            .prop_map(
+                |(
+                    data_object_key,
+                    content_hash,
+                    writer_id,
+                    (writer_epoch, writer_seq, created_unix_ns, object_size),
+                    (min_event_ts_ns, max_event_ts_ns, sample_count, series_count),
+                    (ingest_hour_bucket, shard),
+                )| SegmentPin {
+                    data_object_key,
+                    object_size,
+                    min_event_ts_ns,
+                    max_event_ts_ns,
+                    ingest_hour_bucket,
+                    sample_count,
+                    series_count,
+                    shard,
+                    content_hash,
+                    writer_id: Uuid::from_u128(writer_id),
+                    writer_epoch,
+                    writer_seq,
+                    created_unix_ns,
+                },
+            )
     }
 
     fn token_strategy() -> impl Strategy<Value = CommitToken> {

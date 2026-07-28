@@ -28,6 +28,16 @@
 //! lives in services/ravel-server behind its `sql` feature; nothing here
 //! links axum, and nothing there links datafusion.
 
+//! Ticket C1d (issue #152) adds the second transport behind the `flight-sql`
+//! feature: `flight` is the `FlightSqlService` implementation and
+//! `flight_ticket` its snapshot-pinning ticket codec. It is a transport and
+//! nothing more -- it validates, resolves, plans, and executes through the
+//! same `SqlExecutor` the HTTP path uses, so the two cannot answer the same
+//! query differently. Its own additions are the ones the two-RPC shape forces:
+//! pinning the resolved snapshot into the ticket so `DoGet` never re-resolves
+//! (review F18), and checking the metadata-resolved tenant against the
+//! ticket's own before redeeming it.
+
 mod config;
 mod dedup;
 mod error;
@@ -52,7 +62,11 @@ pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_UNAVAILABLE,
     MSG_UNSATISFIABLE, SqlError,
 };
-pub use executor::{SqlExecutor, SqlOutcome, SqlRequest, SqlStats};
+pub use executor::{PinnedQuery, PinnedStream, SqlExecutor, SqlOutcome, SqlRequest, SqlStats};
+#[cfg(feature = "flight-sql")]
+pub use flight::{
+    DEFAULT_GC_PROTECTION_HORIZON, FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService,
+};
 #[cfg(feature = "flight-sql")]
 pub use flight_ticket::{FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin};
 pub use memory::{TenantDelegatingPool, TenantMemoryAccountant};

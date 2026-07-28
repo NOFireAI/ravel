@@ -43,6 +43,22 @@ url = "2"
 # It carries its own arrow 58, the same major datafusion 54 resolves, so the
 # Flight encoders and the scan pipeline's `RecordBatch`es are the same types.
 arrow-flight = { workspace = true, optional = true }
+# The rest of the `flight-sql` set, all of them already workspace pins and all
+# of them off in the default build:
+#  - `tonic` supplies `Request`/`Response`/`Status`/`MetadataMap`, which appear
+#    in every `FlightSqlService` signature. arrow-flight does not re-export it.
+#  - `prost` supplies the `Message` trait used to encode a Flight SQL command
+#    into the opaque `Ticket` bytes the protocol dispatches on.
+#  - `bytes` supplies the `Bytes` the Flight protobuf fields are typed as.
+#  - `uuid` types `SegmentPin::writer_id`, one of the `SegmentRef` fields the
+#    snapshot-pinning ticket carries.
+#  - `tracing` records the full, unredacted error at the Flight error
+#    boundary, the same discipline the HTTP endpoint follows.
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -63,7 +79,14 @@ serde_json = { workspace = true }
 # datafusion's own feature, not one of ours). The implication is stated where a
 # `sql` feature actually exists, in services/ravel-server, whose `flight-sql`
 # enables its `sql`.
-flight-sql = ["dep:arrow-flight"]
+flight-sql = [
+    "dep:arrow-flight",
+    "dep:tonic",
+    "dep:prost",
+    "dep:bytes",
+    "dep:uuid",
+    "dep:tracing",
+]
 
 [dev-dependencies]
 proptest = { workspace = true }
