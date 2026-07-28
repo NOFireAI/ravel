@@ -2,16 +2,26 @@
 //! pruning, and coalesced byte-range page fetches over one segment
 //! (docs/query-engine.md "Flow", docs/segment-format.md reader protocol).
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
-use ravel_catalog::SegmentRef;
+use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_object_store::{Etag, GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
-    ExpectedIdentity, Footer, FooterOutcome, ReaderLimits, SeriesEntry, ValPageKind,
-    check_identity, decode_catalog, decode_catalog_v2, decode_pages, decode_pages_soa,
-    open_from_suffix, plan_ranges, select,
+    ExpectedIdentity, Footer, FooterOutcome, ReaderLimits, SeriesEntry, SeriesEntryV4, ValPageKind,
+    ValueKind, check_identity, decode_catalog, decode_catalog_v2, decode_catalog_v3,
+    decode_catalog_v4, decode_pages, decode_pages_soa, decode_run_pages_soa, open_from_suffix,
+    plan_ranges, plan_ranges_v3, plan_ranges_v4, select,
 };
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
+
+/// RSEG trailer versions this fetcher decodes. v1/v2/v3 are L0 flush
+/// formats (ADR-0014, ADR-0017); v4 is the compaction (L1) format
+/// (docs/compaction-retention-plan.md §4), whose per-series runs each
+/// become one [`FetchedSeriesSoa`].
+const VERSION_V3: u16 = 3;
+const VERSION_V4: u16 = 4;
 
 /// Section kinds from docs/segment-format.md. Not exported by `ravel-segment`
 /// (its `format` module is private); these values are a persistent,
@@ -235,16 +245,22 @@ impl SegmentFetcher {
     }
 
     /// Opens a segment: suffix-GET, chase `NeedRange` for the footer if
-    /// necessary, and verify identity against `expected`. Returns the
-    /// trailer `version` (1 or 2) alongside the footer so callers can
-    /// dispatch `decode_selected` on it (docs/segment-format.md "RSEG v2
-    /// amendment": v1 and v2 objects coexist indefinitely, no compactor
-    /// exists yet to retire v1 objects).
+    /// necessary, and verify identity. Returns the trailer `version`
+    /// alongside the footer so callers can dispatch page decode on it.
+    ///
+    /// Identity verification is level-aware
+    /// (docs/compaction-retention-plan.md §3.5). An L0 ref verifies the
+    /// footer's writer identity against the commit record (ADR-0010 §7,
+    /// unchanged). An L1 part ref verifies the v4 footer's
+    /// tenant/shard/ingest_hour/input_set_hash/part_index against the
+    /// compaction record's fields the ref carries: a part has no writer
+    /// identity, so the five record-derived fields are the identity.
     async fn open_segment(
         &self,
-        key: &str,
-        expected: &ExpectedIdentity,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
     ) -> Result<(Footer, u16, Etag, FetchedRegions), FetchError> {
+        let key = &seg_ref.data_object_key;
         let first = self
             .store
             .get(key, GetRange::Suffix(self.suffix_len))
@@ -289,19 +305,37 @@ impl SegmentFetcher {
             }
         };
 
-        check_identity(&footer, expected).map_err(|source| corrupt(key, source))?;
+        match &seg_ref.level {
+            SegmentLevel::L0 => {
+                let expected = expected_identity(tenant_hash, seg_ref);
+                check_identity(&footer, &expected).map_err(|source| corrupt(key, source))?;
+            }
+            SegmentLevel::L1 {
+                input_set_hash,
+                part_index,
+            } => {
+                verify_l1_identity(
+                    &footer,
+                    version,
+                    tenant_hash,
+                    seg_ref,
+                    input_set_hash,
+                    *part_index,
+                )
+                .map_err(|source| corrupt(key, source))?;
+            }
+        }
         Ok((footer, version, suffix_etag, regions))
     }
 
-    /// Decodes the catalog and returns the series matching `matchers`,
-    /// fetching whatever byte ranges are not already covered by `regions`.
-    /// Version-dispatched (docs/segment-format.md "RSEG v2 amendment"): v1
-    /// fetches LABEL_DICT+SERIES_TABLE and decodes via `decode_catalog`,
-    /// unchanged from before v2 existed; v2 fetches
-    /// LABEL_DICT+SERIES_IDS+SERIES_META and decodes via `decode_catalog_v2`.
-    /// Both produce the same `SeriesEntry` shape, so everything downstream
-    /// of this function (`select`, `plan_ranges`, page decode) is
-    /// version-blind.
+    /// Decodes the catalog and returns the per-series [`SeriesEntry`] view
+    /// of the series matching `matchers`, fetching whatever byte ranges are
+    /// not already covered by `regions`. Version-dispatched: v1 uses
+    /// LABEL_DICT+SERIES_TABLE (`decode_catalog`); v2/v3/v4 use
+    /// LABEL_DICT+SERIES_IDS+SERIES_META (`decode_catalog_v2`/`_v3`/`_v4`),
+    /// with v4 folded to the per-series `SeriesEntry` shape. All produce the
+    /// same shape, so labels-only callers (`fetch_series`) are version-blind;
+    /// the sample paths handle v4's per-run page data separately.
     async fn decode_selected(
         &self,
         key: &str,
@@ -343,56 +377,42 @@ impl SegmentFetcher {
                 decode_catalog(footer, &label_dict_bytes, &series_table_bytes, self.limits)
                     .map_err(|source| corrupt(key, source))?
             }
-            2 => {
-                let (ld_off, ld_len) =
-                    section_range(footer, section_kind::LABEL_DICT).ok_or_else(|| {
-                        corrupt(
-                            key,
-                            ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
-                        )
-                    })?;
-                let (si_off, si_len) =
-                    section_range(footer, section_kind::SERIES_IDS).ok_or_else(|| {
-                        corrupt(
-                            key,
-                            ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
-                        )
-                    })?;
-                let (sm_off, sm_len) = section_range(footer, section_kind::SERIES_META)
-                    .ok_or_else(|| {
-                        corrupt(
-                            key,
-                            ravel_segment::SegmentError::MissingSection("SERIES_META"),
-                        )
-                    })?;
-                self.ensure_ranges(
-                    key,
-                    suffix_etag,
-                    &[
-                        (ld_off, ld_off + ld_len),
-                        (si_off, si_off + si_len),
-                        (sm_off, sm_off + sm_len),
-                    ],
-                    regions,
-                )
-                .await?;
-                let label_dict_bytes = regions
-                    .slice(ld_off, ld_len)
-                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-                let series_ids_bytes = regions
-                    .slice(si_off, si_len)
-                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-                let series_meta_bytes = regions
-                    .slice(sm_off, sm_len)
-                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-                decode_catalog_v2(
-                    footer,
-                    &label_dict_bytes,
-                    &series_ids_bytes,
-                    &series_meta_bytes,
-                    self.limits,
-                )
-                .map_err(|source| corrupt(key, source))?
+            2 | VERSION_V3 | VERSION_V4 => {
+                let (label_dict_bytes, series_ids_bytes, series_meta_bytes) = self
+                    .ensure_catalog_sections(key, footer, suffix_etag, regions)
+                    .await?;
+                match version {
+                    2 => decode_catalog_v2(
+                        footer,
+                        &label_dict_bytes,
+                        &series_ids_bytes,
+                        &series_meta_bytes,
+                        self.limits,
+                    )
+                    .map_err(|source| corrupt(key, source))?,
+                    VERSION_V3 => decode_catalog_v3(
+                        footer,
+                        &label_dict_bytes,
+                        &series_ids_bytes,
+                        &series_meta_bytes,
+                        self.limits,
+                    )
+                    .map_err(|source| corrupt(key, source))?,
+                    // v4: fold each multi-run series to the per-series
+                    // `SeriesEntry` shape (labels only are needed here; the
+                    // per-run page data is decoded by the v4 sample path).
+                    _ => decode_catalog_v4(
+                        footer,
+                        &label_dict_bytes,
+                        &series_ids_bytes,
+                        &series_meta_bytes,
+                        self.limits,
+                    )
+                    .map_err(|source| corrupt(key, source))?
+                    .into_iter()
+                    .map(|e| e.entry)
+                    .collect(),
+                }
             }
             other => {
                 return Err(corrupt(
@@ -408,9 +428,96 @@ impl SegmentFetcher {
             .collect())
     }
 
+    /// Fetches the LABEL_DICT, SERIES_IDS, and SERIES_META section byte
+    /// slices shared by the v2/v3/v4 catalog decoders (their stored,
+    /// crc-covered bytes; the decoders decompress and verify). v2/v3/v4 all
+    /// write the three contiguously, so `ensure_ranges` coalesces them into
+    /// one GET.
+    async fn ensure_catalog_sections(
+        &self,
+        key: &str,
+        footer: &Footer,
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+    ) -> Result<(Bytes, Bytes, Bytes), FetchError> {
+        let (ld_off, ld_len) =
+            section_range(footer, section_kind::LABEL_DICT).ok_or_else(|| {
+                corrupt(
+                    key,
+                    ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+                )
+            })?;
+        let (si_off, si_len) =
+            section_range(footer, section_kind::SERIES_IDS).ok_or_else(|| {
+                corrupt(
+                    key,
+                    ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
+                )
+            })?;
+        let (sm_off, sm_len) =
+            section_range(footer, section_kind::SERIES_META).ok_or_else(|| {
+                corrupt(
+                    key,
+                    ravel_segment::SegmentError::MissingSection("SERIES_META"),
+                )
+            })?;
+        self.ensure_ranges(
+            key,
+            suffix_etag,
+            &[
+                (ld_off, ld_off + ld_len),
+                (si_off, si_off + si_len),
+                (sm_off, sm_off + sm_len),
+            ],
+            regions,
+        )
+        .await?;
+        let label_dict_bytes = regions
+            .slice(ld_off, ld_len)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let series_ids_bytes = regions
+            .slice(si_off, si_len)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let series_meta_bytes = regions
+            .slice(sm_off, sm_len)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        Ok((label_dict_bytes, series_ids_bytes, series_meta_bytes))
+    }
+
+    /// Decodes the v4 catalog (per-series folded entry plus per-run view)
+    /// and returns the series matching `matchers`
+    /// (docs/compaction-retention-plan.md §4). The per-run page data lives
+    /// in [`SeriesEntryV4::runs`]; the sample paths turn each run into one
+    /// [`FetchedSeriesSoa`]/[`FetchedSeries`].
+    async fn decode_v4_selected(
+        &self,
+        key: &str,
+        footer: &Footer,
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+        let (label_dict_bytes, series_ids_bytes, series_meta_bytes) = self
+            .ensure_catalog_sections(key, footer, suffix_etag, regions)
+            .await?;
+        let entries = decode_catalog_v4(
+            footer,
+            &label_dict_bytes,
+            &series_ids_bytes,
+            &series_meta_bytes,
+            self.limits,
+        )
+        .map_err(|source| corrupt(key, source))?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| matches_series(matchers, &e.entry.labels))
+            .collect())
+    }
+
     /// Returns the series (labels only, no samples) in this segment matching
     /// `matchers`. Used by the labels/label-values/series HTTP endpoints,
-    /// which never need page data.
+    /// which never need page data. Version-blind: v4 multi-run series fold
+    /// to the same per-series `SeriesEntry` shape.
     pub async fn fetch_series(
         &self,
         tenant_hash: TenantHash,
@@ -418,14 +525,16 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
     ) -> Result<Vec<SeriesEntry>, FetchError> {
         let key = &seg_ref.data_object_key;
-        let expected = expected_identity(tenant_hash, seg_ref);
-        let (footer, version, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
+        let (footer, version, suffix_etag, mut regions) =
+            self.open_segment(tenant_hash, seg_ref).await?;
         self.decode_selected(key, &footer, version, &suffix_etag, &mut regions, matchers)
             .await
     }
 
     /// Fetches and decodes the samples of every series in this segment
-    /// matching `matchers`.
+    /// matching `matchers`. For a v4 (L1) part this emits one
+    /// [`FetchedSeries`] per (series, run) with the run's provenance; for
+    /// v1/v2/v3 one per series with the segment's provenance.
     pub async fn fetch(
         &self,
         tenant_hash: TenantHash,
@@ -433,32 +542,34 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
     ) -> Result<Vec<FetchedSeries>, FetchError> {
         let key = &seg_ref.data_object_key;
-        let expected = expected_identity(tenant_hash, seg_ref);
-        let (footer, version, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
+        let (footer, version, suffix_etag, mut regions) =
+            self.open_segment(tenant_hash, seg_ref).await?;
+        if version == VERSION_V4 {
+            let (out, _stats) = self
+                .fetch_v4_runs(key, &footer, &suffix_etag, &mut regions, matchers, false)
+                .await?;
+            return Ok(out.into_iter().map(RunDecode::into_aos).collect());
+        }
+
         let entries = self
             .decode_selected(key, &footer, version, &suffix_etag, &mut regions, matchers)
             .await?;
-        if entries.is_empty() {
+        let selected_refs = scalar_refs(&entries);
+        if selected_refs.is_empty() {
             return Ok(Vec::new());
         }
+        let planned = plan_scalar_ranges(&footer, &selected_refs, version)
+            .map_err(|source| corrupt(key, source))?;
+        self.ensure_ranges(
+            key,
+            &suffix_etag,
+            &scalar_page_ranges(&planned),
+            &mut regions,
+        )
+        .await?;
 
-        let selected_refs: Vec<&SeriesEntry> = entries.iter().collect();
-        let planned =
-            plan_ranges(&footer, &selected_refs).map_err(|source| corrupt(key, source))?;
-        let page_ranges: Vec<(u64, u64)> = planned
-            .iter()
-            .flat_map(|p| {
-                [
-                    (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
-                    (p.val_range.0, p.val_range.0 + p.val_range.1),
-                ]
-            })
-            .collect();
-        self.ensure_ranges(key, &suffix_etag, &page_ranges, &mut regions)
-            .await?;
-
-        let mut out = Vec::with_capacity(entries.len());
-        for (entry, plan) in entries.iter().zip(planned.iter()) {
+        let mut out = Vec::with_capacity(selected_refs.len());
+        for (entry, plan) in selected_refs.iter().zip(planned.iter()) {
             let ts_bytes = regions
                 .slice(plan.ts_range.0, plan.ts_range.1)
                 .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
@@ -481,10 +592,11 @@ impl SegmentFetcher {
 
     /// SoA counterpart to `fetch` (docs/arrow-datafusion-plan.md ticket
     /// A1a): decodes the same selected series but returns timestamps and
-    /// values as separate vecs per series, plus page-kind stats. Reuses one
-    /// decompression scratch buffer across every series in the segment;
-    /// `timestamps`/`values` are fresh per series, since each is returned
-    /// to the caller inside its own `FetchedSeriesSoa`.
+    /// values as separate vecs, plus page-kind stats. For a v4 (L1) part
+    /// this emits one [`FetchedSeriesSoa`] per (series, run) with the run's
+    /// provenance from the v4 catalog (docs/compaction-retention-plan.md
+    /// §3.5); for v1/v2/v3 one per series. Reuses one decompression scratch
+    /// buffer across every page in the segment.
     pub async fn fetch_soa(
         &self,
         tenant_hash: TenantHash,
@@ -492,34 +604,36 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
     ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
         let key = &seg_ref.data_object_key;
-        let expected = expected_identity(tenant_hash, seg_ref);
-        let (footer, version, suffix_etag, mut regions) = self.open_segment(key, &expected).await?;
+        let (footer, version, suffix_etag, mut regions) =
+            self.open_segment(tenant_hash, seg_ref).await?;
+        if version == VERSION_V4 {
+            let (runs, stats) = self
+                .fetch_v4_runs(key, &footer, &suffix_etag, &mut regions, matchers, true)
+                .await?;
+            return Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats));
+        }
+
         let entries = self
             .decode_selected(key, &footer, version, &suffix_etag, &mut regions, matchers)
             .await?;
-        if entries.is_empty() {
+        let selected_refs = scalar_refs(&entries);
+        if selected_refs.is_empty() {
             return Ok((Vec::new(), FetchStats::default()));
         }
-
-        let selected_refs: Vec<&SeriesEntry> = entries.iter().collect();
-        let planned =
-            plan_ranges(&footer, &selected_refs).map_err(|source| corrupt(key, source))?;
-        let page_ranges: Vec<(u64, u64)> = planned
-            .iter()
-            .flat_map(|p| {
-                [
-                    (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
-                    (p.val_range.0, p.val_range.0 + p.val_range.1),
-                ]
-            })
-            .collect();
-        self.ensure_ranges(key, &suffix_etag, &page_ranges, &mut regions)
-            .await?;
+        let planned = plan_scalar_ranges(&footer, &selected_refs, version)
+            .map_err(|source| corrupt(key, source))?;
+        self.ensure_ranges(
+            key,
+            &suffix_etag,
+            &scalar_page_ranges(&planned),
+            &mut regions,
+        )
+        .await?;
 
         let mut stats = FetchStats::default();
         let mut scratch = Vec::new();
-        let mut out = Vec::with_capacity(entries.len());
-        for (entry, plan) in entries.iter().zip(planned.iter()) {
+        let mut out = Vec::with_capacity(selected_refs.len());
+        for (entry, plan) in selected_refs.iter().zip(planned.iter()) {
             let ts_bytes = regions
                 .slice(plan.ts_range.0, plan.ts_range.1)
                 .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
@@ -551,6 +665,218 @@ impl SegmentFetcher {
         }
         Ok((out, stats))
     }
+
+    /// Decodes a v4 (L1) part's scalar series into one [`RunDecode`] per
+    /// (series, run) (docs/compaction-retention-plan.md §3.5). Each run
+    /// carries its own provenance (`created_unix_ns`, `writer_epoch`,
+    /// `writer_seq`) copied from the v4 catalog, so cross-input duplicate
+    /// samples resolve under the same total order as the pre-compaction L0
+    /// segments would. Histogram-valued series are skipped here: histogram
+    /// query support has no fetch path yet, and a scalar SoA cannot hold
+    /// them (the same reason `count_raw` gates VAL stats).
+    async fn fetch_v4_runs(
+        &self,
+        key: &str,
+        footer: &Footer,
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+        matchers: &[LabelMatcher],
+        count_stats: bool,
+    ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
+        let selected = self
+            .decode_v4_selected(key, footer, suffix_etag, regions, matchers)
+            .await?;
+        let scalar: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Scalar)
+            .collect();
+        if scalar.is_empty() {
+            return Ok((Vec::new(), FetchStats::default()));
+        }
+        let planned = plan_ranges_v4(footer, &scalar).map_err(|source| corrupt(key, source))?;
+        let page_ranges: Vec<(u64, u64)> = planned
+            .iter()
+            .flat_map(|p| {
+                [
+                    (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                    (p.val_range.0, p.val_range.0 + p.val_range.1),
+                ]
+            })
+            .collect();
+        self.ensure_ranges(key, suffix_etag, &page_ranges, regions)
+            .await?;
+
+        let by_id: HashMap<SeriesId, &SeriesEntryV4> =
+            scalar.iter().map(|e| (e.entry.series_id, *e)).collect();
+
+        let mut stats = FetchStats::default();
+        let mut scratch = Vec::new();
+        let mut out = Vec::with_capacity(planned.len());
+        for plan in &planned {
+            let series = by_id
+                .get(&plan.series_id)
+                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+            let run = series
+                .runs
+                .get(plan.run_index)
+                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+            let ts_bytes = regions
+                .slice(plan.ts_range.0, plan.ts_range.1)
+                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+            let val_bytes = regions
+                .slice(plan.val_range.0, plan.val_range.1)
+                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+            let mut timestamps = Vec::new();
+            let mut values = Vec::new();
+            let val_kind = decode_run_pages_soa(
+                &plan.series_id,
+                run,
+                &ts_bytes,
+                &val_bytes,
+                self.limits,
+                &mut scratch,
+                &mut timestamps,
+                &mut values,
+            )
+            .map_err(|source| corrupt(key, source))?;
+            if count_stats {
+                stats.record_val_page(val_kind, val_bytes.len());
+            }
+            out.push(RunDecode {
+                series_id: plan.series_id,
+                labels: series.entry.labels.clone(),
+                timestamps,
+                values,
+                created_unix_ns: run.created_unix_ns,
+                writer_epoch: run.writer_epoch,
+                writer_seq: run.writer_seq,
+            });
+        }
+        Ok((out, stats))
+    }
+}
+
+/// One decoded v4 run, convertible to either the AoS or SoA fetched shape.
+struct RunDecode {
+    series_id: SeriesId,
+    labels: LabelSet,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+}
+
+impl RunDecode {
+    fn into_soa(self) -> FetchedSeriesSoa {
+        FetchedSeriesSoa {
+            series_id: self.series_id,
+            labels: self.labels,
+            timestamps: self.timestamps,
+            values: self.values,
+            created_unix_ns: self.created_unix_ns,
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+        }
+    }
+
+    fn into_aos(self) -> FetchedSeries {
+        let samples = self
+            .timestamps
+            .into_iter()
+            .zip(self.values)
+            .map(|(ts_ns, value)| Sample { ts_ns, value })
+            .collect();
+        FetchedSeries {
+            series_id: self.series_id,
+            labels: self.labels,
+            samples,
+            created_unix_ns: self.created_unix_ns,
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+        }
+    }
+}
+
+/// Selects the scalar series among decoded entries. v1/v2 entries are all
+/// scalar; v3 may carry histogram series, which the scalar sample path
+/// cannot decode and no histogram query path consumes yet, so they are
+/// filtered out here.
+fn scalar_refs(entries: &[SeriesEntry]) -> Vec<&SeriesEntry> {
+    entries
+        .iter()
+        .filter(|e| e.value_kind == ValueKind::Scalar)
+        .collect()
+}
+
+/// Plans TS/VAL ranges for scalar `selected` entries, using the
+/// version-appropriate planner: v3 keeps VAL_PAGES optional
+/// (`plan_ranges_v3`), while v1/v2 always have it (`plan_ranges`).
+fn plan_scalar_ranges(
+    footer: &Footer,
+    selected: &[&SeriesEntry],
+    version: u16,
+) -> Result<Vec<ravel_segment::PlannedRange>, ravel_segment::SegmentError> {
+    if version == VERSION_V3 {
+        plan_ranges_v3(footer, selected)
+    } else {
+        plan_ranges(footer, selected)
+    }
+}
+
+fn scalar_page_ranges(planned: &[ravel_segment::PlannedRange]) -> Vec<(u64, u64)> {
+    planned
+        .iter()
+        .flat_map(|p| {
+            [
+                (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                (p.val_range.0, p.val_range.0 + p.val_range.1),
+            ]
+        })
+        .collect()
+}
+
+/// Verify an L1 part's v4 footer against the compaction record's identity
+/// fields the [`SegmentRef`] carries (docs/compaction-retention-plan.md
+/// §3.5: readers verify tenant/shard/ingest_hour/input_set_hash/part_index
+/// against the record, the L1 analog of ADR-0010 §7). A part has no writer
+/// identity, so these five fields are the identity. `level` must also be 1.
+fn verify_l1_identity(
+    footer: &Footer,
+    version: u16,
+    tenant_hash: TenantHash,
+    seg_ref: &SegmentRef,
+    input_set_hash: &[u8; 32],
+    part_index: u32,
+) -> Result<(), ravel_segment::SegmentError> {
+    if version != VERSION_V4 {
+        return Err(ravel_segment::SegmentError::IdentityMismatch(
+            "segment_format_version",
+        ));
+    }
+    if footer.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("tenant_hash"));
+    }
+    if footer.shard != seg_ref.shard {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("shard"));
+    }
+    if footer.ingest_hour_bucket != seg_ref.ingest_hour_bucket {
+        return Err(ravel_segment::SegmentError::IdentityMismatch(
+            "ingest_hour_bucket",
+        ));
+    }
+    if footer.input_set_hash.as_slice() != input_set_hash.as_slice() {
+        return Err(ravel_segment::SegmentError::IdentityMismatch(
+            "input_set_hash",
+        ));
+    }
+    if footer.part_index != part_index {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("part_index"));
+    }
+    if footer.level != 1 {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("level"));
+    }
+    Ok(())
 }
 
 fn expected_identity(tenant_hash: TenantHash, seg_ref: &SegmentRef) -> ExpectedIdentity {
@@ -663,6 +989,7 @@ mod tests {
             writer_epoch: 1,
             writer_seq: 1,
             created_unix_ns: 42,
+            level: ravel_catalog::SegmentLevel::L0,
         };
         (store, tenant_hash, seg_ref)
     }
@@ -769,6 +1096,7 @@ mod tests {
             writer_epoch: 1,
             writer_seq: 1,
             created_unix_ns: 42,
+            level: ravel_catalog::SegmentLevel::L0,
         };
         (written.bytes, tenant_hash, seg_ref)
     }
