@@ -303,15 +303,14 @@ fn parse_footer_reports_v2_version_and_rejects_unknown_versions() {
     let mut corrupted = written.bytes.to_vec();
     let n = corrupted.len();
     // version is trailer bytes [8..10] from the end (see
-    // docs/segment-format.md trailer layout); bump it to 5, an accepted-
-    // nowhere version (1/2/3/4 are all real trailer versions as of the
-    // compaction-retention plan P3), and recompute nothing else --
-    // parse_footer must reject on the version check before ever reaching
-    // footer_crc32c.
-    corrupted[n - 16 + 8] = 5;
+    // docs/segment-format.md trailer layout); bump it to 6, an accepted-
+    // nowhere version (1/2/3/4/5 are all real trailer versions as of
+    // ADR-0026), and recompute nothing else -- parse_footer must reject on
+    // the version check before ever reaching footer_crc32c.
+    corrupted[n - 16 + 8] = 6;
     corrupted[n - 16 + 9] = 0;
     let err = ravel_segment::parse_footer(corrupted.len() as u64, &corrupted).unwrap_err();
-    assert_eq!(err, SegmentError::UnsupportedVersion(5));
+    assert_eq!(err, SegmentError::UnsupportedVersion(6));
 }
 
 #[test]
@@ -321,8 +320,8 @@ fn validate_sections_rejects_unsupported_version_directly() {
     let limits = ReaderLimits::default();
     let loc = ravel_segment::open_from_full(&written.bytes, limits).expect("opens");
     let err =
-        ravel_segment::validate_sections(&loc.footer, 5, loc.footer_offset, limits).unwrap_err();
-    assert_eq!(err, SegmentError::UnsupportedVersion(5));
+        ravel_segment::validate_sections(&loc.footer, 6, loc.footer_offset, limits).unwrap_err();
+    assert_eq!(err, SegmentError::UnsupportedVersion(6));
 }
 
 // --- 3. decode_catalog_matching_v2 vs decode_catalog_v2 + select ------

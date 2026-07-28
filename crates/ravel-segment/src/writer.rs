@@ -12,8 +12,8 @@ use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId};
 use crate::crc::{footer_crc, page_crc};
 use crate::error::WriteError;
 use crate::format::{
-    MAGIC, RESERVED, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, VERSION_V4, ZSTD_LEVEL,
-    compression, page_comp, page_enc, section_kind,
+    MAGIC, RESERVED, SIGNAL_METRICS, V5_SPARSE_THRESHOLD, VERSION, VERSION_V2, VERSION_V3,
+    VERSION_V4, VERSION_V5, ZSTD_LEVEL, compression, page_comp, page_enc, section_kind,
 };
 use crate::gorilla::encode_gorilla_into;
 use crate::histogram::{HistogramValue, encode_histogram_record_into};
@@ -1048,6 +1048,86 @@ impl SegmentWriter {
                 blake3,
             },
         })
+    }
+
+    /// Encodes RSEG v5 (ADR-0026, docs/segment-format.md "RSEG v5
+    /// amendment"): the v4 grammar plus, when the output object carries at
+    /// least [`V5_SPARSE_THRESHOLD`] series, the sparse SERIES_IDX (kind 8)
+    /// and chunked SERIES_META (kind 9) sections. Takes the same
+    /// [`SeriesInputV4`] runs as [`SegmentWriter::write_v4`]: v5 is the
+    /// compaction output format, so its inputs are pre-framed runs, never raw
+    /// samples.
+    ///
+    /// Implemented as a post-process over `write_v4`'s output rather than a
+    /// bespoke encode path, so the v4 grammar stays a single source of truth
+    /// and the below-threshold case is provably the v4 object with only the
+    /// trailer version bumped. Below the threshold the object is byte-for-byte
+    /// the v4 object save the trailer's version field (and the footer_crc it
+    /// feeds, plus the whole-object blake3); at or above it the sparse
+    /// sections are layered on and the whole-section SERIES_META (kind 6) is
+    /// replaced by the chunked form (kind 9).
+    ///
+    /// L0 writers never call this (ADR-0026 decision point 3); the measured
+    /// small-object regression is a property of the L0 shape, and this method
+    /// is for the compacted tier.
+    pub fn write_v5(
+        series: Vec<SeriesInputV4>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+    ) -> Result<WrittenSegment, WriteError> {
+        let base = Self::write_v4(series, identity, ingest_bounds, meta)?;
+        if base.summary.series_count < V5_SPARSE_THRESHOLD {
+            return Ok(retrailer_v4_to_v5(base));
+        }
+        crate::sparse::build_sparse_object(&base)
+    }
+}
+
+/// Rewrites a freshly built v4 object's trailer to declare version 5,
+/// recomputing the footer_crc (which covers the version) and the whole-object
+/// blake3. Everything before the trailer -- every section byte and the footer
+/// protobuf -- is copied verbatim, so a below-threshold v5 object differs from
+/// the v4 object only in the trailer's version field and the two derived
+/// values. This is the byte-level proof of ADR-0026's "below the threshold, a
+/// v5 object is the v4 object plus a version bump".
+fn retrailer_v4_to_v5(base: WrittenSegment) -> WrittenSegment {
+    let obj = base.bytes.as_ref();
+    let total = obj.len();
+    // A `write_v4` result always carries the full 16-byte trailer.
+    let trailer_start = total - crate::format::TRAILER_LEN as usize;
+    let footer_len = u32::from_le_bytes([
+        obj[total - 16],
+        obj[total - 15],
+        obj[total - 14],
+        obj[total - 13],
+    ]);
+    let footer_end = trailer_start;
+    let footer_start = footer_end - footer_len as usize;
+    let footer_bytes = &obj[footer_start..footer_end];
+    let crc = footer_crc(
+        footer_bytes,
+        footer_len,
+        VERSION_V5,
+        SIGNAL_METRICS,
+        RESERVED,
+    );
+
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&obj[..footer_end]);
+    out.extend_from_slice(&footer_len.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&VERSION_V5.to_le_bytes());
+    out.push(SIGNAL_METRICS);
+    out.push(RESERVED);
+    out.extend_from_slice(&MAGIC);
+
+    let blake3 = *blake3::hash(&out).as_bytes();
+    let mut summary = base.summary;
+    summary.blake3 = blake3;
+    WrittenSegment {
+        bytes: Bytes::from(out),
+        summary,
     }
 }
 

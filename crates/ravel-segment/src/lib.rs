@@ -6,30 +6,19 @@
 
 mod crc;
 mod error;
-mod experiment;
 mod format;
 mod gorilla;
 mod histogram;
 mod identity;
 mod reader;
+mod sparse;
 mod ts_delta;
 mod varint;
 mod writer;
 
-/// Within-segment selective-read experiment (GitHub issue #167). PROTOTYPE,
-/// flag-gated, never on the default writer/reader path; see the module docs.
-pub mod experiment_api {
-    pub use crate::experiment::{
-        ChunkLocation, DEFAULT_STRIDE, ExperimentError, ExperimentFlags, IdsWindow, PageLoc,
-        SECTION_KIND_SERIES_IDX, SECTION_KIND_SERIES_META_CHUNKS, SparseIdIndex,
-        decode_chunk_page_location, decode_page_locations_v2, decompress_chunk_frame,
-        find_experimental_section, find_index_in_window, parse_footer_from_suffix_unvalidated,
-        parse_footer_unvalidated, parse_series_idx, write_v2_experimental,
-    };
-}
-
 pub use error::{SegmentError, WriteError};
-pub use format::ReaderLimits;
+pub use format::{ReaderLimits, V5_SPARSE_THRESHOLD, V5_STRIDE};
+
 pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
@@ -40,6 +29,15 @@ pub use reader::{
     decode_pages_soa, decode_run_histogram_pages, decode_run_pages_soa, open_from_full,
     open_from_suffix, parse_footer, plan_ranges, plan_ranges_v3, plan_ranges_v4, select,
     validate_sections,
+};
+/// RSEG v5 sparse catalog (ADR-0026): SERIES_IDX + chunked SERIES_META
+/// selective-read structures. `decode_catalog_v5` is the whole-catalog decode
+/// (delegating to v4 below the sparse threshold); the rest is the point-lookup
+/// sparse probe: parse SERIES_IDX, locate a crc-verified SERIES_IDS window,
+/// then a crc-verified meta chunk, then decode that series' runs.
+pub use sparse::{
+    ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_chunk_runs,
+    find_index_in_window, parse_series_idx, verify_and_decompress_chunk_frame, verify_id_window,
 };
 pub use writer::{
     CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity,
