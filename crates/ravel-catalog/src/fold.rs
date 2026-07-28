@@ -33,17 +33,6 @@ use crate::snapshot_format::{self, HEAD_FORMAT_VERSION, NamePostings, PartLimits
 /// RSEG section kinds needed to decode a segment's catalog
 /// (docs/segment-format.md `SectionKind`). Kinds 1/2 are v1
 /// (LABEL_DICT/SERIES_TABLE); 5/6 are v2 (SERIES_IDS/SERIES_META).
-/// Duplicated locally rather than imported: `ravel-segment`'s section-kind
-/// constants live in a private module, and `ravel-query`'s fetcher (the
-/// production reader of these same segments) duplicates the same constants
-/// for the same reason.
-mod section_kind {
-    pub const LABEL_DICT: u32 = 1;
-    pub const SERIES_TABLE: u32 = 2;
-    pub const SERIES_IDS: u32 = 5;
-    pub const SERIES_META: u32 = 6;
-}
-
 /// A failure while building the name-postings index for a fold. Every
 /// variant is caught by [`Catalog::build_postings`], logged, and turned into
 /// "fold succeeds without a postings ref" (docs/metric-index-plan.md P5a:
@@ -69,27 +58,6 @@ enum PostingsBuildError {
     MissingMetricName,
     #[error("unsupported segment format version {0}")]
     UnsupportedSegmentVersion(u16),
-    #[error("segment section lies outside the fetched object bytes")]
-    SectionOutOfBounds,
-}
-
-fn section_range(footer: &ravel_segment::Footer, kind: u32) -> Option<(u64, u64)> {
-    footer
-        .sections
-        .iter()
-        .find(|s| s.kind == kind)
-        .map(|s| (s.offset, s.len))
-}
-
-fn slice_section(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8], PostingsBuildError> {
-    let start = usize::try_from(offset).map_err(|_| PostingsBuildError::SectionOutOfBounds)?;
-    let len = usize::try_from(len).map_err(|_| PostingsBuildError::SectionOutOfBounds)?;
-    let end = start
-        .checked_add(len)
-        .ok_or(PostingsBuildError::SectionOutOfBounds)?;
-    bytes
-        .get(start..end)
-        .ok_or(PostingsBuildError::SectionOutOfBounds)
 }
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
@@ -773,44 +741,16 @@ impl Catalog {
         };
         ravel_segment::check_identity(&location.footer, &expected)?;
 
-        let series = match location.version {
-            1 => {
-                let (ld_off, ld_len) = section_range(&location.footer, section_kind::LABEL_DICT)
-                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
-                        "LABEL_DICT",
-                    )))?;
-                let (st_off, st_len) = section_range(&location.footer, section_kind::SERIES_TABLE)
-                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
-                        "SERIES_TABLE",
-                    )))?;
-                let label_dict = slice_section(&got.data, ld_off, ld_len)?;
-                let series_table = slice_section(&got.data, st_off, st_len)?;
-                ravel_segment::decode_catalog(&location.footer, label_dict, series_table, limits)?
-            }
-            2 => {
-                let (ld_off, ld_len) = section_range(&location.footer, section_kind::LABEL_DICT)
-                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
-                        "LABEL_DICT",
-                    )))?;
-                let (si_off, si_len) = section_range(&location.footer, section_kind::SERIES_IDS)
-                    .ok_or(PostingsBuildError::Segment(SegmentError::MissingSection(
-                        "SERIES_IDS",
-                    )))?;
-                let (sm_off, sm_len) = section_range(&location.footer, section_kind::SERIES_META)
-                    .ok_or(PostingsBuildError::Segment(
-                    SegmentError::MissingSection("SERIES_META"),
-                ))?;
-                let label_dict = slice_section(&got.data, ld_off, ld_len)?;
-                let series_ids = slice_section(&got.data, si_off, si_len)?;
-                let series_meta = slice_section(&got.data, sm_off, sm_len)?;
-                ravel_segment::decode_catalog_v2(
-                    &location.footer,
-                    label_dict,
-                    series_ids,
-                    series_meta,
-                    limits,
-                )?
-            }
+        // ADR-0027: v5 is the only supported version (`open_from_full` above
+        // has already rejected anything else). The chunked v5 catalog spans
+        // sections, so it is decoded over the whole object -- already in hand
+        // here via the `GetRange::Full` GET -- and folded to the per-series
+        // `SeriesEntry` view the postings build consumes.
+        let series: Vec<ravel_segment::SeriesEntry> = match location.version {
+            5 => ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
+                .into_iter()
+                .map(|e| e.entry)
+                .collect(),
             other => return Err(PostingsBuildError::UnsupportedSegmentVersion(other)),
         };
 

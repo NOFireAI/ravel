@@ -39,8 +39,8 @@ code, not just using it.
   does Ravel actually promise."
 - [catalog-and-mvcc.md](catalog-and-mvcc.md): object key layout, the commit
   protocol, commit tokens, and snapshot resolution.
-- [segment-format.md](segment-format.md): the RSEG v1 on-object-store binary
-  format.
+- [segment-format.md](segment-format.md): the RSEG v5 on-object-store binary
+  format (the only supported version pre-release, ADR-0027).
 - [object-store-contract.md](object-store-contract.md): the
   `ObjectStoreBackend` trait every storage vendor (memory, S3/MinIO) must
   satisfy, and the durability arguments made against it.

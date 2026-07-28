@@ -74,7 +74,7 @@
 
   <rect x="76" y="583" width="1000" height="50" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="90" y="600" font-size="11" font-weight="bold" fill="#17191c">b. prune series</text>
-  <text x="90" y="615" font-size="10" fill="#17191c">SERIES_TABLE ts bounds vs padded_range, then matchers vs LABEL_DICT: equality by dictionary</text>
+  <text x="90" y="615" font-size="10" fill="#17191c">SERIES_META ts bounds vs padded_range, then matchers vs LABEL_DICT: equality by dictionary</text>
   <text x="90" y="627" font-size="10" fill="#17191c">ordinal compare (resolve once); regex / negative matchers evaluate on materialized label sets</text>
 
   <line x1="576" y1="633" x2="576" y2="646" stroke="#383e46" stroke-width="1.5" marker-end="url(#arrow)"/>

@@ -1,11 +1,11 @@
 //! Ingest-then-read-back over `MemoryStore` for directly-constructed
-//! histogram `IngestPoint`s (docs/rseg-v3-plan.md phase C7, section 7):
-//! proves `IngestRouter::write_values` -> shard buffer -> `SegmentWriter::
-//! write_v3` plumbing end to end, since native histograms are rejected at
-//! wire admission until phase C8 and so never reach this path through OTLP
-//! or remote-write decode. Read-back uses `ravel-segment`'s reader API
-//! directly (mirrors crates/ravel-segment/tests/reader_v3.rs), because
-//! `ravel-query`'s fetcher does not yet decode RSEG v3/HIST_PAGES.
+//! histogram `IngestPoint`s: proves `IngestRouter::write_values` -> shard
+//! buffer -> `SegmentWriter::write_histograms` (the v5 raw-sample adapter)
+//! plumbing end to end, since native histograms are rejected at wire
+//! admission and so never reach this path through OTLP or remote-write
+//! decode. Read-back uses `ravel-segment`'s v5 reader API directly (the
+//! single-run v5 grammar), because `ravel-query`'s fetcher decodes only
+//! scalar series.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -16,11 +16,13 @@ use std::time::Duration;
 use common::{TestClock, build_labels, tenant};
 use ravel_commit::keys;
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, IngestPoint, IngestRouter, IngestValue, WriteMode};
+use ravel_ingest::{
+    IngestConfig, IngestPoint, IngestRouter, IngestValue, SEGMENT_FORMAT_VERSION, WriteMode,
+};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_segment::{
     HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ReaderLimits, ResetHint,
-    SeriesEntry, ValueKind,
+    SeriesEntryV4, ValueKind,
 };
 use ravel_types::{METRIC_NAME_LABEL, Sample, SeriesId, Signal};
 
@@ -83,13 +85,13 @@ fn scalar_point(
     }
 }
 
-/// A flush buffer with any histogram-kind series must produce RSEG v3, even
-/// with a scalar series mixed into the same batch (docs/rseg-v3-plan.md
-/// section 3.2). Reads the object back through `ravel-segment`'s own reader
-/// API (not `ravel-query`, which doesn't decode v3 yet) and checks both
-/// series' content round-trips exactly.
+/// A flush buffer with a histogram series and a scalar series mixed into the
+/// same batch produces one RSEG v5 object with a histogram run and a scalar
+/// run. Reads it back through `ravel-segment`'s own v5 reader API (not
+/// `ravel-query`, which decodes only scalar series) and checks both series'
+/// content round-trips exactly.
 #[tokio::test]
-async fn histogram_and_scalar_points_ingest_and_read_back_as_v3() {
+async fn histogram_and_scalar_points_ingest_and_read_back_as_v5() {
     let store: Arc<dyn ObjectStoreBackend> =
         Arc::new(ravel_object_store::memory::MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
@@ -125,8 +127,9 @@ async fn histogram_and_scalar_points_ingest_and_read_back_as_v3() {
         .data;
     let decoded_record = record::decode(&commit_bytes).expect("decode commit record");
     assert_eq!(
-        decoded_record.segment_format_version, 3,
-        "a flush containing a histogram series must stamp v3"
+        decoded_record.segment_format_version,
+        u32::from(SEGMENT_FORMAT_VERSION),
+        "every flush stamps v5"
     );
     assert_eq!(decoded_record.series_count, 2);
     assert_eq!(decoded_record.sample_count, 2);
@@ -138,54 +141,59 @@ async fn histogram_and_scalar_points_ingest_and_read_back_as_v3() {
         .data;
     let limits = ReaderLimits::default();
     let loc = ravel_segment::open_from_full(&data_bytes, limits).expect("opens segment");
-    assert_eq!(loc.version, 3);
+    assert_eq!(loc.version, 5);
 
-    let section = |kind: u32| -> &[u8] {
-        let s = loc
-            .footer
-            .sections
-            .iter()
-            .find(|s| s.kind == kind)
-            .expect("section present");
-        let start = s.offset as usize;
-        &data_bytes[start..start + s.len as usize]
-    };
-    const LABEL_DICT: u32 = 1;
-    const SERIES_IDS: u32 = 5;
-    const SERIES_META: u32 = 6;
-
-    let dict = section(LABEL_DICT);
-    let ids = section(SERIES_IDS);
-    let meta = section(SERIES_META);
-    let entries = ravel_segment::decode_catalog_v3(&loc.footer, dict, ids, meta, limits)
+    let entries = ravel_segment::decode_catalog_v5(&loc.footer, &data_bytes, limits)
         .expect("decodes catalog");
     assert_eq!(entries.len(), 2);
 
-    let selected: Vec<&SeriesEntry> = entries.iter().collect();
-    let ranges = ravel_segment::plan_ranges_v3(&loc.footer, &selected).expect("plans ranges");
+    let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v4(&loc.footer, &selected).expect("plans ranges");
 
     let mut saw_scalar = false;
     let mut saw_histogram = false;
-    for (entry, range) in entries.iter().zip(ranges.iter()) {
+    for entry in &entries {
+        let run = &entry.runs[0];
+        let range = ranges
+            .iter()
+            .find(|r| r.series_id == entry.entry.series_id && r.run_index == 0)
+            .expect("planned range for run 0");
         let ts_start = range.ts_range.0 as usize;
         let ts_bytes = &data_bytes[ts_start..ts_start + range.ts_range.1 as usize];
-        match entry.value_kind {
+        match entry.entry.value_kind {
             ValueKind::Scalar => {
                 let val_start = range.val_range.0 as usize;
                 let val_bytes = &data_bytes[val_start..val_start + range.val_range.1 as usize];
-                let samples = ravel_segment::decode_pages(entry, ts_bytes, val_bytes, limits)
-                    .expect("decodes");
-                assert_eq!(samples.len(), 1);
-                assert_eq!(samples[0].ts_ns, 1_000);
-                assert_eq!(samples[0].value.to_bits(), 3.5_f64.to_bits());
+                let mut scratch = Vec::new();
+                let mut timestamps = Vec::new();
+                let mut values = Vec::new();
+                ravel_segment::decode_run_pages_soa(
+                    &entry.entry.series_id,
+                    run,
+                    ts_bytes,
+                    val_bytes,
+                    limits,
+                    &mut scratch,
+                    &mut timestamps,
+                    &mut values,
+                )
+                .expect("decodes");
+                assert_eq!(timestamps.len(), 1);
+                assert_eq!(timestamps[0], 1_000);
+                assert_eq!(values[0].to_bits(), 3.5_f64.to_bits());
                 saw_scalar = true;
             }
             ValueKind::Histogram => {
                 let hist_start = range.hist_range.0 as usize;
                 let hist_bytes = &data_bytes[hist_start..hist_start + range.hist_range.1 as usize];
-                let samples =
-                    ravel_segment::decode_histogram_pages(entry, ts_bytes, hist_bytes, limits)
-                        .expect("decodes");
+                let samples = ravel_segment::decode_run_histogram_pages(
+                    &entry.entry.series_id,
+                    run,
+                    ts_bytes,
+                    hist_bytes,
+                    limits,
+                )
+                .expect("decodes");
                 assert_eq!(samples.len(), 1);
                 assert_eq!(samples[0].ts_ns, 1_000);
                 let want = match hist.value {

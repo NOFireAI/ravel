@@ -14,8 +14,7 @@ use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3,
-    SeriesValues,
+    HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
 };
 use ravel_types::{CommitToken, LabelSet, Sample, SeriesId, Signal, TenantId};
 use tokio::sync::{mpsc, oneshot};
@@ -23,19 +22,12 @@ use tokio::time::Duration;
 use uuid::Uuid;
 
 use crate::clock::Clock;
-use crate::config::{IngestConfig, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2};
+use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION};
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
 use crate::value::{IngestPoint, IngestValue, ValueKind};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
-
-/// RSEG v3's on-wire format version (docs/rseg-v3-plan.md section 3.1),
-/// duplicated as a literal the same way `SEGMENT_FORMAT_V1`/`_V2` are
-/// (config.rs). Only used here to stamp the commit record when a flush's
-/// buffer forces a v3 write; never exposed as an `IngestConfig`-selectable
-/// value (that stays v1/v2-only until docs/rseg-v3-plan.md's phase C8).
-const SEGMENT_FORMAT_V3: u16 = 3;
 
 pub(crate) type Ack = oneshot::Sender<Result<CommitToken, WriteError>>;
 
@@ -445,74 +437,22 @@ impl ShardActor {
             max_ingest_ts_ns,
         };
 
-        // A flush buffer containing any histogram-kind series must produce
-        // an RSEG v3 object: there is no way to durably store a histogram
-        // sample in v1/v2 (docs/rseg-v3-plan.md section 3.2). This is
-        // content-driven, not `self.config.segment_format_version`-driven --
-        // that config's legal values stay v1/v2-only until
-        // docs/rseg-v3-plan.md's phase C8 makes v3 a selectable default.
-        let has_histogram = series
-            .values()
-            .any(|accum| accum.values.kind() == ValueKind::Histogram);
-
-        let (written, segment_version) = if has_histogram {
-            let series_inputs: Vec<SeriesInputV3> = series
-                .into_iter()
-                .map(|(series_id, accum)| SeriesInputV3 {
-                    series_id,
-                    labels: accum.labels,
-                    values: accum.values.into_series_values(),
-                })
-                .collect();
-            (
-                SegmentWriter::write_v3(series_inputs, identity, ingest_bounds),
-                SEGMENT_FORMAT_V3,
-            )
-        } else {
-            // Resolved exactly once and reused for both the writer call
-            // below and the commit record's `segment_format_version` stamp
-            // further down: an unrecognized config value normalizes to
-            // `SEGMENT_FORMAT_V1` here, at the single read site, so the
-            // writer call and the stamp can never disagree about which
-            // version this flush actually produced (docs/rseg-v2-plan.md
-            // P6).
-            let segment_version = match self.config.segment_format_version {
-                SEGMENT_FORMAT_V2 => SEGMENT_FORMAT_V2,
-                _ => SEGMENT_FORMAT_V1,
-            };
-            let mut series_inputs: Vec<SeriesInput> = Vec::with_capacity(series.len());
-            for (series_id, accum) in series {
-                match accum.values {
-                    SeriesAccumValues::Scalar(samples) => series_inputs.push(SeriesInput {
-                        series_id,
-                        labels: accum.labels,
-                        samples,
-                    }),
-                    SeriesAccumValues::Histogram(_) => {
-                        // Unreachable: `has_histogram` above is false, so no
-                        // accum here can be histogram-kind. Fail loud
-                        // instead of silently dropping the series if that
-                        // ever stops holding.
-                        self.metrics.record_abandoned_input_rejected();
-                        self.ack_waiters(
-                            waiters,
-                            Err(WriteError::SegmentBuild(
-                                "internal: histogram series routed to scalar-only writer path"
-                                    .into(),
-                            )),
-                        );
-                        return;
-                    }
-                }
-            }
-            let written = match segment_version {
-                SEGMENT_FORMAT_V2 => {
-                    SegmentWriter::write_v2(series_inputs, identity, ingest_bounds)
-                }
-                _ => SegmentWriter::write(series_inputs, identity, ingest_bounds),
-            };
-            (written, segment_version)
-        };
+        // ADR-0027: every flush emits v5, scalar and histogram batches alike.
+        // The raw-sample adapter frames each series into a single run, so the
+        // writer choice is no longer version- or content-driven; the buffer's
+        // per-series value kind (scalar or histogram) is carried through
+        // `into_series_values` and the writer picks the VAL/HIST page per
+        // series.
+        let series_inputs: Vec<SeriesInputV3> = series
+            .into_iter()
+            .map(|(series_id, accum)| SeriesInputV3 {
+                series_id,
+                labels: accum.labels,
+                values: accum.values.into_series_values(),
+            })
+            .collect();
+        let segment_version = SEGMENT_FORMAT_VERSION;
+        let written = SegmentWriter::write_histograms(series_inputs, identity, ingest_bounds);
         let written = match written {
             Ok(w) => w,
             Err(e) => {

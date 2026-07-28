@@ -17,7 +17,7 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
   -> per selector (concurrency-bounded, default 8), against that one
      snapshot:
        for each snapshot segment: suffix GET (64 KiB) -> Reader::parse
-         -> prune series by that selector's own matchers (SERIES_TABLE +
+         -> prune series by that selector's own matchers (SERIES_META +
             LABEL_DICT)
          -> plan page ranges, coalesce adjacent (gap <= 64 KiB)
          -> ranged GETs -> decode pages -> per-series samples
@@ -58,7 +58,7 @@ and passes through bit-exactly (issue #75).
 
 1. Segment level: commit-record event-time bounds vs padded range (already
    done by Catalog::resolve).
-2. Series level: SERIES_TABLE entry ts bounds vs padded range, then matcher
+2. Series level: SERIES_META entry ts bounds vs padded range, then matcher
    evaluation against the decoded LabelSet. Equality matchers use dictionary
    ordinal lookups (resolve value -> ordinal once, compare ordinals);
    regex/negative matchers evaluate on materialized label sets.
@@ -69,7 +69,7 @@ and passes through bit-exactly (issue #75).
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
 - `POST/GET /api/v1/query_range` (query, start, end, step, timeout).
 - `GET /api/v1/labels`, `/api/v1/label/{name}/values` (match[] optional,
-  start/end optional): from snapshot SERIES_TABLE label dictionaries.
+  start/end optional): from snapshot SERIES_META label dictionaries.
 - `GET/POST /api/v1/series` (match[] required, start/end).
 - All accept `min_commit_token`. Errors use the Prometheus JSON error
   envelope (`status:"error"`, `errorType`, `error`) with correct HTTP codes
