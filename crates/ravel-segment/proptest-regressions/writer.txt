@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1be444f09b0d457876c0ed52c1aae94b4d3df83981413f5d215fe3a72f9e7ee0 # shrinks to series = [SeriesInputV3 { series_id: SeriesId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), labels: LabelSet([Label { name: "__name__", value: "_" }]), values: Histogram([HistogramSample { ts_ns: 0, value: HistogramValue { scale: 0, zero_threshold: 0.0, sum: None, custom_values: None, positive_spans: [], negative_spans: [], counts: Int { zero_count: 3, count: 3, positive: [], negative: [] }, reset_hint: Unknown } }]) }]

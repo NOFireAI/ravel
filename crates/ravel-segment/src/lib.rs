@@ -8,6 +8,7 @@ mod crc;
 mod error;
 mod format;
 mod gorilla;
+mod histogram;
 mod identity;
 mod reader;
 mod ts_delta;
@@ -16,6 +17,7 @@ mod writer;
 
 pub use error::{SegmentError, WriteError};
 pub use format::ReaderLimits;
+pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
     FooterLocation, FooterOutcome, PlannedRange, SeriesEntry, ValPageKind, decode_catalog,
@@ -24,7 +26,8 @@ pub use reader::{
     validate_sections,
 };
 pub use writer::{
-    IngestBounds, SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput, WrittenSegment,
+    HistogramSample, IngestBounds, SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput,
+    SeriesInputV3, SeriesValues, WrittenSegment,
 };
 
 pub use ravel_proto::segment::v1::Footer;
