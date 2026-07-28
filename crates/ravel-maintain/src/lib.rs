@@ -13,6 +13,7 @@ mod cursor;
 mod error;
 mod input;
 mod merge;
+mod publish;
 mod scan;
 mod segread;
 
@@ -21,5 +22,6 @@ pub use config::MaintainConfig;
 pub use error::MaintainError;
 pub use input::{CompactionInput, hash16, input_set_hash, sort_inputs_canonically};
 pub use merge::{BuildIdentity, BuiltPart, merge_and_build};
+pub use publish::{PublishInput, PublishOutcome, publish};
 pub use scan::{SealedBucket, scan_next};
 pub use segread::{DecodedInput, read_input};
