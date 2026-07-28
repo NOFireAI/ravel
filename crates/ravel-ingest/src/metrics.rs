@@ -1,5 +1,39 @@
 //! Self-observability counters (docs/ingest.md "Metrics"). Plain atomics for
 //! now; scraping/otel export is a later task.
+//!
+//! # Counting convention
+//!
+//! Every counter here is a monotonic process-global total. There is **no
+//! per-shard and no per-tenant dimension**: a single [`IngestMetrics`] is
+//! constructed once by the router and shared by every shard actor through an
+//! `Arc`, so a value is the sum across all shards and all tenants of this
+//! process. The dimensioned model docs/ingest.md describes (per-shard buffered
+//! bytes/points, per-shard latency histograms, per-tenant accepted/rejected
+//! points) is not implemented here; that doc marks it as tracked future work.
+//!
+//! Two timing conventions coexist, and mixing them up misreads the numbers:
+//!
+//! - **Attempt-time.** [`record_flush`](IngestMetrics::record_flush) fires when
+//!   a flush is *opened* (`shard.rs` `flush_tenant`), before the segment build,
+//!   the data-object PUT, or the commit-record PUT. A flush that is later
+//!   abandoned is therefore counted in both `flushes_by_*` **and** one of the
+//!   `abandoned_*` counters. Flushes that actually reached a durable commit
+//!   are the three trigger counters summed, minus `abandoned_retry_exhausted`
+//!   and `abandoned_input_rejected`; the bare trigger sum overcounts.
+//! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's strict
+//!   waiters are acked, i.e. at the flush's terminal outcome. They count
+//!   strict-mode waiters only: a buffered-mode flush, or an age/size flush with
+//!   no strict waiter attached, records zero on both. They are an ack-outcome
+//!   counter, not a flush-outcome counter, despite sitting next to one.
+//!
+//! `flushes_manual` covers every `FlushTrigger::Manual` flush: an explicit
+//! `FlushNow`, the `Shutdown` drain, and the channel-close drop-path drain
+//! (`shard.rs` `run`). It is not exclusively operator-requested flushes.
+//!
+//! `put_retries` counts every retried PUT attempt on both the data-object and
+//! the commit-record path (`put_data_object_with_retry` and
+//! `publish_with_retry`); the first attempt of each is not a retry and is not
+//! counted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,14 +46,42 @@ pub enum FlushTrigger {
 
 #[derive(Debug, Default)]
 pub struct IngestMetrics {
+    /// Flushes opened because the tenant buffer reached `target_bytes`.
+    /// Attempt-time: incremented at flush open, so it includes flushes later
+    /// abandoned.
     flushes_by_size: AtomicU64,
+    /// Flushes opened because the tenant buffer aged past `max_flush_delay`.
+    /// Attempt-time, same as `flushes_by_size`.
     flushes_by_age: AtomicU64,
+    /// Flushes opened by any `FlushTrigger::Manual` path: an explicit
+    /// `FlushNow`, the `Shutdown` drain, or the channel-close drop-path drain.
+    /// Attempt-time.
     flushes_manual: AtomicU64,
+    /// Retried PUT attempts across both the data-object and commit-record
+    /// paths. Excludes each path's first attempt.
     put_retries: AtomicU64,
-    abandoned_flushes: AtomicU64,
+    /// Flushes abandoned because a PUT exhausted its retry budget or
+    /// `max_flush_lifetime` elapsed first (`WriteError::Abandoned`). A
+    /// durability signal: the input was fine, the object store did not accept
+    /// it in time. Nothing was acknowledged and the whole write stays
+    /// retryable.
+    abandoned_retry_exhausted: AtomicU64,
+    /// Flushes abandoned because the input could not be turned into a durable
+    /// object at all: the segment build, data-key derivation, or commit-record
+    /// build failed (`WriteError::SegmentBuild`). A client signal: identical
+    /// input will fail again, so the write is not retryable. Split out from
+    /// `abandoned_retry_exhausted` because `error.rs` already treats the two
+    /// causes differently (a8-F05).
+    abandoned_input_rejected: AtomicU64,
+    /// Cumulative bytes admitted into shard buffers at enqueue time.
     buffered_bytes_total: AtomicU64,
+    /// Cumulative sample count admitted into shard buffers at enqueue time.
     buffered_points_total: AtomicU64,
+    /// Strict-mode waiters acked with a commit token (success-time). Zero for
+    /// buffered-mode and for flushes with no strict waiter.
     acks_ok: AtomicU64,
+    /// Strict-mode waiters acked with a `WriteError` (success-time). Zero for
+    /// buffered-mode and for flushes with no strict waiter.
     acks_err: AtomicU64,
     /// Batches rejected because two points shared a `series_id` under
     /// distinct canonical label sets (ADR-0005 fail-loud collision check).
@@ -33,14 +95,16 @@ pub struct IngestMetrics {
     shard_deaths: AtomicU64,
 }
 
-/// Point-in-time copy of [`IngestMetrics`] for scraping.
+/// Point-in-time copy of [`IngestMetrics`] for scraping. See the
+/// [module docs](self) for each field's timing convention.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
-    pub abandoned_flushes: u64,
+    pub abandoned_retry_exhausted: u64,
+    pub abandoned_input_rejected: u64,
     pub buffered_bytes_total: u64,
     pub buffered_points_total: u64,
     pub acks_ok: u64,
@@ -63,8 +127,18 @@ impl IngestMetrics {
         self.put_retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_abandoned(&self) {
-        self.abandoned_flushes.fetch_add(1, Ordering::Relaxed);
+    /// A flush abandoned by retry-budget or lifetime exhaustion
+    /// (`WriteError::Abandoned`): a durability signal, retryable.
+    pub(crate) fn record_abandoned_retry_exhausted(&self) {
+        self.abandoned_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned because the input could not be built into a durable
+    /// object (`WriteError::SegmentBuild`): a client signal, not retryable.
+    pub(crate) fn record_abandoned_input_rejected(&self) {
+        self.abandoned_input_rejected
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_buffered(&self, bytes: u64, points: u64) {
@@ -93,7 +167,8 @@ impl IngestMetrics {
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
-            abandoned_flushes: self.abandoned_flushes.load(Ordering::Relaxed),
+            abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
+            abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
             buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
             buffered_points_total: self.buffered_points_total.load(Ordering::Relaxed),
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
@@ -116,7 +191,7 @@ mod tests {
         metrics.record_flush(FlushTrigger::Age);
         metrics.record_flush(FlushTrigger::Manual);
         metrics.record_put_retry();
-        metrics.record_abandoned();
+        metrics.record_abandoned_retry_exhausted();
         metrics.record_buffered(100, 3);
         metrics.record_acks(2, true);
         metrics.record_acks(1, false);
@@ -128,12 +203,29 @@ mod tests {
         assert_eq!(snap.flushes_by_age, 2);
         assert_eq!(snap.flushes_manual, 1);
         assert_eq!(snap.put_retries, 1);
-        assert_eq!(snap.abandoned_flushes, 1);
+        assert_eq!(snap.abandoned_retry_exhausted, 1);
+        assert_eq!(snap.abandoned_input_rejected, 0);
         assert_eq!(snap.buffered_bytes_total, 100);
         assert_eq!(snap.buffered_points_total, 3);
         assert_eq!(snap.acks_ok, 2);
         assert_eq!(snap.acks_err, 1);
         assert_eq!(snap.series_id_collisions, 1);
         assert_eq!(snap.shard_deaths, 1);
+    }
+
+    #[test]
+    fn abandoned_causes_are_counted_separately() {
+        let metrics = IngestMetrics::default();
+        // Two durability abandonments (retry/lifetime exhaustion) and one
+        // input rejection (segment build failed). The split lets an operator
+        // tell a store problem from a bad-input problem by counter alone
+        // (a8-F05), which the old single `abandoned_flushes` could not.
+        metrics.record_abandoned_retry_exhausted();
+        metrics.record_abandoned_retry_exhausted();
+        metrics.record_abandoned_input_rejected();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.abandoned_retry_exhausted, 2);
+        assert_eq!(snap.abandoned_input_rejected, 1);
     }
 }

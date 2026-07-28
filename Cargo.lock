@@ -2238,6 +2238,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3682,7 +3683,6 @@ dependencies = [
  "ravel-commit",
  "ravel-object-store",
  "ravel-proto",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3717,12 +3717,10 @@ dependencies = [
  "bytes",
  "crc32c",
  "hex",
- "proptest",
  "prost",
  "rand 0.10.2",
  "ravel-object-store",
  "ravel-proto",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3758,7 +3756,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "proptest",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
@@ -3768,7 +3765,6 @@ dependencies = [
  "ravel-proto",
  "ravel-query",
  "ravel-segment",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3786,7 +3782,6 @@ dependencies = [
  "futures",
  "object_store 0.14.1",
  "parking_lot",
- "proptest",
  "rand 0.10.2",
  "thiserror",
  "tokio",
@@ -3807,7 +3802,6 @@ dependencies = [
  "prost-build",
  "protox",
  "ravel-otlp",
- "ravel-test-util",
  "ravel-types",
  "stats_alloc",
  "thiserror",
@@ -3824,8 +3818,6 @@ name = "ravel-otlp"
 version = "0.1.0"
 dependencies = [
  "opentelemetry-proto",
- "proptest",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3837,11 +3829,37 @@ version = "0.1.0"
 dependencies = [
  "promql-parser",
  "proptest",
- "ravel-test-util",
  "ravel-types",
  "regex",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "ravel-promql-difftest"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "prost",
+ "prost-build",
+ "protox",
+ "rand 0.10.2",
+ "ravel-catalog",
+ "ravel-ingest",
+ "ravel-object-store",
+ "ravel-otlp",
+ "ravel-query",
+ "ravel-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "snap",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -3869,7 +3887,6 @@ dependencies = [
  "ravel-object-store",
  "ravel-promql",
  "ravel-segment",
- "ravel-test-util",
  "ravel-types",
  "serde",
  "serde_json",
@@ -3908,7 +3925,6 @@ dependencies = [
  "proptest",
  "prost",
  "ravel-proto",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3974,25 +3990,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ravel-test-util"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "proptest",
- "rand 0.10.2",
- "ravel-object-store",
- "ravel-types",
- "tokio",
-]
-
-[[package]]
 name = "ravel-types"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.0",
  "blake3",
  "hex",
- "proptest",
  "thiserror",
  "uuid",
 ]
@@ -4095,6 +4098,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5268,6 +5272,15 @@ name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

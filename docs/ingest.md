@@ -113,6 +113,41 @@ carries max token per shard).
 
 ## Metrics (self-observability)
 
-Per shard: buffered bytes/points, flush count by trigger (size|age), flush
-build/put/commit latency histograms, retries, failures, ack latency, queue
-depth. Per tenant: accepted/rejected points, bytes.
+`IngestMetrics` (crates/ravel-ingest/src/metrics.rs) exposes process-global
+`u64` counters through `IngestMetricsSnapshot`. They carry no per-shard and no
+per-tenant dimension: one `IngestMetrics` is built by the router and shared by
+every shard actor via `Arc`, so each value is the sum across all shards and all
+tenants of the process.
+
+Counters recorded today:
+
+- `flushes_by_size`, `flushes_by_age`, `flushes_manual`: flush count by trigger.
+  `flushes_manual` covers explicit `FlushNow`, the `Shutdown` drain, and the
+  channel-close drop-path drain. These are **attempt-time**: incremented when a
+  flush is opened, before the segment build or any PUT, so a later-abandoned
+  flush is counted here as well as in an `abandoned_*` counter. Successful
+  flushes = the three trigger counters minus the two `abandoned_*` counters.
+- `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
+  budget or `max_flush_lifetime` elapsed (`WriteError::Abandoned`). Durability
+  signal; retryable.
+- `abandoned_input_rejected`: flush abandoned because the input could not be
+  built into a durable object (`WriteError::SegmentBuild`). Client signal; not
+  retryable. Split from `abandoned_retry_exhausted` so a store problem is
+  distinguishable from a bad-input problem by counter alone.
+- `put_retries`: retried PUT attempts across the data-object and commit-record
+  paths (first attempt of each excluded).
+- `buffered_bytes_total`, `buffered_points_total`: cumulative volume admitted
+  into shard buffers at enqueue time.
+- `acks_ok`, `acks_err`: strict-mode waiters acked (**success-time**, at the
+  flush's terminal outcome). Zero for buffered-mode and for flushes with no
+  strict waiter, so this is an ack-outcome counter, not a flush-outcome one.
+- `series_id_collisions`: batches rejected fail-loud on an ADR-0005 series-id
+  collision.
+- `shard_deaths`: distinct shard actors observed dead by the router, counted
+  once per shard.
+
+Tracked future work (not yet implemented; own ticket, see a8-F05): a per-shard
+and per-tenant dimensioned model — per-shard buffered bytes/points, flush
+build/put/commit latency histograms, ack latency, and queue depth; per-tenant
+accepted/rejected points and bytes. It requires a metrics backend that these
+flat atomics do not provide and is out of scope for the counters above.

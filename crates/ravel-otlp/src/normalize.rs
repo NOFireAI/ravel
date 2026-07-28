@@ -3,7 +3,13 @@
 //! docs/architecture.md).
 //!
 //! Scope: `Gauge` and cumulative `Sum` metrics with `NumberDataPoint` values
-//! (`as_int` and `as_double`; integers convert to `f64`); cumulative
+//! (`as_int` and `as_double`; integers convert to `f64`, and the segment
+//! format stores `f64` only, so an `as_int` value whose magnitude exceeds
+//! 2^53 is rounded to the nearest representable `f64`. That rounding is not
+//! silent: such a point is still admitted, but it also emits an informational
+//! [`Rejection::IntegerValuePrecisionLoss`] carrying the original integer, so
+//! the loss is observable per the "approximation is opt-in and visible"
+//! invariant); cumulative
 //! `Histogram` (explicit bucket bounds) and `Summary` metrics, exploded into
 //! Prometheus-convention scalar series per ADR-0016 (`{name}_bucket{le=...}`,
 //! `{name}_sum`, `{name}_count`, `{name}{quantile=...}`). `Histogram` and
@@ -234,7 +240,10 @@ fn normalize_metric(
             let mut memo = SeriesIdMemo::new();
             for dp in &gauge.data_points {
                 match build_point(&ctx, dp, &mut memo) {
-                    Ok(p) => points.push(p),
+                    Ok((p, info)) => {
+                        points.push(p);
+                        rejected.extend(info);
+                    }
                     Err(r) => rejected.push(r),
                 }
             }
@@ -260,7 +269,10 @@ fn normalize_metric(
             let mut memo = SeriesIdMemo::new();
             for dp in &sum.data_points {
                 match build_point(&ctx, dp, &mut memo) {
-                    Ok(p) => points.push(p),
+                    Ok((p, info)) => {
+                        points.push(p);
+                        rejected.extend(info);
+                    }
                     Err(r) => rejected.push(r),
                 }
             }
@@ -381,11 +393,26 @@ impl SeriesIdMemo {
     }
 }
 
+/// Whether an OTLP `as_int` value survives conversion to the `f64` the
+/// segment format stores. `f64` carries a 53-bit mantissa, so every integer
+/// with magnitude up to 2^53 is exact and some larger even integers are too.
+/// The `i128` round-trip is exact across the whole `i64` range: a bare
+/// `as i64` round-trip would saturate for values that round up to 2^63 at the
+/// top of the range and so falsely accept a rounded value.
+fn int_survives_f64(v: i64) -> bool {
+    (v as f64) as i128 == v as i128
+}
+
+/// Build one point, and, when the point's `as_int` value did not survive the
+/// conversion to `f64`, an informational [`Rejection::IntegerValuePrecisionLoss`]
+/// to carry alongside it (`None` otherwise). The point is admitted either way;
+/// the rounding is unavoidable given `f64`-only storage, so it is surfaced, not
+/// rejected.
 fn build_point(
     ctx: &PointContext,
     dp: &NumberDataPoint,
     memo: &mut SeriesIdMemo,
-) -> Result<NormalizedPoint, Rejection> {
+) -> Result<(NormalizedPoint, Option<Rejection>), Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
             attribute_count: dp.attributes.len(),
@@ -400,12 +427,20 @@ fn build_point(
     // is unconditionally replaced by the stale marker and the underlying
     // oneof is never consulted, so a point with no value set can still
     // signal staleness.
+    // A NoRecordedValue point never consults the oneof, so a large `as_int`
+    // there is discarded, not rounded, and reports no precision loss.
+    let mut precision_loss = None;
     let value = if has_no_recorded_value(dp.flags) {
         stale_nan()
     } else {
         match dp.value {
             Some(NumberValue::AsDouble(v)) => v,
-            Some(NumberValue::AsInt(v)) => v as f64,
+            Some(NumberValue::AsInt(v)) => {
+                if !int_survives_f64(v) {
+                    precision_loss = Some(Rejection::IntegerValuePrecisionLoss { value: v });
+                }
+                v as f64
+            }
             None => return Err(Rejection::MissingValue),
         }
     };
@@ -430,15 +465,18 @@ fn build_point(
         .series_id(ctx.tenant, ctx.metric_name, &label_set)
         .map_err(|_| Rejection::OversizedSeriesComponent)?;
 
-    Ok(NormalizedPoint {
-        series_id,
-        labels: label_set,
-        sample: Sample {
-            ts_ns: event_ts_ns,
-            value,
+    Ok((
+        NormalizedPoint {
+            series_id,
+            labels: label_set,
+            sample: Sample {
+                ts_ns: event_ts_ns,
+                value,
+            },
+            is_monotonic_sum: ctx.is_sum && ctx.is_monotonic,
         },
-        is_monotonic_sum: ctx.is_sum && ctx.is_monotonic,
-    })
+        precision_loss,
+    ))
 }
 
 /// Validate and resolve a data point's event timestamp: zero rejects
@@ -903,6 +941,16 @@ mod tests {
         }
     }
 
+    fn strindex_kv(key: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyValueVariant::StringValueStrindex(1)),
+            }),
+            ..Default::default()
+        }
+    }
+
     fn number_point(attrs: Vec<KeyValue>, ts_ns: i64, value: NumberValue) -> NumberDataPoint {
         NumberDataPoint {
             attributes: attrs,
@@ -1249,6 +1297,119 @@ mod tests {
     }
 
     #[test]
+    fn int_value_at_2_pow_53_is_exact_and_silent() {
+        // 2^53 is the largest magnitude every integer below which is exactly
+        // representable as f64; it is itself exact. It must be admitted with
+        // no precision-loss signal and the bit-exact sample value.
+        let boundary: i64 = 1 << 53; // 9_007_199_254_740_992
+        let rm = resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "widgets",
+                vec![number_point(vec![], 1_000, NumberValue::AsInt(boundary))],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 1);
+        // Bit-exact, not just ==: the stored f64 round-trips back to the input.
+        assert_eq!(
+            out.points[0].sample.value.to_bits(),
+            (boundary as f64).to_bits()
+        );
+        assert_eq!(out.points[0].sample.value as i64, boundary);
+    }
+
+    #[test]
+    fn int_value_above_2_pow_53_is_admitted_but_flagged() {
+        // 2^53 + 1 is the first integer that rounds when cast to f64 (down to
+        // 2^53). The point is still admitted (rejecting legitimate large
+        // counters would be worse), but the loss becomes observable through an
+        // informational rejection that does not inflate the rejected-point
+        // count.
+        let above: i64 = (1 << 53) + 1; // 9_007_199_254_740_993
+        let rm = resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "widgets",
+                vec![number_point(vec![], 1_000, NumberValue::AsInt(above))],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        // Admitted: the sample is stored as the nearest f64.
+        assert_eq!(out.points.len(), 1);
+        assert_eq!(out.points[0].sample.value, above as f64);
+        assert_ne!(out.points[0].sample.value as i64, above);
+        // Observable: exactly one informational rejection carrying the input.
+        assert_eq!(out.rejected.len(), 1);
+        assert!(matches!(
+            out.rejected[0],
+            Rejection::IntegerValuePrecisionLoss { value } if value == above
+        ));
+        // Informational: it does not count against the sender's points.
+        assert_eq!(out.rejected[0].rejected_count(), 0);
+    }
+
+    #[test]
+    fn int_value_at_i64_max_is_flagged_not_silently_saturated() {
+        // i64::MAX casts to 2^63 as f64, which a bare `as i64` round-trip would
+        // saturate back to i64::MAX and so falsely accept. The i128 round-trip
+        // in `int_survives_f64` catches it.
+        let rm = resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "widgets",
+                vec![number_point(vec![], 1_000, NumberValue::AsInt(i64::MAX))],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert_eq!(out.points.len(), 1);
+        assert_eq!(out.rejected.len(), 1);
+        assert!(matches!(
+            out.rejected[0],
+            Rejection::IntegerValuePrecisionLoss { value } if value == i64::MAX
+        ));
+    }
+
+    #[test]
+    fn large_int_no_recorded_value_reports_no_precision_loss() {
+        // A NoRecordedValue point never reads the int, so a value above 2^53
+        // there is discarded (stale marker), not rounded; no signal is due.
+        let dp = NumberDataPoint {
+            attributes: vec![],
+            time_unix_nano: 1_000,
+            value: Some(NumberValue::AsInt((1 << 53) + 1)),
+            flags: DataPointFlags::NoRecordedValueMask as u32,
+            ..Default::default()
+        };
+        let rm = resource_metrics(vec![], vec![gauge_metric("widgets", vec![dp])]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert_eq!(out.points.len(), 1);
+        assert!(out.points[0].sample.value.is_nan());
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    }
+
+    #[test]
     fn double_value_passes_through() {
         let rm = resource_metrics(
             vec![],
@@ -1506,6 +1667,38 @@ mod tests {
         );
         assert!(out.points.is_empty());
         assert_eq!(out.rejected, vec![Rejection::ComplexAttributeValue]);
+    }
+
+    #[test]
+    fn string_reference_attribute_rejection_names_the_strindex_case() {
+        // A StringValueStrindex (string-table reference) attribute is
+        // rejected like the other complex kinds, but the diagnostic must
+        // name the string-reference case so a sender using string-table
+        // references can tell what shape was rejected (a8-F10).
+        let rm = resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "widgets",
+                vec![number_point(
+                    vec![strindex_kv("region")],
+                    1_000,
+                    NumberValue::AsDouble(1.0),
+                )],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![Rejection::ComplexAttributeValue]);
+        let message = out.rejected[0].to_string();
+        assert!(
+            message.contains("string-table reference") && message.contains("strindex"),
+            "rejection message must name the string-reference case, got: {message}"
+        );
     }
 
     #[test]

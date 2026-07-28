@@ -2,15 +2,35 @@
 //! normalization (ADR-0010 §6, §8; docs/consistency-model.md "Late and
 //! skewed data").
 //!
-//! Limits are checked before any expensive per-point allocation, so a
-//! hostile or misconfigured sender cannot force unbounded work per request.
-//! Every rejection is typed rather than a bare error: the OTLP partial
-//! success response reports a rejected-point count, and
-//! [`Rejection::rejected_count`] gives the right multiplier for rejections
-//! that cover more than one point (an oversized request, an oversized
-//! resource, an unsupported metric type) without the normalizer having to
-//! materialize one entry per point just to prove it didn't drop them
-//! silently.
+//! Ordering and cost. These limits are enforced inside `normalize_metrics`,
+//! which runs only after the transport layer has already decoded the whole
+//! `ExportMetricsServiceRequest` into memory: the HTTP path decodes the
+//! full body in `services/ravel-server` before calling in, and the gRPC
+//! path does the same through tonic. `max_data_points_per_request` and the
+//! other limits here therefore bound per-point label allocation and what
+//! reaches the shard buffer; they do not bound decode-time allocation. The
+//! only bound on the work a hostile or misconfigured sender can force
+//! before any check here runs is the transport body/message limit, which
+//! lives in the services crate, not in this module.
+//!
+//! Rejections are typed rather than bare errors: the OTLP partial-success
+//! response reports a rejected-point count, and
+//! [`Rejection::rejected_count`] gives the multiplier for a rejection that
+//! covers more than one point (an oversized request, an unsupported metric
+//! type). Not every multi-point rejection uses that mechanism, though. A
+//! resource-scoped rejection materializes one `Rejection` per data point
+//! under the resource (the `repeat_n` in `normalize_resource`), so the
+//! partial-success message repeats the same reason once per point rather
+//! than carrying a single group-scoped rejection with the count.
+//! `rejected_count` exists to make the group-scoped encoding possible, but
+//! the resource path does not yet use it.
+//!
+//! Cross-reference (not corrected here): decoding the full body before the
+//! request-size check, and the per-point materialization of resource
+//! rejections, are behavior gaps recorded as finding a8-F07 in
+//! `docs/reviews/2026-07-27-storage-engine-quality-audit/a8-ingest-otlp.md`.
+//! This doc describes the admission model as it is; any correctness change
+//! belongs to a separate ticket.
 
 /// Admission limits checked at OTLP ingest, before allocating per-point
 /// label structures.
@@ -119,7 +139,7 @@ pub enum Rejection {
     DuplicateLabelName(String),
 
     #[error(
-        "attribute value is an array, kvlist, or bytes value, which has no label representation"
+        "attribute value is an array, kvlist, bytes, or string-table reference (strindex) value, which has no label representation"
     )]
     ComplexAttributeValue,
 
@@ -190,6 +210,22 @@ pub enum Rejection {
     /// ADR-0017's exemplar decision.
     #[error("histogram exemplar(s) dropped: no Prometheus-convention representation")]
     HistogramExemplarsDropped { count: usize },
+
+    /// Informational, not an admission failure: the data point was admitted
+    /// and stored, but its OTLP `as_int` value has a magnitude above 2^53 and
+    /// is not exactly representable as the `f64` the segment format stores, so
+    /// the persisted sample is the nearest `f64` rather than the exact integer.
+    /// `rejected_count()` returns 0 so it never inflates the sender-facing
+    /// rejected-points count. Emitting it makes the (given `f64`-only storage,
+    /// unavoidable) approximation visible rather than silent, per the
+    /// "exact semantics by default; approximation is opt-in and visible"
+    /// invariant. `value` is the original integer; the stored `f64` is shown
+    /// in the message.
+    #[error(
+        "integer value {value} has magnitude above 2^53 and was stored as the nearest f64 {}",
+        *value as f64
+    )]
+    IntegerValuePrecisionLoss { value: i64 },
 }
 
 impl Rejection {
@@ -205,7 +241,8 @@ impl Rejection {
             | Rejection::UnsupportedMetricType { count, .. }
             | Rejection::UnsupportedTemporality { count } => *count,
             Rejection::HistogramMinMaxDropped { .. }
-            | Rejection::HistogramExemplarsDropped { .. } => 0,
+            | Rejection::HistogramExemplarsDropped { .. }
+            | Rejection::IntegerValuePrecisionLoss { .. } => 0,
             _ => 1,
         }
     }

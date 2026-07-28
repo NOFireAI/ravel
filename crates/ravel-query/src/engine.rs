@@ -1267,9 +1267,10 @@ mod prefetch_tests {
     const NS_PER_SEC: i64 = 1_000_000_000;
     const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
     const BASE_NS: i64 = 1_700_000_000_000_000_000;
-    // Matches `ravel_promql::eval::DEFAULT_LOOKBACK_NS`, not exported from
-    // that crate; a hand-built plan has to supply its own range_ns.
-    const DEFAULT_LOOKBACK_NS: i64 = 5 * NS_PER_MIN;
+    // Single source of truth for the lookback delta lives in ravel-promql
+    // (the evaluator owns the semantic). A hand-built plan reuses it so the
+    // test window can never drift from what the evaluator selects (a6-F02).
+    const DEFAULT_LOOKBACK_NS: i64 = ravel_promql::DEFAULT_LOOKBACK_NS;
 
     fn labels(metric: &str) -> LabelSet {
         LabelSet::new(vec![Label {
@@ -1470,6 +1471,42 @@ mod prefetch_tests {
                 .expect("query empty source")
                 .is_empty(),
             "no plans means no series, regardless of matchers"
+        );
+    }
+
+    /// a6-F02: the pre-fetch padding (`padded_range`) and the evaluator's
+    /// lookback window must be one and the same value. Both now derive from
+    /// the single `ravel_promql::DEFAULT_LOOKBACK_NS` constant; this pins the
+    /// link so a future change to that constant moves the engine's fetch
+    /// window with it instead of silently under- or over-fetching the left
+    /// edge of the lookback window.
+    #[test]
+    fn prefetch_padding_matches_evaluator_lookback_delta() {
+        // `plan_selectors` builds the same plan the engine feeds to
+        // `selector_fetch_window` in production; a bare selector's own range
+        // is exactly the evaluator's lookback delta.
+        let plans = plan_selectors("http_requests_total", 0, 0).expect("plan bare selector");
+        assert_eq!(plans.len(), 1, "one selector, one plan");
+        assert_eq!(
+            plans[0].range_ns,
+            ravel_promql::DEFAULT_LOOKBACK_NS,
+            "the selector's fetch range must be the evaluator's lookback delta"
+        );
+
+        // The padded fetch window an instant query resolves extends left by
+        // exactly that delta off the evaluation instant, so the evaluator can
+        // never select a sample the source did not fetch.
+        let sel_ts = BASE_NS;
+        let window = selector_fetch_window(&plans[0], &EvalWindow::Instant { t_ns: sel_ts })
+            .expect("instant fetch window");
+        assert_eq!(
+            window.end_ns, sel_ts,
+            "instant window ends at the eval instant"
+        );
+        assert_eq!(
+            window.start_ns,
+            sel_ts - ravel_promql::DEFAULT_LOOKBACK_NS,
+            "the fetch window's left extent is the shared lookback delta"
         );
     }
 }

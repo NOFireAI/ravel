@@ -1,0 +1,33 @@
+total_size: 456
+trailer_offset: 440
+version: 3
+footer_offset: 272
+tenant_hash: efefefefefefefefefefefefefefefef
+shard: 7
+writer_id: golden-v3-writer
+writer_epoch: 3
+writer_seq: 90
+min_event_ts_ns: 0
+max_event_ts_ns: 4000
+min_ingest_ts_ns: -5000
+max_ingest_ts_ns: 20000
+sample_count: 7
+series_count (footer): 3
+sections:
+  kind=1 name=LABEL_DICT offset=0 len=61 uncompressed_len=52 comp=2
+  kind=5 name=SERIES_IDS offset=61 len=52 uncompressed_len=52 comp=0
+  kind=6 name=SERIES_META offset=113 len=61 uncompressed_len=59 comp=2
+  kind=3 name=TS_PAGES offset=174 len=29 uncompressed_len=29 comp=0
+  kind=4 name=VAL_PAGES offset=208 len=32 uncompressed_len=32 comp=0
+  kind=7 name=HIST_PAGES offset=240 len=32 uncompressed_len=32 comp=0
+schema_count (derived): 1
+  schema[0]: __name__
+series_count (decoded): 3
+series:
+  series_id=07070707070707070707070707070707 labels=__name__=up sample_count=5 min_ts_ns=0 max_ts_ns=4000 value_kind=VAL_SCALAR ts_range=[174, 189) val_range=[208, 223)
+  series_id=08080808080808080808080808080808 labels=__name__=latency_histogram sample_count=1 min_ts_ns=0 max_ts_ns=0 value_kind=HIST_SPANS ts_range=[189, 196) hist_range=[240, 272)
+    hist[0]: ts_ns=0 scale=1 zero_threshold=0.000000001 sum=4.5 reset_hint=UNKNOWN
+      count_kind=INT zero_count=1 count=5
+      positive: spans=[(0, 2)] counts=[2,2]
+      negative: spans=[] counts=[]
+  series_id=09090909090909090909090909090909 labels=__name__=cpu_seconds_total sample_count=1 min_ts_ns=42 max_ts_ns=42 value_kind=VAL_SCALAR ts_range=[196, 203) val_range=[226, 240) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=3)
