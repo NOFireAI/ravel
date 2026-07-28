@@ -293,8 +293,8 @@ golden_case!(
 
 /// Encode determinism: the same logical input encoded twice produces
 /// byte-identical output (no nondeterministic iteration order leaking into
-/// LABEL_DICT's first-occurrence order, HashMap-based schema dedup, or
-/// anything else on the v2 path).
+/// LABEL_DICT's sorted order, HashMap-based schema dedup, or anything else
+/// on the v2 path).
 #[test]
 fn write_v2_is_deterministic_across_repeated_calls() {
     let first = SegmentWriter::write_v2(multi_schema_series(), fixed_identity(), fixed_bounds())

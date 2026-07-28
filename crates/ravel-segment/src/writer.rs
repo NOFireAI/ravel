@@ -356,8 +356,11 @@ impl SegmentWriter {
     /// docs/segment-format.md "RSEG v2 amendment"). Same writer edge rules
     /// as `write` (zero-sample series dropped, duplicate ids rejected, an
     /// empty segment records bounds = 0); v2 changes only the catalog
-    /// layout: LABEL_DICT drops the distinct-string sort (first-occurrence
-    /// order instead), SERIES_TABLE is replaced by SERIES_IDS + SERIES_META
+    /// layout: LABEL_DICT keeps v1's distinct-string sort (issue #146
+    /// restored it; the v2 ordering rule stays relaxed so readers never
+    /// depend on order, but the writer emits sorted ordinals because it
+    /// compresses far better -- docs/segment-format.md), SERIES_TABLE is
+    /// replaced by SERIES_IDS + SERIES_META
     /// (a schema dictionary plus 9 columnar blocks), and VAL_PAGES gains an
     /// 8-byte alignment rule for VAL_RAW_F64 page payloads. Page format,
     /// page encodings, sample ordering, and the raw-fallback rule are
@@ -1410,12 +1413,13 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, WriteError> {
 // are called from here and none of them are edited, so the v1 code path
 // above stays trivially provable as byte-identical by inspection. ---
 
-/// v2 dictionary build result: strings in first-occurrence (interner)
-/// order -- no distinct-string sort, unlike v1's `Dictionary` -- plus the
-/// same per-occurrence ordinal resolution and dictionary size.
+/// v2 dictionary build result: distinct non-`__name__` strings in sorted
+/// order (issue #146 restored v1's sort; the v2 ordering rule stays relaxed
+/// but the sorted dictionary compresses far better), plus the same
+/// per-occurrence ordinal resolution and dictionary size.
 struct DictionaryV2<'a> {
-    /// Distinct non-`__name__` strings in first-occurrence order
-    /// (ordinals 1..).
+    /// Distinct non-`__name__` strings in sorted order (ordinals 1..),
+    /// the same rank scheme v1's `Dictionary::sorted_non_name` uses.
     order: Vec<&'a str>,
     /// On-disk ordinal for every occurrence, aligned with iterating
     /// `series` and each series' labels in order (same shape as v1's
@@ -1425,39 +1429,38 @@ struct DictionaryV2<'a> {
     count: u32,
 }
 
-/// Ordinal 0 is always `"__name__"` (explicit special case, independent of
-/// interning order, exactly like v1's `build_dictionary`). Every other
-/// distinct string gets the next ordinal the first time it is seen, in
-/// series-then-label iteration order: no sort, unlike v1. This is the
-/// "no distinct-string sort" rule from the v2 LABEL_DICT ordering
-/// amendment; it is also why `__name__` must be pre-seeded into the
-/// interner before the loop starts, rather than special-cased afterward
-/// as v1 does with its sort-then-rank pass.
+/// Ordinal 0 is always `"__name__"` (forced during the rank pass, exactly
+/// like v1's `build_dictionary`); every other distinct string is assigned an
+/// ordinal in sorted order (issue #146). Interning runs first in
+/// series-then-label iteration order to resolve each occurrence to a
+/// pre-rank distinct index, then a single sort-then-rank pass -- the same
+/// big-endian 8-byte prefix key scheme v1 uses -- assigns the final sorted
+/// ordinals and remaps every occurrence. The v2 LABEL_DICT ordering rule
+/// stays relaxed (readers never depend on order), but the sorted dictionary
+/// compresses far better (issue #93 measured +532% compressed bytes for the
+/// old first-occurrence order).
 fn build_dictionary_v2(series: &[SeriesInput]) -> Result<DictionaryV2<'_>, WriteError> {
     let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
-    // Pre-size the interner to the occurrence upper bound (`+1` for the
-    // preseeded __name__) and the schema memo to a bounded distinct-schema
-    // estimate, to avoid rehash growth (issue #95). `order` is left to grow:
-    // it holds one entry per distinct string, well below `total_strings`, so
-    // reserving the upper bound commits far more pages than it fills and costs
-    // more than the doubling reallocs it would avoid (measured on the bench
-    // host).
+    // `interner` is pre-sized to the occurrence upper bound (distinct count
+    // <= occurrences) and the schema memo to a bounded distinct-schema
+    // estimate, to avoid rehash growth (issue #95). `distinct` is left to
+    // grow: it holds one entry per distinct string, well below
+    // `total_strings`, so reserving the upper bound commits far more pages
+    // than it fills (measured on the bench host).
     let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
-        HashMap::with_capacity_and_hasher(total_strings + 1, BuildHasherDefault::default());
-    interner.insert(METRIC_NAME_LABEL, 0);
+        HashMap::with_capacity_and_hasher(total_strings, BuildHasherDefault::default());
+    let mut distinct: Vec<&str> = Vec::new();
 
     // Schema-keyed name interning (issue #95): a series' ordered label-name
-    // list is memoized to the ordinals it resolved to, so a repeat schema
-    // does one map lookup instead of one interner probe per name. `write_v2`
-    // sorts the batch by series id, so equal schemas are not adjacent; the
-    // memo is a content-keyed map, never a last-seen check.
+    // list is memoized to the pre-rank distinct indices it resolved to, so a
+    // repeat schema does one map lookup instead of one interner probe per
+    // name. `write_v2` sorts the batch by series id, so equal schemas are not
+    // adjacent; the memo is a content-keyed map, never a last-seen check.
     //
-    // First-occurrence ordinal order is the v2 LABEL_DICT order and MUST stay
-    // byte-identical. The fast path is only taken when the schema was seen
-    // before, which means every one of its names is already interned, so it
-    // assigns no new name ordinals; it interns the values in the same
-    // interleaved order the slow path uses. The sequence of newly assigned
-    // ordinals is therefore identical to the original single-pass loop.
+    // The memo cannot change the emitted bytes: it records pre-rank distinct
+    // indices, every occurrence is remapped through the same sorted-rank
+    // table below, and the fast path interns each schema's values in the same
+    // interleaved order the slow path uses. This mirrors v1's memo exactly.
     let mut schema_memo: HashMap<Vec<&str>, Vec<u32>, BuildHasherDefault<FnvHasher>> =
         HashMap::with_capacity_and_hasher(
             schema_memo_capacity(series),
@@ -1465,40 +1468,23 @@ fn build_dictionary_v2(series: &[SeriesInput]) -> Result<DictionaryV2<'_>, Write
         );
     let mut name_key: Vec<&str> = Vec::new();
 
-    let mut order: Vec<&str> = Vec::new();
     let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
-    let mut next_ordinal: u32 = 1;
 
     for s in series {
         name_key.clear();
         name_key.extend(s.labels.iter().map(|l| l.name.as_str()));
 
         if let Some(name_ords) = schema_memo.get(name_key.as_slice()) {
-            for (label, &name_ord) in s.labels.iter().zip(name_ords.iter()) {
-                occurrence_ordinals.push(name_ord);
-                let value_id = intern_v2(
-                    &mut interner,
-                    &mut order,
-                    &mut next_ordinal,
-                    label.value.as_str(),
-                )?;
+            for (label, &name_id) in s.labels.iter().zip(name_ords.iter()) {
+                occurrence_ordinals.push(name_id);
+                let value_id = intern_dict(&mut interner, &mut distinct, label.value.as_str())?;
                 occurrence_ordinals.push(value_id);
             }
         } else {
             let mut name_ords: Vec<u32> = Vec::with_capacity(s.labels.len());
             for label in s.labels.iter() {
-                let name_id = intern_v2(
-                    &mut interner,
-                    &mut order,
-                    &mut next_ordinal,
-                    label.name.as_str(),
-                )?;
-                let value_id = intern_v2(
-                    &mut interner,
-                    &mut order,
-                    &mut next_ordinal,
-                    label.value.as_str(),
-                )?;
+                let name_id = intern_dict(&mut interner, &mut distinct, label.name.as_str())?;
+                let value_id = intern_dict(&mut interner, &mut distinct, label.value.as_str())?;
                 occurrence_ordinals.push(name_id);
                 occurrence_ordinals.push(value_id);
                 name_ords.push(name_id);
@@ -1507,34 +1493,82 @@ fn build_dictionary_v2(series: &[SeriesInput]) -> Result<DictionaryV2<'_>, Write
         }
     }
 
+    let (order, rank, count) = sort_and_rank_dict(&distinct)?;
+
+    let occurrence_ordinals = occurrence_ordinals
+        .into_iter()
+        .map(|id| rank[id as usize])
+        .collect();
+
     Ok(DictionaryV2 {
         order,
         occurrence_ordinals,
-        count: next_ordinal,
+        count,
     })
 }
 
-/// Interns one string into the v2 dictionary interner, returning its on-disk
-/// ordinal. New strings are appended to `order` (first-occurrence order,
-/// which is the v2 LABEL_DICT order) and assigned the next ordinal.
-/// `__name__` is preseeded to ordinal 0 by the caller, so it is never
-/// appended here. Extracted so the schema-memo fast and slow paths share one
-/// probe implementation.
+/// Sorts the distinct pre-rank strings and assigns sorted ordinals, `__name__`
+/// pinned to 0, using the same big-endian 8-byte prefix key scheme v1's
+/// `build_dictionary` uses (via the shared, version-agnostic `prefix_key`
+/// sort-key helper). Returns the sorted non-`__name__` strings (in ordinal
+/// order), a pre-rank-index-to-sorted-ordinal table, and the dictionary size
+/// (including ordinal 0). Shared by the v2 and v3 dictionary builds; v1 keeps
+/// its own inline copy so its path stays trivially provable as untouched by
+/// inspection.
+fn sort_and_rank_dict<'a>(
+    distinct: &[&'a str],
+) -> Result<(Vec<&'a str>, Vec<u32>, u32), WriteError> {
+    let mut order: Vec<(u64, u32)> = distinct
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (prefix_key(s), i as u32))
+        .collect();
+    order.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| distinct[a.1 as usize].cmp(distinct[b.1 as usize]))
+    });
+
+    let mut rank = vec![0u32; distinct.len()];
+    let mut next: u32 = 1;
+    for &(_, id) in &order {
+        if distinct[id as usize] == METRIC_NAME_LABEL {
+            rank[id as usize] = 0;
+        } else {
+            rank[id as usize] = next;
+            next = next.checked_add(1).ok_or(WriteError::TooManyDictStrings)?;
+        }
+    }
+    // `next` is now the dictionary size including the implicit ordinal 0.
+    let count = next;
+
+    let mut sorted_non_name: Vec<&str> = Vec::with_capacity(order.len());
+    for &(_, id) in &order {
+        let text = distinct[id as usize];
+        if text != METRIC_NAME_LABEL {
+            sorted_non_name.push(text);
+        }
+    }
+
+    Ok((sorted_non_name, rank, count))
+}
+
+/// Interns one string into a v2/v3 dictionary interner, returning its
+/// pre-rank distinct index (not the final ordinal; the sort-then-rank pass
+/// assigns those). New strings are appended to `distinct` in first-occurrence
+/// order. Shared by the v2 and v3 dictionary builds; deliberately a copy of
+/// v1's `intern_distinct`, per the frozen-contract discipline that no v2/v3
+/// code calls a v1 function.
 #[inline]
-fn intern_v2<'a>(
+fn intern_dict<'a>(
     interner: &mut HashMap<&'a str, u32, BuildHasherDefault<FnvHasher>>,
-    order: &mut Vec<&'a str>,
-    next_ordinal: &mut u32,
+    distinct: &mut Vec<&'a str>,
     text: &'a str,
 ) -> Result<u32, WriteError> {
     match interner.entry(text) {
         std::collections::hash_map::Entry::Occupied(e) => Ok(*e.get()),
         std::collections::hash_map::Entry::Vacant(e) => {
-            let id = *next_ordinal;
-            *next_ordinal = next_ordinal
-                .checked_add(1)
-                .ok_or(WriteError::TooManyDictStrings)?;
-            order.push(text);
+            let id = u32::try_from(distinct.len()).map_err(|_| WriteError::TooManyDictStrings)?;
+            distinct.push(text);
             e.insert(id);
             Ok(id)
         }
@@ -1542,9 +1576,9 @@ fn intern_v2<'a>(
 }
 
 /// Grammar identical to v1's `encode_label_dict` (count:u32, then
-/// len:varint + UTF-8 bytes per string, `__name__` first); the only
-/// difference is that the remaining strings come from `dict.order`
-/// (first-occurrence order) instead of a sorted list.
+/// len:varint + UTF-8 bytes per string, `__name__` first). `dict.order` is
+/// the sorted non-`__name__` string list (issue #146), the same order v1
+/// emits.
 fn encode_label_dict_v2(dict: &DictionaryV2<'_>) -> Result<Vec<u8>, WriteError> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&dict.count.to_le_bytes());
@@ -1853,48 +1887,49 @@ fn zstd_compress_v2(data: &[u8]) -> Result<Vec<u8>, WriteError> {
 // (section 3.3), but still get their own copies here per that same
 // discipline. ---
 
-/// Identical grammar and first-occurrence-order rule as v2's
-/// `DictionaryV2` (section 3.3: "unchanged from v2").
+/// Identical grammar and sorted-order rule as v2's `DictionaryV2` (section
+/// 3.3: LABEL_DICT "unchanged from v2"; issue #146 restored the sort in
+/// both).
 struct DictionaryV3<'a> {
+    /// Distinct non-`__name__` strings in sorted order (ordinals 1..).
     order: Vec<&'a str>,
     occurrence_ordinals: Vec<u32>,
     count: u32,
 }
 
+/// Interns every occurrence to a pre-rank distinct index in series-then-label
+/// iteration order, then assigns sorted ordinals via the shared
+/// `sort_and_rank_dict` pass (`__name__` pinned to 0), the same scheme as
+/// `build_dictionary_v2`. LABEL_DICT is "unchanged from v2" (section 3.3), so
+/// this inherits the issue #146 sort. v3 has no schema memo: it stores no
+/// SERIES_META schema dictionary keyed on name ordinals the way v2's builder
+/// does, so the plain single-pass interner is used.
 fn build_dictionary_v3(series: &[SeriesInputV3]) -> Result<DictionaryV3<'_>, WriteError> {
     let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
     let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
-        HashMap::with_capacity_and_hasher(total_strings + 1, BuildHasherDefault::default());
-    interner.insert(METRIC_NAME_LABEL, 0);
-
-    let mut order: Vec<&str> = Vec::new();
+        HashMap::with_capacity_and_hasher(total_strings, BuildHasherDefault::default());
+    let mut distinct: Vec<&str> = Vec::new();
     let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
-    let mut next_ordinal: u32 = 1;
 
     for s in series {
         for label in s.labels.iter() {
             for text in [label.name.as_str(), label.value.as_str()] {
-                let id = match interner.entry(text) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let id = next_ordinal;
-                        next_ordinal = next_ordinal
-                            .checked_add(1)
-                            .ok_or(WriteError::TooManyDictStrings)?;
-                        order.push(text);
-                        e.insert(id);
-                        id
-                    }
-                };
-                occurrence_ordinals.push(id);
+                occurrence_ordinals.push(intern_dict(&mut interner, &mut distinct, text)?);
             }
         }
     }
 
+    let (order, rank, count) = sort_and_rank_dict(&distinct)?;
+
+    let occurrence_ordinals = occurrence_ordinals
+        .into_iter()
+        .map(|id| rank[id as usize])
+        .collect();
+
     Ok(DictionaryV3 {
         order,
         occurrence_ordinals,
-        count: next_ordinal,
+        count,
     })
 }
 
@@ -2787,17 +2822,23 @@ mod v2_tests {
 
     #[test]
     fn schema_name_ord_follows_name_byte_order_not_ordinal_order() {
-        // Series A interns "zone" (and its value) first, claiming a low
-        // ordinal for a name that sorts *last* among {app, region, zone}
-        // by byte comparison. Series B then uses all three names
-        // together. A writer that derived a schema's name_ord sequence by
-        // sorting ordinal *values* (instead of reusing the label list's
-        // own name-byte order, which `LabelSet::new` already established
-        // in crates/ravel-types) would silently reorder series B's label
-        // pairs here and corrupt canonical series identity (ADR-0005).
-        // This is invisible to a v1-vs-v2 roundtrip test because a writer
-        // and a hypothetical reader sharing the same wrong assumption
-        // round-trip perfectly with each other.
+        // Series A interns "zone" (and its value) first; series B then uses
+        // all three names {app, region, zone} together. The writer must
+        // derive series B's schema name_ord sequence from the label list's
+        // own name-byte order (which `LabelSet::new` already established in
+        // crates/ravel-types), never by sorting ordinal values -- doing the
+        // latter would silently reorder series B's label pairs and corrupt
+        // canonical series identity (ADR-0005). This is invisible to a
+        // v1-vs-v2 roundtrip test because a writer and a hypothetical reader
+        // sharing the same wrong assumption round-trip perfectly.
+        //
+        // Issue #146 restored v1's LABEL_DICT sort, so ordinal order once
+        // again coincides with name-byte order; the two can no longer
+        // diverge in the emitted bytes. The docs' relaxed ordering rule
+        // keeps the landmine live for any future writer that unsorts, so
+        // this test still pins the writer's *method* (materialize schema
+        // and value ordinals from the label list, positionally), which is
+        // what actually guards identity regardless of dictionary order.
         let series_a = SeriesInput {
             series_id: SeriesId([0x01; 16]),
             labels: LabelSet::new(vec![Label {
@@ -2860,16 +2901,16 @@ mod v2_tests {
             .expect("ordinal fits u32")
         };
 
-        // Sanity check the scenario actually exercises the landmine:
-        // zone's ordinal must be lower than app's and region's (it was
-        // interned first, by series A), even though zone sorts last by
-        // name bytes.
+        // With the restored sort (issue #146), ordinals follow name-byte
+        // order: app < region < zone, regardless of interning order. This
+        // confirms the v2 dictionary is sorted, the same invariant the
+        // dedicated sorted-dict test asserts.
         let ordinal_zone = ord("zone");
         let ordinal_app = ord("app");
         let ordinal_region = ord("region");
         assert!(
-            ordinal_zone < ordinal_app && ordinal_zone < ordinal_region,
-            "test setup did not create the intended ordinal/name-byte divergence"
+            ordinal_app < ordinal_region && ordinal_region < ordinal_zone,
+            "v2 LABEL_DICT must be sorted: app < region < zone by name bytes"
         );
 
         let meta_desc = section_desc(&footer, section_kind::SERIES_META);
@@ -2890,16 +2931,18 @@ mod v2_tests {
             vec![ordinal_zone]
         );
 
-        // Series B's schema MUST be in name-byte order (app, region,
-        // zone), i.e. [ordinal_app, ordinal_region, ordinal_zone] -- NOT
-        // ascending by ordinal value, which would incorrectly be
-        // [ordinal_zone, ordinal_app, ordinal_region].
+        // Series B's schema MUST be materialized in the label list's
+        // name-byte order (app, region, zone), i.e. [ordinal_app,
+        // ordinal_region, ordinal_zone]. With the sorted dictionary this
+        // also happens to be ascending ordinal order, but the writer must
+        // reach it from the label list, never from the input insertion
+        // order (zone, app, region), which would give the wrong pairing.
         let schema_b = &meta.schemas[meta.schema_ref[series_b_idx] as usize];
         assert_eq!(
             schema_b,
             &vec![ordinal_app, ordinal_region, ordinal_zone],
-            "schema name_ord sequence must follow name-byte order (app, region, zone), \
-             not ordinal-value order"
+            "schema name_ord sequence must follow the label list's name-byte order \
+             (app, region, zone)"
         );
 
         // And the value ordinals must stay glued to their own name in
@@ -2911,6 +2954,70 @@ mod v2_tests {
             &vec![ord("a1"), ord("r1"), ord("z2")],
             "value_ord must stay positionally paired with its own schema name, in the \
              same name-byte order"
+        );
+    }
+
+    /// Issue #146: the v2 writer emits LABEL_DICT with `__name__` pinned at
+    /// ordinal 0 and every other distinct string in sorted (byte) order,
+    /// restoring v1's dictionary sort. The inputs are chosen so
+    /// first-occurrence interning order differs from sorted order, so a
+    /// writer that skipped the sort would fail this.
+    #[test]
+    fn v2_label_dict_is_sorted() {
+        let mk = |id: u8, metric: &str, k: &str, v: &str| SeriesInput {
+            series_id: SeriesId([id; 16]),
+            labels: LabelSet::new(vec![
+                Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: metric.to_string(),
+                },
+                Label {
+                    name: k.to_string(),
+                    value: v.to_string(),
+                },
+            ])
+            .expect("valid labels"),
+            samples: vec![Sample {
+                ts_ns: 0,
+                value: 1.0,
+            }],
+        };
+        // Distinct non-name strings appear in interning order
+        // zeta, zzz, yyy, alpha, aaa, bbb, mu, mmm, nnn; sorted order leads
+        // with "aaa", so the two orders genuinely differ.
+        let series = vec![
+            mk(0x01, "zeta", "zzz", "yyy"),
+            mk(0x02, "alpha", "aaa", "bbb"),
+            mk(0x03, "mu", "mmm", "nnn"),
+        ];
+        let written =
+            SegmentWriter::write_v2(series, test_identity(), test_bounds()).expect("writes");
+        let object = written.bytes.as_ref();
+        let footer = decode_footer(object);
+        let dict_desc = section_desc(&footer, section_kind::LABEL_DICT);
+        let dict_raw = decompress_section(
+            section(object, &footer, section_kind::LABEL_DICT),
+            dict_desc.uncompressed_len,
+        );
+        let dict = parse_label_dict(&dict_raw);
+
+        assert_eq!(
+            dict[0].as_str(),
+            METRIC_NAME_LABEL,
+            "__name__ pinned at ordinal 0"
+        );
+        let rest = &dict[1..];
+        let mut expected = rest.to_vec();
+        expected.sort();
+        assert_eq!(
+            rest,
+            expected.as_slice(),
+            "v2 LABEL_DICT past ordinal 0 must be byte-sorted (issue #146)"
+        );
+        assert_ne!(
+            rest[0].as_str(),
+            "zeta",
+            "test setup must make sorted order differ from first-occurrence order"
         );
     }
 
@@ -3373,6 +3480,83 @@ mod v3_tests {
 
     fn decompress_section(stored: &[u8], uncompressed_len: u64) -> Vec<u8> {
         zstd::bulk::decompress(stored, uncompressed_len as usize).expect("zstd decompresses")
+    }
+
+    fn parse_label_dict(raw: &[u8]) -> Vec<String> {
+        let count = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes")) as usize;
+        let mut pos = 4usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = read_uvarint(raw, &mut pos).expect("varint") as usize;
+            let s = std::str::from_utf8(&raw[pos..pos + len])
+                .expect("utf8")
+                .to_string();
+            pos += len;
+            out.push(s);
+        }
+        assert_eq!(pos, raw.len(), "trailing bytes in LABEL_DICT");
+        out
+    }
+
+    /// Issue #146: v3's LABEL_DICT is "unchanged from v2" (section 3.3), so
+    /// it inherits the restored sort -- `__name__` at ordinal 0, every other
+    /// distinct string in sorted (byte) order. Inputs are chosen so
+    /// first-occurrence order differs from sorted order.
+    #[test]
+    fn v3_label_dict_is_sorted() {
+        let mk = |id: u8, metric: &str, k: &str, v: &str| SeriesInputV3 {
+            series_id: SeriesId([id; 16]),
+            labels: LabelSet::new(vec![
+                Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: metric.to_string(),
+                },
+                Label {
+                    name: k.to_string(),
+                    value: v.to_string(),
+                },
+            ])
+            .expect("valid labels"),
+            values: SeriesValues::Scalar(vec![Sample {
+                ts_ns: 0,
+                value: 1.0,
+            }]),
+        };
+        let series = vec![
+            mk(0x01, "zeta", "zzz", "yyy"),
+            mk(0x02, "alpha", "aaa", "bbb"),
+            mk(0x03, "mu", "mmm", "nnn"),
+        ];
+        let written =
+            SegmentWriter::write_v3(series, test_identity(), test_bounds()).expect("writes");
+        let object = written.bytes.as_ref();
+        let footer = decode_footer(object);
+        let dict_desc =
+            section_desc(&footer, section_kind::LABEL_DICT).expect("LABEL_DICT present");
+        let dict_raw = decompress_section(
+            section(object, &footer, section_kind::LABEL_DICT),
+            dict_desc.uncompressed_len,
+        );
+        let dict = parse_label_dict(&dict_raw);
+
+        assert_eq!(
+            dict[0].as_str(),
+            METRIC_NAME_LABEL,
+            "__name__ pinned at ordinal 0"
+        );
+        let rest = &dict[1..];
+        let mut expected = rest.to_vec();
+        expected.sort();
+        assert_eq!(
+            rest,
+            expected.as_slice(),
+            "v3 LABEL_DICT past ordinal 0 must be byte-sorted (unchanged from v2, issue #146)"
+        );
+        assert_ne!(
+            rest[0].as_str(),
+            "zeta",
+            "test setup must make sorted order differ from first-occurrence order"
+        );
     }
 
     struct ParsedSeriesMetaV3 {
