@@ -191,6 +191,25 @@ pub fn engine(store: Arc<dyn ObjectStoreBackend>, catalog: Catalog) -> QueryEngi
     QueryEngine::new(Arc::new(catalog), store, EngineConfig::default())
 }
 
+/// Unwraps an instant-query result this suite expects to be a plain
+/// instant vector (every query here is a bare selector, never a
+/// scalar/string literal), panicking with the actual variant otherwise.
+pub fn expect_vector(value: ravel_promql::Value) -> ravel_promql::InstantVector {
+    match value {
+        ravel_promql::Value::Vector(v) => v,
+        other => panic!("expected instant vector, got {other:?}"),
+    }
+}
+
+/// Unwraps a range-query result this suite expects to be a plain range
+/// matrix, panicking with the actual variant otherwise.
+pub fn expect_matrix(value: ravel_promql::Value) -> ravel_promql::RangeMatrix {
+    match value {
+        ravel_promql::Value::Matrix(m) => m,
+        other => panic!("expected range matrix, got {other:?}"),
+    }
+}
+
 /// Grace window + max flush lifetime for orphan GC, in milliseconds
 /// (docs/consistency-model.md "Deletion and GC"): defaults 24h + 1h.
 #[derive(Debug, Clone, Copy)]

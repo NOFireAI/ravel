@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    TestClock, catalog, commit_and_trailer_versions, engine, make_point, publish_segment,
-    series_input, tenant,
+    TestClock, catalog, commit_and_trailer_versions, engine, expect_matrix, make_point,
+    publish_segment, series_input, tenant,
 };
 use ravel_ingest::{IngestConfig, IngestRouter, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
@@ -188,8 +188,8 @@ async fn run_mixed_population_case(v1_writer_seq: u64, v2_writer_seq: u64, expec
     let cat = catalog(Arc::clone(&store), 1);
     let eng = engine(store, cat);
     let now_ns = t2 + NS_PER_MIN;
-    let matrix = eng
-        .range(
+    let matrix = expect_matrix(
+        eng.range(
             tid.hash(),
             "mixed_metric",
             t0 / 1_000_000,
@@ -200,7 +200,8 @@ async fn run_mixed_population_case(v1_writer_seq: u64, v2_writer_seq: u64, expec
             Duration::from_secs(5),
         )
         .await
-        .expect("range query");
+        .expect("range query"),
+    );
 
     assert_eq!(matrix.len(), 1, "exactly the one merged series, no more");
     let (_labels, samples) = &matrix[0];
