@@ -11,11 +11,13 @@ mod error;
 mod fold;
 mod snapshot;
 mod snapshot_format;
+mod snapshot_resolve;
 
 pub use catalog::Catalog;
 pub use config::{
     CatalogConfig, DEFAULT_CACHE_CAPACITY_PER_TENANT, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
-    DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_INGEST_LAG_NS,
+    DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_HEAD_CACHE_TTL_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS,
+    DEFAULT_MAX_INGEST_LAG_NS, DEFAULT_SNAPSHOT_CACHE_PARTS,
 };
 pub use error::CatalogError;
 pub use fold::{FoldReport, Transaction};
