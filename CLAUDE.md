@@ -55,6 +55,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p <your-crate>        # plus --workspace when your change is cross-crate
 ```
 
+While iterating, scope clippy and tests to your crate with `-p`; run the
+full set above exactly once, immediately before the commit. Where
+cargo-nextest is installed, `cargo nextest run` is an accepted
+equivalent of `cargo test` (CI's check job runs it with the `ci`
+profile); doctests still need `cargo test --doc`.
+
 ## Commits
 
 Conventional Commits: imperative header <=72 chars (feat/fix/docs/test/

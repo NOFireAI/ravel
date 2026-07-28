@@ -112,6 +112,13 @@ tempfile = "3"
 # profile.dev, so this covers every test binary too.
 debug = "line-tables-only"
 
+[profile.ci]
+# Gate runs on CI runners and fleet executors: no debug info at all, for
+# faster codegen and smaller artifacts. Backtraces there are read from
+# panic messages and test names, not debuggers.
+inherits = "dev"
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
