@@ -3865,6 +3865,7 @@ dependencies = [
  "clap",
  "opentelemetry-proto",
  "prost",
+ "rand 0.10.2",
  "ravel-catalog",
  "ravel-ingest",
  "ravel-object-store",
@@ -3881,6 +3882,7 @@ dependencies = [
  "tonic-prost",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -30,7 +30,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
-use ravel_server::{Mode, Running, ServerConfig};
+use ravel_server::{FoldTaskConfig, Mode, Running, ServerConfig};
 use ravel_types::TenantId;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -123,6 +123,11 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
     };
     let running = ravel_server::start(config, store_dyn)
         .await
