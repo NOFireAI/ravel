@@ -103,6 +103,11 @@ path = "src/bin/catalog_resolve_bench.rs"
 bench = false
 
 [[bin]]
+name = "selective_read_accounting"
+path = "src/bin/selective_read_accounting.rs"
+bench = false
+
+[[bin]]
 name = "parquet_baseline"
 path = "src/bin/parquet_baseline.rs"
 required-features = ["parquet-baseline"]
