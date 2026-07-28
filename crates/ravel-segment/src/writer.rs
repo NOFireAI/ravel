@@ -12,8 +12,8 @@ use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId};
 use crate::crc::{footer_crc, page_crc};
 use crate::error::WriteError;
 use crate::format::{
-    MAGIC, RESERVED, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, ZSTD_LEVEL, compression,
-    page_comp, page_enc, section_kind,
+    MAGIC, RESERVED, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, VERSION_V4, ZSTD_LEVEL,
+    compression, page_comp, page_enc, section_kind,
 };
 use crate::gorilla::encode_gorilla_into;
 use crate::histogram::{HistogramValue, encode_histogram_record_into};
@@ -128,6 +128,58 @@ pub struct SeriesInputV3 {
     pub series_id: SeriesId,
     pub labels: LabelSet,
     pub values: SeriesValues,
+}
+
+/// One run's provenance, event-time bounds, and pre-encoded page bytes for
+/// RSEG v4 (docs/compaction-retention-plan.md section 4). `ts_page` and
+/// `value_page` are fully framed (6-byte page header -- enc, comp,
+/// crc32c -- then payload) exactly as read from an input object;
+/// `write_v4` never decodes or re-encodes them, only copies them
+/// verbatim into the output's page sections.
+#[derive(Debug, Clone)]
+pub struct RunInputV4 {
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    pub min_ts_ns: i64,
+    pub max_ts_ns: i64,
+    pub sample_count: u32,
+    pub ts_page: Vec<u8>,
+    pub value_page: RunValuePageV4,
+}
+
+/// A run's VAL or HIST page, fully framed. The variant fixes the owning
+/// series' `value_kind` for its whole life (docs/rseg-v3-plan.md section
+/// 3.4, generalized to run granularity in v4); mixing variants within one
+/// series is rejected (`WriteError::MixedValueKindInSeries`).
+#[derive(Debug, Clone)]
+pub enum RunValuePageV4 {
+    Scalar(Vec<u8>),
+    Histogram(Vec<u8>),
+}
+
+/// One series' identity, labels, and ordered run list for RSEG v4.
+/// Deliberately a separate type from [`SeriesInputV3`]: a v4 caller
+/// (`ravel-maintain`) supplies pre-encoded run pages copied verbatim from
+/// input objects, never raw samples.
+#[derive(Debug)]
+pub struct SeriesInputV4 {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub runs: Vec<RunInputV4>,
+}
+
+/// Compaction-specific Footer provenance a caller supplies (ADR-0018).
+/// `base_created_unix_ns` is deliberately excluded: `write_v4` derives it
+/// itself as the min `created_unix_ns` over all runs, the same way
+/// `min_event_ts_ns` is derived from run bounds rather than taken from the
+/// caller.
+#[derive(Debug, Clone)]
+pub struct CompactionMetaV4 {
+    pub ingest_hour_bucket: u32,
+    pub input_set_hash: [u8; 32],
+    pub part_index: u32,
+    pub level: u32,
 }
 
 /// Builds RSEG v1 metric segment objects. Stateless; `write` is the entire
@@ -268,6 +320,8 @@ impl SegmentWriter {
             sample_count,
             series_count,
             sections,
+            // v1/v2/v3 never populate the v4 compaction-provenance fields.
+            ..Default::default()
         };
 
         let footer_bytes = footer.encode_to_vec();
@@ -475,6 +529,8 @@ impl SegmentWriter {
             sample_count,
             series_count,
             sections,
+            // v1/v2/v3 never populate the v4 compaction-provenance fields.
+            ..Default::default()
         };
 
         let footer_bytes = footer.encode_to_vec();
@@ -694,6 +750,8 @@ impl SegmentWriter {
             sample_count,
             series_count,
             sections,
+            // v1/v2/v3 never populate the v4 compaction-provenance fields.
+            ..Default::default()
         };
 
         let footer_bytes = footer.encode_to_vec();
@@ -712,6 +770,265 @@ impl SegmentWriter {
         object.extend_from_slice(&footer_len.to_le_bytes());
         object.extend_from_slice(&crc.to_le_bytes());
         object.extend_from_slice(&VERSION_V3.to_le_bytes());
+        object.push(SIGNAL_METRICS);
+        object.push(RESERVED);
+        object.extend_from_slice(&MAGIC);
+
+        let blake3 = *blake3::hash(&object).as_bytes();
+
+        Ok(WrittenSegment {
+            bytes: Bytes::from(object),
+            summary: SegmentSummary {
+                min_event_ts_ns,
+                max_event_ts_ns,
+                sample_count,
+                series_count,
+                blake3,
+            },
+        })
+    }
+
+    /// Encodes RSEG v4: the L0->L1 compaction multi-run format
+    /// (ADR-0018, docs/compaction-retention-plan.md section 4). A strict
+    /// superset of the real, already-landed v3 (ADR-0017, native
+    /// histograms): SERIES_META's per-series columns become run-major (a
+    /// series holds one or more runs, each with its own dedup-priority
+    /// provenance), and the Footer gains additive compaction-provenance
+    /// fields. This writer never decodes or re-encodes a sample: every
+    /// run's TS/VAL/HIST page bytes are pre-framed by the caller and
+    /// copied verbatim, including v3's HIST_PAGES bytes for histogram
+    /// series, which stay an opaque per-run blob to this writer.
+    ///
+    /// Runs with `sample_count == 0` are dropped; a series left with no
+    /// runs afterward is dropped in turn (mirrors the empty-series rule
+    /// of `write`/`write_v2`/`write_v3`, generalized to run granularity).
+    pub fn write_v4(
+        mut series: Vec<SeriesInputV4>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+    ) -> Result<WrittenSegment, WriteError> {
+        for s in &mut series {
+            s.runs.retain(|r| r.sample_count != 0);
+        }
+        series.retain(|s| !s.runs.is_empty());
+
+        series.sort_unstable_by_key(|s| s.series_id.0);
+        if series
+            .windows(2)
+            .any(|w| w[0].series_id.0 == w[1].series_id.0)
+        {
+            return Err(WriteError::DuplicateSeriesId);
+        }
+
+        for s in &series {
+            u16::try_from(s.labels.len()).map_err(|_| WriteError::TooManyLabels)?;
+
+            let mut has_scalar = false;
+            let mut has_histogram = false;
+            for r in &s.runs {
+                match &r.value_page {
+                    RunValuePageV4::Scalar(_) => has_scalar = true,
+                    RunValuePageV4::Histogram(_) => has_histogram = true,
+                }
+            }
+            if has_scalar && has_histogram {
+                return Err(WriteError::MixedValueKindInSeries);
+            }
+        }
+
+        for s in &mut series {
+            s.runs
+                .sort_by_key(|r| (r.created_unix_ns, r.writer_epoch, r.writer_seq));
+        }
+
+        let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+
+        let mut run_total: u32 = 0;
+        let mut sample_count: u64 = 0;
+        let mut min_event_ts_ns = i64::MAX;
+        let mut max_event_ts_ns = i64::MIN;
+        let mut base_created_unix_ns = i64::MAX;
+        for s in &series {
+            let series_run_count =
+                u32::try_from(s.runs.len()).map_err(|_| WriteError::TooManyRuns)?;
+            run_total = run_total
+                .checked_add(series_run_count)
+                .ok_or(WriteError::TooManyRuns)?;
+            for r in &s.runs {
+                sample_count = sample_count
+                    .checked_add(u64::from(r.sample_count))
+                    .ok_or(WriteError::TooManySamples)?;
+                min_event_ts_ns = min_event_ts_ns.min(r.min_ts_ns);
+                max_event_ts_ns = max_event_ts_ns.max(r.max_ts_ns);
+                base_created_unix_ns = base_created_unix_ns.min(r.created_unix_ns);
+            }
+        }
+        if series.is_empty() {
+            min_event_ts_ns = 0;
+            max_event_ts_ns = 0;
+            base_created_unix_ns = 0;
+        }
+
+        let dict = build_dictionary_v4(&series)?;
+
+        let total_samples =
+            usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
+        let run_total_usize = run_total as usize;
+        let mut ts_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 4);
+        let mut val_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 9);
+        let mut hist_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 32);
+
+        let series_meta_raw = build_series_meta_v4(
+            &series,
+            &dict.occurrence_ordinals,
+            min_event_ts_ns,
+            base_created_unix_ns,
+            run_total,
+            &mut ts_pages,
+            &mut val_pages,
+            &mut hist_pages,
+        )?;
+        let series_ids_raw = encode_series_ids_v4(&series)?;
+        let label_dict_raw = encode_label_dict_v4(&dict)?;
+
+        let label_dict_compressed = zstd_compress_v4(&label_dict_raw)?;
+        let series_meta_compressed = zstd_compress_v4(&series_meta_raw)?;
+
+        let mut object = Vec::with_capacity(
+            label_dict_compressed.len()
+                + series_ids_raw.len()
+                + series_meta_compressed.len()
+                + ts_pages.len()
+                + val_pages.len()
+                + hist_pages.len()
+                + 512,
+        );
+
+        // Physical section order 1, 5, 6, 3, 4, 7 (LABEL_DICT, SERIES_IDS,
+        // SERIES_META, TS_PAGES, VAL_PAGES, HIST_PAGES), unchanged from v3
+        // (section 4: "no new section kind").
+        let label_dict_offset = object.len() as u64;
+        object.extend_from_slice(&label_dict_compressed);
+
+        let series_ids_offset = object.len() as u64;
+        object.extend_from_slice(&series_ids_raw);
+
+        let series_meta_offset = object.len() as u64;
+        object.extend_from_slice(&series_meta_compressed);
+
+        let ts_pages_offset = object.len() as u64;
+        object.extend_from_slice(&ts_pages);
+
+        let mut sections = vec![
+            Section {
+                kind: section_kind::LABEL_DICT,
+                offset: label_dict_offset,
+                len: label_dict_compressed.len() as u64,
+                crc32c: crc32c::crc32c(&label_dict_compressed),
+                comp: compression::ZSTD,
+                uncompressed_len: label_dict_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::SERIES_IDS,
+                offset: series_ids_offset,
+                len: series_ids_raw.len() as u64,
+                crc32c: crc32c::crc32c(&series_ids_raw),
+                comp: compression::NONE,
+                uncompressed_len: series_ids_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::SERIES_META,
+                offset: series_meta_offset,
+                len: series_meta_compressed.len() as u64,
+                crc32c: crc32c::crc32c(&series_meta_compressed),
+                comp: compression::ZSTD,
+                uncompressed_len: series_meta_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::TS_PAGES,
+                offset: ts_pages_offset,
+                len: ts_pages.len() as u64,
+                crc32c: crc32c::crc32c(&ts_pages),
+                comp: compression::NONE,
+                uncompressed_len: ts_pages.len() as u64,
+            },
+        ];
+
+        // VAL_PAGES: present only when at least one series is scalar-kind.
+        if !val_pages.is_empty() {
+            // 8-byte-align the VAL_PAGES section offset, unchanged from
+            // v2/v3.
+            let val_pad = (8 - (object.len() % 8)) % 8;
+            object.extend(std::iter::repeat_n(0u8, val_pad));
+            let val_pages_offset = object.len() as u64;
+            debug_assert_eq!(
+                val_pages_offset % 8,
+                0,
+                "VAL_PAGES section must be 8-byte aligned"
+            );
+            object.extend_from_slice(&val_pages);
+            sections.push(Section {
+                kind: section_kind::VAL_PAGES,
+                offset: val_pages_offset,
+                len: val_pages.len() as u64,
+                crc32c: crc32c::crc32c(&val_pages),
+                comp: compression::NONE,
+                uncompressed_len: val_pages.len() as u64,
+            });
+        }
+
+        // HIST_PAGES: present only when at least one series is
+        // histogram-kind. No alignment requirement, unchanged from v3.
+        if !hist_pages.is_empty() {
+            let hist_pages_offset = object.len() as u64;
+            object.extend_from_slice(&hist_pages);
+            sections.push(Section {
+                kind: section_kind::HIST_PAGES,
+                offset: hist_pages_offset,
+                len: hist_pages.len() as u64,
+                crc32c: crc32c::crc32c(&hist_pages),
+                comp: compression::NONE,
+                uncompressed_len: hist_pages.len() as u64,
+            });
+        }
+
+        let footer = Footer {
+            tenant_hash: identity.tenant_hash.to_vec(),
+            shard: identity.shard,
+            writer_id: identity.writer_id,
+            writer_epoch: identity.writer_epoch,
+            writer_seq: identity.writer_seq,
+            min_event_ts_ns,
+            max_event_ts_ns,
+            min_ingest_ts_ns: ingest_bounds.min_ingest_ts_ns,
+            max_ingest_ts_ns: ingest_bounds.max_ingest_ts_ns,
+            sample_count,
+            series_count,
+            sections,
+            base_created_unix_ns,
+            ingest_hour_bucket: meta.ingest_hour_bucket,
+            input_set_hash: meta.input_set_hash.to_vec(),
+            part_index: meta.part_index,
+            level: meta.level,
+        };
+
+        let footer_bytes = footer.encode_to_vec();
+        let footer_len =
+            u32::try_from(footer_bytes.len()).map_err(|_| WriteError::FooterTooLarge)?;
+        object.extend_from_slice(&footer_bytes);
+
+        let crc = footer_crc(
+            &footer_bytes,
+            footer_len,
+            VERSION_V4,
+            SIGNAL_METRICS,
+            RESERVED,
+        );
+
+        object.extend_from_slice(&footer_len.to_le_bytes());
+        object.extend_from_slice(&crc.to_le_bytes());
+        object.extend_from_slice(&VERSION_V4.to_le_bytes());
         object.push(SIGNAL_METRICS);
         object.push(RESERVED);
         object.extend_from_slice(&MAGIC);
@@ -1893,6 +2210,335 @@ fn build_series_meta_v3(
 /// ticket's constraint that v1/v2 functions are never called from the v3
 /// path.
 fn zstd_compress_v3(data: &[u8]) -> Result<Vec<u8>, WriteError> {
+    zstd::bulk::compress(data, ZSTD_LEVEL).map_err(|e| WriteError::Zstd(e.to_string()))
+}
+
+// --- RSEG v4 only (ADR-0018, docs/compaction-retention-plan.md section 4):
+// multi-run verbatim-copy writer. Deliberately duplicates rather than
+// shares helpers with v1/v2/v3 (same discipline as the `_v3` functions
+// above), so each version's byte-for-byte behavior stays provable by
+// inspection alone. This writer never encodes a sample: TS/VAL/HIST page
+// bytes are already framed by the caller, so there is no "encoding" to
+// duplicate for VAL/HIST -- only page-copy-with-alignment bookkeeping. ---
+
+/// Page header length (enc(1) + comp(1) + crc32c(4)), same framing as
+/// v1/v2/v3. A pre-encoded run page shorter than this cannot be valid.
+const RUN_PAGE_HEADER_LEN_V4: usize = 6;
+
+/// Identical grammar and first-occurrence-order rule as v3's
+/// `DictionaryV3` (section 4: "SERIES_IDS / LABEL_DICT ... as v2/v3").
+struct DictionaryV4<'a> {
+    order: Vec<&'a str>,
+    occurrence_ordinals: Vec<u32>,
+    count: u32,
+}
+
+fn build_dictionary_v4(series: &[SeriesInputV4]) -> Result<DictionaryV4<'_>, WriteError> {
+    let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
+    let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
+        HashMap::with_capacity_and_hasher(total_strings + 1, BuildHasherDefault::default());
+    interner.insert(METRIC_NAME_LABEL, 0);
+
+    let mut order: Vec<&str> = Vec::new();
+    let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
+    let mut next_ordinal: u32 = 1;
+
+    for s in series {
+        for label in s.labels.iter() {
+            for text in [label.name.as_str(), label.value.as_str()] {
+                let id = match interner.entry(text) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let id = next_ordinal;
+                        next_ordinal = next_ordinal
+                            .checked_add(1)
+                            .ok_or(WriteError::TooManyDictStrings)?;
+                        order.push(text);
+                        e.insert(id);
+                        id
+                    }
+                };
+                occurrence_ordinals.push(id);
+            }
+        }
+    }
+
+    Ok(DictionaryV4 {
+        order,
+        occurrence_ordinals,
+        count: next_ordinal,
+    })
+}
+
+/// Grammar identical to v1/v2/v3's label-dict encode (count:u32, then
+/// len:varint + UTF-8 bytes per string, `__name__` first).
+fn encode_label_dict_v4(dict: &DictionaryV4<'_>) -> Result<Vec<u8>, WriteError> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&dict.count.to_le_bytes());
+    write_uvarint(&mut buf, METRIC_NAME_LABEL.len() as u64);
+    buf.extend_from_slice(METRIC_NAME_LABEL.as_bytes());
+    for s in &dict.order {
+        let bytes = s.as_bytes();
+        write_uvarint(&mut buf, bytes.len() as u64);
+        buf.extend_from_slice(bytes);
+    }
+    Ok(buf)
+}
+
+/// SERIES_IDS (kind 5): identical grammar to v2/v3. `series` is already
+/// sorted by `series_id.0` bytes (`write_v4`'s preamble).
+fn encode_series_ids_v4(series: &[SeriesInputV4]) -> Result<Vec<u8>, WriteError> {
+    let count = u32::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+    let mut buf = Vec::with_capacity(4 + series.len() * 16);
+    buf.extend_from_slice(&count.to_le_bytes());
+    for s in series {
+        buf.extend_from_slice(&s.series_id.0);
+    }
+    Ok(buf)
+}
+
+/// Copies one run's pre-framed TS page verbatim into `ts_pages`. TS pages
+/// are never aligned (unchanged from v1/v2/v3); returns the page's byte
+/// length for the caller's `ts_page_len` column.
+fn append_ts_run_page_v4(page: &[u8], ts_pages: &mut Vec<u8>) -> Result<u64, WriteError> {
+    if page.len() < RUN_PAGE_HEADER_LEN_V4 {
+        return Err(WriteError::RunPageTooShort);
+    }
+    ts_pages.extend_from_slice(page);
+    Ok(page.len() as u64)
+}
+
+/// Copies one run's pre-framed VAL page verbatim into `val_pages`,
+/// applying the v2/v3 raw-f64 alignment rule (ADR-0014 section 3.5) by
+/// inspecting the page's own `enc` byte (its first byte) rather than
+/// re-deciding the encoding: this writer never decodes the payload.
+/// Returns the pad length inserted before this page's header (the
+/// caller's `val_page_gap` column); the page itself is copied unmodified,
+/// so its crc32c (bound to series_id/enc/comp/payload, not position)
+/// stays valid.
+fn append_val_run_page_v4(page: &[u8], val_pages: &mut Vec<u8>) -> Result<u64, WriteError> {
+    if page.len() < RUN_PAGE_HEADER_LEN_V4 {
+        return Err(WriteError::RunPageTooShort);
+    }
+    let enc = page[0];
+
+    let mut gap = 0u64;
+    if enc == page_enc::VAL_RAW_F64 {
+        let unaligned_payload_start = val_pages.len() as u64 + RUN_PAGE_HEADER_LEN_V4 as u64;
+        let rem = unaligned_payload_start % 8;
+        if rem != 0 {
+            gap = 8 - rem;
+            val_pages.extend(std::iter::repeat_n(0u8, gap as usize));
+        }
+    }
+
+    val_pages.extend_from_slice(page);
+    Ok(gap)
+}
+
+/// Copies one run's pre-framed HIST page verbatim into `hist_pages`. No
+/// alignment requirement, unchanged from v3 (section 3.2); this writer
+/// treats v3's HIST_PAGES bytes as an opaque per-run blob (never
+/// re-encodes a histogram record).
+fn append_hist_run_page_v4(page: &[u8], hist_pages: &mut Vec<u8>) -> Result<(), WriteError> {
+    if page.len() < RUN_PAGE_HEADER_LEN_V4 {
+        return Err(WriteError::RunPageTooShort);
+    }
+    hist_pages.extend_from_slice(page);
+    Ok(())
+}
+
+/// SERIES_META (kind 6, uncompressed form) for RSEG v4
+/// (docs/compaction-retention-plan.md section 4): v3's series-major
+/// `schema_ref`/`value_ord`/`value_kind` blocks unchanged, plus a new
+/// series-major `run_count` block and a `run_total` header field, then
+/// eight run-major blocks (provenance, sample_count, bounds, and the four
+/// page gap/len pairs) that generalize v3's one-run-per-series columns.
+/// Same schema-dictionary landmine note as `build_series_meta_v3`: a
+/// schema's name_ord sequence is read directly off `s.labels.iter()`
+/// (already sorted by name bytes by `LabelSet::new`), never re-derived by
+/// sorting ordinal values.
+#[allow(clippy::too_many_arguments)]
+fn build_series_meta_v4(
+    series: &[SeriesInputV4],
+    occurrence_ordinals: &[u32],
+    footer_min_event_ts_ns: i64,
+    footer_base_created_unix_ns: i64,
+    run_total: u32,
+    ts_pages: &mut Vec<u8>,
+    val_pages: &mut Vec<u8>,
+    hist_pages: &mut Vec<u8>,
+) -> Result<Vec<u8>, WriteError> {
+    let count = u32::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+
+    let mut schema_index: HashMap<Vec<u32>, u32> = HashMap::new();
+    let mut schemas: Vec<Vec<u32>> = Vec::new();
+
+    let mut col_schema_ref: Vec<u8> = Vec::new();
+    let mut col_value_ord: Vec<u8> = Vec::new();
+    let mut col_value_kind: Vec<u8> = Vec::new();
+    let mut col_run_count: Vec<u8> = Vec::new();
+    let mut col_run_created_delta: Vec<u8> = Vec::new();
+    let mut col_run_epoch: Vec<u8> = Vec::new();
+    let mut col_run_seq: Vec<u8> = Vec::new();
+    let mut col_run_sample_count: Vec<u8> = Vec::new();
+    let mut col_run_min_ts_delta: Vec<u8> = Vec::new();
+    let mut col_run_ts_span: Vec<u8> = Vec::new();
+    let mut col_ts_page_gap: Vec<u8> = Vec::new();
+    let mut col_ts_page_len: Vec<u8> = Vec::new();
+    let mut col_val_page_gap: Vec<u8> = Vec::new();
+    let mut col_val_page_len: Vec<u8> = Vec::new();
+    let mut col_hist_page_gap: Vec<u8> = Vec::new();
+    let mut col_hist_page_len: Vec<u8> = Vec::new();
+
+    let mut next_occurrence = occurrence_ordinals.iter();
+
+    for s in series {
+        let label_count = s.labels.len();
+        let mut name_ords: Vec<u32> = Vec::with_capacity(label_count);
+        let mut value_ords: Vec<u32> = Vec::with_capacity(label_count);
+        let mut prev_name: Option<&str> = None;
+        for label in s.labels.iter() {
+            debug_assert!(
+                prev_name.is_none_or(|prev| prev <= label.name.as_str()),
+                "LabelSet invariant violated: labels not sorted by name bytes"
+            );
+            prev_name = Some(label.name.as_str());
+
+            let name_ord = *next_occurrence
+                .next()
+                .ok_or(WriteError::DictionaryInvariant)?;
+            let value_ord = *next_occurrence
+                .next()
+                .ok_or(WriteError::DictionaryInvariant)?;
+            name_ords.push(name_ord);
+            value_ords.push(value_ord);
+        }
+
+        let schema_ref = match schema_index.get(&name_ords) {
+            Some(&idx) => idx,
+            None => {
+                let idx = u32::try_from(schemas.len()).map_err(|_| WriteError::TooManySchemas)?;
+                schema_index.insert(name_ords.clone(), idx);
+                schemas.push(name_ords);
+                idx
+            }
+        };
+        write_uvarint(&mut col_schema_ref, u64::from(schema_ref));
+        for value_ord in &value_ords {
+            write_uvarint(&mut col_value_ord, u64::from(*value_ord));
+        }
+
+        // Uniform across the series' runs by construction: `write_v4`'s
+        // preamble rejects a mixed-kind series before this function runs.
+        let value_kind: u8 = match s.runs.first().map(|r| &r.value_page) {
+            Some(RunValuePageV4::Histogram(_)) => 1,
+            _ => 0,
+        };
+        col_value_kind.push(value_kind);
+
+        let run_count = u32::try_from(s.runs.len()).map_err(|_| WriteError::TooManyRuns)?;
+        write_uvarint(&mut col_run_count, u64::from(run_count));
+
+        for r in &s.runs {
+            write_uvarint(
+                &mut col_run_created_delta,
+                (i128::from(r.created_unix_ns) - i128::from(footer_base_created_unix_ns)) as u64,
+            );
+            write_uvarint(&mut col_run_epoch, r.writer_epoch);
+            write_uvarint(&mut col_run_seq, r.writer_seq);
+            write_uvarint(&mut col_run_sample_count, u64::from(r.sample_count));
+            write_uvarint(
+                &mut col_run_min_ts_delta,
+                (i128::from(r.min_ts_ns) - i128::from(footer_min_event_ts_ns)) as u64,
+            );
+            write_uvarint(
+                &mut col_run_ts_span,
+                (i128::from(r.max_ts_ns) - i128::from(r.min_ts_ns)) as u64,
+            );
+
+            let ts_page_len = append_ts_run_page_v4(&r.ts_page, ts_pages)?;
+            write_uvarint(&mut col_ts_page_gap, 0);
+            write_uvarint(&mut col_ts_page_len, ts_page_len);
+
+            match &r.value_page {
+                RunValuePageV4::Scalar(page) => {
+                    let val_gap = append_val_run_page_v4(page, val_pages)?;
+                    write_uvarint(&mut col_val_page_gap, val_gap);
+                    write_uvarint(&mut col_val_page_len, page.len() as u64);
+                    write_uvarint(&mut col_hist_page_gap, 0);
+                    write_uvarint(&mut col_hist_page_len, 0);
+                }
+                RunValuePageV4::Histogram(page) => {
+                    append_hist_run_page_v4(page, hist_pages)?;
+                    write_uvarint(&mut col_val_page_gap, 0);
+                    write_uvarint(&mut col_val_page_len, 0);
+                    write_uvarint(&mut col_hist_page_gap, 0);
+                    write_uvarint(&mut col_hist_page_len, page.len() as u64);
+                }
+            }
+        }
+    }
+
+    let schema_count = u32::try_from(schemas.len()).map_err(|_| WriteError::TooManySchemas)?;
+
+    let mut buf = Vec::with_capacity(
+        12 + schemas.len() * 4
+            + col_schema_ref.len()
+            + col_value_ord.len()
+            + col_value_kind.len()
+            + col_run_count.len()
+            + col_run_created_delta.len()
+            + col_run_epoch.len()
+            + col_run_seq.len()
+            + col_run_sample_count.len()
+            + col_run_min_ts_delta.len()
+            + col_run_ts_span.len()
+            + col_ts_page_gap.len()
+            + col_ts_page_len.len()
+            + col_val_page_gap.len()
+            + col_val_page_len.len()
+            + col_hist_page_gap.len()
+            + col_hist_page_len.len()
+            + 64,
+    );
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&schema_count.to_le_bytes());
+    for schema in &schemas {
+        write_uvarint(&mut buf, schema.len() as u64);
+        for name_ord in schema {
+            write_uvarint(&mut buf, u64::from(*name_ord));
+        }
+    }
+    buf.extend_from_slice(&run_total.to_le_bytes());
+    for col in [
+        &col_schema_ref,
+        &col_value_ord,
+        &col_value_kind,
+        &col_run_count,
+        &col_run_created_delta,
+        &col_run_epoch,
+        &col_run_seq,
+        &col_run_sample_count,
+        &col_run_min_ts_delta,
+        &col_run_ts_span,
+        &col_ts_page_gap,
+        &col_ts_page_len,
+        &col_val_page_gap,
+        &col_val_page_len,
+        &col_hist_page_gap,
+        &col_hist_page_len,
+    ] {
+        write_uvarint(&mut buf, col.len() as u64);
+        buf.extend_from_slice(col);
+    }
+    Ok(buf)
+}
+
+/// Same operation as v1/v2/v3's zstd compress; kept separate per this
+/// crate's discipline that no version's writer path calls another's
+/// helpers.
+fn zstd_compress_v4(data: &[u8]) -> Result<Vec<u8>, WriteError> {
     zstd::bulk::compress(data, ZSTD_LEVEL).map_err(|e| WriteError::Zstd(e.to_string()))
 }
 
