@@ -3,8 +3,8 @@
 //!
 //! Layer 1 (B1, tests/pipeline.rs) gates the *scan* against an independent
 //! greatest-wins oracle. This file gates the *operator layer*: a reference
-//! executor for the v1 SQL subset (project, filter, count/sum/min/max, group
-//! by, order by, limit) evaluates over rows it pulls through
+//! executor for the v1 SQL subset (project, filter, count/sum, group by,
+//! order by, limit, ungrouped min/max) evaluates over rows it pulls through
 //! `util::reference_rows` -- an independent merge over `SegmentFetcher::fetch`
 //! -- and the result is compared f64-bit-identical against the same query run
 //! through the real SQL path.
@@ -22,26 +22,29 @@
 //!   would disagree on every NaN row. [`Pred::eval`] uses `total_cmp`.
 //!
 //! - **min/max have two different implementations**, chosen by whether the
-//!   query has a GROUP BY:
+//!   query has a GROUP BY, and only one of them is in the v1 subset:
 //!   - No GROUP BY: `AggregateExec` takes the `AggregateStream` path, whose
 //!     `MinAccumulator`/`MaxAccumulator` call arrow's `min`/`max` kernels and
 //!     combine partials with `f64::total_cmp`. Result: a true total order,
 //!     where negative NaN is the minimum and positive NaN the maximum, and
-//!     -0.0 < 0.0.
+//!     -0.0 < 0.0. [`min_total_order`]/[`max_total_order`] implement this
+//!     exactly, and it is the only form the gate exercises.
 //!   - With GROUP BY: `GroupedHashAggregateStream` uses
 //!     `PrimitiveGroupsAccumulator` with `|cur, new| if
 //!     new.partial_cmp(cur) is Some(Less) | None { cur = new }`, seeded with
 //!     `f64::MAX` (min) / `f64::MIN` (max). That is *not* a total order: it
-//!     is order-dependent, NaN latches then releases, and `-0.0` never
-//!     displaces `0.0` because they compare `Equal`.
-//!
-//!   [`min_total_order`] and [`min_grouped`] implement the two exactly.
-//!
-//! - **The grouped seed leaks into results.** Because the seed is `f64::MAX`
-//!   and `partial_cmp(+Inf, f64::MAX)` is `Greater`, a GROUP BY min over a
-//!   group whose only value is `+Inf` returns `f64::MAX`, not `+Inf`. That is
-//!   a DataFusion quirk, not a Ravel one; it is pinned as a golden case below
-//!   so an upstream fix trips CI instead of silently changing SQL results.
+//!     is order-dependent, NaN latches then releases, `-0.0` never displaces
+//!     `0.0` because they compare `Equal`, and a group whose only value is
+//!     `+Inf` returns the unseeded `f64::MAX` instead of `+Inf` because the
+//!     seed is never displaced. This is a silently wrong answer, not an
+//!     approximation, and it cannot be caught by a differential gate: an
+//!     independent reference for a grouped accumulator is just a second copy
+//!     of the same seed-and-fold algorithm (checkpoint review finding, not
+//!     in the original plan). `min`/`max` combined with `GROUP BY` is
+//!     therefore outside the v1 subset and rejected at validation
+//!     (crate::validate::reject_grouped_min_max), the same way `avg` is;
+//!     `grouped_min_max_is_rejected_before_planning` below tests the
+//!     rejection, not the accumulator.
 //!
 //! - **`avg` is out of the v1 subset** and rejected at validation
 //!   (crate::validate), so it never reaches this gate.
@@ -250,49 +253,6 @@ fn max_total_order(values: &[f64]) -> Option<f64> {
     })
 }
 
-/// The grouped accumulator's single update step: take `new` when it compares
-/// `wanted` against the running value, and *also* when `partial_cmp` returns
-/// `None` (a NaN was involved on either side).
-fn grouped_step(cur: f64, new: f64, wanted: Ordering) -> f64 {
-    match new.partial_cmp(&cur) {
-        Some(order) if order == wanted => new,
-        None => new,
-        _ => cur,
-    }
-}
-
-/// One grouped aggregation, seed to result, including the second phase.
-///
-/// `AggregateExec` runs grouped min/max in two phases even on a single
-/// partition: `Partial` folds the rows into a per-group value, then `Final`
-/// merges that value into a **freshly seeded** accumulator using the same
-/// step. The second phase is not a no-op, and modelling it is not optional:
-/// for a group whose partial result is `+Inf`, `Partial` already leaves the
-/// `f64::MAX` seed in place for `min`, and even when `Partial` does produce a
-/// value, `Final` re-applies the seed comparison to it. Folding only the rows
-/// disagrees with DataFusion on exactly the infinity cases.
-fn grouped_aggregate(values: &[f64], seed: f64, wanted: Ordering) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    let partial = values
-        .iter()
-        .fold(seed, |cur, &new| grouped_step(cur, new, wanted));
-    Some(grouped_step(seed, partial, wanted))
-}
-
-/// Grouped `min`: `PrimitiveGroupsAccumulator` seeded with `f64::MAX`,
-/// folding `partial_cmp` in row order, then merged through a second seeded
-/// pass.
-fn min_grouped(values: &[f64]) -> Option<f64> {
-    grouped_aggregate(values, f64::MAX, Ordering::Less)
-}
-
-/// Grouped `max`, seeded with `f64::MIN`.
-fn max_grouped(values: &[f64]) -> Option<f64> {
-    grouped_aggregate(values, f64::MIN, Ordering::Greater)
-}
-
 /// `sum`: a sequential fold from `0.0` in input order. Exact for the grouped
 /// accumulator by construction, and exact for the ungrouped arrow kernel
 /// whenever every partial sum is exactly representable (see the module docs).
@@ -314,8 +274,10 @@ enum Shape {
     Projection { limit: Option<usize> },
     /// `SELECT count(value), min(value), max(value) ...`
     SelectionAggregates,
-    /// `SELECT series_id, count(value), min(value), max(value) ... GROUP BY
-    /// series_id ORDER BY series_id`
+    /// `SELECT series_id, count(value) ... GROUP BY series_id ORDER BY
+    /// series_id`. No `min`/`max` here: they are rejected by validation
+    /// when grouped (see `crates/ravel-sql/src/validate.rs`), so this shape
+    /// only exercises grouped `count`.
     GroupedSelectionAggregates,
     /// `SELECT sum(value) ...`
     Sum,
@@ -345,7 +307,7 @@ impl Query {
                 format!("SELECT count(value), min(value), max(value) FROM samples {where_clause}")
             }
             Shape::GroupedSelectionAggregates => format!(
-                "SELECT series_id, count(value), min(value), max(value) \
+                "SELECT series_id, count(value) \
                  FROM samples {where_clause} GROUP BY series_id ORDER BY series_id"
             ),
             Shape::Sum => format!("SELECT sum(value) FROM samples {where_clause}"),
@@ -380,12 +342,7 @@ impl Query {
             Shape::GroupedSelectionAggregates => group_by_series(&kept)
                 .into_iter()
                 .map(|(sid, values)| {
-                    vec![
-                        Cell::Bytes(sid.to_vec()),
-                        Cell::Int(values.len() as i64),
-                        optional_float(min_grouped(&values)),
-                        optional_float(max_grouped(&values)),
-                    ]
+                    vec![Cell::Bytes(sid.to_vec()), Cell::Int(values.len() as i64)]
                 })
                 .collect(),
             Shape::Sum => {
@@ -764,43 +721,22 @@ async fn golden_ungrouped_min_max_use_total_order_nan_semantics() {
     );
 }
 
-/// Grouped min/max do *not* use a total order: the accumulator folds
-/// `partial_cmp` in row order, so a NaN latches the running value and the
-/// next comparison (also `None`) replaces it again. The pinned expectation is
-/// the last value in `(series_id, ts)` order for both min and max.
+/// Grouped min/max are rejected before planning (checkpoint review finding,
+/// not in the original plan): DataFusion's grouped accumulator folds
+/// `partial_cmp` from an `f64::MAX`/`f64::MIN` seed rather than using a total
+/// order. A NaN in the group latches the running value so every later
+/// comparison is also `None` and the accumulator just takes the newest row;
+/// `-0.0`/`0.0` compare `Equal` so the first one seen wins, disagreeing with
+/// the ungrouped, `total_cmp`-based accumulator; and a group whose only
+/// value is `+Inf`/`-Inf` never displaces the seed, so `min`/`max` returns
+/// `f64::MAX`/`f64::MIN` instead of the actual value. None of that is
+/// reachable through this endpoint: `crate::validate` rejects `min`/`max`
+/// combined with `GROUP BY` with a typed error before any of it can run.
+/// Ungrouped `min`/`max` are unaffected (see
+/// `golden_ungrouped_min_max_use_total_order_nan_semantics` above) and stay
+/// in the v1 subset.
 #[tokio::test]
-async fn golden_grouped_min_max_pin_the_partial_cmp_accumulator() {
-    let tenant = tenant_id("golden");
-    let specs = vec![SegSpec::new(
-        1,
-        1,
-        1,
-        vec![SeriesSpec::new(
-            "nan",
-            vec![(1, -1.0), (2, f64::from_bits(NAN_POS)), (3, 5.0)],
-        )],
-    )];
-    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
-
-    let row = scalar(
-        &fixture,
-        &tenant,
-        "SELECT min(value), max(value) FROM samples GROUP BY series_id",
-    )
-    .await;
-    assert_eq!(
-        row,
-        vec![Cell::float(5.0), Cell::float(5.0)],
-        "after a NaN, every later comparison is None and the accumulator \
-         takes the newest value, so both min and max end at the last row"
-    );
-}
-
-/// The signed-zero split between the two implementations, pinned in both
-/// directions. Ungrouped uses `total_cmp`, where `-0.0 < 0.0`; grouped uses
-/// `partial_cmp`, where they are `Equal` and the first one seen wins.
-#[tokio::test]
-async fn golden_negative_zero_differs_between_grouped_and_ungrouped_min() {
+async fn grouped_min_max_is_rejected_before_planning() {
     let tenant = tenant_id("golden");
     let specs = vec![SegSpec::new(
         1,
@@ -810,81 +746,22 @@ async fn golden_negative_zero_differs_between_grouped_and_ungrouped_min() {
     )];
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
-    let ungrouped = scalar(&fixture, &tenant, "SELECT min(value) FROM samples").await;
-    assert_eq!(
-        ungrouped,
-        vec![Cell::float(-0.0)],
-        "total_cmp orders -0.0 below 0.0"
-    );
-
-    let grouped = scalar(
-        &fixture,
-        &tenant,
+    for sql in [
+        "SELECT min(value), max(value) FROM samples GROUP BY series_id",
         "SELECT min(value) FROM samples GROUP BY series_id",
-    )
-    .await;
-    assert_eq!(
-        grouped,
-        vec![Cell::float(0.0)],
-        "partial_cmp calls 0.0 and -0.0 equal, so the first row's +0.0 stands"
-    );
-}
-
-/// The grouped accumulator's seed leaks into the result: `partial_cmp(+Inf,
-/// f64::MAX)` is `Greater`, so a group whose only value is `+Inf` yields
-/// `f64::MAX` for `min` (and symmetrically `f64::MIN` for `max` over
-/// `-Inf`). This is a DataFusion quirk, pinned so an upstream fix is a
-/// visible CI failure rather than a silent change in SQL results.
-#[tokio::test]
-async fn golden_grouped_min_max_leak_the_accumulator_seed_for_infinities() {
-    let tenant = tenant_id("golden");
-    let specs = vec![SegSpec::new(
-        1,
-        1,
-        1,
-        vec![
-            SeriesSpec::new("pos", vec![(1, f64::INFINITY)]),
-            SeriesSpec::new("neg", vec![(1, f64::NEG_INFINITY)]),
-        ],
-    )];
-    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
-
-    let outcome = fixture
-        .executor
-        .execute(
-            tenant.hash(),
-            &request(
-                "SELECT label(labels, '__name__') AS name, min(value), max(value) \
-                 FROM samples GROUP BY series_id, name ORDER BY name",
-            ),
-        )
-        .await
-        .expect("grouped query");
-    let rows = actual_rows_with_names(&outcome);
-
-    let neg = rows.get("neg").expect("neg group");
-    assert_eq!(
-        neg[0],
-        Cell::float(f64::NEG_INFINITY),
-        "min over -Inf is -Inf: partial_cmp(-Inf, f64::MAX) is Less"
-    );
-    assert_eq!(
-        neg[1],
-        Cell::float(f64::MIN),
-        "max over -Inf leaks the f64::MIN seed"
-    );
-
-    let pos = rows.get("pos").expect("pos group");
-    assert_eq!(
-        pos[0],
-        Cell::float(f64::MAX),
-        "min over +Inf leaks the f64::MAX seed"
-    );
-    assert_eq!(
-        pos[1],
-        Cell::float(f64::INFINITY),
-        "max over +Inf is +Inf: partial_cmp(+Inf, f64::MIN) is Greater"
-    );
+        "SELECT series_id, max(value) FROM samples GROUP BY series_id HAVING min(value) > 0",
+    ] {
+        let err = fixture
+            .executor
+            .execute(tenant.hash(), &request(sql))
+            .await
+            .expect_err("grouped min/max must be rejected before planning");
+        let message = err.client_message();
+        assert!(
+            message.contains("MIN/MAX") && message.contains("GROUP BY"),
+            "{sql}: {message}"
+        );
+    }
 }
 
 /// `sum` with non-finite input. The properties pinned here are the ones that
@@ -981,24 +858,4 @@ async fn golden_multi_segment_overlap_and_duplicate_ts() {
         },
     ];
     assert_all(&fixture, &tenant, &queries).await;
-}
-
-/// Helper for the grouped-infinity golden case: index result rows by their
-/// first column, a metric name string.
-fn actual_rows_with_names(
-    outcome: &ravel_sql::SqlOutcome,
-) -> std::collections::HashMap<String, Vec<Cell>> {
-    let mut out = std::collections::HashMap::new();
-    for batch in outcome.output.batches() {
-        let names = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name column");
-        for row in 0..batch.num_rows() {
-            let cells = actual_row(batch, row);
-            out.insert(names.value(row).to_string(), cells[1..].to_vec());
-        }
-    }
-    out
 }
