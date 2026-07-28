@@ -1,0 +1,158 @@
+# Aggregation operator corpus (ticket #129, docs/promql-evaluator-plan.md
+# section P8), against crates/ravel-promql-difftest/src/generator.rs's
+# `diff_agg_group` and `diff_agg_special` series. Every offset is relative
+# to the dataset's base_ts_ms.
+#
+# `diff_agg_group` has two `job` groups (`a`: instances 1/2/3 = 10/20/20,
+# `b`: instances 1/2/3 = 5/5/15), so `by`/`without`/no-modifier grouping,
+# `count_values`, and `quantile` all have more than one member per group to
+# reduce. `topk`/`bottomk` are exercised ungrouped (no `by`/`without`)
+# against the combined six-series vector, where the tied maximum (job a's
+# two 20s) and tied minimum (job b's two 5s) are each fully retained by
+# `k=2` rather than split at a tie boundary, per the plan's k<=12 comparator
+# caveat for topk/bottomk ordering (docs/promql-evaluator-plan.md section
+# 2.2; see crates/ravel-promql/src/aggregate.rs's module doc comment).
+#
+# `diff_agg_special` (NaN, -0.0, 1.0, one series each, all present at the
+# same instant) exercises NaN-skipping min/max, NaN-propagating sum, and
+# NaN-sorts-last topk/bottomk.
+
+name: agg_sum_no_modifier
+query: sum(diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_sum_empty_by
+query: sum by () (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_sum_by_job
+query: sum by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_sum_without_instance
+query: sum without (instance) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_avg_by_job
+query: avg by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_min_by_job
+query: min by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_max_by_job
+query: max by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_count_by_job
+query: count by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_group_by_job
+query: group by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_stddev_by_job
+query: stddev by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_stdvar_by_job
+query: stdvar by (job) (diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_quantile_by_job
+query: quantile by (job) (0.5, diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_quantile_out_of_range_clamps
+query: quantile(1.5, diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_count_values
+query: count_values("val", diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_topk_tie_fully_retained
+query: topk(2, diff_agg_group)
+kind: instant
+time: +0s
+mode: ordered
+
+name: agg_bottomk_tie_fully_retained
+query: bottomk(2, diff_agg_group)
+kind: instant
+time: +0s
+mode: ordered
+
+name: agg_topk_k_larger_than_input
+query: topk(20, diff_agg_group)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_range_sum_by_job
+query: sum by (job) (diff_agg_group)
+kind: range
+start: +0s
+end: +300s
+step: 30s
+mode: unordered
+
+name: agg_special_max_skips_nan
+query: max(diff_agg_special)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_special_min_skips_nan
+query: min(diff_agg_special)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_special_sum_propagates_nan
+query: sum(diff_agg_special)
+kind: instant
+time: +0s
+mode: unordered
+
+name: agg_special_topk_nan_sorts_last
+query: topk(3, diff_agg_special)
+kind: instant
+time: +0s
+mode: ordered
+
+name: agg_special_bottomk_nan_sorts_last
+query: bottomk(3, diff_agg_special)
+kind: instant
+time: +0s
+mode: ordered
