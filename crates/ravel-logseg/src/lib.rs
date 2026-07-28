@@ -14,11 +14,14 @@
 
 pub mod block;
 pub mod bloom;
+pub mod bloom_section;
 pub mod encoding;
 pub mod error;
 pub mod field_dir;
+pub mod footer;
 pub mod page;
 pub mod record;
+pub mod skip_index;
 pub mod stream_dir;
 pub mod tokenizer;
 pub mod varint;
