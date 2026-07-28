@@ -1,0 +1,26 @@
+[package]
+name = "ravel-segment-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# cargo-fuzz requires the fuzz project to be its own workspace root so the
+# nightly/sanitizer build flags do not leak into the main workspace. An empty
+# [workspace] table detaches it from the parent workspace at crates/*.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ravel-segment]
+path = ".."
+
+[[bin]]
+name = "parse_footer"
+path = "fuzz_targets/parse_footer.rs"
+test = false
+doc = false
+bench = false
