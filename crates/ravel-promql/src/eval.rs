@@ -171,7 +171,7 @@ const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 /// the whole query's own parameters, fixed regardless of which grid step (if
 /// any) is currently being evaluated. For an instant query both fields equal
 /// the query's evaluation timestamp.
-struct QueryWindow {
+pub(crate) struct QueryWindow {
     start_ns: i64,
     end_ns: i64,
 }
@@ -320,6 +320,17 @@ impl Evaluator {
                 )?;
                 Ok(Value::Matrix(matrix))
             }
+            RangeCore::Call(call) => {
+                let matrix = crate::functions::eval_range_call(
+                    self, source, call, start_ns, end_ns, step_ns, points, &ctx,
+                )?;
+                let matrix = if negate {
+                    negate_matrix(matrix)
+                } else {
+                    matrix
+                };
+                Ok(Value::Matrix(matrix))
+            }
         }
     }
 
@@ -351,9 +362,10 @@ impl Evaluator {
     }
 
     /// General recursive evaluator for a single instant. Handles the P1
-    /// grammar (paren, unary minus, literals, vector/matrix selectors) and
-    /// rejects everything else, naming the construct.
-    fn eval_expr(
+    /// grammar (paren, unary minus, literals, vector/matrix selectors), P4's
+    /// registered function calls, and rejects everything else, naming the
+    /// construct.
+    pub(crate) fn eval_expr(
         &self,
         source: &dyn SeriesSource,
         expr: &promql_parser::parser::Expr,
@@ -379,6 +391,7 @@ impl Evaluator {
             Expr::MatrixSelector(ms) => self
                 .eval_matrix_selector(source, ms, eval_ts_ns, ctx)
                 .map(Value::Matrix),
+            Expr::Call(c) => crate::functions::eval_call(self, source, c, eval_ts_ns, ctx),
             _ => Err(unsupported_construct_error(expr)),
         }
     }
@@ -415,13 +428,11 @@ impl Evaluator {
 
     /// Evaluate a matrix selector at one instant: every non-stale sample in
     /// the left-open window `(sel_ts - range, sel_ts]`, per matched series.
-    /// Not reachable from `eval_instant`/`eval_range` in this phase (a bare
-    /// matrix selector is always a top-level [`Error::WrongType`], matching
-    /// Prometheus), but implemented and tested now: a future phase's
-    /// function calls (e.g. `rate(x[5m])`) evaluate their matrix-typed
-    /// argument through this same path.
-    #[allow(dead_code)]
-    fn eval_matrix_selector(
+    /// Not reachable from a bare top-level expression (a bare matrix
+    /// selector is always a top-level [`Error::WrongType`], matching
+    /// Prometheus); reached through a registered function's matrix-typed
+    /// argument instead (`crate::functions`).
+    pub(crate) fn eval_matrix_selector(
         &self,
         source: &dyn SeriesSource,
         ms: &promql_parser::parser::MatrixSelector,
@@ -526,6 +537,110 @@ impl Evaluator {
         }
         Ok(out)
     }
+
+    /// Build the range matrix for a top-level function call over a matrix
+    /// selector argument (`crate::functions::eval_range_call`'s shared
+    /// helper): one `source.query` call sized to the whole grid's combined
+    /// window, then `reduce` is applied to each step's own window slice.
+    ///
+    /// A matrix selector's per-step window bounds (`window_start`, `sel_ts`)
+    /// are both monotonically non-decreasing as the grid's reported
+    /// timestamp increases, whether or not `offset`/`@` is present (`@`
+    /// pins every step to the same instant, so its bounds are constant,
+    /// which is still non-decreasing). So for each series a single forward-
+    /// only `(lo, hi)` index cursor spans every step, giving O(samples +
+    /// steps) per series (plan section 3.1) instead of re-scanning the
+    /// series' samples from scratch per step.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn eval_range_matrix_reduction(
+        &self,
+        source: &dyn SeriesSource,
+        ms: &promql_parser::parser::MatrixSelector,
+        start_ns: i64,
+        end_ns: i64,
+        step_ns: i64,
+        points: u64,
+        ctx: &QueryWindow,
+        reduce: impl Fn(&[Sample], i64, i64, i64, i64) -> Option<f64>,
+    ) -> Result<RangeMatrix, Error> {
+        let selector_matchers = build_matchers(&ms.vs)?;
+        let offset_ns = signed_offset_ns(ms.vs.offset.as_ref())?;
+        let at_ts_ns = resolve_at(ms.vs.at.as_ref(), ctx.start_ns, ctx.end_ns)?;
+        let range_ns = duration_to_ns(ms.range)?;
+
+        // Evaluation grid: (reported ts, offset/@-shifted window end, window
+        // start). `points` is already known to be within budget.
+        let capacity = usize::try_from(points).unwrap_or(self.max_range_points);
+        let mut grid: Vec<(i64, i64, i64)> = Vec::with_capacity(capacity);
+        let mut t = start_ns;
+        while t <= end_ns {
+            let base_ts = at_ts_ns.unwrap_or(t);
+            let sel_ts = base_ts.checked_sub(offset_ns).ok_or(Error::TimeOverflow)?;
+            let window_start = sel_ts.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+            grid.push((t, sel_ts, window_start));
+            t = t.checked_add(step_ns).ok_or(Error::TimeOverflow)?;
+        }
+        if grid.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let min_window_start = grid.iter().map(|(_, _, w)| *w).min().unwrap_or(start_ns);
+        let max_sel_ts = grid
+            .iter()
+            .map(|(_, sel, _)| *sel)
+            .max()
+            .unwrap_or(start_ns);
+        let window = TimeRange {
+            start_ns: min_window_start,
+            end_ns: max_sel_ts,
+        };
+
+        let series = source.query(&selector_matchers, window)?;
+        let mut out = Vec::with_capacity(series.len());
+        for s in series {
+            // Staleness does not depend on the current step's window, so it
+            // is filtered once per series up front; the cursor below then
+            // only has to track the left-open/right-closed window bounds.
+            let live: Vec<Sample> = s
+                .samples
+                .iter()
+                .filter(|sample| sample.value.to_bits() != STALE_NAN_BITS)
+                .copied()
+                .collect();
+
+            let mut lo = 0usize;
+            let mut hi = 0usize;
+            let mut out_samples = Vec::new();
+            for (reported_ts, sel_ts, window_start) in &grid {
+                while lo < live.len() && live[lo].ts_ns <= *window_start {
+                    lo += 1;
+                }
+                while hi < live.len() && live[hi].ts_ns <= *sel_ts {
+                    hi += 1;
+                }
+                let window_samples = &live[lo..hi];
+                if window_samples.is_empty() {
+                    continue;
+                }
+                if let Some(value) = reduce(
+                    window_samples,
+                    *window_start,
+                    *sel_ts,
+                    range_ns,
+                    *reported_ts,
+                ) {
+                    out_samples.push(Sample {
+                        ts_ns: *reported_ts,
+                        value,
+                    });
+                }
+            }
+            if !out_samples.is_empty() {
+                out.push((drop_metric_name(s.labels), out_samples));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A range query's top-level construct, after stripping any enclosing
@@ -537,6 +652,7 @@ enum RangeCore<'a> {
     Scalar(f64),
     Str(&'a str),
     Selector(&'a promql_parser::parser::VectorSelector),
+    Call(&'a promql_parser::parser::Call),
 }
 
 /// Strip `Paren`/`Unary` wrappers from `expr`, returning the core construct
@@ -565,6 +681,13 @@ fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'
                     got: "range vector",
                 });
             }
+            // Whether `c.func.name` is actually registered is decided by
+            // `crate::functions::eval_range_call`, not here: unlike every
+            // other arm, a `Call` is not itself a self-describing construct
+            // (an unregistered name still needs the same
+            // "function call: {name}" error a future family's addition
+            // would otherwise have to update this match to keep producing).
+            Expr::Call(c) => return Ok((RangeCore::Call(c), negate)),
             _ => return Err(unsupported_construct_error(cur)),
         }
     }
@@ -572,8 +695,11 @@ fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'
 
 /// The [`Error::Unsupported`] for an AST node this phase does not evaluate.
 /// Callers must have already handled `Paren`, `Unary`, `NumberLiteral`,
-/// `StringLiteral`, `VectorSelector`, and `MatrixSelector`; this panics on
-/// any of those (programmer error, not reachable) and covers the rest.
+/// `StringLiteral`, `VectorSelector`, `MatrixSelector`, and `Call` (the last
+/// always dispatches to `crate::functions`, which produces its own
+/// "function call: {name}" [`Error::Unsupported`] for an unregistered name);
+/// this panics on any of those (programmer error, not reachable) and covers
+/// the rest.
 fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
     use promql_parser::parser::Expr;
     match expr {
@@ -586,9 +712,6 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
         Expr::Subquery(_) => Error::Unsupported {
             construct: "subquery".to_string(),
         },
-        Expr::Call(c) => Error::Unsupported {
-            construct: format!("function call: {}", c.func.name),
-        },
         Expr::Extension(_) => Error::Unsupported {
             construct: "extension node".to_string(),
         },
@@ -597,7 +720,8 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::VectorSelector(_)
-        | Expr::MatrixSelector(_) => {
+        | Expr::MatrixSelector(_)
+        | Expr::Call(_) => {
             unreachable!("caller must handle every supported construct before falling back")
         }
     }
@@ -608,7 +732,7 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
 /// instant query's own time) shifted by the selector's `offset`, if any.
 /// `@`'s `start()`/`end()` forms resolve against the whole query's fixed
 /// parameters (`ctx`), not the current step, exactly like Prometheus.
-fn selector_eval_ts(
+pub(crate) fn selector_eval_ts(
     vs: &promql_parser::parser::VectorSelector,
     eval_ts_ns: i64,
     ctx: &QueryWindow,
@@ -670,9 +794,29 @@ fn negate_vector(v: InstantVector) -> InstantVector {
         .collect()
 }
 
+/// Negate every sample's value in a range matrix. Unlike [`negate_vector`],
+/// `__name__` is not dropped here: a function call's result labels already
+/// had it dropped unconditionally by
+/// [`Evaluator::eval_range_matrix_reduction`], before negation is even
+/// considered.
+fn negate_matrix(m: RangeMatrix) -> RangeMatrix {
+    m.into_iter()
+        .map(|(labels, samples)| {
+            let negated = samples
+                .into_iter()
+                .map(|s| Sample {
+                    ts_ns: s.ts_ns,
+                    value: -s.value,
+                })
+                .collect();
+            (labels, negated)
+        })
+        .collect()
+}
+
 /// Remove `__name__` from a label set, exactly as Prometheus does for the
 /// result of a numeric operation.
-fn drop_metric_name(labels: LabelSet) -> LabelSet {
+pub(crate) fn drop_metric_name(labels: LabelSet) -> LabelSet {
     // Filtering can only remove entries from an already-deduplicated
     // `LabelSet`, so this reconstruction cannot introduce a duplicate name
     // and cannot fail in practice.
@@ -1014,7 +1158,7 @@ mod tests {
     #[test]
     fn unsupported_constructs_name_the_rejected_node() {
         let cases: &[(&str, &str)] = &[
-            ("rate(up[5m])", "rate"),
+            ("abs(up)", "abs"),
             ("sum(up)", "sum"),
             ("up + down", "binary expression"),
             ("up[5m:1m]", "subquery"),

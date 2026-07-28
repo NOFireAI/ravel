@@ -4,13 +4,16 @@
 //! expressions, unary minus, number/string literals, and vector/matrix
 //! selectors (all matcher types, offset, the `@` modifier), 5m default
 //! lookback, staleness-aware iteration, and a resolution cap on range
-//! queries. Aggregation, binary expressions, subqueries, and function calls
-//! are not yet evaluated (`Error::Unsupported`), but [`plan_selectors`]
-//! still reports every selector reachable through them, for a future
-//! phase's prefetch. The evaluator consumes a storage-agnostic series
-//! stream trait.
+//! queries. The counter/regression function family (`rate`, `irate`,
+//! `increase`, `delta`, `idelta`, `resets`, `changes`, `deriv`,
+//! `predict_linear`) is evaluated via [`functions`]; aggregation, binary
+//! expressions, subqueries, and every other function are not yet evaluated
+//! (`Error::Unsupported`), but [`plan_selectors`] still reports every
+//! selector reachable through them, for a future phase's prefetch. The
+//! evaluator consumes a storage-agnostic series stream trait.
 
 mod eval;
+mod functions;
 mod matchers;
 mod plan;
 mod source;
