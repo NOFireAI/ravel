@@ -1,10 +1,7 @@
 //! ravel-cli: inspect segments, decode commit records, list catalog entries.
 
-mod store;
-
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use clap::{Parser, Subcommand};
+use ravel_cli::{catalog, now_ns, store};
 use ravel_proto::segment::v1::Footer;
 use ravel_types::{Signal, TenantId, TimeRange};
 
@@ -84,11 +81,24 @@ enum CatalogCommand {
         #[arg(long, default_value_t = 4)]
         shards: u32,
     },
-}
-
-fn now_ns() -> anyhow::Result<i64> {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    i64::try_from(dur.as_nanos()).map_err(|_| anyhow::anyhow!("system clock too far in the future"))
+    /// One-shot catalog fold for a tenant (docs/metric-index-plan.md section 4).
+    Fold {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
+    },
+    /// Decode and print HEAD and every referenced snapshot part.
+    Inspect {
+        #[arg(long)]
+        tenant: String,
+    },
+    /// Re-list sealed commit records and diff against the snapshot; exits
+    /// nonzero if the snapshot is missing or mismatches sealed history.
+    Verify {
+        #[arg(long)]
+        tenant: String,
+    },
 }
 
 #[tokio::main]
@@ -115,6 +125,15 @@ async fn main() -> anyhow::Result<()> {
                     shards,
                 },
         } => catalog_list(&cli.store, &tenant, hours, shards).await,
+        Command::Catalog {
+            command: CatalogCommand::Fold { tenant, shards },
+        } => catalog::fold(store::build_store(&cli.store)?, &tenant, shards).await,
+        Command::Catalog {
+            command: CatalogCommand::Inspect { tenant },
+        } => catalog::inspect(store::build_store(&cli.store)?, &tenant).await,
+        Command::Catalog {
+            command: CatalogCommand::Verify { tenant },
+        } => catalog::verify(store::build_store(&cli.store)?, &tenant).await,
     }
 }
 
