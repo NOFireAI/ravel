@@ -9,8 +9,13 @@
 
 mod clock;
 mod config;
+mod cursor;
 mod error;
+mod input;
+mod scan;
 
 pub use clock::{Clock, SystemClock};
 pub use config::MaintainConfig;
 pub use error::MaintainError;
+pub use input::{CompactionInput, hash16, input_set_hash, sort_inputs_canonically};
+pub use scan::{SealedBucket, scan_next};
