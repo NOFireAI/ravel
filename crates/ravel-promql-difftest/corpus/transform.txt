@@ -48,11 +48,18 @@ kind: instant
 time: +180s
 mode: unordered
 
+# ADR-0025 allowlist (transcendental libm difference, same class as
+# instant_atanh_domain_clamped): measured 1 ULP off Prometheus on
+# linux-amd64 CI (did not reproduce on darwin-arm64 locally, confirming
+# this is a libm implementation detail, not just a Rust-vs-Go one: the
+# platform's own libm varies too, independent of which language calls
+# it). tolerance: 2 is 1 ULP of headroom over the measured gap.
 name: instant_exp_gauge_walk
 query: exp(diff_gauge_walk)
 kind: instant
 time: +300s
 mode: unordered
+tolerance: 2
 
 name: instant_ln_over_special_values
 query: ln(diff_special_values)
