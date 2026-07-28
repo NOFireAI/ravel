@@ -354,12 +354,17 @@ count entries, entry i for block i:
 ```
 
 Inserted keys are hashed as
-`h = blake3(seed_le(8) || column_id_le(4) || token)`, with
-`h1 = u64::from_le_bytes(h[0..8])` and
-`h2 = u64::from_le_bytes(h[8..16]) | 1`. The filter is blocked on 512-bit
-blocks: `block = h1 % (m_bits / 512)` selects the block, and for
-`i in 0..k` the bit at `block * 512 + ((h1 + i*h2) % 512)` is set
-(all additions and the multiply wrap). `k = 7`, chosen for a ~1%
+`h = blake3(seed_le(8) || column_id_le(4) || token)`, reading three 64-bit
+values from disjoint bytes of the digest:
+`block = u64::from_le_bytes(h[0..8])`,
+`g1 = u64::from_le_bytes(h[8..16])`, and
+`g2 = u64::from_le_bytes(h[16..24]) | 1`. The filter is blocked on 512-bit
+blocks: `block % (m_bits / 512)` selects the block, and for `i in 0..k`
+the bit at `(block % (m_bits/512)) * 512 + ((g1 + i*g2) % 512)` is set
+(all additions and the multiply wrap). Block selection and the
+within-block offsets read disjoint digest bytes so the first probe is not
+congruent to the block index (which would collapse most set bits onto two
+offsets and wreck the false-positive rate). `k = 7`, chosen for a ~1%
 false-positive rate; `m_bits = next_pow2(max(512, ceil(n * 9.585)))`
 where `n` is the block's distinct `(column_id, token)` count (9.585 bits
 per element for p = 0.01).
