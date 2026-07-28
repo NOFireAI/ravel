@@ -75,10 +75,9 @@ pub struct RwNormalizeOutput {
     /// metric-metadata store yet (ADR-0015).
     pub metadata_dropped: usize,
     /// Created/start timestamps accepted-and-dropped. Always 0 for RW1:
-    /// `prometheus.Sample` has no such field on the wire (only RW2's
-    /// `io.prometheus.write.v2.Sample.start_timestamp` does); this field
-    /// exists so the RW2 decoder (ticket A2) can populate it without
-    /// changing this struct's shape.
+    /// `prometheus.Sample` has no such field on the wire; RW2's
+    /// `Sample.start_timestamp` and `Histogram.start_timestamp` populate
+    /// [`ResolvedRequest::created_timestamps_count`], which this mirrors.
     pub created_timestamps_dropped: usize,
 }
 
@@ -108,7 +107,7 @@ pub fn normalize_resolved(
             histograms_dropped: 0,
             exemplars_dropped: 0,
             metadata_dropped: resolved.metadata_count,
-            created_timestamps_dropped: 0,
+            created_timestamps_dropped: resolved.created_timestamps_count,
         };
     }
 
@@ -136,7 +135,7 @@ pub fn normalize_resolved(
         histograms_dropped,
         exemplars_dropped,
         metadata_dropped: resolved.metadata_count,
-        created_timestamps_dropped: 0,
+        created_timestamps_dropped: resolved.created_timestamps_count,
     }
 }
 
@@ -351,6 +350,7 @@ mod tests {
         ResolvedRequest {
             series,
             metadata_count: 0,
+            created_timestamps_count: 0,
         }
     }
 
@@ -788,6 +788,17 @@ mod tests {
         )]);
         let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
         assert_eq!(out.created_timestamps_dropped, 0);
+    }
+
+    #[test]
+    fn created_timestamps_dropped_mirrors_resolved_tally() {
+        let mut req = request(vec![series(
+            vec![label("__name__", "up")],
+            vec![sample(1_000, 1.0)],
+        )]);
+        req.created_timestamps_count = 3;
+        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        assert_eq!(out.created_timestamps_dropped, 3);
     }
 
     // --- request-level cap ---

@@ -38,6 +38,8 @@ fn resolve(req: WriteRequest) -> ResolvedRequest {
     ResolvedRequest {
         series: req.timeseries.into_iter().map(resolve_series).collect(),
         metadata_count: req.metadata.len(),
+        // prometheus.Sample carries no start_timestamp field on the wire.
+        created_timestamps_count: 0,
     }
 }
 
