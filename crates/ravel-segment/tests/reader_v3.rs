@@ -818,34 +818,115 @@ fn ts_strategy() -> impl Strategy<Value = i64> {
     -1_000_000i64..1_000_000i64
 }
 
-/// Generates a self-consistent int-kind histogram: each of `span_len`
-/// positive buckets holds exactly 1, `zero_count` is 1, and `count` is
-/// their exact sum, so `count >= zero_count && count >= sum(bucket_counts)`
-/// (docs/rseg-v3-plan.md section 3.5) always holds by construction rather
-/// than by chance.
-fn int_histogram_strategy() -> impl Strategy<Value = HistogramValue> {
-    (1u32..5).prop_map(|span_len| {
-        let zero_count = 1u64;
-        let count = zero_count + u64::from(span_len);
-        HistogramValue {
-            scale: 1,
-            zero_threshold: 1e-9,
-            sum: Some(count as f64),
-            custom_values: None,
-            positive_spans: vec![ravel_segment::HistogramSpan {
-                offset: 0,
-                length: span_len,
-            }],
-            negative_spans: vec![],
-            counts: HistogramCounts::Int {
+fn reset_hint_strategy() -> impl Strategy<Value = ravel_segment::ResetHint> {
+    prop_oneof![
+        Just(ravel_segment::ResetHint::Unknown),
+        Just(ravel_segment::ResetHint::Yes),
+        Just(ravel_segment::ResetHint::No),
+        Just(ravel_segment::ResetHint::Gauge),
+    ]
+}
+
+/// 0-2 spans per side, offsets ranging negative to positive (the format
+/// places no ordering constraint on span offsets at decode time -- see
+/// `decode_hist_spans`, which only rejects `length == 0`), lengths 1-3.
+fn hist_spans_strategy() -> impl Strategy<Value = Vec<ravel_segment::HistogramSpan>> {
+    proptest::collection::vec(
+        (-20i32..20, 1u32..4)
+            .prop_map(|(offset, length)| ravel_segment::HistogramSpan { offset, length }),
+        0..3,
+    )
+}
+
+/// Generates a self-consistent histogram covering int/float count kind,
+/// multiple spans per side with negative and positive offsets, optional
+/// custom boundaries (`scale == -53`, strictly ascending), and every
+/// `reset_hint` state (C5, RSEG v3 phase 4, issue #137; supersedes the
+/// narrower fixed-single-span int-only generator this replaces). Bucket
+/// counts are all-distinct-and-positive by construction and `count =
+/// zero_count + sum(bucket_counts)`, so `count >= zero_count && count >=
+/// sum(bucket_counts)` (docs/rseg-v3-plan.md section 3.5) always holds
+/// without relying on the reader's `<`-based NaN-transparent check.
+/// NaN/Inf/-0.0 float payloads are exercised separately (see
+/// `write_v3_read_roundtrip_preserves_nan_inf_negative_zero_float_histogram_bits`
+/// below): mixing them into this generator would make the
+/// `HistogramValue`-derived `PartialEq` this test relies on unusable, since
+/// `NaN != NaN` under `==`.
+fn histogram_value_strategy() -> impl Strategy<Value = HistogramValue> {
+    let scale_and_custom = prop_oneof![
+        3 => (-20i32..20).prop_map(|s| (s, None)),
+        1 => proptest::collection::vec(1.0f64..1_000.0, 1..5).prop_map(|mut bounds| {
+            bounds.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            bounds.dedup_by(|a, b| a == b);
+            (-53, Some(bounds))
+        }),
+    ];
+
+    (
+        any::<bool>(),
+        scale_and_custom,
+        0.0f64..1.0,
+        hist_spans_strategy(),
+        hist_spans_strategy(),
+        any::<bool>(),
+        0u64..5,
+        reset_hint_strategy(),
+    )
+        .prop_map(
+            |(
+                is_float,
+                (scale, custom_values),
+                zero_threshold,
+                positive_spans,
+                negative_spans,
+                has_sum,
                 zero_count,
-                count,
-                positive: (0..span_len).map(|_| 1u64).collect(),
-                negative: vec![],
+                reset_hint,
+            )| {
+                let positive_len: usize = positive_spans.iter().map(|s| s.length as usize).sum();
+                let negative_len: usize = negative_spans.iter().map(|s| s.length as usize).sum();
+                let counts = if is_float {
+                    let positive: Vec<f64> = (0..positive_len).map(|i| (i as f64) + 1.0).collect();
+                    let negative: Vec<f64> = (0..negative_len).map(|i| (i as f64) + 1.0).collect();
+                    let total: f64 = positive.iter().chain(negative.iter()).sum();
+                    let zero_count = zero_count as f64;
+                    HistogramCounts::Float {
+                        count: zero_count + total,
+                        zero_count,
+                        positive,
+                        negative,
+                    }
+                } else {
+                    let positive: Vec<u64> = (0..positive_len).map(|i| (i as u64) + 1).collect();
+                    let negative: Vec<u64> = (0..negative_len).map(|i| (i as u64) + 1).collect();
+                    let total: u64 = positive.iter().chain(negative.iter()).sum();
+                    HistogramCounts::Int {
+                        count: zero_count + total,
+                        zero_count,
+                        positive,
+                        negative,
+                    }
+                };
+                let sum = if has_sum {
+                    Some(match &counts {
+                        HistogramCounts::Int { count, .. } => *count as f64,
+                        HistogramCounts::Float { count, .. } => *count,
+                    })
+                } else {
+                    None
+                };
+                HistogramValue {
+                    scale,
+                    zero_threshold,
+                    sum,
+                    custom_values,
+                    positive_spans,
+                    negative_spans,
+                    counts,
+                    reset_hint,
+                }
             },
-            reset_hint: ravel_segment::ResetHint::Unknown,
-        }
-    })
+        )
 }
 
 proptest! {
@@ -856,7 +937,7 @@ proptest! {
         scalar_ts in proptest::collection::vec(ts_strategy(), 1..6),
         scalar_val in proptest::collection::vec(any::<f64>(), 1..6),
         hist_ts in proptest::collection::vec(ts_strategy(), 1..4),
-        hist_val in proptest::collection::vec(int_histogram_strategy(), 1..4),
+        hist_val in proptest::collection::vec(histogram_value_strategy(), 1..4),
     ) {
         let n = scalar_ts.len().min(scalar_val.len());
         let scalar_samples: Vec<Sample> = scalar_ts[..n]
@@ -881,13 +962,13 @@ proptest! {
         let mut expected_scalar = scalar_samples.clone();
         expected_scalar.sort_by_key(|s| s.ts_ns);
         let mut expected_hist_ts: Vec<i64> = hist_samples.iter().map(|s| s.ts_ns).collect();
-        let mut expected_hist_sum: Vec<Option<f64>> =
-            hist_samples.iter().map(|s| s.value.sum).collect();
+        let mut expected_hist_value: Vec<HistogramValue> =
+            hist_samples.iter().map(|s| s.value.clone()).collect();
         {
             let mut indexed: Vec<usize> = (0..hist_samples.len()).collect();
             indexed.sort_by_key(|&i| hist_samples[i].ts_ns);
             expected_hist_ts = indexed.iter().map(|&i| expected_hist_ts[i]).collect();
-            expected_hist_sum = indexed.iter().map(|&i| expected_hist_sum[i]).collect();
+            expected_hist_value = indexed.iter().map(|&i| expected_hist_value[i].clone()).collect();
         }
 
         let series = vec![
@@ -940,17 +1021,112 @@ proptest! {
                         ravel_segment::decode_histogram_pages(entry, ts_bytes, hist_bytes, limits)
                             .expect("decodes histogram pages");
                     prop_assert_eq!(decoded.len(), expected_hist_ts.len());
-                    for ((got, &want_ts), want_sum) in decoded
+                    for ((got, &want_ts), want_value) in decoded
                         .iter()
                         .zip(expected_hist_ts.iter())
-                        .zip(expected_hist_sum.iter())
+                        .zip(expected_hist_value.iter())
                     {
                         prop_assert_eq!(got.ts_ns, want_ts);
-                        prop_assert_eq!(got.value.sum, *want_sum);
+                        // Full structural equality (scale, zero_threshold,
+                        // custom_values, spans, counts, reset_hint), not
+                        // just the sum field: `HistogramValue`'s derived
+                        // `PartialEq` is safe here because
+                        // `histogram_value_strategy` never generates NaN
+                        // or -0.0 (see that function's doc comment).
+                        prop_assert_eq!(&got.value, want_value);
                     }
                 }
             }
         }
+    }
+}
+
+/// Deterministic (non-proptest) round trip for NaN/Inf/-0.0 float
+/// histogram payloads (C5, RSEG v3 phase 4, issue #137): `HistogramCounts::
+/// Float` fields and `sum` are legal to carry NaN, +-Infinity, and -0.0
+/// (docs/rseg-v3-plan.md section 2's int/float duality); `decode_histogram_
+/// record`'s doc comment records the `<`-not-`!(>=)` count check
+/// specifically so these payloads pass validation rather than being
+/// rejected. Compared via `to_bits()`, never `==`, per repo-wide float-
+/// comparison discipline (CLAUDE.md) -- this is exactly why this case is
+/// deterministic rather than folded into `histogram_value_strategy`'s
+/// proptest, whose assertions rely on derived `PartialEq`.
+#[test]
+fn write_v3_read_roundtrip_preserves_nan_inf_negative_zero_float_histogram_bits() {
+    let value = HistogramValue {
+        scale: 3,
+        zero_threshold: -0.0,
+        sum: Some(f64::NAN),
+        custom_values: None,
+        positive_spans: vec![ravel_segment::HistogramSpan {
+            offset: 0,
+            length: 3,
+        }],
+        negative_spans: vec![],
+        counts: HistogramCounts::Float {
+            zero_count: f64::NAN,
+            count: f64::INFINITY,
+            positive: vec![f64::NAN, -0.0, f64::INFINITY],
+            negative: vec![],
+        },
+        reset_hint: ravel_segment::ResetHint::Gauge,
+    };
+    let series = vec![SeriesInputV3 {
+        series_id: SeriesId([0x0A; 16]),
+        labels: labels(&[(METRIC_NAME_LABEL, "nan_inf_hist")]),
+        values: SeriesValues::Histogram(vec![HistogramSample {
+            ts_ns: 0,
+            value: value.clone(),
+        }]),
+    }];
+    let written =
+        SegmentWriter::write_v3(series, test_identity(), test_bounds()).expect("writes v3");
+    let bytes = written.bytes.as_ref();
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits).expect("opens");
+    let dict = section_bytes(bytes, &loc.footer, LABEL_DICT);
+    let ids = section_bytes(bytes, &loc.footer, SERIES_IDS);
+    let meta = section_bytes(bytes, &loc.footer, SERIES_META);
+    let entries = ravel_segment::decode_catalog_v3(&loc.footer, dict, ids, meta, limits)
+        .expect("decodes catalog");
+    let selected: Vec<&SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v3(&loc.footer, &selected).expect("plans ranges");
+    let (entry, range) = entries.iter().zip(ranges.iter()).next().expect("one entry");
+    let ts_bytes = slice_range(bytes, range.ts_range);
+    let hist_bytes = slice_range(bytes, range.hist_range);
+    let decoded = ravel_segment::decode_histogram_pages(entry, ts_bytes, hist_bytes, limits)
+        .expect("decodes histogram");
+    assert_eq!(decoded.len(), 1);
+    let got = &decoded[0].value;
+
+    assert_eq!(got.scale, value.scale);
+    assert_eq!(got.zero_threshold.to_bits(), value.zero_threshold.to_bits());
+    assert_eq!(got.sum.map(f64::to_bits), value.sum.map(f64::to_bits));
+    assert_eq!(got.reset_hint, value.reset_hint);
+    match (&got.counts, &value.counts) {
+        (
+            HistogramCounts::Float {
+                zero_count: gz,
+                count: gc,
+                positive: gp,
+                negative: gn,
+            },
+            HistogramCounts::Float {
+                zero_count: ez,
+                count: ec,
+                positive: ep,
+                negative: en,
+            },
+        ) => {
+            assert_eq!(gz.to_bits(), ez.to_bits());
+            assert_eq!(gc.to_bits(), ec.to_bits());
+            assert_eq!(gp.len(), ep.len());
+            for (g, e) in gp.iter().zip(ep.iter()) {
+                assert_eq!(g.to_bits(), e.to_bits());
+            }
+            assert_eq!(gn.len(), en.len());
+        }
+        _ => panic!("expected float counts on both sides"),
     }
 }
 
