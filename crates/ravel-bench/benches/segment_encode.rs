@@ -3,11 +3,9 @@
 //! (100 / 10k / 1M series)"). 1M series is scaled down to 200k for `--quick`
 //! CI runtime; pass a higher `RAVEL_BENCH_MAX_SERIES` to widen the sweep.
 //!
-//! Covers both RSEG v1 (`SegmentWriter::write`) and v2
-//! (`SegmentWriter::write_v2`, ADR-0014) as separate bench ids within the
-//! same group (`{series_count}_series_v1` / `_v2`) so a later comparison
-//! run has matched, directly comparable numbers for both. This crate makes
-//! v2 runnable; it does not measure or claim any v1/v2 delta itself.
+//! Measures the RSEG v5 writer (`SegmentWriter::write`, the raw-sample
+//! adapter). ADR-0027 retired the older versions, so the cross-version bench
+//! arms are gone; bench ids are `{series_count}_series_v5`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -69,21 +67,11 @@ fn bench_segment_encode(c: &mut Criterion) {
         // time (a12-F01). iter_batched runs the clone in the untimed setup
         // closure and times only the write, matching the pattern in
         // src/bin/segment_alloc_profile.rs.
-        group.bench_function(format!("{series_count}_series_v1"), |b| {
+        group.bench_function(format!("{series_count}_series_v5"), |b| {
             b.iter_batched(
                 || clone_inputs(&inputs),
                 |series| {
                     SegmentWriter::write(series, bench_identity(), bench_bounds()).expect("encode")
-                },
-                BatchSize::SmallInput,
-            );
-        });
-        group.bench_function(format!("{series_count}_series_v2"), |b| {
-            b.iter_batched(
-                || clone_inputs(&inputs),
-                |series| {
-                    SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
-                        .expect("encode v2")
                 },
                 BatchSize::SmallInput,
             );
@@ -117,22 +105,12 @@ fn bench_segment_encode_axis_sweep(c: &mut Criterion) {
             let actual_samples: usize = inputs.iter().map(|s| s.samples.len()).sum();
             group.throughput(Throughput::Elements(actual_samples as u64));
             let stem = format!("s{samples_per_series}_l{labels_per_series}");
-            group.bench_function(format!("{stem}_v1"), |b| {
+            group.bench_function(format!("{stem}_v5"), |b| {
                 b.iter_batched(
                     || clone_inputs(&inputs),
                     |series| {
                         SegmentWriter::write(series, bench_identity(), bench_bounds())
                             .expect("encode")
-                    },
-                    BatchSize::SmallInput,
-                );
-            });
-            group.bench_function(format!("{stem}_v2"), |b| {
-                b.iter_batched(
-                    || clone_inputs(&inputs),
-                    |series| {
-                        SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
-                            .expect("encode v2")
                     },
                     BatchSize::SmallInput,
                 );

@@ -14,7 +14,7 @@ mod shard;
 mod value;
 
 pub use clock::{Clock, SystemClock};
-pub use config::{IngestConfig, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2};
+pub use config::{IngestConfig, SEGMENT_FORMAT_VERSION};
 pub use error::WriteError;
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};

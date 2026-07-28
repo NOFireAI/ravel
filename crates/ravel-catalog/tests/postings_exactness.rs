@@ -40,16 +40,6 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const MARGIN_NS: i64 =
     DEFAULT_MAX_FLUSH_LIFETIME_NS + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS + DEFAULT_FOLD_SAFETY_MARGIN_NS;
 
-/// Duplicated from `ravel-segment`'s private `format` module, matching the
-/// precedent already established in both `ravel-query`'s fetcher and
-/// `ravel-catalog::fold`'s `section_kind`.
-mod section_kind {
-    pub const LABEL_DICT: u32 = 1;
-    pub const SERIES_TABLE: u32 = 2;
-    pub const SERIES_IDS: u32 = 5;
-    pub const SERIES_META: u32 = 6;
-}
-
 fn now_at_seal(hour: u32) -> i64 {
     (i64::from(hour) + 1) * NS_PER_HOUR + MARGIN_NS
 }
@@ -82,8 +72,9 @@ fn series_input(tenant: &TenantId, metric: &str) -> SeriesInput {
     }
 }
 
-/// Writes one real RSEG segment (v2 if `use_v2`, else v1) covering `metrics`
-/// and publishes its commit record.
+/// Writes one real RSEG v5 segment covering `metrics` and publishes its
+/// commit record. ADR-0027 left v5 the only version; the trailing `_use_v2`
+/// flag is retained (ignored) so the call sites need not change.
 #[allow(clippy::too_many_arguments)]
 async fn publish_real_segment(
     store: &dyn ObjectStoreBackend,
@@ -95,7 +86,7 @@ async fn publish_real_segment(
     writer_seq: u64,
     ingest_hour_bucket: u32,
     metrics: &[&str],
-    use_v2: bool,
+    _use_v2: bool,
 ) {
     let inputs: Vec<SeriesInput> = metrics.iter().map(|m| series_input(tenant_id, m)).collect();
     let identity = SegmentIdentity {
@@ -109,11 +100,7 @@ async fn publish_real_segment(
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
     };
-    let written = if use_v2 {
-        SegmentWriter::write_v2(inputs, identity, bounds).expect("write v2 segment")
-    } else {
-        SegmentWriter::write(inputs, identity, bounds).expect("write v1 segment")
-    };
+    let written = SegmentWriter::write(inputs, identity, bounds).expect("write v5 segment");
 
     let new_record = NewCommitRecord {
         tenant_hash,
@@ -130,7 +117,7 @@ async fn publish_real_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: if use_v2 { 2 } else { 1 },
+        segment_format_version: 5,
         created_unix_ns: 0,
         ingest_hour_bucket,
     };
@@ -143,14 +130,6 @@ async fn publish_real_segment(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish");
-}
-
-fn section_range(footer: &ravel_segment::Footer, kind: u32) -> Option<(u64, u64)> {
-    footer
-        .sections
-        .iter()
-        .find(|s| s.kind == kind)
-        .map(|s| (s.offset, s.len))
 }
 
 /// Brute-force scan of one entry's own segment catalog: fetches the segment
@@ -190,38 +169,15 @@ async fn brute_force_names(
     };
     ravel_segment::check_identity(&location.footer, &expected).expect("identity checks out");
 
-    let series = match location.version {
-        1 => {
-            let (ld_off, ld_len) =
-                section_range(&location.footer, section_kind::LABEL_DICT).expect("label dict");
-            let (st_off, st_len) =
-                section_range(&location.footer, section_kind::SERIES_TABLE).expect("series table");
-            let label_dict = &got.data[ld_off as usize..(ld_off + ld_len) as usize];
-            let series_table = &got.data[st_off as usize..(st_off + st_len) as usize];
-            ravel_segment::decode_catalog(&location.footer, label_dict, series_table, limits)
-                .expect("decode v1 catalog")
-        }
-        2 => {
-            let (ld_off, ld_len) =
-                section_range(&location.footer, section_kind::LABEL_DICT).expect("label dict");
-            let (si_off, si_len) =
-                section_range(&location.footer, section_kind::SERIES_IDS).expect("series ids");
-            let (sm_off, sm_len) =
-                section_range(&location.footer, section_kind::SERIES_META).expect("series meta");
-            let label_dict = &got.data[ld_off as usize..(ld_off + ld_len) as usize];
-            let series_ids = &got.data[si_off as usize..(si_off + si_len) as usize];
-            let series_meta = &got.data[sm_off as usize..(sm_off + sm_len) as usize];
-            ravel_segment::decode_catalog_v2(
-                &location.footer,
-                label_dict,
-                series_ids,
-                series_meta,
-                limits,
-            )
-            .expect("decode v2 catalog")
-        }
-        other => panic!("unexpected segment version {other}"),
-    };
+    assert_eq!(location.version, 5, "ADR-0027: v5 is the only version");
+    // The chunked v5 catalog spans sections; decode it over the whole object
+    // (already fetched) and fold to the per-series `SeriesEntry` view.
+    let series: Vec<ravel_segment::SeriesEntry> =
+        ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)
+            .expect("decode v5 catalog")
+            .into_iter()
+            .map(|e| e.entry)
+            .collect();
 
     series
         .iter()
