@@ -32,9 +32,11 @@ pub struct DecodedInput {
     pub created_unix_ns: i64,
     pub writer_epoch: u64,
     pub writer_seq: u64,
+    pub min_ingest_ts_ns: i64,
+    pub max_ingest_ts_ns: i64,
 }
 
-fn section_slice<'a>(
+pub(crate) fn section_slice<'a>(
     footer: &Footer,
     kind: SectionKind,
     bytes: &'a [u8],
@@ -146,6 +148,8 @@ pub async fn read_input(
         created_unix_ns: record.created_unix_ns,
         writer_epoch: record.writer_epoch,
         writer_seq: record.writer_seq,
+        min_ingest_ts_ns: record.min_ingest_ts_ns,
+        max_ingest_ts_ns: record.max_ingest_ts_ns,
     })
 }
 
