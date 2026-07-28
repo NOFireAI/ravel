@@ -23,10 +23,14 @@
 //!   replaced here, so a `CREATE EXTERNAL TABLE`/`COPY` that somehow slipped
 //!   the parse gate has nothing to bind to. `RsegScanExec` does its own I/O
 //!   through `SegmentFetcher` and never consults this registry.
-//! - The `avg` UDAF and the stddev/variance family (`stddev`, `var`,
-//!   `stddev_pop`, `var_pop`, `covar_samp`, `covar_pop`, `corr`, and their
-//!   aliases) are deregistered, backstopping the subset check in
-//!   crate::validate.
+//! - Aggregate registration is an allowlist (ADR-0022 decision 2): every
+//!   aggregate UDAF the default session registers is enumerated and every name
+//!   outside the admitted set ([`ADMITTED_AGGREGATES`]: `count`, `sum`, `min`,
+//!   `max`) is deregistered. This backstops the subset check in crate::validate
+//!   and fails closed under DataFusion upgrades -- a newly added default
+//!   aggregate is excluded by default rather than silently reachable.
+//!   `avg`/`mean` are admitted by a later ticket (issue #172); until then they
+//!   fall outside the admitted set and are removed here with the rest.
 //! - The `range`/`generate_series` table functions are deregistered
 //!   (checkpoint review finding, not in the original design):
 //!   `SessionContext::new_with_config_rt` calls DataFusion's
@@ -62,6 +66,18 @@ use crate::udf::{label_match_udf, label_udf};
 
 /// The single table name every SQL query addresses.
 pub const SAMPLES_TABLE: &str = "samples";
+
+/// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
+/// enumerates the aggregate UDAFs the default session registers and
+/// deregisters every name outside this set, so exclusion is the default state
+/// and a DataFusion upgrade that adds a default aggregate fails closed.
+/// `avg`/`mean` are admitted by a later ticket (ADR-0022 decision 7, issue
+/// #172) and stay excluded here until their custom UDAF lands.
+///
+/// The complement within the default registrations lives in
+/// [`crate::validate::EXCLUDED_AGGREGATES`]; the two are kept exhaustive by
+/// `admitted_and_excluded_aggregates_cover_the_default_registrations` below.
+pub const ADMITTED_AGGREGATES: [&str; 4] = ["count", "sum", "min", "max"];
 
 /// An `ObjectStoreRegistry` that holds nothing and registers nothing.
 ///
@@ -125,27 +141,20 @@ pub fn build_session(
 
     ctx.register_udf(label_udf());
     ctx.register_udf(label_match_udf());
-    // Backstop for the v1 subset check in crate::validate: even a syntactic
-    // form the AST walk missed cannot resolve an avg accumulator here.
-    ctx.deregister_udaf("avg");
-    ctx.deregister_udaf("mean");
-    // The stddev/variance family shares avg's excluded floating-mean property
-    // (Welford's online algorithm, no bit-identical naive reference); reject in
-    // crate::validate, deregister here so a missed syntactic form cannot
-    // resolve the accumulator. Every registered spelling and alias is removed.
-    for name in [
-        "stddev",
-        "stddev_samp",
-        "stddev_pop",
-        "var",
-        "var_samp",
-        "variance",
-        "var_pop",
-        "covar",
-        "covar_samp",
-        "covar_pop",
-        "corr",
-    ] {
+    // Allowlist enforcement (ADR-0022 decision 2), the hard registration
+    // boundary behind the parse gate. Enumerate every aggregate UDAF the
+    // default session registered and deregister every name outside the admitted
+    // set, so a DataFusion upgrade that registers a new default aggregate fails
+    // closed instead of silently widening the SQL surface. Names are collected
+    // first because deregistration mutates the same map the accessor borrows.
+    let excluded: Vec<String> = ctx
+        .state()
+        .aggregate_functions()
+        .keys()
+        .filter(|name| !ADMITTED_AGGREGATES.contains(&name.to_ascii_lowercase().as_str()))
+        .cloned()
+        .collect();
+    for name in &excluded {
         ctx.deregister_udaf(name);
     }
     // `with_default_features()` (inside `new_with_config_rt` above)
@@ -177,6 +186,52 @@ mod tests {
         assert!(!options.optimizer.repartition_sorts);
         assert!(!options.optimizer.repartition_windows);
         assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// ADR-0022 decision 2: the validation reject-list
+    /// (`crate::validate::EXCLUDED_AGGREGATES`) plus the registration allowlist
+    /// ([`ADMITTED_AGGREGATES`]) must exactly cover every aggregate UDAF the
+    /// default DataFusion session registers -- primary spellings and aliases.
+    /// A version bump that adds a default aggregate breaks this test instead of
+    /// silently widening the SQL surface, and a stale entry (a name no longer
+    /// registered) is caught the same way.
+    #[test]
+    fn admitted_and_excluded_aggregates_cover_the_default_registrations() {
+        use std::collections::BTreeSet;
+
+        // A default context registers the same aggregate UDAFs `build_session`
+        // starts from; the session_config flags do not add or remove any.
+        let ctx = SessionContext::new();
+        let registered: BTreeSet<String> = ctx
+            .state()
+            .aggregate_functions()
+            .keys()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+
+        let mut classified: BTreeSet<String> = BTreeSet::new();
+        for name in ADMITTED_AGGREGATES {
+            assert!(
+                classified.insert(name.to_string()),
+                "duplicate admitted aggregate name {name}"
+            );
+        }
+        for name in crate::validate::EXCLUDED_AGGREGATES {
+            assert!(
+                classified.insert(name.to_string()),
+                "{name} appears in both the admitted set and the excluded list"
+            );
+        }
+
+        let unclassified: Vec<&String> = registered.difference(&classified).collect();
+        let stale: Vec<&String> = classified.difference(&registered).collect();
+        assert!(
+            unclassified.is_empty() && stale.is_empty(),
+            "aggregate allowlist/reject-list drifted from the default registrations.\n  \
+             registered but unclassified (surface silently widened; add to the admitted set \
+             or crate::validate::EXCLUDED_AGGREGATES): {unclassified:?}\n  \
+             classified but not registered (stale entry to remove): {stale:?}"
+        );
     }
 
     #[test]

@@ -25,24 +25,34 @@
 //! therefore walks the whole query tree -- body, set operations, CTEs, and
 //! parenthesized subqueries -- and rejects any statement-bearing node.
 //!
-//! Subset validation (`avg`, grouped `min`/`max`) rides along here rather
-//! than in a second pass:
-//! `avg` is excluded from the v1 SQL subset because DataFusion's avg
-//! accumulator has its own intermediate typing and no naive reference is
-//! bit-identical to it (docs/arrow-datafusion-plan.md section 2 "Exactness",
-//! review F7). The rejection names `SUM`/`COUNT` as the workaround, as the
-//! plan requires. The session builder additionally deregisters the `avg`
-//! UDAF (crate::session) so a syntactic form this walk failed to spot still
-//! cannot execute; the walk exists for the good error message, the
-//! deregistration is the backstop.
+//! Subset validation (the aggregate allowlist, grouped `min`/`max`) rides
+//! along here rather than in a second pass.
 //!
-//! The stddev/variance family (`stddev`, `var`, `stddev_pop`, `var_pop`,
-//! `covar_samp`, `covar_pop`, `corr`, and their aliases) is excluded for the
-//! same reason: DataFusion computes them with Welford's online algorithm, so
-//! no independent naive reference is bit-identical to the accumulator and the
-//! differential gate cannot admit them (docs/reviews/2026-07-28-ravel-sql-\
-//! audit/sql4-validate-error-tenant.md, finding sql4-F02). They are rejected
-//! here and their UDAFs are deregistered in crate::session, mirroring `avg`.
+//! The v1 SQL subset admits exactly four aggregates: `count`, `sum`, `min`,
+//! `max` ([`ADMITTED_AGGREGATES`](crate::session::ADMITTED_AGGREGATES)). Every
+//! other aggregate DataFusion registers by default is excluded, because none
+//! of them meets the exactness admission rule (ADR-0022 decision 1): `avg`'s
+//! lane-parallel batch sum has no portable sequential reference, the
+//! stddev/variance/covariance/correlation family folds a floating mean
+//! (Welford, or a grouped sum-of-products state with a lossy merge) that no
+//! naive reference reproduces bit-for-bit, and the remaining defaults
+//! (`median`, the `regr_*` and `approx_*` families, `string_agg`, `array_agg`,
+//! `first_value`/`last_value`/`nth_value`, the bit and bool aggregates,
+//! `grouping`, `percentile_cont`) are unverified by the differential gate.
+//! ADR-0022 decision 2 makes exclusion the default: this walk rejects any call
+//! spelled as one of the excluded names ([`EXCLUDED_AGGREGATES`]) with an error
+//! naming the admitted set, and `crate::session::build_session` enforces the
+//! same allowlist at registration by deregistering every default UDAF outside
+//! the admitted set. The walk exists for the good error message; the
+//! deregistration is the backstop. A CI test
+//! (`crate::session`'s `admitted_and_excluded_aggregates_cover_the_default_\
+//! registrations`) asserts the excluded list plus the admitted set exactly
+//! cover the default registrations, so a DataFusion upgrade that adds a default
+//! aggregate fails closed instead of silently widening the surface.
+//!
+//! `avg`/`mean` are excluded here in this ticket (ADR-0022 decision 7's first
+//! half, issue #160); a later ticket (issue #172) admits them via a custom
+//! sequential UDAF and moves them into the allowlist.
 //!
 //! `min`/`max` are excluded from the v1 subset **only when grouped**
 //! (discovered during the B3 checkpoint review, not in the original plan):
@@ -64,16 +74,63 @@ use datafusion::sql::sqlparser::ast::{
 };
 use std::ops::ControlFlow;
 
-/// The v1 SQL subset rejects `avg`; the message names the workaround.
-const AVG_MESSAGE: &str = "AVG is not part of the v1 SQL subset; use SUM(x) / COUNT(x) instead \
-     (docs/arrow-datafusion-plan.md section 2 \"Exactness\")";
-
-/// The v1 SQL subset rejects the stddev/variance/covariance/correlation
-/// family; the message names the excluded property, exactly as `avg` does.
-const STDDEV_VAR_MESSAGE: &str = "STDDEV/VARIANCE (and COVAR/CORR) are not part of the v1 SQL \
-     subset: DataFusion computes them with Welford's online algorithm and no naive reference is \
-     bit-identical to it, the same floating-mean property that excludes AVG \
-     (docs/arrow-datafusion-plan.md section 2 \"Exactness\")";
+/// Every aggregate UDAF name (primary spelling and alias) the default
+/// DataFusion session registers that is **not** in the admitted set
+/// ([`ADMITTED_AGGREGATES`](crate::session::ADMITTED_AGGREGATES): `count`,
+/// `sum`, `min`, `max`). ADR-0022 decision 2 makes exclusion the default: the
+/// aggregate walk rejects any call spelled as one of these, and
+/// `crate::session::build_session` deregisters the same names at registration.
+///
+/// This list is kept exhaustive by a CI test in `crate::session`
+/// (`admitted_and_excluded_aggregates_cover_the_default_registrations`) that
+/// asserts these names plus the admitted set exactly cover the UDAF names a
+/// default session registers, so a DataFusion version bump that adds a default
+/// aggregate breaks that test rather than silently widening the SQL surface.
+/// `avg`/`mean` are here in this ticket and move to the allowlist when their
+/// custom UDAF lands (ADR-0022 decision 7, issue #172).
+pub(crate) const EXCLUDED_AGGREGATES: [&str; 41] = [
+    "approx_distinct",
+    "approx_median",
+    "approx_percentile_cont",
+    "approx_percentile_cont_with_weight",
+    "array_agg",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    "corr",
+    "covar",
+    "covar_pop",
+    "covar_samp",
+    "first_value",
+    "grouping",
+    "last_value",
+    "mean",
+    "median",
+    "nth_value",
+    "percentile_cont",
+    "quantile_cont",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "var",
+    "var_pop",
+    "var_population",
+    "var_samp",
+    "var_sample",
+];
 
 /// The v1 SQL subset rejects `min`/`max` combined with `GROUP BY`.
 const GROUPED_MIN_MAX_MESSAGE: &str = "MIN/MAX combined with GROUP BY is not part of the v1 SQL \
@@ -114,14 +171,16 @@ pub enum ValidationError {
     )]
     WriteInQuery { kind: &'static str },
 
-    /// `avg` is outside the v1 subset.
-    #[error("{AVG_MESSAGE}")]
-    AvgUnsupported,
-
-    /// The stddev/variance/covariance/correlation family is outside the v1
-    /// subset.
-    #[error("{STDDEV_VAR_MESSAGE}")]
-    StddevVarUnsupported,
+    /// An aggregate outside the v1 admitted set (`count`, `sum`, `min`, `max`)
+    /// appeared in the query. Every other aggregate DataFusion registers by
+    /// default is excluded (ADR-0022 decision 2); `name` is the offending
+    /// lowercased spelling.
+    #[error(
+        "{name} is not part of the v1 SQL aggregate subset; \
+         the admitted aggregates are count, sum, min, max \
+         (docs/adrs/0022-floating-aggregate-exactness.md)"
+    )]
+    ExcludedAggregate { name: String },
 
     /// `min`/`max` combined with `GROUP BY` is outside the v1 subset.
     #[error("{GROUPED_MIN_MAX_MESSAGE}")]
@@ -167,8 +226,7 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
     };
 
     reject_writes_in_query(query)?;
-    reject_avg(query)?;
-    reject_stddev_var(query)?;
+    reject_excluded_aggregates(query)?;
     reject_grouped_min_max(query)?;
     Ok(())
 }
@@ -289,34 +347,46 @@ fn write_kind(body: &SetExpr) -> Option<&'static str> {
     }
 }
 
-/// Reject `avg` anywhere in the query, including inside subqueries and
-/// nested function arguments.
-fn reject_avg(query: &Query) -> Result<(), ValidationError> {
-    let flow = query.visit(&mut AvgFinder);
-    if flow.is_break() {
-        return Err(ValidationError::AvgUnsupported);
+/// Whether `bare` names an aggregate excluded from the v1 subset, i.e. any
+/// default-registered aggregate outside the admitted set (see
+/// [`EXCLUDED_AGGREGATES`]).
+fn is_excluded_aggregate(bare: &str) -> bool {
+    EXCLUDED_AGGREGATES.contains(&bare)
+}
+
+/// Reject any excluded aggregate anywhere in the query, including inside
+/// subqueries and nested function arguments. ADR-0022 decision 2 flips the
+/// subset from a per-function blacklist to an allowlist: only `count`, `sum`,
+/// `min`, `max` are admitted, so this walk rejects every other default
+/// aggregate. `crate::session::build_session` deregisters the same names as a
+/// backstop; the walk exists for the error message that names the admitted set.
+fn reject_excluded_aggregates(query: &Query) -> Result<(), ValidationError> {
+    if let ControlFlow::Break(name) = query.visit(&mut ExcludedAggregateFinder) {
+        return Err(ValidationError::ExcludedAggregate { name });
     }
     Ok(())
 }
 
-struct AvgFinder;
+struct ExcludedAggregateFinder;
 
-impl Visitor for AvgFinder {
-    type Break = ();
+impl Visitor for ExcludedAggregateFinder {
+    /// The offending lowercased bare name, carried out so the error can name
+    /// it.
+    type Break = String;
 
-    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<String> {
         if let SqlExpr::Function(func) = expr {
             let name = func.name.to_string().to_ascii_lowercase();
             // Match the bare name and any schema-qualified spelling
             // (`public.avg`), which the planner resolves to the same UDAF.
             let bare = name.rsplit('.').next().unwrap_or(name.as_str());
-            if bare == "avg" || bare == "mean" {
-                return ControlFlow::Break(());
+            if is_excluded_aggregate(bare) {
+                return ControlFlow::Break(bare.to_string());
             }
             // sqlparser does not descend into `FunctionArguments::List`
             // expressions from `pre_visit_expr` on the enclosing call in
             // every version; walk them explicitly so `sum(avg(x))`-shaped
-            // nesting cannot hide an avg.
+            // nesting cannot hide an excluded aggregate.
             if let FunctionArguments::List(list) = &func.args {
                 for arg in &list.args {
                     let inner = match arg {
@@ -325,77 +395,9 @@ impl Visitor for AvgFinder {
                         | FunctionArg::Unnamed(arg) => arg,
                     };
                     if let FunctionArgExpr::Expr(inner) = inner
-                        && inner.visit(self).is_break()
+                        && let ControlFlow::Break(found) = inner.visit(self)
                     {
-                        return ControlFlow::Break(());
-                    }
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-/// Whether `bare` names a member of the excluded stddev/variance family,
-/// including DataFusion's registered aliases (`variance`, the `_samp`
-/// spellings, `covar`).
-fn is_stddev_var_family(bare: &str) -> bool {
-    matches!(
-        bare,
-        "stddev"
-            | "stddev_samp"
-            | "stddev_pop"
-            | "var"
-            | "var_samp"
-            | "variance"
-            | "var_pop"
-            | "covar"
-            | "covar_samp"
-            | "covar_pop"
-            | "corr"
-    )
-}
-
-/// Reject the stddev/variance/covariance/correlation family anywhere in the
-/// query, including inside subqueries and nested function arguments. These
-/// share `avg`'s excluded floating-mean property (Welford's online algorithm
-/// has no bit-identical naive reference), so they are handled exactly like
-/// `avg`: rejected here, and deregistered as a backstop in crate::session.
-fn reject_stddev_var(query: &Query) -> Result<(), ValidationError> {
-    let flow = query.visit(&mut StddevVarFinder);
-    if flow.is_break() {
-        return Err(ValidationError::StddevVarUnsupported);
-    }
-    Ok(())
-}
-
-struct StddevVarFinder;
-
-impl Visitor for StddevVarFinder {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
-        if let SqlExpr::Function(func) = expr {
-            let name = func.name.to_string().to_ascii_lowercase();
-            // Match the bare name and any schema-qualified spelling
-            // (`public.stddev`), which the planner resolves to the same UDAF.
-            let bare = name.rsplit('.').next().unwrap_or(name.as_str());
-            if is_stddev_var_family(bare) {
-                return ControlFlow::Break(());
-            }
-            // Walk nested call arguments explicitly, as `AvgFinder` does, so a
-            // `sum(stddev(x))`-shaped nesting cannot hide a family member.
-            if let FunctionArguments::List(list) = &func.args {
-                for arg in &list.args {
-                    let inner = match arg {
-                        FunctionArg::Named { arg, .. }
-                        | FunctionArg::ExprNamed { arg, .. }
-                        | FunctionArg::Unnamed(arg) => arg,
-                    };
-                    if let FunctionArgExpr::Expr(inner) = inner
-                        && inner.visit(self).is_break()
-                    {
-                        return ControlFlow::Break(());
+                        return ControlFlow::Break(found);
                     }
                 }
             }
@@ -698,23 +700,43 @@ mod tests {
     }
 
     #[test]
-    fn avg_is_rejected_and_names_the_workaround() {
+    fn avg_is_rejected_and_names_the_admitted_set() {
         let err = reject("SELECT avg(value) FROM samples");
-        assert_eq!(err, ValidationError::AvgUnsupported);
+        assert_eq!(
+            err,
+            ValidationError::ExcludedAggregate {
+                name: "avg".to_string()
+            }
+        );
         let msg = err.to_string();
-        assert!(msg.contains("SUM"), "message must name SUM: {msg}");
-        assert!(msg.contains("COUNT"), "message must name COUNT: {msg}");
+        for admitted in ["count", "sum", "min", "max"] {
+            assert!(
+                msg.contains(admitted),
+                "message must name the admitted aggregate {admitted}: {msg}"
+            );
+        }
     }
 
     #[test]
     fn avg_is_rejected_in_a_subquery_and_case_insensitively() {
         assert_eq!(
             reject("SELECT s FROM (SELECT AVG(value) AS s FROM samples)"),
-            ValidationError::AvgUnsupported
+            ValidationError::ExcludedAggregate {
+                name: "avg".to_string()
+            }
         );
         assert_eq!(
             reject("SELECT max(value) FROM samples HAVING Avg(value) > 1"),
-            ValidationError::AvgUnsupported
+            ValidationError::ExcludedAggregate {
+                name: "avg".to_string()
+            }
+        );
+        // `mean` is avg's registered alias and is excluded under the same name.
+        assert_eq!(
+            reject("SELECT mean(value) FROM samples"),
+            ValidationError::ExcludedAggregate {
+                name: "mean".to_string()
+            }
         );
     }
 
@@ -726,19 +748,22 @@ mod tests {
             "stddev_pop",
             "var",
             "var_samp",
-            "variance",
             "var_pop",
         ] {
             assert_eq!(
                 reject(&format!("SELECT {func}(value) FROM samples")),
-                ValidationError::StddevVarUnsupported,
+                ValidationError::ExcludedAggregate {
+                    name: func.to_string()
+                },
                 "ungrouped {func} must be rejected"
             );
             assert_eq!(
                 reject(&format!(
                     "SELECT series_id, {func}(value) FROM samples GROUP BY series_id"
                 )),
-                ValidationError::StddevVarUnsupported,
+                ValidationError::ExcludedAggregate {
+                    name: func.to_string()
+                },
                 "grouped {func} must be rejected"
             );
         }
@@ -749,8 +774,36 @@ mod tests {
         for func in ["covar_samp", "covar_pop", "corr"] {
             assert_eq!(
                 reject(&format!("SELECT {func}(value, value) FROM samples")),
-                ValidationError::StddevVarUnsupported,
+                ValidationError::ExcludedAggregate {
+                    name: func.to_string()
+                },
                 "{func} must be rejected"
+            );
+        }
+    }
+
+    /// A representative spread across the rest of the default aggregate set
+    /// (regression, approx, median, string/array aggregation, bit and bool
+    /// families, and the value pickers) is excluded, not just the floating-mean
+    /// functions: the allowlist admits only `count`/`sum`/`min`/`max`.
+    #[test]
+    fn other_default_aggregates_are_excluded_by_the_allowlist() {
+        for func in [
+            "median",
+            "regr_slope",
+            "approx_distinct",
+            "string_agg",
+            "array_agg",
+            "bit_and",
+            "bool_or",
+            "first_value",
+        ] {
+            assert_eq!(
+                reject(&format!("SELECT {func}(value) FROM samples")),
+                ValidationError::ExcludedAggregate {
+                    name: func.to_string()
+                },
+                "{func} must be excluded from the v1 subset"
             );
         }
     }
@@ -759,16 +812,22 @@ mod tests {
     fn stddev_var_is_rejected_in_a_subquery_and_case_insensitively() {
         assert_eq!(
             reject("SELECT s FROM (SELECT STDDEV(value) AS s FROM samples)"),
-            ValidationError::StddevVarUnsupported
+            ValidationError::ExcludedAggregate {
+                name: "stddev".to_string()
+            }
         );
         assert_eq!(
             reject("SELECT sum(value) FROM samples HAVING Var_Pop(value) > 1"),
-            ValidationError::StddevVarUnsupported
+            ValidationError::ExcludedAggregate {
+                name: "var_pop".to_string()
+            }
         );
         // Nested inside another call, as `sum(stddev(x))`.
         assert_eq!(
             reject("SELECT sum(stddev(value)) FROM samples"),
-            ValidationError::StddevVarUnsupported
+            ValidationError::ExcludedAggregate {
+                name: "stddev".to_string()
+            }
         );
     }
 
