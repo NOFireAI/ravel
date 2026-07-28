@@ -76,7 +76,6 @@ fn sql3_f01_grow_bypasses_the_query_and_tenant_ceiling() {
 /// do not. Both assertions FAIL on the audited HEAD: the error is
 /// `SqlError::Execution`, not `ResourcesExhausted`.
 #[tokio::test]
-#[ignore = "sql3-F02: sort/aggregate budget errors mistyped as Execution; fails on the audited HEAD"]
 async fn sql3_f02_a_sort_or_aggregate_budget_error_keeps_its_type() {
     let tenant = tenant_id("acme");
     let specs = vec![SegSpec::new(

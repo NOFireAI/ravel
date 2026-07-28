@@ -411,6 +411,16 @@ fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusionError> {
             }
             Err(DataFusionError::Collection(remaining))
         }
+        // A native budget exhaustion is a signal the client must see, so
+        // recover it here rather than let a wrapper above collapse it into a
+        // generic execution message. Because every wrapper arm recurses
+        // through `take_sql_error`, a `ResourcesExhausted` at any depth
+        // surfaces as `SqlError::ResourcesExhausted` (with its byte counts
+        // intact), whichever `Context`/`Diagnostic`/`Collection` wrapper an
+        // operator such as the external sort or hash aggregate carried it in.
+        // This mirrors the nested-`SqlError` recovery the other arms already
+        // do, and matches the `Shared`-wrapped case classify_shared handles.
+        DataFusionError::ResourcesExhausted(msg) => Ok(SqlError::ResourcesExhausted(msg)),
         other => Err(other),
     }
 }
@@ -441,6 +451,9 @@ fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
             classify_shared(inner)
         }
         DataFusionError::Shared(inner) => classify_shared(inner),
+        // A budget exhaustion behind an `Arc` keeps its own type and message
+        // for the client, same as it does through the owned wrappers above.
+        DataFusionError::ResourcesExhausted(msg) => Some(SqlError::ResourcesExhausted(msg.clone())),
         _ => None,
     }
 }
