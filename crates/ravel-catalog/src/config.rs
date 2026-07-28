@@ -8,6 +8,15 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// the ADR; a capacity cap is the simpler of the two eviction strategies it
 /// explicitly allows ("simple LRU or capacity cap per tenant").
 pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
+/// Default `max_flush_lifetime`: 1 hour, in nanoseconds. The GC interlock
+/// (ADR-0010 §11) forbids publishing a commit record after this long past
+/// its ingest hour's end; the seal watermark relies on that bound
+/// (docs/metric-index-plan.md, ADR-0020).
+pub const DEFAULT_MAX_FLUSH_LIFETIME_NS: i64 = 60 * 60 * 1_000_000_000;
+/// Default `fold_safety_margin`: 15 minutes, in nanoseconds. Extra padding
+/// past `max_flush_lifetime + clock_skew_allowance` before a fold trusts an
+/// ingest hour to be sealed (docs/metric-index-plan.md, ADR-0020).
+pub const DEFAULT_FOLD_SAFETY_MARGIN_NS: i64 = 15 * 60 * 1_000_000_000;
 
 /// Catalog configuration.
 ///
@@ -33,6 +42,15 @@ pub struct CatalogConfig {
     /// Bound on decoded commit records cached per tenant. Default
     /// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`].
     pub cache_capacity_per_tenant: usize,
+    /// Longest a writer may take to publish a commit record after its
+    /// ingest hour ends, in nanoseconds. Part of the seal-watermark margin
+    /// (docs/metric-index-plan.md, ADR-0020). Default
+    /// [`DEFAULT_MAX_FLUSH_LIFETIME_NS`].
+    pub max_flush_lifetime_ns: i64,
+    /// Extra margin added past `max_flush_lifetime_ns +
+    /// clock_skew_allowance_ns` before a fold trusts an ingest hour to be
+    /// sealed, in nanoseconds. Default [`DEFAULT_FOLD_SAFETY_MARGIN_NS`].
+    pub fold_safety_margin_ns: i64,
 }
 
 impl Default for CatalogConfig {
@@ -42,6 +60,8 @@ impl Default for CatalogConfig {
             max_ingest_lag_ns: DEFAULT_MAX_INGEST_LAG_NS,
             clock_skew_allowance_ns: DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
             cache_capacity_per_tenant: DEFAULT_CACHE_CAPACITY_PER_TENANT,
+            max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            fold_safety_margin_ns: DEFAULT_FOLD_SAFETY_MARGIN_NS,
         }
     }
 }
