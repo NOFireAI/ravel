@@ -85,6 +85,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use proptest::prelude::*;
+use ravel_promql::LabelMatcher;
 use ravel_sql::QueryOutput;
 use ravel_types::TenantId;
 use util::{Fixture, RefRow, SegSpec, SeriesSpec, request, tenant_id};
@@ -191,6 +192,14 @@ enum Pred {
     TsLt(i64),
     TsBetween(i64, i64),
     ValueGt(f64),
+    /// `label(labels, '__name__') != 'v'`. The pushdown extractor recognizes
+    /// this shape and pushes a negation matcher into the fetcher's SERIES_TABLE
+    /// prune; the reference never prunes, so any series the prune drops but the
+    /// SQL predicate keeps surfaces as a row-count diff.
+    LabelNe(&'static str),
+    /// `label_match(labels, '__name__', 'pat')`, an anchored `^(?:pat)$`
+    /// regex matcher pushed into the same prune.
+    LabelMatch(&'static str),
     And(Box<Pred>, Box<Pred>),
     Or(Box<Pred>, Box<Pred>),
 }
@@ -203,6 +212,8 @@ impl Pred {
             Pred::TsLt(u) => format!("CAST(ts AS BIGINT) < {u}"),
             Pred::TsBetween(l, u) => format!("CAST(ts AS BIGINT) BETWEEN {l} AND {u}"),
             Pred::ValueGt(c) => format!("value > {c:?}"),
+            Pred::LabelNe(v) => format!("label(labels, '__name__') != '{v}'"),
+            Pred::LabelMatch(p) => format!("label_match(labels, '__name__', '{p}')"),
             Pred::And(a, b) => format!("({}) AND ({})", a.sql(), b.sql()),
             Pred::Or(a, b) => format!("({}) OR ({})", a.sql(), b.sql()),
         }
@@ -220,6 +231,20 @@ impl Pred {
             Pred::TsLt(u) => row.ts < *u,
             Pred::TsBetween(l, u) => row.ts >= *l && row.ts <= *u,
             Pred::ValueGt(c) => row.value.total_cmp(c) == Ordering::Greater,
+            // `label(...)` is NULL for an absent label, and `NULL != 'v'` is
+            // not true, so an absent-label row is dropped. The grammar is
+            // AND/OR only (no NOT), so substituting NULL with `false` and
+            // evaluating two-valued matches SQL's WHERE result exactly.
+            Pred::LabelNe(v) => match row.labels.get("__name__") {
+                Some(name) => name != *v,
+                None => false,
+            },
+            // `label_match` is total (absent reads as ""), anchored `^(?:p)$`,
+            // exactly the matcher the prune uses -- applied here to every
+            // fetched series independently of any prune.
+            Pred::LabelMatch(p) => LabelMatcher::regex("__name__", *p)
+                .expect("valid test regex")
+                .is_match(&row.labels),
             Pred::And(a, b) => a.eval(row) && b.eval(row),
             Pred::Or(a, b) => a.eval(row) || b.eval(row),
         }
@@ -500,6 +525,19 @@ fn arb_pred() -> impl Strategy<Value = Pred> {
             Just(Pred::ValueGt(0.0)),
             Just(Pred::ValueGt(-1.0)),
             Just(Pred::ValueGt(1.0)),
+        ],
+        // Label predicates over `__name__` (the datasets' metric is a/b/c),
+        // exercising the negation and regex matcher pushdown. `z` matches no
+        // present metric; `.*` matches every series; `a|b` and `b.*` cover
+        // partial alternations against the anchored `^(?:pat)$` semantics.
+        prop_oneof![
+            Just(Pred::LabelNe("a")),
+            Just(Pred::LabelNe("b")),
+            Just(Pred::LabelNe("z")),
+            Just(Pred::LabelMatch("a")),
+            Just(Pred::LabelMatch("a|b")),
+            Just(Pred::LabelMatch("b.*")),
+            Just(Pred::LabelMatch(".*")),
         ],
     ];
     leaf.prop_recursive(2, 6, 2, |inner| {

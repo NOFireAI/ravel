@@ -32,7 +32,9 @@ use ravel_object_store::{
 };
 use ravel_query::{EngineConfig, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
-use ravel_sql::{RavelTableProvider, SqlConfig, TenantMemoryAccountant, label_udf};
+use ravel_sql::{
+    RavelTableProvider, SqlConfig, TenantMemoryAccountant, label_match_udf, label_udf,
+};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -315,6 +317,7 @@ fn register(ctx: &SessionContext, snapshot: Snapshot, store: Arc<dyn ObjectStore
     let fetcher = SegmentFetcher::new(store);
     let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
     ctx.register_udf(label_udf());
+    ctx.register_udf(label_match_udf());
     ctx.register_table("samples", Arc::new(provider))
         .expect("register table");
 }
@@ -579,6 +582,138 @@ async fn between_predicate_matches_oracle() {
         }
     }
     assert_eq!(got, want, "BETWEEN must match the oracle over [3,7]");
+}
+
+// ---------------------------------------------------------------------------
+// Label negation / regex pushdown: no row loss (widen-only series prune).
+//
+// The label-matcher path prunes whole series (and their page GETs) inside the
+// fetcher against SERIES_TABLE, before DataFusion sees a row. A series wrongly
+// excluded there yields rows the Inexact residual can never recover, so it is
+// the prune form most able to silently under-fetch. Both cases assert
+// bit-exact equality against the independent no-prune `oracle`, and each
+// carries an absent-label series (and the regex case a partial-match series)
+// to pin the PromQL superset semantics the prune rests on (finding sql1-F01).
+// ---------------------------------------------------------------------------
+
+fn labelled_series(metric: &str, extra: &[(&str, &str)], samples: &[(i64, f64)]) -> SeriesSpec {
+    SeriesSpec {
+        labels: metric_labels(metric, extra),
+        samples: samples.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn label_negation_loses_no_rows() {
+    // Three series in one segment: host=a, host=b, and one with no host label
+    // at all. `label(labels,'host') != 'a'` must return exactly the host=b
+    // series. host=a is excluded by value; the absent-host series is excluded
+    // because `label(...)` is NULL there and `NULL != 'a'` is not true. The
+    // negation matcher pushed into the fetcher keeps a superset -- it retains
+    // the absent-host series (absent-as-empty, `"" != "a"`) -- and the residual
+    // removes the surplus, so host=b must survive intact.
+    let specs = vec![SegSpec {
+        created_unix_ns: 1,
+        writer_epoch: 1,
+        writer_seq: 1,
+        series: vec![
+            labelled_series("cpu", &[("host", "a")], &[(0, 1.0), (10, 2.0)]),
+            labelled_series("cpu", &[("host", "b")], &[(0, 3.0), (10, 4.0)]),
+            labelled_series("cpu", &[("region", "us")], &[(0, 5.0), (10, 6.0)]),
+        ],
+    }];
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(store.as_ref(), &specs).await;
+    let want_all = oracle(Arc::clone(&store), &snapshot).await;
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    register(&ctx, snapshot, Arc::clone(&store));
+
+    let batches = ctx
+        .table("samples")
+        .await
+        .unwrap()
+        .filter(
+            label_udf()
+                .call(vec![col("labels"), lit("host")])
+                .not_eq(lit("a")),
+        )
+        .unwrap()
+        .select(vec![col("ts"), col("value"), col("series_id")])
+        .unwrap()
+        .collect()
+        .await
+        .expect("collect");
+    let got = reduce_ts_value_series(&batches);
+
+    // Expected = only the host=b series, straight from the no-prune oracle.
+    let b_id = series_id_of(&metric_labels("cpu", &[("host", "b")]));
+    let mut want: Reduced = HashMap::new();
+    want.insert(b_id, want_all[&b_id].clone());
+
+    assert_eq!(
+        got, want,
+        "label negation must return exactly the host=b series, losing none of it"
+    );
+}
+
+#[tokio::test]
+async fn label_regex_loses_no_rows() {
+    // Five series in one segment. `label_match(labels,'host','web.*')` anchors
+    // as `^(?:web.*)$` and reads an absent label as "". Exactly the anchored
+    // matches survive:
+    //   - host=web1, host=web   -> match
+    //   - host=aweb             -> partial: contains "web" but is not an
+    //                              anchored match, so it must be excluded
+    //   - host=db1              -> no match
+    //   - region=us (no host)   -> "" does not match web.*, excluded
+    // The regex matcher pushed into the fetcher selects the same anchored
+    // superset the residual re-applies; a sub-anchoring or dropped-series bug
+    // in the prune would show up as a row-count or value diff against the
+    // no-prune oracle.
+    let specs = vec![SegSpec {
+        created_unix_ns: 1,
+        writer_epoch: 1,
+        writer_seq: 1,
+        series: vec![
+            labelled_series("cpu", &[("host", "web1")], &[(0, 1.0), (10, 2.0)]),
+            labelled_series("cpu", &[("host", "web")], &[(0, 3.0), (10, 4.0)]),
+            labelled_series("cpu", &[("host", "aweb")], &[(0, 5.0), (10, 6.0)]),
+            labelled_series("cpu", &[("host", "db1")], &[(0, 7.0), (10, 8.0)]),
+            labelled_series("cpu", &[("region", "us")], &[(0, 9.0), (10, 10.0)]),
+        ],
+    }];
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(store.as_ref(), &specs).await;
+    let want_all = oracle(Arc::clone(&store), &snapshot).await;
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    register(&ctx, snapshot, Arc::clone(&store));
+
+    let batches = ctx
+        .table("samples")
+        .await
+        .unwrap()
+        .filter(label_match_udf().call(vec![col("labels"), lit("host"), lit("web.*")]))
+        .unwrap()
+        .select(vec![col("ts"), col("value"), col("series_id")])
+        .unwrap()
+        .collect()
+        .await
+        .expect("collect");
+    let got = reduce_ts_value_series(&batches);
+
+    // Expected = only the two anchored-match series, from the no-prune oracle.
+    let mut want: Reduced = HashMap::new();
+    for host in ["web1", "web"] {
+        let id = series_id_of(&metric_labels("cpu", &[("host", host)]));
+        want.insert(id, want_all[&id].clone());
+    }
+
+    assert_eq!(
+        got, want,
+        "label_match must return exactly the anchored web.* series, losing none of them"
+    );
 }
 
 // ---------------------------------------------------------------------------

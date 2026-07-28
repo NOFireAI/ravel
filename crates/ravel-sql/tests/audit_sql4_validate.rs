@@ -29,7 +29,6 @@ use ravel_sql::{ValidationError, validate};
 /// the `HAVING max(value)` case already is. Fails today: `validate` returns
 /// `Ok(())`.
 #[test]
-#[ignore = "audit sql4-F01: documents an acceptance gap, fails against baseline"]
 fn grouped_min_max_in_order_by_must_be_rejected() {
     assert_eq!(
         validate("SELECT series_id FROM samples GROUP BY series_id ORDER BY max(value)")
