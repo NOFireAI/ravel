@@ -566,3 +566,339 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         put_requests: counters.put_requests,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+
+    use super::*;
+    use crate::config::{
+        DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+        DEFAULT_MAX_FLUSH_LIFETIME_NS,
+    };
+
+    const DEFAULT_MARGIN_NS: i64 = DEFAULT_MAX_FLUSH_LIFETIME_NS
+        + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0xcd; 16])
+    }
+
+    fn config(shard_count: u32) -> CatalogConfig {
+        CatalogConfig {
+            shard_count,
+            ..Default::default()
+        }
+    }
+
+    /// `now_ns` at which ingest hour `hour` has just sealed under default
+    /// margins: the exact boundary of `sealed_watermark_hour`.
+    fn now_at_seal(hour: u32) -> i64 {
+        (i64::from(hour) + 1) * NS_PER_HOUR + DEFAULT_MARGIN_NS
+    }
+
+    async fn publish_segment(
+        store: &MemoryStore,
+        shard: u32,
+        writer_id: Uuid,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+    ) -> CommitRecord {
+        let payload = format!("seg-{shard}-{writer_id}-{seq}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    #[test]
+    fn seal_boundary_is_inclusive_and_hour_by_hour() {
+        let cfg = config(1);
+        assert_eq!(sealed_watermark_hour(now_at_seal(10), &cfg), Some(10));
+        assert_eq!(sealed_watermark_hour(now_at_seal(10) - 1, &cfg), Some(9));
+        assert_eq!(sealed_watermark_hour(now_at_seal(0), &cfg), Some(0));
+        assert_eq!(sealed_watermark_hour(now_at_seal(0) - 1, &cfg), None);
+    }
+
+    #[tokio::test]
+    async fn no_hour_sealed_yet_is_a_no_op() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), 0, &[])
+            .await
+            .expect("fold");
+        assert!(report.no_op);
+        assert_eq!(report.watermark_hour, None);
+        assert_eq!(report.put_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_tenant_still_produces_a_valid_empty_fold() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, config(2)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(5),
+                &[],
+            )
+            .await
+            .expect("fold");
+        assert!(!report.no_op);
+        assert!(report.rebuilt);
+        assert_eq!(report.watermark_hour, Some(5));
+        assert_eq!(report.entry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn first_fold_rebuilds_from_commit_layout_and_second_call_is_idempotent() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 2, 10, now - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt);
+        assert!(!first.no_op);
+        assert_eq!(first.watermark_hour, Some(10));
+        assert_eq!(first.previous_watermark_hour, None);
+        assert_eq!(first.entry_count, 2);
+
+        // Same now_ns: nothing new sealed, so this must be a clean no-op
+        // that touches neither the part nor HEAD.
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .await
+            .expect("second fold");
+        assert!(second.no_op);
+        assert_eq!(second.watermark_hour, Some(10));
+        assert_eq!(second.put_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_fold_preserves_previous_entries_and_folds_only_new_hours() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 1);
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "a valid HEAD must fold incrementally");
+        assert!(!second.no_op);
+        assert_eq!(second.previous_watermark_hour, Some(10));
+        assert_eq!(second.watermark_hour, Some(12));
+        // Hours 11 and 12 across the single shard: two new buckets listed,
+        // only one of which has data.
+        assert_eq!(second.buckets_folded, 2);
+        assert_eq!(second.entry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_head_falls_back_to_rebuild_and_recovers_all_entries() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+
+        // Corrupt HEAD in place: same key, garbage bytes.
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        store
+            .put(
+                &head_key,
+                Bytes::from_static(b"not a head"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with garbage");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("fold after corruption");
+        assert!(report.rebuilt);
+        assert!(!report.no_op);
+        assert_eq!(report.watermark_hour, Some(12));
+        assert_eq!(report.entry_count, 2);
+    }
+
+    /// Every snapshot part key contains `/snap/`; a HEAD key never does, so
+    /// this rule fails exactly the previous-part reads a later incremental
+    /// fold performs, and nothing else. Simulates a part that has become
+    /// unreadable (e.g. GC raced with a stalled fold) without needing to
+    /// know its content-addressed key ahead of time.
+    #[tokio::test]
+    async fn unreadable_previous_part_falls_back_to_rebuild() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
+                .with_key_contains("/snap/"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 1);
+
+        let now_2 = now_at_seal(12);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("fold falls back to rebuild");
+        assert!(second.rebuilt);
+        assert_eq!(second.entry_count, 2);
+        assert!(store.fault_count(Op::Get, FaultKind::Permanent) >= 1);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_first_folds_race_head_cas_and_only_one_advances() {
+        let store = Arc::new(MemoryStore::new());
+        let now = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+
+        let catalog_a = Catalog::new(store.clone(), config(1)).expect("catalog a");
+        let catalog_b = Catalog::new(store.clone(), config(1)).expect("catalog b");
+        let tenant = tenant();
+        let (result_a, result_b) = tokio::join!(
+            catalog_a.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[]),
+            catalog_b.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[]),
+        );
+        let report_a = result_a.expect("fold a");
+        let report_b = result_b.expect("fold b");
+
+        let no_op_count = [&report_a, &report_b].iter().filter(|r| r.no_op).count();
+        assert_eq!(
+            no_op_count, 1,
+            "exactly one racer must rebase onto the other's HEAD"
+        );
+        for report in [&report_a, &report_b] {
+            assert_eq!(report.watermark_hour, Some(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_commit_identity_across_buckets_is_fatal() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_at_seal(11);
+        let writer_id = Uuid::new_v4();
+
+        // A well-formed record naturally placed in hour 10's directory.
+        let record_a = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: 5,
+            content_hash: *blake3::hash(b"a").as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1,
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 1,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+            ingest_hour_bucket: 10,
+        })
+        .expect("valid record a");
+        let key_a =
+            keys::commit_key(&tenant(), Signal::Metrics, 0, 10, writer_id, 1, 1).expect("key a");
+        store
+            .put(
+                &key_a,
+                record::encode(&record_a),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put a");
+
+        // Same shard/writer_id/epoch/seq/ingest_hour_bucket identity, but
+        // physically misplaced under hour 9's directory (a buggy or
+        // misbehaving writer). validate_expected_fields never checks the
+        // embedded ingest_hour_bucket against the physical directory, so
+        // both entries decode and validate cleanly; fold's own identity
+        // dedup must be what catches the collision.
+        let key_b =
+            keys::commit_key(&tenant(), Signal::Metrics, 0, 9, writer_id, 1, 1).expect("key b");
+        store
+            .put(
+                &key_b,
+                record::encode(&record_a),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put b");
+
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .await
+            .expect_err("must detect duplicate identity");
+        assert!(matches!(err, CatalogError::DuplicateEntryIdentity { .. }));
+    }
+}
