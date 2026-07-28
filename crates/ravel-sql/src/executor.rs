@@ -67,7 +67,6 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
@@ -76,7 +75,7 @@ use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 
 use crate::config::SqlConfig;
 use crate::error::SqlError;
-use crate::memory::TenantMemoryAccountant;
+use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
 use crate::provider::RavelTableProvider;
 use crate::session::build_session;
@@ -267,7 +266,7 @@ impl SqlExecutor {
         snapshot: Snapshot,
         sql: &str,
     ) -> Result<PinnedQuery, SqlError> {
-        let pool: Arc<dyn MemoryPool> = self.config.query_pool(self.tenant_budget(tenant_hash));
+        let (pool, breach) = self.config.query_pool(self.tenant_budget(tenant_hash));
         let provider = Arc::new(RavelTableProvider::new(
             snapshot,
             tenant_hash,
@@ -278,7 +277,12 @@ impl SqlExecutor {
         let ctx = build_session(&self.config, pool, provider).map_err(plan_error)?;
         let frame = ctx.sql(sql).await.map_err(plan_error)?;
         let schema = frame.schema().inner().clone();
-        Ok(PinnedQuery { ctx, frame, schema })
+        Ok(PinnedQuery {
+            ctx,
+            frame,
+            schema,
+            breach,
+        })
     }
 
     /// One `Catalog::resolve` plus the `max_segments` budget check.
@@ -354,6 +358,9 @@ pub struct PinnedQuery {
     ctx: SessionContext,
     frame: DataFrame,
     schema: SchemaRef,
+    /// The best-effort memory ceiling's abort flag, tripped by the pool's
+    /// `grow` and moved into the [`PinnedStream`] on execute (issue #163).
+    breach: Arc<CeilingBreach>,
 }
 
 impl PinnedQuery {
@@ -365,12 +372,18 @@ impl PinnedQuery {
     /// Start the plan's stream. The session stays alive inside the returned
     /// [`PinnedStream`] for as long as the stream does.
     pub async fn execute(self) -> Result<PinnedStream, SqlError> {
-        let PinnedQuery { ctx, frame, schema } = self;
+        let PinnedQuery {
+            ctx,
+            frame,
+            schema,
+            breach,
+        } = self;
         let inner = frame.execute_stream().await.map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
             inner,
             schema,
+            breach,
         })
     }
 }
@@ -386,6 +399,11 @@ pub struct PinnedStream {
     _ctx: SessionContext,
     inner: SendableRecordBatchStream,
     schema: SchemaRef,
+    /// The best-effort memory ceiling's abort flag (issue #163). Checked
+    /// before every delegated poll; once the pool's `grow` has tripped it,
+    /// the stream fails with [`SqlError::ResourcesExhausted`] instead of
+    /// running the over-budget plan to completion.
+    breach: Arc<CeilingBreach>,
 }
 
 impl PinnedStream {
@@ -399,6 +417,24 @@ impl Stream for PinnedStream {
     type Item = Result<RecordBatch, SqlError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // The best-effort memory ceiling's hard-abort seam (issue #163). The
+        // pool's `grow` cannot decline a reservation, so a join that overruns
+        // a ceiling reserves the bytes and then trips the breach. This is the
+        // one place every batch from every transport (HTTP SQL and Flight SQL,
+        // crate::flight) passes through, so checking here aborts both.
+        //
+        // The abort fires on the poll *after* the `grow` that tripped it: the
+        // batch already in flight during that `grow` is not retroactively
+        // suppressed. That is intentional, not a gap. `grow` runs synchronously
+        // inside an operator's own `poll`, deep under `inner.poll_next_unpin`;
+        // the earliest seam that sees the tripped flag without reaching into
+        // DataFusion's operators is the next poll of this outer stream. Bounding
+        // the overshoot to one more in-flight batch is the whole point of the
+        // ticket -- it stops the query short of running to completion over
+        // budget, which is what happened before (#156).
+        if let Some(message) = self.breach.message() {
+            return Poll::Ready(Some(Err(SqlError::ResourcesExhausted(message.to_string()))));
+        }
         self.inner
             .poll_next_unpin(cx)
             .map(|next| next.map(|batch| batch.map_err(execution_error)))

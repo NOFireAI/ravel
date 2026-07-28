@@ -755,7 +755,7 @@ async fn pushdown_path_preserves_sort_preserving_merge() {
 // ---------------------------------------------------------------------------
 
 fn task_ctx_with_pool(config: &SqlConfig, tenant: Arc<TenantMemoryAccountant>) -> Arc<TaskContext> {
-    let pool = config.query_pool(tenant);
+    let (pool, _breach) = config.query_pool(tenant);
     let rt = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .build_arc()
@@ -918,7 +918,7 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
         max_query_bytes: 1 << 30,
     };
     let tenant = TenantMemoryAccountant::new(8);
-    let pool = config.query_pool(Arc::clone(&tenant));
+    let (pool, _breach) = config.query_pool(Arc::clone(&tenant));
     let reserved_before = pool.reserved();
     let rt = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::clone(&pool))
