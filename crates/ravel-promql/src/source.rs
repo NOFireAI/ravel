@@ -16,14 +16,24 @@ use regex::Regex;
 ///
 /// `samples` MUST be sorted ascending by [`Sample::ts_ns`]. Implementors are
 /// responsible for the sort; the evaluator relies on it (binary search) and
-/// does not re-sort. Duplicate timestamps are legal; where two samples share
-/// a timestamp, the evaluator treats the one later in the vec as
-/// authoritative (see `eval::pick_sample`). Implementors MUST place samples
-/// in the vec in the same order as the normative total order for equal
-/// timestamps defined in docs/catalog-and-mvcc.md (commit sequence order),
-/// so that "later in the vec" and "authoritative per the commit log" agree;
-/// an implementor that reorders equal-timestamp samples arbitrarily breaks
-/// that guarantee even though the vec is still sorted by `ts_ns`.
+/// does not re-sort.
+///
+/// Implementors SHOULD deliver at most one sample per `(series, ts)`, already
+/// resolved under the normative commit total order (ADR-0010 §5:
+/// `created_unix_ns`, `writer_epoch`, `writer_seq`, in-page index; greatest
+/// `value.to_bits()` on a full tie). That resolution belongs upstream: in the
+/// real pipeline the query engine's lazy k-way merge (docs/query-engine.md)
+/// dedups to one sample per ts *before* building any `SeriesData`, because it
+/// is the only layer that carries the commit provenance the total order ranks
+/// on. A [`Sample`] here carries only `ts_ns` and `value`, so this surface
+/// cannot reconstruct that order and does not define a competing one.
+///
+/// Should an implementor nonetheless pass raw duplicates, the evaluator
+/// resolves them by the one component of the normative order the values alone
+/// carry, greatest `value.to_bits()` (see `eval::pick_sample`), never by
+/// vector position. That is defense-in-depth, not a second tiebreak rule: it
+/// is the normative order's own final comparison, so it can never contradict
+/// the deduped input the engine hands over.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeriesData {
     pub labels: LabelSet,

@@ -243,8 +243,9 @@ impl Evaluator {
     /// For each series matching the selector, the most recent sample with
     /// `ts_ns > sel_ts - lookback` and `ts_ns <= sel_ts` is used (`sel_ts`
     /// is `t_ms` shifted by the selector's `offset`/`@`, if any); series
-    /// with no such sample are omitted. Ties at the same timestamp resolve
-    /// to the sample stored last (see [`SeriesData`](crate::source::SeriesData)).
+    /// with no such sample are omitted. The input carries one sample per
+    /// `(series, ts)`, deduped upstream under the normative total order (see
+    /// [`SeriesData`](crate::source::SeriesData)).
     pub fn instant(
         &self,
         source: &dyn SeriesSource,
@@ -700,12 +701,22 @@ fn step_count(start_ns: i64, end_ns: i64, step_ns: i64) -> u64 {
     u64::try_from(steps).unwrap_or(u64::MAX)
 }
 
-/// Pick the most recent sample in `(sel_ts - lookback, sel_ts]`. `samples`
-/// must be sorted ascending by `ts_ns` (the `SeriesSource` contract); among
-/// duplicate timestamps, the one later in the vec wins, which falls out of
-/// `partition_point` for free given that ordering.
+/// Pick the value at the most recent timestamp in `(sel_ts - lookback,
+/// sel_ts]`. `samples` must be sorted ascending by `ts_ns` (the
+/// `SeriesSource` contract), which is guaranteed to hold at most one sample
+/// per ts in the normal pipeline: the engine's k-way merge has already
+/// deduped by the normative commit total order (ADR-0010 §5) upstream, where
+/// the commit provenance that order ranks on is still available (see
+/// [`SeriesData`](crate::source::SeriesData)).
 ///
-/// If the selected sample is a Prometheus staleness marker
+/// Should a source violate that contract and hand raw duplicates at the
+/// selected ts, they are resolved by the one component of the normative order
+/// the values alone carry, greatest `value.to_bits()`, never by vector
+/// position. This is the normative order's own final tiebreak, not a second
+/// competing rule, so it agrees with the engine's dedup; with a deduped input
+/// the run is a single sample and the scan is a no-op.
+///
+/// If the resolved sample is a Prometheus staleness marker
 /// ([`STALE_NAN_BITS`]) the series is absent from that sample forward, so
 /// this returns `None`. A later real sample supersedes the marker and is
 /// picked normally; markers older than the selected sample are irrelevant.
@@ -714,15 +725,26 @@ fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Op
     if idx == 0 {
         return None;
     }
-    let candidate = &samples[idx - 1];
+    let candidate_ts_ns = samples[idx - 1].ts_ns;
     let window_start = sel_ts_ns.checked_sub(lookback_delta_ns)?;
-    if candidate.ts_ns <= window_start {
+    if candidate_ts_ns <= window_start {
         return None;
     }
-    if candidate.value.to_bits() == STALE_NAN_BITS {
+    // Resolve any duplicate (series, ts) by the normative final tiebreak
+    // (greatest value.to_bits(), ADR-0010 §5) over the contiguous run of
+    // equal-ts samples ending at idx-1, not by vector position. Bit-pattern
+    // comparison, never `==`, so NaN payloads and -0.0 stay significant and a
+    // staleness marker (a NaN payload) resolves exactly as it does upstream.
+    let mut best_bits = samples[idx - 1].value.to_bits();
+    let mut i = idx - 1;
+    while i > 0 && samples[i - 1].ts_ns == candidate_ts_ns {
+        best_bits = best_bits.max(samples[i - 1].value.to_bits());
+        i -= 1;
+    }
+    if best_bits == STALE_NAN_BITS {
         return None;
     }
-    Some(candidate.value)
+    Some(f64::from_bits(best_bits))
 }
 
 /// Build the full matcher list for a vector selector, including the
@@ -911,16 +933,58 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_timestamp_last_sample_in_vec_wins() {
+    fn duplicate_timestamp_resolves_by_normative_order_not_vec_position() {
+        // In the real pipeline the engine dedups each (series, ts) to a
+        // single sample under the normative commit total order (ADR-0010 §5)
+        // before this surface ever sees it. If a source violates that and
+        // hands raw duplicates, the evaluator must resolve them by that same
+        // order's final tiebreak, greatest value.to_bits(), which is the one
+        // component the (ts, value) pairs still carry once the commit
+        // provenance is gone. It must NOT pick "later in the vec": the winner
+        // is the same regardless of the order the source happened to store
+        // equal-ts samples in.
         let ts_ns = ms_to_ns(minutes(1)).expect("no overflow");
+        // 5.0 has the greater value.to_bits() of the pair (both positive
+        // finite, so bit order matches numeric order), so it is the normative
+        // winner either way. TestSource sorts stably on ts, preserving the
+        // insertion order among equal timestamps, so the first arrangement
+        // puts the normative winner *first* (a positional "last wins" rule
+        // would wrongly pick 3.0) and the second puts it *last*.
+        for arrangement in [
+            [(ts_ns, 5.0_f64), (ts_ns, 3.0_f64)],
+            [(ts_ns, 3.0_f64), (ts_ns, 5.0_f64)],
+        ] {
+            let source = TestSource::new()
+                .with_series(&[("__name__", "up")], &arrangement)
+                .expect("valid series");
+            let result = Evaluator::new()
+                .instant(&source, "up", minutes(1))
+                .expect("evaluates");
+            assert_eq!(result.len(), 1);
+            assert_eq!(
+                result[0].value, 5.0,
+                "arrangement {arrangement:?}: greatest value.to_bits() wins \
+                 (the normative final tiebreak), not vector position",
+            );
+        }
+
+        // The winner is chosen by bit pattern, exactly as the engine's dedup
+        // compares (ADR-0010 §5), so a staleness marker sharing the ts with a
+        // real value resolves the same way here as upstream: the marker has
+        // the greater bits, wins the tie, and makes the series absent. This
+        // pins that the surface uses `to_bits()`, never `==` or a numeric max
+        // that would treat the NaN marker as unordered.
+        let stale = f64::from_bits(STALE_NAN_BITS);
         let source = TestSource::new()
-            .with_series(&[("__name__", "up")], &[(ts_ns, 1.0), (ts_ns, 2.0)])
+            .with_series(&[("__name__", "up")], &[(ts_ns, 7.0), (ts_ns, stale)])
             .expect("valid series");
         let result = Evaluator::new()
             .instant(&source, "up", minutes(1))
             .expect("evaluates");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 2.0);
+        assert!(
+            result.is_empty(),
+            "staleness marker wins the bit-pattern tiebreak and marks the series absent",
+        );
     }
 
     #[test]
