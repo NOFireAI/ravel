@@ -6,6 +6,8 @@
 //! are persistent contracts: changing them requires a new version domain
 //! string, never an in-place edit.
 
+pub mod logstream;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
