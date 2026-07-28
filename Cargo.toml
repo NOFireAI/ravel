@@ -65,6 +65,7 @@ snap = "1.1"
 
 # query
 promql-parser = "0.10"
+regex = "1"
 
 # serde for control-plane/config docs only (never for on-object formats)
 serde = { version = "1", features = ["derive"] }

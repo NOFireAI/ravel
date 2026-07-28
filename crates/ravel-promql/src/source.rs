@@ -16,9 +16,14 @@ use regex::Regex;
 ///
 /// `samples` MUST be sorted ascending by [`Sample::ts_ns`]. Implementors are
 /// responsible for the sort; the evaluator relies on it (binary search) and
-/// does not re-sort. Duplicate timestamps are legal; where two samples
-/// share a timestamp, the evaluator treats the one later in the vec as
-/// authoritative (see `eval::pick_sample`).
+/// does not re-sort. Duplicate timestamps are legal; where two samples share
+/// a timestamp, the evaluator treats the one later in the vec as
+/// authoritative (see `eval::pick_sample`). Implementors MUST place samples
+/// in the vec in the same order as the normative total order for equal
+/// timestamps defined in docs/catalog-and-mvcc.md (commit sequence order),
+/// so that "later in the vec" and "authoritative per the commit log" agree;
+/// an implementor that reorders equal-timestamp samples arbitrarily breaks
+/// that guarantee even though the vec is still sorted by `ts_ns`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeriesData {
     pub labels: LabelSet,
