@@ -37,6 +37,9 @@ code, not just using it.
   shard actors, flush) and sizing defaults.
 - [query-engine.md](query-engine.md): the query engine's internal structure
   (snapshot resolution, segment fetch, pruning, evaluation) and budgets.
+- [analytics.md](analytics.md): the post-evaluation analytics stage (ADR-0028):
+  `ravel-analytics`' pure per-series change point detection and robust summary
+  statistics, their parameters, error taxonomy, and evidence gate.
 - [consistency-model.md](consistency-model.md): the normative durability and
   visibility guarantees: acknowledgement modes, the crash matrix, read-your-write,
   late/skewed data handling, deletion and GC. The source of truth for "what
