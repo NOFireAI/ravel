@@ -96,6 +96,7 @@ task scope.
 | ravel-otlp | docs/adrs/0005 (mapping note), crate module docs |
 | ravel-otap | docs/otap-ingest.md, proto/otel-arrow/docs/ |
 | ravel-promql, ravel-query | docs/query-engine.md, docs/adrs/0007 |
+| ravel-analytics | docs/analytics.md, docs/adrs/0028 |
 | services/* | docs/architecture.md |
 
 docs/consistency-model.md is normative for acknowledgement, visibility,
