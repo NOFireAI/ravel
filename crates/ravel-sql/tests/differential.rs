@@ -9,17 +9,25 @@
 //! -- and the result is compared f64-bit-identical against the same query run
 //! through the real SQL path.
 //!
+//! The subset grammar itself -- the query shapes, the predicate language, the
+//! dataset strategies, the comparable [`util::gate::Cell`] form, and the
+//! reference aggregate folds -- lives in [`util::gate`], shared with the
+//! Flight-vs-HTTP transport parity gate (tests/flight_differential.rs, issue
+//! #153) so the two gates cannot disagree about what the subset is. This file
+//! owns the oracle comparison against `reference_rows`; the parity gate owns
+//! the transport comparison.
+//!
 //! # Why the reference is not "naive"
 //!
 //! Review F7's whole point is that "DataFusion == naive scalar arithmetic" is
-//! false. Everything below was verified against the pinned datafusion 54.1.0
-//! and arrow 58.4.0 in the workspace lockfile, reading the accumulators
-//! rather than guessing:
+//! false. Everything in [`util::gate`] was verified against the pinned
+//! datafusion 54.1.0 and arrow 58.4.0 in the workspace lockfile, reading the
+//! accumulators rather than guessing:
 //!
 //! - **Comparisons are total-order, not IEEE.** arrow's compare kernels
 //!   (`arrow_ord::cmp`) use `f64::total_cmp`, so in SQL `value > 5.0` is
 //!   *true* for NaN and `-0.0 < 0.0` is *true*. A reference using Rust's `>`
-//!   would disagree on every NaN row. [`Pred::eval`] uses `total_cmp`.
+//!   would disagree on every NaN row. `Pred::eval` uses `total_cmp`.
 //!
 //! - **min/max use one total-order implementation** for floating point,
 //!   grouped and ungrouped alike (ADR-0023). DataFusion's built-ins disagree
@@ -33,8 +41,8 @@
 //!   total-order UDAF (crate::minmax) that uses `f64::total_cmp` everywhere,
 //!   so grouped and ungrouped MIN/MAX over the same multiset agree bit for
 //!   bit. Defining the semantics as a total order is what makes an
-//!   *independent* scalar reference possible: [`min_total_order`] and
-//!   [`max_total_order`] implement that order once, and the gate applies them
+//!   *independent* scalar reference possible: `min_total_order` and
+//!   `max_total_order` implement that order once, and the gate applies them
 //!   both ungrouped (over the whole selection) and per group. This is the
 //!   grouped differential gate the interim design (issue #143) called
 //!   impossible while the semantics were only the accumulator's fold order.
@@ -76,335 +84,14 @@ mod util;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use datafusion::arrow::array::{
-    Array, FixedSizeBinaryArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
-};
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::arrow::record_batch::RecordBatch;
 use proptest::prelude::*;
-use ravel_promql::LabelMatcher;
-use ravel_sql::QueryOutput;
 use ravel_types::TenantId;
-use util::{Fixture, RefRow, SegSpec, SeriesSpec, request, tenant_id};
-
-// ---------------------------------------------------------------------------
-// Comparable cells
-// ---------------------------------------------------------------------------
-
-/// One result cell, reduced to something comparable bit-for-bit. Floats are
-/// held as `to_bits`, never as `f64`, so NaN payloads and the sign of zero
-/// are part of the comparison instead of being erased by `==`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Cell {
-    Null,
-    Int(i64),
-    FloatBits(u64),
-    Bytes(Vec<u8>),
-    Text(String),
-}
-
-impl Cell {
-    fn float(v: f64) -> Cell {
-        Cell::FloatBits(v.to_bits())
-    }
-}
-
-type Row = Vec<Cell>;
-
-/// Reduce the real query's batches to comparable rows, driven by the output
-/// schema so any column type the v1 subset can produce is handled.
-fn actual_rows(output: &QueryOutput) -> Vec<Row> {
-    let mut rows = Vec::with_capacity(output.num_rows());
-    for batch in output.batches() {
-        for row in 0..batch.num_rows() {
-            rows.push(actual_row(batch, row));
-        }
-    }
-    rows
-}
-
-fn actual_row(batch: &RecordBatch, row: usize) -> Row {
-    batch
-        .columns()
-        .iter()
-        .map(|col| {
-            if col.is_null(row) {
-                return Cell::Null;
-            }
-            match col.data_type() {
-                DataType::Int64 => Cell::Int(
-                    col.as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("int64")
-                        .value(row),
-                ),
-                DataType::Float64 => Cell::float(
-                    col.as_any()
-                        .downcast_ref::<Float64Array>()
-                        .expect("float64")
-                        .value(row),
-                ),
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => Cell::Int(
-                    col.as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .expect("timestamp")
-                        .value(row),
-                ),
-                DataType::FixedSizeBinary(_) => Cell::Bytes(
-                    col.as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .expect("fixed size binary")
-                        .value(row)
-                        .to_vec(),
-                ),
-                DataType::Utf8 => Cell::Text(
-                    col.as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("utf8")
-                        .value(row)
-                        .to_string(),
-                ),
-                other => panic!("differential gate has no cell mapping for {other}"),
-            }
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// The v1 predicate grammar
-// ---------------------------------------------------------------------------
-
-/// A predicate in the v1 subset, in both its SQL and its evaluable form.
-///
-/// `ts` is compared through `CAST(ts AS BIGINT)` so the literal is an
-/// unambiguous nanosecond integer. That shape is deliberately *not* one the
-/// widen-only pushdown extractor recognizes (crate::pushdown only matches
-/// bare `ts` against a timestamp literal), which makes every proptest case an
-/// adversarial no-pushdown case; the recognized shape is covered separately
-/// by [`ts_literal_predicates_are_lossless`].
-#[derive(Clone, Debug)]
-enum Pred {
-    True,
-    TsGe(i64),
-    TsLt(i64),
-    TsBetween(i64, i64),
-    ValueGt(f64),
-    /// `label(labels, '__name__') != 'v'`. The pushdown extractor recognizes
-    /// this shape and pushes a negation matcher into the fetcher's SERIES_TABLE
-    /// prune; the reference never prunes, so any series the prune drops but the
-    /// SQL predicate keeps surfaces as a row-count diff.
-    LabelNe(&'static str),
-    /// `label_match(labels, '__name__', 'pat')`, an anchored `^(?:pat)$`
-    /// regex matcher pushed into the same prune.
-    LabelMatch(&'static str),
-    And(Box<Pred>, Box<Pred>),
-    Or(Box<Pred>, Box<Pred>),
-}
-
-impl Pred {
-    fn sql(&self) -> String {
-        match self {
-            Pred::True => "1 = 1".to_string(),
-            Pred::TsGe(l) => format!("CAST(ts AS BIGINT) >= {l}"),
-            Pred::TsLt(u) => format!("CAST(ts AS BIGINT) < {u}"),
-            Pred::TsBetween(l, u) => format!("CAST(ts AS BIGINT) BETWEEN {l} AND {u}"),
-            Pred::ValueGt(c) => format!("value > {c:?}"),
-            Pred::LabelNe(v) => format!("label(labels, '__name__') != '{v}'"),
-            Pred::LabelMatch(p) => format!("label_match(labels, '__name__', '{p}')"),
-            Pred::And(a, b) => format!("({}) AND ({})", a.sql(), b.sql()),
-            Pred::Or(a, b) => format!("({}) OR ({})", a.sql(), b.sql()),
-        }
-    }
-
-    /// Evaluate against one reference row.
-    ///
-    /// `value > c` uses `total_cmp`, matching arrow's compare kernels: NaN is
-    /// greater than every finite value and `-0.0` is strictly less than
-    /// `0.0`. Rust's own `>` would be wrong here.
-    fn eval(&self, row: &RefRow) -> bool {
-        match self {
-            Pred::True => true,
-            Pred::TsGe(l) => row.ts >= *l,
-            Pred::TsLt(u) => row.ts < *u,
-            Pred::TsBetween(l, u) => row.ts >= *l && row.ts <= *u,
-            Pred::ValueGt(c) => row.value.total_cmp(c) == Ordering::Greater,
-            // `label(...)` is NULL for an absent label, and `NULL != 'v'` is
-            // not true, so an absent-label row is dropped. The grammar is
-            // AND/OR only (no NOT), so substituting NULL with `false` and
-            // evaluating two-valued matches SQL's WHERE result exactly.
-            Pred::LabelNe(v) => match row.labels.get("__name__") {
-                Some(name) => name != *v,
-                None => false,
-            },
-            // `label_match` is total (absent reads as ""), anchored `^(?:p)$`,
-            // exactly the matcher the prune uses -- applied here to every
-            // fetched series independently of any prune.
-            Pred::LabelMatch(p) => LabelMatcher::regex("__name__", *p)
-                .expect("valid test regex")
-                .is_match(&row.labels),
-            Pred::And(a, b) => a.eval(row) && b.eval(row),
-            Pred::Or(a, b) => a.eval(row) || b.eval(row),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Replicated aggregate semantics
-// ---------------------------------------------------------------------------
-
-/// Ungrouped `min`: arrow's kernel plus DataFusion's scalar combine, both on
-/// `f64::total_cmp`. Empty input is SQL NULL.
-fn min_total_order(values: &[f64]) -> Option<f64> {
-    values.iter().copied().reduce(|a, b| {
-        if b.total_cmp(&a) == Ordering::Less {
-            b
-        } else {
-            a
-        }
-    })
-}
-
-/// Ungrouped `max`, same construction.
-fn max_total_order(values: &[f64]) -> Option<f64> {
-    values.iter().copied().reduce(|a, b| {
-        if b.total_cmp(&a) == Ordering::Greater {
-            b
-        } else {
-            a
-        }
-    })
-}
-
-/// `sum`: a sequential fold from `0.0` in input order. Exact for the grouped
-/// accumulator by construction, and exact for the ungrouped arrow kernel
-/// whenever every partial sum is exactly representable (see the module docs).
-fn sum_sequential(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    Some(values.iter().fold(0.0f64, |acc, v| acc + v))
-}
-
-// ---------------------------------------------------------------------------
-// The reference executor
-// ---------------------------------------------------------------------------
-
-/// The query shapes the v1 subset covers.
-#[derive(Clone, Debug)]
-enum Shape {
-    /// `SELECT ts, value ... ORDER BY series_id, ts [LIMIT n]`
-    Projection { limit: Option<usize> },
-    /// `SELECT count(value), min(value), max(value) ...`
-    SelectionAggregates,
-    /// `SELECT series_id, count(value), min(value), max(value) ... GROUP BY
-    /// series_id ORDER BY series_id`. Grouped `min`/`max` are in the v1 subset
-    /// (ADR-0023): the total-order UDAF (crate::minmax) makes them agree with
-    /// the ungrouped path bit for bit, so the per-group reference folds
-    /// [`min_total_order`]/[`max_total_order`] are an independent oracle.
-    GroupedSelectionAggregates,
-    /// `SELECT sum(value) ...`
-    Sum,
-    /// `SELECT series_id, sum(value) ... GROUP BY series_id ORDER BY
-    /// series_id`
-    GroupedSum,
-}
-
-#[derive(Clone, Debug)]
-struct Query {
-    shape: Shape,
-    pred: Pred,
-}
-
-impl Query {
-    fn sql(&self) -> String {
-        let where_clause = format!("WHERE {}", self.pred.sql());
-        match &self.shape {
-            Shape::Projection { limit } => {
-                let limit = limit.map_or(String::new(), |n| format!(" LIMIT {n}"));
-                format!(
-                    "SELECT ts, value FROM samples {where_clause} \
-                     ORDER BY series_id, ts{limit}"
-                )
-            }
-            Shape::SelectionAggregates => {
-                format!("SELECT count(value), min(value), max(value) FROM samples {where_clause}")
-            }
-            Shape::GroupedSelectionAggregates => format!(
-                "SELECT series_id, count(value), min(value), max(value) \
-                 FROM samples {where_clause} GROUP BY series_id ORDER BY series_id"
-            ),
-            Shape::Sum => format!("SELECT sum(value) FROM samples {where_clause}"),
-            Shape::GroupedSum => format!(
-                "SELECT series_id, sum(value) FROM samples {where_clause} \
-                 GROUP BY series_id ORDER BY series_id"
-            ),
-        }
-    }
-
-    /// Evaluate over the independent reference rows, which arrive already in
-    /// the canonical `(series_id, ts)` dedup order.
-    fn eval(&self, rows: &[RefRow]) -> Vec<Row> {
-        let kept: Vec<&RefRow> = rows.iter().filter(|r| self.pred.eval(r)).collect();
-
-        match &self.shape {
-            Shape::Projection { limit } => {
-                let n = limit.unwrap_or(kept.len());
-                kept.iter()
-                    .take(n)
-                    .map(|r| vec![Cell::Int(r.ts), Cell::float(r.value)])
-                    .collect()
-            }
-            Shape::SelectionAggregates => {
-                let values: Vec<f64> = kept.iter().map(|r| r.value).collect();
-                vec![vec![
-                    Cell::Int(values.len() as i64),
-                    optional_float(min_total_order(&values)),
-                    optional_float(max_total_order(&values)),
-                ]]
-            }
-            Shape::GroupedSelectionAggregates => group_by_series(&kept)
-                .into_iter()
-                .map(|(sid, values)| {
-                    vec![
-                        Cell::Bytes(sid.to_vec()),
-                        Cell::Int(values.len() as i64),
-                        optional_float(min_total_order(&values)),
-                        optional_float(max_total_order(&values)),
-                    ]
-                })
-                .collect(),
-            Shape::Sum => {
-                let values: Vec<f64> = kept.iter().map(|r| r.value).collect();
-                vec![vec![optional_float(sum_sequential(&values))]]
-            }
-            Shape::GroupedSum => group_by_series(&kept)
-                .into_iter()
-                .map(|(sid, values)| {
-                    vec![
-                        Cell::Bytes(sid.to_vec()),
-                        optional_float(sum_sequential(&values)),
-                    ]
-                })
-                .collect(),
-        }
-    }
-}
-
-fn optional_float(value: Option<f64>) -> Cell {
-    value.map_or(Cell::Null, Cell::float)
-}
-
-/// Group the kept rows by series id, preserving `(series_id, ts)` order
-/// within each group -- the order the grouped accumulators see, and the one
-/// their order-dependent min/max semantics depend on. `BTreeMap` also gives
-/// the `ORDER BY series_id` output order for free.
-fn group_by_series(rows: &[&RefRow]) -> Vec<([u8; 16], Vec<f64>)> {
-    let mut groups: BTreeMap<[u8; 16], Vec<f64>> = BTreeMap::new();
-    for row in rows {
-        groups.entry(row.series_id).or_default().push(row.value);
-    }
-    groups.into_iter().collect()
-}
+use util::gate::{
+    Cell, Pred, Query, Row, Shape, ValuePool, actual_rows, arb_dataset, arb_pred,
+    arb_single_group_dataset, block_on, exact_sum_value, group_by_series, interesting_value,
+    max_total_order, min_total_order,
+};
+use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
 // ---------------------------------------------------------------------------
 // The gate itself
@@ -442,140 +129,6 @@ async fn assert_all(fixture: &Fixture, tenant: &TenantId, queries: &[Query]) {
     for query in queries {
         assert_bit_identical(fixture, tenant, query).await;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Value pools and dataset strategies
-// ---------------------------------------------------------------------------
-
-/// A value pool, named by constructor so the dataset strategies can be
-/// parameterized by it (a `BoxedStrategy` is not `Clone`, a `fn` pointer is).
-type ValuePool = fn() -> BoxedStrategy<f64>;
-
-/// The full float edge-case pool: NaN with distinct payloads (both signs),
-/// both infinities, both zeros, a denormal, and ordinary values.
-fn interesting_value() -> BoxedStrategy<f64> {
-    prop_oneof![
-        Just(0.0f64),
-        Just(-0.0f64),
-        Just(1.0f64),
-        Just(-1.0f64),
-        Just(2.5f64),
-        Just(f64::INFINITY),
-        Just(f64::NEG_INFINITY),
-        Just(f64::from_bits(0x7ff8_0000_0000_0001)),
-        Just(f64::from_bits(0x7ff8_0000_0000_00aa)),
-        Just(f64::from_bits(0xfff8_0000_0000_0001)), // negative NaN
-        Just(f64::from_bits(0x0000_0000_0000_0001)), // denormal
-        Just(f64::MIN_POSITIVE),
-    ]
-    .boxed()
-}
-
-/// Values whose partial sums are exactly representable in f64, so every
-/// association order (including arrow's lane-parallel one) yields identical
-/// bits. See the module docs for why ungrouped `sum` needs this.
-fn exact_sum_value() -> BoxedStrategy<f64> {
-    prop_oneof![
-        Just(0.0f64),
-        Just(-0.0f64),
-        (-64i64..64).prop_map(|n| n as f64),
-        (-8i64..8).prop_map(|n| (n * 1024) as f64),
-    ]
-    .boxed()
-}
-
-fn arb_series(value: ValuePool) -> impl Strategy<Value = SeriesSpec> {
-    let metric = prop_oneof![Just("a"), Just("b"), Just("c")].prop_map(|s| s.to_string());
-    // A small ts range forces duplicate timestamps within a segment and
-    // overlap across segments.
-    let samples = prop::collection::vec((0i64..6, value()), 1..8);
-    (metric, samples).prop_map(|(metric, samples)| SeriesSpec::new(&metric, samples))
-}
-
-fn arb_segment(value: ValuePool) -> impl Strategy<Value = SegSpec> {
-    let series = prop::collection::vec(arb_series(value), 1..4);
-    (0i64..4, 1u64..3, 1u64..3, series).prop_map(
-        |(created_unix_ns, writer_epoch, writer_seq, series)| {
-            SegSpec::new(created_unix_ns, writer_epoch, writer_seq, series)
-        },
-    )
-}
-
-fn arb_dataset(value: ValuePool) -> impl Strategy<Value = Vec<SegSpec>> {
-    prop::collection::vec(arb_segment(value), 1..4).prop_map(|specs| {
-        // The segment writer rejects duplicate series ids inside one
-        // segment; collapse duplicate metrics per segment. Cross-segment
-        // duplicates are the point and are kept.
-        specs
-            .into_iter()
-            .map(|mut seg| {
-                let mut seen = std::collections::HashSet::new();
-                seg.series.retain(|s| seen.insert(s.metric.clone()));
-                seg
-            })
-            .collect()
-    })
-}
-
-/// A dataset that collapses to exactly one series (one group): every segment
-/// carries a single series under the same metric, drawn from the full float
-/// edge-case pool. Used to assert grouped and ungrouped MIN/MAX agree bit for
-/// bit (ADR-0023 decision 1).
-fn arb_single_group_dataset() -> impl Strategy<Value = Vec<SegSpec>> {
-    let samples = prop::collection::vec((0i64..6, interesting_value()), 1..8);
-    let segment = (0i64..4, 1u64..3, 1u64..3, samples).prop_map(
-        |(created_unix_ns, writer_epoch, writer_seq, samples)| {
-            SegSpec::new(
-                created_unix_ns,
-                writer_epoch,
-                writer_seq,
-                vec![SeriesSpec::new("solo", samples)],
-            )
-        },
-    );
-    prop::collection::vec(segment, 1..4)
-}
-
-fn arb_pred() -> impl Strategy<Value = Pred> {
-    let leaf = prop_oneof![
-        Just(Pred::True),
-        (0i64..6).prop_map(Pred::TsGe),
-        (0i64..7).prop_map(Pred::TsLt),
-        (0i64..4, 2i64..7).prop_map(|(l, u)| Pred::TsBetween(l, u)),
-        prop_oneof![
-            Just(Pred::ValueGt(0.0)),
-            Just(Pred::ValueGt(-1.0)),
-            Just(Pred::ValueGt(1.0)),
-        ],
-        // Label predicates over `__name__` (the datasets' metric is a/b/c),
-        // exercising the negation and regex matcher pushdown. `z` matches no
-        // present metric; `.*` matches every series; `a|b` and `b.*` cover
-        // partial alternations against the anchored `^(?:pat)$` semantics.
-        prop_oneof![
-            Just(Pred::LabelNe("a")),
-            Just(Pred::LabelNe("b")),
-            Just(Pred::LabelNe("z")),
-            Just(Pred::LabelMatch("a")),
-            Just(Pred::LabelMatch("a|b")),
-            Just(Pred::LabelMatch("b.*")),
-            Just(Pred::LabelMatch(".*")),
-        ],
-    ];
-    leaf.prop_recursive(2, 6, 2, |inner| {
-        prop_oneof![
-            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::And(Box::new(a), Box::new(b))),
-            (inner.clone(), inner).prop_map(|(a, b)| Pred::Or(Box::new(a), Box::new(b))),
-        ]
-    })
-}
-
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime")
-        .block_on(fut)
 }
 
 proptest! {
@@ -739,8 +292,8 @@ async fn ts_literal_predicates_are_lossless() {
 // ---------------------------------------------------------------------------
 //
 // These encode DataFusion's *observed* NaN and signed-zero behavior as
-// literal expected bits. They are not derived from the reference functions
-// above, so they pin both sides: an upstream semantics change on a version
+// literal expected bits. They are not derived from the reference functions in
+// util::gate, so they pin both sides: an upstream semantics change on a version
 // bump fails here, and a drift in the reference fails against the proptests.
 
 fn overlap_dataset() -> Vec<SegSpec> {
@@ -1017,7 +570,7 @@ async fn golden_grouped_min_max_over_ts_delegates() {
 /// are well defined regardless of arrow's lane order: an infinite sum keeps
 /// its sign, mixed infinities produce NaN, and a NaN input produces NaN. The
 /// NaN *payload* is deliberately not pinned, because which lane sees the NaN
-/// first is architecture-dependent (module docs).
+/// first is architecture-dependent (util::gate docs).
 #[tokio::test]
 async fn golden_sum_with_infinities_and_nan() {
     let tenant = tenant_id("golden");
