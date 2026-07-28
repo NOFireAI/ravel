@@ -151,8 +151,7 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
         DataType::Binary => json!(hex(downcast::<BinaryArray>(array, "Binary")?.value(row))),
         DataType::Dictionary(key, value) if **key == DataType::Int32 => {
             let dict = downcast::<DictionaryArray<Int32Type>>(array, "Dictionary(Int32, _)")?;
-            let index = usize::try_from(dict.keys().value(row))
-                .map_err(|_| SqlError::Internal("negative dictionary key".to_string()))?;
+            let index = resolve_key(dict.keys().value(row), dict.values().len())?;
             if matches!(**value, DataType::Map(_, _)) {
                 map_to_json(dict.values(), index)
             } else {
@@ -214,6 +213,24 @@ fn float_to_json(value: f64) -> Json {
         // input, which the branches above already handled.
         json!(value)
     }
+}
+
+/// Resolve a dictionary key into a valid index into the `len` distinct
+/// values. A negative key (via `usize::try_from`) or an index `>= len` is a
+/// corrupt column, so it becomes a typed `SqlError::Internal` rather than an
+/// out-of-bounds index panic on `dict.values()`. This mirrors the sibling
+/// decoder in `labels.rs`, which rejects the identical condition on the same
+/// `Dictionary(Int32, Map)` column, so both decoders fail loudly and the same
+/// way. Callers handle a null cell before reaching here.
+fn resolve_key(key: i32, len: usize) -> Result<usize, SqlError> {
+    let k = usize::try_from(key)
+        .map_err(|_| SqlError::Internal(format!("negative dictionary key {key}")))?;
+    if k >= len {
+        return Err(SqlError::Internal(format!(
+            "dictionary key {k} out of range for {len} entries"
+        )));
+    }
+    Ok(k)
 }
 
 fn downcast<'a, T: Array + 'static>(array: &'a ArrayRef, what: &str) -> Result<&'a T, SqlError> {
@@ -298,6 +315,20 @@ mod tests {
         assert_eq!(col.value(0).to_bits(), payload.to_bits());
         assert_eq!(col.value(1).to_bits(), (-0.0f64).to_bits());
         assert_eq!(col.value(2).to_bits(), f64::NEG_INFINITY.to_bits());
+    }
+
+    #[test]
+    fn out_of_range_dictionary_key_is_typed_error() {
+        // Arrow's safe DictionaryArray constructors validate key bounds, so a
+        // corrupt key is unconstructible through safe APIs and cannot be driven
+        // end to end without `unsafe`, which is denied workspace-wide.
+        // resolve_key is the guard cell_to_json calls before indexing
+        // dict.values(); test it directly. A negative key and an out-of-range
+        // positive key must each be a typed Internal error, never a panic; a
+        // valid key resolves.
+        assert!(matches!(resolve_key(-1, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(4, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(3, 4), Ok(3)));
     }
 
     #[test]
