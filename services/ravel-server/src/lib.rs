@@ -2,6 +2,9 @@
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
 pub mod config;
+#[cfg(feature = "flight-sql")]
+pub mod flight;
+pub mod flight_auth;
 pub mod fold;
 pub mod ingest;
 pub mod otlp_grpc;
@@ -198,18 +201,34 @@ pub async fn start(
         Ok(())
     });
 
-    let (grpc_addr, grpc_shutdown, grpc_task) = if let Some(router) = &ingest_router {
+    let metrics_service = ingest_router.as_ref().map(|router| {
         let state = gateway_state(router, config.tenant_resolver.clone());
-        let service = otlp_grpc::GrpcMetricsService::new(state);
+        MetricsServiceServer::new(otlp_grpc::GrpcMetricsService::new(state))
+    });
+
+    // The gRPC listener carries OTLP ingest, so gateway modes always bind it.
+    // With `flight-sql` on it also carries Flight SQL, which is a query
+    // surface, so a query-only process binds it too.
+    let serve_grpc = metrics_service.is_some() || cfg!(feature = "flight-sql");
+
+    let (grpc_addr, grpc_shutdown, grpc_task) = if serve_grpc {
+        let grpc = tonic::transport::Server::builder().add_optional_service(metrics_service);
+        #[cfg(feature = "flight-sql")]
+        let grpc = grpc.add_service(flight::service());
         let (tx, rx) = oneshot::channel::<()>();
-        let addr = config.listen_grpc;
+        // Bound here rather than inside `serve_with_shutdown` so the reported
+        // address is the one actually bound; with port 0 the configured value
+        // says nothing.
+        let listener = tokio::net::TcpListener::bind(config.listen_grpc).await?;
+        let addr = listener.local_addr()?;
         let task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(MetricsServiceServer::new(service))
-                .serve_with_shutdown(addr, async {
+            grpc.serve_with_incoming_shutdown(
+                tonic::transport::server::TcpIncoming::from(listener),
+                async {
                     let _ = rx.await;
-                })
-                .await?;
+                },
+            )
+            .await?;
             Ok(())
         });
         (Some(addr), Some(tx), Some(task))

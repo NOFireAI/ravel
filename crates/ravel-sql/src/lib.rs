@@ -32,6 +32,10 @@ mod config;
 mod dedup;
 mod error;
 mod executor;
+#[cfg(feature = "flight-sql")]
+pub mod flight;
+#[cfg(feature = "flight-sql")]
+mod flight_ticket;
 mod labels;
 mod memory;
 mod output;
@@ -49,6 +53,8 @@ pub use error::{
     MSG_UNSATISFIABLE, SqlError,
 };
 pub use executor::{SqlExecutor, SqlOutcome, SqlRequest, SqlStats};
+#[cfg(feature = "flight-sql")]
+pub use flight_ticket::{FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin};
 pub use memory::{TenantDelegatingPool, TenantMemoryAccountant};
 pub use output::QueryOutput;
 pub use provider::RavelTableProvider;

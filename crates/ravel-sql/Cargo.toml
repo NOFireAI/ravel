@@ -39,11 +39,31 @@ datafusion = { version = "54", default-features = false, features = ["sql"] }
 # object_store, so this adds no new supply-chain surface.
 url = "2"
 
+# Flight SQL transport for the `flight` module, off unless `flight-sql` is on.
+# It carries its own arrow 58, the same major datafusion 54 resolves, so the
+# Flight encoders and the scan pipeline's `RecordBatch`es are the same types.
+arrow-flight = { workspace = true, optional = true }
+
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# Flight SQL transport. Off by default: it links arrow-flight and tonic on top
+# of datafusion, and the Flight surface is opt-in per deployment
+# (docs/arrow-datafusion-plan.md section 3, ADR-0013 structural isolation).
+# Gates the `flight` module (the future FlightSqlService, issue #152) and the
+# `flight_ticket` module (the snapshot-pinning ticket codec, issue #150).
+#
+# The feature matrix in section 3 writes this as "flight-sql implies sql". This
+# crate has no `sql` feature to imply: its SQL surface is unconditional
+# (datafusion is a hard dependency, and the `sql` in its feature list is
+# datafusion's own feature, not one of ours). The implication is stated where a
+# `sql` feature actually exists, in services/ravel-server, whose `flight-sql`
+# enables its `sql`.
+flight-sql = ["dep:arrow-flight"]
 
 [dev-dependencies]
 proptest = { workspace = true }
