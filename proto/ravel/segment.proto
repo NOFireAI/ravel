@@ -47,4 +47,13 @@ message Footer {
   uint64 sample_count = 10;
   uint64 series_count = 11;
   repeated Section sections = 12;
+
+  // RSEG v4 only (ADR-0018); zero/absent on v1/v2/v3 objects, required
+  // nonzero semantics only when the trailer version is 4. See
+  // docs/segment-format.md "RSEG v4 amendment".
+  sfixed64 base_created_unix_ns = 13; // min created_unix_ns over all runs
+  uint32 ingest_hour_bucket = 14;
+  bytes input_set_hash = 15;
+  uint32 part_index = 16;
+  uint32 level = 17;
 }

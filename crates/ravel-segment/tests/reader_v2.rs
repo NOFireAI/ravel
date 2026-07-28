@@ -866,6 +866,7 @@ fn build_scenario(
                 uncompressed_len: 200,
             },
         ],
+        ..Default::default()
     };
     (footer, dict_bytes, ids_bytes, meta_bytes)
 }
