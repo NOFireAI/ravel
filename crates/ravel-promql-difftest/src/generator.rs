@@ -291,9 +291,12 @@ fn classic_histogram_family(
     per_bucket_series
 }
 
-/// Label shapes for future vector-matching phases (P7): a one-to-one
-/// matching pair, a non-matching pair, and a many-to-one (`group_left`)
-/// shape. P3 exercises these only via selector matchers.
+/// Label shapes for vector-matching (P7): a one-to-one matching pair, a
+/// non-matching pair, a many-to-one (`group_left`) shape, and (added for
+/// P7's binary-operator corpus) duplicate-signature shapes for
+/// matching-cardinality error cases plus an extra `group_left` "one" side
+/// carrying a label absent from the "many" side, for the label-copy
+/// delete case.
 fn vector_matching_shapes(rng: &mut StdRng, config: &DatasetConfig) -> Vec<GeneratedSeries> {
     let ts = regular_timestamps(config);
     let mut make = |name: &str, extra: &[(&str, &str)]| -> GeneratedSeries {
@@ -318,6 +321,19 @@ fn vector_matching_shapes(rng: &mut StdRng, config: &DatasetConfig) -> Vec<Gener
         make("diff_group_left", &[("job", "batch"), ("instance", "1")]),
         make("diff_group_left", &[("job", "batch"), ("instance", "2")]),
         make("diff_group_right", &[("job", "batch")]),
+        // Two `diff_dup_left` series that agree on `job` (their on(job)
+        // matching signature) but differ on `replica`: an `on(job)` match
+        // against either dup side is ambiguous.
+        make("diff_dup_left", &[("job", "dup"), ("replica", "a")]),
+        make("diff_dup_left", &[("job", "dup"), ("replica", "b")]),
+        // Symmetric duplicate on the right-hand side.
+        make("diff_dup_right", &[("job", "dup"), ("region", "us")]),
+        make("diff_dup_right", &[("job", "dup"), ("region", "eu")]),
+        // A `group_left` "one" side carrying `version`, a label
+        // `diff_group_left`'s series never had: the copied-label delete
+        // case (the many side's own `version`, if any, is removed since
+        // the one side is absent for it).
+        make("diff_group_meta", &[("job", "batch"), ("version", "v2")]),
     ]
 }
 
