@@ -25,6 +25,12 @@ kind: instant
 time: +300s
 mode: unordered
 
+# ADR-0025 allowlist: measured 1 ULP off Prometheus at one grid point.
+# extrapolated_rate is a deliberate operation-for-operation port
+# (rate.rs's module doc), so this is very likely a real, findable
+# arithmetic difference upstream of this function, not an inherent
+# limit; tracked separately in issue #170 rather than investigated here.
+# tolerance: 2 is 1 ULP of headroom over the measured gap.
 name: range_rate_across_reset_at_boundary
 query: rate(diff_counter_total{shape="reset_at_boundary"}[5m])
 kind: range
@@ -32,6 +38,7 @@ start: +0s
 end: +1170s
 step: 60s
 mode: unordered
+tolerance: 2
 
 name: instant_delta_gauge_walk_short_window
 query: delta(diff_gauge_walk[1m])
@@ -65,11 +72,18 @@ end: +1170s
 step: 60s
 mode: unordered
 
+# ADR-0025 allowlist: measured 904 ULPs off Prometheus (the largest of
+# the five allowlisted cases). linear_regression's operation order
+# reads as a faithful port, so this is very likely upstream input
+# drift or a subtle order difference not yet found, not an inherent
+# limit; see ADR-0025 and issue #170 rather than re-deriving here.
+# tolerance: 1024 rounds up to the next power of two over the measured gap.
 name: instant_deriv_gauge_walk
 query: deriv(diff_gauge_walk[5m])
 kind: instant
 time: +600s
 mode: unordered
+tolerance: 1024
 
 name: instant_predict_linear_gauge_walk
 query: predict_linear(diff_gauge_walk[5m], 120)
@@ -77,6 +91,9 @@ kind: instant
 time: +600s
 mode: unordered
 
+# ADR-0025 allowlist: measured 3 ULPs off Prometheus at one grid point,
+# same linear_regression function as instant_deriv_gauge_walk above.
+# tolerance: 8 rounds up to the next power of two over the measured gap.
 name: range_predict_linear_over_a_grid
 query: predict_linear(diff_gauge_walk[5m], 60)
 kind: range
@@ -84,12 +101,18 @@ start: +300s
 end: +900s
 step: 60s
 mode: unordered
+tolerance: 8
 
+# ADR-0025 allowlist: measured 1 ULP off Prometheus, same
+# extrapolated_rate function as range_rate_across_reset_at_boundary
+# above.
+# tolerance: 2 is 1 ULP of headroom over the measured gap.
 name: instant_rate_over_irregularly_spaced_samples
 query: rate(diff_sparse_jitter[3m])
 kind: instant
 time: +300s
 mode: unordered
+tolerance: 2
 
 name: instant_increase_short_series_two_samples
 query: increase(diff_boundary[10m])
