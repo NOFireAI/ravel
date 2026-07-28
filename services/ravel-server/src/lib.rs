@@ -2,6 +2,7 @@
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
 pub mod config;
+pub mod fold;
 pub mod ingest;
 pub mod otlp_grpc;
 pub mod otlp_http;
@@ -20,11 +21,12 @@ use ravel_ingest::{IngestConfig, IngestRouter, SystemClock};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
-use ravel_types::Signal;
+use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub use config::{Cli, Mode, StoreKind};
+pub use fold::FoldTaskConfig;
 
 const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -34,6 +36,12 @@ pub struct ServerConfig {
     pub listen_grpc: SocketAddr,
     pub shard_count: u32,
     pub tenant_resolver: Arc<dyn TenantResolver>,
+    /// Tenants this process folds catalog snapshots for
+    /// (docs/metric-index-plan.md section 4). Independent of
+    /// `tenant_resolver`: any (tenant, signal) whose commit history should
+    /// stay indexed belongs here.
+    pub fold_tenants: Vec<TenantHash>,
+    pub fold: FoldTaskConfig,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -46,6 +54,7 @@ pub struct Running {
     grpc_shutdown: Option<oneshot::Sender<()>>,
     grpc_task: Option<JoinHandle<anyhow::Result<()>>>,
     ingest_router: Option<Arc<IngestRouter>>,
+    fold_tasks: fold::FoldTasks,
 }
 
 impl Running {
@@ -72,6 +81,8 @@ impl Running {
                 }
             }
         }
+
+        self.fold_tasks.shutdown().await;
 
         Ok(())
     }
@@ -131,14 +142,18 @@ pub async fn start(
         let rw_state = remote_write_state(router, config.tenant_resolver.clone());
         http_router = http_router.merge(remote_write::router(rw_state));
     }
+    let catalog = query::build_catalog(store.clone(), config.shard_count)?;
+
     if matches!(config.mode, Mode::All | Mode::Query) {
         let app_state = query::build_app_state(
+            catalog.clone(),
             store.clone(),
-            config.shard_count,
             config.tenant_resolver.clone(),
-        )?;
+        );
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }
+
+    let fold_tasks = fold::spawn(catalog, store.clone(), &config.fold_tenants, config.fold);
 
     let listener = tokio::net::TcpListener::bind(config.listen_http).await?;
     let http_addr = listener.local_addr()?;
@@ -179,5 +194,6 @@ pub async fn start(
         grpc_shutdown,
         grpc_task,
         ingest_router,
+        fold_tasks,
     })
 }

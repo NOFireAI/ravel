@@ -1,9 +1,11 @@
 //! ravel-server: gateway + ingest + query in one binary for development
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
+use std::time::Duration;
+
 use anyhow::Context;
 use clap::Parser;
-use ravel_server::{Cli, ServerConfig};
+use ravel_server::{Cli, FoldTaskConfig, ServerConfig};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -23,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let tenant_tokens = cli.parse_tenant_tokens()?;
+    let fold_tenants = tenant_tokens.values().map(|id| id.hash()).collect();
     let tenant_resolver =
         ravel_server::tenant::build_resolver(tenant_tokens, cli.dev_insecure_tenant_header);
     let store =
@@ -34,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
         listen_grpc: cli.listen_grpc,
         shard_count: cli.shards,
         tenant_resolver,
+        fold_tenants,
+        fold: FoldTaskConfig {
+            enabled: !cli.disable_fold,
+            fold_interval: Duration::from_secs(cli.fold_interval_secs),
+        },
     };
 
     let running = ravel_server::start(config, store).await?;

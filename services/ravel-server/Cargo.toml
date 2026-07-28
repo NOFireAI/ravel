@@ -26,6 +26,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["json", "query"] }
