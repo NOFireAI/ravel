@@ -3,7 +3,7 @@
 Read the ADRs for the reasoning behind each choice. This file is the map.
 
 ```
-OTLP gRPC / OTLP HTTP-protobuf
+OTLP gRPC / OTLP HTTP-protobuf / Remote Write 1.0+2.0 (/api/v1/write)
         |
         v
   gateway (auth, tenant, limits)          services/ravel-server --mode all
@@ -54,8 +54,14 @@ Phase 1 runs every service as modes of one binary (`ravel-server --mode
 all|gateway|query`). Crate boundaries keep the split honest so later phases
 can deploy them separately.
 
-Signals other than metrics, compaction, catalog snapshots, Remote Write,
-RavelQL, Sigma/OCSF: later phases. See the spec docs as they land.
+Remote Write (ADR-0015) reuses this same gateway/router/shard pipeline: RW1
+and RW2 payloads decode and normalize to the same `NormalizedPoint` shape
+OTLP produces, in `ravel-remote-write`, then flow through the identical
+`IngestRouter::write` call OTLP uses, strict-mode only. No new crash-matrix
+failure point, since no new flush/commit path was added.
+
+Signals other than metrics, compaction, catalog snapshots, RavelQL,
+Sigma/OCSF: later phases. See the spec docs as they land.
 
 ## SQL query path (in progress)
 
