@@ -11,13 +11,14 @@
 //! `Box<dyn Fn>`, so [`FunctionDef`] and every family's table stay `Copy`
 //! `const` arrays with no allocation or dynamic dispatch.
 
+mod histogram_classic;
 mod rate;
 
-use ravel_types::Sample;
+use ravel_types::{LabelSet, Sample};
 
 use crate::eval::{
-    Error, Evaluator, InstantVector, QueryWindow, RangeMatrix, Value, drop_metric_name,
-    duration_to_ns, selector_eval_ts,
+    Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix, Value,
+    drop_metric_name, duration_to_ns, selector_eval_ts,
 };
 use crate::source::SeriesSource;
 
@@ -36,6 +37,14 @@ pub(crate) struct FunctionDef {
 pub(crate) enum FunctionKind {
     RangeVector(fn(&[Sample], RangeWindow) -> Option<f64>),
     RangeVectorScalar(fn(&[Sample], RangeWindow, f64) -> Option<f64>),
+    /// `f(phi, v instant-vector) -> instant-vector`: many-to-fewer,
+    /// grouping `v` by its own labels rather than reducing one series'
+    /// matrix window, so it does not fit either `RangeVector` shape above
+    /// (P9, `histogram_quantile`).
+    HistogramQuantile(fn(f64, InstantVector) -> Vec<(LabelSet, f64)>),
+    /// `f(lower, upper, v instant-vector) -> instant-vector`, the two-scalar
+    /// counterpart of `HistogramQuantile` (P9, `histogram_fraction`).
+    HistogramFraction(fn(f64, f64, InstantVector) -> Vec<(LabelSet, f64)>),
 }
 
 /// The window bounds a range-vector function needs beyond the raw samples:
@@ -54,7 +63,7 @@ pub(crate) struct RangeWindow {
 }
 
 /// All registered function families, aggregated into one lookup table.
-const FAMILIES: &[&[FunctionDef]] = &[rate::FUNCTIONS];
+const FAMILIES: &[&[FunctionDef]] = &[rate::FUNCTIONS, histogram_classic::FUNCTIONS];
 
 fn lookup(name: &str) -> Option<FunctionDef> {
     FAMILIES
@@ -100,6 +109,20 @@ pub(crate) fn eval_call(
             Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
                 f(samples, window, t)
             })))
+        }
+        FunctionKind::HistogramQuantile(f) => {
+            let phi = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
+            let vector = vector_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
+            Ok(Value::Vector(to_instant_vector(f(phi, vector), eval_ts_ns)))
+        }
+        FunctionKind::HistogramFraction(f) => {
+            let lower = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
+            let upper = scalar_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
+            let vector = vector_arg(evaluator, source, &call.args.args[2], eval_ts_ns, ctx)?;
+            Ok(Value::Vector(to_instant_vector(
+                f(lower, upper, vector),
+                eval_ts_ns,
+            )))
         }
     }
 }
@@ -177,6 +200,20 @@ pub(crate) fn eval_range_call(
                 },
             )
         }
+        // `eval_range`'s current architecture (`resolve_range_core`) only
+        // supports a top-level call that reduces one series' matrix window
+        // per grid step; `histogram_quantile`/`histogram_fraction` instead
+        // group and reduce a whole instant vector at once, so they have no
+        // per-series matrix to reduce here. Both are still fully usable in
+        // an instant query, including nested inside another expression
+        // (`eval_call` above), a pre-existing architectural boundary of the
+        // range-query path rather than something specific to these two
+        // functions.
+        FunctionKind::HistogramQuantile(_) | FunctionKind::HistogramFraction(_) => {
+            Err(Error::Unsupported {
+                construct: format!("{} in a range query", call.func.name),
+            })
+        }
     }
 }
 
@@ -245,6 +282,41 @@ fn scalar_arg(
             got: other.type_name(),
         }),
     }
+}
+
+/// Evaluate a function argument known (by promql-parser's parse-time type
+/// check) to be Vector-typed, via the general recursive evaluator so any
+/// vector-producing construct works, including a nested function call
+/// (e.g. `histogram_quantile(0.9, rate(h_bucket[5m]))`).
+fn vector_arg(
+    evaluator: &Evaluator,
+    source: &dyn SeriesSource,
+    expr: &promql_parser::parser::Expr,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> Result<InstantVector, Error> {
+    match evaluator.eval_expr(source, expr, eval_ts_ns, ctx)? {
+        Value::Vector(v) => Ok(v),
+        other => Err(Error::WrongType {
+            expected: "instant vector",
+            got: other.type_name(),
+        }),
+    }
+}
+
+/// Wrap a many-to-fewer function's grouped output (already reduced to one
+/// value per output group, with `le`/`__name__` already stripped from its
+/// labels by the grouping itself) into an [`InstantVector`] at the query's
+/// evaluation instant.
+fn to_instant_vector(groups: Vec<(LabelSet, f64)>, eval_ts_ns: i64) -> InstantVector {
+    groups
+        .into_iter()
+        .map(|(labels, value)| InstantSample {
+            labels,
+            ts_ns: eval_ts_ns,
+            value,
+        })
+        .collect()
 }
 
 /// Reduce each matched series' matrix window through `reduce`, dropping
