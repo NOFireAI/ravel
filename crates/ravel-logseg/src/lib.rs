@@ -32,3 +32,7 @@ pub use error::LogSegError;
 pub use reader::{RlogReader, ScanStats};
 pub use record::{FieldSel, LogRecord, Predicate};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
+
+// Re-exported for callers building records; these are the ravel-types identity
+// primitives that appear in the public [`LogRecord`] and [`Predicate`] surface.
+pub use ravel_types::logstream::{AttrValue, LogStreamId};
