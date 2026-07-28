@@ -63,7 +63,16 @@ wrap at 80. Sign off with `git commit -s`. Trailer `Refs: #<issue>` (or
 `Fixes: #<issue>` when the commit fully resolves it). Plain language: no
 em-dashes, no filler adjectives, no AI footers or self-references.
 
-## Doc map (read the doc that governs your crate; skip the rest)
+## Documentation stays current
+
+Update documentation in the same commit as the behavior it describes, not
+as a follow-up. A new endpoint or query capability updates README.md; a
+status change updates PROGRESS.md; a format or protocol change updates its
+normative doc below. A stale doc is a bug like any other, and the same
+"report, don't silently fix" rule applies if you find one outside your
+task scope.
+
+### Doc map (read the doc that governs your crate; skip the rest)
 
 | Crate | Normative doc |
 |---|---|
@@ -78,9 +87,18 @@ em-dashes, no filler adjectives, no AI footers or self-references.
 | services/* | docs/architecture.md |
 
 docs/consistency-model.md is normative for acknowledgement, visibility,
-and crash behavior everywhere. ADRs live in docs/adrs/ (one decision per
-file); PROGRESS.md carries current status; BENCHMARKS.md carries measured
-numbers only.
+and crash behavior everywhere. ADRs live in docs/adrs/, one decision per
+file.
+
+### Repo-wide docs (not crate-specific)
+
+| What | Where |
+|---|---|
+| Project overview, quickstart, PromQL/SQL query examples | README.md |
+| Index of every guide and spec | docs/README.md |
+| Getting started, ingest, query, operations, inspecting data | docs/guides/ |
+| Living log of what shipped, broke, and what's next | PROGRESS.md |
+| Measured benchmark numbers, with the commands/environment that produced them | BENCHMARKS.md |
 
 ## Testing patterns
 

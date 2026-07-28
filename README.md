@@ -18,11 +18,10 @@ anything the object store survives.
 
 ## Status
 
-Research prototype. Phase 1 is a complete, working vertical slice for metrics:
-OTLP ingest, object-native commit, PromQL selector queries, all running end to
-end against MinIO or S3, with 229 tests passing (unit, property, and a crash
-matrix that asserts every row of the consistency model). See
-[PROGRESS.md](PROGRESS.md) for the full log.
+Research prototype: a working vertical slice for metrics, OTLP ingest through
+PromQL and SQL query, running end to end against MinIO or S3. See
+[PROGRESS.md](PROGRESS.md) for the living log of what has been built and
+when.
 
 What exists today:
 
@@ -33,9 +32,16 @@ What exists today:
   one immutable commit record, both content-addressed.
 - A catalog that resolves a consistent snapshot of segments per query via
   listing (no compaction yet).
-- PromQL vector selectors (all matcher types, `offset`, 5m lookback) over
-  `/api/v1/query` and `/api/v1/query_range`, plus `/api/v1/labels`,
-  `/api/v1/label/{name}/values`, and `/api/v1/series`.
+- PromQL: vector/matrix selectors (all matcher types, `offset`, `@`, 5m
+  lookback), binary operators, and most of the function library (`rate`,
+  `histogram_quantile`, the `*_over_time` family, label and math functions)
+  over `/api/v1/query` and `/api/v1/query_range`, plus `/api/v1/labels`,
+  `/api/v1/label/{name}/values`, and `/api/v1/series`. Aggregation operators
+  (`sum by (...)`, `topk`, ...) and subqueries are not implemented yet.
+- SQL over the same data via DataFusion (`ravel-sql`): `POST /api/v1/sql`,
+  behind `ravel-server`'s `sql` cargo feature, with a read-only `samples`
+  table and the same duplicate-sample resolution as PromQL, bit-for-bit. See
+  [ADR-0013](docs/adrs/0013-arrow-zero-copy-and-datafusion.md).
 - `ravel-server` (dev binary, all roles in one process) and `ravel-cli`
   (segment/commit/catalog inspection).
 
@@ -43,8 +49,8 @@ What is planned, not built:
 
 - Remote Write 1.0/2.0, OTel logs/traces/profiles, native histograms and
   exemplars.
-- A full PromQL evaluator (aggregations, binary operators, functions,
-  subqueries) with a differential test suite against Prometheus.
+- PromQL aggregation operators and subqueries, with a differential test
+  suite against Prometheus for everything the evaluator does support.
 - L0-to-L1 compaction, exact rollups, retention, and deletion GC. Today,
   orphaned L0 objects (data written but never committed) are the only thing
   garbage collected, and that collector is a documented design, not shipped
@@ -53,10 +59,8 @@ What is planned, not built:
   before listing-based discovery runs out of headroom.
 - OTAP (OpenTelemetry Arrow) ingest, scaffolded but not wired into the
   gateway.
-- SQL over the metrics data: a `ravel-sql` crate (DataFusion) implementing
-  the scan -> sort-preserving-merge -> dedup pipeline, matching PromQL's
-  duplicate-sample resolution bit-for-bit. In progress; not yet wired to an
-  HTTP or Flight SQL endpoint. See [ADR-0013](docs/adrs/0013-arrow-zero-copy-and-datafusion.md).
+- Flight SQL: the gRPC surface is wired but returns unimplemented (tracked in
+  issue #152).
 
 ## Quickstart
 
@@ -91,6 +95,68 @@ curl -G http://127.0.0.1:4318/api/v1/query \
   --data-urlencode "query=your_metric_name" \
   --data-urlencode "min_commit_token=<token from the export response>"
 ```
+
+## Querying
+
+Once data is ingested (see Quickstart), query it either as PromQL or as SQL.
+Both read the same catalog and segments and apply the same duplicate-sample
+resolution, so they agree on results.
+
+### PromQL
+
+`/api/v1/query` (instant) and `/api/v1/query_range` (a grid of steps) support
+selectors, `offset`/`@`, binary operators, and most of the function library
+(`rate`, `histogram_quantile`, the `*_over_time` family, label and math
+functions). Aggregation operators (`sum by (...)`, `topk`, ...) and
+subqueries are not implemented yet.
+
+```sh
+# Instant: a binary expression over a function result
+curl -G http://127.0.0.1:4318/api/v1/query \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode "query=rate(http_requests_total[5m]) > 0" \
+  --data-urlencode "time=<unix seconds>"
+
+# Range: the same selector evaluated over a grid of steps
+curl -G http://127.0.0.1:4318/api/v1/query_range \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode "query=rate(http_requests_total[5m])" \
+  --data-urlencode "start=<unix seconds>" \
+  --data-urlencode "end=<unix seconds>" \
+  --data-urlencode "step=15s"
+```
+
+### SQL
+
+`POST /api/v1/sql` runs a read-only SQL statement against a `samples(ts,
+value, ...)` table via DataFusion. It is off by default: build or run
+`ravel-server` with the `sql` cargo feature to enable it.
+
+```sh
+cargo run -p ravel-server --features sql -- \
+  --store s3 --s3-endpoint http://127.0.0.1:9000 --s3-bucket ravel-dev \
+  --s3-access-key ravel --s3-secret-key ravel-dev-secret \
+  --tenant-token devtoken=acme &
+
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "query": "SELECT ts, value FROM samples ORDER BY ts",
+        "start": 0,
+        "end": 1893456000
+      }'
+# {"status":"success","data":{"rows":[[100,1.0],[200,2.5]]}}
+```
+
+Only `SELECT` is accepted (no `INSERT`/`COPY`/`CREATE EXTERNAL TABLE`/`SET`/
+multi-statement bodies); rejected statements and execution errors come back
+as a redacted `{"status":"error","errorType":...,"error":...}` body, never
+raw backend or DataFusion plan text. Send `Accept:
+application/vnd.apache.arrow.stream` instead of JSON for a bit-exact Arrow
+IPC stream (needed for `NaN`/`-0.0` payloads, which JSON cannot represent
+exactly). Flight SQL (the gRPC equivalent) is wired but not yet implemented
+(issue #152).
 
 ## Architecture
 
