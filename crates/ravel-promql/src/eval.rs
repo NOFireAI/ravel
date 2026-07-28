@@ -48,6 +48,9 @@
 //! future phase to consume; `instant`/`range` unwrap the `Vector`/`Matrix`
 //! case and turn anything else into [`Error::WrongType`].
 
+use std::cell::Cell;
+use std::time::Instant;
+
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
 
 use crate::matchers;
@@ -142,6 +145,12 @@ pub enum Error {
         "range query resolution of {points} evaluation points exceeds the maximum of {max}; widen step_ms or narrow the range"
     )]
     TooManyPoints { points: u64, max: usize },
+    #[error(
+        "nested subquery evaluation touched {touched} evaluation points across every nesting level, exceeding the shared budget of {max}; narrow the range, widen the step, or reduce subquery nesting"
+    )]
+    EvalBudgetExhausted { touched: u64, max: u64 },
+    #[error("evaluation exceeded its deadline before finishing")]
+    DeadlineExceeded,
     #[error("query evaluates to {got}, but this operation requires {expected}")]
     WrongType {
         expected: &'static str,
@@ -176,6 +185,19 @@ pub const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 /// does not constrain the grid.
 pub const DEFAULT_MAX_RANGE_POINTS: usize = 11_000;
 
+/// Default shared budget on total evaluation-grid points touched across
+/// *every* subquery nesting level of one query (issue #193). Unlike
+/// [`DEFAULT_MAX_RANGE_POINTS`], which caps a single subquery/range node's
+/// own grid independently, this one counter accumulates across the whole
+/// recursive evaluation tree ([`QueryWindow::charge_budget`], charged by
+/// [`Evaluator::eval_subquery_matrix`] on every call): a subquery nested
+/// inside another subquery, or re-evaluated once per enclosing grid step,
+/// cannot multiply its cost past any single node's own cap. 1,000,000
+/// comfortably covers a legitimate multi-thousand-step range query wrapping
+/// a modest subquery, while still stopping a multi-level nested blowup
+/// within a handful of nesting levels.
+pub const DEFAULT_MAX_TOTAL_EVAL_POINTS: u64 = 1_000_000;
+
 /// Default step for a subquery that does not specify its own (`expr[5m:]`),
 /// in nanoseconds: 1 minute, matching Prometheus' global `evaluation_interval`
 /// default (`NoStepSubqueryIntervalFn`). `ravel-query`'s engine config carries
@@ -201,6 +223,49 @@ const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 pub(crate) struct QueryWindow {
     start_ns: i64,
     end_ns: i64,
+    /// Shared cross-level evaluation-grid-point budget (issue #193), charged
+    /// down by [`Self::charge_budget`] on every subquery-grid evaluation
+    /// ([`Evaluator::eval_subquery_matrix`]) regardless of nesting depth or
+    /// how many times an enclosing grid re-evaluates it from scratch.
+    budget: Cell<u64>,
+    /// Wall-clock instant after which evaluation must stop with
+    /// [`Error::DeadlineExceeded`], checked by [`Self::check_deadline`] once
+    /// per subquery grid step (issue #193): the evaluator is otherwise fully
+    /// synchronous with no yield point for `ravel-query`'s
+    /// `tokio::time::timeout` to preempt at, so a runaway nested evaluation
+    /// would otherwise always run to completion before the timeout could
+    /// fire. `None` (the default, [`Evaluator::new`]) never cancels.
+    deadline: Option<Instant>,
+}
+
+impl QueryWindow {
+    /// Charge `points` (one subquery-grid evaluation's own size) against the
+    /// shared cross-level budget. `max` is the configured ceiling
+    /// ([`Evaluator::max_total_eval_points`]), reported back in the error so
+    /// callers can name it; `touched` is the running total that would have
+    /// been reached had this charge been allowed, so it always exceeds `max`
+    /// when this returns an error.
+    fn charge_budget(&self, points: u64, max: u64) -> Result<(), Error> {
+        let remaining = self.budget.get();
+        if points > remaining {
+            let already_touched = max.saturating_sub(remaining);
+            return Err(Error::EvalBudgetExhausted {
+                touched: already_touched.saturating_add(points),
+                max,
+            });
+        }
+        self.budget.set(remaining - points);
+        Ok(())
+    }
+
+    /// `Err(Error::DeadlineExceeded)` once [`Self::deadline`] has passed;
+    /// `Ok(())` otherwise, including when no deadline was set.
+    pub(crate) fn check_deadline(&self) -> Result<(), Error> {
+        match self.deadline {
+            Some(deadline) if Instant::now() >= deadline => Err(Error::DeadlineExceeded),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// PromQL evaluator. Stateless besides its lookback and resolution
@@ -210,6 +275,8 @@ pub struct Evaluator {
     lookback_delta_ns: i64,
     max_range_points: usize,
     default_step_ns: i64,
+    max_total_eval_points: u64,
+    deadline: Option<Instant>,
 }
 
 impl Default for Evaluator {
@@ -218,6 +285,8 @@ impl Default for Evaluator {
             lookback_delta_ns: DEFAULT_LOOKBACK_NS,
             max_range_points: DEFAULT_MAX_RANGE_POINTS,
             default_step_ns: DEFAULT_SUBQUERY_STEP_NS,
+            max_total_eval_points: DEFAULT_MAX_TOTAL_EVAL_POINTS,
+            deadline: None,
         }
     }
 }
@@ -260,6 +329,33 @@ impl Evaluator {
         self.default_step_ns
     }
 
+    /// Override the default shared cross-level evaluation budget
+    /// ([`DEFAULT_MAX_TOTAL_EVAL_POINTS`]): the total number of evaluation-
+    /// grid points a query may touch across every subquery nesting level,
+    /// as opposed to [`Self::with_max_range_points`]'s per-node cap.
+    pub fn with_max_total_eval_points(mut self, max_total_eval_points: u64) -> Self {
+        self.max_total_eval_points = max_total_eval_points;
+        self
+    }
+
+    /// The configured shared cross-level evaluation budget, in grid points.
+    pub fn max_total_eval_points(&self) -> u64 {
+        self.max_total_eval_points
+    }
+
+    /// Set a wall-clock deadline: once past, evaluation stops with
+    /// [`Error::DeadlineExceeded`] the next time a subquery grid step checks
+    /// it (issue #193), rather than running to completion regardless of an
+    /// enclosing caller's own timeout. `ravel-query`'s `QueryEngine` derives
+    /// this from its own `deadline: Duration` parameter
+    /// (`Instant::now() + deadline`) before evaluating. Unset by default
+    /// ([`Evaluator::new`]), so an `Evaluator` built without this call never
+    /// self-cancels.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     /// Evaluate `query` at `t_ms`, returning the full [`Value`] the query
     /// resolves to (scalar, string, or instant vector; a bare matrix
     /// selector at top level is a [`Error::WrongType`], matching
@@ -275,6 +371,8 @@ impl Evaluator {
         let ctx = QueryWindow {
             start_ns: t_ns,
             end_ns: t_ns,
+            budget: Cell::new(self.max_total_eval_points),
+            deadline: self.deadline,
         };
         self.eval_expr(source, &expr, t_ns, &ctx)
     }
@@ -341,7 +439,12 @@ impl Evaluator {
         }
 
         let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
-        let ctx = QueryWindow { start_ns, end_ns };
+        let ctx = QueryWindow {
+            start_ns,
+            end_ns,
+            budget: Cell::new(self.max_total_eval_points),
+            deadline: self.deadline,
+        };
 
         // P1's supported grammar (paren, unary minus, literals, one
         // selector) can contain at most one selector, so unlike a general
@@ -376,6 +479,7 @@ impl Evaluator {
             RangeCore::Generic(e) => {
                 let matrix =
                     crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+                        ctx.check_deadline()?;
                         self.eval_expr(source, e, t, &ctx)
                     })?;
                 Ok(Value::Matrix(matrix))
@@ -585,8 +689,10 @@ impl Evaluator {
                 max: self.max_range_points,
             });
         }
+        ctx.charge_budget(points, self.max_total_eval_points)?;
 
         crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+            ctx.check_deadline()?;
             self.eval_expr(source, &sq.expr, t, ctx)
         })
     }
@@ -1827,6 +1933,8 @@ mod tests {
         let ctx = QueryWindow {
             start_ns: sel_ts_ns,
             end_ns: sel_ts_ns,
+            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
+            deadline: None,
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
@@ -1858,6 +1966,8 @@ mod tests {
         let ctx = QueryWindow {
             start_ns: sel_ts_ns,
             end_ns: sel_ts_ns,
+            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
+            deadline: None,
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
@@ -2061,6 +2171,100 @@ mod tests {
             source.query_count(),
             0,
             "rejection must happen before any grid step reaches storage"
+        );
+    }
+
+    #[test]
+    fn default_shared_eval_budget_has_the_documented_value() {
+        assert_eq!(DEFAULT_MAX_TOTAL_EVAL_POINTS, 1_000_000);
+        assert_eq!(
+            Evaluator::new().max_total_eval_points(),
+            DEFAULT_MAX_TOTAL_EVAL_POINTS
+        );
+    }
+
+    #[test]
+    fn repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget() {
+        // A range query over `max_over_time(up[5m:1m])` re-evaluates the
+        // inner `up[5m:1m]` subquery from scratch at every one of its 6
+        // outer grid steps (issue #193): each step's own inner grid is only
+        // 5 points (one `source.query` call apiece, since the inner
+        // expression is the bare selector `up`), far under any per-node
+        // `max_range_points` cap, so `TooManyPoints` never fires no matter
+        // how many outer steps run. Left uncapped, the full query would
+        // touch 6 * 5 = 30 evaluation points and issue 30 storage queries.
+        // The shared cross-level budget must still catch the multiplied
+        // cost: with a budget of 10, exactly the first two outer steps'
+        // worth of points (10) are charged before the third step's charge
+        // (which would bring the running total to 15) is rejected.
+        let source = one_series_source();
+        let err = Evaluator::new()
+            .with_max_total_eval_points(10)
+            .range(
+                &source,
+                "max_over_time(up[5m:1m])",
+                minutes(5),
+                minutes(10),
+                minutes(1),
+            )
+            .expect_err("shared cross-level budget must be exhausted");
+        let Error::EvalBudgetExhausted { touched, max } = err else {
+            panic!("expected EvalBudgetExhausted, got {err:?}");
+        };
+        assert_eq!(max, 10);
+        assert_eq!(touched, 15);
+        assert_eq!(
+            source.query_count(),
+            10,
+            "only the first two outer steps' worth of points may reach storage \
+             before the shared budget rejects the third"
+        );
+        assert!(
+            source.query_count() < 30,
+            "rejection must happen well before the outer grid's full 30-point \
+             cost (6 outer steps * 5 inner points each) is reached; got {} \
+             storage queries",
+            source.query_count()
+        );
+    }
+
+    #[test]
+    fn short_deadline_cancels_a_long_running_nested_subquery_evaluation() {
+        // `max_over_time(up[1000s:1s])` over a 1000-step outer range (1000
+        // points, 1s step) re-evaluates its ~1000-point inner subquery from
+        // scratch at every outer step (issue #193): ~1,000,000 total
+        // evaluation points, comfortably under both the per-node
+        // `max_range_points` cap and the shared `max_total_eval_points`
+        // budget, so without a deadline this runs to completion -- measured
+        // separately at just over 1.5s in this same debug build. With a
+        // 20ms deadline, the evaluator's own `check_deadline` (fired inside
+        // the per-outer-step subquery re-evaluation loop, once per inner
+        // grid point too) must notice and stop well before that, not after
+        // running the full ~1,000,000-point computation and only then
+        // reporting a timeout: the assertion on `elapsed` is what tells the
+        // two apart, since a bug that dropped every `check_deadline` call
+        // would still return `DeadlineExceeded` eventually (via a future
+        // outer wrapper) but only after the full ~1.5s of work.
+        let source = one_series_source();
+        let deadline = Instant::now() + std::time::Duration::from_millis(20);
+        let start = Instant::now();
+        let err = Evaluator::new()
+            .with_deadline(deadline)
+            .range(
+                &source,
+                "max_over_time(up[1000s:1s])",
+                1_000_000,
+                1_000_000 + 999_000,
+                1_000,
+            )
+            .expect_err("a deadline in the past relative to the workload must fire");
+        let elapsed = start.elapsed();
+        assert!(matches!(err, Error::DeadlineExceeded));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "evaluation must be cancelled soon after the 20ms deadline, not \
+             after running the full ~1,000,000-point computation (which \
+             takes over 1.5s in this same debug build); took {elapsed:?}"
         );
     }
 

@@ -5,7 +5,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
@@ -117,12 +117,13 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Value, QueryStats), QueryError> {
-        tokio::time::timeout(
+        let eval_deadline = Instant::now() + deadline;
+        let outcome = tokio::time::timeout(
             deadline,
-            self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns),
+            self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns, eval_deadline),
         )
-        .await
-        .map_err(|_| QueryError::DeadlineExceeded { deadline })?
+        .await;
+        unify_deadline(outcome, deadline)
     }
 
     async fn instant_inner(
@@ -132,6 +133,7 @@ impl QueryEngine {
         t_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        eval_deadline: Instant,
     ) -> Result<(Value, QueryStats), QueryError> {
         let t_ns = ms_to_ns(t_ms)?;
         let plans = plan_selectors(query, t_ms, t_ms)?;
@@ -139,8 +141,9 @@ impl QueryEngine {
         let (source, stats) = self
             .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        let evaluator =
-            Evaluator::new().with_default_step(self.config.default_evaluation_interval)?;
+        let evaluator = Evaluator::new()
+            .with_default_step(self.config.default_evaluation_interval)?
+            .with_deadline(eval_deadline);
         let value = evaluator.eval_instant(&source, query, t_ms)?;
         Ok((value, stats))
     }
@@ -188,7 +191,8 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Value, QueryStats), QueryError> {
-        tokio::time::timeout(
+        let eval_deadline = Instant::now() + deadline;
+        let outcome = tokio::time::timeout(
             deadline,
             self.range_inner(
                 tenant_hash,
@@ -198,10 +202,11 @@ impl QueryEngine {
                 step_ms,
                 min_tokens,
                 now_ns,
+                eval_deadline,
             ),
         )
-        .await
-        .map_err(|_| QueryError::DeadlineExceeded { deadline })?
+        .await;
+        unify_deadline(outcome, deadline)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -214,6 +219,7 @@ impl QueryEngine {
         step_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        eval_deadline: Instant,
     ) -> Result<(Value, QueryStats), QueryError> {
         if step_ms <= 0 {
             return Err(QueryError::NonPositiveStep { step_ms });
@@ -233,8 +239,9 @@ impl QueryEngine {
         let (source, stats) = self
             .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        let evaluator =
-            Evaluator::new().with_default_step(self.config.default_evaluation_interval)?;
+        let evaluator = Evaluator::new()
+            .with_default_step(self.config.default_evaluation_interval)?
+            .with_deadline(eval_deadline);
         let value = evaluator.eval_range(&source, query, start_ms, end_ms, step_ms)?;
         Ok((value, stats))
     }
@@ -533,6 +540,33 @@ impl QueryEngine {
             out.push(r?);
         }
         Ok(out)
+    }
+}
+
+/// Collapses the two ways a deadline can surface into the one
+/// `QueryError::DeadlineExceeded` callers already match on (issue #193).
+///
+/// Before the evaluator itself checked a deadline, the only source of
+/// `DeadlineExceeded` was `tokio::time::timeout` elapsing (`Err(_)` here,
+/// the `Elapsed` case): the query kept running synchronously inside the
+/// evaluator with no yield point, so the outer timeout could only ever fire
+/// *after* the call returned control to the runtime. The evaluator now
+/// checks its own deadline between subquery grid steps and can return
+/// `QueryError::Eval(ravel_promql::Error::DeadlineExceeded)` while still
+/// well inside the outer timeout's budget (`Ok(Err(..))` here) -- that is
+/// the case that actually demonstrates early interruption. Both are the
+/// same condition from a caller's perspective, so both collapse to the one
+/// variant already documented and tested against.
+fn unify_deadline<T>(
+    outcome: Result<Result<T, QueryError>, tokio::time::error::Elapsed>,
+    deadline: Duration,
+) -> Result<T, QueryError> {
+    match outcome {
+        Err(_) => Err(QueryError::DeadlineExceeded { deadline }),
+        Ok(Err(QueryError::Eval(ravel_promql::Error::DeadlineExceeded))) => {
+            Err(QueryError::DeadlineExceeded { deadline })
+        }
+        Ok(result) => result,
     }
 }
 
