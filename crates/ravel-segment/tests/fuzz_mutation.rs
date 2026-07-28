@@ -26,9 +26,9 @@ use ravel_segment::{
     IngestBounds, ReaderLimits, ResetHint, RunInputV4, RunValuePageV4, SegmentError,
     SegmentIdentity, SegmentWriter, SeriesEntry, SeriesEntryV4, SeriesInput, SeriesInputV3,
     SeriesInputV4, SeriesValues, ValueKind, decode_catalog, decode_catalog_v2, decode_catalog_v3,
-    decode_catalog_v4, decode_histogram_pages, decode_pages, decode_run_histogram_pages,
-    decode_run_pages_soa, open_from_full, parse_footer, plan_ranges, plan_ranges_v3,
-    plan_ranges_v4,
+    decode_catalog_v4, decode_catalog_v5, decode_histogram_pages, decode_pages,
+    decode_run_histogram_pages, decode_run_pages_soa, open_from_full, parse_footer, plan_ranges,
+    plan_ranges_v3, plan_ranges_v4,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 use std::sync::OnceLock;
@@ -132,6 +132,9 @@ fn full_decode(bytes: &[u8]) -> Result<usize, SegmentError> {
     if loc.version == 4 {
         return full_decode_v4(bytes, limits);
     }
+    if loc.version == 5 {
+        return full_decode_v5(bytes, limits);
+    }
     let entries = match loc.version {
         1 => {
             let dict = section_bytes(bytes, &loc.footer, LABEL_DICT)?;
@@ -200,11 +203,31 @@ fn full_decode_v4(bytes: &[u8], limits: ReaderLimits) -> Result<usize, SegmentEr
     let ids = section_bytes(bytes, &loc.footer, SERIES_IDS)?;
     let meta = section_bytes(bytes, &loc.footer, SERIES_META)?;
     let entries = decode_catalog_v4(&loc.footer, dict, ids, meta, limits)?;
+    decode_all_runs_v4(bytes, &loc.footer, &entries, limits)
+}
 
+/// v5's leg of `full_decode` (ADR-0026): the catalog comes from
+/// `decode_catalog_v5` (which reassembles the chunked SERIES_META, or
+/// delegates to v4 below the sparse threshold), then the per-run page decode
+/// is identical to v4 -- v5 changes only the catalog layout, not the pages.
+fn full_decode_v5(bytes: &[u8], limits: ReaderLimits) -> Result<usize, SegmentError> {
+    let loc = open_from_full(bytes, limits)?;
+    let entries = decode_catalog_v5(&loc.footer, bytes, limits)?;
+    decode_all_runs_v4(bytes, &loc.footer, &entries, limits)
+}
+
+/// Plans and decodes every run of every entry through the v4 page path,
+/// shared by `full_decode_v4` and `full_decode_v5` (v5 pages are v4 pages).
+fn decode_all_runs_v4(
+    bytes: &[u8],
+    footer: &ravel_segment::Footer,
+    entries: &[SeriesEntryV4],
+    limits: ReaderLimits,
+) -> Result<usize, SegmentError> {
     let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
-    let ranges = plan_ranges_v4(&loc.footer, &selected)?;
+    let ranges = plan_ranges_v4(footer, &selected)?;
     let mut total = 0usize;
-    for entry in &entries {
+    for entry in entries {
         for (run_index, run) in entry.runs.iter().enumerate() {
             let range = ranges
                 .iter()
@@ -498,6 +521,130 @@ fn v4_seeds() -> &'static [Vec<u8>] {
     })
 }
 
+/// Builds a batch of single-run v4 inputs by writing one v3 object over the
+/// whole batch and slicing each series' verbatim TS/VAL-or-HIST page bytes,
+/// the scalable counterpart of `v4_scalar_run_from_v1` (which writes one
+/// object per series). `hist_every > 0` makes every `hist_every`-th series a
+/// histogram series, so the v5 seed exercises HIST runs.
+fn v5_inputs(n: usize, hist_every: usize) -> Vec<SeriesInputV4> {
+    let base = 1_600_000_000_000_000_000i64;
+    let mut v3: Vec<SeriesInputV3> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut id = [0u8; 16];
+        id[0] = (i % 11) as u8;
+        id[8..16].copy_from_slice(&(i as u64).wrapping_mul(0x9E37_79B9).to_be_bytes());
+        id[6] = (i >> 8) as u8;
+        id[7] = i as u8;
+        let ls = labels(&[
+            (METRIC_NAME_LABEL, "v5_seed"),
+            ("job", &format!("j{}", i % 5)),
+            ("inst", &format!("i{i}")),
+        ]);
+        let values = if hist_every > 0 && i % hist_every == 0 {
+            SeriesValues::Histogram(vec![HistogramSample {
+                ts_ns: base + i as i64,
+                value: v4_sample_histogram_value(i as i32),
+            }])
+        } else {
+            SeriesValues::Scalar(vec![
+                Sample {
+                    ts_ns: base + i as i64,
+                    value: i as f64,
+                },
+                Sample {
+                    ts_ns: base + i as i64 + 500,
+                    value: i as f64 + 0.25,
+                },
+            ])
+        };
+        v3.push(SeriesInputV3 {
+            series_id: SeriesId(id),
+            labels: ls,
+            values,
+        });
+    }
+
+    let written = SegmentWriter::write_v3(v3, v4_fixture_identity(), v4_fixture_bounds())
+        .expect("write v3 source for v5 seed");
+    let obj = written.bytes.as_ref();
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(obj, limits).expect("open v3 source");
+    let footer = &loc.footer;
+    let dict = section_bytes(obj, footer, 1).expect("dict");
+    let ids = section_bytes(obj, footer, 5).expect("ids");
+    let meta = section_bytes(obj, footer, 6).expect("meta");
+    let entries = decode_catalog_v3(footer, dict, ids, meta, limits).expect("decode v3 source");
+
+    let ts_sec = footer.sections.iter().find(|s| s.kind == 3).expect("ts");
+    let val_sec = footer.sections.iter().find(|s| s.kind == 4);
+    let hist_sec = footer.sections.iter().find(|s| s.kind == 7);
+
+    entries
+        .iter()
+        .map(|e| {
+            let (o, l) = e.ts_page;
+            let a = (ts_sec.offset + o) as usize;
+            let ts_page = obj[a..a + l as usize].to_vec();
+            let value_page = match e.value_kind {
+                ValueKind::Scalar => {
+                    let s = val_sec.expect("val section");
+                    let (o, l) = e.val_page;
+                    let a = (s.offset + o) as usize;
+                    RunValuePageV4::Scalar(obj[a..a + l as usize].to_vec())
+                }
+                ValueKind::Histogram => {
+                    let s = hist_sec.expect("hist section");
+                    let (o, l) = e.hist_page;
+                    let a = (s.offset + o) as usize;
+                    RunValuePageV4::Histogram(obj[a..a + l as usize].to_vec())
+                }
+            };
+            SeriesInputV4 {
+                series_id: e.series_id,
+                labels: e.labels.clone(),
+                runs: vec![RunInputV4 {
+                    created_unix_ns: 100 + (e.min_ts_ns % 61),
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    min_ts_ns: e.min_ts_ns,
+                    max_ts_ns: e.max_ts_ns,
+                    sample_count: e.sample_count,
+                    ts_page,
+                    value_page,
+                }],
+            }
+        })
+        .collect()
+}
+
+/// Two real v5 objects: one below the 4096 sparse-emission threshold (the
+/// v4-shaped whole catalog under a version-5 trailer) and one above it (the
+/// SERIES_IDX + chunked SERIES_META sparse form), the latter with histogram
+/// runs mixed in. Built once and cached.
+fn v5_seeds() -> &'static [Vec<u8>] {
+    static SEEDS: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    SEEDS.get_or_init(|| {
+        let below = SegmentWriter::write_v5(
+            v5_inputs(64, 3),
+            v4_fixture_identity(),
+            v4_fixture_bounds(),
+            v4_fixture_meta(),
+        )
+        .expect("writes below-threshold v5 seed");
+        let sparse = SegmentWriter::write_v5(
+            v5_inputs(4096, 7),
+            v4_fixture_identity(),
+            v4_fixture_bounds(),
+            v4_fixture_meta(),
+        )
+        .expect("writes sparse v5 seed");
+        vec![
+            below.bytes.as_ref().to_vec(),
+            sparse.bytes.as_ref().to_vec(),
+        ]
+    })
+}
+
 /// Single-bit flip at an in-bounds offset, then truncate to an in-bounds
 /// length: the seed-corpus mutation operators the finding names.
 fn mutate(bytes: &[u8], bit: usize, do_truncate: bool, truncate_to: usize) -> Vec<u8> {
@@ -513,15 +660,19 @@ fn mutate(bytes: &[u8], bit: usize, do_truncate: bool, truncate_to: usize) -> Ve
 }
 
 fn seed_count() -> usize {
-    STATIC_SEEDS.len() + v4_seeds().len()
+    STATIC_SEEDS.len() + v4_seeds().len() + v5_seeds().len()
 }
 
 fn seed(index: usize) -> &'static [u8] {
     let index = index % seed_count();
     if index < STATIC_SEEDS.len() {
-        STATIC_SEEDS[index]
+        return STATIC_SEEDS[index];
+    }
+    let index = index - STATIC_SEEDS.len();
+    if index < v4_seeds().len() {
+        &v4_seeds()[index]
     } else {
-        &v4_seeds()[index - STATIC_SEEDS.len()]
+        &v5_seeds()[index - v4_seeds().len()]
     }
 }
 

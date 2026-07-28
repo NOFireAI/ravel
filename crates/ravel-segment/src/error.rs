@@ -50,6 +50,13 @@ pub enum WriteError {
     RunPageTooShort,
     #[error("more than u32::MAX runs in one segment")]
     TooManyRuns,
+
+    // --- RSEG v5 only (ADR-0026, docs/segment-format.md "RSEG v5
+    // amendment"): sparse-section assembly. Raised only if re-reading the
+    // just-built v4 base object to layer the sparse sections on top fails,
+    // which is an internal invariant violation, never valid caller input. ---
+    #[error("v5 sparse-section assembly failed re-reading the v4 base: {0}")]
+    SparseAssembly(String),
 }
 
 /// Errors that can occur while parsing or decoding a segment. All violations
@@ -195,4 +202,20 @@ pub enum SegmentError {
     RunCountSumMismatch { run_count_sum: u64, run_total: u64 },
     #[error("SERIES_META run provenance/bounds arithmetic overflowed i64")]
     ProvenanceBoundsOverflow,
+
+    // --- RSEG v5 only (ADR-0026, docs/segment-format.md "RSEG v5
+    // amendment"): SERIES_IDX + chunked SERIES_META decode. v1-v4 objects
+    // never produce these. ---
+    #[error("SERIES_IDX layout version {0} is not supported")]
+    UnsupportedSparseIndexVersion(u8),
+    #[error("SERIES_IDX stride is zero")]
+    ZeroStride,
+    #[error("SERIES_IDX id-window crc32c mismatch")]
+    IdWindowCrcMismatch,
+    #[error("SERIES_META chunk frame crc32c mismatch")]
+    ChunkCrcMismatch,
+    #[error("SERIES_META chunk frame is internally inconsistent")]
+    BadChunkFrame,
+    #[error("a v5 object carries SERIES_IDX/SERIES_META_CHUNKS without the other")]
+    SparseSectionsIncomplete,
 }
