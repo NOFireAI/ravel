@@ -941,6 +941,16 @@ mod tests {
         }
     }
 
+    fn strindex_kv(key: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyValueVariant::StringValueStrindex(1)),
+            }),
+            ..Default::default()
+        }
+    }
+
     fn number_point(attrs: Vec<KeyValue>, ts_ns: i64, value: NumberValue) -> NumberDataPoint {
         NumberDataPoint {
             attributes: attrs,
@@ -1657,6 +1667,38 @@ mod tests {
         );
         assert!(out.points.is_empty());
         assert_eq!(out.rejected, vec![Rejection::ComplexAttributeValue]);
+    }
+
+    #[test]
+    fn string_reference_attribute_rejection_names_the_strindex_case() {
+        // A StringValueStrindex (string-table reference) attribute is
+        // rejected like the other complex kinds, but the diagnostic must
+        // name the string-reference case so a sender using string-table
+        // references can tell what shape was rejected (a8-F10).
+        let rm = resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "widgets",
+                vec![number_point(
+                    vec![strindex_kv("region")],
+                    1_000,
+                    NumberValue::AsDouble(1.0),
+                )],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![Rejection::ComplexAttributeValue]);
+        let message = out.rejected[0].to_string();
+        assert!(
+            message.contains("string-table reference") && message.contains("strindex"),
+            "rejection message must name the string-reference case, got: {message}"
+        );
     }
 
     #[test]

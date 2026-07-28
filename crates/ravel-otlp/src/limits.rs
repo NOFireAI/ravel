@@ -119,7 +119,7 @@ pub enum Rejection {
     DuplicateLabelName(String),
 
     #[error(
-        "attribute value is an array, kvlist, or bytes value, which has no label representation"
+        "attribute value is an array, kvlist, bytes, or string-table reference (strindex) value, which has no label representation"
     )]
     ComplexAttributeValue,
 
