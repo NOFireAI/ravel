@@ -46,6 +46,33 @@ rejected point counts and reasons.
 - Without a token, queries see some recent consistent snapshot; freshness is
   bounded by listing behavior, not guaranteed.
 
+## Catalog snapshot staleness (docs/metric-index-plan.md 5.4)
+
+- The catalog fold (background task, one-shot via `ravel-cli catalog fold`)
+  precomputes an immutable snapshot part per sealed ingest hour behind a
+  CAS'd HEAD pointer, so `resolve` can skip listing everything at or below
+  the snapshot's watermark. This is a cost optimization only: it never
+  changes which commits a query sees.
+- Without a `min_commit_token`, freshness is bounded by listing behavior for
+  the open window above the watermark (unchanged from Phase 1: freshness of
+  recent commits is listing-immediate) and by the snapshot for sealed
+  history, which is complete by the seal lemma (docs/metric-index-plan.md
+  section 2), so staleness there is zero in healthy operation.
+- Every index failure mode (HEAD missing/corrupt, snapshot part
+  missing/corrupt, a stale cached HEAD, a folder down for hours, folders
+  racing the HEAD CAS) degrades to wider Phase 1 listing, never to missing
+  or wrong data (docs/metric-index-plan.md 5.3). The index never introduces
+  false positives beyond what MVCC already handles: a snapshot entry whose
+  object was since retired resolves to NotFound -> SnapshotInvalidated ->
+  re-resolve, the existing path above.
+- One narrow, documented exception: a folder whose clock runs fast beyond
+  `fold_safety_margin` can seal an hour before every writer's flush for it
+  has landed. A commit published into that already-sealed bucket is
+  invisible to non-token queries until an operator forces a HEAD rebuild
+  (see docs/guides/operations.md "Catalog fold and verify"). The
+  `min_commit_token` (read-your-write) path is unaffected: it always GETs
+  its exact commit key directly, never through the snapshot.
+
 ## Snapshot isolation
 
 - A query resolves one snapshot (a logical set of immutable segments) and
