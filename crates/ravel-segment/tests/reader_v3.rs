@@ -1151,3 +1151,269 @@ fn v3_object_truncation_always_fails_closed() {
         assert!(result.is_ok(), "panicked at truncation length {cut}");
     }
 }
+
+// --- 6. v1-vs-v2-vs-v3 differential property over scalar content (C5,   ---
+// --- RSEG v3 phase 4, issue #137): docs/rseg-v3-plan.md section 10's C5  ---
+// --- entry calls for "the v1-vs-v2-vs-v3 differential property          ---
+// --- extended (same logical scalar content still decodes identically    ---
+// --- across all three)". Histogram content has no v1/v2 counterpart, so ---
+// --- its own differential is encode-then-decode against itself, which   ---
+// --- `v3_roundtrip_over_arbitrary_scalar_and_histogram_mixes` above and  ---
+// --- `write_v3_read_roundtrip_preserves_nan_inf_negative_zero_float_     ---
+// --- histogram_bits` already cover. This section reuses `ts_strategy`    ---
+// --- from section 4 above and mirrors tests/reader_v2.rs's own          ---
+// --- `labelset_strategy`/`sample_value_strategy`/`samples_strategy`/     ---
+// --- `build_series_inputs_for_differential` (each test file is a        ---
+// --- separate compiled crate, so the helpers can't be imported directly ---
+// --- across files; the shapes are kept identical on purpose).
+
+fn label_name_strategy() -> impl Strategy<Value = String> {
+    "[a-z]{1,6}"
+}
+
+fn label_value_strategy() -> impl Strategy<Value = String> {
+    "[a-zA-Z0-9_]{0,8}"
+}
+
+fn labelset_strategy() -> impl Strategy<Value = LabelSet> {
+    (
+        "[a-z_]{1,10}",
+        prop::collection::vec((label_name_strategy(), label_value_strategy()), 0..5),
+    )
+        .prop_map(|(metric_name, extra)| {
+            let mut ls = vec![Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: metric_name,
+            }];
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(METRIC_NAME_LABEL.to_string());
+            for (name, value) in extra {
+                if seen.insert(name.clone()) {
+                    ls.push(Label { name, value });
+                }
+            }
+            LabelSet::new(ls).expect("no duplicate names by construction")
+        })
+}
+
+fn sample_value_strategy() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        10 => any::<f64>(),
+        1 => Just(f64::NAN),
+        1 => Just(-f64::NAN),
+        1 => Just(f64::INFINITY),
+        1 => Just(f64::NEG_INFINITY),
+        1 => Just(0.0f64),
+        1 => Just(-0.0f64),
+    ]
+}
+
+fn samples_strategy() -> impl Strategy<Value = Vec<(i64, f64)>> {
+    prop_oneof![
+        3 => prop::collection::vec((ts_strategy(), sample_value_strategy()), 1..2),
+        5 => prop::collection::vec((ts_strategy(), sample_value_strategy()), 1..12),
+    ]
+}
+
+fn build_series_inputs_for_differential(
+    series_data: &[(LabelSet, Vec<(i64, f64)>)],
+) -> Vec<ravel_segment::SeriesInput> {
+    series_data
+        .iter()
+        .enumerate()
+        .map(|(idx, (series_labels, samples))| {
+            let mut id_bytes = [0u8; 16];
+            id_bytes[..8].copy_from_slice(&(idx as u64).to_be_bytes());
+            ravel_segment::SeriesInput {
+                series_id: SeriesId(id_bytes),
+                labels: series_labels.clone(),
+                samples: samples
+                    .iter()
+                    .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn build_series_inputs_v3_for_differential(
+    series_data: &[(LabelSet, Vec<(i64, f64)>)],
+) -> Vec<SeriesInputV3> {
+    series_data
+        .iter()
+        .enumerate()
+        .map(|(idx, (series_labels, samples))| {
+            let mut id_bytes = [0u8; 16];
+            id_bytes[..8].copy_from_slice(&(idx as u64).to_be_bytes());
+            SeriesInputV3 {
+                series_id: SeriesId(id_bytes),
+                labels: series_labels.clone(),
+                values: SeriesValues::Scalar(
+                    samples
+                        .iter()
+                        .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                        .collect(),
+                ),
+            }
+        })
+        .collect()
+}
+
+type NormalizedSeries = ([u8; 16], LabelSet, Vec<(i64, u64)>);
+
+fn decode_v1_scalar(bytes: &[u8]) -> Vec<NormalizedSeries> {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits).expect("v1 opens");
+    assert_eq!(loc.version, 1);
+    let dict = section_bytes(bytes, &loc.footer, 1);
+    let table = section_bytes(bytes, &loc.footer, 2);
+    let mut entries =
+        ravel_segment::decode_catalog(&loc.footer, dict, table, limits).expect("v1 catalog");
+    entries.sort_by_key(|e| e.series_id.0);
+
+    let selected: Vec<&SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges(&loc.footer, &selected).expect("v1 plans");
+    entries
+        .iter()
+        .zip(ranges.iter())
+        .map(|(entry, range)| {
+            let ts_bytes = slice_range(bytes, range.ts_range);
+            let val_bytes = slice_range(bytes, range.val_range);
+            let samples =
+                ravel_segment::decode_pages(entry, ts_bytes, val_bytes, limits).expect("v1 pages");
+            (
+                entry.series_id.0,
+                entry.labels.clone(),
+                samples
+                    .iter()
+                    .map(|s| (s.ts_ns, s.value.to_bits()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn decode_v2_scalar(bytes: &[u8]) -> Vec<NormalizedSeries> {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits).expect("v2 opens");
+    assert_eq!(loc.version, 2);
+    let dict = section_bytes(bytes, &loc.footer, 1);
+    let ids = section_bytes(bytes, &loc.footer, 5);
+    let meta = section_bytes(bytes, &loc.footer, 6);
+    let mut entries =
+        ravel_segment::decode_catalog_v2(&loc.footer, dict, ids, meta, limits).expect("v2 catalog");
+    entries.sort_by_key(|e| e.series_id.0);
+
+    let selected: Vec<&SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges(&loc.footer, &selected).expect("v2 plans");
+    entries
+        .iter()
+        .zip(ranges.iter())
+        .map(|(entry, range)| {
+            let ts_bytes = slice_range(bytes, range.ts_range);
+            let val_bytes = slice_range(bytes, range.val_range);
+            let samples =
+                ravel_segment::decode_pages(entry, ts_bytes, val_bytes, limits).expect("v2 pages");
+            (
+                entry.series_id.0,
+                entry.labels.clone(),
+                samples
+                    .iter()
+                    .map(|s| (s.ts_ns, s.value.to_bits()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn decode_v3_scalar(bytes: &[u8]) -> Vec<NormalizedSeries> {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits).expect("v3 opens");
+    assert_eq!(loc.version, 3);
+    let dict = section_bytes(bytes, &loc.footer, 1);
+    let ids = section_bytes(bytes, &loc.footer, 5);
+    let meta = section_bytes(bytes, &loc.footer, 6);
+    let mut entries =
+        ravel_segment::decode_catalog_v3(&loc.footer, dict, ids, meta, limits).expect("v3 catalog");
+    entries.sort_by_key(|e| e.series_id.0);
+
+    let selected: Vec<&SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v3(&loc.footer, &selected).expect("v3 plans");
+    entries
+        .iter()
+        .zip(ranges.iter())
+        .map(|(entry, range)| {
+            assert_eq!(
+                entry.value_kind,
+                ValueKind::Scalar,
+                "this section writes scalar-only v3 input"
+            );
+            let ts_bytes = slice_range(bytes, range.ts_range);
+            let val_bytes = slice_range(bytes, range.val_range);
+            let samples =
+                ravel_segment::decode_pages(entry, ts_bytes, val_bytes, limits).expect("v3 pages");
+            (
+                entry.series_id.0,
+                entry.labels.clone(),
+                samples
+                    .iter()
+                    .map(|s| (s.ts_ns, s.value.to_bits()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// The same logical scalar-only content, written by all three versions'
+    /// writers, must decode to identical (series_id, labels, sorted
+    /// (ts_ns, value-bits)) content regardless of which version wrote it.
+    /// v3's own writer/reader (`SeriesValues::Scalar`, `ValueKind::Scalar`)
+    /// is exercised here the same way P4 of docs/rseg-v2-plan.md already
+    /// exercised v1-vs-v2.
+    #[test]
+    fn v1_v2_v3_scalar_differential_over_arbitrary_input(
+        series_data in prop::collection::vec((labelset_strategy(), samples_strategy()), 0..8),
+        tenant_hash in proptest::array::uniform16(any::<u8>()),
+        shard in any::<u32>(),
+        writer_id in "[a-zA-Z0-9-]{1,20}",
+        epoch in any::<u64>(),
+        seq in any::<u64>(),
+    ) {
+        // Each writer consumes its input by value and neither SeriesInput
+        // nor SeriesInputV3/SegmentIdentity/IngestBounds is Clone, so build
+        // three independent (but logically identical) batches/structs
+        // rather than adding Clone derives to production types for test
+        // convenience.
+        let inputs1 = build_series_inputs_for_differential(&series_data);
+        let inputs2 = build_series_inputs_for_differential(&series_data);
+        let inputs3 = build_series_inputs_v3_for_differential(&series_data);
+
+        let identity1 = SegmentIdentity {
+            tenant_hash, shard, writer_id: writer_id.clone(), writer_epoch: epoch, writer_seq: seq,
+        };
+        let identity2 = SegmentIdentity {
+            tenant_hash, shard, writer_id: writer_id.clone(), writer_epoch: epoch, writer_seq: seq,
+        };
+        let identity3 = SegmentIdentity {
+            tenant_hash, shard, writer_id, writer_epoch: epoch, writer_seq: seq,
+        };
+        let bounds = || IngestBounds {
+            min_ingest_ts_ns: -1_000_000_000,
+            max_ingest_ts_ns: 1_000_000_000,
+        };
+
+        let v1 = SegmentWriter::write(inputs1, identity1, bounds()).expect("v1 writes");
+        let v2 = SegmentWriter::write_v2(inputs2, identity2, bounds()).expect("v2 writes");
+        let v3 = SegmentWriter::write_v3(inputs3, identity3, bounds()).expect("v3 writes");
+
+        let got1 = decode_v1_scalar(&v1.bytes);
+        let got2 = decode_v2_scalar(&v2.bytes);
+        let got3 = decode_v3_scalar(&v3.bytes);
+
+        prop_assert_eq!(&got1, &got2, "v1 and v2 diverged on the same logical scalar input");
+        prop_assert_eq!(&got1, &got3, "v1 and v3 diverged on the same logical scalar input");
+    }
+}
