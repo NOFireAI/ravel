@@ -35,6 +35,18 @@
 //! before encoding does not move that line, and treating it as if it did
 //! would make the second rule unreachable.
 //!
+//! # The pinned surface (ticket C1d)
+//!
+//! [`SqlExecutor::resolve_snapshot`] and [`SqlExecutor::plan_pinned`] split
+//! the two halves above apart for a transport whose resolve and execute land
+//! in different RPCs (Flight SQL, crate::flight). They are not a second
+//! implementation: [`SqlExecutor::execute`] runs through `plan_pinned` too, so
+//! there is exactly one place that builds a query's pool, provider, and
+//! session, and exactly one `Catalog::resolve` call site. A transport that
+//! reimplemented either would be free to drift on tenant accounting, on the
+//! per-query session invariant, or on the retry contract; going through these
+//! two methods is what makes that impossible rather than merely unlikely.
+//!
 //! # Deadline
 //!
 //! The wall deadline wraps the whole call, retry included, so a query cannot
@@ -44,13 +56,20 @@
 //! never returned (docs/query-engine.md "Budgets").
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
+use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::memory_pool::MemoryPool;
-use futures::StreamExt;
+use datafusion::prelude::SessionContext;
+use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_query::SegmentFetcher;
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
@@ -212,6 +231,56 @@ impl SqlExecutor {
         ))
     }
 
+    /// One `Catalog::resolve` plus the `max_segments` budget check, exposed
+    /// for a transport that resolves and executes in two separate RPCs.
+    ///
+    /// Flight SQL resolves at `GetFlightInfo`, pins the resulting segment set
+    /// into its ticket, and executes against that pin at `DoGet` (review F18).
+    /// It must reach `Catalog::resolve` through this call rather than its own,
+    /// so both transports share one signature, one budget check, and one
+    /// injected-clock discipline. Validation is *not* performed here: the
+    /// caller runs [`crate::validate`] first, exactly as [`Self::execute`]
+    /// does, so a rejected statement still costs no catalog LIST.
+    pub async fn resolve_snapshot(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+    ) -> Result<Snapshot, SqlError> {
+        self.resolve(tenant_hash, req).await
+    }
+
+    /// Build the fresh per-query, single-tenant session over an already
+    /// resolved `snapshot` and plan `sql` against it, without executing.
+    ///
+    /// This is the one construction path for a query's session: its own
+    /// `TenantDelegatingPool` over the tenant's accountant, its own
+    /// `RavelTableProvider` over the owned snapshot, its own `SessionContext`
+    /// (security invariant 2, crate::session). Both [`Self::execute`] and the
+    /// Flight SQL `DoGet` path go through it, which is what makes the two
+    /// transports share the memory-accounting and cancellation behaviour
+    /// rather than merely resemble it (review F13): the pool the returned
+    /// query owns is dropped with it, and every `MemoryReservation` the plan
+    /// took shrinks back through it into the tenant accountant.
+    pub async fn plan_pinned(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        sql: &str,
+    ) -> Result<PinnedQuery, SqlError> {
+        let pool: Arc<dyn MemoryPool> = self.config.query_pool(self.tenant_budget(tenant_hash));
+        let provider = Arc::new(RavelTableProvider::new(
+            snapshot,
+            tenant_hash,
+            self.fetcher.clone(),
+            self.config,
+        ));
+
+        let ctx = build_session(&self.config, pool, provider).map_err(plan_error)?;
+        let frame = ctx.sql(sql).await.map_err(plan_error)?;
+        let schema = frame.schema().inner().clone();
+        Ok(PinnedQuery { ctx, frame, schema })
+    }
+
     /// One `Catalog::resolve` plus the `max_segments` budget check.
     async fn resolve(
         &self,
@@ -247,28 +316,15 @@ impl SqlExecutor {
         req: &SqlRequest,
         snapshot: Snapshot,
     ) -> (Result<QueryOutput, SqlError>, usize) {
-        let pool: Arc<dyn MemoryPool> = self.config.query_pool(self.tenant_budget(tenant_hash));
-        let provider = Arc::new(RavelTableProvider::new(
-            snapshot,
-            tenant_hash,
-            self.fetcher.clone(),
-            self.config,
-        ));
-
-        let ctx = match build_session(&self.config, pool, provider) {
-            Ok(ctx) => ctx,
-            Err(e) => return (Err(plan_error(e)), 0),
+        let planned = match self.plan_pinned(tenant_hash, snapshot, &req.sql).await {
+            Ok(planned) => planned,
+            Err(e) => return (Err(e), 0),
         };
+        let schema = planned.schema();
 
-        let frame = match ctx.sql(&req.sql).await {
-            Ok(frame) => frame,
-            Err(e) => return (Err(plan_error(e)), 0),
-        };
-        let schema = frame.schema().inner().clone();
-
-        let mut stream = match frame.execute_stream().await {
+        let mut stream = match planned.execute().await {
             Ok(stream) => stream,
-            Err(e) => return (Err(plan_error(e)), 0),
+            Err(e) => return (Err(e), 0),
         };
 
         let mut batches = Vec::new();
@@ -279,11 +335,73 @@ impl SqlExecutor {
                     emitted += 1;
                     batches.push(batch);
                 }
-                Err(e) => return (Err(execution_error(e)), emitted),
+                Err(e) => return (Err(e), emitted),
             }
         }
 
         (Ok(QueryOutput::new(schema, batches)), emitted)
+    }
+}
+
+/// A query planned against one pinned snapshot, not yet executing.
+///
+/// Owns the throwaway `SessionContext` built by
+/// [`SqlExecutor::plan_pinned`], so dropping it drops the session, its
+/// `RuntimeEnv`, and its memory pool. Exposing the planned schema before
+/// execution is what lets Flight SQL's `GetFlightInfo` answer with the result
+/// schema without reading a single segment.
+pub struct PinnedQuery {
+    ctx: SessionContext,
+    frame: DataFrame,
+    schema: SchemaRef,
+}
+
+impl PinnedQuery {
+    /// The planned result schema.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Start the plan's stream. The session stays alive inside the returned
+    /// [`PinnedStream`] for as long as the stream does.
+    pub async fn execute(self) -> Result<PinnedStream, SqlError> {
+        let PinnedQuery { ctx, frame, schema } = self;
+        let inner = frame.execute_stream().await.map_err(plan_error)?;
+        Ok(PinnedStream {
+            _ctx: ctx,
+            inner,
+            schema,
+        })
+    }
+}
+
+/// A running plan's `RecordBatch` stream, with its session attached.
+///
+/// Dropping this mid-stream is the cancellation path: the plan's operators
+/// and their `MemoryReservation`s drop with it, each reservation's `Drop`
+/// calls `MemoryPool::shrink`, and `TenantDelegatingPool` forwards that to
+/// the tenant accountant (crate::memory, review F13). No transport needs an
+/// explicit release step, and adding one would double-count.
+pub struct PinnedStream {
+    _ctx: SessionContext,
+    inner: SendableRecordBatchStream,
+    schema: SchemaRef,
+}
+
+impl PinnedStream {
+    /// The stream's schema, identical to the planned schema.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl Stream for PinnedStream {
+    type Item = Result<RecordBatch, SqlError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner
+            .poll_next_unpin(cx)
+            .map(|next| next.map(|batch| batch.map_err(execution_error)))
     }
 }
 

@@ -166,6 +166,12 @@ pub async fn start(
     }
     let catalog = query::build_catalog(store.clone(), config.shard_count)?;
 
+    // Held past the HTTP wiring so the Flight SQL service can register
+    // against the same executor rather than building a second one; `None`
+    // in a gateway-only process, which serves no query surface at all.
+    #[cfg(feature = "sql")]
+    let mut sql_state: Option<sql::SqlState> = None;
+
     if matches!(config.mode, Mode::All | Mode::Query) {
         let app_state = query::build_app_state(
             catalog.clone(),
@@ -177,12 +183,13 @@ pub async fn start(
             // Mounted alongside the Prometheus-shaped routes on the same
             // listener, sharing the catalog and object store but nothing
             // else: the SQL path builds its own session per query.
-            let sql_state = query::build_sql_state(
+            let state = query::build_sql_state(
                 store.clone(),
                 config.shard_count,
                 config.tenant_resolver.clone(),
             )?;
-            http_router = http_router.merge(sql::router(sql_state));
+            http_router = http_router.merge(sql::router(state.clone()));
+            sql_state = Some(state);
         }
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }
@@ -209,12 +216,17 @@ pub async fn start(
     // The gRPC listener carries OTLP ingest, so gateway modes always bind it.
     // With `flight-sql` on it also carries Flight SQL, which is a query
     // surface, so a query-only process binds it too.
-    let serve_grpc = metrics_service.is_some() || cfg!(feature = "flight-sql");
+    #[cfg(feature = "flight-sql")]
+    let flight_service = sql_state.as_ref().map(flight::service);
+    #[cfg(feature = "flight-sql")]
+    let serve_grpc = metrics_service.is_some() || flight_service.is_some();
+    #[cfg(not(feature = "flight-sql"))]
+    let serve_grpc = metrics_service.is_some();
 
     let (grpc_addr, grpc_shutdown, grpc_task) = if serve_grpc {
         let grpc = tonic::transport::Server::builder().add_optional_service(metrics_service);
         #[cfg(feature = "flight-sql")]
-        let grpc = grpc.add_service(flight::service());
+        let grpc = grpc.add_optional_service(flight_service);
         let (tx, rx) = oneshot::channel::<()>();
         // Bound here rather than inside `serve_with_shutdown` so the reported
         // address is the one actually bound; with port 0 the configured value
