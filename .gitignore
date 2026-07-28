@@ -7,3 +7,4 @@
 /examples/otlp_metrics_fixture.pb
 __pycache__/
 /.superpowers/
+/.cache/
