@@ -9,27 +9,19 @@
 # format and the query-serving binary this harness runs against come from
 # one consistent upstream tag.
 #
-# IMPORTANT: the sha256 checksums below are placeholders, not real
-# published hashes. This environment has no network egress, so they could
-# not be fetched from upstream (Prometheus' GitHub release page /
-# sha256sums.txt) and verified here. The script refuses to run past the
-# verification step while a checksum still carries the UNVERIFIED-PLACEHOLDER
-# marker: silently trusting an unverified binary would defeat the point of
-# pinning one. Populate PROM_SHA256_LINUX_AMD64 / PROM_SHA256_DARWIN_ARM64
-# (or add a platform) with the real published digest before first use.
+# Checksums below are the published sha256 values from Prometheus'
+# GitHub release page for v3.13.1 (sha256sums.txt), verified against
+# https://github.com/prometheus/prometheus/releases/download/v3.13.1/sha256sums.txt.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROM_VERSION="3.13.1"
 CACHE_DIR="${RAVEL_DIFFTEST_PROM_CACHE:-$ROOT_DIR/.cache/prometheus}"
 
-# UNVERIFIED-PLACEHOLDER: replace with the real sha256 from Prometheus'
-# published `sha256sums.txt` for v${PROM_VERSION} before relying on this
-# script outside a network-isolated sandbox.
-PROM_SHA256_LINUX_AMD64="UNVERIFIED-PLACEHOLDER-linux-amd64"
-PROM_SHA256_LINUX_ARM64="UNVERIFIED-PLACEHOLDER-linux-arm64"
-PROM_SHA256_DARWIN_AMD64="UNVERIFIED-PLACEHOLDER-darwin-amd64"
-PROM_SHA256_DARWIN_ARM64="UNVERIFIED-PLACEHOLDER-darwin-arm64"
+PROM_SHA256_LINUX_AMD64="962b812371aff838d152b6ff2d56fdb7a6396f5542f48ebf73421b9721f0d103"
+PROM_SHA256_LINUX_ARM64="fbd8e5e0f6ad2e7d053e717739186caee4fd0cab2cf9335bfc86c292fe2a2bfe"
+PROM_SHA256_DARWIN_AMD64="bc6cef4bdbeb3d0974ac161684dd2a0c4d4e341a13a4a634917b1c09d0f33fc5"
+PROM_SHA256_DARWIN_ARM64="28d1f1224b2a22f84c801487fad4b3bd58f94a8cb58cf9340557e787030c9703"
 
 log() {
   echo "[fetch-prometheus] $*" >&2
