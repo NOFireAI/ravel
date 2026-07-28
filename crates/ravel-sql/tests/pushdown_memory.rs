@@ -238,7 +238,10 @@ async fn build_snapshot(store: &dyn ObjectStoreBackend, specs: &[SegSpec]) -> Sn
         segments.push(write_segment(store, &key, writer_id, spec).await);
     }
     segments.sort_by_key(|s| (s.created_unix_ns, s.writer_epoch, s.writer_seq, s.shard));
-    Snapshot { segments }
+    Snapshot {
+        segments,
+        segments_pruned: 0,
+    }
 }
 
 /// Per-series ts -> winning value bits.

@@ -12,8 +12,8 @@ use promql_parser::parser::{Expr, Offset};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
-    Evaluator, LabelMatcher, PlanAnchor, SelectorPlan, SeriesData, SeriesSource, SourceError,
-    Value, from_ast_matchers, has_or_group, matches_series, ms_to_ns, plan_selectors,
+    Evaluator, LabelMatcher, MatchOp, PlanAnchor, SelectorPlan, SeriesData, SeriesSource,
+    SourceError, Value, from_ast_matchers, has_or_group, matches_series, ms_to_ns, plan_selectors,
 };
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
@@ -37,6 +37,31 @@ enum EvalWindow {
         end_ns: i64,
         step_ns: i64,
     },
+}
+
+/// Segment-level counters for one query's snapshot resolution
+/// (docs/metric-index-plan.md P5b). `segments_pruned` counts only
+/// snapshot-sourced segments postings-based pruning excluded; it is always
+/// 0 when pruning did not apply -- no shared equality `__name__` filter
+/// across the query's selectors, no usable postings, or a window served
+/// entirely by listing/`min_token` lookup, both structurally unprunable
+/// (docs/metric-index-plan.md P5b, `SnapshotWindow::extract_into`). This is
+/// an exact count, never an estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryStats {
+    /// Segments actually fetched (the post-pruning snapshot size).
+    pub segments_fetched: u64,
+    /// Snapshot-sourced segments postings pruning excluded.
+    pub segments_pruned: u64,
+}
+
+impl QueryStats {
+    fn from_snapshot(snapshot: &Snapshot) -> Self {
+        QueryStats {
+            segments_fetched: snapshot.segments.len() as u64,
+            segments_pruned: snapshot.segments_pruned,
+        }
+    }
 }
 
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
@@ -73,6 +98,25 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<Value, QueryError> {
+        let (value, _stats) = self
+            .instant_with_stats(tenant_hash, query, t_ms, min_tokens, now_ns, deadline)
+            .await?;
+        Ok(value)
+    }
+
+    /// Same as [`Self::instant`], additionally returning this query's
+    /// segment counters (docs/metric-index-plan.md P5b). Additive: `instant`
+    /// keeps its original signature and behavior unchanged, mirroring the
+    /// `Catalog::resolve`/`resolve_pruned` split.
+    pub async fn instant_with_stats(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        t_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+    ) -> Result<(Value, QueryStats), QueryError> {
         tokio::time::timeout(
             deadline,
             self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns),
@@ -88,14 +132,15 @@ impl QueryEngine {
         t_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-    ) -> Result<Value, QueryError> {
+    ) -> Result<(Value, QueryStats), QueryError> {
         let t_ns = ms_to_ns(t_ms)?;
         let plans = plan_selectors(query, t_ms, t_ms)?;
         let eval_window = EvalWindow::Instant { t_ns };
-        let source = self
+        let (source, stats) = self
             .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        Ok(Evaluator::new().eval_instant(&source, query, t_ms)?)
+        let value = Evaluator::new().eval_instant(&source, query, t_ms)?;
+        Ok((value, stats))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -110,6 +155,37 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<Value, QueryError> {
+        let (value, _stats) = self
+            .range_with_stats(
+                tenant_hash,
+                query,
+                start_ms,
+                end_ms,
+                step_ms,
+                min_tokens,
+                now_ns,
+                deadline,
+            )
+            .await?;
+        Ok(value)
+    }
+
+    /// Same as [`Self::range`], additionally returning this query's segment
+    /// counters (docs/metric-index-plan.md P5b). Additive: `range` keeps its
+    /// original signature and behavior unchanged, mirroring the
+    /// `Catalog::resolve`/`resolve_pruned` split.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_with_stats(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+    ) -> Result<(Value, QueryStats), QueryError> {
         tokio::time::timeout(
             deadline,
             self.range_inner(
@@ -136,7 +212,7 @@ impl QueryEngine {
         step_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-    ) -> Result<Value, QueryError> {
+    ) -> Result<(Value, QueryStats), QueryError> {
         if step_ms <= 0 {
             return Err(QueryError::NonPositiveStep { step_ms });
         }
@@ -152,10 +228,11 @@ impl QueryEngine {
             end_ns,
             step_ns,
         };
-        let source = self
+        let (source, stats) = self
             .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        Ok(Evaluator::new().eval_range(&source, query, start_ms, end_ms, step_ms)?)
+        let value = Evaluator::new().eval_range(&source, query, start_ms, end_ms, step_ms)?;
+        Ok((value, stats))
     }
 
     /// Resolves the series (labels only, no samples) matching `matchers` in
@@ -169,6 +246,25 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<Vec<(SeriesId, LabelSet)>, QueryError> {
+        let (series, _stats) = self
+            .resolve_series_with_stats(tenant_hash, matchers, window, min_tokens, now_ns, deadline)
+            .await?;
+        Ok(series)
+    }
+
+    /// Same as [`Self::resolve_series`], additionally returning this query's
+    /// segment counters (docs/metric-index-plan.md P5b). Additive:
+    /// `resolve_series` keeps its original signature and behavior unchanged,
+    /// mirroring the `Catalog::resolve`/`resolve_pruned` split.
+    pub async fn resolve_series_with_stats(
+        &self,
+        tenant_hash: TenantHash,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         tokio::time::timeout(
             deadline,
             self.resolve_series_inner(tenant_hash, matchers, window, min_tokens, now_ns),
@@ -184,7 +280,8 @@ impl QueryEngine {
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
-    ) -> Result<Vec<(SeriesId, LabelSet)>, QueryError> {
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        let name_filter = equality_name_filter(matchers);
         let attempt = |snapshot: Snapshot| async move {
             let fetched = self
                 .fetch_all_series(tenant_hash, &snapshot, matchers)
@@ -204,8 +301,15 @@ impl QueryEngine {
             Ok(by_id.into_iter().collect())
         };
 
-        self.resolve_snapshot_with_retry(tenant_hash, window, min_tokens, now_ns, attempt)
-            .await
+        self.resolve_snapshot_with_retry(
+            tenant_hash,
+            window,
+            min_tokens,
+            now_ns,
+            name_filter,
+            attempt,
+        )
+        .await
     }
 
     /// Prefetches every selector `plan_selectors` reported: one shared
@@ -226,9 +330,9 @@ impl QueryEngine {
         eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
-    ) -> Result<MergedSource, QueryError> {
+    ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
-            return Ok(MergedSource { series: Vec::new() });
+            return Ok((MergedSource { series: Vec::new() }, QueryStats::default()));
         }
 
         let windows: Vec<TimeRange> = plans
@@ -241,6 +345,7 @@ impl QueryEngine {
             padded.end_ns = padded.end_ns.max(w.end_ns);
         }
 
+        let name_filter = shared_equality_name_filter(plans);
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
         let concurrency = self.config.fetch_concurrency.max(1);
@@ -277,8 +382,15 @@ impl QueryEngine {
             })
         };
 
-        self.resolve_snapshot_with_retry(tenant_hash, padded, min_tokens, now_ns, attempt)
-            .await
+        self.resolve_snapshot_with_retry(
+            tenant_hash,
+            padded,
+            min_tokens,
+            now_ns,
+            name_filter,
+            attempt,
+        )
+        .await
     }
 
     /// Resolves a snapshot, enforces `max_segments`, runs `attempt` once,
@@ -286,38 +398,44 @@ impl QueryEngine {
     /// concurrent GC/compaction) re-resolves and retries the whole query
     /// exactly once before giving up with `SnapshotInvalidated`
     /// (docs/catalog-and-mvcc.md).
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_snapshot_with_retry<T, F, Fut>(
         &self,
         tenant_hash: TenantHash,
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        name_filter: Option<&str>,
         mut attempt: F,
-    ) -> Result<T, QueryError>
+    ) -> Result<(T, QueryStats), QueryError>
     where
         F: FnMut(Snapshot) -> Fut,
         Fut: std::future::Future<Output = Result<T, QueryError>>,
     {
         let first = self
-            .resolve_bounded(tenant_hash, window, min_tokens, now_ns)
+            .resolve_bounded(tenant_hash, window, min_tokens, now_ns, name_filter)
             .await?;
+        let first_stats = QueryStats::from_snapshot(&first);
         match attempt(first).await {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
                 ..
             })) => {
                 let second = self
-                    .resolve_bounded(tenant_hash, window, min_tokens, now_ns)
+                    .resolve_bounded(tenant_hash, window, min_tokens, now_ns, name_filter)
                     .await?;
+                let second_stats = QueryStats::from_snapshot(&second);
                 match attempt(second).await {
                     Err(QueryError::Fetch(FetchError::Store {
                         source: StoreError::NotFound,
                         ..
                     })) => Err(QueryError::SnapshotInvalidated),
-                    other => other,
+                    Ok(t) => Ok((t, second_stats)),
+                    Err(other) => Err(other),
                 }
             }
-            other => other,
+            Ok(t) => Ok((t, first_stats)),
+            Err(other) => Err(other),
         }
     }
 
@@ -327,10 +445,18 @@ impl QueryEngine {
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
+        name_filter: Option<&str>,
     ) -> Result<Snapshot, QueryError> {
         let snapshot = self
             .catalog
-            .resolve(&tenant_hash, Signal::Metrics, window, min_tokens, now_ns)
+            .resolve_pruned(
+                &tenant_hash,
+                Signal::Metrics,
+                window,
+                min_tokens,
+                now_ns,
+                name_filter,
+            )
             .await?;
         if snapshot.segments.len() > self.config.max_segments {
             return Err(QueryError::TooManySegments {
@@ -464,6 +590,44 @@ fn selector_fetch_window(
             .ok_or(QueryError::TimeOverflow)?,
         end_ns: sel_end_ns,
     })
+}
+
+/// The literal metric name a single equality `__name__` matcher pins, or
+/// `None` if postings pruning must bypass entirely (docs/metric-index-plan.md
+/// P5b): no `__name__` matcher at all, or any `__name__` matcher that is not
+/// a lone `=` (a regex, a negation, or more than one `__name__` matcher on
+/// the same selector all take the conservative bypass path).
+fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<&str> {
+    let mut found: Option<&str> = None;
+    for m in matchers {
+        if m.name == METRIC_NAME_LABEL {
+            match &m.op {
+                MatchOp::Eq if found.is_none() => found = Some(m.value.as_str()),
+                _ => return None,
+            }
+        }
+    }
+    found
+}
+
+/// The equality `__name__` filter shared by every selector in a
+/// multi-selector query (docs/metric-index-plan.md P5b). `prefetch` resolves
+/// one snapshot shared across all of a query's selectors (e.g. `foo + bar`),
+/// so pruning only applies when every selector agrees on one literal name;
+/// otherwise a filter narrower than some other selector's own matchers would
+/// silently drop segments that selector still needs, so this bypasses (`None`)
+/// on any disagreement or on any selector with no equality name of its own.
+fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<&'a str> {
+    let mut shared: Option<&'a str> = None;
+    for plan in plans {
+        let name = equality_name_filter(&plan.matchers)?;
+        match shared {
+            None => shared = Some(name),
+            Some(s) if s == name => {}
+            Some(_) => return None,
+        }
+    }
+    shared
 }
 
 /// Parses `query` as a bare vector selector (Phase 1 scope) and returns its
@@ -1824,7 +1988,7 @@ mod prefetch_tests {
         let eng = engine(Arc::clone(&store));
         let plans = vec![window_plan("metric_a"), window_plan("metric_b")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
-        let source = eng
+        let (source, _stats) = eng
             .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
             .await
             .expect("prefetch must succeed across both selectors");
@@ -1873,7 +2037,7 @@ mod prefetch_tests {
         let eng = engine(Arc::clone(&store));
         let plans = vec![window_plan("metric_a"), window_plan("metric_b")];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
-        let source = eng
+        let (source, _stats) = eng
             .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
             .await
             .expect("prefetch");
@@ -1898,7 +2062,7 @@ mod prefetch_tests {
         let tenant_hash = TenantId::new("acme").hash();
         let eng = engine(store);
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
-        let source = eng
+        let (source, _stats) = eng
             .prefetch(tenant_hash, &[], &eval_window, &[], BASE_NS)
             .await
             .expect("empty plan list must not error");

@@ -11,7 +11,7 @@ use ravel_proto::commit::v1::CommitRecord;
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
-use crate::cache::{HeadCache, PartCache, RecordCache};
+use crate::cache::{HeadCache, PartCache, PostingsCache, RecordCache};
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
 use crate::snapshot::{SegmentRef, Snapshot};
@@ -33,6 +33,7 @@ pub struct Catalog {
     cache: RecordCache,
     head_cache: HeadCache,
     part_cache: PartCache,
+    postings_cache: PostingsCache,
 }
 
 impl Catalog {
@@ -51,6 +52,7 @@ impl Catalog {
             cache: RecordCache::default(),
             head_cache: HeadCache::default(),
             part_cache: PartCache::default(),
+            postings_cache: PostingsCache::default(),
         })
     }
 
@@ -75,6 +77,12 @@ impl Catalog {
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-part cache.
     pub(crate) fn part_cache(&self) -> &PartCache {
         &self.part_cache
+    }
+
+    /// `pub(crate)`: lets `snapshot_resolve` share the decoded-postings
+    /// cache (P5b).
+    pub(crate) fn postings_cache(&self) -> &PostingsCache {
+        &self.postings_cache
     }
 
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot
@@ -102,7 +110,51 @@ impl Catalog {
         min_tokens: &[CommitToken],
         now_ns: i64,
     ) -> Result<Snapshot, CatalogError> {
+        self.resolve_impl(tenant, signal, range, min_tokens, now_ns, None)
+            .await
+    }
+
+    /// Like [`Catalog::resolve`], but applies postings-based segment pruning
+    /// (P5b, docs/metric-index-plan.md 5.4) when `name_filter` is `Some`: an
+    /// equality `__name__` matcher value from the caller's query.
+    ///
+    /// Pruning only ever removes snapshot-sourced segments this snapshot's
+    /// postings provably do not carry that name; listing- and
+    /// `min_token`-sourced segments are never touched (they never pass
+    /// through the postings-aware code path at all), and missing or corrupt
+    /// postings silently degrade to the same behavior as [`Catalog::resolve`]
+    /// (docs/metric-index-plan.md "exact semantics by default": approximate
+    /// or unavailable pruning data must never fail a query or drop a
+    /// segment that a matcher could actually match).
+    ///
+    /// A separate method rather than a `resolve` parameter: this keeps
+    /// `Catalog::resolve`'s existing signature and every call site
+    /// (in-crate and external) unchanged, per this ticket's "keep the
+    /// `Catalog` public API stable if possible" requirement.
+    pub async fn resolve_pruned(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+    ) -> Result<Snapshot, CatalogError> {
+        self.resolve_impl(tenant, signal, range, min_tokens, now_ns, name_filter)
+            .await
+    }
+
+    async fn resolve_impl(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+    ) -> Result<Snapshot, CatalogError> {
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
+        let mut segments_pruned = 0u64;
 
         if let Some((window_start_hour, window_end_hour)) = self.window_hour_bounds(range, now_ns) {
             // A snapshot at watermark W serves every window hour <= W
@@ -120,6 +172,8 @@ impl Catalog {
                         window_start_hour,
                         snapshot_end_hour,
                         &range,
+                        name_filter,
+                        &mut segments_pruned,
                         &mut segments,
                     )?;
                     window.watermark_hour.saturating_add(1)
@@ -157,7 +211,10 @@ impl Catalog {
                 s.writer_id,
             )
         });
-        Ok(Snapshot { segments })
+        Ok(Snapshot {
+            segments,
+            segments_pruned,
+        })
     }
 
     /// The (start_hour, end_hour) ingest-hour bucket range the listing

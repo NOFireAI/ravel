@@ -12,7 +12,10 @@ use ravel_types::{LabelSet, SeriesId, TimeRange};
 
 use crate::engine::parse_match_selector;
 use crate::http::error::ApiError;
-use crate::http::json::{ApiResponse, instant_value_to_json, range_value_to_json, series_to_json};
+use crate::http::json::{
+    ApiResponse, QueryResponseData, instant_value_to_json, range_value_to_json, series_to_json,
+    with_stats,
+};
 use crate::http::params::{Params, decode_commit_tokens, parse_deadline, parse_timestamp_ms};
 use crate::http::{AppState, ONE_HOUR_NS};
 
@@ -65,10 +68,7 @@ pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Respons
     }
 }
 
-async fn handle_query(
-    state: &AppState,
-    req: Request<Body>,
-) -> Result<crate::http::json::QueryData, ApiError> {
+async fn handle_query(state: &AppState, req: Request<Body>) -> Result<QueryResponseData, ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
@@ -82,11 +82,11 @@ async fn handle_query(
     let min_tokens = decode_commit_tokens(params.all("min_commit_token"))?;
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
 
-    let value = state
+    let (value, stats) = state
         .engine
-        .instant(tenant_hash, query, time_ms, &min_tokens, now, deadline)
+        .instant_with_stats(tenant_hash, query, time_ms, &min_tokens, now, deadline)
         .await?;
-    instant_value_to_json(value, time_ms)
+    Ok(with_stats(instant_value_to_json(value, time_ms)?, stats))
 }
 
 pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -99,7 +99,7 @@ pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> R
 async fn handle_query_range(
     state: &AppState,
     req: Request<Body>,
-) -> Result<crate::http::json::QueryData, ApiError> {
+) -> Result<QueryResponseData, ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
@@ -112,9 +112,9 @@ async fn handle_query_range(
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
     let now = now_ns();
 
-    let value = state
+    let (value, stats) = state
         .engine
-        .range(
+        .range_with_stats(
             tenant_hash,
             query,
             start_ms,
@@ -125,7 +125,10 @@ async fn handle_query_range(
             deadline,
         )
         .await?;
-    range_value_to_json(value, start_ms, end_ms, step_ms)
+    Ok(with_stats(
+        range_value_to_json(value, start_ms, end_ms, step_ms)?,
+        stats,
+    ))
 }
 
 fn parse_duration_ms_field(params: &Params) -> Result<i64, ApiError> {
@@ -260,6 +263,13 @@ async fn resolve_matched_series(
     // whole request (docs in the task's pre-approved deviations list). The
     // shared wall budget above is orthogonal to that: snapshots stay
     // per-selector, but all selectors draw down one deadline.
+    //
+    // Per-selector segment stats (docs/metric-index-plan.md P5b) are not
+    // surfaced on this path: the labels/label_values/series endpoints have
+    // no established response envelope for it (only the value-bearing
+    // query/query_range endpoints do; see this ticket's final report), and
+    // aggregating per-selector counts here would double count segments any
+    // two selectors both matched.
     let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();
     for selector in selectors {
         let matchers: Vec<LabelMatcher> = parse_match_selector(selector)?;
