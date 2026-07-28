@@ -1,0 +1,75 @@
+# Error corpus (ticket P3, docs/promql-evaluator-plan.md section 5.3):
+# queries that are malformed PromQL syntax, not queries that merely hit a
+# construct one engine hasn't implemented yet. Every entry here must fail
+# to parse on both a real Prometheus and Ravel, so `mode: error` only ever
+# compares the `errorType` class (`bad_data` on both sides) rather than
+# exact message text. Semantic-gap cases (a function Ravel doesn't support
+# yet) deliberately do NOT belong here: they would make this file a
+# moving target as P4+ phases land new functions, rather than a fixed
+# syntax-error regression set.
+
+name: error_unclosed_paren
+query: sum(diff_gauge_walk
+kind: instant
+time: +0s
+mode: error
+
+name: error_unclosed_brace
+query: diff_gauge_walk{job="api"
+kind: instant
+time: +0s
+mode: error
+
+name: error_unterminated_string
+query: diff_gauge_walk{job="api}
+kind: instant
+time: +0s
+mode: error
+
+name: error_missing_operand
+query: diff_gauge_walk +
+kind: instant
+time: +0s
+mode: error
+
+name: error_invalid_duration_unit
+query: diff_gauge_walk[5x]
+kind: instant
+time: +0s
+mode: error
+
+name: error_empty_matcher_list
+query: {}
+kind: instant
+time: +0s
+mode: error
+
+name: error_bad_regex_matcher
+query: diff_gauge_walk{job=~"("}
+kind: instant
+time: +0s
+mode: error
+
+name: error_at_modifier_not_a_number
+query: diff_gauge_walk @ notanumber
+kind: instant
+time: +0s
+mode: error
+
+name: error_duplicate_offset
+query: diff_gauge_walk offset 1m offset 2m
+kind: instant
+time: +0s
+mode: error
+
+name: error_range_selector_missing_duration
+query: diff_gauge_walk[]
+kind: instant
+time: +0s
+mode: error
+
+name: error_stray_comma_in_matchers
+query: diff_gauge_walk{job="api",}
+kind: instant
+time: +0s
+mode: error
