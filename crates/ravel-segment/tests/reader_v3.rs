@@ -559,6 +559,11 @@ fn build_scenario_v3(
         sample_count: spec.sample_count.iter().sum(),
         series_count: u64::from(spec.count),
         sections,
+        base_created_unix_ns: 0,
+        ingest_hour_bucket: 0,
+        input_set_hash: Vec::new(),
+        part_index: 0,
+        level: 0,
     };
     (footer, dict_bytes, ids_bytes, meta_bytes)
 }
