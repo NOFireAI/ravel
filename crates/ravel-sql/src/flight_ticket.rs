@@ -53,15 +53,18 @@
 //!   service and this codec's version 2 respectively; the layout stays
 //!   hand-rolled because the version byte, not a schema registry, is what
 //!   governs it.)
-//! - A trailing 64-bit checksum makes accidental corruption (a single
+//! - A trailing keyed BLAKE3-256 MAC makes accidental corruption (a single
 //!   flipped byte anywhere) a typed decode error rather than a silently
-//!   different pin.
+//!   different pin, and -- unlike a plain checksum -- also makes the ticket
+//!   unforgeable by anyone who does not hold the minting process's secret key
+//!   (issue #185; version 2 used an unkeyed FNV-1a-64 checksum any client
+//!   could recompute after tampering with a field).
 //!
 //! Layout (all integers little-endian, lengths are `u32`):
 //!
 //! ```text
 //! magic         4   b"RFT1"
-//! version       1   = 2
+//! version       1   = 3
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -85,8 +88,20 @@
 //!     key                N   data_object_key (UTF-8)
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
-//! checksum      8   FNV-1a-64 over every preceding byte
+//! mac          32   keyed BLAKE3-256 over every preceding byte
 //! ```
+//!
+//! # Integrity: a keyed MAC, not a checksum
+//!
+//! [`FlightTicket::encode`] and [`FlightTicket::decode`] both take a
+//! [`TicketKey`]: a 32-byte secret generated once, in memory, when the
+//! `FlightSqlService` is constructed, and never sent to a client or persisted.
+//! The trailing tag is `blake3::keyed_hash(key, payload)`, not a plain hash of
+//! the payload, so recomputing it requires the key. A client can still read
+//! and replay a ticket verbatim (that is the protocol), but cannot flip a
+//! single field -- extend `deadline_ns`, swap a `data_object_key`, change the
+//! `tenant` -- and produce a tag the minting process will accept, which the
+//! version-2 FNV-1a-64 checksum never prevented.
 //!
 //! # Segment identity fields (the judgment call from issue #150, settled by C1)
 //!
@@ -116,10 +131,14 @@
 //!   carried too: a snapshot missing them would dedup differently than the
 //!   HTTP path did over the same segments.
 //!
-//! Version 1 tickets are rejected ([`FlightTicketError::UnsupportedVersion`]),
-//! not upgraded. They are ephemeral by construction -- no ticket outlives its
+//! Version 1 and version 2 tickets are rejected
+//! ([`FlightTicketError::UnsupportedVersion`] or, for version 2's
+//! differently-shaped trailing checksum, a MAC or length mismatch), not
+//! upgraded. They are ephemeral by construction -- no ticket outlives its
 //! `deadline_ns`, and nothing on any released path ever minted one -- so
-//! there is no compatibility window to preserve.
+//! there is no compatibility window to preserve. Version 3 (issue #185)
+//! replaces the unkeyed FNV-1a-64 checksum with a keyed BLAKE3 MAC; see
+//! "Integrity: a keyed MAC, not a checksum" above.
 
 use ravel_catalog::SegmentRef;
 use ravel_types::{CommitToken, TenantHash};
@@ -131,11 +150,27 @@ use uuid::Uuid;
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
-/// Smallest possible encoded ticket: the fixed header plus the trailing
-/// checksum, with zero tokens, zero segments, and an empty statement.
-const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 8;
+/// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
+const MAC_LEN: usize = 32;
+
+/// Length in bytes of the secret key [`FlightTicket::encode`] and
+/// [`FlightTicket::decode`] are keyed by.
+pub const TICKET_KEY_LEN: usize = 32;
+
+/// The secret, in-process MAC key a ticket is signed and verified with.
+///
+/// Generated once when the `FlightSqlService` is constructed (see
+/// `crate::flight::service`) and held only in memory: it is never logged,
+/// sent to a client, or persisted. A process restart mints a fresh key, which
+/// is safe because a ticket is ephemeral by construction and never expected
+/// to outlive the process that minted it.
+pub type TicketKey = [u8; TICKET_KEY_LEN];
+
+/// Smallest possible encoded ticket: the fixed header plus the trailing MAC,
+/// with zero tokens, zero segments, and an empty statement.
+const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + MAC_LEN;
 
 /// One pinned segment inside a [`FlightTicket`]: the wire mirror of a
 /// resolved [`SegmentRef`].
@@ -250,13 +285,14 @@ pub struct FlightTicket {
 }
 
 impl FlightTicket {
-    /// Encode to the wire layout documented on this module.
+    /// Encode to the wire layout documented on this module, signed with
+    /// `key`.
     ///
     /// Returns [`FlightTicketError::StatementTooLong`] if the statement
     /// exceeds [`MAX_STATEMENT_LEN`], and [`FlightTicketError::FieldTooLong`]
     /// if any single length field would not fit in a `u32` (not reachable
     /// with real keys or tokens).
-    pub fn encode(&self) -> Result<Vec<u8>, FlightTicketError> {
+    pub fn encode(&self, key: &TicketKey) -> Result<Vec<u8>, FlightTicketError> {
         if self.statement.len() > MAX_STATEMENT_LEN {
             return Err(FlightTicketError::StatementTooLong {
                 len: self.statement.len(),
@@ -295,29 +331,25 @@ impl FlightTicket {
 
         write_len_prefixed(&mut buf, self.statement.as_bytes())?;
 
-        let checksum = fnv1a64(&buf);
-        buf.extend_from_slice(&checksum.to_le_bytes());
+        let tag = mac(key, &buf);
+        buf.extend_from_slice(&tag);
         Ok(buf)
     }
 
-    /// Decode from the wire layout. Every malformed, truncated, corrupt, or
-    /// trailing-garbage input yields a typed [`FlightTicketError`], never a
-    /// panic.
-    pub fn decode(bytes: &[u8]) -> Result<FlightTicket, FlightTicketError> {
+    /// Decode from the wire layout, verifying the trailing MAC against `key`.
+    /// Every malformed, truncated, corrupt, tampered, or trailing-garbage
+    /// input yields a typed [`FlightTicketError`], never a panic.
+    pub fn decode(bytes: &[u8], key: &TicketKey) -> Result<FlightTicket, FlightTicketError> {
         if bytes.len() < MIN_ENCODED_LEN {
             return Err(FlightTicketError::Truncated);
         }
-        // Split off and verify the trailing checksum before parsing, so a
-        // corrupt length field cannot drive parsing at all.
-        let split = bytes.len() - 8;
+        // Split off and verify the trailing MAC before parsing, so a corrupt
+        // length field cannot drive parsing at all, and so a tampered field
+        // is rejected before any of it is trusted.
+        let split = bytes.len() - MAC_LEN;
         let (payload, stored) = bytes.split_at(split);
-        let stored = u64::from_le_bytes(
-            stored
-                .try_into()
-                .map_err(|_| FlightTicketError::Truncated)?,
-        );
-        if fnv1a64(payload) != stored {
-            return Err(FlightTicketError::ChecksumMismatch);
+        if !ct_eq(&mac(key, payload), stored) {
+            return Err(FlightTicketError::MacMismatch);
         }
 
         let mut cur = Cursor::new(payload);
@@ -450,9 +482,10 @@ pub enum FlightTicketError {
     /// Version byte is not one this codec understands.
     #[error("unsupported ticket version {0}")]
     UnsupportedVersion(u8),
-    /// The trailing checksum did not match the body (corruption/tampering).
-    #[error("ticket checksum mismatch")]
-    ChecksumMismatch,
+    /// The trailing MAC did not match the body (corruption, tampering, or a
+    /// key other than the one it was signed with).
+    #[error("ticket MAC mismatch")]
+    MacMismatch,
     /// A statement or object-key field was not valid UTF-8.
     #[error("ticket contains invalid UTF-8")]
     InvalidUtf8,
@@ -464,16 +497,28 @@ pub enum FlightTicketError {
     TrailingBytes,
 }
 
-/// FNV-1a 64-bit hash. Chosen over a `std::hash` hasher because it is
-/// deterministic across processes and platforms, which the ticket requires:
-/// `GetFlightInfo` and `DoGet` may run on different nodes.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Keyed BLAKE3-256 MAC over `bytes`. Deterministic across processes and
+/// platforms for a given key, which the ticket requires: `GetFlightInfo` and
+/// `DoGet` may run on different nodes sharing the same in-process key only
+/// when they are, in fact, the same process (see [`TicketKey`] docs).
+/// Forging a tag without `key` is a BLAKE3 key-recovery / preimage problem,
+/// not a recomputation any client can do, which is the property version 2's
+/// unkeyed FNV-1a-64 checksum lacked.
+fn mac(key: &TicketKey, bytes: &[u8]) -> [u8; MAC_LEN] {
+    *blake3::keyed_hash(key, bytes).as_bytes()
+}
+
+/// Constant-time byte-slice comparison, so verifying a MAC does not leak how
+/// many leading bytes matched through a timing side channel.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-    hash
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn u32_len(len: usize) -> Result<u32, FlightTicketError> {
@@ -544,6 +589,12 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use uuid::Uuid;
+
+    /// A fixed key for tests that don't care about key material itself, only
+    /// that encode/decode agree on one.
+    fn test_key() -> TicketKey {
+        [0x42u8; TICKET_KEY_LEN]
+    }
 
     fn sample_token(seed: u64) -> CommitToken {
         CommitToken {
@@ -616,8 +667,8 @@ mod tests {
             segments: vec![pin],
             ..sample_ticket()
         };
-        let bytes = ticket.encode().expect("encode");
-        let decoded = FlightTicket::decode(&bytes).expect("decode");
+        let bytes = ticket.encode(&test_key()).expect("encode");
+        let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
         assert_eq!(decoded.snapshot().segments, vec![seg]);
     }
 
@@ -627,8 +678,8 @@ mod tests {
     #[test]
     fn rebuilt_snapshot_reports_no_pruning() {
         let ticket = sample_ticket();
-        let bytes = ticket.encode().expect("encode");
-        let decoded = FlightTicket::decode(&bytes).expect("decode");
+        let bytes = ticket.encode(&test_key()).expect("encode");
+        let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
 
         let snapshot = decoded.snapshot();
         assert_eq!(
@@ -646,6 +697,7 @@ mod tests {
     /// reinterpreted under the current layout.
     #[test]
     fn a_foreign_version_byte_is_refused() {
+        let key = test_key();
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
         body.push(VERSION.wrapping_add(1));
@@ -655,10 +707,12 @@ mod tests {
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
-        let checksum = fnv1a64(&body);
-        body.extend_from_slice(&checksum.to_le_bytes());
+        // A valid MAC under the real key: the version check, not the MAC,
+        // must be what rejects this.
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
         assert!(matches!(
-            FlightTicket::decode(&body),
+            FlightTicket::decode(&body, &key),
             Err(FlightTicketError::UnsupportedVersion(_))
         ));
     }
@@ -666,8 +720,8 @@ mod tests {
     #[test]
     fn round_trip_fixed_ticket() {
         let ticket = sample_ticket();
-        let bytes = ticket.encode().expect("encode");
-        let decoded = FlightTicket::decode(&bytes).expect("decode");
+        let bytes = ticket.encode(&test_key()).expect("encode");
+        let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
         assert_eq!(ticket, decoded);
     }
 
@@ -681,9 +735,12 @@ mod tests {
             now_ns: 0,
             deadline_ns: 0,
         };
-        let bytes = ticket.encode().expect("encode");
+        let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(bytes.len(), MIN_ENCODED_LEN);
-        assert_eq!(FlightTicket::decode(&bytes).expect("decode"), ticket);
+        assert_eq!(
+            FlightTicket::decode(&bytes, &test_key()).expect("decode"),
+            ticket
+        );
     }
 
     #[test]
@@ -711,21 +768,25 @@ mod tests {
             now_ns: 42,
             deadline_ns: 99,
         };
-        let bytes = ticket.encode().expect("encode");
-        assert_eq!(FlightTicket::decode(&bytes).expect("decode"), ticket);
+        let bytes = ticket.encode(&test_key()).expect("encode");
+        assert_eq!(
+            FlightTicket::decode(&bytes, &test_key()).expect("decode"),
+            ticket
+        );
         // Comfortably inside gRPC's default 4 MiB receive cap.
         assert!(bytes.len() < 4 * 1024 * 1024, "size {}", bytes.len());
     }
 
     #[test]
     fn statement_at_cap_ok_over_cap_rejected() {
+        let key = test_key();
         let mut ticket = sample_ticket();
         ticket.statement = "s".repeat(MAX_STATEMENT_LEN);
-        let bytes = ticket.encode().expect("at-cap encodes");
-        assert_eq!(FlightTicket::decode(&bytes).expect("decode"), ticket);
+        let bytes = ticket.encode(&key).expect("at-cap encodes");
+        assert_eq!(FlightTicket::decode(&bytes, &key).expect("decode"), ticket);
 
         ticket.statement = "s".repeat(MAX_STATEMENT_LEN + 1);
-        match ticket.encode() {
+        match ticket.encode(&key) {
             Err(FlightTicketError::StatementTooLong { len, max }) => {
                 assert_eq!(len, MAX_STATEMENT_LEN + 1);
                 assert_eq!(max, MAX_STATEMENT_LEN);
@@ -736,8 +797,9 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized_statement_claim() {
-        // Hand-build a body claiming a stmt_len above the cap; checksum must
-        // be valid so the length check (not the checksum) is what rejects.
+        // Hand-build a body claiming a stmt_len above the cap; the MAC must
+        // be valid so the length check (not the MAC) is what rejects.
+        let key = test_key();
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
         body.push(VERSION);
@@ -748,60 +810,106 @@ mod tests {
         write_u32(&mut body, 0); // segments
         write_u32(&mut body, (MAX_STATEMENT_LEN + 1) as u32); // stmt_len
         // No stmt bytes follow, but the length check fires before the read.
-        let checksum = fnv1a64(&body);
-        body.extend_from_slice(&checksum.to_le_bytes());
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
         assert!(matches!(
-            FlightTicket::decode(&body),
+            FlightTicket::decode(&body, &key),
             Err(FlightTicketError::StatementTooLong { .. })
         ));
     }
 
     #[test]
     fn empty_input_is_typed_error() {
-        assert_eq!(FlightTicket::decode(&[]), Err(FlightTicketError::Truncated));
+        assert_eq!(
+            FlightTicket::decode(&[], &test_key()),
+            Err(FlightTicketError::Truncated)
+        );
     }
 
     #[test]
     fn truncated_input_is_typed_error() {
-        let bytes = sample_ticket().encode().expect("encode");
+        let key = test_key();
+        let bytes = sample_ticket().encode(&key).expect("encode");
         for cut in 0..bytes.len() {
             // Every prefix shorter than the whole is rejected, never panics.
-            assert!(FlightTicket::decode(&bytes[..cut]).is_err());
+            assert!(FlightTicket::decode(&bytes[..cut], &key).is_err());
         }
     }
 
     #[test]
     fn bad_magic_is_typed_error() {
-        let mut bytes = sample_ticket().encode().expect("encode");
+        let key = test_key();
+        let mut bytes = sample_ticket().encode(&key).expect("encode");
         bytes[0] ^= 0xff;
-        // Flipping a body byte trips the checksum first; the point is a
-        // typed error, never a panic.
-        assert!(FlightTicket::decode(&bytes).is_err());
+        // Flipping a body byte trips the MAC first; the point is a typed
+        // error, never a panic.
+        assert!(FlightTicket::decode(&bytes, &key).is_err());
     }
 
     #[test]
     fn trailing_bytes_rejected() {
-        let mut bytes = sample_ticket().encode().expect("encode");
+        let key = test_key();
+        let mut bytes = sample_ticket().encode(&key).expect("encode");
         bytes.push(0);
-        // The appended byte is now read as the checksum tail, so the stored
-        // checksum no longer matches the body.
+        // The appended byte is now read as part of the MAC tail, so the
+        // stored MAC no longer matches the body.
         assert!(matches!(
-            FlightTicket::decode(&bytes),
-            Err(FlightTicketError::ChecksumMismatch)
+            FlightTicket::decode(&bytes, &key),
+            Err(FlightTicketError::MacMismatch)
         ));
     }
 
     #[test]
     fn every_single_flip_is_detected() {
-        let bytes = sample_ticket().encode().expect("encode");
+        let key = test_key();
+        let bytes = sample_ticket().encode(&key).expect("encode");
         for i in 0..bytes.len() {
             let mut corrupt = bytes.clone();
             corrupt[i] ^= 0x01;
             assert!(
-                FlightTicket::decode(&corrupt).is_err(),
+                FlightTicket::decode(&corrupt, &key).is_err(),
                 "flip at {i} decoded successfully"
             );
         }
+    }
+
+    /// The vulnerability issue #185 fixes: tampering with a field (here, the
+    /// deadline the redemption path trusts) must be rejected as a MAC
+    /// mismatch, not silently accepted because the tamperer recomputed some
+    /// self-consistent checksum -- there is no key-independent way to make
+    /// the tag agree again.
+    #[test]
+    fn tampering_with_a_field_is_rejected_as_a_mac_mismatch() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let mut bytes = ticket.encode(&key).expect("encode");
+        // Offset of the first byte of `deadline_ns`: magic + version +
+        // tenant + now_ns.
+        let deadline_offset = 4 + 1 + 16 + 8;
+        bytes[deadline_offset] ^= 0x01;
+        assert_eq!(
+            FlightTicket::decode(&bytes, &key),
+            Err(FlightTicketError::MacMismatch)
+        );
+    }
+
+    /// The precise defect in the version-2 unkeyed FNV-1a-64 checksum: any
+    /// holder of a ticket could tamper with a field and recompute a checksum
+    /// that decode would accept, because the checksum needed no secret. A
+    /// keyed MAC closes exactly this: recomputing the tag under any key other
+    /// than the minting process's own is rejected, even though the tag is
+    /// self-consistent under the attacker's own (wrong) key.
+    #[test]
+    fn recomputing_the_tag_under_the_wrong_key_does_not_forge_a_valid_ticket() {
+        let real_key = test_key();
+        let mut ticket = sample_ticket();
+        ticket.deadline_ns += 1_000_000_000; // an attacker extending its budget
+        let attacker_key = [0x99u8; TICKET_KEY_LEN];
+        let bytes = ticket.encode(&attacker_key).expect("encode under any key");
+        assert_eq!(
+            FlightTicket::decode(&bytes, &real_key),
+            Err(FlightTicketError::MacMismatch)
+        );
     }
 
     #[test]
@@ -893,25 +1001,27 @@ mod tests {
                 now_ns,
                 deadline_ns,
             };
-            let bytes = ticket.encode().expect("encode");
-            let decoded = FlightTicket::decode(&bytes).expect("decode");
+            let key = test_key();
+            let bytes = ticket.encode(&key).expect("encode");
+            let decoded = FlightTicket::decode(&bytes, &key).expect("decode");
             prop_assert_eq!(ticket, decoded);
         }
 
         // Arbitrary bytes never panic: decode returns Ok or a typed Err.
         #[test]
         fn prop_arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
-            let _ = FlightTicket::decode(&bytes);
+            let _ = FlightTicket::decode(&bytes, &test_key());
         }
 
         // Any single-byte flip of a valid ticket is caught.
         #[test]
         fn prop_single_flip_detected(idx in any::<prop::sample::Index>()) {
-            let bytes = sample_ticket().encode().expect("encode");
+            let key = test_key();
+            let bytes = sample_ticket().encode(&key).expect("encode");
             let i = idx.index(bytes.len());
             let mut corrupt = bytes;
             corrupt[i] ^= 0x80;
-            prop_assert!(FlightTicket::decode(&corrupt).is_err());
+            prop_assert!(FlightTicket::decode(&corrupt, &key).is_err());
         }
     }
 }

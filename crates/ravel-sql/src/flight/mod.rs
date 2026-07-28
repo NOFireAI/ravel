@@ -168,6 +168,22 @@ impl FlightSqlConfig {
         let ttl_ns = i64::try_from(ttl.as_nanos()).unwrap_or(i64::MAX);
         now_ns.saturating_add(ttl_ns)
     }
+
+    /// The effective deadline `DoGet` may use when redeeming a ticket whose
+    /// embedded deadline is `ticket_deadline_ns` (issue #186).
+    ///
+    /// `DoGet` cannot simply trust `ticket_deadline_ns`: it is bytes a client
+    /// holds, read back from the wire at redemption, possibly long after
+    /// minting and possibly against a deployment whose config has since
+    /// changed. Re-deriving `now_ns + max_deadline` bounded by
+    /// `gc_protection_horizon` the same way [`Self::ticket_deadline_ns`] does
+    /// at mint time, and taking the minimum with the ticket's own value,
+    /// means the embedded deadline can only ever shorten the effective
+    /// budget below what this deployment would mint today, never lengthen
+    /// it.
+    pub(crate) fn clamp_ticket_deadline_ns(&self, ticket_deadline_ns: i64, now_ns: i64) -> i64 {
+        ticket_deadline_ns.min(self.ticket_deadline_ns(now_ns, self.max_deadline))
+    }
 }
 
 /// Convenience alias for the shared clock handle the service holds.
@@ -196,6 +212,42 @@ mod tests {
             config.ticket_deadline_ns(1_000, Duration::from_secs(30)),
             1_000 + 10_000_000_000
         );
+    }
+
+    /// The redemption-side half of issue #186: a ticket that honestly claims
+    /// a deadline far beyond this deployment's GC protection horizon (minted
+    /// under a looser config, or simply tampered with, though tampering is
+    /// caught earlier by the ticket's MAC) must still be clamped down to the
+    /// horizon at redemption. The embedded deadline may only shorten the
+    /// effective budget, never lengthen it.
+    #[test]
+    fn redemption_clamps_a_ticket_deadline_that_outlives_the_gc_horizon() {
+        let config = FlightSqlConfig {
+            max_deadline: Duration::from_secs(30),
+            gc_protection_horizon: Duration::from_secs(5),
+            default_window: Duration::from_secs(3600),
+        };
+        let now_ns = 1_000;
+        let far_future_ns = now_ns + 3_600_000_000_000; // one hour out
+        assert_eq!(
+            config.clamp_ticket_deadline_ns(far_future_ns, now_ns),
+            now_ns + 5_000_000_000,
+            "the gc horizon wins even though the ticket asked for far more",
+        );
+    }
+
+    /// The embedded deadline is still honored when it is the tighter bound:
+    /// clamping never lengthens a ticket's budget past what it asked for.
+    #[test]
+    fn redemption_honors_a_ticket_deadline_tighter_than_the_gc_horizon() {
+        let config = FlightSqlConfig {
+            max_deadline: Duration::from_secs(30),
+            gc_protection_horizon: Duration::from_secs(5),
+            default_window: Duration::from_secs(3600),
+        };
+        let now_ns = 1_000;
+        let tight_ns = now_ns + 1_000_000_000; // 1 s, tighter than the 5 s horizon
+        assert_eq!(config.clamp_ticket_deadline_ns(tight_ns, now_ns), tight_ns);
     }
 
     #[test]

@@ -41,11 +41,13 @@ use ravel_types::TenantHash;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
+use rand::Rng as _;
+
 use crate::executor::SqlExecutor;
 use crate::flight::request::{sql_request, status_from_sql};
 use crate::flight::stream::{DoGetStream, statement_stream};
 use crate::flight::{ClockRef, FlightAuth, FlightClock, FlightSqlConfig, metadata};
-use crate::flight_ticket::{FlightTicket, SegmentPin};
+use crate::flight_ticket::{FlightTicket, SegmentPin, TicketKey};
 use crate::validate::validate;
 
 /// The message every prepared-statement method returns. Prepared statements
@@ -63,6 +65,16 @@ pub struct RavelFlightSqlService {
     auth: Arc<dyn FlightAuth>,
     clock: ClockRef,
     config: FlightSqlConfig,
+    /// The in-process secret this service's tickets are signed and verified
+    /// with (issue #185). Generated once, here, at construction time and
+    /// held only in memory: never logged, never sent to a client, never
+    /// persisted. A process restart mints a fresh key and invalidates every
+    /// ticket the previous process signed, which is safe because a ticket is
+    /// ephemeral by construction (bounded by `deadline_ns`) and never meant
+    /// to outlive the process that minted it. Key persistence/rotation across
+    /// restarts is not implemented; see the module docs if a deployment ever
+    /// needs tickets to survive a restart.
+    ticket_key: TicketKey,
 }
 
 impl RavelFlightSqlService {
@@ -78,12 +90,24 @@ impl RavelFlightSqlService {
         clock: Arc<dyn FlightClock>,
         config: FlightSqlConfig,
     ) -> Self {
+        let mut ticket_key = TicketKey::default();
+        rand::rng().fill_bytes(&mut ticket_key);
         RavelFlightSqlService {
             executor,
             auth,
             clock,
             config,
+            ticket_key,
         }
+    }
+
+    /// The in-process key this service signs and verifies tickets with.
+    ///
+    /// Exposed so a test can decode a ticket outside the normal `DoGet` path
+    /// (for example, to assert what `GetFlightInfo` minted). Never logged or
+    /// sent to a client by any code path in this crate.
+    pub fn ticket_key(&self) -> &TicketKey {
+        &self.ticket_key
     }
 
     /// The authoritative tenant for a request. Every method calls this first.
@@ -197,7 +221,7 @@ impl FlightSqlService for RavelFlightSqlService {
             now_ns,
             deadline_ns: self.config.ticket_deadline_ns(now_ns, req.deadline),
         };
-        let handle = ticket.encode().map_err(|err| {
+        let handle = ticket.encode(&self.ticket_key).map_err(|err| {
             // The only reachable case is an over-long statement, which is the
             // caller's own input.
             tracing::debug!(tenant = %tenant.to_hex(), error = %err, "flight ticket encode failed");
@@ -236,10 +260,12 @@ impl FlightSqlService for RavelFlightSqlService {
     ) -> Result<Response<DoGetStream>, Status> {
         let tenant = self.tenant(request.metadata())?;
 
-        let decoded = FlightTicket::decode(&ticket.statement_handle).map_err(|err| {
-            tracing::debug!(tenant = %tenant.to_hex(), error = %err, "flight ticket decode failed");
-            Status::invalid_argument("malformed flight ticket")
-        })?;
+        let decoded = FlightTicket::decode(&ticket.statement_handle, &self.ticket_key).map_err(
+            |err| {
+                tracing::debug!(tenant = %tenant.to_hex(), error = %err, "flight ticket decode failed");
+                Status::invalid_argument("malformed flight ticket")
+            },
+        )?;
 
         if decoded.tenant != tenant {
             tracing::warn!(
@@ -251,8 +277,14 @@ impl FlightSqlService for RavelFlightSqlService {
             ));
         }
 
-        let stream =
-            statement_stream(&self.executor, Arc::clone(&self.clock), tenant, decoded).await?;
+        let stream = statement_stream(
+            &self.executor,
+            Arc::clone(&self.clock),
+            tenant,
+            decoded,
+            &self.config,
+        )
+        .await?;
         Ok(Response::new(stream))
     }
 
