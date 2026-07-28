@@ -180,9 +180,9 @@ fn corrupt_v3_series_meta_prints_typed_error_not_panic() {
         .expect("reads fixture");
     let mut corrupt = good.clone();
     // SERIES_META section per the captured golden fixture's footer: offset
-    // 113, len 61 (see tests/fixtures/
+    // 113, len 59 (see tests/fixtures/
     // golden_v3_mixed_scalar_and_histogram_inspect.txt's `kind=6
-    // name=SERIES_META offset=113 len=61`).
+    // name=SERIES_META offset=113 len=59`).
     let flip_at = 113 + 30;
     assert!(
         flip_at < corrupt.len(),
