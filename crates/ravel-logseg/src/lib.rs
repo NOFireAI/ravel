@@ -20,6 +20,7 @@ pub mod error;
 pub mod field_dir;
 pub mod footer;
 pub mod page;
+pub mod reader;
 pub mod record;
 pub mod skip_index;
 pub mod stream_dir;
@@ -28,5 +29,6 @@ pub mod varint;
 pub mod writer;
 
 pub use error::LogSegError;
-pub use record::LogRecord;
+pub use reader::{RlogReader, ScanStats};
+pub use record::{FieldSel, LogRecord, Predicate};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};

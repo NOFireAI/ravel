@@ -150,3 +150,33 @@ pub struct ResolvedRow {
     /// most once per row.
     pub columns: Vec<(u32, ColumnValue)>,
 }
+
+/// Selects the field a predicate arm applies to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldSel {
+    Body,
+    SeverityText,
+    Attr(String),
+}
+
+/// A scan predicate. `And` is the only combinator; every arm prunes
+/// independently and the surviving blocks are re-evaluated exactly per row
+/// (docs/log-segment-format.md "Pruning soundness").
+#[derive(Clone, Debug, PartialEq)]
+pub enum Predicate {
+    And(Vec<Predicate>),
+    /// Inclusive timestamp range on `ts_ns`.
+    TsRange {
+        min_ns: i64,
+        max_ns: i64,
+    },
+    StreamIn(Vec<LogStreamId>),
+    HasWord {
+        field: FieldSel,
+        word: String,
+    },
+    Equals {
+        field: FieldSel,
+        value: AttrValue,
+    },
+}
