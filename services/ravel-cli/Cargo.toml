@@ -18,6 +18,11 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

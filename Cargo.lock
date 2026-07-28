@@ -3635,6 +3635,8 @@ name = "ravel-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
+ "bytes",
  "clap",
  "hex",
  "prost",
@@ -3646,6 +3648,7 @@ dependencies = [
  "ravel-types",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
