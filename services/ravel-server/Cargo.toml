@@ -11,6 +11,7 @@ ravel-object-store = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-ingest = { workspace = true }
 ravel-otlp = { workspace = true }
+ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
