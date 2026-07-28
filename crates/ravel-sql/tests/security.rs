@@ -18,6 +18,7 @@
 
 mod util;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ravel_object_store::ObjectStoreBackend;
@@ -216,6 +217,133 @@ async fn a_tenant_query_cannot_observe_another_tenants_rows() {
     assert_eq!(sum_b.to_bits(), 2703.0f64.to_bits());
 }
 
+/// Invariant 2, data half, adversarial query shapes (sql4-F03): the single
+/// flat-aggregate positive test above proves the happy path, but tenant
+/// isolation is the invariant whose failure is an S0 cross-tenant
+/// disclosure, so it must be pinned against the query shapes an attacker
+/// would actually probe, not just `count/sum`. Each shape below is issued
+/// for tenant A and for tenant B against the same two-tenant fixture. The
+/// tenants publish under the same metric name with disjoint value sets, so
+/// "every returned value belongs to the requester and none to the other
+/// tenant" is a bit-exact isolation check. A shape that resolves must return
+/// only the requester's own rows; a shape that fails to plan is equally
+/// acceptable (it reaches no data). Either way, no shape may surface another
+/// tenant's value.
+///
+/// This locks in the *structural* guarantee: `tenant_hash` is a caller
+/// parameter no SQL text can influence, and exactly one tenant-bound
+/// `samples` table exists per session. A future change that registered a
+/// second catalog/schema or a cross-tenant-capable provider would break
+/// these cases rather than passing silently.
+#[tokio::test]
+async fn adversarial_query_shapes_stay_tenant_isolated() {
+    let a = tenant_id("tenant-a");
+    let b = tenant_id("tenant-b");
+    let a_specs = vec![SegSpec::new(
+        10,
+        1,
+        1,
+        vec![SeriesSpec::new("shared", vec![(100, 1.0), (200, 2.0)])],
+    )];
+    let b_specs = vec![SegSpec::new(
+        10,
+        1,
+        1,
+        vec![SeriesSpec::new(
+            "shared",
+            vec![(100, 900.0), (200, 901.0), (300, 902.0)],
+        )],
+    )];
+    let fixture = Fixture::memory(&[(&a, &a_specs), (&b, &b_specs)]).await;
+
+    let a_bits: HashSet<u64> = [1.0f64, 2.0].iter().map(|v| v.to_bits()).collect();
+    let b_bits: HashSet<u64> = [900.0f64, 901.0, 902.0]
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+
+    // Every shape projects a single `value` column so the result is compared
+    // uniformly, whatever the enclosing query structure.
+    let shapes: &[(&str, &str)] = &[
+        // A fully qualified catalog.schema.table reference. DataFusion's
+        // default catalog/schema is `datafusion.public`, so this names the
+        // one registered tenant-bound table by its long name; it must not
+        // become a handle to any other tenant's data.
+        (
+            "qualified datafusion.public.samples",
+            "SELECT value FROM datafusion.public.samples",
+        ),
+        // A reference into a catalog that does not exist. There is no second
+        // catalog to resolve into, so this must fail to plan, never fall back
+        // to another tenant.
+        ("qualified other.samples", "SELECT value FROM other.samples"),
+        // UNION (distinct) and UNION ALL: both arms resolve to the same
+        // single tenant-bound provider; there is no second data source.
+        (
+            "union",
+            "SELECT value FROM samples UNION SELECT value FROM samples",
+        ),
+        (
+            "union all",
+            "SELECT value FROM samples UNION ALL SELECT value FROM samples",
+        ),
+        // A correlated subquery: the inner query references the outer row and
+        // reads `samples`, but `samples` is still the single tenant-bound
+        // table on both sides.
+        (
+            "correlated subquery",
+            "SELECT value FROM samples s \
+             WHERE EXISTS (SELECT 1 FROM samples t WHERE t.ts = s.ts)",
+        ),
+        // A CTE reading `samples`: the WITH binding names the same provider.
+        (
+            "cte",
+            "WITH c AS (SELECT value FROM samples) SELECT value FROM c",
+        ),
+    ];
+
+    for (shape, sql) in shapes {
+        for (me, mine, theirs) in [(&a, &a_bits, &b_bits), (&b, &b_bits, &a_bits)] {
+            let who = me.as_str();
+            match fixture.executor.execute(me.hash(), &request(sql)).await {
+                Ok(out) => {
+                    let got = value_bits(&out.output);
+                    // A resolving shape must actually read the requester's own
+                    // rows, not silently return an empty set that would hide a
+                    // wrong resolution.
+                    assert!(
+                        !got.is_empty(),
+                        "shape `{shape}` for {who}: resolved but returned no rows"
+                    );
+                    for bits in &got {
+                        assert!(
+                            mine.contains(bits),
+                            "shape `{shape}` for {who}: value {} is not the requester's own row",
+                            f64::from_bits(*bits)
+                        );
+                        assert!(
+                            !theirs.contains(bits),
+                            "shape `{shape}` for {who}: reached another tenant's value {}",
+                            f64::from_bits(*bits)
+                        );
+                    }
+                }
+                Err(err) => {
+                    // Failing to plan is an acceptable outcome: it reaches no
+                    // data. It must be a client-safe class, not an internal
+                    // leak, and it must not carry another tenant's detail to
+                    // the client.
+                    assert!(
+                        matches!(err, SqlError::Plan(_))
+                            || matches!(err.class(), ErrorClass::BadRequest),
+                        "shape `{shape}` for {who}: unexpected error class: {err}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Invariant 2, budget half: tenant A running a query must not move tenant
 /// B's accountant. Both accountants are read before and after.
 #[tokio::test]
@@ -331,6 +459,26 @@ async fn all_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
         .collect();
     keys.sort();
     keys
+}
+
+/// Every cell of a single-column `value` projection, as raw bit patterns so
+/// NaN and signed zero compare exactly. Used by the adversarial-shape
+/// isolation test, where each shape projects only `value`.
+fn value_bits(output: &ravel_sql::QueryOutput) -> Vec<u64> {
+    use datafusion::arrow::array::Float64Array;
+
+    let mut bits = Vec::new();
+    for batch in output.batches() {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("value column is Float64");
+        for i in 0..batch.num_rows() {
+            bits.push(col.value(i).to_bits());
+        }
+    }
+    bits
 }
 
 fn count_and_sum(output: &ravel_sql::QueryOutput) -> (i64, f64) {
