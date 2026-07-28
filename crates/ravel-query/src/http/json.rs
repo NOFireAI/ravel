@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use ravel_promql::{Value, ms_to_ns};
 use ravel_types::{LabelSet, SeriesId};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use crate::http::error::ApiError;
 
@@ -29,21 +29,40 @@ pub enum QueryData {
     #[serde(rename = "matrix")]
     Matrix(Vec<MatrixResult>),
     #[serde(rename = "scalar")]
-    Scalar((f64, String)),
+    Scalar((Timestamp, String)),
     #[serde(rename = "string")]
-    String((f64, String)),
+    String((Timestamp, String)),
 }
 
 #[derive(Debug, Serialize)]
 pub struct VectorResult {
     pub metric: HashMap<String, String>,
-    pub value: (f64, String),
+    pub value: (Timestamp, String),
 }
 
 #[derive(Debug, Serialize)]
 pub struct MatrixResult {
     pub metric: HashMap<String, String>,
-    pub values: Vec<(f64, String)>,
+    pub values: Vec<(Timestamp, String)>,
+}
+
+/// A query result timestamp, rendered in JSON as Prometheus' Go encoder
+/// renders it: a whole-second value is a bare integer (`1700000150`), not
+/// serde_json's default `f64` encoding, which always keeps a fractional
+/// part (`1700000150.0`) to disambiguate an `f64` from a JSON integer on
+/// deserialize. Matching Prometheus' actual wire text, not just its
+/// numeric value, is the bit-exact HTTP-API parity ADR-0021 requires.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Timestamp(pub f64);
+
+impl Serialize for Timestamp {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.is_finite() && self.0.fract() == 0.0 && self.0.abs() < 2f64.powi(53) {
+            serializer.serialize_i64(self.0 as i64)
+        } else {
+            serializer.serialize_f64(self.0)
+        }
+    }
 }
 
 /// Prometheus renders a sample value as a JSON string, not a number, so
@@ -72,8 +91,8 @@ fn labels_to_map(labels: &LabelSet) -> HashMap<String, String> {
 /// Reported sample timestamps from the evaluator are always exact
 /// multiples of 1ms in nanoseconds (docs/query-engine.md, `ravel_promql`
 /// eval module doc), so this floor-division never loses precision.
-fn ts_ns_to_seconds(ts_ns: i64) -> f64 {
-    (ts_ns as f64) / 1_000_000_000.0
+fn ts_ns_to_seconds(ts_ns: i64) -> Timestamp {
+    Timestamp((ts_ns as f64) / 1_000_000_000.0)
 }
 
 /// Render an [`Evaluator::eval_instant`] result as a Prometheus-shaped
@@ -158,7 +177,7 @@ pub fn range_value_to_json(
     }
 }
 
-fn ms_to_seconds(ms: i64) -> Result<f64, ApiError> {
+fn ms_to_seconds(ms: i64) -> Result<Timestamp, ApiError> {
     Ok(ts_ns_to_seconds(
         ms_to_ns(ms).map_err(|e| ApiError::BadData(e.to_string()))?,
     ))
@@ -214,7 +233,7 @@ mod tests {
             instant_value_to_json(Value::Scalar(42.5), 1_700_000_000_000).expect("scalar renders");
         match data {
             QueryData::Scalar((ts, value)) => {
-                assert_eq!(ts, 1_700_000_000.0);
+                assert_eq!(ts, Timestamp(1_700_000_000.0));
                 assert_eq!(value, "42.5");
             }
             _ => panic!("expected scalar result, got a differently-shaped QueryData"),
@@ -227,7 +246,7 @@ mod tests {
             .expect("string renders");
         match data {
             QueryData::String((ts, value)) => {
-                assert_eq!(ts, 1_700_000_000.0);
+                assert_eq!(ts, Timestamp(1_700_000_000.0));
                 assert_eq!(value, "up");
             }
             _ => panic!("expected string result, got a differently-shaped QueryData"),
@@ -282,6 +301,22 @@ mod tests {
         assert_eq!(matrix.len(), 1);
         let values: Vec<&str> = matrix[0].values.iter().map(|(_, v)| v.as_str()).collect();
         assert_eq!(values, vec!["idle", "idle"]);
+    }
+
+    #[test]
+    fn whole_second_timestamp_renders_without_a_fractional_part() {
+        // Prometheus' Go encoder emits a whole-second timestamp as a bare
+        // JSON integer; serde_json's default f64 encoding would emit
+        // `1700000150.0` instead, which is a real value this differential
+        // test corpus caught against a pinned Prometheus binary.
+        let json = serde_json::to_string(&Timestamp(1_700_000_150.0)).expect("serializes");
+        assert_eq!(json, "1700000150");
+    }
+
+    #[test]
+    fn fractional_timestamp_still_renders_its_fractional_part() {
+        let json = serde_json::to_string(&Timestamp(1_700_000_150.5)).expect("serializes");
+        assert_eq!(json, "1700000150.5");
     }
 
     #[test]

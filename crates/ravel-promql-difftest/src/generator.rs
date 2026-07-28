@@ -101,6 +101,8 @@ pub fn generate(config: &DatasetConfig) -> Dataset {
     series.extend(classic_histogram_family(&mut rng, config, false));
     series.extend(classic_histogram_family(&mut rng, config, true));
     series.extend(vector_matching_shapes(&mut rng, config));
+    series.extend(aggregation_group(config));
+    series.extend(aggregation_special(config));
 
     Dataset { series }
 }
@@ -335,6 +337,50 @@ fn vector_matching_shapes(rng: &mut StdRng, config: &DatasetConfig) -> Vec<Gener
         // the one side is absent for it).
         make("diff_group_meta", &[("job", "batch"), ("version", "v2")]),
     ]
+}
+
+/// Label/value shapes for the aggregation corpus (ticket #129, plan section
+/// P8): two `job` groups, each with three `instance`s, and constant values
+/// (not randomized) so a `topk`/`bottomk` tie is exact and stable at every
+/// timestamp rather than depending on where in the walk the query lands.
+/// `job="a"` carries an exact duplicate at its own maximum (`instance`s `2`
+/// and `3` both `20.0`), used for an ungrouped `topk`/`bottomk` scenario
+/// where the whole tied pair is retained (`k=2`, matching the full width of
+/// the tie, so no implementation-dependent boundary cut is exercised).
+/// `job="b"`'s own duplicate (`instance`s `1` and `2` both `5.0`) provides
+/// the ungrouped bottom tie.
+fn aggregation_group(config: &DatasetConfig) -> Vec<GeneratedSeries> {
+    let ts = regular_timestamps(config);
+    let defs: &[(&str, &str, f64)] = &[
+        ("a", "1", 10.0),
+        ("a", "2", 20.0),
+        ("a", "3", 20.0),
+        ("b", "1", 5.0),
+        ("b", "2", 5.0),
+        ("b", "3", 15.0),
+    ];
+    defs.iter()
+        .map(|(job, instance, value)| GeneratedSeries {
+            labels: metric("diff_agg_group", &[("job", job), ("instance", instance)]),
+            samples: ts.iter().map(|t| (*t, *value)).collect(),
+        })
+        .collect()
+}
+
+/// Three series, one per special value, all present at the same instant (in
+/// contrast to `special_values`, whose one series holds them one per
+/// timestamp): exercises aggregation's NaN-skipping `min`/`max`, NaN-
+/// propagating `sum`, and NaN-sorts-last `topk`/`bottomk` against a mix that
+/// also includes a `-0.0` sample.
+fn aggregation_special(config: &DatasetConfig) -> Vec<GeneratedSeries> {
+    let ts = regular_timestamps(config);
+    let defs: &[(&str, f64)] = &[("nan", f64::NAN), ("negzero", -0.0), ("one", 1.0)];
+    defs.iter()
+        .map(|(kind, value)| GeneratedSeries {
+            labels: metric("diff_agg_special", &[("kind", kind)]),
+            samples: ts.iter().map(|t| (*t, *value)).collect(),
+        })
+        .collect()
 }
 
 #[allow(dead_code)]

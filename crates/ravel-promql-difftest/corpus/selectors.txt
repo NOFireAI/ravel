@@ -120,11 +120,16 @@ kind: instant
 time: +120s
 mode: unordered
 
-name: instant_special_values_negative_zero
-query: diff_special_values
-kind: instant
-time: +150s
-mode: unordered
+# -0.0 is deliberately excluded from this corpus, not merely untested: the
+# pinned Prometheus binary renders this dataset's -0.0 sample as "0"
+# (verified against v3.13.1), so it does not preserve the sign of zero
+# through its own storage/query path, while Ravel's comparator treats
+# -0.0 as bit-significant by design (src/comparator.rs's own header
+# comment; CLAUDE.md's float-comparison testing pattern). Matching
+# Prometheus here
+# would mean Ravel deliberately discarding a bit it currently preserves
+# correctly. This is a real, accepted engine-behavior divergence, not a
+# corpus mistake; see issue #170.
 
 name: instant_stale_marker_is_absent
 query: diff_stale
@@ -156,13 +161,19 @@ kind: instant
 time: +601s
 mode: unordered
 
+# A bare matrix selector is not a valid top-level query for
+# /api/v1/query_range on either engine: the endpoint requires the query
+# to evaluate to an instant value at each grid step, and a matrix
+# selector only does that nested inside a function like rate(). Both
+# Prometheus and Ravel reject these identically (bad_data), so this is
+# `mode: error`, not a value comparison.
 name: range_matrix_selector_basic_window
 query: diff_gauge_walk[5m]
 kind: range
 start: +0s
 end: +600s
 step: 30s
-mode: unordered
+mode: error
 
 name: range_matrix_selector_with_offset
 query: diff_counter_total{shape="reset"}[5m] offset 1m
@@ -170,7 +181,7 @@ kind: range
 start: +300s
 end: +900s
 step: 60s
-mode: unordered
+mode: error
 
 name: range_matrix_selector_across_reset_boundary
 query: diff_counter_total{shape="reset_at_boundary"}[10m]
@@ -178,7 +189,7 @@ kind: range
 start: +0s
 end: +1170s
 step: 30s
-mode: unordered
+mode: error
 
 name: range_matrix_selector_no_match
 query: diff_metric_that_does_not_exist[5m]
@@ -186,7 +197,7 @@ kind: range
 start: +0s
 end: +300s
 step: 30s
-mode: unordered
+mode: error
 
 name: range_query_over_sparse_jittered_series
 query: diff_sparse_jitter
@@ -210,4 +221,15 @@ kind: range
 start: +0s
 end: +300s
 step: 30s
+mode: unordered
+
+# Moved from errors.txt: a trailing comma in a matcher list is no longer a
+# parse error on the pinned Prometheus binary (v3.13.1 tolerates it), so
+# this belongs among semantic-gap-shaped cases, not errors.txt's fixed
+# syntax-error set (see that file's own header comment on why it must
+# stay a fixed regression set). Both engines return an empty vector.
+name: stray_comma_in_matchers_is_accepted_and_matches_nothing
+query: diff_gauge_walk{job="api",}
+kind: instant
+time: +0s
 mode: unordered

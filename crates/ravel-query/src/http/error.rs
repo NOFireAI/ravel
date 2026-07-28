@@ -149,9 +149,11 @@ fn from_eval_error(inner: &ravel_promql::Error, outer: &QueryError) -> ApiError 
         | ravel_promql::Error::NonPositiveStep { .. }
         | ravel_promql::Error::InvalidRange { .. }
         | ravel_promql::Error::WrongType { .. } => ApiError::BadData(outer.to_string()),
-        ravel_promql::Error::Unsupported { .. } | ravel_promql::Error::TooManyPoints { .. } => {
-            ApiError::Unsupported(outer.to_string())
-        }
+        ravel_promql::Error::Unsupported { .. }
+        | ravel_promql::Error::TooManyPoints { .. }
+        | ravel_promql::Error::AmbiguousMatch { .. }
+        | ravel_promql::Error::InvalidRegex { .. }
+        | ravel_promql::Error::InvalidLabelName { .. } => ApiError::Unsupported(outer.to_string()),
         // The series-source error can wrap raw backend text; redact it and
         // log the full detail rather than echo it to the client (a7-F02).
         ravel_promql::Error::Source(_) => {
@@ -338,6 +340,45 @@ mod tests {
         let err = QueryError::Eval(ravel_promql::Error::TooManyPoints {
             points: 20_000,
             max: 11_000,
+        });
+        match ApiError::from(err) {
+            ApiError::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got a different ApiError variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_ambiguous_match_maps_to_unsupported_not_unavailable() {
+        // A many-to-many or unmarked many-to-one binary-operator match is a
+        // client-side query mistake, not a storage fault: it must not fall
+        // into the catch-all's blanket 503 redaction, which would hide a
+        // real, query-derived (never backend-derived) message behind the
+        // generic unavailable text.
+        let err = QueryError::Eval(ravel_promql::Error::AmbiguousMatch {
+            detail: "many-to-many matching not allowed".to_string(),
+        });
+        match ApiError::from(err) {
+            ApiError::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got a different ApiError variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_invalid_regex_maps_to_unsupported_not_unavailable() {
+        let err = QueryError::Eval(ravel_promql::Error::InvalidRegex {
+            pattern: "(unterminated".to_string(),
+            reason: "unclosed group".to_string(),
+        });
+        match ApiError::from(err) {
+            ApiError::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got a different ApiError variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_invalid_label_name_maps_to_unsupported_not_unavailable() {
+        let err = QueryError::Eval(ravel_promql::Error::InvalidLabelName {
+            label: "1bad".to_string(),
         });
         match ApiError::from(err) {
             ApiError::Unsupported(_) => {}

@@ -15,6 +15,18 @@ untrusted input: bounds-check everything, fuzz all decoders. No `unsafe`.
 > below; v1 and v2 text above stays unchanged and authoritative for v1
 > and v2 objects, which remain readable indefinitely
 > (docs/rseg-v3-plan.md §5).
+>
+> RSEG v4 amendment (ADR-0018): trailer `version = 4` is the multi-run
+> compaction output written by the compactor only. See "RSEG v4
+> amendment" below; v1, v2, and v3 text stays unchanged and
+> authoritative for objects of those versions, which remain readable
+> indefinitely (docs/compaction-retention-plan.md).
+
+The diagram below shows the v1 baseline layout with the checksum
+coverage brackets, and the per-version section tapes for v2, v3, and
+v4:
+
+![RSEG object byte layout](diagrams/rseg-layout.svg)
 
 All integers little-endian. "varint" means protobuf-style LEB128; signed
 values use zigzag.

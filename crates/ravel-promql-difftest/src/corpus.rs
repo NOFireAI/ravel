@@ -308,4 +308,12 @@ mode: error
                 .any(|e| e.mode == ComparisonMode::ExpectError)
         );
     }
+
+    #[test]
+    fn aggregate_corpus_file_parses_cleanly() {
+        let entries =
+            parse_corpus(include_str!("../corpus/aggregate.txt")).expect("parse aggregate corpus");
+        assert!(entries.len() >= 15);
+        assert!(entries.iter().any(|e| e.mode == ComparisonMode::Ordered));
+    }
 }

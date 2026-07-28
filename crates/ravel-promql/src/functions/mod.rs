@@ -12,8 +12,8 @@
 //! `const` arrays with no allocation or dynamic dispatch.
 
 mod histogram_classic;
-mod label;
-mod over_time;
+pub(crate) mod label;
+pub(crate) mod over_time;
 mod rate;
 mod time;
 mod transform;
