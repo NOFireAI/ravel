@@ -400,7 +400,7 @@ impl ShardActor {
         let written = match written {
             Ok(w) => w,
             Err(e) => {
-                self.metrics.record_abandoned();
+                self.metrics.record_abandoned_input_rejected();
                 self.ack_waiters(waiters, Err(WriteError::SegmentBuild(e.to_string())));
                 return;
             }
@@ -417,7 +417,7 @@ impl ShardActor {
         ) {
             Ok(k) => k,
             Err(e) => {
-                self.metrics.record_abandoned();
+                self.metrics.record_abandoned_input_rejected();
                 self.ack_waiters(waiters, Err(WriteError::SegmentBuild(e.to_string())));
                 return;
             }
@@ -427,7 +427,7 @@ impl ShardActor {
             .put_data_object_with_retry(&data_key, written.bytes.clone(), deadline_ns)
             .await
         {
-            self.metrics.record_abandoned();
+            self.metrics.record_abandoned_retry_exhausted();
             self.ack_waiters(
                 waiters,
                 Err(WriteError::Abandoned(
@@ -458,7 +458,7 @@ impl ShardActor {
         }) {
             Ok(r) => r,
             Err(e) => {
-                self.metrics.record_abandoned();
+                self.metrics.record_abandoned_input_rejected();
                 self.ack_waiters(waiters, Err(WriteError::SegmentBuild(e.to_string())));
                 return;
             }
@@ -469,7 +469,7 @@ impl ShardActor {
                 self.ack_waiters(waiters, Ok(token));
             }
             None => {
-                self.metrics.record_abandoned();
+                self.metrics.record_abandoned_retry_exhausted();
                 self.ack_waiters(
                     waiters,
                     Err(WriteError::Abandoned(
