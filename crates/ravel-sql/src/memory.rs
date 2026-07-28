@@ -209,6 +209,7 @@ impl MemoryPool for TenantDelegatingPool {
         // saturating floor, undercounting the tenant. Both budgets are
         // therefore best-effort ceilings once joins reach this pool (B3+),
         // not hard caps against every DataFusion-internal growth path.
+        // Accepted and documented: ADR-0013 amendment (2026-07-28).
         self.query_used.fetch_add(additional, Ordering::AcqRel);
         self.tenant.grow(additional);
     }

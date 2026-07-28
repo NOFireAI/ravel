@@ -1,9 +1,11 @@
 # ADR-0013: Targeted Arrow zero-copy, DataFusion for SQL and relational operators only
 
 Status: Accepted (2026-07-27); amended the same day after the adversarial
-review (docs/reviews/2026-07-27-arrow-datafusion-plan-review.md). The
-decision stands; several mechanism claims below are corrected, and the
-plan document carries the full finding-by-finding response.
+review (docs/reviews/2026-07-27-arrow-datafusion-plan-review.md), and
+amended again 2026-07-28 to scope the memory-ceiling guarantee after the
+ravel-sql audit (see the amendment at the end). The decision stands;
+several mechanism claims below are corrected, and the plan document
+carries the full finding-by-finding response.
 
 ## Context
 
@@ -57,7 +59,11 @@ Option 3. Concretely:
 - Query budgets bridge to DataFusion through a budget-sized per-query
   memory pool and a tenant-delegating `MemoryPool` implementation;
   budget exhaustion is an error, never a partial result; spilling stays
-  disabled.
+  disabled. This hard-cap guarantee holds for scan, sort, and aggregate
+  operators, which reserve through the enforced `try_grow` path; it is
+  best-effort for join operators, which reach the pool through
+  DataFusion's infallible `grow`/`resize` path. See the 2026-07-28
+  amendment below.
 - Exactness is enforced by a two-layer differential gate: the scan plus
   dedup output is compared against the PromQL merge path on the same
   snapshot (an independent implementation of the same dedup total order,
@@ -102,3 +108,45 @@ docs/arrow-datafusion-plan.md.
 - ADR-0006 is completed rather than superseded: the Phase 3 evaluation it
   promised has happened, and its core holding (custom evaluator for
   PromQL) stands.
+
+## Amendment (2026-07-28): memory ceilings are best-effort for joins
+
+The independent ravel-sql audit
+(docs/reviews/2026-07-28-ravel-sql-audit/sql3-exec-memory-deadline.md,
+finding sql3-F01) found that the Decision's "budget exhaustion is an
+error" clause and the pool implementation disagree on the `grow` path.
+The code is correct; this amendment makes the ADR match it.
+
+- The per-query and per-tenant memory ceilings are a hard cap for scan,
+  sort, and aggregate operators. These reserve through
+  `TenantDelegatingPool::try_grow` (crates/ravel-sql/src/memory.rs),
+  which compares each request against both the per-query and the
+  per-tenant limit and returns `ResourcesExhausted` when either would be
+  exceeded. A large scan, sort, or aggregate errors, it never OOMs.
+- The ceilings are best-effort once join operators reach the pool through
+  DataFusion's infallible `grow`/`resize` path
+  (`TenantDelegatingPool::grow`, memory.rs:196-214). That path grows both
+  budgets unconditionally and is not checked against either limit;
+  clamping it is not a valid fix, because `MemoryReservation` increments
+  its own local size unconditionally after calling `grow`, so a pool that
+  grows a different amount than requested desyncs the reservation's
+  accounting and over-releases on drop. At least the nested-loop and
+  sort-merge join operators use this path.
+- Joins remain enabled in the v1 SQL subset. A non-equi self-join over
+  `samples` is a legal single read-only SELECT and executes;
+  `with_repartition_joins(false)` in the session config confirms joins
+  are expected to run.
+- Residual risk: a large join can allocate memory counted against neither
+  ceiling, so a query's true footprint can exceed its configured budget
+  with no error. Because the SQL process is shared and multi-tenant, a
+  large enough overshoot can OOM the process in the worst case, dropping
+  every tenant's in-flight query. There is no data corruption and no
+  cross-tenant disclosure.
+- Blast-radius mitigation, a per-tenant concurrent-query or query-memory
+  limit that bounds how much a single tenant can commit at once, is
+  tracked as a separate follow-up (Refs: #156). It is not a precondition
+  for keeping joins enabled.
+- The behavior is demonstrated by
+  `crates/ravel-sql/tests/audit_sql3_exec.rs::sql3_f01_grow_bypasses_the_query_and_tenant_ceiling`,
+  kept `#[ignore]`d as documentation of the accepted best-effort behavior
+  rather than as a failing gate.
