@@ -33,4 +33,6 @@ pub enum MaintainError {
     UnsupportedInputVersion(u16),
     #[error("series {series_id} carries mixed run value kinds across inputs")]
     MixedValueKindAcrossInputs { series_id: String },
+    #[error("hour bucket {0} overflows scan range (u32 exhausted)")]
+    HourBucketOverflow(u32),
 }
