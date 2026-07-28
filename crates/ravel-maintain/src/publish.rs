@@ -251,7 +251,9 @@ mod tests {
     use crate::scan::scan_next;
     use crate::segread::read_input;
     use ravel_commit::record::{NewCommitRecord, build};
-    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{PutMode, PutOptions};
     use ravel_segment::{IngestBounds, SegmentIdentity, SeriesInput};
@@ -411,9 +413,14 @@ mod tests {
         let clock = FakeClock::new(0);
         let config = MaintainConfig::default();
 
-        let outcome = publish(&store, &clock, &config, &plan(&th, &sorted, hash, &parts, 0))
-            .await
-            .expect("publish");
+        let outcome = publish(
+            &store,
+            &clock,
+            &config,
+            &plan(&th, &sorted, hash, &parts, 0),
+        )
+        .await
+        .expect("publish");
         assert_eq!(outcome, PublishOutcome::Published);
 
         let rkey = record_key(&th, hash).await;
@@ -429,8 +436,12 @@ mod tests {
 
         // Every part object the record names is durable.
         for part in &parts {
-            let key = part_key(&plan(&th, &sorted, hash, &parts, 0), &input::hash16(&hash), part)
-                .expect("part key");
+            let key = part_key(
+                &plan(&th, &sorted, hash, &parts, 0),
+                &input::hash16(&hash),
+                part,
+            )
+            .expect("part key");
             store.head(&key).await.expect("part durable");
         }
     }
@@ -488,7 +499,9 @@ mod tests {
         // A second independent run over the same inputs finds the record and
         // converges without writing a second one.
         assert_eq!(
-            publish(&store, &clock, &config, &req).await.expect("second"),
+            publish(&store, &clock, &config, &req)
+                .await
+                .expect("second"),
             PublishOutcome::Converged
         );
     }
@@ -556,9 +569,14 @@ mod tests {
             .await
             .expect("plant foreign record");
 
-        let err = publish(&store, &clock, &config, &plan(&th, &sorted, hash, &parts, 0))
-            .await
-            .expect_err("must alarm");
+        let err = publish(
+            &store,
+            &clock,
+            &config,
+            &plan(&th, &sorted, hash, &parts, 0),
+        )
+        .await
+        .expect_err("must alarm");
         assert!(
             matches!(err, MaintainError::InputSetHashMismatch { .. }),
             "expected InputSetHashMismatch, got {err}"
@@ -575,7 +593,12 @@ mod tests {
         let w_b = Uuid::parse_str("00000000-0000-0000-0000-0000000000b2").expect("uuid");
         let config = MaintainConfig::default();
 
-        async fn run(th: &TenantHash, w_a: Uuid, w_b: Uuid, cfg: &MaintainConfig) -> (String, Vec<u8>) {
+        async fn run(
+            th: &TenantHash,
+            w_a: Uuid,
+            w_b: Uuid,
+            cfg: &MaintainConfig,
+        ) -> (String, Vec<u8>) {
             let store = MemoryStore::new();
             let raw = vec![
                 seed(&store, th, w_a, "metric_a").await,
@@ -701,9 +724,12 @@ mod tests {
         let fault = FaultStore::new(
             mem,
             FaultPlan::empty().with_rule(
-                Rule::new(Op::Put, ScriptedFault::Transient("record put dropped".into()))
-                    .with_key_contains(".cmt")
-                    .with_occurrence(Occurrence::Nth(1)),
+                Rule::new(
+                    Op::Put,
+                    ScriptedFault::Transient("record put dropped".into()),
+                )
+                .with_key_contains(".cmt")
+                .with_occurrence(Occurrence::Nth(1)),
             ),
         );
         let req = plan(&th, &sorted, hash, &parts, 0);
