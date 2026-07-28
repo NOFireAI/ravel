@@ -24,6 +24,7 @@ rand = { workspace = true }
 ravel-test-util = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-query = { workspace = true }
+ravel-promql = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

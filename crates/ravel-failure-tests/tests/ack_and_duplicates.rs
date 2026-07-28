@@ -9,7 +9,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClock, make_point, tenant};
+use common::{TestClock, expect_vector, make_point, tenant};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::AnyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
@@ -110,17 +110,19 @@ async fn ack_lost_after_commit_then_client_retry_dedups_to_one_value() {
     )
     .expect("catalog");
     let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
-    let result = engine
-        .instant(
-            tid.hash(),
-            "requests_total",
-            event_ts / 1_000_000,
-            &[],
-            clock.now(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("query");
+    let result = expect_vector(
+        engine
+            .instant(
+                tid.hash(),
+                "requests_total",
+                event_ts / 1_000_000,
+                &[],
+                clock.now(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query"),
+    );
     assert_eq!(
         result.len(),
         1,
@@ -222,17 +224,19 @@ async fn duplicate_otlp_delivery_normalized_twice_does_not_double_count() {
     )
     .expect("catalog");
     let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
-    let result = engine
-        .instant(
-            tid.hash(),
-            "otlp_gauge",
-            event_ts / 1_000_000,
-            &[],
-            clock.now(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("query");
+    let result = expect_vector(
+        engine
+            .instant(
+                tid.hash(),
+                "otlp_gauge",
+                event_ts / 1_000_000,
+                &[],
+                clock.now(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query"),
+    );
     assert_eq!(result.len(), 1, "one series, not two, despite two ingests");
     assert_eq!(result[0].value, 7.0);
 }
