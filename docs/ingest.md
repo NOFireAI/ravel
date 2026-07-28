@@ -13,6 +13,28 @@ gateway handler (axum / tonic)
   -> IngestRouter::write(tenant, points, mode) -> WriteReceipt
 ```
 
+Remote Write (`POST /api/v1/write`, ADR-0015) is a second gateway handler
+in front of the same router, decode/normalize swapped for the RW-specific
+crate:
+
+```
+POST /api/v1/write (axum)
+  -> auth + tenant resolve (shared TenantResolver)
+  -> negotiate RW1 vs RW2 (Content-Type, then X-Prometheus-Remote-Write-Version; else 415)
+  -> snappy-decompress (capped) + protobuf decode (ravel-remote-write) -> ResolvedRequest
+  -> normalize_resolved (ravel-remote-write) -> Vec<NormalizedPoint> + rejects
+  -> IngestRouter::write(tenant, points, mode=Strict) -> WriteReceipt
+```
+
+This surface always passes `mode=Strict`: it never reads
+`x-ravel-ingest-mode`, since a Remote Write sender treats any 2xx as
+durable and drops its WAL entry on that basis. A commit token still comes
+back in `x-ravel-commit-token`; RW2 responses additionally carry
+`X-Prometheus-Remote-Write-Samples-Written` (and the histogram- and
+exemplar-written counterparts, currently always 0). Malformed input is
+400; shard backpressure and retryable store failures are mapped to a
+retryable 5xx with `Retry-After`.
+
 IngestRouter owns `shard_count` shard handles. It groups points by
 `shard_for(series_id, shard_count)` and sends one message per shard:
 
