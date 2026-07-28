@@ -12,6 +12,7 @@
 //! `const` arrays with no allocation or dynamic dispatch.
 
 mod histogram_classic;
+mod over_time;
 mod rate;
 
 use ravel_types::{LabelSet, Sample};
@@ -45,6 +46,22 @@ pub(crate) enum FunctionKind {
     /// `f(lower, upper, v instant-vector) -> instant-vector`, the two-scalar
     /// counterpart of `HistogramQuantile` (P9, `histogram_fraction`).
     HistogramFraction(fn(f64, f64, InstantVector) -> Vec<(LabelSet, f64)>),
+    /// `f(q, v range-vector) -> instant-vector`: the scalar comes first
+    /// (`quantile_over_time(q, v)`), the mirror image of
+    /// `RangeVectorScalar`'s argument order (`predict_linear(v, t)`). P5's
+    /// only member of this shape.
+    ScalarRangeVector(fn(f64, &[Sample], RangeWindow) -> Option<f64>),
+    /// `absent_over_time`: not a per-series reduction of the matrix
+    /// argument's rows like every other member of this enum. It reports
+    /// whether the *whole* range vector matched anything at all,
+    /// synthesizing its own single output series from the selector's
+    /// equality matchers when it did not (the same label-derivation rule
+    /// `absent()` uses, duplicated in `over_time.rs` rather than shared:
+    /// P6's `functions/transform.rs`, the home for `absent()`, lands in
+    /// parallel and this phase must not touch that file). Carries no
+    /// function pointer; `eval_call`/`eval_range_call` special-case it
+    /// directly.
+    AbsentOverTime,
 }
 
 /// The window bounds a range-vector function needs beyond the raw samples:
@@ -63,7 +80,11 @@ pub(crate) struct RangeWindow {
 }
 
 /// All registered function families, aggregated into one lookup table.
-const FAMILIES: &[&[FunctionDef]] = &[rate::FUNCTIONS, histogram_classic::FUNCTIONS];
+const FAMILIES: &[&[FunctionDef]] = &[
+    rate::FUNCTIONS,
+    histogram_classic::FUNCTIONS,
+    over_time::FUNCTIONS,
+];
 
 fn lookup(name: &str) -> Option<FunctionDef> {
     FAMILIES
@@ -122,6 +143,22 @@ pub(crate) fn eval_call(
             Ok(Value::Vector(to_instant_vector(
                 f(lower, upper, vector),
                 eval_ts_ns,
+            )))
+        }
+        FunctionKind::ScalarRangeVector(f) => {
+            let q = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
+            let ms = matrix_arg(&call.args.args[1])?;
+            let window = range_window(ms, eval_ts_ns, ctx)?;
+            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
+                f(q, samples, window)
+            })))
+        }
+        FunctionKind::AbsentOverTime => {
+            let ms = matrix_arg(&call.args.args[0])?;
+            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            Ok(Value::Vector(over_time::absent_over_time_instant(
+                &ms.vs, matrix, eval_ts_ns,
             )))
         }
     }
@@ -213,6 +250,39 @@ pub(crate) fn eval_range_call(
             Err(Error::Unsupported {
                 construct: format!("{} in a range query", call.func.name),
             })
+        }
+        FunctionKind::ScalarRangeVector(f) => {
+            let ms = matrix_arg(&call.args.args[1])?;
+            // Same up-front, once-per-call resolution as
+            // `RangeVectorScalar` above, and for the same reason: P5's only
+            // such argument is a constant/scalar-only expression tree, so
+            // it cannot vary per grid step.
+            let q = scalar_arg(evaluator, source, &call.args.args[0], start_ns, ctx)?;
+            evaluator.eval_range_matrix_reduction(
+                source,
+                ms,
+                start_ns,
+                end_ns,
+                step_ns,
+                points,
+                ctx,
+                move |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
+                    f(
+                        q,
+                        samples,
+                        RangeWindow {
+                            start_ns: window_start_ns,
+                            end_ns: sel_ts_ns,
+                            range_ns,
+                            eval_ts_ns: reported_ts_ns,
+                        },
+                    )
+                },
+            )
+        }
+        FunctionKind::AbsentOverTime => {
+            let ms = matrix_arg(&call.args.args[0])?;
+            over_time::absent_over_time_range(evaluator, source, ms, start_ns, end_ns, step_ns, ctx)
         }
     }
 }
