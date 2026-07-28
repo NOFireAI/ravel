@@ -26,6 +26,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
 
 # ravel-sql is declared here as a path dependency rather than through
 # `[workspace.dependencies]` because the workspace root Cargo.toml is outside

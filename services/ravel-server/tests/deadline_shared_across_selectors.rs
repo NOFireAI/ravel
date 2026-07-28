@@ -25,7 +25,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_server::{Mode, Running, ServerConfig};
+use ravel_server::{FoldTaskConfig, Mode, Running, ServerConfig};
 use ravel_types::TenantId;
 
 const TOKEN: &str = "testtoken";
@@ -87,6 +87,11 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
     };
     ravel_server::start(config, store)
         .await

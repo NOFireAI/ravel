@@ -67,6 +67,18 @@ pub struct Cli {
 
     #[arg(long, env = "RAVEL_S3_SECRET_KEY")]
     pub s3_secret_key: Option<String>,
+
+    /// Disables the per-(tenant, signal) background catalog fold task
+    /// (docs/metric-index-plan.md section 4). Folding is a pure optimization
+    /// for query resolve cost; disabling it never changes query results, only
+    /// their cost (ADR-0020).
+    #[arg(long)]
+    pub disable_fold: bool,
+
+    /// How often each tenant's fold task wakes up to check for newly sealed
+    /// hours, in seconds (docs/metric-index-plan.md section 4).
+    #[arg(long, default_value_t = 300)]
+    pub fold_interval_secs: u64,
 }
 
 impl Cli {
