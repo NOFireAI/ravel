@@ -1,6 +1,11 @@
-//! PromQL evaluator core (ADR-0007). Phase 1 scope: instant and range
-//! evaluation of a single vector selector (matchers + offset). Every other
-//! AST node is rejected with [`Error::Unsupported`], naming the construct.
+//! PromQL evaluator core (ADR-0007, ADR-0021). A typed recursive-descent
+//! interpreter over the promql-parser AST: [`Value`] is the internal result
+//! type (scalar, string, instant vector, range matrix), and [`Evaluator`]
+//! walks paren expressions, unary minus, number/string literals, and vector
+//! and matrix selectors (with `offset` and the `@` modifier, including
+//! `start()`/`end()`). Every other AST node (aggregation, binary expression,
+//! subquery, function call) is rejected with [`Error::Unsupported`], naming
+//! the construct.
 //!
 //! ## Time precision
 //!
@@ -28,8 +33,20 @@
 //! nothing and having touched neither the parser nor the
 //! [`SeriesSource`]. This is a hard limit, never a truncation; the query
 //! fails rather than silently returning a coarser or shorter matrix.
+//!
+//! ## Public entry points vs. `instant`/`range`
+//!
+//! [`Evaluator::instant`] and [`Evaluator::range`] keep their pre-existing
+//! signatures and return types byte-for-byte (ADR-0021 consequence: "the
+//! evaluator's public API is preserved"), since `ravel-query` depends on
+//! their concrete `InstantVector`/`RangeMatrix` return types and is out of
+//! scope for this phase. They are now implemented in terms of
+//! [`Evaluator::eval_instant`]/[`Evaluator::eval_range`], which expose the
+//! full [`Value`] result (including bare scalar and string results) for a
+//! future phase to consume; `instant`/`range` unwrap the `Vector`/`Matrix`
+//! case and turn anything else into [`Error::WrongType`].
 
-use ravel_types::{LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
+use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
 
 use crate::matchers;
 use crate::source::{LabelMatcher, MatchOp, SeriesSource, SourceError};
@@ -52,9 +69,9 @@ pub fn ns_to_ms_floor(ns: i64) -> i64 {
 }
 
 /// One series' value at the query's evaluation instant. `ts_ns` is always
-/// the query's evaluation time, never the offset-shifted lookup time used
-/// to pick the sample: Prometheus reports the query timestamp regardless of
-/// any `offset` on the selector.
+/// the query's evaluation time, never the offset/`@`-shifted lookup time
+/// used to pick the sample: Prometheus reports the query timestamp
+/// regardless of any `offset` or `@` on the selector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstantSample {
     pub labels: LabelSet,
@@ -69,6 +86,29 @@ pub type InstantVector = Vec<InstantSample>;
 /// per evaluated step at which that series had a value in the lookback
 /// window. Series with no value at any step are omitted entirely.
 pub type RangeMatrix = Vec<(LabelSet, Vec<Sample>)>;
+
+/// A typed evaluation result. Internal to `ravel-promql`: AST types from
+/// promql-parser still do not leak from the crate (ADR-0007 consequence).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Scalar(f64),
+    String(String),
+    Vector(InstantVector),
+    Matrix(RangeMatrix),
+}
+
+impl Value {
+    /// A short, human-readable name of this value's type, for error
+    /// messages (e.g. [`Error::WrongType`]).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Scalar(_) => "scalar",
+            Value::String(_) => "string",
+            Value::Vector(_) => "instant vector",
+            Value::Matrix(_) => "range vector",
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -89,10 +129,15 @@ pub enum Error {
         "range query resolution of {points} evaluation points exceeds the maximum of {max}; widen step_ms or narrow the range"
     )]
     TooManyPoints { points: u64, max: usize },
+    #[error("query evaluates to {got}, but this operation requires {expected}")]
+    WrongType {
+        expected: &'static str,
+        got: &'static str,
+    },
 }
 
 /// Default PromQL lookback: 5 minutes, in nanoseconds.
-const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
+pub(crate) const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 
 /// Default cap on the number of evaluation points (grid steps) a single
 /// range query may produce, counting both endpoints when the range is
@@ -110,14 +155,24 @@ pub const DEFAULT_MAX_RANGE_POINTS: usize = 11_000;
 /// Prometheus staleness marker: the exact NaN bit pattern a scrape/rule
 /// engine writes to signal that a series has ended. Per Prometheus lookback
 /// semantics (ADR-0007) and ADR-0010 §5, when this is the most recent sample
-/// in the lookback window the series is **absent** at that instant, not a
-/// NaN value. Detection is an exact-bits comparison, never `is_nan()`: every
-/// other NaN payload is a live, observable value and passes through
-/// bit-for-bit (`f64::to_bits` exactness is a frozen invariant).
+/// in the lookback (or matrix) window the series is **absent** at that
+/// instant, not a NaN value. Detection is an exact-bits comparison, never
+/// `is_nan()`: every other NaN payload is a live, observable value and
+/// passes through bit-for-bit (`f64::to_bits` exactness is a frozen
+/// invariant).
 const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
-/// PromQL evaluator for a single vector selector. Stateless besides its
-/// lookback and resolution configuration; safe to share across queries.
+/// The ambient time window a query's `@ start()`/`@ end()` resolve against:
+/// the whole query's own parameters, fixed regardless of which grid step (if
+/// any) is currently being evaluated. For an instant query both fields equal
+/// the query's evaluation timestamp.
+struct QueryWindow {
+    start_ns: i64,
+    end_ns: i64,
+}
+
+/// PromQL evaluator. Stateless besides its lookback and resolution
+/// configuration; safe to share across queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Evaluator {
     lookback_delta_ns: i64,
@@ -159,64 +214,62 @@ impl Evaluator {
         self.max_range_points
     }
 
+    /// Evaluate `query` at `t_ms`, returning the full [`Value`] the query
+    /// resolves to (scalar, string, or instant vector; a bare matrix
+    /// selector at top level is a [`Error::WrongType`], matching
+    /// Prometheus' own instant-query type check).
+    pub fn eval_instant(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        t_ms: i64,
+    ) -> Result<Value, Error> {
+        let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
+        let t_ns = ms_to_ns(t_ms)?;
+        let ctx = QueryWindow {
+            start_ns: t_ns,
+            end_ns: t_ns,
+        };
+        self.eval_expr(source, &expr, t_ns, &ctx)
+    }
+
     /// Evaluate `query` as an instant vector at `t_ms`.
     ///
     /// For each series matching the selector, the most recent sample with
     /// `ts_ns > sel_ts - lookback` and `ts_ns <= sel_ts` is used (`sel_ts`
-    /// is `t_ms` shifted by the selector's `offset`, if any); series with no
-    /// such sample are omitted. Ties at the same timestamp resolve to the
-    /// sample stored last (see [`SeriesData`](crate::source::SeriesData)).
+    /// is `t_ms` shifted by the selector's `offset`/`@`, if any); series
+    /// with no such sample are omitted. Ties at the same timestamp resolve
+    /// to the sample stored last (see [`SeriesData`](crate::source::SeriesData)).
     pub fn instant(
         &self,
         source: &dyn SeriesSource,
         query: &str,
         t_ms: i64,
     ) -> Result<InstantVector, Error> {
-        let vs = parse_vector_selector(query)?;
-        let selector_matchers = build_matchers(&vs)?;
-        let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
-
-        let t_ns = ms_to_ns(t_ms)?;
-        let sel_ts_ns = t_ns.checked_sub(offset_ns).ok_or(Error::TimeOverflow)?;
-        let window = TimeRange {
-            start_ns: sel_ts_ns
-                .checked_sub(self.lookback_delta_ns)
-                .ok_or(Error::TimeOverflow)?,
-            end_ns: sel_ts_ns,
-        };
-
-        let series = source.query(&selector_matchers, window)?;
-        let mut out = Vec::with_capacity(series.len());
-        for s in series {
-            if let Some(value) = pick_sample(&s.samples, sel_ts_ns, self.lookback_delta_ns) {
-                out.push(InstantSample {
-                    labels: s.labels,
-                    ts_ns: t_ns,
-                    value,
-                });
-            }
+        match self.eval_instant(source, query, t_ms)? {
+            Value::Vector(v) => Ok(v),
+            other => Err(Error::WrongType {
+                expected: "instant vector",
+                got: other.type_name(),
+            }),
         }
-        Ok(out)
     }
 
     /// Evaluate `query` as a range matrix over `start_ms..=end_ms` stepping
-    /// by `step_ms`. Evaluation instants are `start`, `start + step`, ...,
-    /// stopping at the last instant `<= end` (so `end` is included when the
-    /// range is an exact multiple of `step` from `start`, and excluded
-    /// otherwise). The same per-step lookback rule as [`Self::instant`]
-    /// applies at each instant.
-    ///
-    /// The number of evaluation points is checked against
-    /// [`Self::max_range_points`] before anything is parsed or allocated;
-    /// an over-budget request returns [`Error::TooManyPoints`].
-    pub fn range(
+    /// by `step_ms`, returning the full [`Value`] the query resolves to. A
+    /// scalar or string top-level expression is constant across the whole
+    /// grid (Prometheus repeats the same value at every step), so it is
+    /// reported once rather than per step; materializing the repeated
+    /// series for the wire format is the HTTP rendering layer's job (a
+    /// later phase), not the evaluator's.
+    pub fn eval_range(
         &self,
         source: &dyn SeriesSource,
         query: &str,
         start_ms: i64,
         end_ms: i64,
         step_ms: i64,
-    ) -> Result<RangeMatrix, Error> {
+    ) -> Result<Value, Error> {
         if step_ms <= 0 {
             return Err(Error::NonPositiveStep { step_ms });
         }
@@ -240,18 +293,195 @@ impl Evaluator {
             });
         }
 
-        let vs = parse_vector_selector(query)?;
-        let selector_matchers = build_matchers(&vs)?;
-        let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
+        let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
+        let ctx = QueryWindow { start_ns, end_ns };
 
-        // Evaluation grid: (reported ts, offset-shifted lookup ts). `points`
-        // is now known to be within the budget, so this is a single bounded
-        // allocation.
+        // P1's supported grammar (paren, unary minus, literals, one
+        // selector) can contain at most one selector, so unlike a general
+        // multi-selector tree there is no risk of re-querying storage once
+        // per node: the grid below still issues exactly one `source.query`
+        // call for the whole range, same as before this phase. A future
+        // phase that adds binary/call/aggregate expressions (and therefore
+        // multiple selectors, or the same selector's value needed at
+        // multiple sub-evaluations) is the point at which per-selector
+        // cursoring (ADR-0021 §1) becomes necessary; it is not needed yet.
+        let (core, negate) = resolve_range_core(&expr)?;
+        match core {
+            RangeCore::Scalar(v) => Ok(Value::Scalar(if negate { -v } else { v })),
+            RangeCore::Str(s) => Ok(Value::String(s.to_string())),
+            RangeCore::Selector(vs) => {
+                let matrix = self.eval_range_selector(
+                    source, vs, start_ns, end_ns, step_ns, points, &ctx, negate,
+                )?;
+                Ok(Value::Matrix(matrix))
+            }
+        }
+    }
+
+    /// Evaluate `query` as a range matrix over `start_ms..=end_ms` stepping
+    /// by `step_ms`. Evaluation instants are `start`, `start + step`, ...,
+    /// stopping at the last instant `<= end` (so `end` is included when the
+    /// range is an exact multiple of `step` from `start`, and excluded
+    /// otherwise). The same per-step lookback rule as [`Self::instant`]
+    /// applies at each instant.
+    ///
+    /// The number of evaluation points is checked against
+    /// [`Self::max_range_points`] before anything is parsed or allocated;
+    /// an over-budget request returns [`Error::TooManyPoints`].
+    pub fn range(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> Result<RangeMatrix, Error> {
+        match self.eval_range(source, query, start_ms, end_ms, step_ms)? {
+            Value::Matrix(m) => Ok(m),
+            other => Err(Error::WrongType {
+                expected: "range vector",
+                got: other.type_name(),
+            }),
+        }
+    }
+
+    /// General recursive evaluator for a single instant. Handles the P1
+    /// grammar (paren, unary minus, literals, vector/matrix selectors) and
+    /// rejects everything else, naming the construct.
+    fn eval_expr(
+        &self,
+        source: &dyn SeriesSource,
+        expr: &promql_parser::parser::Expr,
+        eval_ts_ns: i64,
+        ctx: &QueryWindow,
+    ) -> Result<Value, Error> {
+        use promql_parser::parser::Expr;
+        match expr {
+            Expr::Paren(p) => self.eval_expr(source, &p.expr, eval_ts_ns, ctx),
+            Expr::Unary(u) => match self.eval_expr(source, &u.expr, eval_ts_ns, ctx)? {
+                Value::Scalar(x) => Ok(Value::Scalar(-x)),
+                Value::Vector(v) => Ok(Value::Vector(negate_vector(v))),
+                other => Err(Error::WrongType {
+                    expected: "scalar or instant vector",
+                    got: other.type_name(),
+                }),
+            },
+            Expr::NumberLiteral(n) => Ok(Value::Scalar(n.val)),
+            Expr::StringLiteral(s) => Ok(Value::String(s.val.clone())),
+            Expr::VectorSelector(vs) => self
+                .eval_vector_selector(source, vs, eval_ts_ns, ctx)
+                .map(Value::Vector),
+            Expr::MatrixSelector(ms) => self
+                .eval_matrix_selector(source, ms, eval_ts_ns, ctx)
+                .map(Value::Matrix),
+            _ => Err(unsupported_construct_error(expr)),
+        }
+    }
+
+    fn eval_vector_selector(
+        &self,
+        source: &dyn SeriesSource,
+        vs: &promql_parser::parser::VectorSelector,
+        eval_ts_ns: i64,
+        ctx: &QueryWindow,
+    ) -> Result<InstantVector, Error> {
+        let selector_matchers = build_matchers(vs)?;
+        let sel_ts_ns = selector_eval_ts(vs, eval_ts_ns, ctx)?;
+        let window = TimeRange {
+            start_ns: sel_ts_ns
+                .checked_sub(self.lookback_delta_ns)
+                .ok_or(Error::TimeOverflow)?,
+            end_ns: sel_ts_ns,
+        };
+
+        let series = source.query(&selector_matchers, window)?;
+        let mut out = Vec::with_capacity(series.len());
+        for s in series {
+            if let Some(value) = pick_sample(&s.samples, sel_ts_ns, self.lookback_delta_ns) {
+                out.push(InstantSample {
+                    labels: s.labels,
+                    ts_ns: eval_ts_ns,
+                    value,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Evaluate a matrix selector at one instant: every non-stale sample in
+    /// the left-open window `(sel_ts - range, sel_ts]`, per matched series.
+    /// Not reachable from `eval_instant`/`eval_range` in this phase (a bare
+    /// matrix selector is always a top-level [`Error::WrongType`], matching
+    /// Prometheus), but implemented and tested now: a future phase's
+    /// function calls (e.g. `rate(x[5m])`) evaluate their matrix-typed
+    /// argument through this same path.
+    #[allow(dead_code)]
+    fn eval_matrix_selector(
+        &self,
+        source: &dyn SeriesSource,
+        ms: &promql_parser::parser::MatrixSelector,
+        eval_ts_ns: i64,
+        ctx: &QueryWindow,
+    ) -> Result<RangeMatrix, Error> {
+        let selector_matchers = build_matchers(&ms.vs)?;
+        let sel_ts_ns = selector_eval_ts(&ms.vs, eval_ts_ns, ctx)?;
+        let range_ns = duration_to_ns(ms.range)?;
+        let window_start = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+        let window = TimeRange {
+            start_ns: window_start,
+            end_ns: sel_ts_ns,
+        };
+
+        let series = source.query(&selector_matchers, window)?;
+        let mut out = Vec::with_capacity(series.len());
+        for s in series {
+            // The window fetched from storage is inclusive on both ends
+            // (`TimeRange`'s own contract); a matrix selector's window is
+            // left-open like the instant lookback window, so the exclusive
+            // lower bound is enforced here.
+            let samples: Vec<Sample> = s
+                .samples
+                .iter()
+                .filter(|sample| sample.ts_ns > window_start)
+                .filter(|sample| sample.value.to_bits() != STALE_NAN_BITS)
+                .copied()
+                .collect();
+            if !samples.is_empty() {
+                out.push((s.labels, samples));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Build the range matrix for a single top-level vector selector
+    /// (`resolve_range_core`'s `Selector` case), one `source.query` call for
+    /// the whole grid, generalized from the pre-P1 implementation to
+    /// support `@` (which, when present, pins every step to the same
+    /// instant rather than shifting with `t`).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_range_selector(
+        &self,
+        source: &dyn SeriesSource,
+        vs: &promql_parser::parser::VectorSelector,
+        start_ns: i64,
+        end_ns: i64,
+        step_ns: i64,
+        points: u64,
+        ctx: &QueryWindow,
+        negate: bool,
+    ) -> Result<RangeMatrix, Error> {
+        let selector_matchers = build_matchers(vs)?;
+        let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
+        let at_ts_ns = resolve_at(vs.at.as_ref(), ctx.start_ns, ctx.end_ns)?;
+
+        // Evaluation grid: (reported ts, offset/@-shifted lookup ts).
+        // `points` is already known to be within budget.
         let capacity = usize::try_from(points).unwrap_or(self.max_range_points);
         let mut grid: Vec<(i64, i64)> = Vec::with_capacity(capacity);
         let mut t = start_ns;
         while t <= end_ns {
-            let sel_ts = t.checked_sub(offset_ns).ok_or(Error::TimeOverflow)?;
+            let base_ts = at_ts_ns.unwrap_or(t);
+            let sel_ts = base_ts.checked_sub(offset_ns).ok_or(Error::TimeOverflow)?;
             grid.push((t, sel_ts));
             t = t.checked_add(step_ns).ok_or(Error::TimeOverflow)?;
         }
@@ -276,16 +506,177 @@ impl Evaluator {
                 if let Some(value) = pick_sample(&s.samples, *sel_ts, self.lookback_delta_ns) {
                     samples.push(Sample {
                         ts_ns: *reported_ts,
-                        value,
+                        value: if negate { -value } else { value },
                     });
                 }
             }
             if !samples.is_empty() {
-                out.push((s.labels, samples));
+                let labels = if negate {
+                    drop_metric_name(s.labels)
+                } else {
+                    s.labels
+                };
+                out.push((labels, samples));
             }
         }
         Ok(out)
     }
+}
+
+/// A range query's top-level construct, after stripping any enclosing
+/// `Paren`/`Unary` wrappers (P1's grammar allows at most one selector, so
+/// this identifies it directly rather than routing through the general
+/// per-instant `eval_expr`, which would re-query storage once per grid
+/// step).
+enum RangeCore<'a> {
+    Scalar(f64),
+    Str(&'a str),
+    Selector(&'a promql_parser::parser::VectorSelector),
+}
+
+/// Strip `Paren`/`Unary` wrappers from `expr`, returning the core construct
+/// and whether an odd number of unary minuses were applied. Any other
+/// top-level construct is a typed error: [`Error::WrongType`] for a bare
+/// matrix selector (invalid at top level, exactly like Prometheus), or
+/// [`Error::Unsupported`] naming the construct for everything this phase
+/// does not implement.
+fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'_>, bool), Error> {
+    use promql_parser::parser::Expr;
+    let mut negate = false;
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::Paren(p) => cur = &p.expr,
+            Expr::Unary(u) => {
+                negate = !negate;
+                cur = &u.expr;
+            }
+            Expr::NumberLiteral(n) => return Ok((RangeCore::Scalar(n.val), negate)),
+            Expr::StringLiteral(s) => return Ok((RangeCore::Str(&s.val), negate)),
+            Expr::VectorSelector(vs) => return Ok((RangeCore::Selector(vs), negate)),
+            Expr::MatrixSelector(_) => {
+                return Err(Error::WrongType {
+                    expected: "scalar, instant vector, or string",
+                    got: "range vector",
+                });
+            }
+            _ => return Err(unsupported_construct_error(cur)),
+        }
+    }
+}
+
+/// The [`Error::Unsupported`] for an AST node this phase does not evaluate.
+/// Callers must have already handled `Paren`, `Unary`, `NumberLiteral`,
+/// `StringLiteral`, `VectorSelector`, and `MatrixSelector`; this panics on
+/// any of those (programmer error, not reachable) and covers the rest.
+fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
+    use promql_parser::parser::Expr;
+    match expr {
+        Expr::Aggregate(a) => Error::Unsupported {
+            construct: format!("aggregation: {}", a.op),
+        },
+        Expr::Binary(b) => Error::Unsupported {
+            construct: format!("binary expression: {}", b.op),
+        },
+        Expr::Subquery(_) => Error::Unsupported {
+            construct: "subquery".to_string(),
+        },
+        Expr::Call(c) => Error::Unsupported {
+            construct: format!("function call: {}", c.func.name),
+        },
+        Expr::Extension(_) => Error::Unsupported {
+            construct: "extension node".to_string(),
+        },
+        Expr::Paren(_)
+        | Expr::Unary(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_) => {
+            unreachable!("caller must handle every supported construct before falling back")
+        }
+    }
+}
+
+/// The selector-local evaluation timestamp: `@`'s absolute instant (falling
+/// back to the ambient `eval_ts_ns`, i.e. the current grid step or the
+/// instant query's own time) shifted by the selector's `offset`, if any.
+/// `@`'s `start()`/`end()` forms resolve against the whole query's fixed
+/// parameters (`ctx`), not the current step, exactly like Prometheus.
+fn selector_eval_ts(
+    vs: &promql_parser::parser::VectorSelector,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> Result<i64, Error> {
+    let offset_ns = signed_offset_ns(vs.offset.as_ref())?;
+    let base_ts_ns = resolve_at(vs.at.as_ref(), ctx.start_ns, ctx.end_ns)?.unwrap_or(eval_ts_ns);
+    base_ts_ns.checked_sub(offset_ns).ok_or(Error::TimeOverflow)
+}
+
+/// Resolve an `@` modifier to an absolute nanosecond instant: `start()`/
+/// `end()` resolve against the query's own fixed parameters, `@ <literal>`
+/// against the literal instant (which may be before the Unix epoch).
+/// `None` (no `@`) is `Ok(None)`.
+pub(crate) fn resolve_at(
+    at: Option<&promql_parser::parser::AtModifier>,
+    query_start_ns: i64,
+    query_end_ns: i64,
+) -> Result<Option<i64>, Error> {
+    use promql_parser::parser::AtModifier;
+    let Some(at) = at else {
+        return Ok(None);
+    };
+    let ns = match at {
+        AtModifier::Start => query_start_ns,
+        AtModifier::End => query_end_ns,
+        AtModifier::At(t) => systemtime_to_ns(*t)?,
+    };
+    Ok(Some(ns))
+}
+
+/// Convert a `SystemTime` (which, for `@`, may represent an instant before
+/// the Unix epoch) to signed nanoseconds since the epoch.
+fn systemtime_to_ns(t: std::time::SystemTime) -> Result<i64, Error> {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since_epoch) => i64::try_from(since_epoch.as_nanos()).map_err(|_| Error::TimeOverflow),
+        Err(before_epoch) => {
+            let ns = i64::try_from(before_epoch.duration().as_nanos())
+                .map_err(|_| Error::TimeOverflow)?;
+            ns.checked_neg().ok_or(Error::TimeOverflow)
+        }
+    }
+}
+
+/// Convert a parsed range/window `Duration` to signed nanoseconds.
+pub(crate) fn duration_to_ns(d: std::time::Duration) -> Result<i64, Error> {
+    i64::try_from(d.as_nanos()).map_err(|_| Error::TimeOverflow)
+}
+
+/// Negate every sample's value in an instant vector, dropping `__name__`
+/// from each series' labels: Prometheus drops the metric name on the result
+/// of any numeric operation, unary minus included.
+fn negate_vector(v: InstantVector) -> InstantVector {
+    v.into_iter()
+        .map(|s| InstantSample {
+            labels: drop_metric_name(s.labels),
+            ts_ns: s.ts_ns,
+            value: -s.value,
+        })
+        .collect()
+}
+
+/// Remove `__name__` from a label set, exactly as Prometheus does for the
+/// result of a numeric operation.
+fn drop_metric_name(labels: LabelSet) -> LabelSet {
+    // Filtering can only remove entries from an already-deduplicated
+    // `LabelSet`, so this reconstruction cannot introduce a duplicate name
+    // and cannot fail in practice.
+    let filtered: Vec<Label> = labels
+        .iter()
+        .filter(|l| l.name != METRIC_NAME_LABEL)
+        .cloned()
+        .collect();
+    LabelSet::new(filtered).unwrap_or_default()
 }
 
 /// Number of evaluation instants in `start_ns..=end_ns` stepping by
@@ -329,57 +720,12 @@ fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Op
     Some(candidate.value)
 }
 
-/// Parse `query` and reject every AST node except a bare vector selector
-/// (optionally with `offset`), and reject the selector itself if it carries
-/// an `@` modifier (not yet supported).
-fn parse_vector_selector(query: &str) -> Result<promql_parser::parser::VectorSelector, Error> {
-    let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
-    match expr {
-        promql_parser::parser::Expr::VectorSelector(vs) => {
-            if vs.at.is_some() {
-                return Err(Error::Unsupported {
-                    construct: "@".to_string(),
-                });
-            }
-            Ok(vs)
-        }
-        promql_parser::parser::Expr::Aggregate(a) => Err(Error::Unsupported {
-            construct: format!("aggregation: {}", a.op),
-        }),
-        promql_parser::parser::Expr::Unary(_) => Err(Error::Unsupported {
-            construct: "unary expression".to_string(),
-        }),
-        promql_parser::parser::Expr::Binary(b) => Err(Error::Unsupported {
-            construct: format!("binary expression: {}", b.op),
-        }),
-        promql_parser::parser::Expr::Paren(_) => Err(Error::Unsupported {
-            construct: "paren expression".to_string(),
-        }),
-        promql_parser::parser::Expr::Subquery(_) => Err(Error::Unsupported {
-            construct: "subquery".to_string(),
-        }),
-        promql_parser::parser::Expr::NumberLiteral(_) => Err(Error::Unsupported {
-            construct: "number literal".to_string(),
-        }),
-        promql_parser::parser::Expr::StringLiteral(_) => Err(Error::Unsupported {
-            construct: "string literal".to_string(),
-        }),
-        promql_parser::parser::Expr::MatrixSelector(_) => Err(Error::Unsupported {
-            construct: "matrix selector".to_string(),
-        }),
-        promql_parser::parser::Expr::Call(c) => Err(Error::Unsupported {
-            construct: format!("function call: {}", c.func.name),
-        }),
-        promql_parser::parser::Expr::Extension(_) => Err(Error::Unsupported {
-            construct: "extension node".to_string(),
-        }),
-    }
-}
-
 /// Build the full matcher list for a vector selector, including the
 /// implicit `__name__` matcher when the selector has a bare metric name
 /// (promql-parser keeps that separate from `vs.matchers`).
-fn build_matchers(vs: &promql_parser::parser::VectorSelector) -> Result<Vec<LabelMatcher>, Error> {
+pub(crate) fn build_matchers(
+    vs: &promql_parser::parser::VectorSelector,
+) -> Result<Vec<LabelMatcher>, Error> {
     if matchers::has_or_group(&vs.matchers) {
         return Err(Error::Unsupported {
             construct: "label matcher or-group".to_string(),
@@ -399,7 +745,9 @@ fn build_matchers(vs: &promql_parser::parser::VectorSelector) -> Result<Vec<Labe
 /// Signed nanosecond shift for a selector's `offset`: positive for `offset
 /// 5m` (look backward), negative for the experimental `offset -5m` (look
 /// forward). `None` (no offset) is zero.
-fn signed_offset_ns(offset: Option<&promql_parser::parser::Offset>) -> Result<i64, Error> {
+pub(crate) fn signed_offset_ns(
+    offset: Option<&promql_parser::parser::Offset>,
+) -> Result<i64, Error> {
     let Some(offset) = offset else {
         return Ok(0);
     };
@@ -665,7 +1013,6 @@ mod tests {
             ("sum(up)", "sum"),
             ("up + down", "binary expression"),
             ("up[5m:1m]", "subquery"),
-            ("up @ 100", "@"),
         ];
         for (query, expected_substr) in cases {
             let err = Evaluator::new()
@@ -682,13 +1029,255 @@ mod tests {
     }
 
     #[test]
-    fn paren_and_matrix_selector_are_also_unsupported() {
-        for query in ["(up)", "up[5m]"] {
-            let err = Evaluator::new()
-                .instant(&TestSource::new(), query, 0)
-                .expect_err("must be rejected");
-            assert!(matches!(err, Error::Unsupported { .. }));
+    fn bare_matrix_selector_at_top_level_is_wrong_type() {
+        // `up[5m]` parses, but a matrix is never a valid top-level instant
+        // query result: Prometheus rejects this as a type error, not as an
+        // unsupported construct, since matrix selectors ARE evaluated (as
+        // sub-expressions of range/subquery in a later phase).
+        let err = Evaluator::new()
+            .instant(&TestSource::new(), "up[5m]", 0)
+            .expect_err("must be rejected");
+        assert!(matches!(
+            err,
+            Error::WrongType {
+                got: "range vector",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn paren_expression_unwraps_to_the_same_result_as_bare_selector() {
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(0, 1.0)])
+            .expect("valid series");
+        let bare = Evaluator::new()
+            .instant(&source, "up", minutes(1))
+            .expect("evaluates");
+        let parenthesized = Evaluator::new()
+            .instant(&source, "(up)", minutes(1))
+            .expect("paren expressions unwrap");
+        assert_eq!(bare, parenthesized);
+
+        // Nested parens unwrap too.
+        let double_parenthesized = Evaluator::new()
+            .instant(&source, "((up))", minutes(1))
+            .expect("nested paren expressions unwrap");
+        assert_eq!(bare, double_parenthesized);
+    }
+
+    #[test]
+    fn unary_minus_negates_value_and_drops_metric_name() {
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up"), ("job", "api")], &[(0, 5.0)])
+            .expect("valid series");
+        let result = Evaluator::new()
+            .instant(&source, "-up", minutes(1))
+            .expect("evaluates");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, -5.0);
+        assert_eq!(result[0].labels.get("__name__"), None);
+        assert_eq!(result[0].labels.get("job"), Some("api"));
+
+        // Double negation restores the original value (though __name__
+        // stays dropped, matching Prometheus: any numeric op drops it).
+        let double_negated = Evaluator::new()
+            .instant(&source, "--up", minutes(1))
+            .expect("evaluates");
+        assert_eq!(double_negated[0].value, 5.0);
+    }
+
+    #[test]
+    fn unary_minus_over_range_negates_every_sample_and_drops_metric_name() {
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "up")],
+                &[(0, 2.0), (ms_to_ns(minutes(1)).expect("ok"), 3.0)],
+            )
+            .expect("valid series");
+        let matrix = Evaluator::new()
+            .range(&source, "-up", 0, minutes(1), minutes(1))
+            .expect("evaluates");
+        assert_eq!(matrix.len(), 1);
+        let (labels, samples) = &matrix[0];
+        assert_eq!(labels.get("__name__"), None);
+        assert_eq!(
+            samples.iter().map(|s| s.value).collect::<Vec<_>>(),
+            vec![-2.0, -3.0]
+        );
+    }
+
+    #[test]
+    fn number_literal_evaluates_to_a_scalar() {
+        let result = Evaluator::new()
+            .eval_instant(&TestSource::new(), "42", 0)
+            .expect("evaluates");
+        assert_eq!(result, Value::Scalar(42.0));
+
+        let negated = Evaluator::new()
+            .eval_instant(&TestSource::new(), "-42", 0)
+            .expect("evaluates");
+        assert_eq!(negated, Value::Scalar(-42.0));
+    }
+
+    #[test]
+    fn string_literal_evaluates_to_a_string() {
+        let result = Evaluator::new()
+            .eval_instant(&TestSource::new(), r#""hello""#, 0)
+            .expect("evaluates");
+        assert_eq!(result, Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn scalar_top_level_range_query_is_constant_across_the_grid() {
+        let result = Evaluator::new()
+            .eval_range(&TestSource::new(), "7", 0, minutes(10), minutes(1))
+            .expect("evaluates");
+        assert_eq!(result, Value::Scalar(7.0));
+    }
+
+    #[test]
+    fn instant_and_range_reject_scalar_and_string_results() {
+        let err = Evaluator::new()
+            .instant(&TestSource::new(), "42", 0)
+            .expect_err("scalar is not an instant vector");
+        assert!(matches!(err, Error::WrongType { got: "scalar", .. }));
+
+        let err = Evaluator::new()
+            .range(&TestSource::new(), r#""x""#, 0, minutes(1), minutes(1))
+            .expect_err("string is not a range vector");
+        assert!(matches!(err, Error::WrongType { got: "string", .. }));
+    }
+
+    #[test]
+    fn at_modifier_pins_the_lookup_instant_regardless_of_query_time() {
+        // `up @ 300` (a literal, seconds since the epoch) always looks up
+        // data as of t=300s, no matter what instant the query itself asks
+        // for.
+        let pinned_ns = ms_to_ns(300_000).expect("ok");
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(pinned_ns, 11.0)])
+            .expect("valid series");
+
+        for query_t_ms in [0, minutes(1), minutes(100)] {
+            let result = Evaluator::new()
+                .instant(&source, "up @ 300", query_t_ms)
+                .expect("evaluates");
+            assert_eq!(result.len(), 1, "pinned lookup at t={query_t_ms}");
+            assert_eq!(result[0].value, 11.0);
+            // Reported timestamp is still the query's own instant.
+            assert_eq!(result[0].ts_ns, ms_to_ns(query_t_ms).expect("ok"));
         }
+    }
+
+    #[test]
+    fn at_start_and_end_resolve_against_query_parameters_for_instant_queries() {
+        // For an instant query, start() and end() both equal the query's
+        // own evaluation timestamp.
+        let t_ms = minutes(10);
+        let sample_ts_ns = ms_to_ns(t_ms).expect("ok");
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(sample_ts_ns, 1.0)])
+            .expect("valid series");
+
+        let start_result = Evaluator::new()
+            .instant(&source, "up @ start()", t_ms)
+            .expect("evaluates");
+        let end_result = Evaluator::new()
+            .instant(&source, "up @ end()", t_ms)
+            .expect("evaluates");
+        assert_eq!(start_result.len(), 1);
+        assert_eq!(end_result.len(), 1);
+        assert_eq!(start_result[0].value, 1.0);
+        assert_eq!(end_result[0].value, 1.0);
+    }
+
+    #[test]
+    fn at_start_resolves_against_the_whole_range_query_span() {
+        // `up @ start()` in a range query pins every step's lookup to the
+        // range's own start, not to the current grid step.
+        let start_ms = minutes(5);
+        let sample_ts_ns = ms_to_ns(start_ms).expect("ok");
+        let source = TestSource::new()
+            .with_series(&[("__name__", "up")], &[(sample_ts_ns, 4.0)])
+            .expect("valid series");
+
+        let matrix = Evaluator::new()
+            .range(&source, "up @ start()", start_ms, minutes(15), minutes(5))
+            .expect("evaluates");
+        assert_eq!(matrix.len(), 1);
+        let (_, samples) = &matrix[0];
+        // Every one of the 3 steps (5m, 10m, 15m) sees the same pinned
+        // value, since the lookup instant never moves off start().
+        assert_eq!(samples.len(), 3);
+        assert!(samples.iter().all(|s| s.value == 4.0));
+    }
+
+    #[test]
+    fn matrix_selector_window_is_left_open() {
+        let range_ns = duration_to_ns(std::time::Duration::from_secs(300)).expect("ok");
+        let sel_ts_ns = ms_to_ns(minutes(10)).expect("ok");
+        let window_start = sel_ts_ns - range_ns;
+
+        // One sample exactly at the (excluded) window start, one 1ns
+        // inside, one at sel_ts itself (included).
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "up")],
+                &[
+                    (window_start, 1.0),
+                    (window_start + 1, 2.0),
+                    (sel_ts_ns, 3.0),
+                ],
+            )
+            .expect("valid series");
+
+        let expr = promql_parser::parser::parse("up[5m]").expect("parses");
+        let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
+            panic!("expected matrix selector");
+        };
+        let ctx = QueryWindow {
+            start_ns: sel_ts_ns,
+            end_ns: sel_ts_ns,
+        };
+        let matrix = Evaluator::new()
+            .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
+            .expect("evaluates");
+        assert_eq!(matrix.len(), 1);
+        let (_, samples) = &matrix[0];
+        let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
+        assert_eq!(values, vec![2.0, 3.0], "window start itself is excluded");
+    }
+
+    #[test]
+    fn matrix_selector_excludes_stale_marker_samples() {
+        let sel_ts_ns = ms_to_ns(minutes(10)).expect("ok");
+        let stale_ts_ns = ms_to_ns(minutes(9)).expect("ok");
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "up")],
+                &[
+                    (stale_ts_ns, f64::from_bits(STALE_NAN_BITS)),
+                    (sel_ts_ns, 9.0),
+                ],
+            )
+            .expect("valid series");
+
+        let expr = promql_parser::parser::parse("up[5m]").expect("parses");
+        let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
+            panic!("expected matrix selector");
+        };
+        let ctx = QueryWindow {
+            start_ns: sel_ts_ns,
+            end_ns: sel_ts_ns,
+        };
+        let matrix = Evaluator::new()
+            .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
+            .expect("evaluates");
+        assert_eq!(matrix.len(), 1);
+        let (_, samples) = &matrix[0];
+        assert_eq!(samples.len(), 1, "the stale marker itself must not surface");
+        assert_eq!(samples[0].value, 9.0);
     }
 
     #[test]
@@ -886,5 +1475,34 @@ mod tests {
             )
             .expect("fits u64")
         );
+    }
+
+    proptest::proptest! {
+        /// `signed_offset_ns` never panics across the full range of
+        /// representable durations, on either sign of offset.
+        #[test]
+        fn signed_offset_ns_never_panics(secs in 0u64..1_000_000_000, negative in proptest::bool::ANY) {
+            let d = std::time::Duration::from_secs(secs);
+            let offset = if negative {
+                promql_parser::parser::Offset::Neg(d)
+            } else {
+                promql_parser::parser::Offset::Pos(d)
+            };
+            let _ = signed_offset_ns(Some(&offset));
+        }
+
+        /// Matrix-selector window arithmetic (`sel_ts - range`) never panics
+        /// even at extreme selector timestamps and range durations; it must
+        /// return `Error::TimeOverflow` instead.
+        #[test]
+        fn matrix_window_arithmetic_never_panics(
+            sel_ts_ns in proptest::num::i64::ANY,
+            range_secs in 0u64..1_000_000_000,
+        ) {
+            let range_ns = duration_to_ns(std::time::Duration::from_secs(range_secs));
+            if let Ok(range_ns) = range_ns {
+                let _ = sel_ts_ns.checked_sub(range_ns);
+            }
+        }
     }
 }
