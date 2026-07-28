@@ -11,9 +11,11 @@ mod error;
 mod metrics;
 mod router;
 mod shard;
+mod value;
 
 pub use clock::{Clock, SystemClock};
 pub use config::{IngestConfig, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2};
 pub use error::WriteError;
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};
+pub use value::{IngestPoint, IngestValue};

@@ -708,6 +708,206 @@ fn merge_series_runs(
     Ok(())
 }
 
+// --- Native-histogram dedup total order (docs/rseg-v3-plan.md section 7) ---
+//
+// Generalizes `is_greater`/`merge_series_runs` to histogram structural
+// comparison by bit pattern. `ravel-promql`'s `SeriesData`/`SeriesSource`
+// remain scalar-only, and wiring this into a live query path additionally
+// needs `fetcher.rs` to decode RSEG v3/HIST_PAGES, both out of this
+// ticket's "Work in" scope (crates/ravel-segment, crates/ravel-ingest,
+// crates/ravel-query only) -- so nothing here is called by
+// `merge_soa_runs`/`MergedSource` yet. The extension is proven directly by
+// the tests below, constructing `HistogramValue`s by hand rather than via
+// OTLP/RW decode, mirroring how phase C7's ingest plumbing is proven.
+
+/// Bit-pattern total order over one [`HistogramValue`]'s full structure:
+/// every float field compared by its raw bit pattern (never `==`/`PartialOrd`
+/// on `f64` itself), so NaN payloads and -0.0 are significant, matching
+/// `f64::to_bits()`'s role in the scalar tiebreak ([`is_greater`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
+struct HistogramSortKey {
+    scale: i32,
+    zero_threshold_bits: u64,
+    sum_bits: Option<u64>,
+    custom_values_bits: Option<Vec<u64>>,
+    positive_spans: Vec<(i32, u32)>,
+    negative_spans: Vec<(i32, u32)>,
+    counts: CountsSortKey,
+    reset_hint_rank: u8,
+}
+
+/// Bit-pattern projection of [`ravel_segment::HistogramCounts`]. Variant
+/// order (`Int` before `Float`) gives the two kinds a stable, deterministic
+/// relative rank; nothing in the format requires one kind to structurally
+/// outrank the other, so any fixed order is correct as long as it never
+/// changes (it decides duplicate-sample winners).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
+enum CountsSortKey {
+    Int {
+        zero_count: u64,
+        count: u64,
+        positive: Vec<u64>,
+        negative: Vec<u64>,
+    },
+    Float {
+        zero_count_bits: u64,
+        count_bits: u64,
+        positive_bits: Vec<u64>,
+        negative_bits: Vec<u64>,
+    },
+}
+
+/// Stable, deterministic rank for [`ravel_segment::ResetHint`] (which has no
+/// `Ord` of its own): only used to make [`HistogramSortKey`] total, not tied
+/// to the format's wire encoding.
+#[allow(dead_code)]
+fn reset_hint_rank(hint: ravel_segment::ResetHint) -> u8 {
+    use ravel_segment::ResetHint;
+    match hint {
+        ResetHint::Unknown => 0,
+        ResetHint::Yes => 1,
+        ResetHint::No => 2,
+        ResetHint::Gauge => 3,
+    }
+}
+
+#[allow(dead_code)]
+fn spans_sort_key(spans: &[ravel_segment::HistogramSpan]) -> Vec<(i32, u32)> {
+    spans.iter().map(|s| (s.offset, s.length)).collect()
+}
+
+#[allow(dead_code)]
+fn histogram_sort_key(v: &ravel_segment::HistogramValue) -> HistogramSortKey {
+    use ravel_segment::HistogramCounts;
+
+    let counts = match &v.counts {
+        HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => CountsSortKey::Int {
+            zero_count: *zero_count,
+            count: *count,
+            positive: positive.clone(),
+            negative: negative.clone(),
+        },
+        HistogramCounts::Float {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => CountsSortKey::Float {
+            zero_count_bits: zero_count.to_bits(),
+            count_bits: count.to_bits(),
+            positive_bits: positive.iter().map(|f| f.to_bits()).collect(),
+            negative_bits: negative.iter().map(|f| f.to_bits()).collect(),
+        },
+    };
+    HistogramSortKey {
+        scale: v.scale,
+        zero_threshold_bits: v.zero_threshold.to_bits(),
+        sum_bits: v.sum.map(f64::to_bits),
+        custom_values_bits: v
+            .custom_values
+            .as_ref()
+            .map(|cv| cv.iter().map(|f| f.to_bits()).collect()),
+        positive_spans: spans_sort_key(&v.positive_spans),
+        negative_spans: spans_sort_key(&v.negative_spans),
+        counts,
+        reset_hint_rank: reset_hint_rank(v.reset_hint),
+    }
+}
+
+/// Histogram counterpart to [`Candidate`]: same provenance priority, paired
+/// with a full [`HistogramValue`] instead of a plain `f64`.
+#[allow(dead_code)]
+struct HistogramCandidate {
+    value: ravel_segment::HistogramValue,
+    priority: (i64, u64, u64, u32),
+}
+
+/// Histogram counterpart to [`is_greater`]: same priority-prefix-first
+/// total order, tie-broken by [`histogram_sort_key`] instead of a plain
+/// `value.to_bits()`.
+#[allow(dead_code)]
+fn histogram_is_greater(a: &HistogramCandidate, b: &HistogramCandidate) -> bool {
+    (a.priority, histogram_sort_key(&a.value)) > (b.priority, histogram_sort_key(&b.value))
+}
+
+/// Histogram counterpart to [`SeriesRun`]: one decoded per-segment run of a
+/// single histogram-kind series, kept in on-disk order.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct HistogramSeriesRun {
+    timestamps: Vec<i64>,
+    values: Vec<ravel_segment::HistogramValue>,
+    prefix: (i64, u64, u64),
+}
+
+/// Histogram counterpart to [`merge_series_runs`]: identical k-way merge
+/// shape (min-heap by ts, drain same-ts heads, [`histogram_is_greater`]
+/// picks the winner), substituting [`HistogramCandidate`] for [`Candidate`]
+/// and yielding [`ravel_segment::HistogramSample`]s.
+#[allow(dead_code)]
+fn merge_histogram_series_runs(
+    runs: &[HistogramSeriesRun],
+    budget: &mut YieldBudget,
+    out: &mut Vec<ravel_segment::HistogramSample>,
+) -> Result<(), QueryError> {
+    let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    let mut cursors = vec![0usize; runs.len()];
+    for (idx, run) in runs.iter().enumerate() {
+        if let Some(&ts) = run.timestamps.first() {
+            heap.push(Reverse((ts, idx)));
+        }
+    }
+
+    while let Some(&Reverse((ts, _))) = heap.peek() {
+        let mut best: Option<HistogramCandidate> = None;
+        while let Some(Reverse((head_ts, idx))) = heap.pop() {
+            if head_ts != ts {
+                heap.push(Reverse((head_ts, idx)));
+                break;
+            }
+            let run = &runs[idx];
+            let mut pos = cursors[idx];
+            while pos < run.timestamps.len() && run.timestamps[pos] == ts {
+                let in_page_index = u32::try_from(pos).unwrap_or(u32::MAX);
+                let candidate = HistogramCandidate {
+                    value: run.values[pos].clone(),
+                    priority: (run.prefix.0, run.prefix.1, run.prefix.2, in_page_index),
+                };
+                best = match best {
+                    Some(current) if histogram_is_greater(&current, &candidate) => Some(current),
+                    _ => Some(candidate),
+                };
+                pos += 1;
+            }
+            cursors[idx] = pos;
+            if let Some(&next_ts) = run.timestamps.get(pos) {
+                if next_ts < ts {
+                    return Err(QueryError::NonMonotonicSamples {
+                        prev: ts,
+                        next: next_ts,
+                    });
+                }
+                heap.push(Reverse((next_ts, idx)));
+            }
+        }
+        if let Some(candidate) = best {
+            budget.count_one()?;
+            out.push(ravel_segment::HistogramSample {
+                ts_ns: ts,
+                value: candidate.value,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A `SeriesSource` backed by the per-series output of the lazy k-way merge
 /// ([`merge_soa_runs`]), not a materialized per-timestamp window
 /// (docs/query-engine.md / `ravel_promql::source` module doc: by the time
@@ -1234,6 +1434,247 @@ mod merge_tests {
                 .collect();
             let want = values.iter().map(|v| v.to_bits()).max().expect("non-empty");
             prop_assert_eq!(winner_bits(segments), want);
+        }
+    }
+}
+
+/// Histogram counterpart to `merge_tests`: exercises `merge_histogram_series_runs`
+/// / `histogram_is_greater` (docs/rseg-v3-plan.md section 7) with the same
+/// hand-picked-cases-plus-independent-oracle-proptest structure, substituting
+/// directly-constructed `HistogramValue`s for plain `f64`s.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod histogram_merge_tests {
+    use std::collections::HashMap;
+
+    use proptest::prelude::*;
+    use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
+
+    use super::*;
+
+    /// A fixed, simple single-bucket int-counts histogram shape, varied only
+    /// by `sum`/`zero_threshold` (the two float fields exercised by the
+    /// bit-pattern tests below).
+    fn histogram_value(sum: Option<f64>, zero_threshold: f64) -> HistogramValue {
+        HistogramValue {
+            scale: 0,
+            zero_threshold,
+            sum,
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
+    fn run(
+        ts: &[i64],
+        values: Vec<HistogramValue>,
+        created: i64,
+        epoch: u64,
+        seq: u64,
+    ) -> HistogramSeriesRun {
+        HistogramSeriesRun {
+            timestamps: ts.to_vec(),
+            values,
+            prefix: (created, epoch, seq),
+        }
+    }
+
+    fn winner(runs: Vec<HistogramSeriesRun>) -> HistogramValue {
+        let mut budget = YieldBudget {
+            yielded: 0,
+            max: 10_000,
+        };
+        let mut out = Vec::new();
+        merge_histogram_series_runs(&runs, &mut budget, &mut out).expect("merge succeeds");
+        assert_eq!(out.len(), 1, "expected exactly one merged sample");
+        out.into_iter().next().expect("checked len == 1").value
+    }
+
+    #[test]
+    fn provenance_decides_winner() {
+        let ts = 1_000;
+        let older = histogram_value(Some(1.0), 0.0);
+        let newer = histogram_value(Some(2.0), 0.0);
+        let runs = vec![
+            run(&[ts], vec![older], 100, 0, 0),
+            run(&[ts], vec![newer.clone()], 200, 0, 0),
+        ];
+        let got = winner(runs);
+        assert_eq!(got.sum, newer.sum);
+    }
+
+    #[test]
+    fn bit_pattern_breaks_full_provenance_tie_with_nan_payloads() {
+        let ts = 1_000;
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert_ne!(nan_a.to_bits(), nan_b.to_bits());
+        let want_bits = nan_a.to_bits().max(nan_b.to_bits());
+
+        let a = histogram_value(Some(nan_a), 0.0);
+        let b = histogram_value(Some(nan_b), 0.0);
+        let runs = vec![
+            run(&[ts], vec![a], 100, 0, 0),
+            run(&[ts], vec![b], 100, 0, 0),
+        ];
+        let got = winner(runs);
+        assert_eq!(got.sum.expect("has sum").to_bits(), want_bits);
+    }
+
+    #[test]
+    fn bit_pattern_breaks_tie_with_negative_zero() {
+        let ts = 1_000;
+        let pos_zero = histogram_value(Some(1.0), 0.0);
+        let neg_zero = histogram_value(Some(1.0), -0.0);
+        assert_ne!(
+            pos_zero.zero_threshold.to_bits(),
+            neg_zero.zero_threshold.to_bits()
+        );
+        let want_bits = pos_zero
+            .zero_threshold
+            .to_bits()
+            .max(neg_zero.zero_threshold.to_bits());
+
+        let runs = vec![
+            run(&[ts], vec![pos_zero], 100, 0, 0),
+            run(&[ts], vec![neg_zero], 100, 0, 0),
+        ];
+        let got = winner(runs);
+        assert_eq!(got.zero_threshold.to_bits(), want_bits);
+    }
+
+    #[test]
+    fn provenance_wins_over_structural_bits() {
+        let ts = 1_000;
+        // Older/lower-priority side has the numerically "louder" bit
+        // pattern; the newer/higher-priority side must still win, proving
+        // the priority prefix dominates the structural tiebreak.
+        let loud_but_old = histogram_value(Some(f64::from_bits(u64::MAX)), 0.0);
+        let quiet_but_new = histogram_value(Some(0.0), 0.0);
+        let runs = vec![
+            run(&[ts], vec![loud_but_old], 100, 0, 0),
+            run(&[ts], vec![quiet_but_new.clone()], 200, 0, 0),
+        ];
+        let got = winner(runs);
+        assert_eq!(
+            got.sum.expect("has sum").to_bits(),
+            quiet_but_new.sum.expect("has sum").to_bits()
+        );
+    }
+
+    #[test]
+    fn non_monotonic_timestamps_within_a_run_error() {
+        let a = histogram_value(Some(1.0), 0.0);
+        let b = histogram_value(Some(2.0), 0.0);
+        let runs = vec![run(&[1_000, 500], vec![a, b], 100, 0, 0)];
+        let mut budget = YieldBudget {
+            yielded: 0,
+            max: 10_000,
+        };
+        let mut out = Vec::new();
+        let err = merge_histogram_series_runs(&runs, &mut budget, &mut out).unwrap_err();
+        assert!(matches!(err, QueryError::NonMonotonicSamples { .. }));
+    }
+
+    fn float_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            Just(0.0_f64),
+            Just(-0.0_f64),
+            Just(f64::NAN),
+            Just(-f64::NAN),
+            Just(f64::INFINITY),
+            Just(f64::NEG_INFINITY),
+            any::<i16>().prop_map(f64::from),
+        ]
+    }
+
+    fn histogram_strategy() -> impl Strategy<Value = HistogramValue> {
+        (proptest::option::of(float_strategy()), float_strategy())
+            .prop_map(|(sum, zero_threshold)| histogram_value(sum, zero_threshold))
+    }
+
+    fn run_strategy() -> impl Strategy<Value = HistogramSeriesRun> {
+        (
+            proptest::collection::vec(1_i64..20, 1..5),
+            0_i64..5,
+            0_u64..3,
+            0_u64..3,
+        )
+            .prop_flat_map(|(mut raw_ts, created, epoch, seq)| {
+                raw_ts.sort_unstable();
+                raw_ts.dedup();
+                let n = raw_ts.len();
+                proptest::collection::vec(histogram_strategy(), n).prop_map(move |values| {
+                    HistogramSeriesRun {
+                        timestamps: raw_ts.clone(),
+                        values,
+                        prefix: (created, epoch, seq),
+                    }
+                })
+            })
+    }
+
+    fn runs_strategy() -> impl Strategy<Value = Vec<HistogramSeriesRun>> {
+        proptest::collection::vec(run_strategy(), 1..4)
+    }
+
+    /// Full ADR-0010 §5 ordering prefix plus per-sample in-page index,
+    /// mirroring `merge_tests::PriorityKey`.
+    type PriorityKey = (i64, u64, u64, u32);
+    /// Complete winner-comparison key: the priority tuple, tie-broken by
+    /// [`HistogramSortKey`].
+    type OrderKey = (PriorityKey, HistogramSortKey);
+
+    /// Linear-scan reference: for each timestamp, keeps the greatest
+    /// `(priority, HistogramSortKey)` tuple across every run, mirroring
+    /// `merge_tests::oracle`'s differential-testing pattern.
+    fn oracle(runs: &[HistogramSeriesRun]) -> HashMap<i64, OrderKey> {
+        let mut best: HashMap<i64, OrderKey> = HashMap::new();
+        for run in runs {
+            for (pos, (&ts, value)) in run.timestamps.iter().zip(run.values.iter()).enumerate() {
+                let in_page_index = u32::try_from(pos).unwrap_or(u32::MAX);
+                let priority = (run.prefix.0, run.prefix.1, run.prefix.2, in_page_index);
+                let key = histogram_sort_key(value);
+                match best.get(&ts) {
+                    Some((cur_priority, cur_key))
+                        if (*cur_priority, cur_key.clone()) >= (priority, key.clone()) => {}
+                    _ => {
+                        best.insert(ts, (priority, key));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn merge_matches_independent_oracle(runs in runs_strategy()) {
+            let want = oracle(&runs);
+            let mut budget = YieldBudget { yielded: 0, max: 100_000 };
+            let mut out = Vec::new();
+            merge_histogram_series_runs(&runs, &mut budget, &mut out).expect("merge succeeds");
+
+            let mut got: HashMap<i64, HistogramSortKey> = HashMap::new();
+            for sample in &out {
+                got.insert(sample.ts_ns, histogram_sort_key(&sample.value));
+            }
+            let want_keys: HashMap<i64, HistogramSortKey> =
+                want.into_iter().map(|(ts, (_, key))| (ts, key)).collect();
+            prop_assert_eq!(got, want_keys);
         }
     }
 }
