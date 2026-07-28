@@ -200,6 +200,15 @@ pub fn engine(store: Arc<dyn ObjectStoreBackend>, catalog: Catalog) -> QueryEngi
     QueryEngine::new(Arc::new(catalog), store, EngineConfig::default())
 }
 
+/// Unwraps a range-query result this suite expects to be a plain range
+/// matrix, panicking with the actual variant otherwise.
+pub fn expect_matrix(value: ravel_promql::Value) -> ravel_promql::RangeMatrix {
+    match value {
+        ravel_promql::Value::Matrix(m) => m,
+        other => panic!("expected range matrix, got {other:?}"),
+    }
+}
+
 /// Fetches the commit record a token addresses, decodes it, then fetches
 /// and opens the exact data object the record's own `object_key` names, and
 /// returns `(commit record's segment_format_version, object's own trailer

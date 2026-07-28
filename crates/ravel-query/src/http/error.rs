@@ -37,6 +37,7 @@ const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
 /// but the message is fixed for a stable, typed contract.
 const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; retry";
 
+#[derive(Debug)]
 pub enum ApiError {
     BadData(String),
     Unsupported(String),
@@ -129,8 +130,11 @@ fn from_eval_error(inner: &ravel_promql::Error, outer: &QueryError) -> ApiError 
         ravel_promql::Error::Parse(_)
         | ravel_promql::Error::TimeOverflow
         | ravel_promql::Error::NonPositiveStep { .. }
-        | ravel_promql::Error::InvalidRange { .. } => ApiError::BadData(outer.to_string()),
-        ravel_promql::Error::Unsupported { .. } => ApiError::Unsupported(outer.to_string()),
+        | ravel_promql::Error::InvalidRange { .. }
+        | ravel_promql::Error::WrongType { .. } => ApiError::BadData(outer.to_string()),
+        ravel_promql::Error::Unsupported { .. } | ravel_promql::Error::TooManyPoints { .. } => {
+            ApiError::Unsupported(outer.to_string())
+        }
         // The series-source error can wrap raw backend text; redact it and
         // log the full detail rather than echo it to the client (a7-F02).
         ravel_promql::Error::Source(_) => {
@@ -285,6 +289,36 @@ mod tests {
         assert_eq!(message, MSG_UNSATISFIABLE);
         assert_ne!(MSG_UNSATISFIABLE, MSG_UNAVAILABLE);
         assert_ne!(MSG_UNSATISFIABLE, MSG_CORRUPT);
+    }
+
+    #[test]
+    fn eval_wrong_type_maps_to_bad_data_not_unsupported() {
+        // WrongType is a client mistake (asked for a shape the query does
+        // not produce), not an unimplemented construct: it must map like a
+        // parse error (400), not like Unsupported (422).
+        let err = QueryError::Eval(ravel_promql::Error::WrongType {
+            expected: "instant vector",
+            got: "range vector",
+        });
+        match ApiError::from(err) {
+            ApiError::BadData(_) => {}
+            other => panic!("expected BadData, got a different ApiError variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_too_many_points_maps_to_unsupported_not_bad_data() {
+        // TooManyPoints is a resolution-budget rejection, grouped with the
+        // other budget classes (TooManySegments/Series/Samples) under the
+        // same 422 "execution" mapping, not the 400 "bad_data" mapping.
+        let err = QueryError::Eval(ravel_promql::Error::TooManyPoints {
+            points: 20_000,
+            max: 11_000,
+        });
+        match ApiError::from(err) {
+            ApiError::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got a different ApiError variant: {other:?}"),
+        }
     }
 
     #[test]

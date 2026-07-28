@@ -9,7 +9,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClock, make_point, tenant};
+use common::{TestClock, expect_vector, make_point, tenant};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
@@ -102,17 +102,19 @@ async fn assert_retry_recovers(fault: ScriptedFault, key_target: &str) {
     )
     .expect("catalog");
     let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
-    let result = engine
-        .instant(
-            tid.hash(),
-            "retried_metric",
-            event_ts / 1_000_000,
-            &[],
-            clock.now(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("query");
+    let result = expect_vector(
+        engine
+            .instant(
+                tid.hash(),
+                "retried_metric",
+                event_ts / 1_000_000,
+                &[],
+                clock.now(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query"),
+    );
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].value, 3.0);
 }
@@ -228,17 +230,19 @@ async fn restart_from_empty_local_state_sees_both_writer_generations() {
         EngineConfig::default(),
     );
 
-    let result_a = engine
-        .instant(
-            tid.hash(),
-            "restart_metric{gen=\"a\"}",
-            ts_a / 1_000_000,
-            &[],
-            clock_b.now(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("query for generation A's data");
+    let result_a = expect_vector(
+        engine
+            .instant(
+                tid.hash(),
+                "restart_metric{gen=\"a\"}",
+                ts_a / 1_000_000,
+                &[],
+                clock_b.now(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query for generation A's data"),
+    );
     assert_eq!(
         result_a.len(),
         1,
@@ -246,33 +250,37 @@ async fn restart_from_empty_local_state_sees_both_writer_generations() {
     );
     assert_eq!(result_a[0].value, 1.0);
 
-    let result_b = engine
-        .instant(
-            tid.hash(),
-            "restart_metric{gen=\"b\"}",
-            ts_b / 1_000_000,
-            &[],
-            clock_b.now(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("query for generation B's data");
+    let result_b = expect_vector(
+        engine
+            .instant(
+                tid.hash(),
+                "restart_metric{gen=\"b\"}",
+                ts_b / 1_000_000,
+                &[],
+                clock_b.now(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query for generation B's data"),
+    );
     assert_eq!(result_b.len(), 1);
     assert_eq!(result_b[0].value, 2.0);
 
     // Read-your-write: a token minted by the new writer B resolves cleanly
     // through the fresh catalog, with no dependency on any state from A.
-    let result_token = engine
-        .instant(
-            tid.hash(),
-            "restart_metric{gen=\"b\"}",
-            ts_b / 1_000_000,
-            &receipt_b.tokens,
-            clock_b.now(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("min_commit_token from the new writer must resolve");
+    let result_token = expect_vector(
+        engine
+            .instant(
+                tid.hash(),
+                "restart_metric{gen=\"b\"}",
+                ts_b / 1_000_000,
+                &receipt_b.tokens,
+                clock_b.now(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("min_commit_token from the new writer must resolve"),
+    );
     assert_eq!(result_token.len(), 1);
     assert_eq!(result_token[0].value, 2.0);
 }

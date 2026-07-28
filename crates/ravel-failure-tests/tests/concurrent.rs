@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::{TestClock, catalog, make_point, tenant};
+use common::{TestClock, catalog, expect_matrix, make_point, tenant};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -135,18 +135,20 @@ async fn query_batch_sample_count(
     let start = batch_start_ns(batch);
     let end = start + (SAMPLES_PER_BATCH - 1) * NS_PER_SEC;
     let query = format!("concurrent_metric{{batch=\"{batch}\"}}");
-    let result = engine
-        .range(
-            tid.hash(),
-            &query,
-            start / 1_000_000,
-            end / 1_000_000,
-            NS_PER_SEC / 1_000_000,
-            &[],
-            BASE_NS,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("range query must not error");
+    let result = expect_matrix(
+        engine
+            .range(
+                tid.hash(),
+                &query,
+                start / 1_000_000,
+                end / 1_000_000,
+                NS_PER_SEC / 1_000_000,
+                &[],
+                BASE_NS,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("range query must not error"),
+    );
     result.first().map_or(0, |(_, samples)| samples.len())
 }

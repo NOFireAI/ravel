@@ -12,8 +12,8 @@ use promql_parser::parser::{Expr, Offset};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
-    Evaluator, InstantVector, LabelMatcher, RangeMatrix, SeriesData, SeriesSource, SourceError,
-    from_ast_matchers, has_or_group, matches_series, ms_to_ns,
+    Evaluator, LabelMatcher, PlanAnchor, SelectorPlan, SeriesData, SeriesSource, SourceError,
+    Value, from_ast_matchers, has_or_group, matches_series, ms_to_ns, plan_selectors,
 };
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
@@ -23,11 +23,21 @@ use crate::config::EngineConfig;
 use crate::error::QueryError;
 use crate::fetcher::{FetchError, FetchedSeriesSoa, SegmentFetcher};
 
-/// Must match `ravel_promql::Evaluator`'s default lookback exactly (that
-/// constant is private): the engine needs the lookback duration to compute
-/// its pre-fetch window *before* the evaluator runs. Phase 1 does not
-/// support per-query lookback overrides.
-const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
+/// Which evaluation shape a prefetch is being computed for: an instant
+/// query has one lookup instant, a range query spans a step grid whose
+/// first and last instants bound every `PlanAnchor::Window` selector's own
+/// lookup window (mirrors `ravel_promql::eval`'s per-step grid exactly, so
+/// the prefetched window covers what evaluation will request).
+enum EvalWindow {
+    Instant {
+        t_ns: i64,
+    },
+    Range {
+        start_ns: i64,
+        end_ns: i64,
+        step_ns: i64,
+    },
+}
 
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
 /// and evaluates PromQL over the result (docs/query-engine.md).
@@ -62,7 +72,7 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         deadline: Duration,
-    ) -> Result<InstantVector, QueryError> {
+    ) -> Result<Value, QueryError> {
         tokio::time::timeout(
             deadline,
             self.instant_inner(tenant_hash, query, t_ms, min_tokens, now_ns),
@@ -78,22 +88,14 @@ impl QueryEngine {
         t_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-    ) -> Result<InstantVector, QueryError> {
-        let (matchers, offset_ns) = parse_selector(query)?;
+    ) -> Result<Value, QueryError> {
         let t_ns = ms_to_ns(t_ms)?;
-        let sel_ts_ns = t_ns
-            .checked_sub(offset_ns)
-            .ok_or(QueryError::TimeOverflow)?;
-        let window = TimeRange {
-            start_ns: sel_ts_ns
-                .checked_sub(DEFAULT_LOOKBACK_NS)
-                .ok_or(QueryError::TimeOverflow)?,
-            end_ns: sel_ts_ns,
-        };
+        let plans = plan_selectors(query, t_ms, t_ms)?;
+        let eval_window = EvalWindow::Instant { t_ns };
         let source = self
-            .resolve_and_merge(tenant_hash, &matchers, window, min_tokens, now_ns)
+            .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        Ok(Evaluator::new().instant(&source, query, t_ms)?)
+        Ok(Evaluator::new().eval_instant(&source, query, t_ms)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -107,7 +109,7 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         deadline: Duration,
-    ) -> Result<RangeMatrix, QueryError> {
+    ) -> Result<Value, QueryError> {
         tokio::time::timeout(
             deadline,
             self.range_inner(
@@ -134,22 +136,26 @@ impl QueryEngine {
         step_ms: i64,
         min_tokens: &[CommitToken],
         now_ns: i64,
-    ) -> Result<RangeMatrix, QueryError> {
+    ) -> Result<Value, QueryError> {
         if step_ms <= 0 {
             return Err(QueryError::NonPositiveStep { step_ms });
         }
         if start_ms > end_ms {
             return Err(QueryError::InvalidRange { start_ms, end_ms });
         }
-        let (matchers, offset_ns) = parse_selector(query)?;
         let start_ns = ms_to_ns(start_ms)?;
         let end_ns = ms_to_ns(end_ms)?;
         let step_ns = ms_to_ns(step_ms)?;
-        let window = range_fetch_window(start_ns, end_ns, step_ns, offset_ns)?;
+        let plans = plan_selectors(query, start_ms, end_ms)?;
+        let eval_window = EvalWindow::Range {
+            start_ns,
+            end_ns,
+            step_ns,
+        };
         let source = self
-            .resolve_and_merge(tenant_hash, &matchers, window, min_tokens, now_ns)
+            .prefetch(tenant_hash, &plans, &eval_window, min_tokens, now_ns)
             .await?;
-        Ok(Evaluator::new().range(&source, query, start_ms, end_ms, step_ms)?)
+        Ok(Evaluator::new().eval_range(&source, query, start_ms, end_ms, step_ms)?)
     }
 
     /// Resolves the series (labels only, no samples) matching `matchers` in
@@ -202,25 +208,76 @@ impl QueryEngine {
             .await
     }
 
-    async fn resolve_and_merge(
+    /// Prefetches every selector `plan_selectors` reported: one shared
+    /// snapshot resolved against the union of every selector's own fetch
+    /// window (`padded_range`, docs/query-engine.md), then one
+    /// concurrency-bounded, independently budget-checked fetch+merge per
+    /// selector's own matchers against that snapshot. A selector's fetch
+    /// only prunes by its own matchers server-side; a later
+    /// `SeriesSource::query` call still clips to its own window, so
+    /// combining every selector's already-merged series into one flat
+    /// source is correct regardless of how widely the selectors' windows
+    /// or matchers differ. An empty plan list (a query with no selectors,
+    /// e.g. a bare scalar or string literal) skips storage entirely.
+    async fn prefetch(
         &self,
         tenant_hash: TenantHash,
-        matchers: &[LabelMatcher],
-        window: TimeRange,
+        plans: &[SelectorPlan],
+        eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
     ) -> Result<MergedSource, QueryError> {
+        if plans.is_empty() {
+            return Ok(MergedSource { series: Vec::new() });
+        }
+
+        let windows: Vec<TimeRange> = plans
+            .iter()
+            .map(|plan| selector_fetch_window(plan, eval_window))
+            .collect::<Result<_, _>>()?;
+        let mut padded = windows[0];
+        for w in &windows[1..] {
+            padded.start_ns = padded.start_ns.min(w.start_ns);
+            padded.end_ns = padded.end_ns.max(w.end_ns);
+        }
+
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
+        let concurrency = self.config.fetch_concurrency.max(1);
         let attempt = |snapshot: Snapshot| async move {
-            let fetched = self
-                .fetch_all_samples_soa(tenant_hash, &snapshot, matchers)
-                .await?;
-            let series = merge_soa_runs(fetched, max_series, max_samples)?;
-            Ok(MergedSource { series })
+            // Owned clones, not borrowed slice items: a closure capturing a
+            // reference into `plans` through this combinator chain makes
+            // rustc infer a fixed (non-higher-ranked) lifetime for the
+            // closure, which later fails to unify with axum's `Handler`
+            // blanket impl ("implementation of FnOnce is not general
+            // enough") at the router call site in `http/mod.rs`. Cloning
+            // each `SelectorPlan` into the future sidesteps that entirely.
+            let results: Vec<Result<Vec<SeriesData>, QueryError>> = stream::iter(plans.to_vec())
+                .map(|plan| {
+                    let snapshot = &snapshot;
+                    async move {
+                        let fetched = self
+                            .fetch_all_samples_soa(tenant_hash, snapshot, &plan.matchers)
+                            .await?;
+                        merge_soa_runs(fetched, max_series, max_samples)
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+            let mut combined: HashMap<LabelSet, SeriesData> = HashMap::new();
+            for r in results {
+                for series in r? {
+                    combined.entry(series.labels.clone()).or_insert(series);
+                }
+            }
+            Ok(MergedSource {
+                series: combined.into_values().collect(),
+            })
         };
 
-        self.resolve_snapshot_with_retry(tenant_hash, window, min_tokens, now_ns, attempt)
+        self.resolve_snapshot_with_retry(tenant_hash, padded, min_tokens, now_ns, attempt)
             .await
     }
 
@@ -349,12 +406,11 @@ impl QueryEngine {
     }
 }
 
-fn range_fetch_window(
-    start_ns: i64,
-    end_ns: i64,
-    step_ns: i64,
-    offset_ns: i64,
-) -> Result<TimeRange, QueryError> {
+/// The last evaluation-grid instant `<= end_ns`, starting at `start_ns` and
+/// stepping by `step_ns`. Mirrors `ravel_promql::eval`'s own per-step range
+/// grid (`while t <= end_ns { ...; t += step_ns }`) exactly, so the fetch
+/// window computed from it lines up with what evaluation will request.
+fn last_grid_ns(start_ns: i64, end_ns: i64, step_ns: i64) -> Result<i64, QueryError> {
     let span = end_ns
         .checked_sub(start_ns)
         .ok_or(QueryError::TimeOverflow)?;
@@ -362,20 +418,51 @@ fn range_fetch_window(
     let step_span = num_steps
         .checked_mul(step_ns)
         .ok_or(QueryError::TimeOverflow)?;
-    let last_grid_ns = start_ns
+    start_ns
         .checked_add(step_span)
-        .ok_or(QueryError::TimeOverflow)?;
-    let sel_start = start_ns
-        .checked_sub(offset_ns)
-        .ok_or(QueryError::TimeOverflow)?;
-    let sel_end = last_grid_ns
-        .checked_sub(offset_ns)
-        .ok_or(QueryError::TimeOverflow)?;
+        .ok_or(QueryError::TimeOverflow)
+}
+
+/// Translates one selector's plan (`range_ns`/`offset_ns`/`anchor`) into the
+/// concrete window to fetch for it, for either an instant or a range query.
+/// `PlanAnchor::Pinned` is already offset-adjusted and constant regardless
+/// of the grid; `PlanAnchor::Window` shifts by `offset_ns` off the ambient
+/// evaluation instant(s) (docs/query-engine.md "padded_range").
+fn selector_fetch_window(
+    plan: &SelectorPlan,
+    eval_window: &EvalWindow,
+) -> Result<TimeRange, QueryError> {
+    let (sel_start_ns, sel_end_ns) = match (&plan.anchor, eval_window) {
+        (PlanAnchor::Pinned(ts), _) => (*ts, *ts),
+        (PlanAnchor::Window, EvalWindow::Instant { t_ns }) => {
+            let sel_ts = t_ns
+                .checked_sub(plan.offset_ns)
+                .ok_or(QueryError::TimeOverflow)?;
+            (sel_ts, sel_ts)
+        }
+        (
+            PlanAnchor::Window,
+            EvalWindow::Range {
+                start_ns,
+                end_ns,
+                step_ns,
+            },
+        ) => {
+            let last_ns = last_grid_ns(*start_ns, *end_ns, *step_ns)?;
+            let sel_start = start_ns
+                .checked_sub(plan.offset_ns)
+                .ok_or(QueryError::TimeOverflow)?;
+            let sel_end = last_ns
+                .checked_sub(plan.offset_ns)
+                .ok_or(QueryError::TimeOverflow)?;
+            (sel_start, sel_end)
+        }
+    };
     Ok(TimeRange {
-        start_ns: sel_start
-            .checked_sub(DEFAULT_LOOKBACK_NS)
+        start_ns: sel_start_ns
+            .checked_sub(plan.range_ns)
             .ok_or(QueryError::TimeOverflow)?,
-        end_ns: sel_end,
+        end_ns: sel_end_ns,
     })
 }
 
@@ -1148,5 +1235,241 @@ mod merge_tests {
             let want = values.iter().map(|v| v.to_bits()).max().expect("non-empty");
             prop_assert_eq!(winner_bits(segments), want);
         }
+    }
+}
+
+/// Exercises `QueryEngine::prefetch` directly with a hand-built, multi-entry
+/// `SelectorPlan` list (ADR-0021 P2): the current evaluator grammar can only
+/// ever produce 0 or 1 plans from real query text (`plan_selectors`'s doc
+/// comment: it deliberately walks constructs the evaluator still rejects,
+/// e.g. `Expr::Binary`, so a query like `a + b` already yields two plans
+/// today even though evaluating it fails with `Unsupported`). These tests
+/// go around `plan_selectors` and call `prefetch` with plans built by hand,
+/// so the multi-selector fetch/merge path is verified independent of which
+/// future phase grows the evaluator to actually emit such plans.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod prefetch_tests {
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_promql::MatchOp;
+    use ravel_segment::{
+        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment,
+    };
+    use ravel_types::{Label, TenantId};
+    use uuid::Uuid;
+
+    use super::*;
+
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
+    const BASE_NS: i64 = 1_700_000_000_000_000_000;
+    // Matches `ravel_promql::eval::DEFAULT_LOOKBACK_NS`, not exported from
+    // that crate; a hand-built plan has to supply its own range_ns.
+    const DEFAULT_LOOKBACK_NS: i64 = 5 * NS_PER_MIN;
+
+    fn labels(metric: &str) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    fn name_matcher(metric: &str) -> LabelMatcher {
+        LabelMatcher {
+            name: METRIC_NAME_LABEL.to_string(),
+            op: MatchOp::Eq,
+            value: metric.to_string(),
+        }
+    }
+
+    fn window_plan(metric: &str) -> SelectorPlan {
+        SelectorPlan {
+            matchers: vec![name_matcher(metric)],
+            range_ns: DEFAULT_LOOKBACK_NS,
+            offset_ns: 0,
+            anchor: PlanAnchor::Window,
+        }
+    }
+
+    /// Writes one real RSEG segment (one series per metric) and publishes
+    /// its commit record, mirroring `tests/e2e.rs`'s own helper.
+    async fn publish_metric(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        metric: &str,
+        ts_ns: i64,
+        value: f64,
+    ) {
+        let series_id =
+            SeriesId::compute(&TenantId::new("acme"), metric, &labels(metric)).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels: labels(metric),
+            samples: vec![Sample { ts_ns, value }],
+        }];
+        let writer_id = Uuid::new_v4();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written: WrittenSegment =
+            SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: BASE_NS,
+            ingest_hour_bucket: hour_bucket,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    fn engine(store: Arc<MemoryStore>) -> QueryEngine {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default())
+    }
+
+    /// Two selectors for two disjoint metrics: the merged source must
+    /// contain both series with their own correct samples, proving
+    /// `prefetch` resolves one shared snapshot and fetches+merges each
+    /// selector's own matchers into a single combined result rather than
+    /// only covering the first plan.
+    #[tokio::test]
+    async fn multi_selector_prefetch_combines_both_selectors_series() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+
+        let ts_a = BASE_NS - NS_PER_MIN;
+        let ts_b = BASE_NS - 2 * NS_PER_MIN;
+        publish_metric(&store, tenant_hash, 1, "metric_a", ts_a, 10.0).await;
+        publish_metric(&store, tenant_hash, 2, "metric_b", ts_b, 20.0).await;
+
+        let eng = engine(Arc::clone(&store));
+        let plans = vec![window_plan("metric_a"), window_plan("metric_b")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let source = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch must succeed across both selectors");
+
+        let window = TimeRange {
+            start_ns: BASE_NS - NS_PER_MIN * 10,
+            end_ns: BASE_NS,
+        };
+        let a = source
+            .query(&[name_matcher("metric_a")], window)
+            .expect("query metric_a");
+        assert_eq!(a.len(), 1, "metric_a's series must have been prefetched");
+        assert_eq!(
+            a[0].samples,
+            vec![Sample {
+                ts_ns: ts_a,
+                value: 10.0
+            }]
+        );
+
+        let b = source
+            .query(&[name_matcher("metric_b")], window)
+            .expect("query metric_b");
+        assert_eq!(b.len(), 1, "metric_b's series must have been prefetched");
+        assert_eq!(
+            b[0].samples,
+            vec![Sample {
+                ts_ns: ts_b,
+                value: 20.0
+            }]
+        );
+    }
+
+    /// A selector's own matcher isolates its fetch: querying the merged
+    /// source with only `metric_a`'s matcher must never return `metric_b`'s
+    /// series, even though `prefetch` resolved one shared snapshot covering
+    /// both.
+    #[tokio::test]
+    async fn multi_selector_prefetch_keeps_each_selectors_series_isolated_by_matcher() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let ts = BASE_NS - NS_PER_MIN;
+        publish_metric(&store, tenant_hash, 1, "metric_a", ts, 1.0).await;
+        publish_metric(&store, tenant_hash, 2, "metric_b", ts, 2.0).await;
+
+        let eng = engine(Arc::clone(&store));
+        let plans = vec![window_plan("metric_a"), window_plan("metric_b")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let source = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch");
+
+        let window = TimeRange {
+            start_ns: BASE_NS - NS_PER_MIN * 10,
+            end_ns: BASE_NS,
+        };
+        let only_a = source
+            .query(&[name_matcher("metric_a")], window)
+            .expect("query metric_a");
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].labels, labels("metric_a"));
+    }
+
+    /// An empty plan list (a query with no selectors, e.g. a bare scalar
+    /// literal) must skip storage entirely rather than resolve a snapshot
+    /// or fetch anything.
+    #[tokio::test]
+    async fn empty_plan_list_skips_storage_and_returns_an_empty_source() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let eng = engine(store);
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let source = eng
+            .prefetch(tenant_hash, &[], &eval_window, &[], BASE_NS)
+            .await
+            .expect("empty plan list must not error");
+        let window = TimeRange {
+            start_ns: BASE_NS - NS_PER_MIN,
+            end_ns: BASE_NS,
+        };
+        assert!(
+            source
+                .query(&[], window)
+                .expect("query empty source")
+                .is_empty(),
+            "no plans means no series, regardless of matchers"
+        );
     }
 }

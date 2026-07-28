@@ -12,9 +12,7 @@ use ravel_types::{LabelSet, SeriesId, TimeRange};
 
 use crate::engine::parse_match_selector;
 use crate::http::error::ApiError;
-use crate::http::json::{
-    ApiResponse, instant_vector_to_json, range_matrix_to_json, series_to_json,
-};
+use crate::http::json::{ApiResponse, instant_value_to_json, range_value_to_json, series_to_json};
 use crate::http::params::{Params, decode_commit_tokens, parse_deadline, parse_timestamp_ms};
 use crate::http::{AppState, ONE_HOUR_NS};
 
@@ -84,11 +82,11 @@ async fn handle_query(
     let min_tokens = decode_commit_tokens(params.all("min_commit_token"))?;
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
 
-    let vector = state
+    let value = state
         .engine
         .instant(tenant_hash, query, time_ms, &min_tokens, now, deadline)
         .await?;
-    Ok(instant_vector_to_json(vector))
+    instant_value_to_json(value, time_ms)
 }
 
 pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -114,7 +112,7 @@ async fn handle_query_range(
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
     let now = now_ns();
 
-    let matrix = state
+    let value = state
         .engine
         .range(
             tenant_hash,
@@ -127,7 +125,7 @@ async fn handle_query_range(
             deadline,
         )
         .await?;
-    Ok(range_matrix_to_json(matrix))
+    range_value_to_json(value, start_ms, end_ms, step_ms)
 }
 
 fn parse_duration_ms_field(params: &Params) -> Result<i64, ApiError> {
