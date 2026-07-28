@@ -26,6 +26,10 @@ pub const DEFAULT_HEAD_CACHE_TTL_NS: i64 = 30 * 1_000_000_000;
 /// content-addressed and immutable, so this cache never invalidates on
 /// write, only evicts by capacity.
 pub const DEFAULT_SNAPSHOT_CACHE_PARTS: usize = 32;
+/// Default bound on decoded name-postings objects cached per tenant (P5b).
+/// Postings objects are content-addressed and immutable, same eviction
+/// rationale as [`DEFAULT_SNAPSHOT_CACHE_PARTS`].
+pub const DEFAULT_POSTINGS_CACHE_ENTRIES: usize = 32;
 
 /// Catalog configuration.
 ///
@@ -76,6 +80,9 @@ pub struct CatalogConfig {
     /// decompressed body size at decode time (docs/metric-index-plan.md
     /// 3.3). Default [`snapshot_format::DEFAULT_MAX_POSTINGS_BYTES`].
     pub max_postings_bytes: u64,
+    /// Bound on decoded name-postings objects cached per tenant (P5b).
+    /// Default [`DEFAULT_POSTINGS_CACHE_ENTRIES`].
+    pub postings_cache_entries: usize,
 }
 
 impl Default for CatalogConfig {
@@ -91,6 +98,7 @@ impl Default for CatalogConfig {
             snapshot_cache_parts: DEFAULT_SNAPSHOT_CACHE_PARTS,
             max_snapshot_part_bytes: snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
             max_postings_bytes: snapshot_format::DEFAULT_MAX_POSTINGS_BYTES,
+            postings_cache_entries: DEFAULT_POSTINGS_CACHE_ENTRIES,
         }
     }
 }
