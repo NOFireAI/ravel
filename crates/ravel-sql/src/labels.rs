@@ -64,8 +64,8 @@ pub fn lookup_label(labels: &ArrayRef, key: &str) -> Result<StringArray, SqlErro
             out.append_null();
             continue;
         }
-        let k = dict.keys().value(i) as usize;
-        match entry_values.get(k).and_then(|v| v.as_deref()) {
+        let k = resolve_key(dict.keys().value(i), entry_values.len())?;
+        match entry_values[k].as_deref() {
             Some(v) => out.append_value(v),
             None => out.append_null(),
         }
@@ -112,10 +112,29 @@ pub fn eval_matcher(labels: &ArrayRef, matcher: &LabelMatcher) -> Result<Boolean
             out.append_value(false);
             continue;
         }
-        let k = dict.keys().value(i) as usize;
-        out.append_value(entry_match.get(k).copied().unwrap_or(false));
+        let k = resolve_key(dict.keys().value(i), entry_match.len())?;
+        out.append_value(entry_match[k]);
     }
     Ok(out.finish())
+}
+
+/// Resolve a dictionary key into a valid index into the `len` distinct
+/// entries. A negative key (via `usize::try_from`) or an index `>= len` is a
+/// corrupt column, so it becomes a typed `SqlError::Internal` rather than a
+/// silent "absent label" / "no match". This mirrors the sibling decoder in
+/// `output.rs`, which rejects the identical condition on the same
+/// `Dictionary(Int32, Map)` column, so both decoders fail loudly and in the
+/// same way. Callers handle a null dictionary row before calling this, since a
+/// null row is legitimately "no series", not corruption.
+fn resolve_key(key: i32, len: usize) -> Result<usize, SqlError> {
+    let k = usize::try_from(key)
+        .map_err(|_| SqlError::Internal(format!("negative dictionary key {key}")))?;
+    if k >= len {
+        return Err(SqlError::Internal(format!(
+            "dictionary key {k} out of range for {len} entries"
+        )));
+    }
+    Ok(k)
 }
 
 /// Look up `key` in the `row`-th map entry of `maps`.
@@ -213,6 +232,21 @@ mod tests {
         let neg = eval_matcher(&labels, &nm).unwrap();
         assert!(!neg.value(0));
         assert!(neg.value(2), "absent-host series matches the negation");
+    }
+
+    #[test]
+    fn out_of_range_key_is_typed_error_not_absent() {
+        // Arrow's safe DictionaryArray constructors (`try_new`,
+        // `ArrayDataBuilder::build`) validate key bounds, so a corrupt key is
+        // unconstructible through safe APIs and cannot be driven end to end
+        // without `unsafe`, which is denied workspace-wide. resolve_key is the
+        // guard both lookup_label and eval_matcher call on every non-null row;
+        // test it directly. A negative key and an out-of-range positive key
+        // must each be a typed Internal error, never silently coerced to
+        // "absent"; a valid key resolves.
+        assert!(matches!(resolve_key(-1, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(4, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(3, 4), Ok(3)));
     }
 
     #[test]
