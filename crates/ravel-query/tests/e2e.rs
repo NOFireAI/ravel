@@ -505,7 +505,7 @@ async fn exceeding_max_series_budget_returns_422() {
 }
 
 #[tokio::test]
-async fn identity_mismatch_between_commit_record_and_footer_returns_503() {
+async fn identity_mismatch_between_commit_record_and_footer_returns_500() {
     let store = Arc::new(MemoryStore::new());
     let tid = tenant("tenant-a");
     let th = tid.hash();
@@ -543,13 +543,16 @@ async fn identity_mismatch_between_commit_record_and_footer_returns_503() {
     );
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // Identity mismatch is a permanent data-integrity fault, not a transient
+    // outage: it maps to the non-retryable 500 `internal`, not 503 (a7-F05,
+    // #62). A retry re-reads the same mismatched objects and never clears.
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["status"], "error");
-    assert_eq!(body["errorType"], "unavailable");
+    assert_eq!(body["errorType"], "internal");
 }
 
 #[tokio::test]
-async fn corrupt_segment_bytes_return_503_not_wrong_data() {
+async fn corrupt_segment_bytes_return_500_not_wrong_data() {
     let store = Arc::new(MemoryStore::new());
     let tid = tenant("tenant-a");
     let th = tid.hash();
@@ -599,9 +602,12 @@ async fn corrupt_segment_bytes_return_503_not_wrong_data() {
     );
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // Corrupt stored bytes are a permanent server-side data fault: the query
+    // fails closed (never wrong data) with the non-retryable 500 `internal`,
+    // not the retryable 503 (a7-F05, #62).
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["status"], "error");
-    assert_eq!(body["errorType"], "unavailable");
+    assert_eq!(body["errorType"], "internal");
 }
 
 #[tokio::test]
