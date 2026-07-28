@@ -1,5 +1,15 @@
 // RSEG footer metadata. Persistent contract: field numbers are frozen.
-// Unknown fields and unknown section kinds must be preserved/skipped by readers.
+// Readers skip unknown fields and unknown section kinds: an object written by
+// a newer writer still decodes, and a section whose kind is not in SectionKind
+// is ignored rather than rejected. Unknown fields are NOT preserved. The
+// generated Rust types (crates/ravel-proto) come from prost, which has no
+// unknown-field storage, so decoding and re-encoding a message drops every
+// field this schema does not name. Any component that rewrites a footer
+// (compaction, a migration, a repair tool) must therefore treat this schema as
+// fully known and build the new value explicitly, never by round-tripping a
+// decoded one. If unknown-field preservation is genuinely needed later, it is
+// an explicit format-change decision recorded in an ADR, not a guarantee a
+// reader may assume today.
 syntax = "proto3";
 
 package ravel.segment.v1;
