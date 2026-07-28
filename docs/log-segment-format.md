@@ -441,9 +441,12 @@ proves absent.
 - Regex/substring predicates consult blooms only when the planner can
   extract word literals that any match must contain; otherwise only
   time/stream/min-max pruning applies and the scan evaluates exactly.
-- A missing or corrupt SKIP_IDX or BLOOM section degrades to scanning
-  (no pruning) and surfaces a counter, never wrong results. Corrupt
-  BLOCKS data is a loud `Corrupted` error.
+- A missing or corrupt BLOOM section degrades to scanning without bloom
+  pruning and surfaces a counter, never wrong results. A corrupt or
+  undecodable SKIP_IDX is a loud `Corrupted` error, not a degrade: its
+  level-0 entries are the only source of block byte ranges and per-block
+  checksums, so without it blocks cannot be located at all. Corrupt
+  BLOCKS data is likewise a loud `Corrupted` error.
 
 ## Validation summary
 
