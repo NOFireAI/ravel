@@ -1,0 +1,57 @@
+// RLOG v1 log-segment footer metadata. Persistent contract: field numbers are
+// frozen and only additive changes with new field numbers are permitted
+// (ADR-0029, docs/log-segment-format.md). Readers skip unknown fields and
+// unknown section kinds, so an object written by a newer writer still decodes.
+// Unknown fields are NOT preserved: the generated prost types have no
+// unknown-field storage, so decoding and re-encoding a message drops every
+// field this schema does not name. Any component that rewrites a footer must
+// build the new value explicitly, never by round-tripping a decoded one.
+syntax = "proto3";
+
+package ravel.logseg.v1;
+
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_LZ4 = 1;
+  COMPRESSION_ZSTD = 2;
+}
+
+// Section kinds; values are part of the format. See
+// docs/log-segment-format.md. Unknown kinds (any value not listed here) MUST
+// be skipped by readers.
+enum SectionKind {
+  SECTION_KIND_UNSPECIFIED = 0;
+  SECTION_KIND_STREAM_DIR = 1;
+  SECTION_KIND_FIELD_DIR = 2;
+  SECTION_KIND_BLOCKS = 3;
+  SECTION_KIND_SKIP_IDX = 4;
+  SECTION_KIND_BLOOM = 5;
+}
+
+message Section {
+  uint32 kind = 1;            // SectionKind; unknown kinds skipped
+  uint64 offset = 2;          // from object start
+  uint64 len = 3;             // stored (possibly compressed) length
+  fixed32 crc32c = 4;         // over stored bytes
+  Compression comp = 5;
+  uint64 uncompressed_len = 6;
+}
+
+message LogFooter {
+  bytes tenant_hash = 1;      // 16 bytes
+  uint32 shard = 2;
+  bytes writer_id = 3;        // 16 bytes
+  uint64 writer_epoch = 4;
+  uint64 writer_seq = 5;
+
+  // Summary (skip index level 2): whole-object bounds and counts.
+  sfixed64 min_ts_ns = 6;
+  sfixed64 max_ts_ns = 7;
+  sfixed64 min_observed_ts_ns = 8;
+  sfixed64 max_observed_ts_ns = 9;
+  uint64 record_count = 10;
+  uint64 block_count = 11;
+  uint64 stream_count = 12;
+
+  repeated Section sections = 13;
+}
