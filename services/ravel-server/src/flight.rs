@@ -1,37 +1,92 @@
 //! Flight SQL registration on the gRPC listener, compiled only under the
 //! `flight-sql` feature.
 //!
-//! Ticket C1a (issue #149) wires the dependency and the feature flag; there is
-//! no protocol logic here yet. The service registered below answers every RPC
-//! with `unimplemented`, which is what arrow-flight's `FlightSqlService`
-//! default methods do: the point is to prove the binary links arrow-flight,
-//! registers a Flight service on the same tonic server as OTLP, and starts.
+//! Ticket C1d (issue #152) replaces C1a's `UnimplementedFlightSqlService` stub
+//! with the real service from `ravel_sql::flight`. This module is only the
+//! wiring: it adapts the two deployment-owned things ravel-sql states as
+//! traits -- the authoritative request identity and the injected clock -- and
+//! hands them to [`RavelFlightSqlService`] together with the same
+//! `SqlExecutor`, clock, and deadline ceiling `SqlState` already carries for
+//! `POST /api/v1/sql`.
 //!
-//! Issue #152 replaces [`UnimplementedFlightSqlService`] with the real service
-//! from `ravel_sql::flight`, which executes through the same per-query
-//! `SessionContext` the HTTP SQL endpoint uses.
+//! Sharing the executor is the point, not an optimization: the per-tenant
+//! memory accountants live inside it, so a tenant that runs one query over
+//! HTTP and one over Flight accounts both against one tenant budget. Two
+//! executors would give the same tenant two independent budgets.
+//!
+//! Nothing here decides anything about the protocol. Tenant resolution reuses
+//! [`crate::flight_auth`], which reuses the OTLP gRPC path's
+//! metadata-to-header translation, so all three transports reject the same
+//! inputs the same way.
+
+use std::sync::Arc;
 
 use arrow_flight::flight_service_server::FlightServiceServer;
-use arrow_flight::sql::SqlInfo;
-use arrow_flight::sql::server::FlightSqlService;
+use ravel_ingest::Clock;
+use ravel_query::http::TenantResolver;
+use ravel_sql::{FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService};
+use ravel_types::{CommitToken, TenantHash};
+use tonic::Status;
+use tonic::metadata::MetadataMap;
 
-/// A Flight SQL service that implements no method.
+use crate::flight_auth;
+use crate::sql::SqlState;
+
+/// Resolves the authoritative tenant and read-your-write tokens for a Flight
+/// SQL request from its gRPC metadata.
 ///
-/// Every RPC falls through to arrow-flight's default trait bodies, which
-/// return `Status::unimplemented`. `register_sql_info` is the one required
-/// method, and it records nothing because there is no SQL-info catalog to
-/// record into until issue #152.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnimplementedFlightSqlService;
-
-#[tonic::async_trait]
-impl FlightSqlService for UnimplementedFlightSqlService {
-    type FlightService = Self;
-
-    async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+/// The deployment's [`TenantResolver`] is the only authority. ravel-sql never
+/// sees a credential and never reads a tenant from a ticket.
+pub struct ResolverFlightAuth {
+    tenant_resolver: Arc<dyn TenantResolver>,
 }
 
-/// Builds the Flight service to register on the gRPC server.
-pub fn service() -> FlightServiceServer<UnimplementedFlightSqlService> {
-    FlightServiceServer::new(UnimplementedFlightSqlService)
+impl FlightAuth for ResolverFlightAuth {
+    fn tenant(&self, metadata: &MetadataMap) -> Result<TenantHash, Status> {
+        flight_auth::resolve_tenant(self.tenant_resolver.as_ref(), metadata)
+    }
+
+    fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
+        flight_auth::min_commit_tokens(metadata)
+    }
+}
+
+/// Adapts the process's [`ravel_ingest::Clock`] to ravel-sql's
+/// [`FlightClock`].
+///
+/// ravel-sql states the one-method clock contract itself rather than linking
+/// ravel-ingest across the ADR-0013 boundary, so the deployment bridges the
+/// two here, once.
+pub struct IngestClock {
+    clock: Arc<dyn Clock>,
+}
+
+impl FlightClock for IngestClock {
+    fn now_ns(&self) -> i64 {
+        self.clock.now_ns()
+    }
+}
+
+/// Builds the Flight SQL service to register on the gRPC server.
+///
+/// `max_deadline` comes from `SqlState`, so a Flight query and an HTTP query
+/// are bounded by the same server ceiling; the GC protection horizon and the
+/// default event-time window take ravel-sql's documented defaults.
+pub fn service(state: &SqlState) -> FlightServiceServer<RavelFlightSqlService> {
+    let auth = Arc::new(ResolverFlightAuth {
+        tenant_resolver: Arc::clone(&state.tenant_resolver),
+    });
+    let clock = Arc::new(IngestClock {
+        clock: Arc::clone(&state.clock),
+    });
+    let config = FlightSqlConfig {
+        max_deadline: state.max_deadline,
+        ..FlightSqlConfig::default()
+    };
+    FlightServiceServer::new(RavelFlightSqlService::new(
+        Arc::clone(&state.executor),
+        auth,
+        clock,
+        config,
+    ))
 }
