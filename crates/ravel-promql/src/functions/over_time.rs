@@ -247,6 +247,7 @@ pub(crate) fn absent_over_time_instant(
     vec![InstantSample {
         labels: absent_labels(vs),
         ts_ns: eval_ts_ns,
+        orig_sample_ts_ns: eval_ts_ns,
         value: 1.0,
     }]
 }

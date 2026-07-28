@@ -72,10 +72,21 @@ pub fn ns_to_ms_floor(ns: i64) -> i64 {
 /// the query's evaluation time, never the offset/`@`-shifted lookup time
 /// used to pick the sample: Prometheus reports the query timestamp
 /// regardless of any `offset` or `@` on the selector.
+///
+/// `orig_sample_ts_ns` is the timestamp the underlying sample actually
+/// carries in storage. It equals `ts_ns` everywhere except a direct vector
+/// selector read (`Evaluator::eval_vector_selector`), where it is the
+/// picked sample's own (possibly offset/`@`-shifted-lookback, possibly
+/// older-than-`ts_ns`) timestamp. Every function that builds its own output
+/// samples resets it back to `ts_ns` (`timestamp()` is the only function
+/// that reads it), matching Prometheus, which only special-cases
+/// `timestamp()` applied directly to a bare vector selector and otherwise
+/// always reports the evaluation time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstantSample {
     pub labels: LabelSet,
     pub ts_ns: i64,
+    pub orig_sample_ts_ns: i64,
     pub value: f64,
 }
 
@@ -134,6 +145,10 @@ pub enum Error {
         expected: &'static str,
         got: &'static str,
     },
+    #[error("invalid destination label name {label:?}")]
+    InvalidLabelName { label: String },
+    #[error("invalid regular expression {pattern:?}: {reason}")]
+    InvalidRegex { pattern: String, reason: String },
 }
 
 /// Default PromQL lookback: 5 minutes, in nanoseconds (ADR-0007). This is
@@ -416,10 +431,13 @@ impl Evaluator {
         let series = source.query(&selector_matchers, window)?;
         let mut out = Vec::with_capacity(series.len());
         for s in series {
-            if let Some(value) = pick_sample(&s.samples, sel_ts_ns, self.lookback_delta_ns) {
+            if let Some((value, orig_sample_ts_ns)) =
+                pick_sample(&s.samples, sel_ts_ns, self.lookback_delta_ns)
+            {
                 out.push(InstantSample {
                     labels: s.labels,
                     ts_ns: eval_ts_ns,
+                    orig_sample_ts_ns,
                     value,
                 });
             }
@@ -520,7 +538,9 @@ impl Evaluator {
         for s in series {
             let mut samples = Vec::new();
             for (reported_ts, sel_ts) in &grid {
-                if let Some(value) = pick_sample(&s.samples, *sel_ts, self.lookback_delta_ns) {
+                if let Some((value, _orig_sample_ts_ns)) =
+                    pick_sample(&s.samples, *sel_ts, self.lookback_delta_ns)
+                {
                     samples.push(Sample {
                         ts_ns: *reported_ts,
                         value: if negate { -value } else { value },
@@ -790,6 +810,7 @@ fn negate_vector(v: InstantVector) -> InstantVector {
         .map(|s| InstantSample {
             labels: drop_metric_name(s.labels),
             ts_ns: s.ts_ns,
+            orig_sample_ts_ns: s.ts_ns,
             value: -s.value,
         })
         .collect()
@@ -864,7 +885,13 @@ fn step_count(start_ns: i64, end_ns: i64, step_ns: i64) -> u64 {
 /// ([`STALE_NAN_BITS`]) the series is absent from that sample forward, so
 /// this returns `None`. A later real sample supersedes the marker and is
 /// picked normally; markers older than the selected sample are irrelevant.
-fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Option<f64> {
+///
+/// Returns `(value, orig_sample_ts_ns)`: the picked value alongside the
+/// picked sample's own timestamp (`timestamp()`'s
+/// [`InstantSample::orig_sample_ts_ns`] needs the real stored timestamp,
+/// which may differ from `sel_ts_ns` since the lookback rule picks the most
+/// recent sample at or before it, not necessarily one exactly at it).
+fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Option<(f64, i64)> {
     let idx = samples.partition_point(|s| s.ts_ns <= sel_ts_ns);
     if idx == 0 {
         return None;
@@ -888,7 +915,7 @@ fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Op
     if best_bits == STALE_NAN_BITS {
         return None;
     }
-    Some(f64::from_bits(best_bits))
+    Some((f64::from_bits(best_bits), candidate_ts_ns))
 }
 
 /// Build the full matcher list for a vector selector, including the
@@ -1222,7 +1249,7 @@ mod tests {
     #[test]
     fn unsupported_constructs_name_the_rejected_node() {
         let cases: &[(&str, &str)] = &[
-            ("abs(up)", "abs"),
+            ("sort_by_label(up)", "sort_by_label"),
             ("sum(up)", "sum"),
             ("up + down", "binary expression"),
             ("up[5m:1m]", "subquery"),
