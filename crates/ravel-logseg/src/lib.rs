@@ -12,6 +12,7 @@
 //! bytes as untrusted and returns [`LogSegError`] on any violation, never
 //! panicking.
 
+pub mod bloom;
 pub mod error;
 pub mod tokenizer;
 pub mod varint;
