@@ -183,4 +183,16 @@ pub enum SegmentError {
     HistogramReservedFlagsNonZero,
     #[error("histogram count is inconsistent with zero_count and its bucket counts")]
     HistogramCountInconsistent,
+
+    // --- RSEG v4 only (ADR-0018, docs/compaction-retention-plan.md section
+    // 4): run-major SERIES_META decode. v1/v2/v3 objects never produce
+    // these. ---
+    #[error("SERIES_META run_count is zero for a series")]
+    ZeroRunCount,
+    #[error(
+        "SERIES_META run_count column sums to {run_count_sum}, but the run_total header is {run_total}"
+    )]
+    RunCountSumMismatch { run_count_sum: u64, run_total: u64 },
+    #[error("SERIES_META run provenance/bounds arithmetic overflowed i64")]
+    ProvenanceBoundsOverflow,
 }

@@ -20,15 +20,18 @@ pub use format::ReaderLimits;
 pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
-    FooterLocation, FooterOutcome, PlannedRange, SeriesEntry, ValPageKind, ValueKind,
-    decode_catalog, decode_catalog_matching, decode_catalog_matching_v2,
-    decode_catalog_matching_v3, decode_catalog_v2, decode_catalog_v3, decode_histogram_pages,
-    decode_pages, decode_pages_soa, open_from_full, open_from_suffix, parse_footer, plan_ranges,
-    plan_ranges_v3, select, validate_sections,
+    FooterLocation, FooterOutcome, PlannedRange, PlannedRunRange, RunEntry, SeriesEntry,
+    SeriesEntryV4, ValPageKind, ValueKind, decode_catalog, decode_catalog_matching,
+    decode_catalog_matching_v2, decode_catalog_matching_v3, decode_catalog_matching_v4,
+    decode_catalog_v2, decode_catalog_v3, decode_catalog_v4, decode_histogram_pages, decode_pages,
+    decode_pages_soa, decode_run_histogram_pages, decode_run_pages_soa, open_from_full,
+    open_from_suffix, parse_footer, plan_ranges, plan_ranges_v3, plan_ranges_v4, select,
+    validate_sections,
 };
 pub use writer::{
-    HistogramSample, IngestBounds, SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput,
-    SeriesInputV3, SeriesValues, WrittenSegment,
+    CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity,
+    SegmentSummary, SegmentWriter, SeriesInput, SeriesInputV3, SeriesInputV4, SeriesValues,
+    WrittenSegment,
 };
 
 pub use ravel_proto::segment::v1::Footer;
