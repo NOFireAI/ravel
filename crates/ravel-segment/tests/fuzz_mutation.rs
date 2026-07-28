@@ -22,10 +22,16 @@
 
 use proptest::prelude::*;
 use ravel_segment::{
-    ReaderLimits, SegmentError, SeriesEntry, ValueKind, decode_catalog, decode_catalog_v2,
-    decode_catalog_v3, decode_histogram_pages, decode_pages, open_from_full, parse_footer,
-    plan_ranges, plan_ranges_v3,
+    CompactionMetaV4, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue,
+    IngestBounds, ReaderLimits, ResetHint, RunInputV4, RunValuePageV4, SegmentError,
+    SegmentIdentity, SegmentWriter, SeriesEntry, SeriesEntryV4, SeriesInput, SeriesInputV3,
+    SeriesInputV4, SeriesValues, ValueKind, decode_catalog, decode_catalog_v2, decode_catalog_v3,
+    decode_catalog_v4, decode_histogram_pages, decode_pages, decode_run_histogram_pages,
+    decode_run_pages_soa, open_from_full, parse_footer, plan_ranges, plan_ranges_v3,
+    plan_ranges_v4,
 };
+use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
+use std::sync::OnceLock;
 
 // Golden fixtures reused as fuzz seeds: the same frozen-format objects the
 // golden-bytes regression tests pin. One v1 object, the full v2 set, and
@@ -48,7 +54,15 @@ use ravel_segment::{
 // rather than fixed. This harness pins the current, correct reader
 // behaviour on the frozen bytes instead of asserting a clean decode that
 // would not reflect reality.
-const SEEDS: &[&[u8]] = &[
+//
+// v4 (ADR-0018, docs/compaction-retention-plan.md section 4) has no golden
+// fixture file: unlike v1-v3, its section bytes cannot be hand-assembled
+// byte-for-byte independent of the writer, since every run's TS/VAL/HIST
+// page must be a verbatim, page-crc-valid copy from a real source segment
+// (writer.rs's own precedent, `histogram_run_reuses_real_v3_hist_page_
+// bytes_verbatim`). `v4_seeds` builds a handful of real v4 objects at
+// runtime instead and appends them after the static seeds (see `seed`).
+const STATIC_SEEDS: &[&[u8]] = &[
     include_bytes!("fixtures/golden_v1_a3.bin"),
     include_bytes!("fixtures/golden_v2_empty.bin"),
     include_bytes!("fixtures/golden_v2_one_sample.bin"),
@@ -115,6 +129,9 @@ fn full_decode(bytes: &[u8]) -> Result<usize, SegmentError> {
     if loc.version == 3 {
         return full_decode_v3(bytes, limits);
     }
+    if loc.version == 4 {
+        return full_decode_v4(bytes, limits);
+    }
     let entries = match loc.version {
         1 => {
             let dict = section_bytes(bytes, &loc.footer, LABEL_DICT)?;
@@ -173,6 +190,314 @@ fn full_decode_v3(bytes: &[u8], limits: ReaderLimits) -> Result<usize, SegmentEr
     Ok(total)
 }
 
+/// v4's leg of `full_decode`: same whole-pipeline shape as the v3 arm
+/// above, but iterated per run instead of per series (docs/compaction-
+/// retention-plan.md section 4), since a v4 series folds an arbitrary
+/// number of runs and each has its own TS/VAL-or-HIST page range.
+fn full_decode_v4(bytes: &[u8], limits: ReaderLimits) -> Result<usize, SegmentError> {
+    let loc = open_from_full(bytes, limits)?;
+    let dict = section_bytes(bytes, &loc.footer, LABEL_DICT)?;
+    let ids = section_bytes(bytes, &loc.footer, SERIES_IDS)?;
+    let meta = section_bytes(bytes, &loc.footer, SERIES_META)?;
+    let entries = decode_catalog_v4(&loc.footer, dict, ids, meta, limits)?;
+
+    let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+    let ranges = plan_ranges_v4(&loc.footer, &selected)?;
+    let mut total = 0usize;
+    for entry in &entries {
+        for (run_index, run) in entry.runs.iter().enumerate() {
+            let range = ranges
+                .iter()
+                .find(|r| r.series_id == entry.entry.series_id && r.run_index == run_index)
+                .ok_or(SegmentError::SectionOutOfBounds)?;
+            let ts_bytes = range_bytes(bytes, range.ts_range)?;
+            total += match entry.entry.value_kind {
+                ValueKind::Scalar => {
+                    let val_bytes = range_bytes(bytes, range.val_range)?;
+                    let mut scratch = Vec::new();
+                    let mut timestamps = Vec::new();
+                    let mut values = Vec::new();
+                    decode_run_pages_soa(
+                        &entry.entry.series_id,
+                        run,
+                        ts_bytes,
+                        val_bytes,
+                        limits,
+                        &mut scratch,
+                        &mut timestamps,
+                        &mut values,
+                    )?;
+                    timestamps.len()
+                }
+                ValueKind::Histogram => {
+                    let hist_bytes = range_bytes(bytes, range.hist_range)?;
+                    decode_run_histogram_pages(
+                        &entry.entry.series_id,
+                        run,
+                        ts_bytes,
+                        hist_bytes,
+                        limits,
+                    )?
+                    .len()
+                }
+            };
+        }
+    }
+    Ok(total)
+}
+
+fn labels(pairs: &[(&str, &str)]) -> LabelSet {
+    LabelSet::new(
+        pairs
+            .iter()
+            .map(|(n, v)| Label {
+                name: (*n).to_string(),
+                value: (*v).to_string(),
+            })
+            .collect(),
+    )
+    .expect("valid labels")
+}
+
+fn v4_fixture_identity() -> SegmentIdentity {
+    SegmentIdentity {
+        tenant_hash: [0x5A; 16],
+        shard: 9,
+        writer_id: "fuzz-v4-seed-writer".to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    }
+}
+
+fn v4_fixture_bounds() -> IngestBounds {
+    IngestBounds {
+        min_ingest_ts_ns: 0,
+        max_ingest_ts_ns: 100_000,
+    }
+}
+
+fn v4_fixture_meta() -> CompactionMetaV4 {
+    CompactionMetaV4 {
+        ingest_hour_bucket: 3,
+        input_set_hash: [0x22; 32],
+        part_index: 1,
+        level: 2,
+    }
+}
+
+/// Wraps one v1-written scalar series' own TS_PAGES/VAL_PAGES bytes,
+/// verbatim, as a single run -- the same technique tests/reader_v4.rs's
+/// `scalar_run_from_v1` uses, since page crc32c is bound to
+/// series_id+enc+comp+payload and must stay under the same series_id.
+fn v4_scalar_run_from_v1(
+    created_unix_ns: i64,
+    series_id: SeriesId,
+    samples: Vec<Sample>,
+) -> RunInputV4 {
+    let min_ts_ns = samples.iter().map(|s| s.ts_ns).min().expect("non-empty");
+    let max_ts_ns = samples.iter().map(|s| s.ts_ns).max().expect("non-empty");
+    let sample_count = samples.len() as u32;
+    let written = SegmentWriter::write(
+        vec![SeriesInput {
+            series_id,
+            labels: labels(&[(METRIC_NAME_LABEL, "fuzz_seed_scalar")]),
+            samples,
+        }],
+        v4_fixture_identity(),
+        v4_fixture_bounds(),
+    )
+    .expect("writes v1 fixture for v4 seed");
+    let bytes = written.bytes.as_ref();
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(bytes, limits).expect("parses v1 fixture footer");
+    let ts_page = section_bytes(bytes, &loc.footer, 3)
+        .expect("ts section")
+        .to_vec();
+    let val_page = section_bytes(bytes, &loc.footer, 4)
+        .expect("val section")
+        .to_vec();
+    RunInputV4 {
+        created_unix_ns,
+        writer_epoch: 1,
+        writer_seq: 1,
+        min_ts_ns,
+        max_ts_ns,
+        sample_count,
+        ts_page,
+        value_page: RunValuePageV4::Scalar(val_page),
+    }
+}
+
+/// Histogram counterpart of `v4_scalar_run_from_v1`, sourcing its run's
+/// verbatim TS_PAGES/HIST_PAGES bytes from a real v3 write.
+fn v4_histogram_run_from_v3(
+    created_unix_ns: i64,
+    series_id: SeriesId,
+    samples: Vec<HistogramSample>,
+) -> RunInputV4 {
+    let min_ts_ns = samples.iter().map(|s| s.ts_ns).min().expect("non-empty");
+    let max_ts_ns = samples.iter().map(|s| s.ts_ns).max().expect("non-empty");
+    let sample_count = samples.len() as u32;
+    let written = SegmentWriter::write_v3(
+        vec![SeriesInputV3 {
+            series_id,
+            labels: labels(&[(METRIC_NAME_LABEL, "fuzz_seed_hist")]),
+            values: SeriesValues::Histogram(samples),
+        }],
+        v4_fixture_identity(),
+        v4_fixture_bounds(),
+    )
+    .expect("writes v3 fixture for v4 seed");
+    let bytes = written.bytes.as_ref();
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(bytes, limits).expect("parses v3 fixture footer");
+    let ts_page = section_bytes(bytes, &loc.footer, 3)
+        .expect("ts section")
+        .to_vec();
+    let hist_page = section_bytes(bytes, &loc.footer, 7)
+        .expect("hist section")
+        .to_vec();
+    RunInputV4 {
+        created_unix_ns,
+        writer_epoch: 1,
+        writer_seq: 1,
+        min_ts_ns,
+        max_ts_ns,
+        sample_count,
+        ts_page,
+        value_page: RunValuePageV4::Histogram(hist_page),
+    }
+}
+
+fn v4_sample_histogram_value(seed: i32) -> HistogramValue {
+    let zero_count = 1u64;
+    let positive = vec![2u64, (seed.unsigned_abs()) as u64 + 1];
+    let count = zero_count + positive.iter().sum::<u64>();
+    HistogramValue {
+        scale: 3,
+        zero_threshold: 0.001,
+        sum: Some(f64::from(seed) + 0.5),
+        custom_values: None,
+        positive_spans: vec![HistogramSpan {
+            offset: 0,
+            length: 2,
+        }],
+        negative_spans: vec![],
+        counts: HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative: vec![],
+        },
+        reset_hint: ResetHint::Unknown,
+    }
+}
+
+/// Three real v4 objects covering the shapes v1-v3 can't express: a
+/// single-run scalar series, a single-run histogram series, and a series
+/// with two runs of differing provenance -- built once and cached, since
+/// each build performs two real segment writes (the source fixture plus
+/// the v4 object itself).
+fn v4_seeds() -> &'static [Vec<u8>] {
+    static SEEDS: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    SEEDS.get_or_init(|| {
+        let scalar_single = SegmentWriter::write_v4(
+            vec![SeriesInputV4 {
+                series_id: SeriesId([0x51; 16]),
+                labels: labels(&[(METRIC_NAME_LABEL, "v4_scalar_single"), ("zone", "a")]),
+                runs: vec![v4_scalar_run_from_v1(
+                    100,
+                    SeriesId([0x51; 16]),
+                    vec![
+                        Sample {
+                            ts_ns: 0,
+                            value: 1.0,
+                        },
+                        Sample {
+                            ts_ns: 1_000,
+                            value: 1.5,
+                        },
+                    ],
+                )],
+            }],
+            v4_fixture_identity(),
+            v4_fixture_bounds(),
+            v4_fixture_meta(),
+        )
+        .expect("writes v4 scalar single-run seed");
+
+        let histogram_single = SegmentWriter::write_v4(
+            vec![SeriesInputV4 {
+                series_id: SeriesId([0x52; 16]),
+                labels: labels(&[(METRIC_NAME_LABEL, "v4_hist_single"), ("zone", "b")]),
+                runs: vec![v4_histogram_run_from_v3(
+                    100,
+                    SeriesId([0x52; 16]),
+                    vec![HistogramSample {
+                        ts_ns: 0,
+                        value: v4_sample_histogram_value(1),
+                    }],
+                )],
+            }],
+            v4_fixture_identity(),
+            v4_fixture_bounds(),
+            v4_fixture_meta(),
+        )
+        .expect("writes v4 histogram single-run seed");
+
+        let scalar_id = SeriesId([0x53; 16]);
+        let hist_id = SeriesId([0x54; 16]);
+        let mixed_multi_run = SegmentWriter::write_v4(
+            vec![
+                SeriesInputV4 {
+                    series_id: scalar_id,
+                    labels: labels(&[(METRIC_NAME_LABEL, "v4_scalar_multi"), ("zone", "c")]),
+                    runs: vec![
+                        v4_scalar_run_from_v1(
+                            200,
+                            scalar_id,
+                            vec![Sample {
+                                ts_ns: 2_000,
+                                value: 2.0,
+                            }],
+                        ),
+                        v4_scalar_run_from_v1(
+                            100,
+                            scalar_id,
+                            vec![Sample {
+                                ts_ns: 0,
+                                value: 1.0,
+                            }],
+                        ),
+                    ],
+                },
+                SeriesInputV4 {
+                    series_id: hist_id,
+                    labels: labels(&[(METRIC_NAME_LABEL, "v4_hist_multi"), ("zone", "d")]),
+                    runs: vec![v4_histogram_run_from_v3(
+                        150,
+                        hist_id,
+                        vec![HistogramSample {
+                            ts_ns: 0,
+                            value: v4_sample_histogram_value(2),
+                        }],
+                    )],
+                },
+            ],
+            v4_fixture_identity(),
+            v4_fixture_bounds(),
+            v4_fixture_meta(),
+        )
+        .expect("writes v4 mixed multi-run seed");
+
+        vec![
+            scalar_single.bytes.as_ref().to_vec(),
+            histogram_single.bytes.as_ref().to_vec(),
+            mixed_multi_run.bytes.as_ref().to_vec(),
+        ]
+    })
+}
+
 /// Single-bit flip at an in-bounds offset, then truncate to an in-bounds
 /// length: the seed-corpus mutation operators the finding names.
 fn mutate(bytes: &[u8], bit: usize, do_truncate: bool, truncate_to: usize) -> Vec<u8> {
@@ -187,8 +512,17 @@ fn mutate(bytes: &[u8], bit: usize, do_truncate: bool, truncate_to: usize) -> Ve
     out
 }
 
+fn seed_count() -> usize {
+    STATIC_SEEDS.len() + v4_seeds().len()
+}
+
 fn seed(index: usize) -> &'static [u8] {
-    SEEDS[index % SEEDS.len()]
+    let index = index % seed_count();
+    if index < STATIC_SEEDS.len() {
+        STATIC_SEEDS[index]
+    } else {
+        &v4_seeds()[index - STATIC_SEEDS.len()]
+    }
 }
 
 /// The two known-inconsistent v3 fixtures (see the `SEEDS` doc comment) and
@@ -210,7 +544,7 @@ proptest! {
     /// (see `expected_unmutated_error`) must decode to the specific typed
     /// error the reader's validation is documented to raise for them.
     #[test]
-    fn seeds_decode_unmutated(index in 0usize..SEEDS.len()) {
+    fn seeds_decode_unmutated(index in 0usize..seed_count()) {
         let result = full_decode(seed(index));
         match expected_unmutated_error(index) {
             Some(expected) => prop_assert_eq!(result, Err(expected)),
@@ -223,7 +557,7 @@ proptest! {
     /// never a panic.
     #[test]
     fn seed_single_bit_and_truncation_never_panics(
-        index in 0usize..SEEDS.len(),
+        index in 0usize..seed_count(),
         bit in any::<usize>(),
         do_truncate in any::<bool>(),
         truncate_to in any::<usize>(),
@@ -253,7 +587,7 @@ proptest! {
     /// shape) must never panic; it returns `Truncated`/typed errors.
     #[test]
     fn open_from_full_on_prefix_of_seed_never_panics(
-        index in 0usize..SEEDS.len(),
+        index in 0usize..seed_count(),
         take in any::<usize>(),
     ) {
         let s = seed(index);

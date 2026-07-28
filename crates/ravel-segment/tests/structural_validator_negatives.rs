@@ -224,8 +224,8 @@ fn v1_unknown_kind_is_skipped_not_rejected() {
 fn unsupported_version_rejected() {
     let (footer, region) = valid_footer();
     assert_eq!(
-        validate_sections(&footer, 4, region, ReaderLimits::default()),
-        Err(SegmentError::UnsupportedVersion(4))
+        validate_sections(&footer, 5, region, ReaderLimits::default()),
+        Err(SegmentError::UnsupportedVersion(5))
     );
 }
 
