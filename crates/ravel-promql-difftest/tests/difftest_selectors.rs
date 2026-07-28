@@ -22,6 +22,7 @@ const SELECTORS_CORPUS: &str = include_str!("../corpus/selectors.txt");
 const ERRORS_CORPUS: &str = include_str!("../corpus/errors.txt");
 const RATE_CORPUS: &str = include_str!("../corpus/rate.txt");
 const TRANSFORM_CORPUS: &str = include_str!("../corpus/transform.txt");
+const BINOP_CORPUS: &str = include_str!("../corpus/binop.txt");
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used)]
@@ -66,6 +67,7 @@ async fn selector_and_error_corpus_match_pinned_prometheus() {
     entries.extend(parse_corpus(ERRORS_CORPUS).expect("parse error corpus"));
     entries.extend(parse_corpus(RATE_CORPUS).expect("parse rate corpus"));
     entries.extend(parse_corpus(TRANSFORM_CORPUS).expect("parse transform corpus"));
+    entries.extend(parse_corpus(BINOP_CORPUS).expect("parse binop corpus"));
 
     let report = run_corpus(
         &entries,
