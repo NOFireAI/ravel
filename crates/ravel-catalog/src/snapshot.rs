@@ -43,4 +43,12 @@ pub struct SegmentRef {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Snapshot {
     pub segments: Vec<SegmentRef>,
+    /// Snapshot-sourced segments excluded by postings-based pruning
+    /// (docs/metric-index-plan.md P5b). Always 0 when the caller used
+    /// [`Catalog::resolve`](crate::Catalog::resolve) or when
+    /// [`Catalog::resolve_pruned`](crate::Catalog::resolve_pruned) found no
+    /// name filter, no usable postings, or a listing/token fallback for the
+    /// whole window; never counts listing- or `min_token`-sourced segments,
+    /// which are never pruned.
+    pub segments_pruned: u64,
 }
