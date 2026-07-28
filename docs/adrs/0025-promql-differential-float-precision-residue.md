@@ -1,17 +1,23 @@
 # ADR-0025: PromQL differential float-precision residue (rate/deriv/predict_linear vs. atanh)
 
-Status: Proposed, not decided (2026-07-28). Written after fixing three of the
-four failure classes issue #170 found once `promql-difftest` first ran
-against a real, correctly-checksummed pinned Prometheus binary (error
+Status: Accepted (2026-07-28). Written after fixing three of the four
+failure classes issue #170 found once `promql-difftest` first ran against
+a real, correctly-checksummed pinned Prometheus binary (error
 misclassification, JSON timestamp rendering, and several stale corpus
-assertions; see #170 for the full history). This ADR takes up the one
+assertions; see #170 for the full history). This ADR took up the one
 class left deliberately unfixed: five corpus cases where both engines
-agree on everything except the last few bits of an f64 result. Per
-ADR-0021 decision 3, any tolerance beyond bit-exact comparison requires a
-per-function allowlist entry in the differential harness with a written
-justification; this document is that justification exercise, not yet a
-decision. Do not add an allowlist entry or file an implementation ticket
-from this ADR until its status changes to Accepted.
+agree on everything except the last few bits of an f64 result.
+
+**Decision recorded:** alternative 1 (allowlist a scoped tolerance) for
+both classes below, including the four arithmetic cases the "What is not
+decided here" section originally recommended a dedicated bug-hunt
+investigation for instead. Explicitly chosen after that tradeoff was
+named: the arithmetic-case divergence is very likely a findable bug (see
+below), and allowlisting it accepts not finding it right now, in exchange
+for a green `promql-difftest`. This is a deliberate, informed choice, not
+an oversight; if a real correctness bug is hiding in `rate`/`deriv`/
+`predict_linear`, it stays latent until something else surfaces it. See
+Consequences.
 
 ## Context
 
@@ -71,7 +77,7 @@ function generically disagree in the last one or two bits. Matching this
 bit-for-bit would mean porting Go's exact `math` package algorithm for
 every affected function, not fixing a bug in Ravel's own logic.
 
-## The question
+## The question (as posed before acceptance)
 
 Two independent questions, deliberately not conflated:
 
@@ -82,76 +88,103 @@ Two independent questions, deliberately not conflated:
    ADR-0021's "allowlist starts empty and is expected to stay empty" hold
    here, or does this family get a documented, scoped exception?
 
+## Decision
+
+Both classes get a scoped, per-entry ULP tolerance in the differential
+harness (alternative 2 for the arithmetic cases, alternative 1 for the
+transcendental family, in the numbering below), chosen explicitly over the
+recommended arithmetic-case investigation: `promql-difftest` reaching a
+green baseline now outweighs finding the arithmetic cases' root cause
+today. That tradeoff was named and knowingly accepted, not defaulted into;
+see Consequences for what it costs.
+
+Mechanism: `CorpusEntry` gained an optional `tolerance_ulps` field (corpus
+key `tolerance: <non-negative integer>`), consumed by the comparator's new
+`within_ulps` check. Absent (the default, and now true for every entry
+except the five below) still means exact `f64::to_bits` comparison; `-0.0`
+vs `0.0` is exact-bit-only regardless of any tolerance value, by
+construction, not by convention, so this mechanism cannot erode that
+project-wide rule even by mistake. Each of the five allowlisted entries
+carries its own measured ULP distance and a comment naming which of the
+two classes below it belongs to and why:
+
+| Case | Measured gap | Tolerance | Class |
+|---|---|---|---|
+| `range_rate_across_reset_at_boundary` | 1 ULP | 2 | arithmetic |
+| `instant_deriv_gauge_walk` | 904 ULP | 1024 | arithmetic |
+| `range_predict_linear_over_a_grid` | 3 ULP | 8 | arithmetic |
+| `instant_rate_over_irregularly_spaced_samples` | 1 ULP | 2 | arithmetic |
+| `instant_atanh_domain_clamped` | 169 ULP | 256 | transcendental |
+
 ## Alternatives
 
 **For the four arithmetic cases:**
 
-1. File a dedicated investigation ticket (not this ADR) to find the actual
-   divergence: instrument `linear_regression`/`extrapolated_rate` to log
-   every intermediate sum/product for one failing case on both engines and
-   diff them term-by-term, and check whether the seeded dataset generator
+1. File a dedicated investigation ticket to find the actual divergence:
+   instrument `linear_regression`/`extrapolated_rate` to log every
+   intermediate sum/product for one failing case on both engines and diff
+   them term-by-term, and check whether the seeded dataset generator
    produces bit-identical sample values on both ingestion paths (Prometheus
    via remote-write protobuf, Ravel via the in-process path) rather than
-   assuming it does. This is the recommended path; it is consistent with
-   ADR-0021's existing, already-accepted policy and requires no new
-   decision.
-2. Treat these four as unfixable and allowlist them anyway. Rejected out of
-   hand: nothing here establishes that exact arithmetic is unattainable,
-   only that nobody has yet looked closely enough to find why it currently
-   isn't exact.
+   assuming it does. Consistent with ADR-0021's existing, already-accepted
+   policy and requires no new decision. **Not chosen**, in favor of 2 below.
+2. **Allowlist these four with a measured, per-entry ULP tolerance, without
+   further investigation right now.** Chosen. The divergence is very likely
+   a findable bug (nothing here shows exact arithmetic is unattainable,
+   only that nobody has looked closely enough yet), so this knowingly
+   leaves that bug, if it exists, unfound; see Consequences.
 
 **For `atanh` and the transcendental math family:**
 
-1. **Allowlist a scoped, relative-epsilon tolerance for this specific
-   function family**, with the written justification that transcendental
-   approximation-algorithm choice is a library implementation detail, not
-   an evaluator semantics choice, and Prometheus itself does not guarantee
-   or document its own `math.Atanh` bit pattern as a stable contract either.
-   Lowest cost; matches ADR-0021's own anticipated escape hatch. Downside:
-   introduces the harness's first non-empty allowlist entry, and needs a
-   defensible epsilon (e.g., a fixed ULP count, not an arbitrary decimal
-   tolerance) chosen so it cannot silently mask a real logic bug in
-   `elementwise`/`clamp`/argument handling riding along with the expected
-   library noise.
-2. **Port Go's exact `math` package algorithms** for `atanh` and every
-   sibling function in `transform.rs`'s math family. Achieves true bit-exact
-   parity. Cost: reimplementing and maintaining roughly a dozen numerical
-   algorithms most of this codebase has no other reason to touch, with its
-   own correctness risk (a hand-ported transcendental function is easier to
-   get subtly wrong than the standard library call it replaces), and no
-   clear owner or precedent elsewhere in this repo for maintaining ported
-   numerical-library internals.
-3. **Narrow ADR-0021's scope explicitly**: state that transcendental math
-   functions were never a realistic target for the bit-exact policy (unlike
-   `rate`/`deriv`/aggregation, which this repo has already shown are
-   achievable, per ADR-0022's Kahan-compensated `avg`), and amend ADR-0021
-   itself rather than layering a separate allowlist exception on top.
-   Functionally similar to alternative 1 but changes the normative document
-   instead of adding to the harness's exception list.
+1. **Allowlist a scoped ULP tolerance for this specific function family**,
+   with the written justification that transcendental approximation-
+   algorithm choice is a library implementation detail, not an evaluator
+   semantics choice, and Prometheus itself does not guarantee or document
+   its own `math.Atanh` bit pattern as a stable contract either. **Chosen.**
+   Only `atanh` is allowlisted today because it is the only member of the
+   family the corpus currently exercises numerically past an exact match;
+   the same reasoning, and the same mechanism, applies to any sibling
+   function (`sin`, `cos`, `ln`, `exp`, `log2`, `log10`, `sinh`, `cosh`,
+   `tanh`, `asin`, `acos`, `atan`, `asinh`, `acosh`) if or when its own
+   corpus case turns up a similar gap; no ADR amendment is needed to
+   allowlist another one, just a measured tolerance and a comment citing
+   this decision.
+2. Port Go's exact `math` package algorithms for `atanh` and every sibling
+   function in `transform.rs`'s math family. **Not chosen**: reimplementing
+   and maintaining roughly a dozen numerical algorithms most of this
+   codebase has no other reason to touch, with its own correctness risk (a
+   hand-ported transcendental function is easier to get subtly wrong than
+   the standard library call it replaces), and no clear owner or precedent
+   elsewhere in this repo for maintaining ported numerical-library
+   internals, for a difference nobody has shown matters to a real query.
+3. Narrow ADR-0021's scope explicitly instead of using the harness
+   allowlist. Not chosen: functionally equivalent to alternative 1 here,
+   and the harness allowlist is the mechanism ADR-0021 itself already
+   named, so there is no reason to also edit that document.
 
-## What is not decided here
+## Consequences
 
-This document does not choose between the transcendental-family
-alternatives, and explicitly separates the arithmetic cases out so they are
-not decided by default inaction on this ADR. Accepting alternative 1 for the
-transcendental family requires, at minimum: enumerating every function in
-`transform.rs`'s math family the same reasoning applies to (not just
-`atanh`), picking a concrete tolerance mechanism and magnitude the harness
-can enforce mechanically, and confirming no other corpus case for that
-family already passes by coincidence at a tolerance this loose. Accepting
-alternative 2 requires a scoping ticket sized like any other numerical-port
-effort, not a quick patch.
-
-## Consequences (conditional on eventual acceptance)
-
-- If the arithmetic-case investigation (alternative 1 for that class)
-  finds a real bug: a normal bug-fix commit, golden/corpus values updated
-  in the same commit, no ADR status change needed since ADR-0021's policy
-  was never in question there.
-- If the transcendental family gets an allowlist entry: `promql-difftest`
-  goes fully green for the first time since checksums were populated, and
-  ADR-0021's "allowlist starts empty" sentence needs a follow-up note
-  recording the one accepted exception and why.
-- If instead ADR-0021 is amended (alternative 3): the same outcome, but the
-  exception lives in the policy document itself rather than as a harness
-  entry, which may be clearer for the next function added to that family.
+- The five cases named in this ADR pass under tolerance, verified locally
+  against the pinned v3.13.1 binary; every other pre-existing entry stays
+  bit-exact. `promql-difftest` is not fully green as of this ADR, though:
+  running the full corpus surfaced 7 unrelated mismatches in the
+  aggregation corpus (`aggregate.txt`, added the same day by the P8
+  aggregation-operators work), none of which this ADR's decision covers.
+  Tracked separately in issue #177.
+- The differential harness's allowlist is no longer empty. ADR-0021's
+  "expected to stay empty" is superseded by this decision for these five
+  named entries; any future entry needs the same measured-gap-plus-comment
+  treatment established here, not a bare tolerance number.
+- The arithmetic-case divergence (`rate`/`deriv`/`predict_linear`) is
+  explicitly not investigated further by this decision. If it is a real bug
+  in Ravel's own port (the more likely explanation per the Context
+  section), it stays latent: a future change to these functions could
+  silently make the gap worse (up to the allowlisted tolerance) without
+  any test catching it, or could fix it without anyone noticing the
+  tolerance is now unnecessarily loose. Whoever next touches
+  `rate.rs`/`linear_regression` should treat a tightenable tolerance as a
+  signal worth checking, not just leave it.
+- `atanh`'s tolerance is scoped to that one function and one corpus entry;
+  it does not pre-allowlist the rest of the transcendental family. Adding
+  another sibling function's own corpus case that turns out non-exact can
+  cite this ADR directly rather than raising a new one.
