@@ -43,8 +43,28 @@
 //!   [`golden_grouped_min_max_over_ts_delegates`] pins that path against an
 //!   integer reference fold.
 //!
-//! - **`avg` is out of the v1 subset** and rejected at validation
-//!   (crate::validate), so it never reaches this gate.
+//! - **`avg`/`mean` are in the v1 subset** via a custom sequential-fold UDAF
+//!   (crate::avg, ADR-0022 decisions 3, 4): the numerator is a plain f64 left
+//!   fold seeded with the first value, in the same deterministic
+//!   `(series_id, ts)` order, divided by the non-null count. Because that UDAF
+//!   replaces the built-in's lane-parallel batch sum, ungrouped `avg` -- unlike
+//!   ungrouped `sum` below -- takes the *full* float edge-case pool.
+//!
+//!   One documented carve-out, narrower than sum's: the **NaN payload** an
+//!   `avg` result carries is not asserted bit-for-bit against the reference.
+//!   ADR-0022 decision 6b already flags that NaN payload propagation through
+//!   f64 addition is hardware-chosen; it is also *compiler*-chosen. LLVM treats
+//!   `fadd` as commutative and may swap its operands, and x86 `addsd` returns
+//!   the left operand's payload when both are NaN, so `acc + v` in the UDAF
+//!   (compiled in this crate) and the identical `acc + v` in [`avg_sequential`]
+//!   (compiled in the test crate) can pick different operand orders and thus
+//!   different NaN payloads -- on the same host. Non-NaN addition is
+//!   bit-commutative, so this affects *only* the NaN-payload bits. The avg
+//!   proptest and goldens therefore assert exact bits for every
+//!   architecture-independent result (finite sums, signed infinities, `-0.0`
+//!   preservation, empty -> NULL) and assert the *property* that a NaN result
+//!   is NaN, via [`avg_cells_match`]. This is the avg analogue of sum's
+//!   restricted-pool deviation and is flagged in the B3 report.
 //!
 //! # The one restriction, and why
 //!
@@ -285,6 +305,41 @@ fn sum_sequential(values: &[f64]) -> Option<f64> {
     Some(values.iter().fold(0.0f64, |acc, v| acc + v))
 }
 
+/// `avg`: the sequential-fold UDAF's reference (crate::avg, ADR-0022 decisions
+/// 3, 4). The numerator is a plain f64 left fold *seeded with the first value*
+/// (not a `0.0` seed, so all-`-0.0` folds to `-0.0`) over the non-null values
+/// in input order, divided by the non-null count in one IEEE division. Empty
+/// input is SQL NULL; a zero count never yields NaN or infinity. This is
+/// independent of [`sum_sequential`]: it owns its own numerator fold and does
+/// not divide `sum_sequential` by a count.
+fn avg_sequential(values: &[f64]) -> Option<f64> {
+    let mut it = values.iter().copied();
+    let first = it.next()?;
+    let numerator = it.fold(first, |acc, v| acc + v);
+    Some(numerator / values.len() as f64)
+}
+
+/// Compare an `avg` result cell against the reference with the NaN-payload
+/// carve-out documented in the module header: two float cells that both decode
+/// to NaN match (the payload is compiler/hardware-chosen through f64 addition),
+/// and every other cell -- including finite values, signed infinities, and
+/// signed zeros -- must be bit-identical. This is strictly stronger than a
+/// tolerance: the only bits it forgives are the NaN mantissa, which the ADR
+/// itself declares not portable (decision 6b).
+fn avg_cells_match(got: &Cell, want: &Cell) -> bool {
+    match (got, want) {
+        (Cell::FloatBits(g), Cell::FloatBits(w)) => {
+            let (gf, wf) = (f64::from_bits(*g), f64::from_bits(*w));
+            if gf.is_nan() || wf.is_nan() {
+                gf.is_nan() && wf.is_nan()
+            } else {
+                g == w
+            }
+        }
+        _ => got == want,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The reference executor
 // ---------------------------------------------------------------------------
@@ -307,6 +362,12 @@ enum Shape {
     /// `SELECT series_id, sum(value) ... GROUP BY series_id ORDER BY
     /// series_id`
     GroupedSum,
+    /// `SELECT avg(value) ...`. The sequential-fold UDAF (crate::avg) takes the
+    /// full float pool, ungrouped included, because it is bit-identical to
+    /// [`avg_sequential`] rather than to arrow's lane-parallel batch sum.
+    Avg,
+    /// `SELECT series_id, avg(value) ... GROUP BY series_id ORDER BY series_id`
+    GroupedAvg,
 }
 
 #[derive(Clone, Debug)]
@@ -336,6 +397,11 @@ impl Query {
             Shape::Sum => format!("SELECT sum(value) FROM samples {where_clause}"),
             Shape::GroupedSum => format!(
                 "SELECT series_id, sum(value) FROM samples {where_clause} \
+                 GROUP BY series_id ORDER BY series_id"
+            ),
+            Shape::Avg => format!("SELECT avg(value) FROM samples {where_clause}"),
+            Shape::GroupedAvg => format!(
+                "SELECT series_id, avg(value) FROM samples {where_clause} \
                  GROUP BY series_id ORDER BY series_id"
             ),
         }
@@ -383,6 +449,19 @@ impl Query {
                     vec![
                         Cell::Bytes(sid.to_vec()),
                         optional_float(sum_sequential(&values)),
+                    ]
+                })
+                .collect(),
+            Shape::Avg => {
+                let values: Vec<f64> = kept.iter().map(|r| r.value).collect();
+                vec![vec![optional_float(avg_sequential(&values))]]
+            }
+            Shape::GroupedAvg => group_by_series(&kept)
+                .into_iter()
+                .map(|(sid, values)| {
+                    vec![
+                        Cell::Bytes(sid.to_vec()),
+                        optional_float(avg_sequential(&values)),
                     ]
                 })
                 .collect(),
@@ -441,6 +520,40 @@ async fn assert_bit_identical(fixture: &Fixture, tenant: &TenantId, query: &Quer
 async fn assert_all(fixture: &Fixture, tenant: &TenantId, queries: &[Query]) {
     for query in queries {
         assert_bit_identical(fixture, tenant, query).await;
+    }
+}
+
+/// Like [`assert_bit_identical`] but compares each cell with [`avg_cells_match`],
+/// which forgives only the NaN-payload bits. Used by the `avg` shapes, whose
+/// results are bit-identical to the reference except for the hardware- and
+/// compiler-chosen NaN payload (module header, ADR-0022 decision 6b).
+async fn assert_avg_matches(fixture: &Fixture, tenant: &TenantId, query: &Query) {
+    let snapshot = fixture.snapshot(tenant).await;
+    let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
+
+    let sql = query.sql();
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request(&sql))
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {sql}\n{e}"));
+
+    let want = query.eval(&reference);
+    let got = actual_rows(&outcome.output);
+
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "row count differs for: {sql}\ngot  {got:?}\nwant {want:?}"
+    );
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert_eq!(g.len(), w.len(), "row {i} width differs for: {sql}");
+        for (gc, wc) in g.iter().zip(w.iter()) {
+            assert!(
+                avg_cells_match(gc, wc),
+                "row {i} differs for: {sql}\ngot  {got:?}\nwant {want:?}"
+            );
+        }
     }
 }
 
@@ -623,6 +736,34 @@ proptest! {
                 Query { shape: Shape::SelectionAggregates, pred },
             ];
             assert_all(&fixture, &tenant, &queries).await;
+        });
+    }
+
+    /// ADR-0022 decisions 3, 4: `avg`/`mean` over the *full* float edge-case
+    /// pool (NaN payloads of both signs, both infinities, signed zeros,
+    /// denormals, cancellation-prone magnitudes), grouped and ungrouped, match
+    /// the independent sequential reference [`avg_sequential`]. Every
+    /// architecture-independent result is bit-identical; a NaN result is
+    /// compared as NaN, not by payload (see the module header and
+    /// [`avg_cells_match`]). Ungrouped `avg` takes the full pool where
+    /// ungrouped `sum` cannot: the UDAF's numerator is a scalar fold, not
+    /// arrow's lane-parallel kernel.
+    #[test]
+    fn avg_matches_reference_over_the_full_pool(
+        specs in arb_dataset(interesting_value as ValuePool),
+        pred in arb_pred(),
+    ) {
+        block_on(async move {
+            let tenant = tenant_id("gate");
+            let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+            for shape in [Shape::Avg, Shape::GroupedAvg] {
+                assert_avg_matches(
+                    &fixture,
+                    &tenant,
+                    &Query { shape, pred: pred.clone() },
+                )
+                .await;
+            }
         });
     }
 
@@ -1052,25 +1193,125 @@ async fn golden_sum_with_infinities_and_nan() {
     }
 }
 
-/// `avg` never reaches the gate: it is rejected at validation with a message
-/// naming the admitted aggregate set (ADR-0022 decision 2, the allowlist).
+/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): both spellings execute
+/// and their result matches the independent sequential reference
+/// [`avg_sequential`] bit for bit over the overlap dataset. This is the
+/// positive counterpart to the old pre-planning rejection: the differential
+/// pool coverage above proves correctness at scale, this pins the two names
+/// reach the same UDAF.
 #[tokio::test]
-async fn avg_is_rejected_before_planning() {
+async fn avg_and_mean_are_admitted_and_match_the_reference() {
     let tenant = tenant_id("golden");
     let specs = overlap_dataset();
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+    let snapshot = fixture.snapshot(&tenant).await;
+    let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
 
-    let err = fixture
-        .executor
-        .execute(tenant.hash(), &request("SELECT avg(value) FROM samples"))
-        .await
-        .expect_err("avg must be rejected");
-    let message = err.client_message();
-    assert!(message.contains("avg"), "{message}");
-    for admitted in ["count", "sum", "min", "max"] {
+    let values: Vec<f64> = reference.iter().map(|r| r.value).collect();
+    let want = optional_float(avg_sequential(&values));
+    for name in ["avg", "mean"] {
+        let row = scalar(
+            &fixture,
+            &tenant,
+            &format!("SELECT {name}(value) FROM samples"),
+        )
+        .await;
+        assert_eq!(
+            row,
+            vec![want.clone()],
+            "{name}(value) must match reference"
+        );
+    }
+}
+
+/// Golden `avg` results whose bits are architecture-independent (ADR-0022
+/// decision 6a), stored literally rather than derived from the reference so a
+/// version bump or a reference drift trips here: an exact finite mean, both
+/// signed infinities, `-0.0` preservation from an all-`-0.0` group, and NULL
+/// for empty input (a zero count yields NULL, never NaN or infinity).
+#[tokio::test]
+async fn golden_avg_architecture_independent_results() {
+    let tenant = tenant_id("golden");
+    let specs = vec![SegSpec::new(
+        1,
+        1,
+        1,
+        vec![
+            // sum 10.0 / count 4 = 2.5, exact.
+            SeriesSpec::new("finite", vec![(1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0)]),
+            // 1.0 + (+Inf) = +Inf; /2 = +Inf.
+            SeriesSpec::new("posinf", vec![(1, 1.0), (2, f64::INFINITY)]),
+            // (-Inf) + (-1.0) = -Inf; /2 = -Inf.
+            SeriesSpec::new("neginf", vec![(1, f64::NEG_INFINITY), (2, -1.0)]),
+            // Seeded with the first value, not 0.0: -0.0 + -0.0 = -0.0; /2 = -0.0.
+            SeriesSpec::new("negzero", vec![(1, -0.0), (2, -0.0)]),
+        ],
+    )];
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    let cases = [
+        ("finite", Cell::float(2.5)),
+        ("posinf", Cell::float(f64::INFINITY)),
+        ("neginf", Cell::float(f64::NEG_INFINITY)),
+        // -0.0 has bit pattern 0x8000_0000_0000_0000, distinct from +0.0 here.
+        ("negzero", Cell::FloatBits(0x8000_0000_0000_0000)),
+    ];
+    for (metric, want) in cases {
+        let sql =
+            format!("SELECT avg(value) FROM samples WHERE label(labels, '__name__') = '{metric}'");
+        let row = scalar(&fixture, &tenant, &sql).await;
+        assert_eq!(row, vec![want.clone()], "avg for {metric}");
+    }
+
+    // Empty input: a predicate that keeps no rows. Ungrouped avg over zero rows
+    // is one NULL row, not NaN.
+    let empty = scalar(
+        &fixture,
+        &tenant,
+        "SELECT avg(value) FROM samples WHERE label(labels, '__name__') = 'absent'",
+    )
+    .await;
+    assert_eq!(empty, vec![Cell::Null], "avg over empty input must be NULL");
+}
+
+/// Golden `avg` with NaN input (ADR-0022 decision 6b). Only the properties that
+/// are architecture-independent are asserted: the result is NaN. The NaN
+/// *payload* is deliberately not pinned -- not as a stored golden and not even
+/// against the same-host reference -- because f64 addition's NaN payload is both
+/// hardware-chosen and compiler-chosen: LLVM treats `fadd` as commutative and
+/// may reorder the operands, so the UDAF's fold and [`avg_sequential`]'s
+/// identical fold can land on different input NaNs (module header). This is
+/// unlike min/max, whose golden NaN bits are sound because `total_cmp` selects
+/// an input value and never synthesizes one.
+#[tokio::test]
+async fn golden_avg_nan_results_are_nan() {
+    let tenant = tenant_id("golden");
+    let specs = vec![SegSpec::new(
+        1,
+        1,
+        1,
+        vec![
+            // Finite + positive NaN: result is NaN.
+            SeriesSpec::new("nanpos", vec![(1, 1.0), (2, f64::from_bits(NAN_POS))]),
+            // Negative NaN first: result is NaN.
+            SeriesSpec::new("nanneg", vec![(1, f64::from_bits(NAN_NEG)), (2, 2.0)]),
+            // +Inf + -Inf = NaN; /2 = NaN.
+            SeriesSpec::new("mixedinf", vec![(1, f64::INFINITY), (2, f64::NEG_INFINITY)]),
+        ],
+    )];
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    for metric in ["nanpos", "nanneg", "mixedinf"] {
+        let sql =
+            format!("SELECT avg(value) FROM samples WHERE label(labels, '__name__') = '{metric}'");
+        let row = scalar(&fixture, &tenant, &sql).await;
+        let Cell::FloatBits(bits) = row[0] else {
+            panic!("expected a float for {metric}, got {row:?}");
+        };
         assert!(
-            message.contains(admitted),
-            "message must name the admitted aggregate {admitted}: {message}"
+            f64::from_bits(bits).is_nan(),
+            "avg for {metric} must be NaN, got {}",
+            f64::from_bits(bits)
         );
     }
 }

@@ -28,11 +28,13 @@
 //! Subset validation (the aggregate allowlist, grouped `min`/`max`) rides
 //! along here rather than in a second pass.
 //!
-//! The v1 SQL subset admits exactly four aggregates: `count`, `sum`, `min`,
-//! `max` ([`ADMITTED_AGGREGATES`](crate::session::ADMITTED_AGGREGATES)). Every
-//! other aggregate DataFusion registers by default is excluded, because none
-//! of them meets the exactness admission rule (ADR-0022 decision 1): `avg`'s
-//! lane-parallel batch sum has no portable sequential reference, the
+//! The v1 SQL subset admits exactly six aggregates: `count`, `sum`, `min`,
+//! `max`, `avg`, `mean` ([`ADMITTED_AGGREGATES`](crate::session::ADMITTED_AGGREGATES)).
+//! Every other aggregate DataFusion registers by default is excluded, because
+//! none of them meets the exactness admission rule (ADR-0022 decision 1):
+//! `avg`'s built-in lane-parallel batch sum has no portable sequential
+//! reference, so it is admitted only after crate::session replaces it with a
+//! sequential-fold UDAF (crate::avg, ADR-0022 decisions 3, 4); the
 //! stddev/variance/covariance/correlation family folds a floating mean
 //! (Welford, or a grouped sum-of-products state with a lossy merge) that no
 //! naive reference reproduces bit-for-bit, and the remaining defaults
@@ -50,9 +52,10 @@
 //! cover the default registrations, so a DataFusion upgrade that adds a default
 //! aggregate fails closed instead of silently widening the surface.
 //!
-//! `avg`/`mean` are excluded here in this ticket (ADR-0022 decision 7's first
-//! half, issue #160); a later ticket (issue #172) admits them via a custom
-//! sequential UDAF and moves them into the allowlist.
+//! `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): they are
+//! in the allowlist, not this reject list, and crate::session registers a
+//! custom sequential-fold UDAF (crate::avg) in place of the built-in whose
+//! lane-parallel batch sum was unpinnable.
 //!
 //! `min`/`max` are fully in the v1 subset, grouped and ungrouped alike.
 //! DataFusion's grouped accumulator does not use a total order (it folds
@@ -83,15 +86,15 @@ use std::ops::ControlFlow;
 /// asserts these names plus the admitted set exactly cover the UDAF names a
 /// default session registers, so a DataFusion version bump that adds a default
 /// aggregate breaks that test rather than silently widening the SQL surface.
-/// `avg`/`mean` are here in this ticket and move to the allowlist when their
-/// custom UDAF lands (ADR-0022 decision 7, issue #172).
-pub(crate) const EXCLUDED_AGGREGATES: [&str; 41] = [
+/// `avg`/`mean` are not here: they are admitted through the allowlist, their
+/// built-in accumulator replaced by a custom sequential-fold UDAF (crate::avg,
+/// ADR-0022 decisions 3, 4, issue #172).
+pub(crate) const EXCLUDED_AGGREGATES: [&str; 39] = [
     "approx_distinct",
     "approx_median",
     "approx_percentile_cont",
     "approx_percentile_cont_with_weight",
     "array_agg",
-    "avg",
     "bit_and",
     "bit_or",
     "bit_xor",
@@ -104,7 +107,6 @@ pub(crate) const EXCLUDED_AGGREGATES: [&str; 41] = [
     "first_value",
     "grouping",
     "last_value",
-    "mean",
     "median",
     "nth_value",
     "percentile_cont",
@@ -161,13 +163,13 @@ pub enum ValidationError {
     )]
     WriteInQuery { kind: &'static str },
 
-    /// An aggregate outside the v1 admitted set (`count`, `sum`, `min`, `max`)
-    /// appeared in the query. Every other aggregate DataFusion registers by
-    /// default is excluded (ADR-0022 decision 2); `name` is the offending
-    /// lowercased spelling.
+    /// An aggregate outside the v1 admitted set (`count`, `sum`, `min`, `max`,
+    /// `avg`, `mean`) appeared in the query. Every other aggregate DataFusion
+    /// registers by default is excluded (ADR-0022 decision 2); `name` is the
+    /// offending lowercased spelling.
     #[error(
         "{name} is not part of the v1 SQL aggregate subset; \
-         the admitted aggregates are count, sum, min, max \
+         the admitted aggregates are count, sum, min, max, avg, mean \
          (docs/adrs/0022-floating-aggregate-exactness.md)"
     )]
     ExcludedAggregate { name: String },
@@ -342,9 +344,10 @@ fn is_excluded_aggregate(bare: &str) -> bool {
 /// Reject any excluded aggregate anywhere in the query, including inside
 /// subqueries and nested function arguments. ADR-0022 decision 2 flips the
 /// subset from a per-function blacklist to an allowlist: only `count`, `sum`,
-/// `min`, `max` are admitted, so this walk rejects every other default
-/// aggregate. `crate::session::build_session` deregisters the same names as a
-/// backstop; the walk exists for the error message that names the admitted set.
+/// `min`, `max`, `avg`, `mean` are admitted, so this walk rejects every other
+/// default aggregate. `crate::session::build_session` deregisters the same
+/// names as a backstop; the walk exists for the error message that names the
+/// admitted set.
 fn reject_excluded_aggregates(query: &Query) -> Result<(), ValidationError> {
     if let ControlFlow::Break(name) = query.visit(&mut ExcludedAggregateFinder) {
         return Err(ValidationError::ExcludedAggregate { name });
@@ -533,45 +536,39 @@ mod tests {
         }
     }
 
+    /// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): the
+    /// custom sequential-fold UDAF (crate::avg) replaces the built-in, so the
+    /// validation walk no longer rejects them, grouped or ungrouped, and in
+    /// every case spelling. Correctness of the bits is gated in
+    /// tests/differential.rs; this test only asserts the text gate passes.
     #[test]
-    fn avg_is_rejected_and_names_the_admitted_set() {
-        let err = reject("SELECT avg(value) FROM samples");
-        assert_eq!(
-            err,
-            ValidationError::ExcludedAggregate {
-                name: "avg".to_string()
-            }
-        );
+    fn avg_and_mean_are_accepted_grouped_and_ungrouped() {
+        for sql in [
+            "SELECT avg(value) FROM samples",
+            "SELECT mean(value) FROM samples",
+            "SELECT AVG(value) FROM samples",
+            "SELECT s FROM (SELECT AVG(value) AS s FROM samples)",
+            "SELECT max(value) FROM samples HAVING Avg(value) > 1",
+            "SELECT series_id, avg(value) FROM samples GROUP BY series_id",
+            "SELECT series_id, mean(value) FROM samples GROUP BY series_id",
+            "SELECT series_id FROM samples GROUP BY series_id ORDER BY avg(value)",
+        ] {
+            validate(sql).unwrap_or_else(|e| panic!("avg/mean must be accepted: {sql}: {e}"));
+        }
+    }
+
+    /// The error message names the full admitted set, so a client sees every
+    /// aggregate it can use, not just the ones the older ticket admitted.
+    #[test]
+    fn excluded_aggregate_message_names_the_admitted_set() {
+        let err = reject("SELECT median(value) FROM samples");
         let msg = err.to_string();
-        for admitted in ["count", "sum", "min", "max"] {
+        for admitted in ["count", "sum", "min", "max", "avg", "mean"] {
             assert!(
                 msg.contains(admitted),
                 "message must name the admitted aggregate {admitted}: {msg}"
             );
         }
-    }
-
-    #[test]
-    fn avg_is_rejected_in_a_subquery_and_case_insensitively() {
-        assert_eq!(
-            reject("SELECT s FROM (SELECT AVG(value) AS s FROM samples)"),
-            ValidationError::ExcludedAggregate {
-                name: "avg".to_string()
-            }
-        );
-        assert_eq!(
-            reject("SELECT max(value) FROM samples HAVING Avg(value) > 1"),
-            ValidationError::ExcludedAggregate {
-                name: "avg".to_string()
-            }
-        );
-        // `mean` is avg's registered alias and is excluded under the same name.
-        assert_eq!(
-            reject("SELECT mean(value) FROM samples"),
-            ValidationError::ExcludedAggregate {
-                name: "mean".to_string()
-            }
-        );
     }
 
     #[test]
@@ -619,7 +616,7 @@ mod tests {
     /// A representative spread across the rest of the default aggregate set
     /// (regression, approx, median, string/array aggregation, bit and bool
     /// families, and the value pickers) is excluded, not just the floating-mean
-    /// functions: the allowlist admits only `count`/`sum`/`min`/`max`.
+    /// functions: the allowlist admits only `count`/`sum`/`min`/`max`/`avg`/`mean`.
     #[test]
     fn other_default_aggregates_are_excluded_by_the_allowlist() {
         for func in [
