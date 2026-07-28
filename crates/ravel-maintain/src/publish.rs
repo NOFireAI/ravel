@@ -251,6 +251,7 @@ mod tests {
     use crate::scan::scan_next;
     use crate::segread::read_input;
     use ravel_commit::record::{NewCommitRecord, build};
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{PutMode, PutOptions};
     use ravel_segment::{IngestBounds, SegmentIdentity, SeriesInput};
@@ -594,5 +595,311 @@ mod tests {
         let (key2, bytes2) = run(&th, w_a, w_b, &config).await;
         assert_eq!(key1, key2, "record keys must match");
         assert_eq!(bytes1, bytes2, "record bytes must match");
+    }
+
+    // --- FaultStore crash walk (plan section 3.6 rows 1-4, 10-11, 13) ---
+
+    /// Seed two disjoint-series L0 inputs and build their parts at `cap`,
+    /// returning the underlying store (ready to wrap in a `FaultStore`).
+    async fn two_input_run(
+        cap: u64,
+    ) -> (
+        MemoryStore,
+        TenantHash,
+        Vec<CompactionInput>,
+        [u8; 32],
+        Vec<BuiltPart>,
+    ) {
+        let store = MemoryStore::new();
+        let th = tenant_hash();
+        let raw = vec![
+            seed(&store, &th, Uuid::new_v4(), "metric_a").await,
+            seed(&store, &th, Uuid::new_v4(), "metric_b").await,
+        ];
+        let (sorted, hash, parts) = prepare(&store, &th, raw, cap).await;
+        (store, th, sorted, hash, parts)
+    }
+
+    /// Row 1: a fault during the LIST/footer read phase writes nothing; the
+    /// scan is read-only and a re-run recovers.
+    #[tokio::test]
+    async fn row1_fault_during_list_is_read_only() {
+        let (mem, th, _sorted, hash, _parts) = two_input_run(256 << 20).await;
+        let clock = FakeClock::new(FAR_FUTURE_NS);
+        let config = MaintainConfig::default();
+        let fault = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(Rule::new(Op::List, ScriptedFault::Timeout)),
+        );
+
+        let err = scan_next(&fault, &clock, &config, &th, Signal::Metrics, SHARD)
+            .await
+            .expect_err("scan faults on LIST");
+        assert!(
+            matches!(err, MaintainError::Store(StoreError::Timeout)),
+            "got {err}"
+        );
+        assert!(fault.fault_count(Op::List, FaultKind::Timeout) >= 1);
+        // Nothing written: no compaction record exists.
+        let rkey = record_key(&th, hash).await;
+        assert!(matches!(
+            fault.inner().head(&rkey).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    /// Row 2: a fault after some (not all) part PUTs leaves record-less parts
+    /// under l1/; a re-run reuses the identical content-addressed keys.
+    #[tokio::test]
+    async fn row2_fault_after_some_part_puts() {
+        let (mem, th, sorted, hash, parts) = two_input_run(1).await;
+        assert_eq!(parts.len(), 2, "tiny cap must split into two parts");
+        let clock = FakeClock::new(0);
+        let config = MaintainConfig::default();
+        let fault = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::PartialWriteThenError)
+                    .with_key_contains(".rseg")
+                    .with_occurrence(Occurrence::Nth(2)),
+            ),
+        );
+        let req = plan(&th, &sorted, hash, &parts, 0);
+
+        let err = publish(&fault, &clock, &config, &req)
+            .await
+            .expect_err("second part PUT faults");
+        assert!(
+            matches!(err, MaintainError::Store(StoreError::Transient(_))),
+            "got {err}"
+        );
+        assert!(fault.fault_count(Op::Put, FaultKind::PartialWriteThenError) >= 1);
+        // No record references the partial part set.
+        let rkey = record_key(&th, hash).await;
+        assert!(matches!(
+            fault.inner().head(&rkey).await,
+            Err(StoreError::NotFound)
+        ));
+
+        // Re-run (Nth(2) consumed): both parts land, record publishes.
+        assert_eq!(
+            publish(&fault, &clock, &config, &req)
+                .await
+                .expect("re-run"),
+            PublishOutcome::Published
+        );
+        fault.inner().head(&rkey).await.expect("record now durable");
+    }
+
+    /// Row 3: a fault on the record PUT (all parts already durable) leaves
+    /// the same record-less state as row 2; a re-run publishes the record.
+    #[tokio::test]
+    async fn row3_fault_after_all_parts_before_record() {
+        let (mem, th, sorted, hash, parts) = two_input_run(256 << 20).await;
+        let clock = FakeClock::new(0);
+        let config = MaintainConfig::default();
+        let fault = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::Transient("record put dropped".into()))
+                    .with_key_contains(".cmt")
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let req = plan(&th, &sorted, hash, &parts, 0);
+
+        let err = publish(&fault, &clock, &config, &req)
+            .await
+            .expect_err("record PUT faults");
+        assert!(
+            matches!(err, MaintainError::Store(StoreError::Transient(_))),
+            "got {err}"
+        );
+        assert!(fault.fault_count(Op::Put, FaultKind::Transient) >= 1);
+
+        let rkey = record_key(&th, hash).await;
+        assert!(matches!(
+            fault.inner().head(&rkey).await,
+            Err(StoreError::NotFound)
+        ));
+        // Parts were all durable before the record PUT.
+        for part in &parts {
+            let key = part_key(&req, &input::hash16(&hash), part).expect("part key");
+            fault.inner().head(&key).await.expect("part durable");
+        }
+
+        assert_eq!(
+            publish(&fault, &clock, &config, &req)
+                .await
+                .expect("re-run"),
+            PublishOutcome::Published
+        );
+        fault.inner().head(&rkey).await.expect("record durable");
+    }
+
+    /// Row 4: a dropped multipart upload leaves no visible object; the
+    /// re-run reuses the identical key and completes.
+    #[tokio::test]
+    async fn row4_partial_multipart_upload_stays_invisible() {
+        let (mem, th, sorted, hash, parts) = two_input_run(256 << 20).await;
+        assert_eq!(parts.len(), 1);
+        let clock = FakeClock::new(0);
+        let config = MaintainConfig::default();
+        let fault = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::PartialWriteThenError)
+                    .with_key_contains(".rseg")
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let req = plan(&th, &sorted, hash, &parts, 0);
+
+        let err = publish(&fault, &clock, &config, &req)
+            .await
+            .expect_err("part upload drops");
+        assert!(matches!(
+            err,
+            MaintainError::Store(StoreError::Transient(_))
+        ));
+        assert!(fault.fault_count(Op::Put, FaultKind::PartialWriteThenError) >= 1);
+
+        let pkey = part_key(&req, &input::hash16(&hash), &parts[0]).expect("part key");
+        assert!(
+            matches!(fault.inner().head(&pkey).await, Err(StoreError::NotFound)),
+            "incomplete upload must leave no visible object"
+        );
+        let rkey = record_key(&th, hash).await;
+        assert!(matches!(
+            fault.inner().head(&rkey).await,
+            Err(StoreError::NotFound)
+        ));
+
+        assert_eq!(
+            publish(&fault, &clock, &config, &req)
+                .await
+                .expect("re-run reuses the key"),
+            PublishOutcome::Published
+        );
+        fault.inner().head(&pkey).await.expect("part now durable");
+    }
+
+    /// Row 10: two compactors race the same inputs; the record CreateIfAbsent
+    /// picks one winner and the loser verifies the winner's parts and
+    /// converges. The loser's rejected conditional write is modeled with
+    /// FailedConditionalWrite on the record key.
+    #[tokio::test]
+    async fn row10_racing_compactor_loser_converges() {
+        let (mem, th, sorted, hash, parts) = two_input_run(256 << 20).await;
+        let clock = FakeClock::new(0);
+        let config = MaintainConfig::default();
+        let req = plan(&th, &sorted, hash, &parts, 0);
+
+        assert_eq!(
+            publish(&mem, &clock, &config, &req)
+                .await
+                .expect("winner publishes"),
+            PublishOutcome::Published
+        );
+
+        let fault = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains(".cmt"),
+            ),
+        );
+        assert_eq!(
+            publish(&fault, &clock, &config, &req)
+                .await
+                .expect("loser converges"),
+            PublishOutcome::Converged
+        );
+        assert!(fault.fault_count(Op::Put, FaultKind::FailedConditionalWrite) >= 1);
+    }
+
+    /// Row 11: AlreadyExists with a different input_set_hash at the same key
+    /// is an invariant breach; publish alarms and deletes nothing.
+    #[tokio::test]
+    async fn row11_alreadyexists_different_hash_alarms() {
+        let (mem, th, sorted, hash, parts) = two_input_run(256 << 20).await;
+        let clock = FakeClock::new(0);
+        let config = MaintainConfig::default();
+        let req = plan(&th, &sorted, hash, &parts, 0);
+
+        // Plant a foreign record before wrapping (so the plant is un-faulted).
+        let rkey = record_key(&th, hash).await;
+        let mut foreign = build_record(&req, 0);
+        foreign.input_set_hash = vec![0x01; 32];
+        mem.put(
+            &rkey,
+            foreign.encode_to_vec().into(),
+            PutOptions {
+                mode: PutMode::Overwrite,
+                checksum: None,
+            },
+        )
+        .await
+        .expect("plant foreign record");
+
+        let fault = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains(".cmt"),
+            ),
+        );
+        let err = publish(&fault, &clock, &config, &req)
+            .await
+            .expect_err("must alarm");
+        assert!(
+            matches!(err, MaintainError::InputSetHashMismatch { .. }),
+            "got {err}"
+        );
+        assert!(fault.fault_count(Op::Put, FaultKind::FailedConditionalWrite) >= 1);
+    }
+
+    /// Row 13: the abandonment interlock. A run past max_compaction_lifetime
+    /// must not publish its record even while the sweeper concurrently
+    /// deletes one of its parts. The late run may harmlessly re-PUT the part
+    /// (it is content-addressed and unreferenced), but the record PUT is
+    /// never reached, so its scripted fault cannot fire.
+    #[tokio::test]
+    async fn row13_abandoned_run_never_publishes() {
+        let (mem, th, sorted, hash, parts) = two_input_run(256 << 20).await;
+        let config = MaintainConfig::default();
+        // started at 0, now well past the 1 h abandonment deadline.
+        let clock = FakeClock::new(config.max_compaction_lifetime_ns + 1);
+        let req = plan(&th, &sorted, hash, &parts, 0);
+
+        // Sweeper deletes a part concurrently with the late retry.
+        let pkey = part_key(&req, &input::hash16(&hash), &parts[0]).expect("part key");
+        mem.delete(&pkey).await.expect("sweeper delete");
+
+        let fault = FaultStore::new(
+            mem,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains(".cmt"),
+            ),
+        );
+        let err = publish(&fault, &clock, &config, &req)
+            .await
+            .expect_err("run is abandoned");
+        assert!(matches!(err, MaintainError::Abandoned { .. }), "got {err}");
+        // The record PUT was never attempted: its fault could not fire.
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+            0
+        );
+        // The part was re-referenced (harmless, content-addressed)...
+        fault
+            .inner()
+            .head(&pkey)
+            .await
+            .expect("part harmlessly re-put");
+        // ...but no record was published.
+        let rkey = record_key(&th, hash).await;
+        assert!(matches!(
+            fault.inner().head(&rkey).await,
+            Err(StoreError::NotFound)
+        ));
     }
 }
