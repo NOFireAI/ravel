@@ -225,6 +225,15 @@ ordering beyond ordinal 0. (v1 objects are unaffected; their dictionary
 remains sorted and readers keep relying on that for v1 decode where they
 do today.)
 
+Writer note (non-normative): the current v2 writer emits the remaining
+strings in sorted lexicographic order, the same as v1, because a sorted
+dictionary compresses far better (issue #146 restored the sort after
+issue #93 measured the first-occurrence order costing +532% compressed
+LABEL_DICT bytes). This is a writer implementation choice, not a
+contract: the rule above stays relaxed, existing v2 objects written in
+first-occurrence order remain valid, and readers must not depend on the
+order.
+
 ### SERIES_IDS (uncompressed form)
 
 ```
@@ -282,10 +291,13 @@ Semantics and validation (all violations Corrupted, never panics):
     sorts by ordinal instead of by name would silently reorder every
     schema's label pairs and corrupt canonical identity.
 - `__name__` is pinned to LABEL_DICT ordinal 0 by explicit writer
-  special-case, independent of any dictionary ordering rule (v1 assigns
-  it before ranking the remaining sorted strings; v2 assigns it before
-  interning the remaining strings in first-occurrence order). Neither
-  version's ordinal-0 placement depends on the sort v2 removes.
+  special-case, independent of any dictionary ordering rule. Both v1 and
+  v2 writers assign it ordinal 0 during the rank pass, before assigning
+  the remaining strings their sorted ordinals (the v2 writer restored v1's
+  sort in issue #146 because the sorted dictionary compresses far better;
+  the normative ordering rule above stays relaxed, so this is a writer
+  choice and readers still MUST NOT depend on any order beyond ordinal 0).
+  Neither version's ordinal-0 placement depends on that sort.
 - Timestamp bounds reconstruct as `min_ts_ns = footer.min_event_ts_ns +
   min_ts_delta` and `max_ts_ns = min_ts_ns + ts_span`, overflow-checked
   i64 arithmetic. Both deltas are non-negative by writer construction.
