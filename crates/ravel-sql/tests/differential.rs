@@ -1053,7 +1053,7 @@ async fn golden_sum_with_infinities_and_nan() {
 }
 
 /// `avg` never reaches the gate: it is rejected at validation with a message
-/// naming the workaround (plan section 2 "Exactness", review F7).
+/// naming the admitted aggregate set (ADR-0022 decision 2, the allowlist).
 #[tokio::test]
 async fn avg_is_rejected_before_planning() {
     let tenant = tenant_id("golden");
@@ -1066,9 +1066,13 @@ async fn avg_is_rejected_before_planning() {
         .await
         .expect_err("avg must be rejected");
     let message = err.client_message();
-    assert!(message.contains("AVG"), "{message}");
-    assert!(message.contains("SUM"), "{message}");
-    assert!(message.contains("COUNT"), "{message}");
+    assert!(message.contains("avg"), "{message}");
+    for admitted in ["count", "sum", "min", "max"] {
+        assert!(
+            message.contains(admitted),
+            "message must name the admitted aggregate {admitted}: {message}"
+        );
+    }
 }
 
 /// Duplicate timestamps and multi-segment overlap under the canonical dedup
