@@ -33,15 +33,37 @@
 //! (not the join), which is exactly where docs/otap-ingest.md says the
 //! win comes from ("the BLAKE3 canonicalization runs once per distinct
 //! combination per batch instead of once per point").
+//!
+//! Histogram and summary data points (ADR-0016 phase B2) explode into the
+//! same Prometheus-convention scalar series as
+//! `ravel_otlp::normalize::explode_histogram`/`explode_summary`, mirrored
+//! here rather than reused (both are private to `ravel_otlp::normalize`):
+//! same bucket accumulation and overflow checks, same `le`/`quantile`
+//! formatting (`ravel_otlp::promcompat::format_float`, which *is* `pub`
+//! and called directly), same stale-marker and min/max/exemplar drop-
+//! counter rules, same atomic per-point rejection. Unlike the gauge/sum
+//! path's batch-wide `GroupCache`, exploded series are resolved with a
+//! per-metric last-seen [`SeriesIdMemo`] -- the same memoization
+//! granularity `ravel_otlp` itself uses -- since one input point yields
+//! several series with different synthesized names/labels rather than one
+//! series per distinct attribute set. OTAP carries histogram exemplars in
+//! a separate `HISTOGRAM_DP_EXEMPLARS` table (OTLP embeds them inline on
+//! the data point), so the `HistogramExemplarsDropped` counter is derived
+//! by counting exemplar rows per parent data-point id rather than reading
+//! a field. OTAP-carried exponential histograms keep rejecting typed via
+//! [`push_unsupported_type_rejections`] (ADR-0017 is a separate, later
+//! ticket).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, DictionaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array,
+    Array, BooleanArray, DictionaryArray, Float64Array, Int32Array, Int64Array, ListArray,
+    RecordBatch, StringArray, StructArray, TimestampNanosecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::UInt8Type;
+use ravel_otlp::promcompat::format_float;
 use ravel_otlp::{IngestLimits, NormalizeOutput, NormalizedPoint, Rejection};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId, TypeError};
 
@@ -117,14 +139,41 @@ pub fn normalize_decoded(
     let root_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::UnivariateMetrics);
     let dp_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::NumberDataPoints);
     let attr_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::NumberDpAttrs);
+    let hist_dp_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::HistogramDataPoints);
+    let hist_attr_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::HistogramDpAttrs);
+    let hist_exemplar_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::HistogramDpExemplars);
+    let summary_dp_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::SummaryDataPoints);
+    let summary_attr_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::SummaryDpAttrs);
 
     let flat_dp = flatten_dp(&dp_batches);
     let flat_attrs = flatten_attrs(&attr_batches);
+    let flat_hist_dp = flatten_histogram_dp(&hist_dp_batches);
+    let flat_hist_attrs = flatten_attrs(&hist_attr_batches);
+    let hist_exemplar_counts = count_by_parent_id(&hist_exemplar_batches);
+    let flat_summary_dp = flatten_summary_dp(&summary_dp_batches);
+    let flat_summary_attrs = flatten_attrs(&summary_attr_batches);
 
-    let dense_size = dense_size_for(&root_batches, &flat_dp);
+    let dense_size = dense_size_for(
+        &root_batches,
+        flat_dp
+            .iter()
+            .map(|d| d.parent_id)
+            .chain(flat_hist_dp.iter().map(|d| d.parent_id))
+            .chain(flat_summary_dp.iter().map(|d| d.parent_id)),
+    );
     let root = build_root_table(&root_batches, dense_size);
-    let (metric_decision, unknown_metric_count) =
+    let (metric_decision, unknown_number_count) =
         build_metric_decisions(&root, &flat_dp, limits, dense_size, &mut rejected);
+    let (hist_decision, unknown_hist_count) =
+        build_histogram_decisions(&root, &flat_hist_dp, limits, dense_size, &mut rejected);
+    let (summary_decision, unknown_summary_count) =
+        build_summary_decisions(&root, &flat_summary_dp, limits, dense_size, &mut rejected);
+    let unknown_metric_count = unknown_number_count + unknown_hist_count + unknown_summary_count;
     if unknown_metric_count > 0 {
         rejected.push(Rejection::UnsupportedMetricType {
             metric_type: UNKNOWN_OTAP_METRIC_TYPE,
@@ -220,6 +269,67 @@ pub fn normalize_decoded(
         }
     }
 
+    let hist_attr_order = sort_attrs_by_parent(&flat_hist_attrs);
+    let mut hist_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
+    for dp in &flat_hist_dp {
+        let Some(decision) = hist_decision
+            .get(dp.parent_id as usize)
+            .and_then(|d| d.as_ref())
+        else {
+            continue;
+        };
+        let range = attr_range_for(&flat_hist_attrs, &hist_attr_order, dp.id);
+        let exemplar_count = hist_exemplar_counts.get(&dp.id).copied().unwrap_or(0);
+        let memo = hist_memos
+            .entry(dp.parent_id)
+            .or_insert_with(SeriesIdMemo::new);
+        match explode_histogram_point(
+            tenant,
+            &decision.name,
+            dp,
+            range,
+            &flat_hist_attrs,
+            limits,
+            ingest_ts_ns,
+            exemplar_count,
+            memo,
+        ) {
+            Ok((mut new_points, informational)) => {
+                points.append(&mut new_points);
+                rejected.extend(informational);
+            }
+            Err(rejection) => rejected.push(rejection),
+        }
+    }
+
+    let summary_attr_order = sort_attrs_by_parent(&flat_summary_attrs);
+    let mut summary_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
+    for dp in &flat_summary_dp {
+        let Some(decision) = summary_decision
+            .get(dp.parent_id as usize)
+            .and_then(|d| d.as_ref())
+        else {
+            continue;
+        };
+        let range = attr_range_for(&flat_summary_attrs, &summary_attr_order, dp.id);
+        let memo = summary_memos
+            .entry(dp.parent_id)
+            .or_insert_with(SeriesIdMemo::new);
+        match explode_summary_point(
+            tenant,
+            &decision.name,
+            dp,
+            range,
+            &flat_summary_attrs,
+            limits,
+            ingest_ts_ns,
+            memo,
+        ) {
+            Ok(mut new_points) => points.append(&mut new_points),
+            Err(rejection) => rejected.push(rejection),
+        }
+    }
+
     NormalizeOutput { points, rejected }
 }
 
@@ -251,33 +361,23 @@ fn count_total_points(batch: &DecodedBatch) -> usize {
     .sum()
 }
 
-/// Unsupported metric payload types are counted rejections, never silent
-/// drops: one combined [`Rejection::UnsupportedMetricType`] per payload
-/// type present in this batch, summing rows across every metric that
-/// shares it (see module docs: OTAP's columnar tables don't carry a
-/// natural per-metric split without a root-table join we don't need for
-/// any other reason, so we reject at payload-type granularity).
+/// Exponential histograms are the one remaining unsupported metric payload
+/// type (ADR-0017, out of B2's scope per docs/ingest-breadth-plan.md §7):
+/// counted as one [`Rejection::UnsupportedMetricType`], never a silent drop.
+/// Histogram and summary payloads are normalized below instead of rejected
+/// here.
 fn push_unsupported_type_rejections(batch: &DecodedBatch, rejected: &mut Vec<Rejection>) {
-    for (ty, label) in [
-        (ArrowPayloadType::HistogramDataPoints, "histogram"),
-        (
-            ArrowPayloadType::ExpHistogramDataPoints,
-            "exponential_histogram",
-        ),
-        (ArrowPayloadType::SummaryDataPoints, "summary"),
-    ] {
-        let count: usize = batch
-            .payloads
-            .iter()
-            .filter(|(t, _)| *t == ty)
-            .map(|(_, rb)| rb.num_rows())
-            .sum();
-        if count > 0 {
-            rejected.push(Rejection::UnsupportedMetricType {
-                metric_type: label,
-                count,
-            });
-        }
+    let count: usize = batch
+        .payloads
+        .iter()
+        .filter(|(t, _)| *t == ArrowPayloadType::ExpHistogramDataPoints)
+        .map(|(_, rb)| rb.num_rows())
+        .sum();
+    if count > 0 {
+        rejected.push(Rejection::UnsupportedMetricType {
+            metric_type: "exponential_histogram",
+            count,
+        });
     }
 }
 
@@ -292,6 +392,10 @@ enum RootKind {
         temporality: i32,
         is_monotonic: bool,
     },
+    Histogram {
+        temporality: i32,
+    },
+    Summary,
     Unsupported,
 }
 
@@ -301,11 +405,58 @@ struct MetricDecision {
     is_monotonic: bool,
 }
 
+/// A histogram metric's decision: only the sanitized name survives past
+/// decision-building, since the temporality check happens once here (see
+/// [`build_histogram_decisions`]), mirroring `ravel_otlp::normalize_metric`'s
+/// single up-front check per `Metric` rather than per point.
+struct HistogramDecision {
+    name: String,
+}
+
+/// A summary metric's decision. Summaries carry no temporality field in
+/// OTLP or OTAP, so unlike [`HistogramDecision`] there is nothing to check
+/// beyond the name.
+struct SummaryDecision {
+    name: String,
+}
+
 struct FlatDp {
     id: u32,
     parent_id: u16,
     ts_ns: i64,
     value: f64,
+}
+
+/// One flattened `HISTOGRAM_DATA_POINTS` row. `bucket_counts` and
+/// `explicit_bounds` are read from `List(UInt64)`/`List(Float64)` columns
+/// (see [`list_u64_at`]/[`list_f64_at`]); a null list or null timestamp
+/// reads as empty/zero rather than panicking, matching this crate's
+/// no-panic-on-malformed-input contract even though this encoder's own test
+/// data never emits either.
+struct FlatHistogramDp {
+    id: u32,
+    parent_id: u16,
+    ts_ns: i64,
+    count: u64,
+    sum: Option<f64>,
+    bucket_counts: Vec<u64>,
+    explicit_bounds: Vec<f64>,
+    flags: u32,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+/// One flattened `SUMMARY_DATA_POINTS` row. `quantiles` is read from the
+/// `List(Struct{quantile: Float64, value: Float64})` column (see
+/// [`quantiles_at`]).
+struct FlatSummaryDp {
+    id: u32,
+    parent_id: u16,
+    ts_ns: i64,
+    count: u64,
+    sum: f64,
+    quantiles: Vec<(f64, f64)>,
+    flags: u32,
 }
 
 struct FlatAttr<'b> {
@@ -336,7 +487,7 @@ enum RawCell {
 type GroupCache =
     HashMap<u32, HashMap<Vec<(String, RawCell)>, Result<(LabelSet, SeriesId), Rejection>>>;
 
-fn dense_size_for(root_batches: &[&RecordBatch], flat_dp: &[FlatDp]) -> usize {
+fn dense_size_for(root_batches: &[&RecordBatch], parent_ids: impl Iterator<Item = u16>) -> usize {
     let mut max_id: u32 = 0;
     for rb in root_batches {
         if let Some(ids) = column_as::<UInt16Array>(rb, "id") {
@@ -345,8 +496,8 @@ fn dense_size_for(root_batches: &[&RecordBatch], flat_dp: &[FlatDp]) -> usize {
             }
         }
     }
-    for dp in flat_dp {
-        max_id = max_id.max(u32::from(dp.parent_id));
+    for parent_id in parent_ids {
+        max_id = max_id.max(u32::from(parent_id));
     }
     (max_id as usize + 1).min(MAX_METRIC_IDS)
 }
@@ -425,6 +576,12 @@ fn build_root_table(root_batches: &[&RecordBatch], dense_size: usize) -> Vec<Opt
                         is_monotonic,
                     }
                 }
+                METRIC_TYPE_HISTOGRAM => {
+                    let temporality =
+                        opt_i32(temporality_col, i).unwrap_or(AGGREGATION_TEMPORALITY_UNSPECIFIED);
+                    RootKind::Histogram { temporality }
+                }
+                METRIC_TYPE_SUMMARY => RootKind::Summary,
                 _ => RootKind::Unsupported,
             };
             if (id as usize) < entries.len() {
@@ -567,6 +724,12 @@ fn build_metric_decisions(
                         is_monotonic: *is_monotonic,
                     });
                 }
+                // A NUMBER_DATA_POINTS row whose parent metric id is
+                // declared Histogram/Summary is a table/type mismatch: our
+                // own encoder can't produce it, but a malformed producer
+                // could, so it's defensive unknown classification, same as
+                // `RootKind::Unsupported`.
+                RootKind::Histogram { .. } | RootKind::Summary => unknown_count += count,
             },
         }
     }
@@ -745,4 +908,605 @@ fn is_label_name_start(c: char) -> bool {
 
 fn is_label_name_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
+}
+
+// --- Histogram/summary explosion (ADR-0016 phase B2). Mirrors
+// `ravel_otlp::normalize`'s private `explode_histogram`/`explode_summary`
+// and their shared helpers exactly (see module docs); duplicated rather than
+// reused since none of it is `pub` there. ---
+
+/// Prometheus stale marker, duplicated from `ravel_otlp::normalize` (itself
+/// duplicated from `ravel-promql`): an ingest crate must not depend on the
+/// query-engine crate, or on a sibling ingest crate, for one constant.
+const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+fn stale_nan() -> f64 {
+    f64::from_bits(STALE_NAN_BITS)
+}
+
+/// `DataPointFlags::NoRecordedValueMask` bit value (otel-arrow copies the
+/// OTLP `flags` field verbatim as a plain `u32` column, so there is no
+/// generated enum to reference here). Hardcoded rather than pulling in
+/// `opentelemetry-proto` for one constant: that crate is a dev-dependency of
+/// this one, and this small a value is cheaper to duplicate than to promote
+/// a test-only dependency to production code.
+const NO_RECORDED_VALUE_MASK: u32 = 1;
+
+fn has_no_recorded_value(flags: u32) -> bool {
+    flags & NO_RECORDED_VALUE_MASK != 0
+}
+
+/// Last-seen memo for `SeriesId::compute`, scoped to one metric id. Mirrors
+/// `ravel_otlp::normalize`'s private `SeriesIdMemo` exactly: within one
+/// metric, `tenant` and the metric name are constant, and the built
+/// `LabelSet` fully determines the canonical `SeriesId` (ADR-0005), so an
+/// equal `LabelSet` always yields a bit-identical id. One input data point
+/// explodes into several series with different synthesized names/labels
+/// (unlike the gauge/sum path's one-point-one-series shape), so this is
+/// keyed per metric id via a `HashMap<u16, SeriesIdMemo>` at the call site
+/// rather than shared across a whole batch.
+struct SeriesIdMemo {
+    last: Option<(LabelSet, SeriesId)>,
+}
+
+impl SeriesIdMemo {
+    fn new() -> Self {
+        SeriesIdMemo { last: None }
+    }
+
+    fn series_id(
+        &mut self,
+        tenant: &TenantId,
+        metric_name: &str,
+        labels: &LabelSet,
+    ) -> Result<SeriesId, TypeError> {
+        if let Some((last_labels, last_id)) = &self.last
+            && last_labels == labels
+        {
+            return Ok(*last_id);
+        }
+        let id = SeriesId::compute(tenant, metric_name, labels)?;
+        self.last = Some((labels.clone(), id));
+        Ok(id)
+    }
+}
+
+/// Read a `List(UInt64)` column's `i`-th list, or empty for a null list or a
+/// values array of an unexpected type (defensive: this crate's own test
+/// encoder never emits either, but malformed input must not panic).
+fn list_u64_at(list: &ListArray, i: usize) -> Vec<u64> {
+    if list.is_null(i) {
+        return Vec::new();
+    }
+    let value = list.value(i);
+    match value.as_any().downcast_ref::<UInt64Array>() {
+        Some(values) => values.values().to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Read a `List(Float64)` column's `i`-th list; see [`list_u64_at`].
+fn list_f64_at(list: &ListArray, i: usize) -> Vec<f64> {
+    if list.is_null(i) {
+        return Vec::new();
+    }
+    let value = list.value(i);
+    match value.as_any().downcast_ref::<Float64Array>() {
+        Some(values) => values.values().to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Read a `List(Struct{quantile: Float64, value: Float64})` column's `i`-th
+/// list of `(quantile, value)` pairs; see [`list_u64_at`].
+fn quantiles_at(list: &ListArray, i: usize) -> Vec<(f64, f64)> {
+    if list.is_null(i) {
+        return Vec::new();
+    }
+    let value = list.value(i);
+    let Some(s) = value.as_any().downcast_ref::<StructArray>() else {
+        return Vec::new();
+    };
+    let Some(quantiles) = s
+        .column_by_name("quantile")
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+    else {
+        return Vec::new();
+    };
+    let Some(values) = s
+        .column_by_name("value")
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+    else {
+        return Vec::new();
+    };
+    (0..s.len())
+        .map(|j| (quantiles.value(j), values.value(j)))
+        .collect()
+}
+
+fn flatten_histogram_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatHistogramDp> {
+    let mut out = Vec::new();
+    for rb in dp_batches {
+        let Some(ids) = column_as::<UInt32Array>(rb, "id") else {
+            continue;
+        };
+        let Some(parents) = column_as::<UInt16Array>(rb, "parent_id") else {
+            continue;
+        };
+        let Some(times) = column_as::<TimestampNanosecondArray>(rb, "time_unix_nano") else {
+            continue;
+        };
+        let Some(counts) = column_as::<UInt64Array>(rb, "count") else {
+            continue;
+        };
+        let Some(bucket_counts_col) = column_as::<ListArray>(rb, "bucket_counts") else {
+            continue;
+        };
+        let Some(bounds_col) = column_as::<ListArray>(rb, "explicit_bounds") else {
+            continue;
+        };
+        let sums = column_as::<Float64Array>(rb, "sum");
+        let flags_col = column_as::<UInt32Array>(rb, "flags");
+        let mins = column_as::<Float64Array>(rb, "min");
+        let maxs = column_as::<Float64Array>(rb, "max");
+        for i in 0..rb.num_rows() {
+            out.push(FlatHistogramDp {
+                id: ids.value(i),
+                parent_id: parents.value(i),
+                ts_ns: times.value(i),
+                count: counts.value(i),
+                sum: opt_f64(sums, i),
+                bucket_counts: list_u64_at(bucket_counts_col, i),
+                explicit_bounds: list_f64_at(bounds_col, i),
+                flags: flags_col.map_or(0, |c| c.value(i)),
+                min: opt_f64(mins, i),
+                max: opt_f64(maxs, i),
+            });
+        }
+    }
+    out
+}
+
+fn flatten_summary_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatSummaryDp> {
+    let mut out = Vec::new();
+    for rb in dp_batches {
+        let Some(ids) = column_as::<UInt32Array>(rb, "id") else {
+            continue;
+        };
+        let Some(parents) = column_as::<UInt16Array>(rb, "parent_id") else {
+            continue;
+        };
+        let Some(times) = column_as::<TimestampNanosecondArray>(rb, "time_unix_nano") else {
+            continue;
+        };
+        let Some(counts) = column_as::<UInt64Array>(rb, "count") else {
+            continue;
+        };
+        let Some(sums) = column_as::<Float64Array>(rb, "sum") else {
+            continue;
+        };
+        let Some(quantile_col) = column_as::<ListArray>(rb, "quantile") else {
+            continue;
+        };
+        let flags_col = column_as::<UInt32Array>(rb, "flags");
+        for i in 0..rb.num_rows() {
+            out.push(FlatSummaryDp {
+                id: ids.value(i),
+                parent_id: parents.value(i),
+                ts_ns: times.value(i),
+                count: counts.value(i),
+                sum: sums.value(i),
+                quantiles: quantiles_at(quantile_col, i),
+                flags: flags_col.map_or(0, |c| c.value(i)),
+            });
+        }
+    }
+    out
+}
+
+/// Count rows by `parent_id` across a set of batches: used for the
+/// `HISTOGRAM_DP_EXEMPLARS` table, whose only role here is giving an
+/// exemplar count per histogram data-point id (OTAP carries exemplars in
+/// their own table joined by `parent_id`; OTLP embeds them inline on the
+/// data point as `dp.exemplars`).
+fn count_by_parent_id(batches: &[&RecordBatch]) -> HashMap<u32, usize> {
+    let mut counts = HashMap::new();
+    for rb in batches {
+        let Some(parents) = column_as::<UInt32Array>(rb, "parent_id") else {
+            continue;
+        };
+        for i in 0..rb.num_rows() {
+            *counts.entry(parents.value(i)).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Per-metric total data-point count for Histogram roots, checked once per
+/// metric id: mirrors `ravel_otlp::normalize_metric`'s Histogram arm, which
+/// validates the (already up-front-checked) name then the cumulative-only
+/// temporality requirement, name first.
+fn build_histogram_decisions(
+    root: &[Option<RootEntry>],
+    flat_dp: &[FlatHistogramDp],
+    limits: &IngestLimits,
+    dense_size: usize,
+    rejected: &mut Vec<Rejection>,
+) -> (Vec<Option<HistogramDecision>>, usize) {
+    let mut dp_count = vec![0u32; dense_size];
+    for dp in flat_dp {
+        if (dp.parent_id as usize) < dp_count.len() {
+            dp_count[dp.parent_id as usize] += 1;
+        }
+    }
+
+    let mut decisions: Vec<Option<HistogramDecision>> = (0..dense_size).map(|_| None).collect();
+    let mut unknown_count = 0usize;
+
+    for id in 0..dense_size {
+        let count = dp_count[id] as usize;
+        if count == 0 {
+            continue;
+        }
+        match root.get(id).and_then(|e| e.as_ref()) {
+            None => unknown_count += count,
+            Some(entry) => match &entry.kind {
+                RootKind::Histogram { temporality } => {
+                    let Some(name) = process_metric_name(&entry.name, limits, count, rejected)
+                    else {
+                        continue;
+                    };
+                    if *temporality != AGGREGATION_TEMPORALITY_CUMULATIVE {
+                        rejected.push(Rejection::UnsupportedTemporality { count });
+                        continue;
+                    }
+                    decisions[id] = Some(HistogramDecision { name });
+                }
+                _ => unknown_count += count,
+            },
+        }
+    }
+
+    (decisions, unknown_count)
+}
+
+/// Per-metric total data-point count for Summary roots, checked once per
+/// metric id: mirrors `ravel_otlp::normalize_metric`'s Summary arm, which
+/// has only the up-front name check (summaries carry no temporality field).
+fn build_summary_decisions(
+    root: &[Option<RootEntry>],
+    flat_dp: &[FlatSummaryDp],
+    limits: &IngestLimits,
+    dense_size: usize,
+    rejected: &mut Vec<Rejection>,
+) -> (Vec<Option<SummaryDecision>>, usize) {
+    let mut dp_count = vec![0u32; dense_size];
+    for dp in flat_dp {
+        if (dp.parent_id as usize) < dp_count.len() {
+            dp_count[dp.parent_id as usize] += 1;
+        }
+    }
+
+    let mut decisions: Vec<Option<SummaryDecision>> = (0..dense_size).map(|_| None).collect();
+    let mut unknown_count = 0usize;
+
+    for id in 0..dense_size {
+        let count = dp_count[id] as usize;
+        if count == 0 {
+            continue;
+        }
+        match root.get(id).and_then(|e| e.as_ref()) {
+            None => unknown_count += count,
+            Some(entry) => match &entry.kind {
+                RootKind::Summary => {
+                    if let Some(name) = process_metric_name(&entry.name, limits, count, rejected) {
+                        decisions[id] = Some(SummaryDecision { name });
+                    }
+                }
+                _ => unknown_count += count,
+            },
+        }
+    }
+
+    (decisions, unknown_count)
+}
+
+/// Validate and resolve one data point's event timestamp exactly like
+/// `ravel_otlp::normalize`'s private `checked_event_ts`, except `ts_ns` is
+/// already `i64` here (read from an Arrow `TimestampNanosecondArray`, not a
+/// wire `u64`), so there is no `i64::try_from` saturation step.
+fn checked_event_ts(
+    ts_ns: i64,
+    ingest_ts_ns: i64,
+    limits: &IngestLimits,
+) -> Result<i64, Rejection> {
+    if ts_ns == 0 {
+        return Err(Rejection::ZeroTimestamp);
+    }
+    let skew_ns = ts_ns.saturating_sub(ingest_ts_ns);
+    if skew_ns > limits.max_future_skew_ns {
+        return Err(Rejection::FutureSkew {
+            skew_ns,
+            max_ns: limits.max_future_skew_ns,
+        });
+    }
+    let lag_ns = ingest_ts_ns.saturating_sub(ts_ns);
+    if lag_ns > limits.max_ingest_lag_ns {
+        return Err(Rejection::TooOld {
+            lag_ns,
+            max_ns: limits.max_ingest_lag_ns,
+        });
+    }
+    Ok(ts_ns)
+}
+
+/// Build the attribute-derived label prefix shared by every series exploded
+/// from one histogram/summary data point (everything but the `__name__`
+/// label and the synthesized `le`/`quantile` label, which differ per
+/// series). Mirrors `ravel_otlp::normalize`'s private
+/// `build_explode_base_labels`, minus the resource-label prefix: as the
+/// module docs explain, this crate's test encoder never emits
+/// `RESOURCE_ATTRS`/`SCOPE_ATTRS`, so every point here already carries an
+/// empty resource label set.
+fn build_base_labels(
+    range: &[u32],
+    attrs: &[FlatAttr],
+    limits: &IngestLimits,
+) -> Result<Vec<Label>, Rejection> {
+    if range.len() > limits.max_attributes_per_point {
+        return Err(Rejection::TooManyAttributes {
+            attribute_count: range.len(),
+            max: limits.max_attributes_per_point,
+        });
+    }
+    let mut labels = Vec::with_capacity(range.len());
+    for &i in range {
+        let a = &attrs[i as usize];
+        let name = sanitize_label_name(a.key);
+        let value = raw_cell_value(&raw_cell(a))?;
+        push_checked(&mut labels, name, value, limits)?;
+    }
+    Ok(labels)
+}
+
+/// Finish one exploded series: attach `__name__` and an optional `le`/
+/// `quantile` label to the shared base labels, then build the label set and
+/// resolve its series id. Mirrors `ravel_otlp::normalize`'s private
+/// `finish_point` exactly.
+#[allow(clippy::too_many_arguments)]
+fn finish_exploded_point(
+    tenant: &TenantId,
+    memo: &mut SeriesIdMemo,
+    base_labels: &[Label],
+    metric_name: &str,
+    extra_label: Option<(&'static str, String)>,
+    ts_ns: i64,
+    value: f64,
+    limits: &IngestLimits,
+) -> Result<NormalizedPoint, Rejection> {
+    let mut labels = Vec::with_capacity(base_labels.len() + 2);
+    labels.extend_from_slice(base_labels);
+    labels.push(Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: metric_name.to_string(),
+    });
+    if let Some((name, value)) = extra_label {
+        push_checked(&mut labels, name.to_string(), value, limits)?;
+    }
+
+    let label_set = LabelSet::new(labels).map_err(|err| match err {
+        TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
+        _ => Rejection::DuplicateLabelName(String::new()),
+    })?;
+
+    let series_id = memo
+        .series_id(tenant, metric_name, &label_set)
+        .map_err(|_| Rejection::OversizedSeriesComponent)?;
+
+    Ok(NormalizedPoint {
+        series_id,
+        labels: label_set,
+        sample: Sample { ts_ns, value },
+        is_monotonic_sum: false,
+    })
+}
+
+/// Explode one `HISTOGRAM_DATA_POINTS` row into its Prometheus-convention
+/// series: one `{name}_bucket{le=<bound>}` per explicit bound plus
+/// `{name}_bucket{le="+Inf"}` (= the point's count), `{name}_sum` when `sum`
+/// is present, and `{name}_count`. Mirrors `ravel_otlp::normalize`'s private
+/// `explode_histogram` exactly, including its check order (event timestamp
+/// first, then bucket-count/bound structural checks, then attribute admission)
+/// and its atomic-rejection contract: an `Err` means none of this point's
+/// series were admitted, never a partial set (ADR-0016). `Ok` also carries
+/// zero-weight informational rejections for dropped min/max/exemplar fields,
+/// since the point itself was admitted; `exemplar_count` comes from
+/// [`count_by_parent_id`] over the `HISTOGRAM_DP_EXEMPLARS` table rather than
+/// an inline field, since OTAP carries exemplars in their own table.
+#[allow(clippy::too_many_arguments)]
+fn explode_histogram_point(
+    tenant: &TenantId,
+    metric_name: &str,
+    dp: &FlatHistogramDp,
+    range: &[u32],
+    attrs: &[FlatAttr],
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_count: usize,
+    memo: &mut SeriesIdMemo,
+) -> Result<(Vec<NormalizedPoint>, Vec<Rejection>), Rejection> {
+    let event_ts_ns = checked_event_ts(dp.ts_ns, ingest_ts_ns, limits)?;
+
+    let expected_buckets = dp.explicit_bounds.len() + 1;
+    if dp.bucket_counts.len() != expected_buckets {
+        return Err(Rejection::HistogramBucketCountMismatch {
+            bounds: dp.explicit_bounds.len(),
+            buckets: dp.bucket_counts.len(),
+            expected: expected_buckets,
+        });
+    }
+    if dp.explicit_bounds.iter().any(|b| !b.is_finite()) {
+        return Err(Rejection::NonFiniteHistogramBound);
+    }
+    if !dp.explicit_bounds.windows(2).all(|w| w[0] < w[1]) {
+        return Err(Rejection::HistogramBoundsNotIncreasing);
+    }
+
+    let base_labels = build_base_labels(range, attrs, limits)?;
+    let stale = has_no_recorded_value(dp.flags);
+    let bucket_name = format!("{metric_name}_bucket");
+
+    let mut series = Vec::with_capacity(expected_buckets + 2);
+    let mut cumulative: u64 = 0;
+    for (bound, count) in dp.explicit_bounds.iter().zip(&dp.bucket_counts) {
+        cumulative = cumulative
+            .checked_add(*count)
+            .ok_or(Rejection::HistogramCountOverflow)?;
+        let value = if stale {
+            stale_nan()
+        } else {
+            cumulative as f64
+        };
+        series.push(finish_exploded_point(
+            tenant,
+            memo,
+            &base_labels,
+            &bucket_name,
+            Some(("le", format_float(*bound))),
+            event_ts_ns,
+            value,
+            limits,
+        )?);
+    }
+
+    // The +Inf bucket and _count both use the point's raw count directly,
+    // not the accumulated bucket sum (matches the collector's mapping and
+    // ravel_otlp::explode_histogram).
+    let count_value = if stale { stale_nan() } else { dp.count as f64 };
+    series.push(finish_exploded_point(
+        tenant,
+        memo,
+        &base_labels,
+        &bucket_name,
+        Some(("le", "+Inf".to_string())),
+        event_ts_ns,
+        count_value,
+        limits,
+    )?);
+
+    if let Some(sum) = dp.sum {
+        let sum_value = if stale { stale_nan() } else { sum };
+        let sum_name = format!("{metric_name}_sum");
+        series.push(finish_exploded_point(
+            tenant,
+            memo,
+            &base_labels,
+            &sum_name,
+            None,
+            event_ts_ns,
+            sum_value,
+            limits,
+        )?);
+    }
+
+    let count_name = format!("{metric_name}_count");
+    series.push(finish_exploded_point(
+        tenant,
+        memo,
+        &base_labels,
+        &count_name,
+        None,
+        event_ts_ns,
+        count_value,
+        limits,
+    )?);
+
+    let mut informational = Vec::new();
+    if dp.min.is_some() || dp.max.is_some() {
+        informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
+    }
+    if exemplar_count > 0 {
+        informational.push(Rejection::HistogramExemplarsDropped {
+            count: exemplar_count,
+        });
+    }
+
+    Ok((series, informational))
+}
+
+/// Explode one `SUMMARY_DATA_POINTS` row into its Prometheus-convention
+/// series: one `{name}{quantile=<q>}` per quantile plus `{name}_sum` and
+/// `{name}_count`. Mirrors `ravel_otlp::normalize`'s private
+/// `explode_summary` exactly, including its check order (event timestamp
+/// first, then per-quantile finite/duplicate checks, then attribute
+/// admission) and its atomic-rejection contract, same as
+/// [`explode_histogram_point`].
+#[allow(clippy::too_many_arguments)]
+fn explode_summary_point(
+    tenant: &TenantId,
+    metric_name: &str,
+    dp: &FlatSummaryDp,
+    range: &[u32],
+    attrs: &[FlatAttr],
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    memo: &mut SeriesIdMemo,
+) -> Result<Vec<NormalizedPoint>, Rejection> {
+    let event_ts_ns = checked_event_ts(dp.ts_ns, ingest_ts_ns, limits)?;
+
+    let mut seen_quantiles = std::collections::HashSet::with_capacity(dp.quantiles.len());
+    for (quantile, _) in &dp.quantiles {
+        if !quantile.is_finite() {
+            return Err(Rejection::NonFiniteQuantile);
+        }
+        if !seen_quantiles.insert(quantile.to_bits()) {
+            return Err(Rejection::DuplicateQuantile);
+        }
+    }
+
+    let base_labels = build_base_labels(range, attrs, limits)?;
+    let stale = has_no_recorded_value(dp.flags);
+
+    let mut series = Vec::with_capacity(dp.quantiles.len() + 2);
+    for (quantile, value) in &dp.quantiles {
+        let v = if stale { stale_nan() } else { *value };
+        series.push(finish_exploded_point(
+            tenant,
+            memo,
+            &base_labels,
+            metric_name,
+            Some(("quantile", format_float(*quantile))),
+            event_ts_ns,
+            v,
+            limits,
+        )?);
+    }
+
+    let sum_value = if stale { stale_nan() } else { dp.sum };
+    let sum_name = format!("{metric_name}_sum");
+    series.push(finish_exploded_point(
+        tenant,
+        memo,
+        &base_labels,
+        &sum_name,
+        None,
+        event_ts_ns,
+        sum_value,
+        limits,
+    )?);
+
+    let count_value = if stale { stale_nan() } else { dp.count as f64 };
+    let count_name = format!("{metric_name}_count");
+    series.push(finish_exploded_point(
+        tenant,
+        memo,
+        &base_labels,
+        &count_name,
+        None,
+        event_ts_ns,
+        count_value,
+        limits,
+    )?);
+
+    Ok(series)
 }
