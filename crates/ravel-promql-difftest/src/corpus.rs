@@ -296,4 +296,16 @@ mode: error
                 .expect_err("must fail");
         assert!(matches!(err, CorpusError::Malformed { .. }));
     }
+
+    #[test]
+    fn binop_corpus_file_parses_cleanly() {
+        let entries =
+            parse_corpus(include_str!("../corpus/binop.txt")).expect("parse binop corpus");
+        assert!(entries.len() >= 20);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.mode == ComparisonMode::ExpectError)
+        );
+    }
 }

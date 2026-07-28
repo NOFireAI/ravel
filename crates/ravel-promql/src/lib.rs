@@ -6,12 +6,14 @@
 //! lookback, staleness-aware iteration, and a resolution cap on range
 //! queries. The counter/regression function family (`rate`, `irate`,
 //! `increase`, `delta`, `idelta`, `resets`, `changes`, `deriv`,
-//! `predict_linear`) is evaluated via [`functions`]; aggregation, binary
-//! expressions, subqueries, and every other function are not yet evaluated
-//! (`Error::Unsupported`), but [`plan_selectors`] still reports every
-//! selector reachable through them, for a future phase's prefetch. The
-//! evaluator consumes a storage-agnostic series stream trait.
+//! `predict_linear`) is evaluated via [`functions`]; binary operators
+//! (arithmetic, comparison, vector matching, set operators) are evaluated
+//! via `binop`. Aggregation, subqueries, and every other function are not
+//! yet evaluated (`Error::Unsupported`), but [`plan_selectors`] still
+//! reports every selector reachable through them, for a future phase's
+//! prefetch. The evaluator consumes a storage-agnostic series stream trait.
 
+mod binop;
 mod eval;
 mod functions;
 mod matchers;
