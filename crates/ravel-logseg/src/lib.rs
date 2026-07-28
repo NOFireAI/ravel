@@ -13,6 +13,7 @@
 //! panicking.
 
 pub mod error;
+pub mod tokenizer;
 pub mod varint;
 
 pub use error::LogSegError;
