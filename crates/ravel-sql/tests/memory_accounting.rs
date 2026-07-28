@@ -97,7 +97,7 @@ async fn a_multi_batch_query_returns_every_reserved_byte() {
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
     let accountant = TenantMemoryAccountant::new(1 << 30);
-    let pool = SqlConfig::default().query_pool(Arc::clone(&accountant));
+    let (pool, _breach) = SqlConfig::default().query_pool(Arc::clone(&accountant));
     assert_eq!(pool.reserved(), 0, "a fresh pool starts empty");
 
     let (batches, after_first, peak) = drain(
@@ -144,7 +144,7 @@ async fn a_multi_batch_aggregate_query_returns_every_reserved_byte() {
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
     let accountant = TenantMemoryAccountant::new(1 << 30);
-    let pool = SqlConfig::default().query_pool(Arc::clone(&accountant));
+    let (pool, _breach) = SqlConfig::default().query_pool(Arc::clone(&accountant));
 
     let (_batches, _first, _peak) = drain(
         &fixture,
@@ -169,7 +169,7 @@ async fn repeated_multi_batch_queries_do_not_accumulate_tenant_bytes() {
 
     let accountant = TenantMemoryAccountant::new(1 << 30);
     for round in 0..3 {
-        let pool = SqlConfig::default().query_pool(Arc::clone(&accountant));
+        let (pool, _breach) = SqlConfig::default().query_pool(Arc::clone(&accountant));
         let (batches, _first, _peak) = drain(
             &fixture,
             &tenant,
@@ -234,7 +234,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         max_query_bytes: 1_400_000,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
-    let pool = config.query_pool(Arc::clone(&accountant));
+    let (pool, _breach) = config.query_pool(Arc::clone(&accountant));
 
     let snapshot = fixture.snapshot(&tenant).await;
     let provider = Arc::new(RavelTableProvider::new(
