@@ -335,8 +335,8 @@ async fn avg_is_rejected_with_a_message_naming_the_workaround() {
     let (status, value) = post_json(&app, "acme-token", "SELECT avg(value) FROM samples").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let message = value["error"].as_str().expect("message");
-    assert!(message.contains("SUM"), "{message}");
-    assert!(message.contains("COUNT"), "{message}");
+    assert!(message.contains("sum"), "{message}");
+    assert!(message.contains("count"), "{message}");
 }
 
 // ---------------------------------------------------------------------------

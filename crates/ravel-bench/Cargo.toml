@@ -46,6 +46,17 @@ parquet = { version = "59", optional = true, features = ["async", "object_store"
 # RSEG path still goes through ravel-object-store (0.14) unchanged.
 object_store = { version = "0.13", optional = true, features = ["aws"] }
 futures = { workspace = true, optional = true }
+# Gated behind `flight-egress` (off by default; issue #154). The egress bench
+# drives the real Flight SQL service and the JSON encoder in-process, so it
+# links ravel-sql with its `flight-sql` feature (which pulls datafusion, arrow
+# 58, and arrow-flight) plus the transport types the DoGet path speaks.
+# ravel-sql is an internal path crate not yet listed in the workspace
+# `[workspace.dependencies]`, so it is named by path here; every other dep
+# below reuses a workspace pin.
+ravel-sql = { path = "../ravel-sql", version = "0.1.0", optional = true, features = ["flight-sql"] }
+arrow-flight = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [features]
 # Parquet baseline harness (issue #97). Off by default: the standard build
@@ -58,6 +69,16 @@ parquet-baseline = [
     "dep:arrow",
     "dep:parquet",
     "dep:object_store",
+    "dep:futures",
+]
+# Flight SQL vs JSON result-egress bench (issue #154). Off by default: it links
+# ravel-sql/datafusion/arrow-flight on top of the standard build, so the plain
+# gates never compile it or the `flight_sql_egress` bin.
+flight-egress = [
+    "dep:ravel-sql",
+    "dep:arrow-flight",
+    "dep:tonic",
+    "dep:prost",
     "dep:futures",
 ]
 
@@ -117,6 +138,12 @@ bench = false
 name = "read_path_accounting"
 path = "src/bin/read_path_accounting.rs"
 required-features = ["parquet-baseline"]
+bench = false
+
+[[bin]]
+name = "flight_sql_egress"
+path = "src/bin/flight_sql_egress.rs"
+required-features = ["flight-egress"]
 bench = false
 
 [[test]]

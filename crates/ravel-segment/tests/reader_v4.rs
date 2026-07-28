@@ -436,7 +436,8 @@ fn decode_catalog_matching_v4_agrees_with_eager_select() {
 }
 
 // --- 3. Quad-version dispatch: v1, v2, v3, and v4 objects each report    ---
-// --- their own trailer version; version 5 is rejected as unsupported.    ---
+// --- their own trailer version; version 6 is rejected as unsupported     ---
+// --- (1-5 are all real trailer versions as of ADR-0026).                  ---
 
 #[test]
 fn quad_version_dispatch_reports_each_trailers_own_version() {
@@ -542,7 +543,7 @@ fn patch_trailer_version(bytes: &[u8], version: u16) -> Vec<u8> {
 }
 
 #[test]
-fn version_five_trailer_is_rejected_as_unsupported() {
+fn version_six_trailer_is_rejected_as_unsupported() {
     let v4_run = scalar_run_from_v1(
         100,
         1,
@@ -564,11 +565,11 @@ fn version_five_trailer_is_rejected_as_unsupported() {
         test_compaction_meta(),
     )
     .expect("writes v4");
-    let patched = patch_trailer_version(v4.bytes.as_ref(), 5);
+    let patched = patch_trailer_version(v4.bytes.as_ref(), 6);
     let limits = ReaderLimits::default();
     assert_eq!(
         ravel_segment::open_from_full(&patched, limits).unwrap_err(),
-        SegmentError::UnsupportedVersion(5)
+        SegmentError::UnsupportedVersion(6)
     );
 }
 

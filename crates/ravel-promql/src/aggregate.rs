@@ -37,16 +37,30 @@
 //! boundary are order-dependent on that exact mechanism: an element seen
 //! while the heap is still filling (below capacity `k`) is retained
 //! unconditionally, even over a later, equal-valued element a value-only
-//! ranking would treat as interchangeable. The final within-heap sort
-//! (Prometheus: `sort.Sort(sort.Reverse(heap))`) is a stable sort here; Go's
-//! own `sort.Sort` also resolves to a stable insertion sort for the small
-//! slice sizes (`len <= 12`) this implies, so it matches bit-for-bit at that
-//! scale. Written, scoped limitation (not a silent allowlist widening): for
-//! a `k` greater than 12, tie order among boundary-value members is not
-//! guaranteed to match the pinned Prometheus binary, since Go's `sort.Sort`
-//! switches to an unstable algorithm past that size. The differential corpus
-//! (`crates/ravel-promql-difftest/corpus/aggregate.txt`) only exercises
-//! `topk`/`bottomk` with `k <= 12`.
+//! ranking would treat as interchangeable. This crate's own admission
+//! mechanics are verified against Prometheus (`agg_topk_...`/`agg_bottomk_...`
+//! entries in the differential corpus retain the correct *set* of members at
+//! every tested `k`, including at tie boundaries).
+//!
+//! The final within-heap sort's *tie-break order* among exactly-equal
+//! boundary values is a different question, and is deliberately **not**
+//! claimed to match Prometheus at any `k`: an earlier version of this
+//! comment claimed bit-for-bit agreement for `k <= 12` on the theory that
+//! Go's `sort.Sort(sort.Reverse(heap))` resolves to a stable insertion sort
+//! at that size. Issue #177 found that claim false even at `k == 2`
+//! (`agg_topk_tie_fully_retained`/`agg_bottomk_tie_fully_retained`): this
+//! crate's heap ends up in the same pre-sort array order Prometheus' own
+//! heap should (same push/pop mechanics, same encounter order), yet the two
+//! engines emit the tied pair in opposite order. `sort.Reverse` wrapping a
+//! stable sort does not trivially reduce to "stable sort then reverse the
+//! whole list" the way it might seem to; the exact mechanism was not chased
+//! down further; see #177. The differential corpus tests tie-boundary
+//! *retention* as `mode: unordered` (right: which members survive is
+//! well-defined and verified) rather than asserting a specific tie-break
+//! order (not: no PromQL consumer can rely on which of several exactly-equal
+//! values a real Prometheus server would place first, so pinning one
+//! implementation's arbitrary choice would test an implementation detail,
+//! not a contract).
 //!
 //! `topk`/`bottomk` output rows keep each selected member's own full,
 //! original label set (including `__name__`): unlike every other

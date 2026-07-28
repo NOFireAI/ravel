@@ -96,7 +96,18 @@ range-evaluation points per query (11,000, matching the Prometheus
 resolution limit; issue #77), wall deadline (server maximum, default
 30 s). The `timeout` param can only lower the deadline: values above the
 server maximum are clamped to it (issue #58). Exceeding a budget returns a
-Prometheus-style error, never a partial silent result.
+Prometheus-style error, never a partial silent result. The point cap is
+enforced independently at every subquery evaluation node (`expr[5m:1m]`),
+checked against that node's own grid before it is built, so a nested
+subquery whose own grid alone exceeds the cap is rejected before any
+allocation or recursive evaluation, at whatever nesting depth it occurs.
+
+A subquery that omits its own step (`expr[5m:]`) defaults to
+`EngineConfig::default_evaluation_interval` (60 s, matching Prometheus'
+global `evaluation_interval` default). Subquery grids are epoch-aligned:
+the grid start is the smallest multiple of the step (measured from Unix
+time zero) that is `>= end - range`, matching Prometheus' own subquery
+alignment, not the query's own step or window start.
 
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly

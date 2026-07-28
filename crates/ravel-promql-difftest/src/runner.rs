@@ -104,7 +104,9 @@ pub async fn run_corpus(
             }
         };
 
-        if let Verdict::Mismatch(detail) = compare(entry.mode, &prom_body, &ravel_body) {
+        if let Verdict::Mismatch(detail) =
+            compare(entry.mode, entry.tolerance_ulps, &prom_body, &ravel_body)
+        {
             failures.push(Failure {
                 entry_name: entry.name.clone(),
                 query: entry.query.clone(),

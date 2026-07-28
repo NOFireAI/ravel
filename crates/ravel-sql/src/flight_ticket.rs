@@ -416,6 +416,10 @@ impl FlightTicket {
     /// snapshot `GetFlightInfo` resolved, never a re-resolution (review F18).
     /// Segment order is preserved from the resolve, which is already the
     /// catalog's deterministic provenance order.
+    ///
+    /// `segments_pruned` is 0: the ticket carries the segments that survived
+    /// the original resolve, and redemption never re-resolves or re-prunes,
+    /// so this snapshot excludes nothing of its own.
     pub fn snapshot(&self) -> ravel_catalog::Snapshot {
         ravel_catalog::Snapshot {
             segments: self
@@ -423,6 +427,7 @@ impl FlightTicket {
                 .iter()
                 .map(SegmentPin::to_segment_ref)
                 .collect(),
+            segments_pruned: 0,
         }
     }
 }
@@ -614,6 +619,27 @@ mod tests {
         let bytes = ticket.encode().expect("encode");
         let decoded = FlightTicket::decode(&bytes).expect("decode");
         assert_eq!(decoded.snapshot().segments, vec![seg]);
+    }
+
+    /// A redeemed ticket reports no pruning of its own. The pin already holds
+    /// the post-prune segment set from `GetFlightInfo`, so a nonzero count
+    /// here would double-count segments the original resolve already dropped.
+    #[test]
+    fn rebuilt_snapshot_reports_no_pruning() {
+        let ticket = sample_ticket();
+        let bytes = ticket.encode().expect("encode");
+        let decoded = FlightTicket::decode(&bytes).expect("decode");
+
+        let snapshot = decoded.snapshot();
+        assert_eq!(
+            snapshot.segments,
+            ticket
+                .segments
+                .iter()
+                .map(SegmentPin::to_segment_ref)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(snapshot.segments_pruned, 0);
     }
 
     /// A version byte this codec does not implement is refused, never

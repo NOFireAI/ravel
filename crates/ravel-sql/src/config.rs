@@ -20,7 +20,7 @@ use std::sync::Arc;
 use datafusion::execution::memory_pool::MemoryPool;
 use ravel_query::EngineConfig;
 
-use crate::memory::{TenantDelegatingPool, TenantMemoryAccountant};
+use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 
 /// Default per-query RecordBatch byte budget: 256 MiB. A placeholder pending
 /// the Phase B measurements docs/arrow-datafusion-plan.md says will set it in
@@ -63,7 +63,22 @@ impl SqlConfig {
     /// `RuntimeEnvBuilder::with_memory_pool` (the endpoint's job in B3); the
     /// scan then registers its `MemoryConsumer` against whatever pool the
     /// `TaskContext` carries.
-    pub fn query_pool(&self, tenant: Arc<TenantMemoryAccountant>) -> Arc<dyn MemoryPool> {
-        Arc::new(TenantDelegatingPool::new(self.max_query_bytes, tenant))
+    ///
+    /// Returns the pool paired with the [`CeilingBreach`] it trips: the pool
+    /// goes onto the `RuntimeEnv`, and the breach travels with the query's
+    /// stream so a `grow` that overshoots either ceiling aborts the query at
+    /// its next poll (issue #163). The two are created together so the caller
+    /// cannot install a pool whose breach nothing observes.
+    pub fn query_pool(
+        &self,
+        tenant: Arc<TenantMemoryAccountant>,
+    ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+        let breach = CeilingBreach::new();
+        let pool = Arc::new(TenantDelegatingPool::new(
+            self.max_query_bytes,
+            tenant,
+            Arc::clone(&breach),
+        ));
+        (pool, breach)
     }
 }

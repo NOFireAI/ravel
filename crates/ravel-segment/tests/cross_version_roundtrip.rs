@@ -346,6 +346,54 @@ fn decode_v4_scalar(bytes: &[u8]) -> Vec<NormalizedSeries> {
         .collect()
 }
 
+/// v5 decode of a below-threshold object (these cases have <8 series, so no
+/// sparse sections): `decode_catalog_v5` delegates to the v4 whole-catalog
+/// path, then the pages decode exactly as v4's. Confirms a version-5 object
+/// carrying the v4-shaped catalog reads back identically.
+fn decode_v5_scalar(bytes: &[u8]) -> Vec<NormalizedSeries> {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits).expect("v5 opens");
+    assert_eq!(loc.version, 5);
+    let mut entries =
+        ravel_segment::decode_catalog_v5(&loc.footer, bytes, limits).expect("v5 catalog");
+    entries.sort_by_key(|e| e.entry.series_id.0);
+
+    let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v4(&loc.footer, &selected).expect("v5 plans");
+    entries
+        .iter()
+        .map(|entry| {
+            let run = &entry.runs[0];
+            let range = ranges
+                .iter()
+                .find(|r| r.series_id == entry.entry.series_id && r.run_index == 0)
+                .expect("planned run range present");
+            let ts_bytes = slice_range(bytes, range.ts_range);
+            let val_bytes = slice_range(bytes, range.val_range);
+            let mut scratch = Vec::new();
+            let mut timestamps = Vec::new();
+            let mut values = Vec::new();
+            ravel_segment::decode_run_pages_soa(
+                &entry.entry.series_id,
+                run,
+                ts_bytes,
+                val_bytes,
+                limits,
+                &mut scratch,
+                &mut timestamps,
+                &mut values,
+            )
+            .expect("v5 run pages");
+            let mut samples: Vec<(i64, u64)> = timestamps
+                .into_iter()
+                .zip(values.into_iter().map(f64::to_bits))
+                .collect();
+            samples.sort_by_key(|(ts, _)| *ts);
+            (entry.entry.series_id.0, entry.entry.labels.clone(), samples)
+        })
+        .collect()
+}
+
 fn test_compaction_meta() -> CompactionMetaV4 {
     CompactionMetaV4 {
         ingest_hour_bucket: 0,
@@ -390,6 +438,7 @@ proptest! {
         let identity3 = SegmentIdentity {
             tenant_hash, shard, writer_id: writer_id.clone(), writer_epoch: epoch, writer_seq: seq,
         };
+        let writer_id_5 = writer_id.clone();
         let identity4 = SegmentIdentity {
             tenant_hash, shard, writer_id, writer_epoch: epoch, writer_seq: seq,
         };
@@ -414,10 +463,24 @@ proptest! {
         // covers the 0..8 lower bound without a special case.
         let inputs4 = build_v4_inputs_from_v1_bytes(&v1.bytes);
         if !inputs4.is_empty() {
+            let identity5 = SegmentIdentity {
+                tenant_hash,
+                shard,
+                writer_id: writer_id_5,
+                writer_epoch: epoch,
+                writer_seq: seq,
+            };
             let v4 = SegmentWriter::write_v4(inputs4, identity4, bounds(), test_compaction_meta())
                 .expect("v4 writes");
             let got4 = decode_v4_scalar(&v4.bytes);
             prop_assert_eq!(&got1, &got4, "v1 and v4 diverged on the same logical scalar input");
+
+            // v5 below threshold: same v4 grammar, version-5 trailer.
+            let inputs5 = build_v4_inputs_from_v1_bytes(&v1.bytes);
+            let v5 = SegmentWriter::write_v5(inputs5, identity5, bounds(), test_compaction_meta())
+                .expect("v5 writes");
+            let got5 = decode_v5_scalar(&v5.bytes);
+            prop_assert_eq!(&got1, &got5, "v1 and v5 diverged on the same logical scalar input");
         }
     }
 }

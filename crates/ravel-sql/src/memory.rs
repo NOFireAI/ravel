@@ -17,11 +17,52 @@
 //! did not forward `shrink` would leak tenant budget on every cancellation.
 
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
+
+/// A one-shot per-query abort flag for the best-effort memory ceiling.
+///
+/// It is set once [`TenantDelegatingPool::grow`]'s unconditional path has
+/// already pushed a budget over its ceiling. Because `grow` cannot decline or
+/// clamp a reservation (see the note on that method: `MemoryReservation` does
+/// `pool.grow` then an unconditional local increment, so a pool that grows a
+/// different amount than asked desyncs the reservation's own accounting), this
+/// flag cannot prevent the overshoot. It only records that the overshoot
+/// happened so the query's stream can notice at its next poll and abort,
+/// rather than run to completion over budget. This is a detect-after-the-fact
+/// signal, not a guard.
+///
+/// The message is set on the first trip only (whichever ceiling was breached
+/// first wins); later trips are no-ops, because the query is already aborting.
+#[derive(Debug, Default)]
+pub struct CeilingBreach {
+    message: OnceLock<String>,
+}
+
+impl CeilingBreach {
+    /// A fresh, untripped breach flag.
+    pub fn new() -> Arc<Self> {
+        Arc::new(CeilingBreach::default())
+    }
+
+    /// Record `message` as the breach reason, but only on the first call;
+    /// subsequent trips are ignored (the query is already aborting, and the
+    /// first ceiling to overshoot is the one worth reporting).
+    fn trip(&self, message: String) {
+        // `set` returns Err when already set; a second breach is expected and
+        // deliberately dropped.
+        let _ = self.message.set(message);
+    }
+
+    /// The breach reason, once tripped; `None` while no ceiling has been
+    /// overshot.
+    pub fn message(&self) -> Option<&str> {
+        self.message.get().map(String::as_str)
+    }
+}
 
 /// Per-tenant memory accountant: a byte counter with a ceiling, shared (via
 /// `Arc`) across every query a tenant runs concurrently. Independent of
@@ -77,9 +118,13 @@ impl TenantMemoryAccountant {
     }
 
     /// Reserve `additional` bytes unconditionally (mirrors the infallible
-    /// `MemoryPool::grow`, which the trait requires never fail).
-    fn grow(&self, additional: usize) {
-        self.used.fetch_add(additional, Ordering::AcqRel);
+    /// `MemoryPool::grow`, which the trait requires never fail). Returns the
+    /// new total so the caller can compare it against the ceiling and trip a
+    /// [`CeilingBreach`] without a second racy load.
+    fn grow(&self, additional: usize) -> usize {
+        self.used
+            .fetch_add(additional, Ordering::AcqRel)
+            .saturating_add(additional)
     }
 
     /// Release `amount` bytes, saturating at zero so a double-shrink or an
@@ -110,6 +155,10 @@ pub struct TenantDelegatingPool {
     query_limit: usize,
     query_used: AtomicUsize,
     tenant: Arc<TenantMemoryAccountant>,
+    /// Tripped when `grow`'s unconditional path pushes either budget over its
+    /// ceiling. Shared with the query's stream, which reads it each poll and
+    /// aborts once it is set (issue #163).
+    breach: Arc<CeilingBreach>,
 }
 
 impl fmt::Debug for TenantDelegatingPool {
@@ -135,12 +184,18 @@ impl fmt::Display for TenantDelegatingPool {
 }
 
 impl TenantDelegatingPool {
-    /// A pool capped at `query_limit` bytes that delegates to `tenant`.
-    pub fn new(query_limit: usize, tenant: Arc<TenantMemoryAccountant>) -> Self {
+    /// A pool capped at `query_limit` bytes that delegates to `tenant` and
+    /// trips `breach` if `grow`'s unconditional path overshoots either ceiling.
+    pub fn new(
+        query_limit: usize,
+        tenant: Arc<TenantMemoryAccountant>,
+        breach: Arc<CeilingBreach>,
+    ) -> Self {
         TenantDelegatingPool {
             query_limit,
             query_used: AtomicUsize::new(0),
             tenant,
+            breach,
         }
     }
 
@@ -210,8 +265,33 @@ impl MemoryPool for TenantDelegatingPool {
         // therefore best-effort ceilings once joins reach this pool (B3+),
         // not hard caps against every DataFusion-internal growth path.
         // Accepted and documented: ADR-0013 amendment (2026-07-28).
-        self.query_used.fetch_add(additional, Ordering::AcqRel);
-        self.tenant.grow(additional);
+        //
+        // What issue #163 adds: after the (still unconditional) increments,
+        // note whether this grow pushed a budget over its ceiling and, if so,
+        // trip the shared CeilingBreach. This does not prevent the overshoot
+        // -- it cannot, per the paragraph above -- it lets the query's stream
+        // notice at its next poll and abort rather than run over budget. Only
+        // one of the two checks trips per call (whichever ceiling was actually
+        // breached); the query check is first so a query overrunning its own
+        // budget is reported against the per-query ceiling, not the tenant's.
+        let query_total = self
+            .query_used
+            .fetch_add(additional, Ordering::AcqRel)
+            .saturating_add(additional);
+        let tenant_total = self.tenant.grow(additional);
+        if query_total > self.query_limit {
+            self.breach.trip(format!(
+                "query memory ceiling breached: {query_total} bytes reserved exceeds \
+                 per-query limit {}",
+                self.query_limit
+            ));
+        } else if tenant_total > self.tenant.limit() {
+            self.breach.trip(format!(
+                "tenant memory ceiling breached: {tenant_total} bytes reserved exceeds \
+                 tenant limit {}",
+                self.tenant.limit()
+            ));
+        }
     }
 
     fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
@@ -250,5 +330,97 @@ impl MemoryPool for TenantDelegatingPool {
 
     fn memory_limit(&self) -> MemoryLimit {
         MemoryLimit::Finite(self.query_limit)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use datafusion::execution::memory_pool::MemoryConsumer;
+
+    use super::*;
+
+    /// Mirrors `sql3_f01`'s construction (tests/audit_sql3_exec.rs): a `grow`
+    /// that pushes the query total past the per-query ceiling trips the
+    /// breach, and the message names the query ceiling and the two numbers.
+    #[test]
+    fn grow_past_the_query_ceiling_trips_the_breach_naming_the_query() {
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let breach = CeilingBreach::new();
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1024,
+            Arc::clone(&tenant),
+            Arc::clone(&breach),
+        ));
+        let res = MemoryConsumer::new("ceiling-query").register(&pool);
+
+        // grow is infallible and cannot decline; the overshoot happens, and
+        // the breach records it.
+        res.grow(4096);
+        let message = breach
+            .message()
+            .expect("query ceiling overshoot must trip the breach");
+        assert!(
+            message.contains("query") && message.contains("per-query"),
+            "message must name the query ceiling: {message}"
+        );
+        assert!(
+            message.contains("4096") && message.contains("1024"),
+            "message must name the reserved bytes and the limit: {message}"
+        );
+        // The tenant ceiling was not breached, so the tenant half of the
+        // message never appears.
+        assert!(
+            !message.contains("tenant"),
+            "only the query ceiling was breached: {message}"
+        );
+    }
+
+    /// A `grow` that stays within the query limit but pushes the tenant total
+    /// past the tenant limit trips the breach against the tenant ceiling.
+    #[test]
+    fn grow_past_only_the_tenant_ceiling_names_the_tenant() {
+        let tenant = TenantMemoryAccountant::new(1024);
+        let breach = CeilingBreach::new();
+        // A generous per-query limit so the same grow clears it but overruns
+        // the small tenant ceiling.
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&tenant),
+            Arc::clone(&breach),
+        ));
+        let res = MemoryConsumer::new("ceiling-tenant").register(&pool);
+
+        res.grow(4096);
+        let message = breach
+            .message()
+            .expect("tenant ceiling overshoot must trip the breach");
+        assert!(
+            message.contains("tenant"),
+            "message must name the tenant ceiling: {message}"
+        );
+        assert!(
+            message.contains("4096") && message.contains("1024"),
+            "message must name the reserved bytes and the limit: {message}"
+        );
+    }
+
+    /// A `grow` that stays under both ceilings leaves the breach untripped.
+    #[test]
+    fn grow_within_both_ceilings_leaves_the_breach_untripped() {
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let breach = CeilingBreach::new();
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&tenant),
+            Arc::clone(&breach),
+        ));
+        let res = MemoryConsumer::new("ceiling-none").register(&pool);
+
+        res.grow(4096);
+        assert!(
+            breach.message().is_none(),
+            "a grow under both ceilings must not trip the breach"
+        );
     }
 }

@@ -13,6 +13,9 @@ pub const DEFAULT_MAX_SAMPLES: usize = 10_000_000;
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 /// Default bound on concurrent in-flight segment fetches per query.
 pub const DEFAULT_FETCH_CONCURRENCY: usize = 8;
+/// Default step for a subquery that omits its own (`expr[5m:]`), matching
+/// Prometheus' global `evaluation_interval` default.
+pub const DEFAULT_EVALUATION_INTERVAL: Duration = Duration::from_secs(60);
 
 /// [`crate::QueryEngine`] resource limits and concurrency. Every limit is
 /// enforced as a typed error (docs/query-engine.md "never silent partial
@@ -24,6 +27,8 @@ pub struct EngineConfig {
     pub max_samples: usize,
     pub deadline: Duration,
     pub fetch_concurrency: usize,
+    /// Step for a subquery that does not specify its own (`expr[5m:]`).
+    pub default_evaluation_interval: Duration,
 }
 
 impl Default for EngineConfig {
@@ -34,6 +39,7 @@ impl Default for EngineConfig {
             max_samples: DEFAULT_MAX_SAMPLES,
             deadline: DEFAULT_DEADLINE,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,
         }
     }
 }

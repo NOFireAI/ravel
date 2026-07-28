@@ -1,6 +1,8 @@
 # ADR-0026: RSEG v5: sparse id index and chunked SERIES_META for the compacted tier
 
-Status: Accepted (2026-07-28). Decides issue #175 from the issue #167
+Status: Accepted (2026-07-28); amended by ADR-0027 (2026-07-28): the
+reader accepts v5 only and all writers, L0 included, emit v5.
+Decides issue #175 from the issue #167
 experiment. This ADR records the decision; docs/segment-format.md gains
 its "RSEG v5 amendment" section when the implementation lands, and until
 then nothing in this ADR changes any stored byte. The flag-gated

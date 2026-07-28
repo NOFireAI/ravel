@@ -21,6 +21,14 @@ untrusted input: bounds-check everything, fuzz all decoders. No `unsafe`.
 > amendment" below; v1, v2, and v3 text stays unchanged and
 > authoritative for objects of those versions, which remain readable
 > indefinitely (docs/compaction-retention-plan.md).
+>
+> RSEG v5 amendment (ADR-0026): trailer `version = 5` is the v4 grammar
+> plus two optional sparse-catalog sections, SERIES_IDX (kind 8) and
+> chunked SERIES_META (kind 9), emitted only when the object carries at
+> least 4096 series. Below that threshold a v5 object is a v4 object with
+> only the trailer version bumped. See "RSEG v5 amendment" below; v1-v4
+> text stays unchanged and authoritative for objects of those versions,
+> which remain readable indefinitely (docs/adrs/0026-rseg-v5-sparse-id-index.md).
 
 The diagram below shows the v1 baseline layout with the checksum
 coverage brackets, and the per-version section tapes for v2, v3, and
@@ -863,3 +871,231 @@ deliberate, visible gap, not a silent one: no reader in this crate
 claims to accept `version = 4` today, so a v4 object reaching an
 unpatched reader fails closed with `UnsupportedVersion(4)` rather than
 being silently misread as v3.
+
+## RSEG v5 amendment (ADR-0026)
+
+Persistent contract, same status as v1-v4 above. Decision record:
+docs/adrs/0026-rseg-v5-sparse-id-index.md. This section is normative for
+v5 objects; the v1-v4 sections above are unchanged and remain normative
+for objects of those versions. Readers dispatch on the trailer `version`
+field and must accept 1, 2, 3, 4, and 5 indefinitely.
+
+v5 is the compacted-tier format that makes a selective read cheap on a
+large object. A point lookup against a v4 (or v2/v3) object fetches the
+whole catalog: SERIES_IDS and SERIES_META are whole-section objects, so
+answering a question about one series in a 100k-series object costs a
+few MB. v5 adds a sparse index over the ids and re-lays SERIES_META into
+per-chunk frames, so a point lookup fetches a few KB. It is the v4
+grammar (ADR-0018) plus two sections and nothing else: no new page
+encoding, no change to LABEL_DICT/SERIES_IDS grammars, no change to the
+page sections. v5 is the default compaction output; L0 writers never emit
+it (the small-object regression is a property of the L0 shape).
+
+### Sparse-emission threshold
+
+Within v5 the two sparse sections are optional. They are emitted when the
+output object carries `series_count >= 4096` and omitted below that. The
+threshold is a writer-side constant, not a reader contract: presence is
+signalled by the sections themselves, so changing the threshold later
+changes no reader behaviour. Below the threshold a v5 object carries the
+v4-shaped catalog verbatim (kind 6 whole SERIES_META, no kind 8/9) and is
+byte-for-byte the v4 object it would be, save the trailer's version field
+(and the `footer_crc32c` that field feeds). At or above the threshold the
+whole-section SERIES_META (kind 6) is replaced by SERIES_META_CHUNKS
+(kind 9) and SERIES_IDX (kind 8) is added; the two ship together, never
+one without the other.
+
+The stride is `K = 512` for both the sparse-id index and the meta-chunk
+grouping: every Kth series id is indexed, and every K series form one
+meta chunk.
+
+### Trailer and versioning
+
+Trailer layout, `footer_crc32c` computation, and reader protocol steps
+1-4 are unchanged. `version = 5`. `magic` stays `"RSG1"`; a v1/v2/v3/v4-
+only reader that meets a v5 object fails closed with
+`UnsupportedVersion(5)`, checksum-covered exactly as the prior version
+bumps. Versions other than 1, 2, 3, 4, 5 are `UnsupportedVersion`.
+
+### Section kinds v5
+
+Unchanged from v4: kinds 1 (LABEL_DICT), 3 (TS_PAGES), 4 (VAL_PAGES), 5
+(SERIES_IDS), 7 (HIST_PAGES) carry the same content and comp policy. Kind
+2 (SERIES_TABLE) is still never emitted. Two kinds enter the frozen
+section-kind registry:
+
+- kind 8 SERIES_IDX: the sparse id index. `comp = NONE`, always fetched
+  whole, covered by its ordinary `Section.crc32c`.
+- kind 9 SERIES_META_CHUNKS: the chunked SERIES_META, replacing the kind
+  6 whole-section form when present. `comp = NONE` at the section level (a
+  container of per-frame zstd frames); its `Section.crc32c` covers the
+  whole section for a full read.
+
+Mandatory kinds for v5: LABEL_DICT (1), SERIES_IDS (5), TS_PAGES (3), and
+exactly one of {kind 6 whole SERIES_META} or {kind 8 SERIES_IDX + kind 9
+SERIES_META_CHUNKS} together. Carrying both catalog forms, or kind 8
+without kind 9 (or the reverse), is Corrupted. VAL_PAGES (4) and
+HIST_PAGES (7) stay each optional with at least one present when
+`series_count > 0`, unchanged from v4.
+
+Physical section order when the sparse sections are present: 1, 5, 9, 8,
+3, `<pad>` 4, 7 (LABEL_DICT, SERIES_IDS, SERIES_META_CHUNKS, SERIES_IDX,
+TS_PAGES, VAL_PAGES, HIST_PAGES). VAL_PAGES stays 8-byte aligned exactly
+as v2/v3/v4, so its VAL_RAW_F64 payload alignment (recorded relative to
+the section start) is preserved verbatim; the page sections are copied
+byte-for-byte from the v4 layout, so every page's within-section offset,
+and therefore its per-page crc, is unchanged. Below the threshold the
+order is v4's (1, 5, 6, 3, 4, 7).
+
+### SERIES_IDX (kind 8)
+
+Uncompressed body (all fixed fields little-endian):
+
+```
+version:       u8    (= 1; the SERIES_IDX layout version, internal to the
+                      section, distinct from the trailer version)
+flags:         u8    (reserved, 0)
+reserved:      u16   (0)
+stride:        u32   (K = 512)
+series_count:  u32
+sparse_count:  u32
+sparse_count sparse entries, each:
+    id:            [u8; 16]   (the indexed series id, strictly ascending)
+    ids_offset:    u64        (byte offset within the SERIES_IDS payload of
+                              this id: 4 + index*16)
+    window_len:    u64        (byte length of the id window this entry heads:
+                              the next entry's ids_offset minus this one, or
+                              to the SERIES_IDS payload end for the last)
+    window_crc32c: u32        (crc32c over SERIES_IDS[ids_offset ..
+                              ids_offset + window_len])
+chunk_stride:  u32   (K = 512)
+chunk_count:   u32
+chunk_count chunk-directory entries, each:
+    frame_offset:            u64  (stored offset of the frame within the
+                                  SERIES_META_CHUNKS section)
+    frame_stored_len:        u64  (stored/compressed frame length)
+    frame_uncompressed_len:  u64
+    first_index:             u32  (absolute series index of the frame's
+                                  first row)
+    n:                       u32  (series in the frame)
+    frame_crc32c:            u32  (crc32c over the stored frame bytes)
+```
+
+Entry `p` (0-based) indexes series `p*stride` and heads the window
+covering ids `[p*stride, (p+1)*stride)` (the last entry's window runs to
+the SERIES_IDS payload end). Chunk `k` covers series
+`[first_index, first_index + n)`; the chunk directory is dense and in
+first-index order, `first_index` running `0, K, 2K, ...`.
+
+### SERIES_META_CHUNKS (kind 9)
+
+A header identical to v4 SERIES_META's preamble, then per-chunk zstd
+frames:
+
+```
+count: u32
+schema_count: u32
+schema_count schemas          (unchanged from v2/v3/v4)
+run_total: u32                (total runs, all series -- unchanged from v4)
+<chunk_count zstd frames, concatenated; each frame's stored range and
+ crc32c live in the SERIES_IDX chunk directory, not inline>
+```
+
+The header carries the shared schema list (label names) and `run_total`,
+used only by a whole-catalog reassembly. Each frame is a self-contained
+run-major column set for one chunk of `n` series, decompressing to:
+
+```
+n: u32
+frame_run_total: u32
+ts_base:   varint   (running TS_PAGES end before this frame's first run)
+val_base:  varint   (running VAL_PAGES end before this frame's first run)
+hist_base: varint   (running HIST_PAGES end before this frame's first run)
+block schema_ref            (n varints)          -- for labels only
+block value_ord             (series-major varints) -- for labels only
+block value_kind            (n bytes: 0 = VAL_SCALAR, 1 = HIST_SPANS)
+block run_count             (n varints, > 0, summing to frame_run_total)
+block run_created_delta     (frame_run_total varints)
+block run_epoch             (frame_run_total varints)
+block run_seq               (frame_run_total varints)
+block run_sample_count      (frame_run_total varints, > 0)
+block run_min_ts_delta      (frame_run_total varints)
+block run_ts_span           (frame_run_total varints)
+block ts_page_gap           (frame_run_total varints)
+block ts_page_len           (frame_run_total varints)
+block val_page_gap          (frame_run_total varints)
+block val_page_len          (frame_run_total varints)
+block hist_page_gap         (frame_run_total varints)
+block hist_page_len         (frame_run_total varints)
+```
+
+Every block is `block_len: varint`-prefixed, exactly as v2/v3/v4 blocks,
+so a page-location reader skips the `schema_ref` and `value_ord` blocks
+wholesale (labels are not needed for a by-id fetch). The column meanings
+and reconstruction arithmetic are v4's, verbatim, with one difference:
+the per-run page running sum starts from the frame's `ts_base`/`val_base`/
+`hist_base` rather than from 0. Those bases are the running section `end`
+accumulated over every run *before* this frame's first run, so the
+reconstructed absolute offsets are identical to what a whole-section v4
+SERIES_META reconstruction (running from 0 over all runs) would produce.
+`run_created_delta` reconstructs against `footer.base_created_unix_ns` and
+`run_min_ts_delta` against `footer.min_event_ts_ns`, exactly as v4. The
+per-run `value_kind`-vs-page-presence rule is checked per frame.
+
+Because the chunked form re-lays the identical raw delta/gap/len columns
+plus per-frame bases, the whole-catalog decode of a v5 sparse object is
+bit-identical to the v4 whole-catalog decode of the same batch, and a
+sparse point-probe of any series is bit-identical to that series' slice
+of the whole-catalog decode.
+
+### Sparse reader protocol
+
+A selective read that already knows a target series id:
+
+1. Suffix-probe and parse the footer (steps 1-4, unchanged). If SERIES_IDX
+   (kind 8) is absent, this is a below-threshold v5 object: use the v4
+   whole-catalog path against kind 6.
+2. Fetch SERIES_IDX whole (its `Section.crc32c` verifies it) and parse it.
+3. Binary-search the sparse ids for the window that must contain the
+   target. `None` (target below the smallest indexed id) means absent.
+4. Range-GET the SERIES_IDS window `[ids_offset, ids_offset + window_len)`
+   and verify it against the entry's `window_crc32c` before trusting it.
+5. Binary-search the fetched window for the target id, yielding its
+   absolute series index (or absent).
+6. Look up the covering chunk in the directory, range-GET its stored frame
+   `[frame_offset, frame_offset + frame_stored_len)`, verify it against
+   the chunk's `frame_crc32c`, then decompress.
+7. Decode the target row's runs from the frame, yielding each run's
+   provenance, bounds, and TS/VAL/HIST page ranges; range-GET those pages
+   (per-page crc unchanged from v1).
+
+Composition with the metric index (ADR-0020): postings prune which
+segments a query reads; SERIES_IDX prunes what a query reads within one
+segment.
+
+### Checksum coverage, v5
+
+Every byte a v5 reader interprets is checksum-verified before use
+(ADR-0010 section 4). A whole-section crc cannot check a range-GET, so the
+partial fetches carry their own crc32c: the id window's crc32c and the
+meta chunk frame's crc32c both live in SERIES_IDX, which is itself small,
+always fetched whole, and covered by its ordinary `Section.crc32c`.
+SERIES_META_CHUNKS's `Section.crc32c` covers the whole section for a full
+read; a partial (single-frame) read verifies the frame's own crc32c from
+the directory instead. TS/VAL/HIST pages keep their unchanged per-page
+crc. `footer_crc32c` covers the trailer (including the version byte) and
+FooterProto. No checksum is weakened, removed, or moved; the SERIES_META
+run columns retain the same semantics and the same crc discipline as v4,
+now carried per frame.
+
+### Unchanged in v5
+
+Page format, all page encodings and HIST_SPANS, the raw-fallback rule,
+sample ordering, footer/trailer mechanics apart from `version`, the
+suffix-read protocol, reader resource caps, whole-object blake3 in the
+commit record, the object key layout, series identity, LABEL_DICT and
+SERIES_IDS grammars, VAL_RAW_F64 page alignment, HIST_PAGES grammar, the
+Footer's five v4 compaction-provenance fields, and the v4 SERIES_META run
+grammar (which the chunk frames carry verbatim, re-chunked). No new
+protobuf field and no new page encoding. `CommitRecord.segment_format_version`
+stamps `5` for v5 writes.

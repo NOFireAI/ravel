@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1150" viewBox="0 0 1500 1150" font-family="system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1220" viewBox="0 0 1500 1220" font-family="system-ui, sans-serif">
   <rect x="0" y="0" width="1500" height="1150" fill="#f4f5f7"/>
 
-  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">RSEG object byte layout — v1 baseline drawn; v2/v3/v4 amendments in the evolution panel below</text>
-  <text x="30" y="48" font-size="12" fill="#4a4f57">docs/segment-format.md + ADR-0004 + ADR-0010 §4 (checksum coverage); amendments: ADR-0014 (v2), ADR-0017 (v3), ADR-0018 (v4)</text>
+  <text x="30" y="30" font-size="20" font-weight="bold" fill="#17191c">RSEG object byte layout — v1 baseline drawn; v2/v3/v4/v5 amendments in the evolution panel below</text>
+  <text x="30" y="48" font-size="12" fill="#4a4f57">docs/segment-format.md + ADR-0004 + ADR-0010 §4 (checksum coverage); amendments: ADR-0014 (v2), ADR-0017 (v3), ADR-0018 (v4), ADR-0026 (v5)</text>
 
   <!-- legend -->
   <g>
@@ -214,7 +214,7 @@
 
   <!-- Panel F: format evolution v1 -> v4 -->
   <rect x="30" y="870" width="1440" height="255" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
-  <text x="46" y="892" font-size="13" font-weight="bold" fill="#17191c">Format evolution — the trailer version field selects the layout; magic stays "RSG1"; readers accept versions 1-4 and skip unknown section kinds</text>
+  <text x="46" y="892" font-size="13" font-weight="bold" fill="#17191c">Format evolution — the trailer version field selects the layout; magic stays "RSG1"; readers accept versions 1-5 and skip unknown section kinds</text>
 
   <!-- v1 row -->
   <rect x="46" y="904" width="64" height="26" fill="#dde1e7" stroke="#454b54" stroke-width="1.5"/>
@@ -282,5 +282,26 @@
   <text x="722" y="1089" font-size="9" text-anchor="middle" fill="#17191c">HIST_PAGES 7</text>
   <text x="800" y="1083" font-size="10.5" fill="#17191c">ADR-0018 — L1 compaction output: one object merges multiple L0 source runs; SERIES_META carries the</text>
   <text x="800" y="1097" font-size="10.5" fill="#17191c">v4 per-run grammar (*); additive footer fields record run provenance. Written by the compactor only.</text>
-  <text x="800" y="1111" font-size="10.5" fill="#4a4f57">All four versions: same trailer, same reader protocol, same checksum rules as drawn above.</text>
+
+  <!-- v5 row -->
+  <rect x="46" y="1128" width="64" height="26" fill="#dde1e7" stroke="#454b54" stroke-width="1.5"/>
+  <text x="78" y="1145" font-size="10" font-weight="bold" text-anchor="middle" fill="#17191c">v5</text>
+  <rect x="118" y="1128" width="108" height="26" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="172" y="1145" font-size="9" text-anchor="middle" fill="#17191c">LABEL_DICT 1</text>
+  <rect x="228" y="1128" width="108" height="26" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="282" y="1145" font-size="9" text-anchor="middle" fill="#17191c">SERIES_IDS 5</text>
+  <rect x="338" y="1128" width="108" height="26" fill="#a9dcae" stroke="#2f6b34" stroke-width="2.5"/>
+  <text x="392" y="1145" font-size="9" font-weight="bold" text-anchor="middle" fill="#17191c">META_CHUNKS 9*</text>
+  <rect x="448" y="1128" width="108" height="26" fill="#a9dcae" stroke="#2f6b34" stroke-width="2.5"/>
+  <text x="502" y="1145" font-size="9" font-weight="bold" text-anchor="middle" fill="#17191c">SERIES_IDX 8*</text>
+  <rect x="558" y="1128" width="108" height="26" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="612" y="1145" font-size="9" text-anchor="middle" fill="#17191c">TS_PAGES 3</text>
+  <rect x="668" y="1128" width="108" height="26" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="722" y="1145" font-size="9" text-anchor="middle" fill="#17191c">VAL_PAGES 4</text>
+  <rect x="778" y="1128" width="108" height="26" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
+  <text x="832" y="1145" font-size="9" text-anchor="middle" fill="#17191c">HIST_PAGES 7</text>
+  <text x="46" y="1174" font-size="10.5" fill="#17191c">ADR-0026 — compacted-tier selective read: SERIES_IDX (8) sparse-indexes every 512th id with its SERIES_IDS window + crc; META_CHUNKS (9*) re-lays</text>
+  <text x="46" y="1188" font-size="10.5" fill="#17191c">SERIES_META into per-chunk zstd frames (per-window and per-chunk crc32c let a range-GET verify what it touches). Emitted only at >= 4096 series;</text>
+  <text x="46" y="1202" font-size="10.5" fill="#17191c">below that a v5 object is the v4 object plus a version bump (whole SERIES_META 6, no 8/9). Point lookup at 100k drops from ~MBs to low-100s of KB.</text>
+  <text x="46" y="1216" font-size="10.5" fill="#4a4f57">All five versions: same trailer, same reader protocol, same checksum rules as drawn above.</text>
 </svg>
