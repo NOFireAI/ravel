@@ -17,8 +17,8 @@
 
 use ravel_segment::{
     Footer, IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesEntry, SeriesInput,
-    WrittenSegment, decode_catalog, decode_catalog_matching, decode_catalog_matching_v2,
-    decode_catalog_v2, open_from_full,
+    SeriesInputV3, SeriesValues, WrittenSegment, decode_catalog, decode_catalog_matching,
+    decode_catalog_matching_v2, decode_catalog_v2, open_from_full,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
 
@@ -72,6 +72,24 @@ pub fn build_segment_v2(raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>) -> WrittenS
         .collect();
     SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
         .expect("encode bench segment v2")
+}
+
+/// v3 counterpart of [`build_segment`]: encodes `raw` series via
+/// `SegmentWriter::write_v3` on the scalar path (every series' payload is
+/// `SeriesValues::Scalar`). v3's catalog layout (LABEL_DICT + SERIES_IDS +
+/// SERIES_META) is unchanged from v2, so this exercises the same catalog
+/// byte gates as [`build_segment_v2`] (docs/rseg-v3-plan.md section 3.4).
+pub fn build_segment_v3(raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>) -> WrittenSegment {
+    let series = raw
+        .into_iter()
+        .map(|(series_id, labels, samples)| SeriesInputV3 {
+            series_id,
+            labels,
+            values: SeriesValues::Scalar(samples),
+        })
+        .collect();
+    SegmentWriter::write_v3(series, bench_identity(), bench_bounds())
+        .expect("encode bench segment v3")
 }
 
 pub fn slice_range(bytes: &[u8], range: (u64, u64)) -> &[u8] {
