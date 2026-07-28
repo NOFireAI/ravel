@@ -9,8 +9,8 @@ use ravel_types::{Label, LabelSet, Sample, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, compression,
-    page_comp, page_enc, section_kind,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, VERSION_V4,
+    compression, page_comp, page_enc, section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use crate::varint::{read_uvarint, read_zigzag_varint};
@@ -28,11 +28,12 @@ pub struct FooterLocation {
     /// Absolute offset of the 16-byte trailer within the object.
     pub trailer_offset: u64,
     pub total_size: u64,
-    /// Trailer format version (1, 2, or 3; `parse_footer` rejects any other
-    /// value). Determines which catalog decode path
+    /// Trailer format version (1, 2, 3, or 4; `parse_footer` rejects any
+    /// other value). Determines which catalog decode path
     /// (`decode_catalog`/`decode_catalog_matching` for v1,
     /// `decode_catalog_v2`/`decode_catalog_matching_v2` for v2,
-    /// `decode_catalog_v3`/`decode_catalog_matching_v3` for v3) and which
+    /// `decode_catalog_v3`/`decode_catalog_matching_v3` for v3,
+    /// `decode_catalog_v4`/`decode_catalog_matching_v4` for v4) and which
     /// `validate_sections` mandatory-kind set applies.
     pub version: u16,
 }
@@ -78,7 +79,8 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     if magic != MAGIC {
         return Err(SegmentError::BadMagic);
     }
-    if version != VERSION && version != VERSION_V2 && version != VERSION_V3 {
+    if version != VERSION && version != VERSION_V2 && version != VERSION_V3 && version != VERSION_V4
+    {
         return Err(SegmentError::UnsupportedVersion(version));
     }
     if signal != SIGNAL_METRICS {
@@ -128,7 +130,7 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
 }
 
 /// Validates footer-level section invariants (docs/segment-format.md),
-/// dispatching on the trailer `version` (1, 2, or 3; anything else is
+/// dispatching on the trailer `version` (1, 2, 3, or 4; anything else is
 /// `UnsupportedVersion`, matching `parse_footer`'s accepted set): at most
 /// one section per known kind, every mandatory kind for that version
 /// present, every section range within `[0, page_region_end)` with checked
@@ -143,7 +145,9 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
 /// performed in `decode_catalog_v2` and `decode_catalog_matching_v2`
 /// instead, which do have those bytes. Same deferral applies to v3's
 /// `value_kind`-vs-page-presence check (`decode_catalog_v3`,
-/// `decode_catalog_matching_v3`).
+/// `decode_catalog_matching_v3`) and to v4's run-count-sum and
+/// run-major `value_kind`-vs-page-presence checks (`decode_catalog_v4`,
+/// `decode_catalog_matching_v4`).
 pub fn validate_sections(
     footer: &Footer,
     version: u16,
@@ -154,6 +158,7 @@ pub fn validate_sections(
         VERSION => validate_sections_v1(footer, page_region_end, limits),
         VERSION_V2 => validate_sections_v2(footer, page_region_end, limits),
         VERSION_V3 => validate_sections_v3(footer, page_region_end, limits),
+        VERSION_V4 => validate_sections_v4(footer, page_region_end, limits),
         other => Err(SegmentError::UnsupportedVersion(other)),
     }
 }
@@ -318,6 +323,66 @@ fn validate_sections_v3(
     Ok(())
 }
 
+/// v4 mandatory-kind validation (docs/compaction-retention-plan.md section
+/// 4): identical mandatory/optional-kind structure to v3 -- LABEL_DICT,
+/// SERIES_IDS, SERIES_META, TS_PAGES are always mandatory; VAL_PAGES and
+/// HIST_PAGES are each optional, but at least one of the two must be
+/// present whenever `footer.series_count > 0`. v4 introduces no new
+/// section kind (docs/compaction-retention-plan.md: "strict superset of
+/// v3"), so this function is structurally identical to
+/// `validate_sections_v3`.
+///
+/// The run-count-sum-vs-run_total check and the run-major
+/// `value_kind`-vs-page-presence check need each series' decoded
+/// SERIES_META tail, which this function does not have; those are
+/// performed in `decode_catalog_v4`/`decode_catalog_matching_v4`, mirroring
+/// v2's and v3's count-equality deferrals above.
+fn validate_sections_v4(
+    footer: &Footer,
+    page_region_end: u64,
+    limits: ReaderLimits,
+) -> Result<(), SegmentError> {
+    let mut seen = [false; 6];
+    for section in &footer.sections {
+        let end = section
+            .offset
+            .checked_add(section.len)
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+        if end > page_region_end {
+            return Err(SegmentError::SectionOutOfBounds);
+        }
+        let idx = match section.kind {
+            section_kind::LABEL_DICT => 0,
+            section_kind::SERIES_IDS => 1,
+            section_kind::SERIES_META => 2,
+            section_kind::TS_PAGES => 3,
+            section_kind::VAL_PAGES => 4,
+            section_kind::HIST_PAGES => 5,
+            _ => continue,
+        };
+        if seen[idx] {
+            return Err(SegmentError::DuplicateSection(section.kind));
+        }
+        seen[idx] = true;
+        if section.uncompressed_len > limits.max_section_uncompressed_bytes {
+            return Err(SegmentError::SectionTooLarge {
+                len: section.uncompressed_len,
+                cap: limits.max_section_uncompressed_bytes,
+            });
+        }
+    }
+    const NAMES: [&str; 4] = ["LABEL_DICT", "SERIES_IDS", "SERIES_META", "TS_PAGES"];
+    for (i, name) in NAMES.iter().enumerate() {
+        if !seen[i] {
+            return Err(SegmentError::MissingSection(name));
+        }
+    }
+    if footer.series_count > 0 && !seen[4] && !seen[5] {
+        return Err(SegmentError::MissingSection("VAL_PAGES or HIST_PAGES"));
+    }
+    Ok(())
+}
+
 /// Convenience: parse and validate a footer from the complete object bytes.
 pub fn open_from_full(bytes: &[u8], limits: ReaderLimits) -> Result<FooterLocation, SegmentError> {
     match parse_footer(bytes.len() as u64, bytes)? {
@@ -370,6 +435,39 @@ pub struct SeriesEntry {
     pub val_page: (u64, u64),
     pub value_kind: ValueKind,
     pub hist_page: (u64, u64),
+}
+
+/// One compaction-input run within a v4 series
+/// (docs/compaction-retention-plan.md section 4): dedup-priority
+/// provenance (`created_unix_ns`, `writer_epoch`, `writer_seq`) plus this
+/// run's own TS and VAL-or-HIST page ranges, relative to their section.
+/// `val_page`/`hist_page` follow the same "(0, 0) means not applicable"
+/// convention as [`SeriesEntry`]: a run's series has a uniform
+/// `value_kind`, so exactly one of the pair is ever non-`(0, 0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunEntry {
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    pub sample_count: u32,
+    pub min_ts_ns: i64,
+    pub max_ts_ns: i64,
+    pub ts_page: (u64, u64),
+    pub val_page: (u64, u64),
+    pub hist_page: (u64, u64),
+}
+
+/// A decoded v4 SERIES_META entry (docs/compaction-retention-plan.md
+/// section 4): `entry` is the folded per-series view callers keyed by
+/// [`SeriesEntry`] already expect (`sample_count` summed over every run,
+/// `min_ts_ns`/`max_ts_ns` spanning every run, `ts_page`/`val_page`/
+/// `hist_page` always `(0, 0)` sentinels since a multi-run series has no
+/// single page range at the series level); `runs` is the per-run view the
+/// page fetcher needs to actually read TS/VAL/HIST bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesEntryV4 {
+    pub entry: SeriesEntry,
+    pub runs: Vec<RunEntry>,
 }
 
 fn find_section(footer: &Footer, kind: u32) -> Option<&Section> {
@@ -946,6 +1044,102 @@ pub fn plan_ranges_v3(
     Ok(out)
 }
 
+/// Absolute (offset, len) byte ranges within the object for one run of a
+/// v4 series' TS, VAL, and HIST pages (docs/compaction-retention-plan.md
+/// section 4), the per-run counterpart of [`PlannedRange`]: a v4 series
+/// may carry more than one run, so ranges are planned per run rather than
+/// per series. `val_range`/`hist_range` are `(0, 0)` for the page kind the
+/// run's series doesn't use, the same convention `PlannedRange` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedRunRange {
+    pub series_id: SeriesId,
+    pub run_index: usize,
+    pub ts_range: (u64, u64),
+    pub val_range: (u64, u64),
+    pub hist_range: (u64, u64),
+}
+
+/// v4 counterpart of [`plan_ranges_v3`]: computes TS/VAL/HIST ranges for
+/// every run of every selected series, looking up VAL_PAGES only if at
+/// least one selected run is `ValueKind::Scalar` and HIST_PAGES only if at
+/// least one is `ValueKind::Histogram` -- the same conditional lookup
+/// `plan_ranges_v3` uses, since v4 keeps VAL_PAGES/HIST_PAGES each
+/// optional (docs/compaction-retention-plan.md section 4: "strict
+/// superset of v3").
+pub fn plan_ranges_v4(
+    footer: &Footer,
+    selected: &[&SeriesEntryV4],
+) -> Result<Vec<PlannedRunRange>, SegmentError> {
+    let ts_section = find_section(footer, section_kind::TS_PAGES)
+        .ok_or(SegmentError::MissingSection("TS_PAGES"))?;
+
+    let mut out = Vec::new();
+    for series in selected {
+        for (run_index, run) in series.runs.iter().enumerate() {
+            let (ts_off, ts_len) = run.ts_page;
+            let ts_end = ts_off
+                .checked_add(ts_len)
+                .ok_or(SegmentError::SectionOutOfBounds)?;
+            if ts_end > ts_section.len {
+                return Err(SegmentError::SectionOutOfBounds);
+            }
+            let ts_abs = ts_section
+                .offset
+                .checked_add(ts_off)
+                .ok_or(SegmentError::SectionOutOfBounds)?;
+
+            let val_range = match series.entry.value_kind {
+                ValueKind::Scalar => {
+                    let val_section = find_section(footer, section_kind::VAL_PAGES)
+                        .ok_or(SegmentError::MissingSection("VAL_PAGES"))?;
+                    let (val_off, val_len) = run.val_page;
+                    let val_end = val_off
+                        .checked_add(val_len)
+                        .ok_or(SegmentError::SectionOutOfBounds)?;
+                    if val_end > val_section.len {
+                        return Err(SegmentError::SectionOutOfBounds);
+                    }
+                    let val_abs = val_section
+                        .offset
+                        .checked_add(val_off)
+                        .ok_or(SegmentError::SectionOutOfBounds)?;
+                    (val_abs, val_len)
+                }
+                ValueKind::Histogram => (0, 0),
+            };
+
+            let hist_range = match series.entry.value_kind {
+                ValueKind::Histogram => {
+                    let hist_section = find_section(footer, section_kind::HIST_PAGES)
+                        .ok_or(SegmentError::MissingSection("HIST_PAGES"))?;
+                    let (hist_off, hist_len) = run.hist_page;
+                    let hist_end = hist_off
+                        .checked_add(hist_len)
+                        .ok_or(SegmentError::SectionOutOfBounds)?;
+                    if hist_end > hist_section.len {
+                        return Err(SegmentError::SectionOutOfBounds);
+                    }
+                    let hist_abs = hist_section
+                        .offset
+                        .checked_add(hist_off)
+                        .ok_or(SegmentError::SectionOutOfBounds)?;
+                    (hist_abs, hist_len)
+                }
+                ValueKind::Scalar => (0, 0),
+            };
+
+            out.push(PlannedRunRange {
+                series_id: series.entry.series_id,
+                run_index,
+                ts_range: (ts_abs, ts_len),
+                val_range,
+                hist_range,
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn split_page_header<'a>(
     series_id: &SeriesId,
     page: &'a [u8],
@@ -1019,20 +1213,24 @@ fn decompress_page_payload_into(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_ts_page_into(
-    entry: &SeriesEntry,
+    series_id: &SeriesId,
+    sample_count: u32,
+    min_ts_ns: i64,
+    max_ts_ns: i64,
     page: &[u8],
     limits: ReaderLimits,
     scratch: &mut Vec<u8>,
     out: &mut Vec<i64>,
 ) -> Result<(), SegmentError> {
-    let (enc, comp, payload) = split_page_header(&entry.series_id, page)?;
+    let (enc, comp, payload) = split_page_header(series_id, page)?;
     if enc != page_enc::TS_DELTA_VARINT {
         return Err(SegmentError::InvalidEncoding(enc));
     }
     decompress_page_payload_into(comp, payload, limits, scratch)?;
-    let count = to_usize(u64::from(entry.sample_count))?;
-    crate::ts_delta::decode_ts_deltas_into(scratch, count, entry.min_ts_ns, entry.max_ts_ns, out)
+    let count = to_usize(u64::from(sample_count))?;
+    crate::ts_delta::decode_ts_deltas_into(scratch, count, min_ts_ns, max_ts_ns, out)
 }
 
 fn decode_raw_f64_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result<(), SegmentError> {
@@ -1060,15 +1258,16 @@ pub enum ValPageKind {
 }
 
 fn decode_val_page_into(
-    entry: &SeriesEntry,
+    series_id: &SeriesId,
+    sample_count: u32,
     page: &[u8],
     limits: ReaderLimits,
     scratch: &mut Vec<u8>,
     out: &mut Vec<f64>,
 ) -> Result<ValPageKind, SegmentError> {
-    let (enc, comp, payload) = split_page_header(&entry.series_id, page)?;
+    let (enc, comp, payload) = split_page_header(series_id, page)?;
     decompress_page_payload_into(comp, payload, limits, scratch)?;
-    let count = to_usize(u64::from(entry.sample_count))?;
+    let count = to_usize(u64::from(sample_count))?;
     match enc {
         page_enc::VAL_GORILLA => {
             crate::gorilla::decode_gorilla_into(scratch, count, out)?;
@@ -1146,8 +1345,24 @@ pub fn decode_pages_soa(
     timestamps: &mut Vec<i64>,
     values: &mut Vec<f64>,
 ) -> Result<ValPageKind, SegmentError> {
-    decode_ts_page_into(entry, ts_page_bytes, limits, scratch, timestamps)?;
-    let val_kind = decode_val_page_into(entry, val_page_bytes, limits, scratch, values)?;
+    decode_ts_page_into(
+        &entry.series_id,
+        entry.sample_count,
+        entry.min_ts_ns,
+        entry.max_ts_ns,
+        ts_page_bytes,
+        limits,
+        scratch,
+        timestamps,
+    )?;
+    let val_kind = decode_val_page_into(
+        &entry.series_id,
+        entry.sample_count,
+        val_page_bytes,
+        limits,
+        scratch,
+        values,
+    )?;
     if timestamps.len() != values.len() {
         return Err(SegmentError::Truncated);
     }
@@ -1351,18 +1566,19 @@ fn decode_histogram_record(bytes: &[u8], pos: &mut usize) -> Result<HistogramVal
 /// VAL/TS pages), then decodes exactly `entry.sample_count` records and
 /// requires the payload to end exactly there.
 fn decode_hist_page_into(
-    entry: &SeriesEntry,
+    series_id: &SeriesId,
+    sample_count: u32,
     page: &[u8],
     limits: ReaderLimits,
     scratch: &mut Vec<u8>,
     out: &mut Vec<HistogramValue>,
 ) -> Result<(), SegmentError> {
-    let (enc, comp, payload) = split_page_header(&entry.series_id, page)?;
+    let (enc, comp, payload) = split_page_header(series_id, page)?;
     if enc != page_enc::HIST_SPANS {
         return Err(SegmentError::InvalidEncoding(enc));
     }
     decompress_page_payload_into(comp, payload, limits, scratch)?;
-    let count = to_usize(u64::from(entry.sample_count))?;
+    let count = to_usize(u64::from(sample_count))?;
     out.clear();
     out.reserve(count.min(scratch.len()));
     let mut pos = 0usize;
@@ -1388,9 +1604,107 @@ pub fn decode_histogram_pages(
 ) -> Result<Vec<HistogramSample>, SegmentError> {
     let mut scratch = Vec::new();
     let mut timestamps = Vec::new();
-    decode_ts_page_into(entry, ts_page_bytes, limits, &mut scratch, &mut timestamps)?;
+    decode_ts_page_into(
+        &entry.series_id,
+        entry.sample_count,
+        entry.min_ts_ns,
+        entry.max_ts_ns,
+        ts_page_bytes,
+        limits,
+        &mut scratch,
+        &mut timestamps,
+    )?;
     let mut values = Vec::new();
-    decode_hist_page_into(entry, hist_page_bytes, limits, &mut scratch, &mut values)?;
+    decode_hist_page_into(
+        &entry.series_id,
+        entry.sample_count,
+        hist_page_bytes,
+        limits,
+        &mut scratch,
+        &mut values,
+    )?;
+    if timestamps.len() != values.len() {
+        return Err(SegmentError::Truncated);
+    }
+    Ok(timestamps
+        .into_iter()
+        .zip(values)
+        .map(|(ts_ns, value)| HistogramSample { ts_ns, value })
+        .collect())
+}
+
+/// Decodes one v4 run's TS and VAL pages directly into separate
+/// timestamp/value vecs (SoA), the per-run counterpart of
+/// [`decode_pages_soa`] for a v4 [`RunEntry`] (docs/compaction-retention-plan.md
+/// section 4). Same validation contract: page crc (bound to `series_id`),
+/// enc/comp validity, overflow- and bounds-checked timestamp accumulation,
+/// on-disk order (including duplicate timestamps) preserved.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_run_pages_soa(
+    series_id: &SeriesId,
+    run: &RunEntry,
+    ts_page_bytes: &[u8],
+    val_page_bytes: &[u8],
+    limits: ReaderLimits,
+    scratch: &mut Vec<u8>,
+    timestamps: &mut Vec<i64>,
+    values: &mut Vec<f64>,
+) -> Result<ValPageKind, SegmentError> {
+    decode_ts_page_into(
+        series_id,
+        run.sample_count,
+        run.min_ts_ns,
+        run.max_ts_ns,
+        ts_page_bytes,
+        limits,
+        scratch,
+        timestamps,
+    )?;
+    let val_kind = decode_val_page_into(
+        series_id,
+        run.sample_count,
+        val_page_bytes,
+        limits,
+        scratch,
+        values,
+    )?;
+    if timestamps.len() != values.len() {
+        return Err(SegmentError::Truncated);
+    }
+    Ok(val_kind)
+}
+
+/// Decodes one v4 run's TS and HIST pages into histogram samples, the
+/// per-run counterpart of [`decode_histogram_pages`] for a v4 [`RunEntry`]
+/// (docs/compaction-retention-plan.md section 4).
+pub fn decode_run_histogram_pages(
+    series_id: &SeriesId,
+    run: &RunEntry,
+    ts_page_bytes: &[u8],
+    hist_page_bytes: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<HistogramSample>, SegmentError> {
+    let mut scratch = Vec::new();
+    let mut timestamps = Vec::new();
+    decode_ts_page_into(
+        series_id,
+        run.sample_count,
+        run.min_ts_ns,
+        run.max_ts_ns,
+        ts_page_bytes,
+        limits,
+        &mut scratch,
+        &mut timestamps,
+    )?;
+    let mut values = Vec::new();
+    decode_hist_page_into(
+        series_id,
+        run.sample_count,
+        hist_page_bytes,
+        limits,
+        &mut scratch,
+        &mut values,
+    )?;
     if timestamps.len() != values.len() {
         return Err(SegmentError::Truncated);
     }
@@ -2465,6 +2779,586 @@ pub fn decode_catalog_matching_v3(
             val_page: tail.val_page[i],
             value_kind: tail.value_kind[i],
             hist_page: tail.hist_page[i],
+        });
+    }
+    Ok(entries)
+}
+
+// --- RSEG v4 SERIES_IDS/SERIES_META decode (ADR-0018,
+// docs/compaction-retention-plan.md section 4). Reuses every
+// version-agnostic v2 primitive exactly as v3's decode path does
+// (`take_block`, `parse_series_ids_v2`, `parse_schema_list_v2`,
+// `check_series_counts_v2`, `parse_schema_ref_block_v2`,
+// `parse_value_ord_block_all_v2`/`_selective_v2`, `reconstruct_ranges_v2`):
+// v4 introduces no new section kind, and SERIES_META's `count`,
+// `schema_count`, schema list, `schema_ref`, and `value_ord` blocks are
+// byte-for-byte unchanged from v2/v3. Only the new `run_total: u32` header
+// field (read immediately after `parse_schema_list_v2`, before
+// `schema_ref`), the tail's run-major columns, and the catalog decoders
+// themselves are new.
+
+/// Per-series/per-run output of SERIES_META's v4 blocks 3-16
+/// (docs/compaction-retention-plan.md section 4). `value_kind` and
+/// `run_count` are series-major (length `count`); `runs` is the flat
+/// run-major fold of the ten run columns (length `run_total`, in the same
+/// series-then-run order the writer emits them) -- the caller splits it
+/// per series using `run_count` as the per-series run-length column,
+/// mirroring how `parse_value_ord_block_all_v2` leaves its own flat vector
+/// for the caller to slice by schema length.
+struct SeriesMetaTailV4 {
+    value_kind: Vec<ValueKind>,
+    run_count: Vec<u32>,
+    runs: Vec<RunEntry>,
+}
+
+/// SERIES_META blocks 3-16 (docs/compaction-retention-plan.md section 4):
+/// `value_kind` and `run_count` (series-major, identical shape to v3's
+/// value_kind block plus a new run-count column, each `run_count` entry
+/// validated non-zero and summed against `run_total`), then ten run-major
+/// columns folded into `run_total`-length [`RunEntry`] values. VAL_PAGES/
+/// HIST_PAGES are each optional exactly as in v3, so their gap/len columns
+/// reconstruct against the section's own `len` when present or `0` when
+/// absent. Per-run `created_unix_ns`/`min_ts_ns`/`max_ts_ns` are
+/// reconstructed via checked i128 arithmetic against
+/// `footer.base_created_unix_ns`/`footer.min_event_ts_ns`
+/// (`ProvenanceBoundsOverflow` on overflow -- kept distinct from v2/v3's
+/// `TimestampBoundsOverflow` since these are new, run-major-only columns
+/// with no v2/v3 error identity to reuse). The per-run value_kind-vs-page
+/// cross-check (`ScalarSeriesHasHistPage`/`HistogramSeriesHasValPage`/
+/// `ZeroHistPageLen`) and the trailing-bytes check run after all sixteen
+/// blocks, mirroring v3's placement; the aggregate run-count-vs-page-count
+/// check and the section-present-but-unneeded check need the footer's
+/// section list alongside the fully parsed tail, so they run in the
+/// caller via `check_value_kind_pages_v4`, exactly as v3 defers
+/// `check_value_kind_pages_v3`.
+fn parse_series_meta_tail_v4(
+    meta_bytes: &[u8],
+    pos: &mut usize,
+    footer: &Footer,
+    count: u32,
+    run_total: u32,
+) -> Result<SeriesMetaTailV4, SegmentError> {
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut value_kind = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        match take_u8(block, &mut bpos)? {
+            0 => value_kind.push(ValueKind::Scalar),
+            1 => value_kind.push(ValueKind::Histogram),
+            other => return Err(SegmentError::InvalidValueKind(other)),
+        }
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut run_count = Vec::with_capacity((count as usize).min(block.len()));
+    let mut run_count_sum: u64 = 0;
+    for _ in 0..count {
+        let v = read_uvarint(block, &mut bpos)?;
+        let v = u32::try_from(v).map_err(|_| SegmentError::FieldOverflow)?;
+        if v == 0 {
+            return Err(SegmentError::ZeroRunCount);
+        }
+        run_count_sum = run_count_sum
+            .checked_add(u64::from(v))
+            .ok_or(SegmentError::FieldOverflow)?;
+        run_count.push(v);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    if run_count_sum != u64::from(run_total) {
+        return Err(SegmentError::RunCountSumMismatch {
+            run_count_sum,
+            run_total: u64::from(run_total),
+        });
+    }
+    let run_total_usize = to_usize(u64::from(run_total))?;
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut created_unix_ns = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        let delta = read_uvarint(block, &mut bpos)?;
+        let sum = i128::from(footer.base_created_unix_ns) + i128::from(delta);
+        created_unix_ns
+            .push(i64::try_from(sum).map_err(|_| SegmentError::ProvenanceBoundsOverflow)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut writer_epoch = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        writer_epoch.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut writer_seq = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        writer_seq.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut sample_count = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        let v = read_uvarint(block, &mut bpos)?;
+        let v = u32::try_from(v).map_err(|_| SegmentError::FieldOverflow)?;
+        if v == 0 {
+            return Err(SegmentError::ZeroSampleCount);
+        }
+        sample_count.push(v);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut min_ts_ns = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        let delta = read_uvarint(block, &mut bpos)?;
+        let sum = i128::from(footer.min_event_ts_ns) + i128::from(delta);
+        min_ts_ns.push(i64::try_from(sum).map_err(|_| SegmentError::ProvenanceBoundsOverflow)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut max_ts_ns = Vec::with_capacity(run_total_usize.min(block.len()));
+    for &min_ts in min_ts_ns.iter().take(run_total_usize) {
+        let span = read_uvarint(block, &mut bpos)?;
+        let sum = i128::from(min_ts) + i128::from(span);
+        max_ts_ns.push(i64::try_from(sum).map_err(|_| SegmentError::ProvenanceBoundsOverflow)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let ts_section = find_section(footer, section_kind::TS_PAGES)
+        .ok_or(SegmentError::MissingSection("TS_PAGES"))?;
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut ts_gap = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        ts_gap.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut ts_len = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        ts_len.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let ts_page = reconstruct_ranges_v2(&ts_gap, &ts_len, ts_section.len)?;
+
+    let val_section_len = find_section(footer, section_kind::VAL_PAGES)
+        .map(|s| s.len)
+        .unwrap_or(0);
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut val_gap = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        val_gap.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut val_len = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        val_len.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let val_page = reconstruct_ranges_v2(&val_gap, &val_len, val_section_len)?;
+
+    let hist_section_len = find_section(footer, section_kind::HIST_PAGES)
+        .map(|s| s.len)
+        .unwrap_or(0);
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut hist_gap = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        hist_gap.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut hist_len = Vec::with_capacity(run_total_usize.min(block.len()));
+    for _ in 0..run_total {
+        hist_len.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let hist_page = reconstruct_ranges_v2(&hist_gap, &hist_len, hist_section_len)?;
+
+    if *pos != meta_bytes.len() {
+        return Err(SegmentError::TrailingBytes);
+    }
+
+    // Per-run value_kind-vs-page cross-check, the run-major counterpart of
+    // v3's per-series check: every run's page presence must match its
+    // series' (uniform) value_kind. `run_count_sum == run_total` (checked
+    // above) guarantees `run_idx` lands exactly on `run_total_usize`.
+    let mut run_idx = 0usize;
+    for i in 0..count as usize {
+        for _ in 0..run_count[i] {
+            match value_kind[i] {
+                ValueKind::Scalar => {
+                    if hist_page[run_idx].1 != 0 {
+                        return Err(SegmentError::ScalarSeriesHasHistPage);
+                    }
+                }
+                ValueKind::Histogram => {
+                    if val_page[run_idx].1 != 0 {
+                        return Err(SegmentError::HistogramSeriesHasValPage);
+                    }
+                    if hist_page[run_idx].1 == 0 {
+                        return Err(SegmentError::ZeroHistPageLen);
+                    }
+                }
+            }
+            run_idx += 1;
+        }
+    }
+
+    let runs = (0..run_total_usize)
+        .map(|i| RunEntry {
+            created_unix_ns: created_unix_ns[i],
+            writer_epoch: writer_epoch[i],
+            writer_seq: writer_seq[i],
+            sample_count: sample_count[i],
+            min_ts_ns: min_ts_ns[i],
+            max_ts_ns: max_ts_ns[i],
+            ts_page: ts_page[i],
+            val_page: val_page[i],
+            hist_page: hist_page[i],
+        })
+        .collect();
+
+    Ok(SeriesMetaTailV4 {
+        value_kind,
+        run_count,
+        runs,
+    })
+}
+
+/// Footer-level cross-checks that need the fully parsed SERIES_META tail
+/// (docs/compaction-retention-plan.md section 4), the run-weighted
+/// counterpart of `check_value_kind_pages_v3`: since a v4 series' pages
+/// live per-run rather than per-series, the "value_kind count must equal
+/// non-empty page count" rule is now over *runs* weighted by each series'
+/// `run_count`, not over series directly. Shared by [`decode_catalog_v4`]
+/// and [`decode_catalog_matching_v4`], exactly as v3's counterpart is
+/// shared by its two catalog decoders.
+fn check_value_kind_pages_v4(
+    footer: &Footer,
+    value_kind: &[ValueKind],
+    run_count: &[u32],
+    runs: &[RunEntry],
+) -> Result<(), SegmentError> {
+    let mut scalar_run_count: u64 = 0;
+    let mut hist_run_count: u64 = 0;
+    for (kind, &rc) in value_kind.iter().zip(run_count) {
+        match kind {
+            ValueKind::Scalar => scalar_run_count += u64::from(rc),
+            ValueKind::Histogram => hist_run_count += u64::from(rc),
+        }
+    }
+
+    if scalar_run_count == 0 && find_section(footer, section_kind::VAL_PAGES).is_some() {
+        return Err(SegmentError::UnexpectedSectionPresent("VAL_PAGES"));
+    }
+    if hist_run_count == 0 && find_section(footer, section_kind::HIST_PAGES).is_some() {
+        return Err(SegmentError::UnexpectedSectionPresent("HIST_PAGES"));
+    }
+
+    let val_page_nonempty = runs.iter().filter(|r| r.val_page.1 != 0).count() as u64;
+    if scalar_run_count != val_page_nonempty {
+        return Err(SegmentError::ValueKindPageCountMismatch {
+            kind: "VAL_SCALAR",
+            value_kind_count: scalar_run_count,
+            page_count: val_page_nonempty,
+        });
+    }
+    let hist_page_nonempty = runs.iter().filter(|r| r.hist_page.1 != 0).count() as u64;
+    if hist_run_count != hist_page_nonempty {
+        return Err(SegmentError::ValueKindPageCountMismatch {
+            kind: "HIST_SPANS",
+            value_kind_count: hist_run_count,
+            page_count: hist_page_nonempty,
+        });
+    }
+    Ok(())
+}
+
+/// Decodes LABEL_DICT + SERIES_IDS + SERIES_META (verifying section crcs)
+/// into [`SeriesEntryV4`] values with materialized [`LabelSet`]s, including
+/// the v4-only run-major columns (docs/compaction-retention-plan.md
+/// section 4). The v4 counterpart of [`decode_catalog_v3`]: same eager
+/// (everyone materialized) semantics and the same schema_ref/value_ord
+/// reuse of v2's primitives, but each output pairs a folded [`SeriesEntry`]
+/// (`sample_count` summed, `min_ts_ns`/`max_ts_ns` spanning every run) with
+/// the per-run [`RunEntry`] view the page fetcher needs.
+pub fn decode_catalog_v4(
+    footer: &Footer,
+    label_dict_bytes: &[u8],
+    series_ids_bytes: &[u8],
+    series_meta_bytes: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let series_ids_section = find_section(footer, section_kind::SERIES_IDS)
+        .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
+    let series_meta_section = find_section(footer, section_kind::SERIES_META)
+        .ok_or(SegmentError::MissingSection("SERIES_META"))?;
+
+    let dict_bytes = decode_section_bytes(label_dict_section, label_dict_bytes, limits)?;
+    let ids_bytes = decode_section_bytes(series_ids_section, series_ids_bytes, limits)?;
+    let meta_bytes = decode_section_bytes(series_meta_section, series_meta_bytes, limits)?;
+
+    let dict_index = index_label_dict(&dict_bytes)?;
+    let series_ids = parse_series_ids_v2(&ids_bytes)?;
+    let series_ids_count = series_ids.len() as u64;
+
+    let mut pos = 0usize;
+    let (meta_count, schemas) =
+        parse_schema_list_v2(&meta_bytes, &mut pos, &dict_bytes, &dict_index)?;
+    check_series_counts_v2(series_ids_count, u64::from(meta_count), footer.series_count)?;
+    let run_total = take_u32_le(&meta_bytes, &mut pos)?;
+
+    let schema_count = schemas.len() as u32;
+    let schema_ref = parse_schema_ref_block_v2(&meta_bytes, &mut pos, meta_count, schema_count)?;
+    let value_ord =
+        parse_value_ord_block_all_v2(&meta_bytes, &mut pos, meta_count, &schema_ref, &schemas)?;
+    let tail = parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total)?;
+    check_value_kind_pages_v4(footer, &tail.value_kind, &tail.run_count, &tail.runs)?;
+
+    let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
+    let mut entries = Vec::with_capacity(series_ids.len());
+    let mut voff = 0usize;
+    let mut roff = 0usize;
+    for i in 0..series_ids.len() {
+        let schema = &schemas[schema_ref[i] as usize];
+        let n = schema.name_ords.len();
+        let vals = &value_ord[voff..voff + n];
+        voff += n;
+        let mut label_pairs = Vec::with_capacity(n);
+        for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
+            let name = resolver.get(name_ord)?;
+            let value = resolver.get(val_ord)?;
+            label_pairs.push(Label {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+        let label_set = LabelSet::new(label_pairs)?;
+
+        let run_count = tail.run_count[i] as usize;
+        let runs: Vec<RunEntry> = tail.runs[roff..roff + run_count].to_vec();
+        roff += run_count;
+
+        let mut sample_count: u32 = 0;
+        let mut min_ts_ns = i64::MAX;
+        let mut max_ts_ns = i64::MIN;
+        for r in &runs {
+            sample_count = sample_count
+                .checked_add(r.sample_count)
+                .ok_or(SegmentError::FieldOverflow)?;
+            min_ts_ns = min_ts_ns.min(r.min_ts_ns);
+            max_ts_ns = max_ts_ns.max(r.max_ts_ns);
+        }
+
+        entries.push(SeriesEntryV4 {
+            entry: SeriesEntry {
+                series_id: SeriesId(series_ids[i]),
+                labels: label_set,
+                sample_count,
+                min_ts_ns,
+                max_ts_ns,
+                ts_page: (0, 0),
+                val_page: (0, 0),
+                value_kind: tail.value_kind[i],
+                hist_page: (0, 0),
+            },
+            runs,
+        });
+    }
+    Ok(entries)
+}
+
+/// Decodes only the series whose labels satisfy every `(name, value)`
+/// equality in `equals`, the v4 counterpart of
+/// [`decode_catalog_matching_v3`]. Column skipping and the
+/// schema-plausibility precomputation are unchanged from v2/v3; the
+/// v4-only check (`check_value_kind_pages_v4`) still runs over the whole
+/// tail regardless of match, and `roff` (the flat run cursor) still
+/// advances for every series regardless of match, since
+/// `parse_series_meta_tail_v4` already parsed every series' runs
+/// up front.
+pub fn decode_catalog_matching_v4(
+    footer: &Footer,
+    label_dict_bytes: &[u8],
+    series_ids_bytes: &[u8],
+    series_meta_bytes: &[u8],
+    equals: &[(&str, &str)],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let series_ids_section = find_section(footer, section_kind::SERIES_IDS)
+        .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
+    let series_meta_section = find_section(footer, section_kind::SERIES_META)
+        .ok_or(SegmentError::MissingSection("SERIES_META"))?;
+
+    let dict_bytes = decode_section_bytes(label_dict_section, label_dict_bytes, limits)?;
+    let ids_bytes = decode_section_bytes(series_ids_section, series_ids_bytes, limits)?;
+    let meta_bytes = decode_section_bytes(series_meta_section, series_meta_bytes, limits)?;
+
+    let dict_index = index_label_dict(&dict_bytes)?;
+    let series_ids = parse_series_ids_v2(&ids_bytes)?;
+    let series_ids_count = series_ids.len() as u64;
+
+    let mut pos = 0usize;
+    let (meta_count, schemas) =
+        parse_schema_list_v2(&meta_bytes, &mut pos, &dict_bytes, &dict_index)?;
+    check_series_counts_v2(series_ids_count, u64::from(meta_count), footer.series_count)?;
+    let run_total = take_u32_le(&meta_bytes, &mut pos)?;
+
+    let find_ordinal = |needle: &str| -> Option<u64> {
+        let needle = needle.as_bytes();
+        dict_index
+            .iter()
+            .position(|&(start, len)| {
+                dict_bytes
+                    .get(start..start + len)
+                    .is_some_and(|s| s == needle)
+            })
+            .map(|i| i as u64)
+    };
+    let mut matcher_ords: Vec<(u64, u64)> = Vec::with_capacity(equals.len());
+    let mut resolvable = true;
+    for (name, value) in equals {
+        match (find_ordinal(name), find_ordinal(value)) {
+            (Some(n), Some(v)) => matcher_ords.push((n, v)),
+            _ => {
+                resolvable = false;
+                break;
+            }
+        }
+    }
+
+    let schema_count = schemas.len() as u32;
+    let schema_ref = parse_schema_ref_block_v2(&meta_bytes, &mut pos, meta_count, schema_count)?;
+
+    let schema_plausible: Vec<bool> = if resolvable {
+        schemas
+            .iter()
+            .map(|schema| {
+                matcher_ords
+                    .iter()
+                    .all(|(name_ord, _)| schema.name_ords.contains(name_ord))
+            })
+            .collect()
+    } else {
+        vec![false; schemas.len()]
+    };
+
+    let value_ord = parse_value_ord_block_selective_v2(
+        &meta_bytes,
+        &mut pos,
+        meta_count,
+        &schema_ref,
+        &schemas,
+        &schema_plausible,
+    )?;
+    let tail = parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total)?;
+    check_value_kind_pages_v4(footer, &tail.value_kind, &tail.run_count, &tail.runs)?;
+
+    let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
+    let mut entries = Vec::new();
+    let mut roff = 0usize;
+    for i in 0..series_ids.len() {
+        let run_count = tail.run_count[i] as usize;
+        let run_slice = &tail.runs[roff..roff + run_count];
+        roff += run_count;
+
+        let Some(vals) = &value_ord[i] else {
+            continue;
+        };
+        let schema = &schemas[schema_ref[i] as usize];
+        let is_match = matcher_ords.iter().all(|(name_ord, wanted_val_ord)| {
+            schema
+                .name_ords
+                .iter()
+                .position(|n| n == name_ord)
+                .is_some_and(|j| vals[j] == *wanted_val_ord)
+        });
+        if !is_match {
+            continue;
+        }
+        let mut label_pairs = Vec::with_capacity(schema.name_ords.len());
+        for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
+            let name = resolver.get(name_ord)?;
+            let value = resolver.get(val_ord)?;
+            label_pairs.push(Label {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+        let label_set = LabelSet::new(label_pairs)?;
+
+        let mut sample_count: u32 = 0;
+        let mut min_ts_ns = i64::MAX;
+        let mut max_ts_ns = i64::MIN;
+        for r in run_slice {
+            sample_count = sample_count
+                .checked_add(r.sample_count)
+                .ok_or(SegmentError::FieldOverflow)?;
+            min_ts_ns = min_ts_ns.min(r.min_ts_ns);
+            max_ts_ns = max_ts_ns.max(r.max_ts_ns);
+        }
+
+        entries.push(SeriesEntryV4 {
+            entry: SeriesEntry {
+                series_id: SeriesId(series_ids[i]),
+                labels: label_set,
+                sample_count,
+                min_ts_ns,
+                max_ts_ns,
+                ts_page: (0, 0),
+                val_page: (0, 0),
+                value_kind: tail.value_kind[i],
+                hist_page: (0, 0),
+            },
+            runs: run_slice.to_vec(),
         });
     }
     Ok(entries)
