@@ -64,5 +64,38 @@ fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
             max_part: max_watermark,
         });
     }
+
+    if let Some(postings) = &head.postings {
+        if postings.blake3.len() != 32 {
+            return Err(SnapshotFormatError::BadPostingsRefBlake3Len(
+                postings.blake3.len(),
+            ));
+        }
+        if postings.key.is_empty() {
+            return Err(SnapshotFormatError::EmptyPostingsKey);
+        }
+        if postings.part_blake3.len() != head.parts.len() {
+            return Err(SnapshotFormatError::PostingsRefPartCountMismatch {
+                postings_parts: postings.part_blake3.len(),
+                head_parts: head.parts.len(),
+            });
+        }
+        for (index, (postings_hash, part)) in postings
+            .part_blake3
+            .iter()
+            .zip(head.parts.iter())
+            .enumerate()
+        {
+            if postings_hash.len() != 32 {
+                return Err(SnapshotFormatError::BadPostingsRefPartBlake3Len {
+                    index,
+                    actual: postings_hash.len(),
+                });
+            }
+            if postings_hash != &part.blake3 {
+                return Err(SnapshotFormatError::PostingsRefPartBlake3Mismatch { index });
+            }
+        }
+    }
     Ok(())
 }
