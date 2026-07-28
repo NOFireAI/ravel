@@ -15,6 +15,7 @@
 //! not a runtime condition to recover from.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use ravel_segment::experiment_api::{ExperimentFlags, write_v2_experimental};
 use ravel_segment::{
     Footer, IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesEntry, SeriesInput,
     WrittenSegment, decode_catalog, decode_catalog_matching, decode_catalog_matching_v2,
@@ -24,10 +25,16 @@ use ravel_types::{LabelSet, Sample, SeriesId};
 
 pub const LABEL_DICT: u32 = 1;
 pub const SERIES_TABLE: u32 = 2;
+pub const TS_PAGES: u32 = 3;
 pub const VAL_PAGES: u32 = 4;
 /// v2-only sections (v1 objects never emit these; ADR-0014).
 pub const SERIES_IDS: u32 = 5;
 pub const SERIES_META: u32 = 6;
+/// Prototype sections (issue #167 experiment; never on the default writer
+/// path). Defined in `ravel_segment::experiment_api`, mirrored here for the
+/// selective-read bench.
+pub const SERIES_IDX: u32 = 8;
+pub const SERIES_META_CHUNKS: u32 = 9;
 
 pub fn bench_identity() -> SegmentIdentity {
     SegmentIdentity {
@@ -72,6 +79,25 @@ pub fn build_segment_v2(raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>) -> WrittenS
         .collect();
     SegmentWriter::write_v2(series, bench_identity(), bench_bounds())
         .expect("encode bench segment v2")
+}
+
+/// Selective-read experiment counterpart of [`build_segment_v2`] (issue #167):
+/// encodes `raw` via `write_v2_experimental` under the given prototype flags.
+/// With `ExperimentFlags::none()` this is byte-identical to `build_segment_v2`.
+pub fn build_segment_v2_experimental(
+    raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>,
+    flags: ExperimentFlags,
+) -> WrittenSegment {
+    let series = raw
+        .into_iter()
+        .map(|(series_id, labels, samples)| SeriesInput {
+            series_id,
+            labels,
+            samples,
+        })
+        .collect();
+    write_v2_experimental(series, bench_identity(), bench_bounds(), flags)
+        .expect("encode experimental bench segment")
 }
 
 pub fn slice_range(bytes: &[u8], range: (u64, u64)) -> &[u8] {
