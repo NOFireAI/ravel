@@ -11,20 +11,22 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # Share compiled objects across the six workspace-compiling jobs via the
+      # GitHub Actions cache backend. rust-cache only restores the dependency
+      # registry; sccache reuses the built artifacts themselves.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf "${ANDROID_HOME:-/usr/local/lib/android}" || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          docker image prune -af || true
+      - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-nextest
+      - name: Install sccache
+        uses: taiki-e/install-action@sccache
+      - name: Install nextest
         uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -55,28 +57,29 @@ jobs:
   # signed-zero semantics, so a bump that changes them fails here.
   sql:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf "${ANDROID_HOME:-/usr/local/lib/android}" || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          docker image prune -af || true
+      - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      - name: Install sccache
+        uses: taiki-e/install-action@sccache
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (sql feature)
         run: cargo clippy -p ravel-server --features sql --all-targets -- -D warnings
       - name: SQL endpoint tests
-        run: cargo test -p ravel-server --features sql
+        run: cargo nextest run -p ravel-server --features sql
       - name: Differential correctness gate
         env:
           # Well above the in-file default so CI explores far more of the
           # float edge-case and multi-segment-overlap space than a local run.
           PROPTEST_CASES: 512
-        run: cargo test -p ravel-sql --test differential
+        run: cargo nextest run -p ravel-sql --test differential
 
   # Supply-chain gate (finding a11-F01). deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
@@ -112,17 +115,23 @@ jobs:
       # Bounded case count keeps wall-clock in check while exploring far more
       # of the corrupt-input space than the 256-case default.
       PROPTEST_CASES: 4096
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      - name: Install sccache
+        uses: taiki-e/install-action@sccache
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Fuzz RSEG codecs (varint, gorilla, delta-varint)
-        run: cargo test -p ravel-segment --lib fuzz_mutation
+        run: cargo nextest run -p ravel-segment --lib fuzz_mutation
       - name: Fuzz RSEG footer/section reader
-        run: cargo test -p ravel-segment --test fuzz_mutation
+        run: cargo nextest run -p ravel-segment --test fuzz_mutation
       - name: Fuzz OTAP Arrow IPC decode
-        run: cargo test -p ravel-otap --test fuzz_mutation
+        run: cargo nextest run -p ravel-otap --test fuzz_mutation
 
   # Runs the object-store contract suite (docs/object-store-contract.md)
   # against a real MinIO endpoint. Without this job the `minio_contract`
@@ -138,17 +147,18 @@ jobs:
   # credentials mirror deploy/docker-compose/minio.yml's role.
   object-store-contract:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf "${ANDROID_HOME:-/usr/local/lib/android}" || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          docker image prune -af || true
+      - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      - name: Install sccache
+        uses: taiki-e/install-action@sccache
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Start MinIO
         run: |
@@ -186,17 +196,25 @@ jobs:
           RAVEL_MINIO_REGION: us-east-1
         run: |
           set -o pipefail
-          cargo test -p ravel-object-store --test contract minio_contract \
-            -- --exact --nocapture | tee contract-output.txt
+          # nextest equivalent of `--test contract minio_contract -- --exact`:
+          # `--test contract` selects the binary and `-E 'test(=minio_contract)'`
+          # matches that one test name exactly. `--no-capture` replaces libtest's
+          # `--nocapture` so the guard's skip line still reaches stdout. nextest
+          # writes its run summary to stderr, so 2>&1 keeps it in the tee'd file.
+          cargo nextest run -p ravel-object-store --test contract \
+            -E 'test(=minio_contract)' --no-capture 2>&1 | tee contract-output.txt
           # Prove the suite actually ran against MinIO rather than taking the
           # RAVEL_MINIO_URL-unset early return. If the guard printed its skip
-          # line, or libtest did not report exactly one passing test, fail the
-          # job even though `cargo test` itself exited 0 on a clean skip.
+          # line, or nextest did not report exactly one passing test, fail the
+          # job even though `cargo nextest` itself exited 0 on a clean skip.
           if grep -q "skipping MinIO contract test" contract-output.txt; then
             echo "::error::minio_contract skipped despite RAVEL_MINIO_URL set"
             exit 1
           fi
-          if ! grep -q "test result: ok. 1 passed" contract-output.txt; then
+          # nextest summary reads e.g. "1 test run: 1 passed, 0 skipped"
+          # (singular "test" when exactly one ran), not libtest's
+          # "test result: ok. 1 passed".
+          if ! grep -qE "1 tests? run: 1 passed" contract-output.txt; then
             echo "::error::minio_contract did not run (expected 1 passed)"
             exit 1
           fi
@@ -219,10 +237,17 @@ jobs:
   # on this job passing.
   promql-difftest:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      - name: Install sccache
+        uses: taiki-e/install-action@sccache
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Fetch pinned Prometheus binary
         id: fetch-prometheus
@@ -233,32 +258,38 @@ jobs:
           RAVEL_DIFFTEST_PROM_BIN: ${{ steps.fetch-prometheus.outputs.bin_path }}
         run: |
           set -o pipefail
-          cargo test -p ravel-promql-difftest --test difftest_selectors \
-            -- --exact --nocapture | tee difftest-output.txt
+          # nextest equivalent of `--test difftest_selectors -- --exact --nocapture`.
+          # The original had no positional test-name filter (the binary holds
+          # exactly one test), so no `-E` filter is needed here. `--no-capture`
+          # keeps the guard's skip line on stdout; 2>&1 keeps nextest's
+          # stderr summary in the tee'd file.
+          cargo nextest run -p ravel-promql-difftest --test difftest_selectors \
+            --no-capture 2>&1 | tee difftest-output.txt
           # Prove the gated test actually ran against the pinned binary
           # rather than taking its RAVEL_DIFFTEST-unset early return.
           if grep -q "skipping: set RAVEL_DIFFTEST" difftest-output.txt; then
             echo "::error::differential test skipped despite RAVEL_DIFFTEST set"
             exit 1
           fi
-          if ! grep -q "test result: ok. 1 passed" difftest-output.txt; then
+          # nextest summary reads "1 test run: 1 passed, 0 skipped", not
+          # libtest's "test result: ok. 1 passed".
+          if ! grep -qE "1 tests? run: 1 passed" difftest-output.txt; then
             echo "::error::differential test did not run (expected 1 passed)"
             exit 1
           fi
 
   coverage:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf "${ANDROID_HOME:-/usr/local/lib/android}" || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          docker image prune -af || true
+      - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      - name: Install sccache
+        uses: taiki-e/install-action@sccache
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

@@ -21,6 +21,10 @@ Start here if you want to run Ravel, ingest into it, or query it.
   worked examples for reading segments, commit records, and catalog listings
   directly out of the object store. Read this when you need to see what's
   actually stored.
+- [guides/development.md](guides/development.md): the fast local iteration
+  loop (`cargo check` while editing, full gate list before committing) and
+  how CI shares build work across jobs with sccache and nextest. Read this
+  if you're changing Ravel's code.
 
 ## Specs
 

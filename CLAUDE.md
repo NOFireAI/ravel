@@ -55,11 +55,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p <your-crate>        # plus --workspace when your change is cross-crate
 ```
 
-While iterating, scope clippy and tests to your crate with `-p`; run the
-full set above exactly once, immediately before the commit. Where
-cargo-nextest is installed, `cargo nextest run` is an accepted
-equivalent of `cargo test` (CI's check job runs it with the `ci`
-profile); doctests still need `cargo test --doc`.
+### Fast local iteration
+
+While iterating, use `cargo check -p <crate>` for fast feedback (or
+`cargo check --workspace` only when the change is genuinely cross-crate),
+and scope clippy and tests to your crate with `-p`. Run the full gate list
+above exactly once, immediately before the commit, not after every edit.
+This is a local development-loop cadence only: it changes nothing about
+what CI enforces on a pull request, which still runs the full fmt, clippy,
+and test gates on every push. Where cargo-nextest is installed, `cargo
+nextest run` is an accepted equivalent of `cargo test` (CI's check job
+runs it with the `ci` profile); doctests still need `cargo test --doc`.
 
 ## Commits
 
