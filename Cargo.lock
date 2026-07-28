@@ -3825,6 +3825,7 @@ dependencies = [
  "crc32c",
  "proptest",
  "prost",
+ "ravel-types",
  "thiserror",
  "zstd",
 ]

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ravel-types = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
 crc32c = { workspace = true }
