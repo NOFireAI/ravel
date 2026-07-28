@@ -2,6 +2,7 @@
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
 pub mod config;
+pub mod flight_auth;
 pub mod fold;
 pub mod ingest;
 pub mod otlp_grpc;
