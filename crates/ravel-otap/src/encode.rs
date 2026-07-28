@@ -60,15 +60,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow::array::{
-    BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    StringDictionaryBuilder, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch,
+    StringArray, StringDictionaryBuilder, StructArray, TimestampNanosecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UInt8Type};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit, UInt8Type};
 use arrow_ipc::writer::StreamWriter;
 
 use crate::normalize::{
     ANY_VALUE_TYPE_ARRAY, ANY_VALUE_TYPE_BOOL, ANY_VALUE_TYPE_DOUBLE, ANY_VALUE_TYPE_INT,
-    ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE, METRIC_TYPE_SUM,
+    ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM, METRIC_TYPE_SUM,
+    METRIC_TYPE_SUMMARY,
 };
 use crate::proto::experimental::arrow::v1::{ArrowPayload, ArrowPayloadType, BatchArrowRecords};
 
@@ -115,6 +118,51 @@ pub struct MetricRow {
     pub name: String,
     pub kind: MetricKind,
     pub data_points: Vec<DataPointRow>,
+}
+
+/// One `HISTOGRAM_DATA_POINTS` row (ADR-0016 phase B2). `exemplar_count`
+/// stands in for `HISTOGRAM_DP_EXEMPLARS` rows joined by parent_id: this
+/// encoder emits that many placeholder exemplar rows for the point rather
+/// than taking real exemplar payloads, since the normalizer only ever counts
+/// them (ADR-0016 drops exemplars entirely).
+pub struct HistogramPointRow {
+    pub time_unix_nano: i64,
+    pub count: u64,
+    pub sum: Option<f64>,
+    pub bucket_counts: Vec<u64>,
+    pub explicit_bounds: Vec<f64>,
+    pub flags: u32,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub exemplar_count: usize,
+    pub attrs: Vec<AttrRow>,
+}
+
+/// A Histogram metric and its data points. `temporality` uses the same
+/// ordinals as [`MetricKind::Sum`]; unlike Sum, only cumulative temporality
+/// is meaningful downstream (ADR-0016), but this encoder emits whatever the
+/// caller passes so tests can exercise the rejection path.
+pub struct HistogramMetricRow {
+    pub name: String,
+    pub temporality: i32,
+    pub data_points: Vec<HistogramPointRow>,
+}
+
+/// One `SUMMARY_DATA_POINTS` row. Summaries carry no temporality field in
+/// OTLP or OTAP.
+pub struct SummaryPointRow {
+    pub time_unix_nano: i64,
+    pub count: u64,
+    pub sum: f64,
+    pub quantiles: Vec<(f64, f64)>,
+    pub flags: u32,
+    pub attrs: Vec<AttrRow>,
+}
+
+/// A Summary metric and its data points.
+pub struct SummaryMetricRow {
+    pub name: String,
+    pub data_points: Vec<SummaryPointRow>,
 }
 
 /// A `std::io::Write` sink backed by a shared, drainable buffer. Lets an
@@ -188,6 +236,172 @@ fn attrs_schema() -> Schema {
     ])
 }
 
+fn u64_list_item_field() -> Arc<Field> {
+    Arc::new(Field::new("item", DataType::UInt64, true))
+}
+
+fn f64_list_item_field() -> Arc<Field> {
+    Arc::new(Field::new("item", DataType::Float64, true))
+}
+
+fn quantile_value_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("quantile", DataType::Float64, false),
+        Field::new("value", DataType::Float64, false),
+    ])
+}
+
+fn quantile_list_item_field() -> Arc<Field> {
+    Arc::new(Field::new(
+        "item",
+        DataType::Struct(quantile_value_fields()),
+        false,
+    ))
+}
+
+fn histogram_data_points_schema() -> Schema {
+    Schema::new(vec![
+        plain_encoding_field("id", DataType::UInt32, false),
+        plain_encoding_field("parent_id", DataType::UInt16, false),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("count", DataType::UInt64, false),
+        Field::new("sum", DataType::Float64, true),
+        Field::new("bucket_counts", DataType::List(u64_list_item_field()), true),
+        Field::new(
+            "explicit_bounds",
+            DataType::List(f64_list_item_field()),
+            true,
+        ),
+        Field::new("flags", DataType::UInt32, false),
+        Field::new("min", DataType::Float64, true),
+        Field::new("max", DataType::Float64, true),
+    ])
+}
+
+fn summary_data_points_schema() -> Schema {
+    Schema::new(vec![
+        plain_encoding_field("id", DataType::UInt32, false),
+        plain_encoding_field("parent_id", DataType::UInt16, false),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("count", DataType::UInt64, false),
+        Field::new("sum", DataType::Float64, false),
+        Field::new("quantile", DataType::List(quantile_list_item_field()), true),
+        Field::new("flags", DataType::UInt32, false),
+    ])
+}
+
+/// Only `parent_id` matters here: ADR-0016 drops exemplars entirely, so the
+/// normalizer only ever counts rows per histogram data-point id
+/// (`count_by_parent_id`), never reads an exemplar's own fields.
+fn histogram_exemplars_schema() -> Schema {
+    Schema::new(vec![plain_encoding_field(
+        "parent_id",
+        DataType::UInt32,
+        false,
+    )])
+}
+
+fn build_u64_list_array(lengths: &[usize], values: Vec<u64>) -> Result<ListArray, EncodeError> {
+    let offsets = OffsetBuffer::from_lengths(lengths.iter().copied());
+    let values_array: ArrayRef = Arc::new(UInt64Array::from(values));
+    Ok(ListArray::try_new(
+        u64_list_item_field(),
+        offsets,
+        values_array,
+        None,
+    )?)
+}
+
+fn build_f64_list_array(lengths: &[usize], values: Vec<f64>) -> Result<ListArray, EncodeError> {
+    let offsets = OffsetBuffer::from_lengths(lengths.iter().copied());
+    let values_array: ArrayRef = Arc::new(Float64Array::from(values));
+    Ok(ListArray::try_new(
+        f64_list_item_field(),
+        offsets,
+        values_array,
+        None,
+    )?)
+}
+
+fn build_quantile_list_array(
+    lengths: &[usize],
+    quantiles: Vec<f64>,
+    values: Vec<f64>,
+) -> Result<ListArray, EncodeError> {
+    let offsets = OffsetBuffer::from_lengths(lengths.iter().copied());
+    let struct_array = StructArray::new(
+        quantile_value_fields(),
+        vec![
+            Arc::new(Float64Array::from(quantiles)) as ArrayRef,
+            Arc::new(Float64Array::from(values)) as ArrayRef,
+        ],
+        None,
+    );
+    Ok(ListArray::try_new(
+        quantile_list_item_field(),
+        offsets,
+        Arc::new(struct_array),
+        None,
+    )?)
+}
+
+/// Accumulates `NUMBER_DP_ATTRS`/`HISTOGRAM_DP_ATTRS`/`SUMMARY_DP_ATTRS` rows
+/// column-by-column; factored out since all three attribute tables share one
+/// schema ([`attrs_schema`]) and one per-row encoding rule (see module docs
+/// on the `type` discriminant).
+#[derive(Default)]
+struct AttrColumnBuilder {
+    parent_ids: Vec<u32>,
+    keys: Vec<String>,
+    types: Vec<u8>,
+    strs: Vec<Option<String>>,
+    bools: Vec<Option<bool>>,
+    ints: Vec<Option<i64>>,
+    doubles: Vec<Option<f64>>,
+}
+
+impl AttrColumnBuilder {
+    fn push(&mut self, parent_id: u32, attr: &AttrRow) {
+        self.parent_ids.push(parent_id);
+        self.keys.push(attr.key.clone());
+        let (ty, str_v, bool_v, int_v, double_v) = match &attr.value {
+            AttrValue::Str(s) => (ANY_VALUE_TYPE_STRING, Some(s.clone()), None, None, None),
+            AttrValue::Bool(b) => (ANY_VALUE_TYPE_BOOL, None, Some(*b), None, None),
+            AttrValue::Int(i) => (ANY_VALUE_TYPE_INT, None, None, Some(*i), None),
+            AttrValue::Double(d) => (ANY_VALUE_TYPE_DOUBLE, None, None, None, Some(*d)),
+            AttrValue::Complex => (ANY_VALUE_TYPE_ARRAY, None, None, None, None),
+        };
+        self.types.push(ty);
+        self.strs.push(str_v);
+        self.bools.push(bool_v);
+        self.ints.push(int_v);
+        self.doubles.push(double_v);
+    }
+
+    fn into_batch(self) -> Result<RecordBatch, EncodeError> {
+        Ok(RecordBatch::try_new(
+            Arc::new(attrs_schema()),
+            vec![
+                Arc::new(UInt32Array::from(self.parent_ids)),
+                Arc::new(StringArray::from(self.keys)),
+                Arc::new(UInt8Array::from(self.types)),
+                Arc::new(StringArray::from(self.strs)),
+                Arc::new(BooleanArray::from(self.bools)),
+                Arc::new(Int64Array::from(self.ints)),
+                Arc::new(Float64Array::from(self.doubles)),
+            ],
+        )?)
+    }
+}
+
 /// A persistent per-payload-type Arrow IPC stream writer: one Arrow schema
 /// (and its dictionaries), written once, followed by any number of record
 /// batches.
@@ -250,8 +464,15 @@ pub struct MetricsStreamEncoder {
     root: PayloadStream,
     data_points: PayloadStream,
     attrs: PayloadStream,
+    hist_data_points: PayloadStream,
+    hist_attrs: PayloadStream,
+    hist_exemplars: PayloadStream,
+    summary_data_points: PayloadStream,
+    summary_attrs: PayloadStream,
     next_metric_id: u16,
     next_dp_id: u32,
+    next_hist_dp_id: u32,
+    next_summary_dp_id: u32,
 }
 
 impl MetricsStreamEncoder {
@@ -275,18 +496,64 @@ impl MetricsStreamEncoder {
                 format!("ravel-otap-number-dp-attrs-{stream_version}"),
                 &attrs_schema(),
             )?,
+            hist_data_points: PayloadStream::try_new(
+                ArrowPayloadType::HistogramDataPoints,
+                format!("ravel-otap-histogram-dp-{stream_version}"),
+                &histogram_data_points_schema(),
+            )?,
+            hist_attrs: PayloadStream::try_new(
+                ArrowPayloadType::HistogramDpAttrs,
+                format!("ravel-otap-histogram-dp-attrs-{stream_version}"),
+                &attrs_schema(),
+            )?,
+            hist_exemplars: PayloadStream::try_new(
+                ArrowPayloadType::HistogramDpExemplars,
+                format!("ravel-otap-histogram-dp-exemplars-{stream_version}"),
+                &histogram_exemplars_schema(),
+            )?,
+            summary_data_points: PayloadStream::try_new(
+                ArrowPayloadType::SummaryDataPoints,
+                format!("ravel-otap-summary-dp-{stream_version}"),
+                &summary_data_points_schema(),
+            )?,
+            summary_attrs: PayloadStream::try_new(
+                ArrowPayloadType::SummaryDpAttrs,
+                format!("ravel-otap-summary-dp-attrs-{stream_version}"),
+                &attrs_schema(),
+            )?,
             next_metric_id: 0,
             next_dp_id: 0,
+            next_hist_dp_id: 0,
+            next_summary_dp_id: 0,
         })
     }
 
     /// Encode `metrics` as one `BatchArrowRecords` with the given
-    /// `batch_id`. Metric and data-point ids are assigned sequentially
-    /// across calls, mimicking a real exporter reusing one stream.
+    /// `batch_id`. Thin wrapper over [`Self::encode_batch_ext`] with no
+    /// histogram or summary metrics, kept so existing callers and their
+    /// signature don't need to change for B2.
     pub fn encode_batch(
         &mut self,
         batch_id: i64,
         metrics: &[MetricRow],
+    ) -> Result<BatchArrowRecords, EncodeError> {
+        self.encode_batch_ext(batch_id, metrics, &[], &[])
+    }
+
+    /// Encode `metrics`, `histograms`, and `summaries` as one
+    /// `BatchArrowRecords` with the given `batch_id`. All root metric ids
+    /// share one `next_metric_id` counter and one `UNIVARIATE_METRICS`
+    /// table, matching otap-spec.md's single root table for every metric
+    /// type. Data-point ids are assigned sequentially across calls,
+    /// mimicking a real exporter reusing one stream; histogram and summary
+    /// data points use their own id counters since they're joined by their
+    /// own `*_DP_ATTRS`/`*_DP_EXEMPLARS` tables, never `NUMBER_DP_ATTRS`.
+    pub fn encode_batch_ext(
+        &mut self,
+        batch_id: i64,
+        metrics: &[MetricRow],
+        histograms: &[HistogramMetricRow],
+        summaries: &[SummaryMetricRow],
     ) -> Result<BatchArrowRecords, EncodeError> {
         let mut root_ids = Vec::new();
         let mut root_types = Vec::new();
@@ -298,14 +565,7 @@ impl MetricsStreamEncoder {
         let mut dp_parent_ids = Vec::new();
         let mut dp_times = Vec::new();
         let mut dp_values = Vec::new();
-
-        let mut attr_parent_ids = Vec::new();
-        let mut attr_keys = Vec::new();
-        let mut attr_types = Vec::new();
-        let mut attr_strs: Vec<Option<String>> = Vec::new();
-        let mut attr_bools: Vec<Option<bool>> = Vec::new();
-        let mut attr_ints: Vec<Option<i64>> = Vec::new();
-        let mut attr_doubles: Vec<Option<f64>> = Vec::new();
+        let mut attr_builder = AttrColumnBuilder::default();
 
         for metric in metrics {
             let metric_id = self.next_metric_id;
@@ -337,22 +597,95 @@ impl MetricsStreamEncoder {
                 dp_values.push(dp.value);
 
                 for attr in &dp.attrs {
-                    attr_parent_ids.push(dp_id);
-                    attr_keys.push(attr.key.clone());
-                    let (ty, str_v, bool_v, int_v, double_v) = match &attr.value {
-                        AttrValue::Str(s) => {
-                            (ANY_VALUE_TYPE_STRING, Some(s.clone()), None, None, None)
-                        }
-                        AttrValue::Bool(b) => (ANY_VALUE_TYPE_BOOL, None, Some(*b), None, None),
-                        AttrValue::Int(i) => (ANY_VALUE_TYPE_INT, None, None, Some(*i), None),
-                        AttrValue::Double(d) => (ANY_VALUE_TYPE_DOUBLE, None, None, None, Some(*d)),
-                        AttrValue::Complex => (ANY_VALUE_TYPE_ARRAY, None, None, None, None),
-                    };
-                    attr_types.push(ty);
-                    attr_strs.push(str_v);
-                    attr_bools.push(bool_v);
-                    attr_ints.push(int_v);
-                    attr_doubles.push(double_v);
+                    attr_builder.push(dp_id, attr);
+                }
+            }
+        }
+
+        let mut hist_dp_ids = Vec::new();
+        let mut hist_dp_parent_ids = Vec::new();
+        let mut hist_dp_times = Vec::new();
+        let mut hist_dp_counts = Vec::new();
+        let mut hist_dp_sums: Vec<Option<f64>> = Vec::new();
+        let mut hist_dp_bucket_lengths = Vec::new();
+        let mut hist_dp_bucket_values: Vec<u64> = Vec::new();
+        let mut hist_dp_bound_lengths = Vec::new();
+        let mut hist_dp_bound_values: Vec<f64> = Vec::new();
+        let mut hist_dp_flags = Vec::new();
+        let mut hist_dp_mins: Vec<Option<f64>> = Vec::new();
+        let mut hist_dp_maxs: Vec<Option<f64>> = Vec::new();
+        let mut hist_attr_builder = AttrColumnBuilder::default();
+        let mut hist_exemplar_parent_ids: Vec<u32> = Vec::new();
+
+        for metric in histograms {
+            let metric_id = self.next_metric_id;
+            self.next_metric_id = self.next_metric_id.wrapping_add(1);
+            root_ids.push(metric_id);
+            root_types.push(METRIC_TYPE_HISTOGRAM);
+            root_names.push(metric.name.clone());
+            root_temporalities.push(Some(metric.temporality));
+            root_monotonic.push(None);
+
+            for dp in &metric.data_points {
+                let dp_id = self.next_hist_dp_id;
+                self.next_hist_dp_id = self.next_hist_dp_id.wrapping_add(1);
+                hist_dp_ids.push(dp_id);
+                hist_dp_parent_ids.push(metric_id);
+                hist_dp_times.push(dp.time_unix_nano);
+                hist_dp_counts.push(dp.count);
+                hist_dp_sums.push(dp.sum);
+                hist_dp_bucket_lengths.push(dp.bucket_counts.len());
+                hist_dp_bucket_values.extend_from_slice(&dp.bucket_counts);
+                hist_dp_bound_lengths.push(dp.explicit_bounds.len());
+                hist_dp_bound_values.extend_from_slice(&dp.explicit_bounds);
+                hist_dp_flags.push(dp.flags);
+                hist_dp_mins.push(dp.min);
+                hist_dp_maxs.push(dp.max);
+
+                for attr in &dp.attrs {
+                    hist_attr_builder.push(dp_id, attr);
+                }
+                hist_exemplar_parent_ids.extend(std::iter::repeat_n(dp_id, dp.exemplar_count));
+            }
+        }
+
+        let mut summary_dp_ids = Vec::new();
+        let mut summary_dp_parent_ids = Vec::new();
+        let mut summary_dp_times = Vec::new();
+        let mut summary_dp_counts = Vec::new();
+        let mut summary_dp_sums = Vec::new();
+        let mut summary_dp_quantile_lengths = Vec::new();
+        let mut summary_dp_quantiles: Vec<f64> = Vec::new();
+        let mut summary_dp_values: Vec<f64> = Vec::new();
+        let mut summary_dp_flags = Vec::new();
+        let mut summary_attr_builder = AttrColumnBuilder::default();
+
+        for metric in summaries {
+            let metric_id = self.next_metric_id;
+            self.next_metric_id = self.next_metric_id.wrapping_add(1);
+            root_ids.push(metric_id);
+            root_types.push(METRIC_TYPE_SUMMARY);
+            root_names.push(metric.name.clone());
+            root_temporalities.push(None);
+            root_monotonic.push(None);
+
+            for dp in &metric.data_points {
+                let dp_id = self.next_summary_dp_id;
+                self.next_summary_dp_id = self.next_summary_dp_id.wrapping_add(1);
+                summary_dp_ids.push(dp_id);
+                summary_dp_parent_ids.push(metric_id);
+                summary_dp_times.push(dp.time_unix_nano);
+                summary_dp_counts.push(dp.count);
+                summary_dp_sums.push(dp.sum);
+                summary_dp_quantile_lengths.push(dp.quantiles.len());
+                for (quantile, value) in &dp.quantiles {
+                    summary_dp_quantiles.push(*quantile);
+                    summary_dp_values.push(*value);
+                }
+                summary_dp_flags.push(dp.flags);
+
+                for attr in &dp.attrs {
+                    summary_attr_builder.push(dp_id, attr);
                 }
             }
         }
@@ -381,19 +714,52 @@ impl MetricsStreamEncoder {
                 Arc::new(Float64Array::from(dp_values)),
             ],
         )?;
+        let attrs_batch = attr_builder.into_batch()?;
 
-        let attrs_batch = RecordBatch::try_new(
-            Arc::new(attrs_schema()),
+        let hist_dp_batch = RecordBatch::try_new(
+            Arc::new(histogram_data_points_schema()),
             vec![
-                Arc::new(UInt32Array::from(attr_parent_ids)),
-                Arc::new(StringArray::from(attr_keys)),
-                Arc::new(UInt8Array::from(attr_types)),
-                Arc::new(StringArray::from(attr_strs)),
-                Arc::new(BooleanArray::from(attr_bools)),
-                Arc::new(Int64Array::from(attr_ints)),
-                Arc::new(Float64Array::from(attr_doubles)),
+                Arc::new(UInt32Array::from(hist_dp_ids)),
+                Arc::new(UInt16Array::from(hist_dp_parent_ids)),
+                Arc::new(TimestampNanosecondArray::from(hist_dp_times)),
+                Arc::new(UInt64Array::from(hist_dp_counts)),
+                Arc::new(Float64Array::from(hist_dp_sums)),
+                Arc::new(build_u64_list_array(
+                    &hist_dp_bucket_lengths,
+                    hist_dp_bucket_values,
+                )?),
+                Arc::new(build_f64_list_array(
+                    &hist_dp_bound_lengths,
+                    hist_dp_bound_values,
+                )?),
+                Arc::new(UInt32Array::from(hist_dp_flags)),
+                Arc::new(Float64Array::from(hist_dp_mins)),
+                Arc::new(Float64Array::from(hist_dp_maxs)),
             ],
         )?;
+        let hist_attrs_batch = hist_attr_builder.into_batch()?;
+        let hist_exemplars_batch = RecordBatch::try_new(
+            Arc::new(histogram_exemplars_schema()),
+            vec![Arc::new(UInt32Array::from(hist_exemplar_parent_ids))],
+        )?;
+
+        let summary_dp_batch = RecordBatch::try_new(
+            Arc::new(summary_data_points_schema()),
+            vec![
+                Arc::new(UInt32Array::from(summary_dp_ids)),
+                Arc::new(UInt16Array::from(summary_dp_parent_ids)),
+                Arc::new(TimestampNanosecondArray::from(summary_dp_times)),
+                Arc::new(UInt64Array::from(summary_dp_counts)),
+                Arc::new(Float64Array::from(summary_dp_sums)),
+                Arc::new(build_quantile_list_array(
+                    &summary_dp_quantile_lengths,
+                    summary_dp_quantiles,
+                    summary_dp_values,
+                )?),
+                Arc::new(UInt32Array::from(summary_dp_flags)),
+            ],
+        )?;
+        let summary_attrs_batch = summary_attr_builder.into_batch()?;
 
         let mut arrow_payloads = Vec::new();
         if let Some(p) = self.root.write_batch(&root_batch)? {
@@ -403,6 +769,21 @@ impl MetricsStreamEncoder {
             arrow_payloads.push(p);
         }
         if let Some(p) = self.attrs.write_batch(&attrs_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self.hist_data_points.write_batch(&hist_dp_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self.hist_attrs.write_batch(&hist_attrs_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self.hist_exemplars.write_batch(&hist_exemplars_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self.summary_data_points.write_batch(&summary_dp_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self.summary_attrs.write_batch(&summary_attrs_batch)? {
             arrow_payloads.push(p);
         }
 
