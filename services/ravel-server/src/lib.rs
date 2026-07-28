@@ -6,6 +6,7 @@ pub mod ingest;
 pub mod otlp_grpc;
 pub mod otlp_http;
 pub mod query;
+pub mod remote_write;
 pub mod store;
 pub mod tenant;
 
@@ -90,6 +91,19 @@ fn gateway_state(
     })
 }
 
+fn remote_write_state(
+    ingest_router: &Arc<IngestRouter>,
+    tenant_resolver: Arc<dyn TenantResolver>,
+) -> Arc<remote_write::RemoteWriteState> {
+    Arc::new(remote_write::RemoteWriteState {
+        tenant_resolver,
+        router: ingest_router.clone(),
+        limits: IngestLimits::default(),
+        ack_deadline: DEFAULT_ACK_DEADLINE,
+        metrics: remote_write::RemoteWriteMetrics::default(),
+    })
+}
+
 /// Binds both listeners (as configured by `mode`) and starts serving in the
 /// background. Returns immediately; call [`Running::shutdown`] to stop.
 pub async fn start(
@@ -114,6 +128,8 @@ pub async fn start(
     if let Some(router) = &ingest_router {
         let state = gateway_state(router, config.tenant_resolver.clone());
         http_router = http_router.merge(otlp_http::router(state));
+        let rw_state = remote_write_state(router, config.tenant_resolver.clone());
+        http_router = http_router.merge(remote_write::router(rw_state));
     }
     if matches!(config.mode, Mode::All | Mode::Query) {
         let app_state = query::build_app_state(

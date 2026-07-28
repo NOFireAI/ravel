@@ -3868,6 +3868,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-otlp",
  "ravel-query",
+ "ravel-remote-write",
  "ravel-types",
  "reqwest 0.13.4",
  "serde",
