@@ -109,6 +109,15 @@ const MAX_METRIC_IDS: usize = 1 << 16;
 /// path our own encoder can produce).
 const UNKNOWN_OTAP_METRIC_TYPE: &str = "unknown_otap_metric_type";
 
+/// Tag for a whole `NUMBER_DATA_POINTS` batch that is missing a column
+/// required to decode any of its rows (`id`, `parent_id`, `time_unix_nano`,
+/// or both `double_value` and `int_value`). Reported via the same counted
+/// [`Rejection::UnsupportedMetricType`] mechanism [`push_unsupported_type_rejections`]
+/// uses for the exponential-histogram class and [`build_metric_decisions`]
+/// uses for [`UNKNOWN_OTAP_METRIC_TYPE`], since `ravel_otlp::Rejection` has no
+/// bespoke "malformed batch" variant (see the crate report for that gap).
+const MALFORMED_NUMBER_DATA_POINTS_BATCH: &str = "malformed_number_data_points_batch";
+
 /// Decode and normalize gauge and sum data points from one decoded OTAP
 /// `BatchArrowRecords` message (`batch.batch_id`'s payloads).
 ///
@@ -150,7 +159,7 @@ pub fn normalize_decoded(
     let summary_attr_batches: Vec<&RecordBatch> =
         payloads_of(batch, ArrowPayloadType::SummaryDpAttrs);
 
-    let flat_dp = flatten_dp(&dp_batches);
+    let flat_dp = flatten_dp(&dp_batches, &mut rejected);
     let flat_attrs = flatten_attrs(&attr_batches);
     let flat_hist_dp = flatten_histogram_dp(&hist_dp_batches);
     let flat_hist_attrs = flatten_attrs(&hist_attr_batches);
@@ -223,6 +232,21 @@ pub fn normalize_decoded(
             continue;
         }
 
+        // A NoRecordedValue point never consults double_value/int_value,
+        // matching OTLP's build_point: the sample is unconditionally the
+        // stale marker even if this row's value columns are both absent.
+        let value = if has_no_recorded_value(dp.flags) {
+            stale_nan()
+        } else {
+            match dp.value {
+                Some(v) => v,
+                None => {
+                    rejected.push(Rejection::MissingValue);
+                    continue;
+                }
+            }
+        };
+
         let raw: Vec<(String, RawCell)> = range
             .iter()
             .map(|&i| {
@@ -260,7 +284,7 @@ pub fn normalize_decoded(
                     labels: label_set.clone(),
                     sample: Sample {
                         ts_ns: dp.ts_ns,
-                        value: dp.value,
+                        value,
                     },
                     is_monotonic_sum: decision.is_sum && decision.is_monotonic,
                 });
@@ -420,11 +444,18 @@ struct SummaryDecision {
     name: String,
 }
 
+/// One flattened `NUMBER_DATA_POINTS` row. `value` is `None` only when both
+/// `double_value` and `int_value` are absent/null for this row: a decode
+/// error unless the row is also flagged stale (otap-spec.md section 5.3.2:
+/// the two value columns are alternatives, neither individually required;
+/// a `NoRecordedValue` point never consults either, matching OTLP's
+/// `build_point`).
 struct FlatDp {
     id: u32,
     parent_id: u16,
     ts_ns: i64,
-    value: f64,
+    value: Option<f64>,
+    flags: u32,
 }
 
 /// One flattened `HISTOGRAM_DATA_POINTS` row. `bucket_counts` and
@@ -592,27 +623,37 @@ fn build_root_table(root_batches: &[&RecordBatch], dense_size: usize) -> Vec<Opt
     entries
 }
 
-fn flatten_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatDp> {
+fn flatten_dp(dp_batches: &[&RecordBatch], rejected: &mut Vec<Rejection>) -> Vec<FlatDp> {
     let mut out = Vec::new();
     for rb in dp_batches {
-        let Some(ids) = column_as::<UInt32Array>(rb, "id") else {
+        let ids = column_as::<UInt32Array>(rb, "id");
+        let parents = column_as::<UInt16Array>(rb, "parent_id");
+        let times = column_as::<TimestampNanosecondArray>(rb, "time_unix_nano");
+        let doubles = column_as::<Float64Array>(rb, "double_value");
+        let ints = column_as::<Int64Array>(rb, "int_value");
+        let (Some(ids), Some(parents), Some(times)) = (ids, parents, times) else {
+            rejected.push(Rejection::UnsupportedMetricType {
+                metric_type: MALFORMED_NUMBER_DATA_POINTS_BATCH,
+                count: rb.num_rows(),
+            });
             continue;
         };
-        let Some(parents) = column_as::<UInt16Array>(rb, "parent_id") else {
+        if doubles.is_none() && ints.is_none() {
+            rejected.push(Rejection::UnsupportedMetricType {
+                metric_type: MALFORMED_NUMBER_DATA_POINTS_BATCH,
+                count: rb.num_rows(),
+            });
             continue;
-        };
-        let Some(times) = column_as::<TimestampNanosecondArray>(rb, "time_unix_nano") else {
-            continue;
-        };
-        let Some(values) = column_as::<Float64Array>(rb, "double_value") else {
-            continue;
-        };
+        }
+        let flags_col = column_as::<UInt32Array>(rb, "flags");
         for i in 0..rb.num_rows() {
+            let value = opt_f64(doubles, i).or_else(|| opt_i64(ints, i).map(|v| v as f64));
             out.push(FlatDp {
                 id: ids.value(i),
                 parent_id: parents.value(i),
                 ts_ns: times.value(i),
-                value: values.value(i),
+                value,
+                flags: flags_col.map_or(0, |c| c.value(i)),
             });
         }
     }
