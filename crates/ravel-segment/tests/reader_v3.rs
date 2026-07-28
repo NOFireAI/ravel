@@ -1734,3 +1734,60 @@ proptest! {
         prop_assert!(result.is_ok(), "panicked mutating record byte {byte_offset} to {new_byte:#04x}");
     }
 }
+
+// ===========================================================================
+// Cargo-fuzz justify-or-add call for the v3 HIST_SPANS surface (C5, RSEG
+// v3 phase 4, issue #137; docs/rseg-v3-plan.md section 10 explicitly asks
+// this be re-derived for v3, "not silently inherited" from P4 of
+// docs/rseg-v2-plan.md's own justify-or-add call for v1/v2, issue #32).
+//
+// Decision: proptest byte-mutation coverage remains sufficient for
+// HIST_SPANS; no cargo-fuzz target is added in this phase.
+//
+// What this phase adds specifically for the HIST_SPANS surface (beyond
+// what P4 already had for v1/v2):
+//   - `hist_mutation_any_record_byte_never_panics` above: every one of the
+//     17 record byte offsets against every possible byte value (512 cases
+//     per run, all 256 values reachable at every offset over enough runs),
+//     with the page crc patched so mutations reach the record decoder
+//     instead of being caught by the framing check first -- the class of
+//     input a whole-object random mutation essentially never produces
+//     unaided, since the crc gate rejects almost all of it before the
+//     record decoder is reached.
+//   - Named boundary tests pinning the exact typed error at each of the
+//     record's Corrupted-rule branches (reserved flags, scale floor,
+//     zero-length span, count/zero_count/bucket-sum consistency).
+//   - `histogram_value_strategy`'s structured generator (widened this
+//     phase to int/float kind, multi-span, custom boundaries, every
+//     reset_hint) feeding the full write-then-read roundtrip property,
+//     giving broad structural coverage on top of the narrow byte-mutation
+//     coverage above.
+//   - The whole-object seed corpus in tests/fuzz_mutation.rs extended
+//     with all seven v3 golden fixtures, covering the framing layer
+//     (page/section crc, footer, catalog) the record-level tests above
+//     deliberately bypass.
+//
+// Why not add a cargo-fuzz target in this phase specifically: a
+// libfuzzer-based corpus explores byte-space cheaply but blindly; the
+// gain over structured proptest is largest when the format has many
+// interacting length-prefixed fields libfuzzer can happen to discover
+// (the same reasoning P4 used for v1/v2's catalog and page framing).
+// HIST_SPANS adds exactly one further such field (the span count/length
+// pairs), which the structured generator and the boundary tests above
+// already exercise directly and deterministically -- a fuzzer would need
+// to get lucky finding a crc-valid page framing bytes-first, which is
+// precisely the cost the byte-mutation tests here sidestep by
+// constructing valid framing and mutating only the field under test.
+// libfuzzer's marginal value over that is judged low enough not to
+// justify the toolchain cost (still nightly-only, still absent from the
+// pinned stable toolchain this repo builds on, per P4's original note).
+//
+// This phase also cannot add a cargo-fuzz target even if the tradeoff
+// above were judged the other way: a fuzz/ crate requires a new
+// workspace member (root Cargo.toml) and a CI job entry, both explicitly
+// out of scope ("Work only in crates/ravel-segment", C5's own line).
+// Recording that structural blocker here rather than silently letting it
+// stand in for the tradeoff judgment above -- the two are separate
+// facts, and the justify-or-add call would be the same even if this
+// ticket could touch the workspace root.
+// ===========================================================================
