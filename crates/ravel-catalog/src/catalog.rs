@@ -11,7 +11,7 @@ use ravel_proto::commit::v1::CommitRecord;
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
-use crate::cache::RecordCache;
+use crate::cache::{HeadCache, PartCache, RecordCache};
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
 use crate::snapshot::{SegmentRef, Snapshot};
@@ -31,6 +31,8 @@ pub struct Catalog {
     store: Arc<dyn ObjectStoreBackend>,
     config: CatalogConfig,
     cache: RecordCache,
+    head_cache: HeadCache,
+    part_cache: PartCache,
 }
 
 impl Catalog {
@@ -47,6 +49,8 @@ impl Catalog {
             store,
             config,
             cache: RecordCache::default(),
+            head_cache: HeadCache::default(),
+            part_cache: PartCache::default(),
         })
     }
 
@@ -60,6 +64,17 @@ impl Catalog {
     /// `store`/`config`/`cache` fields in a separate type.
     pub(crate) fn store(&self) -> &dyn ObjectStoreBackend {
         self.store.as_ref()
+    }
+
+    /// `pub(crate)`: lets `snapshot_resolve` (docs/metric-index-plan.md 5.1)
+    /// share the decoded-HEAD cache from its own `impl Catalog` block.
+    pub(crate) fn head_cache(&self) -> &HeadCache {
+        &self.head_cache
+    }
+
+    /// `pub(crate)`: lets `snapshot_resolve` share the decoded-part cache.
+    pub(crate) fn part_cache(&self) -> &PartCache {
+        &self.part_cache
     }
 
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot
@@ -89,9 +104,34 @@ impl Catalog {
     ) -> Result<Snapshot, CatalogError> {
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
 
-        for (shard, hour) in self.hour_buckets(range, now_ns) {
-            self.list_hour_bucket(tenant, signal, shard, hour, &range, &mut segments)
-                .await?;
+        if let Some((window_start_hour, window_end_hour)) = self.window_hour_bounds(range, now_ns) {
+            // A snapshot at watermark W serves every window hour <= W
+            // straight from its parts; only the suffix above W is listed
+            // (docs/metric-index-plan.md 5.1 step 3). No usable snapshot,
+            // or a watermark below the window's start, falls back to
+            // listing the whole window, unchanged from Phase 1.
+            let window = self.resolve_snapshot_window(tenant, signal, now_ns).await?;
+            let listing_start_hour = match &window {
+                Some(window) if window.watermark_hour >= window_start_hour => {
+                    let snapshot_end_hour = window_end_hour.min(window.watermark_hour);
+                    window.extract_into(
+                        tenant,
+                        signal,
+                        window_start_hour,
+                        snapshot_end_hour,
+                        &range,
+                        &mut segments,
+                    )?;
+                    window.watermark_hour.saturating_add(1)
+                }
+                _ => window_start_hour,
+            };
+            for shard in 0..self.config.shard_count {
+                for hour in listing_start_hour..=window_end_hour {
+                    self.list_hour_bucket(tenant, signal, shard, hour, &range, &mut segments)
+                        .await?;
+                }
+            }
         }
 
         for token in min_tokens {
@@ -120,27 +160,24 @@ impl Catalog {
         Ok(Snapshot { segments })
     }
 
-    /// Every (shard, ingest-hour bucket) pair the listing window covers.
-    fn hour_buckets(&self, range: TimeRange, now_ns: i64) -> Vec<(u32, u32)> {
+    /// The (start_hour, end_hour) ingest-hour bucket range the listing
+    /// window covers, inclusive, or `None` if the window is empty. Applies
+    /// to every shard alike; callers cross it with `0..shard_count`
+    /// themselves.
+    fn window_hour_bounds(&self, range: TimeRange, now_ns: i64) -> Option<(u32, u32)> {
         let window_start_ns = range.start_ns.saturating_sub(self.config.max_ingest_lag_ns);
         let window_end_ns = now_ns.saturating_add(self.config.clock_skew_allowance_ns);
         if window_end_ns < 0 {
-            return Vec::new();
+            return None;
         }
         let start_hour = window_start_ns.div_euclid(NS_PER_HOUR).max(0);
         let end_hour = window_end_ns.div_euclid(NS_PER_HOUR);
         if start_hour > end_hour {
-            return Vec::new();
+            return None;
         }
         let start_hour = u32::try_from(start_hour).unwrap_or(0);
         let end_hour = u32::try_from(end_hour).unwrap_or(u32::MAX);
-        let mut out = Vec::new();
-        for shard in 0..self.config.shard_count {
-            for hour in start_hour..=end_hour {
-                out.push((shard, hour));
-            }
-        }
-        out
+        Some((start_hour, end_hour))
     }
 
     async fn list_hour_bucket(
@@ -155,9 +192,6 @@ impl Catalog {
         let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
         let objects = list_all(self.store.as_ref(), &prefix).await?;
         for meta in objects {
-            if out.contains_key(&meta.key) {
-                continue;
-            }
             let record = self
                 .load_and_validate(tenant, signal, shard, &meta.key)
                 .await?;
@@ -167,7 +201,8 @@ impl Catalog {
             };
             if event_range.overlaps(range) {
                 let segment_ref = build_segment_ref(&meta.key, &record)?;
-                out.insert(meta.key, segment_ref);
+                out.entry(segment_ref.data_object_key.clone())
+                    .or_insert(segment_ref);
             }
         }
         Ok(())
@@ -181,14 +216,12 @@ impl Catalog {
         out: &mut HashMap<String, SegmentRef>,
     ) -> Result<(), CatalogError> {
         let key = keys::commit_key_for_token(tenant, signal, token)?;
-        if out.contains_key(&key) {
-            return Ok(()); // already included via the listing pass
-        }
         if let Some(cached) = self.cache.get(tenant, &key)
             && validate_expected_fields(&cached, tenant, signal, token.shard, &key).is_ok()
         {
             let segment_ref = build_segment_ref(&key, &cached)?;
-            out.insert(key, segment_ref);
+            out.entry(segment_ref.data_object_key.clone())
+                .or_insert(segment_ref);
             return Ok(());
         }
 
@@ -217,7 +250,8 @@ impl Catalog {
                         self.config.cache_capacity_per_tenant,
                     );
                     let segment_ref = build_segment_ref(&key, &record)?;
-                    out.insert(key, segment_ref);
+                    out.entry(segment_ref.data_object_key.clone())
+                        .or_insert(segment_ref);
                     return Ok(());
                 }
                 Err(StoreError::NotFound) if notfound_retries > 0 => {

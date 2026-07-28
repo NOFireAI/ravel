@@ -125,7 +125,7 @@ fn sealed_watermark_hour(now_ns: i64, config: &CatalogConfig) -> Option<u32> {
     u32::try_from(floor_hours - 1).ok()
 }
 
-fn head_object_key(tenant: &TenantHash, signal: Signal) -> String {
+pub(crate) fn head_object_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
