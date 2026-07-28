@@ -2187,12 +2187,17 @@ fn parse_series_meta_tail_v3(
     for i in 0..count as usize {
         match value_kind[i] {
             ValueKind::Scalar => {
-                if hist_page[i] != (0, 0) {
+                // A zero-length range's offset is wherever the running
+                // val_page/hist_page cursor happened to sit (`end` in
+                // `reconstruct_ranges_v2`), not literally 0, so only the
+                // length half of a "not applicable" (gap, len) pair is
+                // meaningful here.
+                if hist_page[i].1 != 0 {
                     return Err(SegmentError::ScalarSeriesHasHistPage);
                 }
             }
             ValueKind::Histogram => {
-                if val_page[i] != (0, 0) {
+                if val_page[i].1 != 0 {
                     return Err(SegmentError::HistogramSeriesHasValPage);
                 }
                 if hist_page[i].1 == 0 {
