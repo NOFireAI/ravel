@@ -199,6 +199,48 @@ jobs:
         if: always()
         run: docker rm -f minio || true
 
+  # PromQL differential test (issue #124, docs/promql-evaluator-plan.md
+  # section 5, ADR-0021 decisions 4-5): checks Ravel's PromQL evaluator
+  # against a pinned real Prometheus binary for bit-exact correctness on
+  # the selector and error corpora in crates/ravel-promql-difftest/corpus.
+  #
+  # scripts/fetch-prometheus.sh verifies the downloaded archive's sha256
+  # before extracting it and refuses to proceed otherwise. As of this job's
+  # introduction those checksums are still literal UNVERIFIED-PLACEHOLDER
+  # values (populated with a real published digest from
+  # https://github.com/prometheus/prometheus/releases/tag/v3.13.1's
+  # sha256sums.txt) because the environment that wrote this job had no
+  # network egress to fetch and verify them. Populate them before relying
+  # on this job passing.
+  promql-difftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pinned Prometheus binary
+        id: fetch-prometheus
+        run: echo "bin_path=$(scripts/fetch-prometheus.sh)" >> "$GITHUB_OUTPUT"
+      - name: Run PromQL differential test
+        env:
+          RAVEL_DIFFTEST: "1"
+          RAVEL_DIFFTEST_PROM_BIN: ${{ steps.fetch-prometheus.outputs.bin_path }}
+        run: |
+          set -o pipefail
+          cargo test -p ravel-promql-difftest --test difftest_selectors \
+            -- --exact --nocapture | tee difftest-output.txt
+          # Prove the gated test actually ran against the pinned binary
+          # rather than taking its RAVEL_DIFFTEST-unset early return.
+          if grep -q "skipping: set RAVEL_DIFFTEST" difftest-output.txt; then
+            echo "::error::differential test skipped despite RAVEL_DIFFTEST set"
+            exit 1
+          fi
+          if ! grep -q "test result: ok. 1 passed" difftest-output.txt; then
+            echo "::error::differential test did not run (expected 1 passed)"
+            exit 1
+          fi
+
   coverage:
     runs-on: ubuntu-latest
     steps:

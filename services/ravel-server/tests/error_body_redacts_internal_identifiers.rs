@@ -206,9 +206,14 @@ async fn storage_failure_body_is_redacted_but_log_keeps_detail() {
         .await
         .expect("query request completes");
 
-    // Status mapping is unchanged (a corrupt segment still yields 503; the
-    // corruption-to-503 taxonomy is issue #62). Only the body content changed.
-    assert_eq!(response.status(), 503, "a corrupt segment yields 503");
+    // A corrupt segment is a permanent server-side data fault, so it maps to
+    // the non-retryable 500 `internal`, not the retryable 503 (issue #62,
+    // a7-F05). The redaction of the body content (below) is unchanged (#59).
+    assert_eq!(
+        response.status(),
+        500,
+        "a corrupt segment yields non-retryable 500"
+    );
     let body: serde_json::Value = response.json().await.expect("error body is JSON");
     let error = body["error"].as_str().expect("error is a string");
 
