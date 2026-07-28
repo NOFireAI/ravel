@@ -31,14 +31,32 @@ stats_alloc = "0.1.10"
 # Gated behind `parquet-baseline` (off by default). arrow reuses the
 # workspace pin (identical to ravel-otap's); parquet is pinned lockstep to
 # the same major and is a new external dependency (see issue #97 report).
+# `async` + `object_store` give the read-side accounting harness (phase b)
+# the async Parquet reader over an object store; `object_store` and
+# `futures` reuse the workspace pins already used by ravel-object-store.
 arrow = { workspace = true, optional = true }
-parquet = { version = "59", optional = true }
+parquet = { version = "59", optional = true, features = ["async", "object_store"] }
+# The read-side Parquet reader is driven through the `object_store` version
+# `parquet` itself depends on (0.13), NOT the workspace pin (0.14), so the
+# counting wrapper implements the same `ObjectStore` trait the async reader
+# consumes. This is a bench-only second version, isolated to this crate; the
+# RSEG path still goes through ravel-object-store (0.14) unchanged.
+object_store = { version = "0.13", optional = true, features = ["aws"] }
+futures = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 
 [features]
-# Write-side Parquet baseline harness (issue #97 phase a). Off by default:
-# the standard build and gates never compile arrow/parquet or the
-# parquet_baseline bin.
-parquet-baseline = ["dep:arrow", "dep:parquet"]
+# Parquet baseline harness (issue #97). Off by default: the standard build
+# and gates never compile arrow/parquet/object_store or the gated bins.
+# Phase a (write-side `parquet_baseline`) and phase b (read-side
+# `read_path_accounting`) share this one feature.
+parquet-baseline = [
+    "dep:arrow",
+    "dep:parquet",
+    "dep:object_store",
+    "dep:futures",
+    "dep:async-trait",
+]
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -80,6 +98,17 @@ bench = false
 name = "parquet_baseline"
 path = "src/bin/parquet_baseline.rs"
 required-features = ["parquet-baseline"]
+bench = false
+
+[[bin]]
+name = "read_path_accounting"
+path = "src/bin/read_path_accounting.rs"
+required-features = ["parquet-baseline"]
+bench = false
+
+[[test]]
+name = "read_accounting"
+path = "tests/read_accounting.rs"
 bench = false
 
 [[test]]
