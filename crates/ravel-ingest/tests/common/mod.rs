@@ -3,8 +3,11 @@
 //! crate's public API; used only by integration tests under `tests/`.
 #![allow(clippy::expect_used, dead_code)]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,35 +27,73 @@ use ravel_segment::{IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, 
 use ravel_types::{
     CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
 /// Clock whose reading is set explicitly by the test, so flush identity
 /// (ingest_hour_bucket, created_unix_ns) is deterministic and can be advanced
 /// mid-retry to exercise hour-boundary pinning.
-pub struct TestClock(AtomicI64);
+///
+/// `Clock::sleep` (the shard actor's flush tick) is driven off `wake_tx`:
+/// every `set_ns`/`advance_ns` sends on the watch channel, waking any
+/// sleeping actor to re-check its deadline. A `watch` (not a `Notify`) is
+/// used so an advance that lands before the sleeper registers is never lost:
+/// the version bump is durable and `changed()` observes it on the next poll.
+pub struct TestClock {
+    now_ns: AtomicI64,
+    wake_tx: watch::Sender<()>,
+}
 
 impl TestClock {
     pub fn new(start_ns: i64) -> Arc<Self> {
-        Arc::new(TestClock(AtomicI64::new(start_ns)))
+        let (wake_tx, _rx) = watch::channel(());
+        Arc::new(TestClock {
+            now_ns: AtomicI64::new(start_ns),
+            wake_tx,
+        })
     }
 
     pub fn set_ns(&self, ns: i64) {
-        self.0.store(ns, Ordering::SeqCst);
+        self.now_ns.store(ns, Ordering::SeqCst);
+        let _ = self.wake_tx.send(());
     }
 
     pub fn advance_ns(&self, delta_ns: i64) {
-        self.0.fetch_add(delta_ns, Ordering::SeqCst);
+        self.now_ns.fetch_add(delta_ns, Ordering::SeqCst);
+        let _ = self.wake_tx.send(());
     }
 
     pub fn now(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
+        self.now_ns.load(Ordering::SeqCst)
     }
 }
 
 impl Clock for TestClock {
     fn now_ns(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
+        self.now_ns.load(Ordering::SeqCst)
+    }
+
+    fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let deadline = self
+            .now_ns()
+            .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+        // Subscribe before the first deadline check: any advance after this
+        // point bumps the watch version and is seen by `changed()`, and any
+        // advance already reflected in `now_ns()` is caught by the check, so
+        // the wakeup can be neither duplicated into a spin nor lost.
+        let mut rx = self.wake_tx.subscribe();
+        Box::pin(async move {
+            loop {
+                if self.now_ns() >= deadline {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    // The clock (and its sender) is gone; nothing will advance
+                    // time again, so let the sleeper proceed rather than hang.
+                    return;
+                }
+            }
+        })
     }
 }
 

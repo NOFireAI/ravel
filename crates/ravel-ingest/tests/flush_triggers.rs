@@ -79,9 +79,12 @@ async fn age_triggered_flush_lands_below_size_threshold() {
         1.0,
     )];
 
-    // The shard actor's "age" check reads the injected `TestClock`, which
-    // never advances on its own: nudge it forward past `max_flush_delay`
-    // while the write is in flight so the actor's tick notices.
+    // The shard actor's flush tick now runs on the injected `TestClock`
+    // (finding a8-F04), so the two clocks that used to be raced with a real
+    // `tokio::time::sleep` are one. Wait cooperatively until the point is
+    // actually buffered in the actor, then advance the injected clock past
+    // `max_flush_delay`; that advance deterministically wakes the tick and
+    // fires the age flush, with no wall-clock sleep.
     let (write_result, ()) = tokio::join!(
         router.write(
             tenant.clone(),
@@ -90,7 +93,9 @@ async fn age_triggered_flush_lands_below_size_threshold() {
             Duration::from_secs(5)
         ),
         async {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            while router.metrics().snapshot().buffered_points_total < 1 {
+                tokio::task::yield_now().await;
+            }
             clock.advance_ns(100_000_000);
         },
     );
