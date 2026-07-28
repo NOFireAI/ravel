@@ -1,20 +1,23 @@
 //! Snapshot resolution: listing-based discovery over commit records
 //! (docs/catalog-and-mvcc.md "Snapshot resolution", ADR-0003, ADR-0010 §2/§10).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use prost::Message;
+use ravel_commit::keys::BucketEntry;
 use ravel_commit::{keys, record, signal};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::CommitRecord;
+use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
-use crate::cache::{HeadCache, PartCache, PostingsCache, RecordCache};
+use crate::cache::{CompactionRecordCache, HeadCache, PartCache, PostingsCache, RecordCache};
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
-use crate::snapshot::{SegmentRef, Snapshot};
+use crate::snapshot::{SegmentLevel, SegmentRef, Snapshot};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// Delay before the single retry on an exact `min_token` GET
@@ -31,9 +34,22 @@ pub struct Catalog {
     store: Arc<dyn ObjectStoreBackend>,
     config: CatalogConfig,
     cache: RecordCache,
+    compaction_cache: CompactionRecordCache,
     head_cache: HeadCache,
     part_cache: PartCache,
     postings_cache: PostingsCache,
+    /// Count of unlisted L0 records observed postdating a compaction record
+    /// in their bucket (docs/catalog-and-mvcc.md step 3: an interlock
+    /// breach, since a flush should have sealed before compaction ran). The
+    /// segment is still included for correctness (overlap harmlessness); the
+    /// counter surfaces the anomaly to metrics.
+    interlock_violations: AtomicU64,
+    /// Count of buckets observed holding two compaction records with
+    /// different `input_set_hash` (docs/catalog-and-mvcc.md step 3, §3.6 row
+    /// 11: a sealed bucket must yield exactly one input set). Both parts
+    /// sets plus all uncovered L0s are still included (harmless overlap);
+    /// the counter surfaces the invariant breach for a human to investigate.
+    compaction_input_set_conflicts: AtomicU64,
 }
 
 impl Catalog {
@@ -50,14 +66,32 @@ impl Catalog {
             store,
             config,
             cache: RecordCache::default(),
+            compaction_cache: CompactionRecordCache::default(),
             head_cache: HeadCache::default(),
             part_cache: PartCache::default(),
             postings_cache: PostingsCache::default(),
+            interlock_violations: AtomicU64::new(0),
+            compaction_input_set_conflicts: AtomicU64::new(0),
         })
     }
 
     pub fn config(&self) -> &CatalogConfig {
         &self.config
+    }
+
+    /// Number of writer-interlock violations observed across this catalog's
+    /// lifetime (an L0 commit record not named in any compaction record's
+    /// input list, whose `created_unix_ns` postdates that record). See
+    /// docs/catalog-and-mvcc.md step 3.
+    pub fn interlock_violations(&self) -> u64 {
+        self.interlock_violations.load(Ordering::Relaxed)
+    }
+
+    /// Number of buckets observed with two compaction records carrying
+    /// different `input_set_hash` (docs/catalog-and-mvcc.md step 3, §3.6
+    /// row 11).
+    pub fn compaction_input_set_conflicts(&self) -> u64 {
+        self.compaction_input_set_conflicts.load(Ordering::Relaxed)
     }
 
     /// `pub(crate)`: lets `fold` (docs/metric-index-plan.md section 4) issue
@@ -202,15 +236,15 @@ impl Catalog {
         // writer_seq) (seq is monotonic only per (writer_id, epoch, shard),
         // ADR-0010 §3), and without an identity tiebreak the stable sort would
         // otherwise leave them in randomized HashMap iteration order (a4-F01).
-        segments.sort_by_key(|s| {
-            (
-                s.created_unix_ns,
-                s.writer_epoch,
-                s.writer_seq,
-                s.shard,
-                s.writer_id,
-            )
-        });
+        //
+        // Mixed L0/L1 levels stay a deterministic total order
+        // (docs/catalog-and-mvcc.md "Snapshot resolution"): an L1 part has
+        // writer_epoch/seq == 0 and writer_id == nil, so it slots into the
+        // same chain by its record's created_unix_ns and gets its
+        // input_set_hash then part_index as the final tiebreaks (a level tag
+        // separates the two tiebreak families). L0 ordering is unchanged: the
+        // appended L1-only key components are constant across L0 refs.
+        segments.sort_by_key(segment_sort_key);
         Ok(Snapshot {
             segments,
             segments_pruned,
@@ -248,21 +282,177 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
         let objects = list_all(self.store.as_ref(), &prefix).await?;
+
+        // Partition the listed keys by shape (docs/catalog-and-mvcc.md step
+        // 2). An unrecognized shape is a fail-loud error, never a silent
+        // skip (plan §3.1: fail-loud on layout drift).
+        let mut l0_keys: Vec<String> = Vec::new();
+        let mut compaction_keys: Vec<String> = Vec::new();
+        let mut has_tombstone = false;
         for meta in objects {
+            match keys::partition_bucket_entry(&meta.key)? {
+                BucketEntry::CommitRecord(_) => l0_keys.push(meta.key),
+                BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
+                BucketEntry::Tombstone(_) => has_tombstone = true,
+            }
+        }
+
+        // Tombstone present: the bucket contributes nothing (ADR-0019,
+        // docs/catalog-and-mvcc.md step 3).
+        if has_tombstone {
+            return Ok(());
+        }
+
+        // No compaction record: Phase 1 behavior, every overlapping L0.
+        if compaction_keys.is_empty() {
+            for key in &l0_keys {
+                self.include_l0_if_overlaps(tenant, signal, shard, key, range, out)
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        // Compaction record(s) present (docs/catalog-and-mvcc.md step 3):
+        // include each record's parts (event-bound filtered), collect the
+        // input identities to exclude, and remember the newest record's
+        // created_unix_ns for the interlock check on unlisted L0s.
+        let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
+        let mut newest_record_created_ns = i64::MIN;
+        let mut input_set_hashes: HashSet<Vec<u8>> = HashSet::new();
+        for ckey in &compaction_keys {
             let record = self
-                .load_and_validate(tenant, signal, shard, &meta.key)
+                .load_and_validate_compaction(tenant, signal, shard, ckey)
                 .await?;
+            input_set_hashes.insert(record.input_set_hash.clone());
+            newest_record_created_ns = newest_record_created_ns.max(record.created_unix_ns);
+            for part in &record.parts {
+                let segment_ref = build_l1_segment_ref(&record, part, ckey)?;
+                let event_range = TimeRange {
+                    start_ns: segment_ref.min_event_ts_ns,
+                    end_ns: segment_ref.max_event_ts_ns,
+                };
+                if event_range.overlaps(range) {
+                    out.entry(segment_ref.data_object_key.clone())
+                        .or_insert(segment_ref);
+                }
+            }
+            for input in &record.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+        }
+
+        // Two records with different input_set_hash in one bucket: both parts
+        // sets are already included above (harmless overlap); alarm loudly
+        // (docs/catalog-and-mvcc.md step 3, §3.6 row 11).
+        if input_set_hashes.len() > 1 {
+            self.compaction_input_set_conflicts
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                shard,
+                hour,
+                records = input_set_hashes.len(),
+                "compaction interlock breach: sealed bucket holds multiple input sets"
+            );
+        }
+
+        // L0 records: exclude exactly those named in an input list; include
+        // any unlisted one normally, raising the interlock metric if it
+        // postdates the newest compaction record (docs/catalog-and-mvcc.md
+        // step 3).
+        for key in &l0_keys {
+            let record = self.load_and_validate(tenant, signal, shard, key).await?;
+            let identity = (
+                record.writer_id.clone(),
+                record.writer_epoch,
+                record.writer_seq,
+            );
+            if excluded.contains(&identity) {
+                continue;
+            }
+            if record.created_unix_ns > newest_record_created_ns {
+                self.interlock_violations.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    shard,
+                    hour,
+                    key = %key,
+                    "writer-interlock violation: L0 record postdates its bucket's compaction record"
+                );
+            }
             let event_range = TimeRange {
                 start_ns: record.min_event_ts_ns,
                 end_ns: record.max_event_ts_ns,
             };
             if event_range.overlaps(range) {
-                let segment_ref = build_segment_ref(&meta.key, &record)?;
+                let segment_ref = build_segment_ref(key, &record)?;
                 out.entry(segment_ref.data_object_key.clone())
                     .or_insert(segment_ref);
             }
         }
         Ok(())
+    }
+
+    /// Load one L0 commit record and, if its event range overlaps `range`,
+    /// add its segment ref to `out`. The plain Phase 1 include path, shared
+    /// by the no-compaction fast path.
+    async fn include_l0_if_overlaps(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        key: &str,
+        range: &TimeRange,
+        out: &mut HashMap<String, SegmentRef>,
+    ) -> Result<(), CatalogError> {
+        let record = self.load_and_validate(tenant, signal, shard, key).await?;
+        let event_range = TimeRange {
+            start_ns: record.min_event_ts_ns,
+            end_ns: record.max_event_ts_ns,
+        };
+        if event_range.overlaps(range) {
+            let segment_ref = build_segment_ref(key, &record)?;
+            out.entry(segment_ref.data_object_key.clone())
+                .or_insert(segment_ref);
+        }
+        Ok(())
+    }
+
+    /// Load, decode, validate, and cache a compaction record, keyed by full
+    /// object key, exactly as [`Catalog::load_and_validate`] does for commit
+    /// records (docs/catalog-and-mvcc.md step 2). Validation covers
+    /// tenant_hash/signal/shard against the (tenant, signal, shard) it was
+    /// listed under plus the reconstruct-and-verify of its own key
+    /// (ADR-0010 §7).
+    async fn load_and_validate_compaction(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        key: &str,
+    ) -> Result<Arc<CompactionRecord>, CatalogError> {
+        if let Some(cached) = self.compaction_cache.get(tenant, key) {
+            validate_compaction_expected_fields(&cached, tenant, signal, shard, key)?;
+            return Ok(cached);
+        }
+        let got = self.store.get(key, GetRange::Full).await?;
+        let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
+            CatalogError::CompactionRecordDecode {
+                key: key.to_string(),
+                source: e,
+            }
+        })?;
+        validate_compaction_expected_fields(&record, tenant, signal, shard, key)?;
+        let record = Arc::new(record);
+        self.compaction_cache.insert(
+            *tenant,
+            key.to_string(),
+            record.clone(),
+            self.config.cache_capacity_per_tenant,
+        );
+        Ok(record)
     }
 
     async fn resolve_min_token(
@@ -316,7 +506,15 @@ impl Catalog {
                     tokio::time::sleep(MIN_TOKEN_RETRY_DELAY).await;
                 }
                 Err(StoreError::NotFound) => {
-                    return Err(unsatisfiable_token(token));
+                    // The commit record is absent after one propagation retry.
+                    // Before declaring the token unsatisfiable, try the
+                    // compaction/tombstone fallback (docs/catalog-and-mvcc.md
+                    // step 5): a swept-post-compaction record is served via its
+                    // L1 parts, a tombstoned bucket is satisfied with zero
+                    // segments.
+                    return self
+                        .resolve_min_token_fallback(tenant, signal, token, out)
+                        .await;
                 }
                 Err(e) if e.is_retryable() && transient_retries > 0 => {
                     transient_retries -= 1;
@@ -325,6 +523,63 @@ impl Catalog {
                 Err(e) => return Err(CatalogError::Store(e)),
             }
         }
+    }
+
+    /// Token fallback when the exact commit-record GET returned NotFound
+    /// after its retry (docs/catalog-and-mvcc.md step 5). The token fully
+    /// determines its (shard, ingest_hour) bucket, but not the
+    /// `input_set_hash16` a compaction record's key embeds, so this LISTs the
+    /// bucket to discover its compaction records and tombstone:
+    ///
+    /// - Tombstone present: satisfied with zero segments (the data was
+    ///   retired, not lost).
+    /// - The token's writer identity found in a compaction record's input
+    ///   list: satisfied via that record's parts (all of them; the token's
+    ///   data is somewhere among them, and read-your-write ignores event
+    ///   range just as the L0 exact-token path does).
+    /// - Neither: `unsatisfiable token`, unchanged.
+    async fn resolve_min_token_fallback(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        out: &mut HashMap<String, SegmentRef>,
+    ) -> Result<(), CatalogError> {
+        let prefix =
+            keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)?;
+        let objects = list_all(self.store.as_ref(), &prefix).await?;
+        let mut compaction_keys: Vec<String> = Vec::new();
+        for meta in objects {
+            match keys::partition_bucket_entry(&meta.key)? {
+                BucketEntry::Tombstone(_) => return Ok(()),
+                BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
+                BucketEntry::CommitRecord(_) => {}
+            }
+        }
+
+        let token_identity = (token.writer_id.to_string(), token.epoch, token.seq);
+        for ckey in &compaction_keys {
+            let record = self
+                .load_and_validate_compaction(tenant, signal, token.shard, ckey)
+                .await?;
+            let covers = record.inputs.iter().any(|input| {
+                (
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ) == token_identity
+            });
+            if covers {
+                for part in &record.parts {
+                    let segment_ref = build_l1_segment_ref(&record, part, ckey)?;
+                    out.entry(segment_ref.data_object_key.clone())
+                        .or_insert(segment_ref);
+                }
+                return Ok(());
+            }
+        }
+
+        Err(unsatisfiable_token(token))
     }
 
     /// `pub(crate)`: also called by `fold` (docs/metric-index-plan.md
@@ -353,6 +608,34 @@ impl Catalog {
         );
         Ok(record)
     }
+}
+
+/// Deterministic total-order key over a mixed L0/L1 segment set
+/// (docs/catalog-and-mvcc.md "Cross-segment duplicate samples" and "Snapshot
+/// resolution"). L0 refs keep their exact previous order: the trailing L1
+/// discriminator/`input_set_hash`/`part_index` components are constant
+/// (0/[0; 32]/0) for every L0 ref, so they never reorder L0-vs-L0. L1 refs
+/// carry `writer_epoch`/`writer_seq` == 0 and `writer_id` == nil, so they
+/// order by their record's `created_unix_ns` then, past the level tag, by
+/// `input_set_hash` then `part_index`.
+fn segment_sort_key(s: &SegmentRef) -> (i64, u64, u64, u32, Uuid, u8, [u8; 32], u32) {
+    let (level_tag, input_set_hash, part_index) = match &s.level {
+        SegmentLevel::L0 => (0u8, [0u8; 32], 0u32),
+        SegmentLevel::L1 {
+            input_set_hash,
+            part_index,
+        } => (1u8, *input_set_hash, *part_index),
+    };
+    (
+        s.created_unix_ns,
+        s.writer_epoch,
+        s.writer_seq,
+        s.shard,
+        s.writer_id,
+        level_tag,
+        input_set_hash,
+        part_index,
+    )
 }
 
 fn unsatisfiable_token(token: &CommitToken) -> CatalogError {
@@ -402,6 +685,105 @@ fn validate_expected_fields(
     Ok(())
 }
 
+/// Validate a decoded compaction record's tenant_hash/signal/shard against
+/// the (tenant, signal, shard) it was listed or addressed under, and verify
+/// its own key reconstructs to the key it was found at (ADR-0010 §7). The
+/// compaction-record analog of [`validate_expected_fields`].
+fn validate_compaction_expected_fields(
+    record: &CompactionRecord,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    key: &str,
+) -> Result<(), CatalogError> {
+    if record.tenant_hash.as_slice() != tenant.0.as_slice() {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "tenant_hash",
+            expected: tenant.to_hex(),
+            actual: format!("{:?}", record.tenant_hash),
+        });
+    }
+    if signal::from_proto(record.signal) != Ok(signal) {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "signal",
+            expected: format!("{signal:?}"),
+            actual: format!("{:?}", record.signal),
+        });
+    }
+    if record.shard != shard {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "shard",
+            expected: shard.to_string(),
+            actual: record.shard.to_string(),
+        });
+    }
+    keys::verify_compaction_record_key(record, key).map_err(|source| {
+        CatalogError::Reconstruction {
+            key: key.to_string(),
+            source,
+        }
+    })?;
+    Ok(())
+}
+
+/// Build an L1 [`SegmentRef`] from a compaction record and one of its parts,
+/// reconstructing the part key from their identity fields (ADR-0010 §7,
+/// never a stored string). `observed_ckey` names the compaction record for
+/// error messages. The footer of the part object is later verified against
+/// these same fields by the reader (docs/compaction-retention-plan.md §3.5).
+fn build_l1_segment_ref(
+    record: &CompactionRecord,
+    part: &CompactionPart,
+    observed_ckey: &str,
+) -> Result<SegmentRef, CatalogError> {
+    let data_object_key = keys::reconstruct_l1_part_key(record, part)?;
+    let content_hash: [u8; 32] =
+        part.content_hash
+            .clone()
+            .try_into()
+            .map_err(|_| CatalogError::FieldMismatch {
+                key: observed_ckey.to_string(),
+                field: "part content_hash",
+                expected: "32 bytes".to_string(),
+                actual: format!("{} bytes", part.content_hash.len()),
+            })?;
+    let input_set_hash: [u8; 32] =
+        record
+            .input_set_hash
+            .clone()
+            .try_into()
+            .map_err(|_| CatalogError::FieldMismatch {
+                key: observed_ckey.to_string(),
+                field: "input_set_hash",
+                expected: "32 bytes".to_string(),
+                actual: format!("{} bytes", record.input_set_hash.len()),
+            })?;
+    Ok(SegmentRef {
+        data_object_key,
+        object_size: part.object_size,
+        min_event_ts_ns: part.min_event_ts_ns,
+        max_event_ts_ns: part.max_event_ts_ns,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        sample_count: part.sample_count,
+        series_count: part.series_count,
+        shard: record.shard,
+        content_hash,
+        // A part has no writer identity of its own (plan §4): these are
+        // never used for an L1 ref's identity or dedup.
+        writer_id: Uuid::nil(),
+        writer_epoch: 0,
+        writer_seq: 0,
+        created_unix_ns: record.created_unix_ns,
+        level: SegmentLevel::L1 {
+            input_set_hash,
+            part_index: part.part_index,
+        },
+    })
+}
+
 fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, CatalogError> {
     let data_object_key =
         keys::verify_object_key(record).map_err(|source| CatalogError::Reconstruction {
@@ -440,6 +822,7 @@ fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, Cat
         writer_epoch: record.writer_epoch,
         writer_seq: record.writer_seq,
         created_unix_ns: record.created_unix_ns,
+        level: SegmentLevel::L0,
     })
 }
 

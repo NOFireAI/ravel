@@ -110,6 +110,7 @@ async fn segment_with_three_jobs() -> (SegmentFetcher, TenantHash, SegmentRef) {
         writer_epoch: 1,
         writer_seq: 1,
         created_unix_ns: 42,
+        level: ravel_catalog::SegmentLevel::L0,
     };
     let backend: Arc<dyn ObjectStoreBackend> = store;
     (SegmentFetcher::new(backend), tenant_hash, seg_ref)
