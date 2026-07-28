@@ -151,7 +151,13 @@ async fn build_snapshot(
     // Snapshot iteration order is the deterministic dedup segment order;
     // reproduce it here (created_unix_ns, writer_epoch, writer_seq, shard).
     segments.sort_by_key(|s| (s.created_unix_ns, s.writer_epoch, s.writer_seq, s.shard));
-    (store, Snapshot { segments })
+    (
+        store,
+        Snapshot {
+            segments,
+            segments_pruned: 0,
+        },
+    )
 }
 
 /// Per-series ts -> winning value bits, the shape both the oracle and the
@@ -560,6 +566,7 @@ async fn mid_scan_get_failure_is_typed_error_and_fault_fires() {
     let seg = write_segment(store.as_ref(), "t/metrics/seg.rseg", writer_id, &spec).await;
     let snapshot = Snapshot {
         segments: vec![seg],
+        segments_pruned: 0,
     };
 
     let backend: Arc<dyn ObjectStoreBackend> = store.clone();
