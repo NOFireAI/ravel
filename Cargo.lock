@@ -3461,6 +3461,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "crc32c",
  "parking_lot",
  "proptest",
  "prost",
@@ -3473,6 +3474,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
