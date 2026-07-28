@@ -12,9 +12,11 @@ use ravel_commit::keys;
 use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::NormalizedPoint;
 use ravel_proto::commit::v1::CommitRecord;
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_segment::{
+    HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3,
+    SeriesValues,
+};
 use ravel_types::{CommitToken, LabelSet, Sample, SeriesId, Signal, TenantId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
@@ -24,15 +26,23 @@ use crate::clock::Clock;
 use crate::config::{IngestConfig, SEGMENT_FORMAT_V1, SEGMENT_FORMAT_V2};
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
+use crate::value::{IngestPoint, IngestValue, ValueKind};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// RSEG v3's on-wire format version (docs/rseg-v3-plan.md section 3.1),
+/// duplicated as a literal the same way `SEGMENT_FORMAT_V1`/`_V2` are
+/// (config.rs). Only used here to stamp the commit record when a flush's
+/// buffer forces a v3 write; never exposed as an `IngestConfig`-selectable
+/// value (that stays v1/v2-only until docs/rseg-v3-plan.md's phase C8).
+const SEGMENT_FORMAT_V3: u16 = 3;
 
 pub(crate) type Ack = oneshot::Sender<Result<CommitToken, WriteError>>;
 
 pub(crate) enum ShardMsg {
     Write {
         tenant: TenantId,
-        points: Vec<NormalizedPoint>,
+        points: Vec<IngestPoint>,
         ack: Option<Ack>,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
@@ -41,9 +51,68 @@ pub(crate) enum ShardMsg {
     Shutdown { done: oneshot::Sender<()> },
 }
 
+/// A series' accumulated sample payload for one shard buffer: exactly one
+/// of scalar or histogram samples, fixed for the series' whole life in
+/// the buffer (mirrors `ravel_segment::SeriesValues`'s v3 invariant, but
+/// kept as its own type so v1/v2-only ravel-ingest callers never need to
+/// know about `ravel_segment::SeriesValues`).
+enum SeriesAccumValues {
+    Scalar(Vec<Sample>),
+    Histogram(Vec<HistogramSample>),
+}
+
+impl SeriesAccumValues {
+    fn kind(&self) -> ValueKind {
+        match self {
+            SeriesAccumValues::Scalar(_) => ValueKind::Scalar,
+            SeriesAccumValues::Histogram(_) => ValueKind::Histogram,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            SeriesAccumValues::Scalar(v) => v.len(),
+            SeriesAccumValues::Histogram(v) => v.len(),
+        }
+    }
+
+    fn new_with(value: IngestValue) -> Self {
+        match value {
+            IngestValue::Scalar(s) => SeriesAccumValues::Scalar(vec![s]),
+            IngestValue::Histogram(h) => SeriesAccumValues::Histogram(vec![h]),
+        }
+    }
+
+    /// Appends `value` if its kind matches `self`; returns `false`
+    /// (leaving `self` unchanged) on a kind mismatch instead of
+    /// panicking, so the caller can turn it into a typed rejection.
+    /// `TenantBuf::merge` checks kinds up front, so in practice this only
+    /// ever returns `false` if that check is ever bypassed.
+    fn try_push(&mut self, value: IngestValue) -> bool {
+        match (self, value) {
+            (SeriesAccumValues::Scalar(v), IngestValue::Scalar(s)) => {
+                v.push(s);
+                true
+            }
+            (SeriesAccumValues::Histogram(v), IngestValue::Histogram(h)) => {
+                v.push(h);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn into_series_values(self) -> SeriesValues {
+        match self {
+            SeriesAccumValues::Scalar(v) => SeriesValues::Scalar(v),
+            SeriesAccumValues::Histogram(v) => SeriesValues::Histogram(v),
+        }
+    }
+}
+
 struct SeriesAccum {
     labels: LabelSet,
-    samples: Vec<Sample>,
+    values: SeriesAccumValues,
 }
 
 #[derive(Default)]
@@ -73,49 +142,55 @@ impl TenantBuf {
     /// added (samples * 16 plus label bytes the first time a series is
     /// seen), per docs/ingest.md's `est_bytes` rule.
     ///
-    /// Fails loud on a series-id collision (ADR-0005): before mutating the
+    /// Fails loud on a series-id collision (ADR-0005) or a value-kind
+    /// mismatch (docs/rseg-v3-plan.md section 3.4: a series is scalar or
+    /// histogram for its whole life, never both): before mutating the
     /// buffer, every incoming point's `series_id` is checked against the
-    /// canonical label set that id already claims, whether from a series
-    /// already buffered for this tenant or from an earlier point in this same
-    /// batch. Two distinct label sets under one id return
-    /// [`WriteError::SeriesIdCollision`] and the buffer is left untouched, so
-    /// the accepted stream for non-colliding series is unaffected. Without
-    /// this check a collision would silently merge the losing series' samples
-    /// under the winning label set (the id-keyed `HashMap` below cannot tell
-    /// them apart), which ADR-0005 forbids.
-    fn merge(
-        &mut self,
-        points: Vec<NormalizedPoint>,
-        arrival_ns: i64,
-    ) -> Result<usize, WriteError> {
-        let mut batch_labels: HashMap<SeriesId, &LabelSet> = HashMap::new();
+    /// canonical label set and value kind that id already claims, whether
+    /// from a series already buffered for this tenant or from an earlier
+    /// point in this same batch. A label mismatch returns
+    /// [`WriteError::SeriesIdCollision`]; a value-kind mismatch returns
+    /// [`WriteError::SeriesValueKindMismatch`]. Either way the buffer is
+    /// left untouched, so the accepted stream for non-colliding series is
+    /// unaffected. Without this check a collision would silently merge the
+    /// losing series' samples under the winning label set (the id-keyed
+    /// `HashMap` below cannot tell them apart), which ADR-0005 forbids.
+    fn merge(&mut self, points: Vec<IngestPoint>, arrival_ns: i64) -> Result<usize, WriteError> {
+        let mut batch_claims: HashMap<SeriesId, (&LabelSet, ValueKind)> = HashMap::new();
         for point in &points {
+            let point_kind = point.value.kind();
             let claimed = self
                 .series
                 .get(&point.series_id)
-                .map(|accum| &accum.labels)
-                .or_else(|| batch_labels.get(&point.series_id).copied());
+                .map(|accum| (&accum.labels, accum.values.kind()))
+                .or_else(|| batch_claims.get(&point.series_id).copied());
             match claimed {
-                Some(labels) if *labels != point.labels => {
+                Some((labels, _)) if *labels != point.labels => {
                     return Err(WriteError::SeriesIdCollision(format!(
                         "series_id {:?} maps to two distinct label sets in one shard buffer",
                         point.series_id
                     )));
                 }
+                Some((_, kind)) if kind != point_kind => {
+                    return Err(WriteError::SeriesValueKindMismatch(format!(
+                        "series_id {:?} received both scalar and histogram points in one shard buffer",
+                        point.series_id
+                    )));
+                }
                 Some(_) => {}
                 None => {
-                    batch_labels.insert(point.series_id, &point.labels);
+                    batch_claims.insert(point.series_id, (&point.labels, point_kind));
                 }
             }
         }
-        drop(batch_labels);
+        drop(batch_claims);
 
         self.note_arrival(arrival_ns);
         let mut bytes_added = 0usize;
         for point in points {
             match self.series.entry(point.series_id) {
                 Entry::Occupied(mut occ) => {
-                    occ.get_mut().samples.push(point.sample);
+                    occ.get_mut().values.try_push(point.value);
                 }
                 Entry::Vacant(vac) => {
                     let label_bytes: usize = point
@@ -126,7 +201,7 @@ impl TenantBuf {
                     bytes_added += label_bytes;
                     vac.insert(SeriesAccum {
                         labels: point.labels,
-                        samples: vec![point.sample],
+                        values: SeriesAccumValues::new_with(point.value),
                     });
                 }
             }
@@ -248,12 +323,7 @@ impl ShardActor {
         }
     }
 
-    async fn handle_write(
-        &mut self,
-        tenant: TenantId,
-        points: Vec<NormalizedPoint>,
-        ack: Option<Ack>,
-    ) {
+    async fn handle_write(&mut self, tenant: TenantId, points: Vec<IngestPoint>, ack: Option<Ack>) {
         if points.is_empty() && ack.is_none() {
             return;
         }
@@ -319,7 +389,7 @@ impl ShardActor {
             .tenants
             .values()
             .flat_map(|buf| buf.series.values())
-            .map(|accum| accum.samples.len() as u64)
+            .map(|accum| accum.values.len() as u64)
             .sum();
         (self.tenants.len(), points)
     }
@@ -361,14 +431,6 @@ impl ShardActor {
         let deadline_ns =
             flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
 
-        let series_inputs: Vec<SeriesInput> = series
-            .into_iter()
-            .map(|(series_id, accum)| SeriesInput {
-                series_id,
-                labels: accum.labels,
-                samples: accum.samples,
-            })
-            .collect();
         let identity = SegmentIdentity {
             tenant_hash: tenant_hash.0,
             shard: self.shard,
@@ -383,19 +445,73 @@ impl ShardActor {
             max_ingest_ts_ns,
         };
 
-        // Resolved exactly once and reused for both the writer branch below
-        // and the commit record's `segment_format_version` stamp further
-        // down: an unrecognized config value normalizes to
-        // `SEGMENT_FORMAT_V1` here, at the single read site, so the writer
-        // call and the stamp can never disagree about which version this
-        // flush actually produced (docs/rseg-v2-plan.md P6).
-        let segment_version = match self.config.segment_format_version {
-            SEGMENT_FORMAT_V2 => SEGMENT_FORMAT_V2,
-            _ => SEGMENT_FORMAT_V1,
-        };
-        let written = match segment_version {
-            SEGMENT_FORMAT_V2 => SegmentWriter::write_v2(series_inputs, identity, ingest_bounds),
-            _ => SegmentWriter::write(series_inputs, identity, ingest_bounds),
+        // A flush buffer containing any histogram-kind series must produce
+        // an RSEG v3 object: there is no way to durably store a histogram
+        // sample in v1/v2 (docs/rseg-v3-plan.md section 3.2). This is
+        // content-driven, not `self.config.segment_format_version`-driven --
+        // that config's legal values stay v1/v2-only until
+        // docs/rseg-v3-plan.md's phase C8 makes v3 a selectable default.
+        let has_histogram = series
+            .values()
+            .any(|accum| accum.values.kind() == ValueKind::Histogram);
+
+        let (written, segment_version) = if has_histogram {
+            let series_inputs: Vec<SeriesInputV3> = series
+                .into_iter()
+                .map(|(series_id, accum)| SeriesInputV3 {
+                    series_id,
+                    labels: accum.labels,
+                    values: accum.values.into_series_values(),
+                })
+                .collect();
+            (
+                SegmentWriter::write_v3(series_inputs, identity, ingest_bounds),
+                SEGMENT_FORMAT_V3,
+            )
+        } else {
+            // Resolved exactly once and reused for both the writer call
+            // below and the commit record's `segment_format_version` stamp
+            // further down: an unrecognized config value normalizes to
+            // `SEGMENT_FORMAT_V1` here, at the single read site, so the
+            // writer call and the stamp can never disagree about which
+            // version this flush actually produced (docs/rseg-v2-plan.md
+            // P6).
+            let segment_version = match self.config.segment_format_version {
+                SEGMENT_FORMAT_V2 => SEGMENT_FORMAT_V2,
+                _ => SEGMENT_FORMAT_V1,
+            };
+            let mut series_inputs: Vec<SeriesInput> = Vec::with_capacity(series.len());
+            for (series_id, accum) in series {
+                match accum.values {
+                    SeriesAccumValues::Scalar(samples) => series_inputs.push(SeriesInput {
+                        series_id,
+                        labels: accum.labels,
+                        samples,
+                    }),
+                    SeriesAccumValues::Histogram(_) => {
+                        // Unreachable: `has_histogram` above is false, so no
+                        // accum here can be histogram-kind. Fail loud
+                        // instead of silently dropping the series if that
+                        // ever stops holding.
+                        self.metrics.record_abandoned_input_rejected();
+                        self.ack_waiters(
+                            waiters,
+                            Err(WriteError::SegmentBuild(
+                                "internal: histogram series routed to scalar-only writer path"
+                                    .into(),
+                            )),
+                        );
+                        return;
+                    }
+                }
+            }
+            let written = match segment_version {
+                SEGMENT_FORMAT_V2 => {
+                    SegmentWriter::write_v2(series_inputs, identity, ingest_bounds)
+                }
+                _ => SegmentWriter::write(series_inputs, identity, ingest_bounds),
+            };
+            (written, segment_version)
         };
         let written = match written {
             Ok(w) => w,
