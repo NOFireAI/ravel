@@ -42,21 +42,28 @@ commit crates match this sequence end to end against MinIO/S3).
 
 ## rseg-layout.svg
 
-The byte layout of an RSEG v1 object: LABEL_DICT and SERIES_TABLE sections,
-the TS_PAGES and VAL_PAGES containers with per-page headers (enc, comp, and
-a crc computed over series_id plus enc plus comp plus payload), the
-protobuf footer, and the 16-byte trailer with its field breakdown. Brackets
-show exactly what footer_crc32c, a section's crc32c, and a page's crc each
-cover.
+The byte layout of an RSEG object. The main drawing is the v1 baseline:
+LABEL_DICT and SERIES_TABLE sections, the TS_PAGES and VAL_PAGES
+containers with per-page headers (enc, comp, and a crc computed over
+series_id plus enc plus comp plus payload), the protobuf footer, and the
+16-byte trailer with its field breakdown. Brackets show exactly what
+footer_crc32c, a section's crc32c, and a page's crc each cover. A format
+evolution panel at the bottom shows the section tape of each version:
+v2 (ADR-0014, columnar SERIES_IDS + SERIES_META catalog, sorted dict,
+VAL_RAW_F64 alignment), v3 (ADR-0017, native histograms, HIST_PAGES),
+and v4 (ADR-0018, multi-run L1 compaction output). Trailer, reader
+protocol, and checksum rules are shared by all four versions.
 
-Illustrates: docs/segment-format.md, docs/adrs/0004-rseg-format.md,
-docs/adrs/0010-spec-amendments-review-1.md (§4, checksum coverage).
+Illustrates: docs/segment-format.md (v1 plus the v2/v3/v4 amendment
+sections), docs/adrs/0004-rseg-format.md,
+docs/adrs/0010-spec-amendments-review-1.md (§4, checksum coverage),
+docs/adrs/0014, 0017, 0018.
 
-Last verified against the code: 2026-07-27 (Phase 1 complete; the RSEG v1
-writer/reader match this layout, proved byte-identical by the golden-bytes
-test. RSEG v2, adding a schema-dictionary catalog and 8-byte VAL_RAW_F64
-alignment, is in progress under ADR-0014 and not reflected in this diagram
-yet).
+Last verified against the code: 2026-07-28 (v1 frozen and proved
+byte-identical by the golden-bytes test; v2/v3 writers emit sorted
+LABEL_DICT since issue #146, v4 since #155; v2 byte gates measured and
+enforced by the deterministic catalog_byte_gates test in ravel-bench,
+issue #166).
 
 ## query-path.svg
 
