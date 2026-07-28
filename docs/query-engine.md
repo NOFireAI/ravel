@@ -106,8 +106,9 @@ A subquery that omits its own step (`expr[5m:]`) defaults to
 `EngineConfig::default_evaluation_interval` (60 s, matching Prometheus'
 global `evaluation_interval` default). Subquery grids are epoch-aligned:
 the grid start is the smallest multiple of the step (measured from Unix
-time zero) that is `>= end - range`, matching Prometheus' own subquery
-alignment, not the query's own step or window start.
+time zero) that is strictly greater than `end - range`, left-open like
+this crate's own matrix-selector window, matching Prometheus' own
+subquery alignment, not the query's own step or window start.
 
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly
