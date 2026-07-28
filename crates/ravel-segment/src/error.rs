@@ -139,4 +139,38 @@ pub enum SegmentError {
     ZeroSampleCount,
     #[error("SERIES_META timestamp bounds arithmetic overflowed i64")]
     TimestampBoundsOverflow,
+
+    // --- RSEG v3 only (ADR-0017, docs/rseg-v3-plan.md section 3.4/3.5):
+    // SERIES_META value_kind/HIST_PAGES columns and HIST_SPANS record
+    // decode. v1/v2 objects never produce these. ---
+    #[error("SERIES_META value_kind byte {0} is neither VAL_SCALAR (0) nor HIST_SPANS (1)")]
+    InvalidValueKind(u8),
+    #[error("scalar-kind series has a nonzero hist_page_gap/hist_page_len")]
+    ScalarSeriesHasHistPage,
+    #[error("histogram-kind series has a nonzero val_page_gap/val_page_len")]
+    HistogramSeriesHasValPage,
+    #[error("histogram-kind series has hist_page_len == 0")]
+    ZeroHistPageLen,
+    #[error(
+        "{kind} value_kind count {value_kind_count} does not match its page section's non-empty entry count {page_count}"
+    )]
+    ValueKindPageCountMismatch {
+        kind: &'static str,
+        value_kind_count: u64,
+        page_count: u64,
+    },
+    #[error("section {0} is present but no series needs it")]
+    UnexpectedSectionPresent(&'static str),
+    #[error("histogram scale {0} is below the -53 custom-boundaries sentinel")]
+    HistogramScaleTooSmall(i32),
+    #[error(
+        "histogram custom_values presence and content must match scale == -53 with strictly ascending boundaries"
+    )]
+    HistogramCustomValuesMismatch,
+    #[error("histogram span length is zero")]
+    HistogramSpanLengthZero,
+    #[error("histogram record reserved flag bits are non-zero")]
+    HistogramReservedFlagsNonZero,
+    #[error("histogram count is inconsistent with zero_count and its bucket counts")]
+    HistogramCountInconsistent,
 }
