@@ -1,0 +1,19 @@
+[package]
+name = "ravel-logseg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+zstd = { workspace = true }
+crc32c = { workspace = true }
+blake3 = { workspace = true }
+prost = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
