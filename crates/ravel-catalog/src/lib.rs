@@ -8,15 +8,17 @@ mod cache;
 mod catalog;
 mod config;
 mod error;
+mod fold;
 mod snapshot;
 mod snapshot_format;
 
 pub use catalog::Catalog;
 pub use config::{
     CatalogConfig, DEFAULT_CACHE_CAPACITY_PER_TENANT, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
-    DEFAULT_MAX_INGEST_LAG_NS,
+    DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_INGEST_LAG_NS,
 };
 pub use error::CatalogError;
+pub use fold::{FoldReport, Transaction};
 pub use snapshot::{SegmentRef, Snapshot};
 pub use snapshot_format::{
     DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, HEAD_FORMAT_VERSION, MAGIC, PartLimits,
