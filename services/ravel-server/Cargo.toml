@@ -26,9 +26,31 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 
+# ravel-sql is declared here as a path dependency rather than through
+# `[workspace.dependencies]` because the workspace root Cargo.toml is outside
+# ticket B3's scope. The version is pinned so cargo-deny does not count it as
+# a wildcard path dependency (finding a11-F07), matching how every other
+# internal crate is pinned.
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.1.0", optional = true }
+
+[features]
+# `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
+# server binary, and the SQL surface is opt-in per deployment
+# (docs/arrow-datafusion-plan.md section 3, ADR-0013 structural isolation).
+sql = ["dep:ravel-sql"]
+
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["json", "query"] }
 async-trait = { workspace = true }
+tower = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-segment = { workspace = true }
+uuid = { workspace = true }
+# Test-only: decodes the Arrow IPC response. This is the workspace arrow pin
+# (59), not the arrow 58 datafusion carries, so the assertion doubles as a
+# check that the IPC bytes the endpoint emits are readable by an independent
+# arrow version rather than only by the one that wrote them.
+arrow = { workspace = true }
 
 [lints]
 workspace = true

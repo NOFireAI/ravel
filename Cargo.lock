@@ -669,6 +669,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d6867f1565b3aad85681f1015055b087fcfd840d6aeee6eee7f2da317603695"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1173,6 +1186,7 @@ dependencies = [
  "datafusion-expr-common",
  "datafusion-functions",
  "datafusion-functions-aggregate",
+ "datafusion-functions-nested",
  "datafusion-functions-table",
  "datafusion-functions-window",
  "datafusion-optimizer",
@@ -1182,12 +1196,14 @@ dependencies = [
  "datafusion-physical-optimizer",
  "datafusion-physical-plan",
  "datafusion-session",
+ "datafusion-sql",
  "futures",
  "indexmap",
  "itertools 0.14.0",
  "log",
  "object_store 0.13.2",
  "parking_lot",
+ "sqlparser",
  "tempfile",
  "tokio",
  "url",
@@ -1260,6 +1276,7 @@ dependencies = [
  "libc",
  "log",
  "object_store 0.13.2",
+ "sqlparser",
  "tokio",
  "uuid",
  "web-time",
@@ -1423,6 +1440,7 @@ dependencies = [
  "indexmap",
  "itertools 0.14.0",
  "serde_json",
+ "sqlparser",
 ]
 
 [[package]]
@@ -1496,6 +1514,31 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr-common",
  "datafusion-physical-expr-common",
+]
+
+[[package]]
+name = "datafusion-functions-nested"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75f0bdfeef16d96417b9632ef855645376b242e9006a126dfd0bedfc54a93f5f"
+dependencies = [
+ "arrow 58.4.0",
+ "arrow-ord 58.4.0",
+ "datafusion-common",
+ "datafusion-doc",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-expr-common",
+ "datafusion-functions",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
+ "datafusion-macros",
+ "datafusion-physical-expr-common",
+ "hashbrown 0.17.1",
+ "itertools 0.14.0",
+ "itoa",
+ "log",
+ "memchr",
 ]
 
 [[package]]
@@ -1703,6 +1746,24 @@ dependencies = [
  "datafusion-expr",
  "datafusion-physical-plan",
  "parking_lot",
+]
+
+[[package]]
+name = "datafusion-sql"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1d71cb454da682b2af7488e1fc1ddd72ee1b28f19297b8ccad73f0a21ee9a69"
+dependencies = [
+ "arrow 58.4.0",
+ "bigdecimal",
+ "chrono",
+ "datafusion-common",
+ "datafusion-expr",
+ "datafusion-functions-nested",
+ "indexmap",
+ "log",
+ "regex",
+ "sqlparser",
 ]
 
 [[package]]
@@ -3857,6 +3918,7 @@ name = "ravel-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow 59.1.0",
  "async-trait",
  "axum",
  "bytes",
@@ -3864,10 +3926,13 @@ dependencies = [
  "opentelemetry-proto",
  "prost",
  "ravel-catalog",
+ "ravel-commit",
  "ravel-ingest",
  "ravel-object-store",
  "ravel-otlp",
  "ravel-query",
+ "ravel-segment",
+ "ravel-sql",
  "ravel-types",
  "reqwest 0.13.4",
  "serde",
@@ -3875,8 +3940,10 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-prost",
+ "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3889,13 +3956,16 @@ dependencies = [
  "futures",
  "proptest",
  "ravel-catalog",
+ "ravel-commit",
  "ravel-object-store",
  "ravel-promql",
  "ravel-query",
  "ravel-segment",
  "ravel-types",
+ "serde_json",
  "thiserror",
  "tokio",
+ "url",
  "uuid",
 ]
 
@@ -4432,6 +4502,27 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
+name = "sqlparser"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
+dependencies = [
+ "log",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6dd45d8fc1c79299bfbb7190e42ccbbdf6a5f52e4a6ad98d92357ea965bd289"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "stable_deref_trait"
