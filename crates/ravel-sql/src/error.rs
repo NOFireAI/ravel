@@ -1,19 +1,108 @@
-//! Errors surfaced by the ravel-sql pipeline.
+//! Errors surfaced by the ravel-sql pipeline, and the redaction boundary
+//! between their full server-side detail and what a client may see.
 //!
 //! Every fetch/decode failure is a hard, typed error carried across the
 //! DataFusion boundary as `DataFusionError::External` so no operator ever
 //! observes partial or silently-wrong data (docs/consistency-model.md
 //! "never silent partial results").
+//!
+//! # Redaction (ticket B3, mirroring finding a7-F02)
+//!
+//! `/api/v1/sql` is a second, independent error-to-HTTP boundary alongside
+//! the PromQL one in crates/ravel-query/src/http/error.rs, and it carries
+//! the same obligation. Two distinct leak sources meet here:
+//!
+//! - Storage-layer faults. Their `Display` embeds the physical object key,
+//!   the tenant hash inside that key, and raw backend error text. The
+//!   tenant-hashed key layout exists precisely to keep the physical layout
+//!   opaque (ADR-0009), so none of it may reach a client body.
+//! - DataFusion planning and execution errors. Their `Display` embeds
+//!   schema fragments, column lists, resolved plan nodes, and (through
+//!   `DataFusionError::External`) whatever a wrapped ravel error carried --
+//!   including, transitively, an object key. Echoing them verbatim would
+//!   reopen the same hole from the other side.
+//!
+//! [`SqlError::client_message`] is the single place that decides what a
+//! caller sees: a fixed, class-specific string per [`ErrorClass`], with the
+//! full `Display` left intact for the server to log. The endpoint logs
+//! `%err` and returns `client_message()`; it never formats the error itself.
+//!
+//! Two classes are deliberately *not* redacted, matching the PromQL path:
+//! validation errors (which quote only the caller's own SQL) and budget
+//! errors (which carry only counts and limits an operator needs).
 
 use datafusion::error::DataFusionError;
+use ravel_catalog::CatalogError;
 use ravel_query::FetchError;
+
+use crate::validate::ValidationError;
+
+/// Stable client message for a data-integrity fault (corrupt segment,
+/// unreconstructable or mismatched commit record). Full detail, including
+/// the object key, is logged server-side only.
+pub const MSG_CORRUPT: &str = "stored data failed integrity validation";
+
+/// Stable client message for a transient storage-layer fault (object-store
+/// error, changed etag between reads, invalidated snapshot).
+pub const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
+
+/// Stable client message for a `min_commit_token` that did not resolve.
+pub const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; retry";
+
+/// Stable client message for a DataFusion planning failure. Deliberately
+/// says nothing about which column, type, or plan node was at fault: those
+/// strings carry schema detail. The full error is logged server-side.
+pub const MSG_PLAN: &str = "the SQL query could not be planned; check that it uses only the v1 subset \
+     over the samples table";
+
+/// Stable client message for a DataFusion execution failure that is not one
+/// of the classes above.
+pub const MSG_EXECUTION: &str = "the SQL query failed during execution";
+
+/// Stable client message for an internal invariant violation. These are
+/// bugs; the caller gets nothing actionable and the server logs everything.
+pub const MSG_INTERNAL: &str = "internal query engine error";
+
+/// The client-visible class of a [`SqlError`]. The HTTP layer maps this to
+/// a status code and an error-type tag; it never inspects the error itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The request is malformed or outside the accepted SQL subset. 400.
+    BadRequest,
+    /// The request is well-formed but cannot be served: budget exceeded,
+    /// memory pool exhausted, planning or execution failure. 422.
+    Unsupported,
+    /// A storage-layer fault. 503.
+    Unavailable,
+    /// The wall deadline expired. 504.
+    Timeout,
+}
 
 /// A ravel-sql execution error.
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
+    /// The request failed the read-only single-statement gate or the v1
+    /// subset check, before any planning (crate::validate).
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
+
+    /// Snapshot resolution failed.
+    #[error("snapshot resolution failed: {0}")]
+    Catalog(#[from] CatalogError),
+
     /// A segment fetch or decode failed mid-scan.
     #[error("segment fetch failed: {0}")]
     Fetch(#[from] FetchError),
+
+    /// A pinned segment vanished and the re-resolve-and-retry contract was
+    /// exhausted (docs/consistency-model.md; plan section 2 retry contract,
+    /// review F9).
+    #[error("the pinned snapshot was invalidated during execution")]
+    SnapshotInvalidated,
+
+    /// The query wall deadline expired. Partial state is discarded.
+    #[error("query exceeded its {millis} ms wall deadline")]
+    DeadlineExceeded { millis: u64 },
 
     /// The post-dedup row count exceeded the configured `max_samples`
     /// budget (docs/query-engine.md "Budgets").
@@ -24,14 +113,256 @@ pub enum SqlError {
     #[error("query fans out over too many segments: {count} exceeds max {max}")]
     TooManySegments { count: usize, max: usize },
 
+    /// The per-query or per-tenant byte budget was exhausted. The detail is
+    /// the pool's own message (byte counts and limits only).
+    #[error("query memory budget exhausted: {0}")]
+    ResourcesExhausted(String),
+
+    /// DataFusion could not plan the query. The payload is the full
+    /// DataFusion message, kept for the server-side log only; it can carry
+    /// schema and column detail and is never returned to a client.
+    #[error("SQL planning failed: {0}")]
+    Plan(String),
+
+    /// DataFusion failed while executing the plan. Same redaction rule as
+    /// [`SqlError::Plan`].
+    #[error("SQL execution failed: {0}")]
+    Execution(String),
+
     /// An invariant inside the pipeline was violated (schema mismatch,
     /// downcast failure). These are bugs, not input errors.
     #[error("internal ravel-sql error: {0}")]
     Internal(String),
 }
 
+impl SqlError {
+    /// The client-visible class, for HTTP status selection.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            SqlError::Validation(_) => ErrorClass::BadRequest,
+            SqlError::Catalog(_) | SqlError::Fetch(_) | SqlError::SnapshotInvalidated => {
+                ErrorClass::Unavailable
+            }
+            SqlError::DeadlineExceeded { .. } => ErrorClass::Timeout,
+            SqlError::TooManySamples { .. }
+            | SqlError::TooManySegments { .. }
+            | SqlError::ResourcesExhausted(_)
+            | SqlError::Plan(_)
+            | SqlError::Execution(_)
+            | SqlError::Internal(_) => ErrorClass::Unsupported,
+        }
+    }
+
+    /// The message a client may see. Storage-layer faults and DataFusion
+    /// plan/execution errors collapse to fixed strings; validation and
+    /// budget errors keep their own text, which is derived only from the
+    /// caller's input or from counts and limits.
+    ///
+    /// The full `Display` of `self` stays available to the caller for
+    /// server-side logging and is never produced here.
+    pub fn client_message(&self) -> String {
+        match self {
+            SqlError::Validation(e) => e.to_string(),
+            SqlError::Catalog(catalog) => redact_catalog(catalog).to_string(),
+            SqlError::Fetch(fetch) => match fetch {
+                FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                FetchError::Store { .. } | FetchError::EtagChanged { .. } => {
+                    MSG_UNAVAILABLE.to_string()
+                }
+            },
+            SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),
+            SqlError::DeadlineExceeded { .. }
+            | SqlError::TooManySamples { .. }
+            | SqlError::TooManySegments { .. }
+            | SqlError::ResourcesExhausted(_) => self.to_string(),
+            SqlError::Plan(_) => MSG_PLAN.to_string(),
+            SqlError::Execution(_) => MSG_EXECUTION.to_string(),
+            SqlError::Internal(_) => MSG_INTERNAL.to_string(),
+        }
+    }
+
+    /// True when this error is a store `NotFound` on a pinned segment: the
+    /// one condition that arms the re-resolve-and-retry contract
+    /// (crate::executor).
+    pub(crate) fn is_segment_not_found(&self) -> bool {
+        matches!(
+            self,
+            SqlError::Fetch(FetchError::Store {
+                source: ravel_object_store::StoreError::NotFound,
+                ..
+            })
+        )
+    }
+}
+
+/// Class-specific redaction for catalog errors, mirroring
+/// `redacted_storage_message` on the PromQL path so both endpoints answer
+/// the same way for the same fault.
+fn redact_catalog(err: &CatalogError) -> &'static str {
+    match err {
+        CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
+        CatalogError::Reconstruction { .. }
+        | CatalogError::FieldMismatch { .. }
+        | CatalogError::Record(_)
+        | CatalogError::Key(_) => MSG_CORRUPT,
+        // Store errors and any future variant redact to the transient
+        // message rather than risk leaking backend text.
+        _ => MSG_UNAVAILABLE,
+    }
+}
+
 impl From<SqlError> for DataFusionError {
     fn from(err: SqlError) -> Self {
         DataFusionError::External(Box::new(err))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_object_store::StoreError;
+
+    use super::*;
+
+    /// A representative internal object key: tenant-hashed prefix, signal,
+    /// level, shard, writer id, and the `.rseg` suffix (ADR-0010 layout).
+    const LEAKY_KEY: &str = "t/deadbeefcafef00d/metrics/l0/0/writer-7.1.2.0123456789abcdef.rseg";
+    const TENANT_HASH: &str = "deadbeefcafef00d";
+    const RAW_STORE_TEXT: &str = "bucket=prod-telemetry endpoint=s3.internal request-id=abc";
+
+    /// Same assertion set the PromQL boundary's tests use (a7-F02).
+    fn assert_redacted(message: &str) {
+        assert!(!message.contains(LEAKY_KEY), "leaked full key: {message}");
+        assert!(
+            !message.contains(TENANT_HASH),
+            "leaked tenant hash: {message}"
+        );
+        assert!(
+            !message.contains(".rseg"),
+            "leaked segment suffix: {message}"
+        );
+        assert!(!message.contains("t/"), "leaked key prefix: {message}");
+        assert!(
+            !message.contains(RAW_STORE_TEXT),
+            "leaked raw store text: {message}"
+        );
+    }
+
+    #[test]
+    fn fetch_store_error_is_redacted_but_detail_survives_for_the_log() {
+        let err = SqlError::Fetch(FetchError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::Transient(RAW_STORE_TEXT.to_string()),
+        });
+        let detail = err.to_string();
+        assert!(detail.contains(LEAKY_KEY), "log detail lost the key");
+        assert!(
+            detail.contains(RAW_STORE_TEXT),
+            "log detail lost store text"
+        );
+
+        assert_eq!(err.client_message(), MSG_UNAVAILABLE);
+        assert_redacted(&err.client_message());
+        assert_eq!(err.class(), ErrorClass::Unavailable);
+    }
+
+    #[test]
+    fn catalog_field_mismatch_redacts_the_key_as_corrupt() {
+        let err = SqlError::Catalog(CatalogError::FieldMismatch {
+            key: LEAKY_KEY.to_string(),
+            field: "tenant_hash",
+            expected: "aaaa".to_string(),
+            actual: TENANT_HASH.to_string(),
+        });
+        assert!(err.to_string().contains(LEAKY_KEY));
+        assert_eq!(err.client_message(), MSG_CORRUPT);
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn catalog_store_error_redacts_to_unavailable() {
+        let err = SqlError::Catalog(CatalogError::Store(StoreError::Permanent(
+            RAW_STORE_TEXT.to_string(),
+        )));
+        assert!(err.to_string().contains(RAW_STORE_TEXT));
+        assert_eq!(err.client_message(), MSG_UNAVAILABLE);
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn unsatisfiable_token_is_a_distinct_stable_class() {
+        let err = SqlError::Catalog(CatalogError::UnsatisfiableToken {
+            shard: 0,
+            writer_id: "writer-7".to_string(),
+            epoch: 1,
+            seq: 2,
+            ingest_hour_bucket: 3,
+        });
+        assert_eq!(err.client_message(), MSG_UNSATISFIABLE);
+        assert_ne!(MSG_UNSATISFIABLE, MSG_UNAVAILABLE);
+        assert_ne!(MSG_UNSATISFIABLE, MSG_CORRUPT);
+    }
+
+    /// The SQL-specific half of the boundary: a DataFusion error whose text
+    /// embeds a wrapped object key must not reach the client either.
+    #[test]
+    fn datafusion_plan_and_execution_errors_are_not_echoed() {
+        let leaky = format!(
+            "Schema error: No field named samples.nope. Valid fields: ts, value. \
+             Underlying: object store get failed for {LEAKY_KEY}: {RAW_STORE_TEXT}"
+        );
+        let plan = SqlError::Plan(leaky.clone());
+        assert!(plan.to_string().contains(LEAKY_KEY), "log detail lost");
+        assert_eq!(plan.client_message(), MSG_PLAN);
+        assert_redacted(&plan.client_message());
+
+        let exec = SqlError::Execution(leaky);
+        assert_eq!(exec.client_message(), MSG_EXECUTION);
+        assert_redacted(&exec.client_message());
+        // plan and execution stay distinguishable to the caller.
+        assert_ne!(MSG_PLAN, MSG_EXECUTION);
+    }
+
+    #[test]
+    fn internal_errors_are_not_echoed() {
+        let err = SqlError::Internal(format!("downcast failed while reading {LEAKY_KEY}"));
+        assert_eq!(err.client_message(), MSG_INTERNAL);
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn safe_errors_keep_their_own_text() {
+        // Budget errors carry only counts and limits.
+        let budget = SqlError::TooManySamples { count: 11, max: 10 };
+        assert_eq!(budget.client_message(), budget.to_string());
+        assert_eq!(budget.class(), ErrorClass::Unsupported);
+
+        // Validation errors quote only the caller's own input.
+        let bad = SqlError::Validation(ValidationError::NotReadOnly { kind: "INSERT" });
+        assert_eq!(bad.client_message(), bad.to_string());
+        assert_eq!(bad.class(), ErrorClass::BadRequest);
+    }
+
+    #[test]
+    fn snapshot_invalidated_is_a_redacted_unavailable() {
+        let err = SqlError::SnapshotInvalidated;
+        assert_eq!(err.client_message(), MSG_UNAVAILABLE);
+        assert_eq!(err.class(), ErrorClass::Unavailable);
+    }
+
+    #[test]
+    fn segment_not_found_is_the_only_retry_trigger() {
+        let not_found = SqlError::Fetch(FetchError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::NotFound,
+        });
+        assert!(not_found.is_segment_not_found());
+
+        let transient = SqlError::Fetch(FetchError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::Transient("flaky".to_string()),
+        });
+        assert!(!transient.is_segment_not_found());
+        assert!(!SqlError::SnapshotInvalidated.is_segment_not_found());
     }
 }

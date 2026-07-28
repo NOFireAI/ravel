@@ -30,6 +30,49 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # The SQL surface (ticket B3, issue #22). Two things the `check` job cannot
+  # cover:
+  #
+  # 1. `POST /api/v1/sql` is behind ravel-server's `sql` cargo feature, so
+  #    `cargo clippy --workspace --all-targets` and `cargo test --workspace`
+  #    never compile the handler, its error-to-HTTP redaction boundary, or
+  #    services/ravel-server/tests/sql_endpoint.rs at all.
+  # 2. The layer-2 differential gate
+  #    (crates/ravel-sql/tests/differential.rs) is only as strong as the
+  #    number of proptest cases it runs. `check` runs it at the in-file
+  #    default; this job runs it with an elevated case count so the NaN,
+  #    signed-zero, denormal, duplicate-timestamp and multi-segment-overlap
+  #    space is explored properly.
+  #
+  # docs/arrow-datafusion-plan.md section 2 requires the gate to be a
+  # required test in ravel-sql CI and to re-run on every DataFusion version
+  # bump; the golden cases in that file pin DataFusion's min/max NaN and
+  # signed-zero semantics, so a bump that changes them fails here.
+  sql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf "${ANDROID_HOME:-/usr/local/lib/android}" || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          docker image prune -af || true
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (sql feature)
+        run: cargo clippy -p ravel-server --features sql --all-targets -- -D warnings
+      - name: SQL endpoint tests
+        run: cargo test -p ravel-server --features sql
+      - name: Differential correctness gate
+        env:
+          # Well above the in-file default so CI explores far more of the
+          # float edge-case and multi-segment-overlap space than a local run.
+          PROPTEST_CASES: 512
+        run: cargo test -p ravel-sql --test differential
+
   # Supply-chain gate (finding a11-F01). deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
   # CI job enforced, so a new advisory, banned license, or unknown source
