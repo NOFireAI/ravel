@@ -152,6 +152,44 @@ pub enum Rejection {
 
     #[error("series identity component exceeds encoding limits")]
     OversizedSeriesComponent,
+
+    #[error(
+        "histogram has {bounds} explicit bounds but {buckets} bucket counts (expected {expected})"
+    )]
+    HistogramBucketCountMismatch {
+        bounds: usize,
+        buckets: usize,
+        expected: usize,
+    },
+
+    #[error("histogram explicit_bounds contains a NaN or infinite value")]
+    NonFiniteHistogramBound,
+
+    #[error("histogram explicit_bounds is not strictly increasing")]
+    HistogramBoundsNotIncreasing,
+
+    #[error("histogram bucket_counts overflow u64 during cumulative accumulation")]
+    HistogramCountOverflow,
+
+    #[error("summary quantile value is NaN or infinite")]
+    NonFiniteQuantile,
+
+    #[error("summary has two quantile_values entries with the same quantile")]
+    DuplicateQuantile,
+
+    /// Informational, not an admission failure: the data point was admitted
+    /// and its exploded series stored, but its `min`/`max` fields have no
+    /// Prometheus-convention representation (ADR-0016) and were dropped.
+    /// `rejected_count()` returns 0 for this variant so it never inflates
+    /// the sender-facing rejected-points count.
+    #[error("histogram min/max field(s) dropped: no Prometheus-convention representation")]
+    HistogramMinMaxDropped { count: usize },
+
+    /// Informational, not an admission failure: same as
+    /// [`Rejection::HistogramMinMaxDropped`] but for exemplars, pending
+    /// ADR-0017's exemplar decision.
+    #[error("histogram exemplar(s) dropped: no Prometheus-convention representation")]
+    HistogramExemplarsDropped { count: usize },
 }
 
 impl Rejection {
@@ -166,6 +204,8 @@ impl Rejection {
             | Rejection::EmptyMetricName { count }
             | Rejection::UnsupportedMetricType { count, .. }
             | Rejection::UnsupportedTemporality { count } => *count,
+            Rejection::HistogramMinMaxDropped { .. }
+            | Rejection::HistogramExemplarsDropped { .. } => 0,
             _ => 1,
         }
     }

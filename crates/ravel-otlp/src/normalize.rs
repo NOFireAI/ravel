@@ -2,11 +2,17 @@
 //! Ravel's canonical metric point representation (ADR-0005;
 //! docs/architecture.md).
 //!
-//! Phase 1 scope: `Gauge` and cumulative `Sum` metrics with `NumberDataPoint`
-//! values (`as_int` and `as_double`; integers convert to `f64`). Histogram,
-//! ExponentialHistogram, and Summary metrics are never silently dropped:
-//! they produce [`Rejection::UnsupportedMetricType`] carrying the number of
-//! data points skipped.
+//! Scope: `Gauge` and cumulative `Sum` metrics with `NumberDataPoint` values
+//! (`as_int` and `as_double`; integers convert to `f64`); cumulative
+//! `Histogram` (explicit bucket bounds) and `Summary` metrics, exploded into
+//! Prometheus-convention scalar series per ADR-0016 (`{name}_bucket{le=...}`,
+//! `{name}_sum`, `{name}_count`, `{name}{quantile=...}`). `Histogram` and
+//! `Sum` reject non-cumulative temporality typed
+//! ([`Rejection::UnsupportedTemporality`]); delta-to-cumulative conversion
+//! needs cross-request state, which stateless compute forbids.
+//! `ExponentialHistogram` is never silently dropped: it produces
+//! [`Rejection::UnsupportedMetricType`] carrying the number of data points
+//! skipped, pending ADR-0017.
 //!
 //! Label mapping follows the standard OTel-to-Prometheus convention:
 //! `resource.attributes["service.name"]` (namespaced by
@@ -37,12 +43,30 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
-    AggregationTemporality, Metric, NumberDataPoint, ResourceMetrics, metric::Data as MetricData,
+    AggregationTemporality, DataPointFlags, HistogramDataPoint, Metric, NumberDataPoint,
+    ResourceMetrics, SummaryDataPoint, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId, TypeError};
 
 use crate::limits::{IngestLimits, Rejection};
+use crate::promcompat::format_float;
+
+/// Prometheus stale marker: a NaN with this exact bit pattern (upstream
+/// convention). Duplicated from `ravel-promql` rather than imported: an
+/// ingest crate must not depend on the query-engine crate for one constant.
+const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+fn stale_nan() -> f64 {
+    f64::from_bits(STALE_NAN_BITS)
+}
+
+/// `DataPointFlags::NoRecordedValueMask` maps to a Prometheus stale marker
+/// on the point's sample(s), matching the collector's mapping, so staleness
+/// semantics survive the OTLP-to-Prometheus boundary (ADR-0016).
+fn has_no_recorded_value(flags: u32) -> bool {
+    flags & DataPointFlags::NoRecordedValueMask as u32 != 0
+}
 
 /// One admitted OTLP data point, normalized to Ravel's canonical shape.
 #[derive(Debug, Clone, PartialEq)]
@@ -241,22 +265,67 @@ fn normalize_metric(
                 }
             }
         }
-        Some(MetricData::Histogram(h)) => rejected.push(Rejection::UnsupportedMetricType {
-            metric_type: "histogram",
-            count: h.data_points.len(),
-        }),
+        Some(MetricData::Histogram(h)) => {
+            let temporality = AggregationTemporality::try_from(h.aggregation_temporality)
+                .unwrap_or(AggregationTemporality::Unspecified);
+            if temporality != AggregationTemporality::Cumulative {
+                rejected.push(Rejection::UnsupportedTemporality {
+                    count: h.data_points.len(),
+                });
+                return;
+            }
+            let ctx = ExplodeContext {
+                tenant,
+                metric_name: &name,
+                resource_labels,
+                limits,
+                ingest_ts_ns,
+            };
+            let mut memo = SeriesIdMemo::new();
+            for dp in &h.data_points {
+                match explode_histogram(&ctx, dp, &mut memo) {
+                    Ok((mut new_points, informational)) => {
+                        points.append(&mut new_points);
+                        rejected.extend(informational);
+                    }
+                    Err(r) => rejected.push(r),
+                }
+            }
+        }
         Some(MetricData::ExponentialHistogram(h)) => {
             rejected.push(Rejection::UnsupportedMetricType {
                 metric_type: "exponential_histogram",
                 count: h.data_points.len(),
             });
         }
-        Some(MetricData::Summary(s)) => rejected.push(Rejection::UnsupportedMetricType {
-            metric_type: "summary",
-            count: s.data_points.len(),
-        }),
+        Some(MetricData::Summary(s)) => {
+            let ctx = ExplodeContext {
+                tenant,
+                metric_name: &name,
+                resource_labels,
+                limits,
+                ingest_ts_ns,
+            };
+            let mut memo = SeriesIdMemo::new();
+            for dp in &s.data_points {
+                match explode_summary(&ctx, dp, &mut memo) {
+                    Ok(mut new_points) => points.append(&mut new_points),
+                    Err(r) => rejected.push(r),
+                }
+            }
+        }
         None => {}
     }
+}
+
+/// Per-metric context shared by every data point of an exploded `Histogram`
+/// or `Summary`, mirroring [`PointContext`] for the multi-series case.
+struct ExplodeContext<'a> {
+    tenant: &'a TenantId,
+    metric_name: &'a str,
+    resource_labels: &'a [Label],
+    limits: &'a IngestLimits,
+    ingest_ts_ns: i64,
 }
 
 /// Per-metric context shared by every data point in a `Gauge` or `Sum`,
@@ -324,37 +393,21 @@ fn build_point(
         });
     }
 
-    // time_unix_nano is u64; real event times fit comfortably in i64, and a
-    // value that doesn't is far outside any sane admission window, so it
-    // saturates rather than wrapping negative.
-    let event_ts_ns = i64::try_from(dp.time_unix_nano).unwrap_or(i64::MAX);
-    if event_ts_ns == 0 {
-        return Err(Rejection::ZeroTimestamp);
-    }
+    let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
-    // Convention (ADR-0010 §8, docs/consistency-model.md): the bound itself
-    // passes, only strictly exceeding it rejects. event_ts == ingest_ts +
-    // max_future_skew is accepted; event_ts == ingest_ts + max_future_skew + 1
-    // is not.
-    let skew_ns = event_ts_ns.saturating_sub(ctx.ingest_ts_ns);
-    if skew_ns > ctx.limits.max_future_skew_ns {
-        return Err(Rejection::FutureSkew {
-            skew_ns,
-            max_ns: ctx.limits.max_future_skew_ns,
-        });
-    }
-    let lag_ns = ctx.ingest_ts_ns.saturating_sub(event_ts_ns);
-    if lag_ns > ctx.limits.max_ingest_lag_ns {
-        return Err(Rejection::TooOld {
-            lag_ns,
-            max_ns: ctx.limits.max_ingest_lag_ns,
-        });
-    }
-
-    let value = match dp.value {
-        Some(NumberValue::AsDouble(v)) => v,
-        Some(NumberValue::AsInt(v)) => v as f64,
-        None => return Err(Rejection::MissingValue),
+    // A NoRecordedValue point still carries a (usually meaningless) value in
+    // the wire message; matching the collector's mapping, the sample value
+    // is unconditionally replaced by the stale marker and the underlying
+    // oneof is never consulted, so a point with no value set can still
+    // signal staleness.
+    let value = if has_no_recorded_value(dp.flags) {
+        stale_nan()
+    } else {
+        match dp.value {
+            Some(NumberValue::AsDouble(v)) => v,
+            Some(NumberValue::AsInt(v)) => v as f64,
+            None => return Err(Rejection::MissingValue),
+        }
     };
 
     let mut labels = Vec::with_capacity(ctx.resource_labels.len() + dp.attributes.len() + 1);
@@ -363,12 +416,7 @@ fn build_point(
         name: METRIC_NAME_LABEL.to_string(),
         value: ctx.metric_name.to_string(),
     });
-
-    for attr in &dp.attributes {
-        let name = sanitize_label_name(&attr.key);
-        let value = any_value_to_label_value(attr.value.as_ref())?;
-        push_checked(&mut labels, name, value, ctx.limits)?;
-    }
+    push_attribute_labels(&mut labels, &dp.attributes, ctx.limits)?;
 
     let label_set = LabelSet::new(labels).map_err(|err| match err {
         TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
@@ -391,6 +439,290 @@ fn build_point(
         },
         is_monotonic_sum: ctx.is_sum && ctx.is_monotonic,
     })
+}
+
+/// Validate and resolve a data point's event timestamp: zero rejects
+/// outright, then the result is bounded to `[ingest_ts_ns - max_ingest_lag_ns,
+/// ingest_ts_ns + max_future_skew_ns]` (ADR-0010 §8, docs/consistency-model.md
+/// "Late and skewed data"). The bound itself passes; only strictly exceeding
+/// it rejects: `event_ts == ingest_ts + max_future_skew` is accepted,
+/// `event_ts == ingest_ts + max_future_skew + 1` is not.
+fn checked_event_ts(
+    time_unix_nano: u64,
+    ingest_ts_ns: i64,
+    limits: &IngestLimits,
+) -> Result<i64, Rejection> {
+    // time_unix_nano is u64; real event times fit comfortably in i64, and a
+    // value that doesn't is far outside any sane admission window, so it
+    // saturates rather than wrapping negative.
+    let event_ts_ns = i64::try_from(time_unix_nano).unwrap_or(i64::MAX);
+    if event_ts_ns == 0 {
+        return Err(Rejection::ZeroTimestamp);
+    }
+
+    let skew_ns = event_ts_ns.saturating_sub(ingest_ts_ns);
+    if skew_ns > limits.max_future_skew_ns {
+        return Err(Rejection::FutureSkew {
+            skew_ns,
+            max_ns: limits.max_future_skew_ns,
+        });
+    }
+    let lag_ns = ingest_ts_ns.saturating_sub(event_ts_ns);
+    if lag_ns > limits.max_ingest_lag_ns {
+        return Err(Rejection::TooOld {
+            lag_ns,
+            max_ns: limits.max_ingest_lag_ns,
+        });
+    }
+    Ok(event_ts_ns)
+}
+
+/// Sanitize and push each attribute as a label, checking the same
+/// name/value length limits applied to every other label.
+fn push_attribute_labels(
+    labels: &mut Vec<Label>,
+    attributes: &[KeyValue],
+    limits: &IngestLimits,
+) -> Result<(), Rejection> {
+    for attr in attributes {
+        let name = sanitize_label_name(&attr.key);
+        let value = any_value_to_label_value(attr.value.as_ref())?;
+        push_checked(labels, name, value, limits)?;
+    }
+    Ok(())
+}
+
+/// Build the resource-plus-attribute label prefix shared by every series
+/// exploded from one `Histogram`/`Summary` data point (everything but the
+/// `__name__` label and the synthesized `le`/`quantile` label, which differ
+/// per series).
+fn build_explode_base_labels(
+    ctx: &ExplodeContext,
+    attributes: &[KeyValue],
+) -> Result<Vec<Label>, Rejection> {
+    if attributes.len() > ctx.limits.max_attributes_per_point {
+        return Err(Rejection::TooManyAttributes {
+            attribute_count: attributes.len(),
+            max: ctx.limits.max_attributes_per_point,
+        });
+    }
+    let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len());
+    labels.extend_from_slice(ctx.resource_labels);
+    push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+    Ok(labels)
+}
+
+/// Finish one exploded series: attach `__name__` and an optional `le`/
+/// `quantile` label to the shared base labels, then build the label set and
+/// resolve its series id exactly like [`build_point`] does for gauge/sum.
+fn finish_point(
+    ctx: &ExplodeContext,
+    memo: &mut SeriesIdMemo,
+    base_labels: &[Label],
+    metric_name: &str,
+    extra_label: Option<(&'static str, String)>,
+    ts_ns: i64,
+    value: f64,
+) -> Result<NormalizedPoint, Rejection> {
+    let mut labels = Vec::with_capacity(base_labels.len() + 2);
+    labels.extend_from_slice(base_labels);
+    labels.push(Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: metric_name.to_string(),
+    });
+    if let Some((name, value)) = extra_label {
+        push_checked(&mut labels, name.to_string(), value, ctx.limits)?;
+    }
+
+    let label_set = LabelSet::new(labels).map_err(|err| match err {
+        TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
+        _ => Rejection::DuplicateLabelName(String::new()),
+    })?;
+
+    let series_id = memo
+        .series_id(ctx.tenant, metric_name, &label_set)
+        .map_err(|_| Rejection::OversizedSeriesComponent)?;
+
+    Ok(NormalizedPoint {
+        series_id,
+        labels: label_set,
+        sample: Sample { ts_ns, value },
+        // Whether an exploded bucket/sum/count series behaves like a
+        // monotonic counter downstream is not decided by this ticket
+        // (docs/ingest-breadth-plan.md §7: "no change to is_monotonic_sum
+        // handling"); the field is carried but never consumed today.
+        is_monotonic_sum: false,
+    })
+}
+
+/// Explode one `HistogramDataPoint` into its Prometheus-convention series:
+/// one `{name}_bucket{le=<bound>}` per explicit bound plus
+/// `{name}_bucket{le="+Inf"}` (= the point's count), `{name}_sum` when `sum`
+/// is present, and `{name}_count`. Rejection is atomic: an `Err` means none
+/// of this point's series were admitted, never a partial set (ADR-0016).
+/// Ok also carries zero-weight informational rejections for dropped
+/// min/max/exemplar fields, since the point itself was admitted.
+fn explode_histogram(
+    ctx: &ExplodeContext,
+    dp: &HistogramDataPoint,
+    memo: &mut SeriesIdMemo,
+) -> Result<(Vec<NormalizedPoint>, Vec<Rejection>), Rejection> {
+    let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
+
+    let expected_buckets = dp.explicit_bounds.len() + 1;
+    if dp.bucket_counts.len() != expected_buckets {
+        return Err(Rejection::HistogramBucketCountMismatch {
+            bounds: dp.explicit_bounds.len(),
+            buckets: dp.bucket_counts.len(),
+            expected: expected_buckets,
+        });
+    }
+    if dp.explicit_bounds.iter().any(|b| !b.is_finite()) {
+        return Err(Rejection::NonFiniteHistogramBound);
+    }
+    if !dp.explicit_bounds.windows(2).all(|w| w[0] < w[1]) {
+        return Err(Rejection::HistogramBoundsNotIncreasing);
+    }
+
+    let base_labels = build_explode_base_labels(ctx, &dp.attributes)?;
+    let stale = has_no_recorded_value(dp.flags);
+    let bucket_name = format!("{}_bucket", ctx.metric_name);
+
+    let mut series = Vec::with_capacity(expected_buckets + 2);
+    let mut cumulative: u64 = 0;
+    for (bound, count) in dp.explicit_bounds.iter().zip(&dp.bucket_counts) {
+        cumulative = cumulative
+            .checked_add(*count)
+            .ok_or(Rejection::HistogramCountOverflow)?;
+        let value = if stale {
+            stale_nan()
+        } else {
+            cumulative as f64
+        };
+        series.push(finish_point(
+            ctx,
+            memo,
+            &base_labels,
+            &bucket_name,
+            Some(("le", format_float(*bound))),
+            event_ts_ns,
+            value,
+        )?);
+    }
+
+    // The +Inf bucket and _count both use the point's raw count directly,
+    // not the accumulated bucket sum (matches the collector's mapping).
+    let count_value = if stale { stale_nan() } else { dp.count as f64 };
+    series.push(finish_point(
+        ctx,
+        memo,
+        &base_labels,
+        &bucket_name,
+        Some(("le", "+Inf".to_string())),
+        event_ts_ns,
+        count_value,
+    )?);
+
+    if let Some(sum) = dp.sum {
+        let sum_value = if stale { stale_nan() } else { sum };
+        let sum_name = format!("{}_sum", ctx.metric_name);
+        series.push(finish_point(
+            ctx,
+            memo,
+            &base_labels,
+            &sum_name,
+            None,
+            event_ts_ns,
+            sum_value,
+        )?);
+    }
+
+    let count_name = format!("{}_count", ctx.metric_name);
+    series.push(finish_point(
+        ctx,
+        memo,
+        &base_labels,
+        &count_name,
+        None,
+        event_ts_ns,
+        count_value,
+    )?);
+
+    let mut informational = Vec::new();
+    if dp.min.is_some() || dp.max.is_some() {
+        informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
+    }
+    if !dp.exemplars.is_empty() {
+        informational.push(Rejection::HistogramExemplarsDropped {
+            count: dp.exemplars.len(),
+        });
+    }
+
+    Ok((series, informational))
+}
+
+/// Explode one `SummaryDataPoint` into its Prometheus-convention series:
+/// one `{name}{quantile=<q>}` per quantile plus `{name}_sum` and
+/// `{name}_count`. Rejection is atomic, same as [`explode_histogram`].
+fn explode_summary(
+    ctx: &ExplodeContext,
+    dp: &SummaryDataPoint,
+    memo: &mut SeriesIdMemo,
+) -> Result<Vec<NormalizedPoint>, Rejection> {
+    let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
+
+    let mut seen_quantiles = std::collections::HashSet::with_capacity(dp.quantile_values.len());
+    for qv in &dp.quantile_values {
+        if !qv.quantile.is_finite() {
+            return Err(Rejection::NonFiniteQuantile);
+        }
+        if !seen_quantiles.insert(qv.quantile.to_bits()) {
+            return Err(Rejection::DuplicateQuantile);
+        }
+    }
+
+    let base_labels = build_explode_base_labels(ctx, &dp.attributes)?;
+    let stale = has_no_recorded_value(dp.flags);
+
+    let mut series = Vec::with_capacity(dp.quantile_values.len() + 2);
+    for qv in &dp.quantile_values {
+        let value = if stale { stale_nan() } else { qv.value };
+        series.push(finish_point(
+            ctx,
+            memo,
+            &base_labels,
+            ctx.metric_name,
+            Some(("quantile", format_float(qv.quantile))),
+            event_ts_ns,
+            value,
+        )?);
+    }
+
+    let sum_value = if stale { stale_nan() } else { dp.sum };
+    let sum_name = format!("{}_sum", ctx.metric_name);
+    series.push(finish_point(
+        ctx,
+        memo,
+        &base_labels,
+        &sum_name,
+        None,
+        event_ts_ns,
+        sum_value,
+    )?);
+
+    let count_value = if stale { stale_nan() } else { dp.count as f64 };
+    let count_name = format!("{}_count", ctx.metric_name);
+    series.push(finish_point(
+        ctx,
+        memo,
+        &base_labels,
+        &count_name,
+        None,
+        event_ts_ns,
+        count_value,
+    )?);
+
+    Ok(series)
 }
 
 fn build_resource_labels(
@@ -522,7 +854,9 @@ fn is_label_name_continue(c: char) -> bool {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use opentelemetry_proto::tonic::metrics::v1::{Gauge, ScopeMetrics, Sum};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Exemplar, Gauge, Histogram, ScopeMetrics, Sum, Summary, summary_data_point,
+    };
     use std::collections::HashSet;
 
     fn tenant() -> TenantId {
@@ -600,6 +934,72 @@ mod tests {
                 data_points: points,
                 aggregation_temporality: temporality as i32,
                 is_monotonic,
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn histogram_point(
+        attrs: Vec<KeyValue>,
+        ts_ns: i64,
+        count: u64,
+        sum: Option<f64>,
+        bounds: Vec<f64>,
+        bucket_counts: Vec<u64>,
+    ) -> HistogramDataPoint {
+        HistogramDataPoint {
+            attributes: attrs,
+            time_unix_nano: ts_ns as u64,
+            count,
+            sum,
+            bucket_counts,
+            explicit_bounds: bounds,
+            ..Default::default()
+        }
+    }
+
+    fn histogram_metric(
+        name: &str,
+        points: Vec<HistogramDataPoint>,
+        temporality: AggregationTemporality,
+    ) -> Metric {
+        Metric {
+            name: name.to_string(),
+            data: Some(MetricData::Histogram(Histogram {
+                data_points: points,
+                aggregation_temporality: temporality as i32,
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn value_at_quantile(quantile: f64, value: f64) -> summary_data_point::ValueAtQuantile {
+        summary_data_point::ValueAtQuantile { quantile, value }
+    }
+
+    fn summary_point(
+        attrs: Vec<KeyValue>,
+        ts_ns: i64,
+        count: u64,
+        sum: f64,
+        quantiles: Vec<summary_data_point::ValueAtQuantile>,
+    ) -> SummaryDataPoint {
+        SummaryDataPoint {
+            attributes: attrs,
+            time_unix_nano: ts_ns as u64,
+            count,
+            sum,
+            quantile_values: quantiles,
+            ..Default::default()
+        }
+    }
+
+    fn summary_metric(name: &str, points: Vec<SummaryDataPoint>) -> Metric {
+        Metric {
+            name: name.to_string(),
+            data: Some(MetricData::Summary(Summary {
+                data_points: points,
             })),
             ..Default::default()
         }
@@ -1255,73 +1655,6 @@ mod tests {
     // --- unsupported metric types: never silently dropped ---
 
     #[test]
-    fn histogram_metric_rejected_with_counts() {
-        use opentelemetry_proto::tonic::metrics::v1::{Histogram, HistogramDataPoint};
-        let metric = Metric {
-            name: "latency".to_string(),
-            data: Some(MetricData::Histogram(Histogram {
-                data_points: vec![
-                    HistogramDataPoint {
-                        time_unix_nano: 1_000,
-                        ..Default::default()
-                    },
-                    HistogramDataPoint {
-                        time_unix_nano: 1_000,
-                        ..Default::default()
-                    },
-                ],
-                aggregation_temporality: AggregationTemporality::Cumulative as i32,
-            })),
-            ..Default::default()
-        };
-        let rm = resource_metrics(vec![], vec![metric]);
-        let out = normalize_metrics(
-            &tenant(),
-            request(vec![rm]),
-            &IngestLimits::default(),
-            1_000,
-        );
-        assert!(out.points.is_empty());
-        assert_eq!(
-            out.rejected,
-            vec![Rejection::UnsupportedMetricType {
-                metric_type: "histogram",
-                count: 2,
-            }]
-        );
-    }
-
-    #[test]
-    fn summary_metric_rejected_with_counts() {
-        use opentelemetry_proto::tonic::metrics::v1::{Summary, SummaryDataPoint};
-        let metric = Metric {
-            name: "latency_summary".to_string(),
-            data: Some(MetricData::Summary(Summary {
-                data_points: vec![SummaryDataPoint {
-                    time_unix_nano: 1_000,
-                    ..Default::default()
-                }],
-            })),
-            ..Default::default()
-        };
-        let rm = resource_metrics(vec![], vec![metric]);
-        let out = normalize_metrics(
-            &tenant(),
-            request(vec![rm]),
-            &IngestLimits::default(),
-            1_000,
-        );
-        assert!(out.points.is_empty());
-        assert_eq!(
-            out.rejected,
-            vec![Rejection::UnsupportedMetricType {
-                metric_type: "summary",
-                count: 1,
-            }]
-        );
-    }
-
-    #[test]
     fn exponential_histogram_metric_rejected_with_counts() {
         use opentelemetry_proto::tonic::metrics::v1::{
             ExponentialHistogram, ExponentialHistogramDataPoint,
@@ -1755,5 +2088,614 @@ mod tests {
         println!("  before (recompute each): {before_thr:>12.0} ids/s ({before:?})");
         println!("  after  (last-seen memo): {after_thr:>12.0} ids/s ({after:?})");
         println!("  speedup: {:.2}x", after_thr / before_thr);
+    }
+
+    // --- histogram/summary explosion (ADR-0016) ---
+
+    #[test]
+    fn ch1_histogram_explosion_matches_cross_protocol_identity_vector() {
+        // docs/ingest-breadth-plan.md §4.1 (CH-1): the same logical histogram
+        // ingested OTLP-exploded and RW-classic must land on identical
+        // SeriesIds and values. The RW-classic side has its own test in its
+        // own crate (track A); this asserts the OTLP side reaches the exact
+        // canonical label sets that side would also construct.
+        let tenant_fixture = TenantId::new("t-fixture");
+        let rm = resource_metrics(
+            vec![
+                string_kv("service.name", "svc"),
+                string_kv("service.instance.id", "i-1"),
+            ],
+            vec![histogram_metric(
+                "http_request_duration_seconds",
+                vec![histogram_point(
+                    vec![],
+                    1_700_000_000_000_000_000,
+                    10,
+                    Some(42.5),
+                    vec![0.1, 1.0, 10.0],
+                    vec![1, 2, 3, 4],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant_fixture,
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_700_000_000_000_000_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 6);
+
+        type ExpectedSeries<'a> = (&'a str, &'a [(&'a str, &'a str)], f64);
+        let expected: &[ExpectedSeries] = &[
+            (
+                "http_request_duration_seconds_bucket",
+                &[("le", "0.1")],
+                1.0,
+            ),
+            ("http_request_duration_seconds_bucket", &[("le", "1")], 3.0),
+            ("http_request_duration_seconds_bucket", &[("le", "10")], 6.0),
+            (
+                "http_request_duration_seconds_bucket",
+                &[("le", "+Inf")],
+                10.0,
+            ),
+            ("http_request_duration_seconds_sum", &[], 42.5),
+            ("http_request_duration_seconds_count", &[], 10.0),
+        ];
+
+        for &(name, extra, value) in expected {
+            let p = out
+                .points
+                .iter()
+                .find(|p| {
+                    p.labels.get(METRIC_NAME_LABEL) == Some(name)
+                        && extra.iter().all(|&(k, v)| p.labels.get(k) == Some(v))
+                })
+                .unwrap_or_else(|| panic!("missing series {name} {extra:?}"));
+            assert_eq!(p.sample.value, value, "{name} {extra:?}");
+            assert_eq!(p.labels.get("job"), Some("svc"));
+            assert_eq!(p.labels.get("instance"), Some("i-1"));
+
+            let mut labels = vec![
+                Label {
+                    name: "job".to_string(),
+                    value: "svc".to_string(),
+                },
+                Label {
+                    name: "instance".to_string(),
+                    value: "i-1".to_string(),
+                },
+                Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: name.to_string(),
+                },
+            ];
+            for &(k, v) in extra {
+                labels.push(Label {
+                    name: k.to_string(),
+                    value: v.to_string(),
+                });
+            }
+            let label_set = LabelSet::new(labels).expect("label set");
+            let expected_id =
+                SeriesId::compute(&tenant_fixture, name, &label_set).expect("compute id");
+            assert_eq!(p.series_id, expected_id, "{name} {extra:?}");
+        }
+    }
+
+    #[test]
+    fn histogram_without_sum_omits_sum_series() {
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![histogram_point(
+                    vec![],
+                    1_000,
+                    3,
+                    None,
+                    vec![1.0],
+                    vec![1, 2],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        // le=1, le=+Inf, _count -- no _sum.
+        assert_eq!(out.points.len(), 3);
+        assert!(
+            out.points
+                .iter()
+                .all(|p| p.labels.get(METRIC_NAME_LABEL) != Some("latency_sum"))
+        );
+    }
+
+    #[test]
+    fn delta_histogram_rejected() {
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![histogram_point(
+                    vec![],
+                    1_000,
+                    3,
+                    Some(1.0),
+                    vec![1.0],
+                    vec![1, 2],
+                )],
+                AggregationTemporality::Delta,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::UnsupportedTemporality { count: 1 }]
+        );
+    }
+
+    #[test]
+    fn histogram_bucket_count_mismatch_rejects_point() {
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![histogram_point(
+                    vec![],
+                    1_000,
+                    3,
+                    Some(1.0),
+                    vec![1.0, 2.0],
+                    vec![1, 2],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::HistogramBucketCountMismatch {
+                bounds: 2,
+                buckets: 2,
+                expected: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn histogram_non_finite_bound_rejects_point() {
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![histogram_point(
+                    vec![],
+                    1_000,
+                    3,
+                    Some(1.0),
+                    vec![f64::NAN],
+                    vec![1, 2],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![Rejection::NonFiniteHistogramBound]);
+    }
+
+    #[test]
+    fn histogram_bounds_not_increasing_rejects_point() {
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![histogram_point(
+                    vec![],
+                    1_000,
+                    3,
+                    Some(1.0),
+                    vec![2.0, 1.0],
+                    vec![1, 2, 3],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![Rejection::HistogramBoundsNotIncreasing]);
+    }
+
+    #[test]
+    fn histogram_count_overflow_rejects_point() {
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![histogram_point(
+                    vec![],
+                    1_000,
+                    3,
+                    Some(1.0),
+                    vec![1.0, 2.0],
+                    vec![u64::MAX, u64::MAX, 0],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![Rejection::HistogramCountOverflow]);
+    }
+
+    #[test]
+    fn histogram_min_max_dropped_is_informational_not_a_rejection() {
+        let mut dp = histogram_point(vec![], 1_000, 3, None, vec![1.0], vec![1, 2]);
+        dp.min = Some(0.5);
+        dp.max = Some(5.0);
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![dp],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert_eq!(out.points.len(), 3);
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::HistogramMinMaxDropped { count: 1 }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 0);
+    }
+
+    #[test]
+    fn histogram_exemplars_dropped_is_informational_not_a_rejection() {
+        let mut dp = histogram_point(vec![], 1_000, 3, None, vec![1.0], vec![1, 2]);
+        dp.exemplars = vec![
+            Exemplar {
+                time_unix_nano: 999,
+                ..Default::default()
+            },
+            Exemplar {
+                time_unix_nano: 998,
+                ..Default::default()
+            },
+        ];
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![dp],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert_eq!(out.points.len(), 3);
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::HistogramExemplarsDropped { count: 2 }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 0);
+    }
+
+    #[test]
+    fn histogram_no_recorded_value_flag_maps_every_series_to_stale_marker() {
+        let mut dp = histogram_point(vec![], 1_000, 3, Some(1.0), vec![1.0], vec![1, 2]);
+        dp.flags = DataPointFlags::NoRecordedValueMask as u32;
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![dp],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 4);
+        for p in &out.points {
+            assert_eq!(p.sample.value.to_bits(), STALE_NAN_BITS);
+        }
+    }
+
+    #[test]
+    fn histogram_attribute_named_le_collides_atomically() {
+        // The synthesized "le" bucket label collides with a same-named
+        // attribute; the whole data point must reject with zero partial
+        // series admitted, not some buckets landing and others not.
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![histogram_point(
+                    vec![string_kv("le", "bogus")],
+                    1_000,
+                    3,
+                    Some(1.0),
+                    vec![1.0],
+                    vec![1, 2],
+                )],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::DuplicateLabelName("le".to_string())]
+        );
+    }
+
+    #[test]
+    fn ch1_summary_explosion_basic_shape_and_identity() {
+        let rm = resource_metrics(
+            vec![string_kv("service.name", "svc")],
+            vec![summary_metric(
+                "http_request_duration_seconds",
+                vec![summary_point(
+                    vec![],
+                    1_000,
+                    10,
+                    42.5,
+                    vec![value_at_quantile(0.5, 0.2), value_at_quantile(0.99, 0.9)],
+                )],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 4);
+
+        let p50 = out
+            .points
+            .iter()
+            .find(|p| {
+                p.labels.get(METRIC_NAME_LABEL) == Some("http_request_duration_seconds")
+                    && p.labels.get("quantile") == Some("0.5")
+            })
+            .expect("p50 series");
+        assert_eq!(p50.sample.value, 0.2);
+
+        let p99 = out
+            .points
+            .iter()
+            .find(|p| {
+                p.labels.get(METRIC_NAME_LABEL) == Some("http_request_duration_seconds")
+                    && p.labels.get("quantile") == Some("0.99")
+            })
+            .expect("p99 series");
+        assert_eq!(p99.sample.value, 0.9);
+
+        let sum = out
+            .points
+            .iter()
+            .find(|p| p.labels.get(METRIC_NAME_LABEL) == Some("http_request_duration_seconds_sum"))
+            .expect("sum series");
+        assert_eq!(sum.sample.value, 42.5);
+
+        let count = out
+            .points
+            .iter()
+            .find(|p| {
+                p.labels.get(METRIC_NAME_LABEL) == Some("http_request_duration_seconds_count")
+            })
+            .expect("count series");
+        assert_eq!(count.sample.value, 10.0);
+    }
+
+    #[test]
+    fn summary_non_finite_quantile_rejects_point() {
+        let rm = resource_metrics(
+            vec![],
+            vec![summary_metric(
+                "latency",
+                vec![summary_point(
+                    vec![],
+                    1_000,
+                    1,
+                    1.0,
+                    vec![value_at_quantile(f64::INFINITY, 1.0)],
+                )],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![Rejection::NonFiniteQuantile]);
+    }
+
+    #[test]
+    fn summary_duplicate_quantile_rejects_point() {
+        let rm = resource_metrics(
+            vec![],
+            vec![summary_metric(
+                "latency",
+                vec![summary_point(
+                    vec![],
+                    1_000,
+                    1,
+                    1.0,
+                    vec![value_at_quantile(0.5, 1.0), value_at_quantile(0.5, 2.0)],
+                )],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![Rejection::DuplicateQuantile]);
+    }
+
+    #[test]
+    fn summary_no_recorded_value_flag_maps_every_series_to_stale_marker() {
+        let mut dp = summary_point(vec![], 1_000, 1, 1.0, vec![value_at_quantile(0.5, 0.3)]);
+        dp.flags = DataPointFlags::NoRecordedValueMask as u32;
+        let rm = resource_metrics(vec![], vec![summary_metric("latency", vec![dp])]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 3);
+        for p in &out.points {
+            assert_eq!(p.sample.value.to_bits(), STALE_NAN_BITS);
+        }
+    }
+
+    #[test]
+    fn summary_attribute_named_quantile_collides_atomically() {
+        let rm = resource_metrics(
+            vec![],
+            vec![summary_metric(
+                "latency",
+                vec![summary_point(
+                    vec![string_kv("quantile", "bogus")],
+                    1_000,
+                    1,
+                    1.0,
+                    vec![value_at_quantile(0.5, 0.3)],
+                )],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::DuplicateLabelName("quantile".to_string())]
+        );
+    }
+
+    #[test]
+    fn gauge_no_recorded_value_flag_maps_to_stale_marker() {
+        // Gauge/Sum flags handling was previously entirely ignored; part of
+        // this ticket per docs/ingest-breadth-plan.md §8 ("B1 fixes
+        // gauge/sum staleness mapping in the same change").
+        let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(5.0));
+        dp.flags = DataPointFlags::NoRecordedValueMask as u32;
+        let rm = resource_metrics(vec![], vec![gauge_metric("widgets", vec![dp])]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points[0].sample.value.to_bits(), STALE_NAN_BITS);
+    }
+
+    #[test]
+    fn sum_no_recorded_value_flag_maps_to_stale_marker() {
+        let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(5.0));
+        dp.flags = DataPointFlags::NoRecordedValueMask as u32;
+        let rm = resource_metrics(
+            vec![],
+            vec![sum_metric(
+                "requests_total",
+                vec![dp],
+                AggregationTemporality::Cumulative,
+                true,
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points[0].sample.value.to_bits(), STALE_NAN_BITS);
+    }
+
+    #[test]
+    fn gauge_flags_zero_is_byte_identical_to_pre_flags_behavior() {
+        // Regression pin: flags = 0 (the default before this ticket added
+        // flags handling) must produce the exact same value as before, not
+        // a stale marker.
+        let dp = number_point(vec![], 1_000, NumberValue::AsDouble(5.0));
+        assert_eq!(dp.flags, 0);
+        let rm = resource_metrics(vec![], vec![gauge_metric("widgets", vec![dp])]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points[0].sample.value, 5.0);
     }
 }
