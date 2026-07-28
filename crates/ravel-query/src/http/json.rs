@@ -21,6 +21,46 @@ pub enum ApiResponse<T> {
     },
 }
 
+/// Segment counters for the query that produced a response
+/// (docs/metric-index-plan.md P5b), rendered under the Prometheus response
+/// envelope's `data` object alongside `resultType`/`result`. Prometheus'
+/// own API has no standardized shape for this (ravel-query previously
+/// carried no query-level stats at all; see this ticket's final report),
+/// so the field names here are ravel's own.
+#[derive(Debug, Serialize)]
+pub struct QueryStatsJson {
+    #[serde(rename = "segmentsFetched")]
+    pub segments_fetched: u64,
+    #[serde(rename = "segmentsPruned")]
+    pub segments_pruned: u64,
+}
+
+impl From<crate::QueryStats> for QueryStatsJson {
+    fn from(stats: crate::QueryStats) -> Self {
+        QueryStatsJson {
+            segments_fetched: stats.segments_fetched,
+            segments_pruned: stats.segments_pruned,
+        }
+    }
+}
+
+/// `/api/v1/query` and `/api/v1/query_range` response `data` object: the
+/// Prometheus-shaped result, flattened alongside this query's segment
+/// stats.
+#[derive(Debug, Serialize)]
+pub struct QueryResponseData {
+    #[serde(flatten)]
+    pub result: QueryData,
+    pub stats: QueryStatsJson,
+}
+
+pub fn with_stats(result: QueryData, stats: crate::QueryStats) -> QueryResponseData {
+    QueryResponseData {
+        result,
+        stats: stats.into(),
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "resultType", content = "result")]
 pub enum QueryData {
