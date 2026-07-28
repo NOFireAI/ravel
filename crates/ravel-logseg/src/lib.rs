@@ -13,6 +13,7 @@
 //! panicking.
 
 pub mod bloom;
+pub mod encoding;
 pub mod error;
 pub mod tokenizer;
 pub mod varint;
