@@ -252,15 +252,16 @@ pub(crate) fn eval_range_call(
         }
         FunctionKind::RangeVectorScalar(f) => {
             let arg = matrix_arg(&call.args.args[0])?;
-            // The scalar argument is evaluated once, at the query's own
-            // (un-shifted) instant, same as Prometheus evaluates a
-            // non-selector argument expression once per step using that
-            // step's own `enh.ts`; since P4's only such argument is a
-            // constant/scalar-only expression tree (no selectors, so no
-            // per-step variance), it is resolved up front rather than once
-            // per grid point.
-            let t = scalar_arg(evaluator, source, &call.args.args[1], start_ns, ctx)?;
-            eval_matrix_arg_range_reduction(
+            let scalar_expr = &call.args.args[1];
+            // Prometheus evaluates a non-selector argument expression once
+            // per step using that step's own `enh.ts`; the scalar argument
+            // can itself vary per step (`scalar()`/`time()`), so it is
+            // resolved fresh inside the reduce closure, at each step's own
+            // `reported_ts_ns`, rather than once up front. `reduce` must
+            // return `Option<f64>`, so a scalar-evaluation error is stashed
+            // in `err` and re-raised after the reduction completes.
+            let err = std::cell::RefCell::new(None);
+            let matrix = eval_matrix_arg_range_reduction(
                 evaluator,
                 source,
                 arg,
@@ -269,8 +270,14 @@ pub(crate) fn eval_range_call(
                 step_ns,
                 points,
                 ctx,
-                move |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
-                    f(
+                |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| match scalar_arg(
+                    evaluator,
+                    source,
+                    scalar_expr,
+                    reported_ts_ns,
+                    ctx,
+                ) {
+                    Ok(t) => f(
                         samples,
                         RangeWindow {
                             start_ns: window_start_ns,
@@ -279,9 +286,17 @@ pub(crate) fn eval_range_call(
                             eval_ts_ns: reported_ts_ns,
                         },
                         t,
-                    )
+                    ),
+                    Err(e) => {
+                        *err.borrow_mut() = Some(e);
+                        None
+                    }
                 },
-            )
+            )?;
+            if let Some(e) = err.into_inner() {
+                return Err(e);
+            }
+            Ok(matrix)
         }
         // `eval_range`'s current architecture (`resolve_range_core`) only
         // supports a top-level call that reduces one series' matrix window
@@ -298,13 +313,16 @@ pub(crate) fn eval_range_call(
             })
         }
         FunctionKind::ScalarRangeVector(f) => {
+            let scalar_expr = &call.args.args[0];
             let arg = matrix_arg(&call.args.args[1])?;
-            // Same up-front, once-per-call resolution as
-            // `RangeVectorScalar` above, and for the same reason: P5's only
-            // such argument is a constant/scalar-only expression tree, so
-            // it cannot vary per grid step.
-            let q = scalar_arg(evaluator, source, &call.args.args[0], start_ns, ctx)?;
-            eval_matrix_arg_range_reduction(
+            // Same per-step resolution as `RangeVectorScalar` above, and
+            // for the same reason: the scalar argument can vary per step
+            // (`scalar()`/`time()`), so it is resolved fresh inside the
+            // reduce closure at each step's own `reported_ts_ns`. `reduce`
+            // must return `Option<f64>`, so a scalar-evaluation error is
+            // stashed in `err` and re-raised after the reduction completes.
+            let err = std::cell::RefCell::new(None);
+            let matrix = eval_matrix_arg_range_reduction(
                 evaluator,
                 source,
                 arg,
@@ -313,8 +331,14 @@ pub(crate) fn eval_range_call(
                 step_ns,
                 points,
                 ctx,
-                move |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
-                    f(
+                |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| match scalar_arg(
+                    evaluator,
+                    source,
+                    scalar_expr,
+                    reported_ts_ns,
+                    ctx,
+                ) {
+                    Ok(q) => f(
                         q,
                         samples,
                         RangeWindow {
@@ -323,9 +347,17 @@ pub(crate) fn eval_range_call(
                             range_ns,
                             eval_ts_ns: reported_ts_ns,
                         },
-                    )
+                    ),
+                    Err(e) => {
+                        *err.borrow_mut() = Some(e);
+                        None
+                    }
                 },
-            )
+            )?;
+            if let Some(e) = err.into_inner() {
+                return Err(e);
+            }
+            Ok(matrix)
         }
         FunctionKind::AbsentOverTime => {
             let arg = matrix_arg(&call.args.args[0])?;
@@ -632,4 +664,103 @@ fn apply_reduce(
         }
     }
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use crate::eval::Evaluator;
+    use crate::testsource::TestSource;
+
+    fn ms_ns(ms: i64) -> i64 {
+        ms * 1_000_000
+    }
+
+    #[test]
+    fn range_query_quantile_over_time_scalar_argument_is_re_evaluated_at_each_step() {
+        // `quantile_over_time`'s scalar `q` argument is `scalar(qm)`, which
+        // varies by evaluation instant: `qm` has no sample within `q`'s
+        // default 5m lookback at the grid's first step (600s), so
+        // `scalar(qm)` is NaN there, but its one sample falls inside the
+        // lookback by the second step (660s). Hoisting the scalar argument
+        // once at the grid's start_ns (the pre-fix bug) would keep it NaN
+        // at every step, including the second.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "g")],
+                &[
+                    (ms_ns(0), 10.0),
+                    (ms_ns(300_000), 20.0),
+                    (ms_ns(590_000), 30.0),
+                ],
+            )
+            .expect("valid series")
+            .with_series(&[("__name__", "qm")], &[(ms_ns(650_000), 1.0)])
+            .expect("valid series");
+
+        let result = Evaluator::new()
+            .range(
+                &source,
+                "quantile_over_time(scalar(qm), g[20m])",
+                600_000,
+                660_000,
+                60_000,
+            )
+            .expect("evaluates");
+
+        assert_eq!(result.len(), 1);
+        let samples = &result[0].1;
+        assert_eq!(samples.len(), 2);
+        assert!(
+            samples[0].value.is_nan(),
+            "first step: qm is absent from its own lookback, so scalar(qm) is NaN"
+        );
+        assert_eq!(
+            samples[1].value, 30.0,
+            "second step: qm=1.0 is now in lookback, quantile(1.0, [10,20,30]) is the max"
+        );
+    }
+
+    #[test]
+    fn range_query_predict_linear_scalar_argument_is_re_evaluated_at_each_step() {
+        // Same bug, the `RangeVectorScalar` shape: `predict_linear`'s
+        // duration argument `scalar(tm)` is NaN at the grid's first step
+        // (tm has no sample in lookback yet) and a real number by the
+        // second step. A duration hoisted once at start_ns would stay NaN
+        // at every step instead of reflecting each step's own lookback.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "h")],
+                &[
+                    (ms_ns(0), 10.0),
+                    (ms_ns(300_000), 20.0),
+                    (ms_ns(590_000), 30.0),
+                ],
+            )
+            .expect("valid series")
+            .with_series(&[("__name__", "tm")], &[(ms_ns(650_000), 5.0)])
+            .expect("valid series");
+
+        let result = Evaluator::new()
+            .range(
+                &source,
+                "predict_linear(h[20m], scalar(tm))",
+                600_000,
+                660_000,
+                60_000,
+            )
+            .expect("evaluates");
+
+        assert_eq!(result.len(), 1);
+        let samples = &result[0].1;
+        assert_eq!(samples.len(), 2);
+        assert!(
+            samples[0].value.is_nan(),
+            "first step: tm is absent from its own lookback, so scalar(tm) is NaN"
+        );
+        assert!(
+            samples[1].value.is_finite(),
+            "second step: tm=5.0 is now in lookback, predict_linear must use this step's own duration"
+        );
+    }
 }
