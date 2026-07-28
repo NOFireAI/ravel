@@ -10,6 +10,7 @@ ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-object-store = { workspace = true }
+ravel-segment = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }

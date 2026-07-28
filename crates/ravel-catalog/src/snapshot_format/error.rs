@@ -83,4 +83,50 @@ pub enum SnapshotFormatError {
     },
     #[error("head part[{index}] has an empty key")]
     EmptyPartKey { index: usize },
+    #[error("head postings ref blake3 must be 32 bytes, got {0}")]
+    BadPostingsRefBlake3Len(usize),
+    #[error("head postings ref has an empty key")]
+    EmptyPostingsKey,
+    #[error("head postings ref part_blake3[{index}] must be 32 bytes, got {actual}")]
+    BadPostingsRefPartBlake3Len { index: usize, actual: usize },
+    #[error("head postings ref names {postings_parts} parts but head has {head_parts} parts")]
+    PostingsRefPartCountMismatch {
+        postings_parts: usize,
+        head_parts: usize,
+    },
+    #[error("head postings ref part_blake3[{index}] does not match parts[{index}].blake3")]
+    PostingsRefPartBlake3Mismatch { index: usize },
+
+    #[error("postings object is smaller than the minimum envelope prefix: {size} bytes")]
+    PostingsTooSmall { size: usize },
+    #[error("unsupported postings format version {0}")]
+    PostingsUnsupportedVersion(u8),
+    #[error("postings header protobuf failed to decode: {0}")]
+    PostingsHeaderDecode(String),
+    #[error("encoded postings header exceeds u32::MAX bytes")]
+    PostingsHeaderTooLarge,
+    #[error("postings has too many names to encode ({0})")]
+    PostingsTooManyNames(usize),
+    #[error("postings name bytes are not valid utf-8")]
+    PostingsNameNotUtf8,
+    #[error("postings names are not strictly sorted ascending")]
+    PostingsNamesUnsorted,
+    #[error("duplicate name in postings dictionary")]
+    PostingsDuplicateName,
+    #[error("postings name_count {actual} does not match header's declared {expected}")]
+    PostingsNameCountMismatch { expected: u32, actual: usize },
+    #[error("postings entry ordinal {ordinal} for name {name:?} exceeds entry_count {entry_count}")]
+    PostingsOrdinalOutOfBounds {
+        name: String,
+        ordinal: u64,
+        entry_count: u64,
+    },
+    #[error("postings entry ordinals for name {name:?} are not strictly increasing")]
+    PostingsOrdinalsNotStrictlyIncreasing { name: String },
+    #[error("postings header part_blake3[{index}] must be 32 bytes, got {actual}")]
+    PostingsPartBlake3Len { index: usize, actual: usize },
+    #[error("postings header part_blake3 does not match the expected covered parts")]
+    PostingsPartBindingMismatch,
+    #[error("malformed varint in postings body")]
+    PostingsBadVarint,
 }

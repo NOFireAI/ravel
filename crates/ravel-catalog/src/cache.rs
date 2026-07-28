@@ -241,6 +241,7 @@ mod tests {
             shard_count: 1,
             watermark_hour,
             parts: vec![],
+            postings: None,
             folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
         }
