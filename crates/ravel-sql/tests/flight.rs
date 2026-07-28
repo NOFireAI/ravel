@@ -14,21 +14,19 @@
 //! expired ticket still reading, a metadata method answering an
 //! unauthenticated caller.
 //!
-//! The broader cross-cutting differential/tenancy/e2e suite is a separate
-//! later ticket; these are this ticket's own tests.
+//! The broader cross-cutting differential/tenancy/e2e suite is issue #153
+//! (tests/flight_differential.rs and tests/flight_tenancy.rs); these are this
+//! ticket's own tests. The shared in-process harness lives in
+//! [`util::flight_harness`], which those suites reuse.
 
 #![cfg(feature = "flight-sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod util;
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::error::FlightError;
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest, CommandGetCatalogs,
@@ -37,240 +35,19 @@ use arrow_flight::sql::{
 };
 use arrow_flight::{FlightDescriptor, Ticket};
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::compute::concat_batches;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_sql::{
-    FlightAuth, FlightClock, FlightSqlConfig, FlightTicket, RavelFlightSqlService, SqlConfig,
-    SqlExecutor,
-};
-use ravel_types::{CommitToken, TenantHash, TenantId};
+use ravel_sql::{FlightClock, FlightSqlConfig, FlightTicket, RavelFlightSqlService};
+use tonic::Request;
 use tonic::metadata::MetadataMap;
-use tonic::{Request, Status};
-use util::{Fixture, NOW_NS, SegSpec, SeriesSpec, full_window, request, tenant_id};
+use util::flight_harness::{
+    Harness, TOKEN_KEY, TestAuth, collect, insert, merged, specs, statement_ticket,
+};
+use util::{NOW_NS, SegSpec, SeriesSpec, request, tenant_id};
 
 const QUERY: &str = "SELECT ts, value FROM samples ORDER BY series_id, ts";
-const TOKEN_KEY: &str = "authorization";
-
-// ---------------------------------------------------------------------------
-// Test doubles for the two traits the deployment owns
-// ---------------------------------------------------------------------------
-
-/// A tenant resolver over a fixed token-to-tenant map, deny by default.
-struct TestAuth {
-    tenants: HashMap<String, TenantHash>,
-}
-
-impl TestAuth {
-    fn new(pairs: &[(&str, &TenantId)]) -> Arc<Self> {
-        Arc::new(TestAuth {
-            tenants: pairs
-                .iter()
-                .map(|(token, tenant)| ((*token).to_string(), tenant.hash()))
-                .collect(),
-        })
-    }
-}
-
-impl FlightAuth for TestAuth {
-    fn tenant(&self, metadata: &MetadataMap) -> Result<TenantHash, Status> {
-        let raw = metadata
-            .get(TOKEN_KEY)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| Status::unauthenticated("invalid or missing tenant credentials"))?;
-        self.tenants
-            .get(raw)
-            .copied()
-            .ok_or_else(|| Status::unauthenticated("invalid or missing tenant credentials"))
-    }
-
-    fn min_commit_tokens(&self, _metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
-        Ok(Vec::new())
-    }
-}
-
-/// A clock the test moves by hand, so ticket expiry is deterministic rather
-/// than a sleep.
-struct TestClock(AtomicI64);
-
-impl TestClock {
-    fn at(now_ns: i64) -> Arc<Self> {
-        Arc::new(TestClock(AtomicI64::new(now_ns)))
-    }
-
-    fn advance(&self, by_ns: i64) {
-        self.0.fetch_add(by_ns, Ordering::AcqRel);
-    }
-}
-
-impl FlightClock for TestClock {
-    fn now_ns(&self) -> i64 {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
-
-fn specs() -> Vec<SegSpec> {
-    vec![
-        SegSpec::new(
-            10,
-            1,
-            1,
-            vec![
-                SeriesSpec::new("cpu", vec![(100, 1.0), (200, 2.0)]),
-                SeriesSpec::new("mem", vec![(150, 7.5)]),
-            ],
-        ),
-        SegSpec::new(20, 1, 2, vec![SeriesSpec::new("cpu", vec![(300, 3.0)])]),
-    ]
-}
-
-struct Harness {
-    service: RavelFlightSqlService,
-    executor: Arc<SqlExecutor>,
-    clock: Arc<TestClock>,
-    store: Arc<dyn ObjectStoreBackend>,
-}
-
-impl Harness {
-    async fn build(
-        store: Arc<dyn ObjectStoreBackend>,
-        tenants: &[(&TenantId, &[SegSpec])],
-    ) -> Self {
-        let fixture =
-            Fixture::build(Arc::clone(&store), tenants, SqlConfig::default(), 1 << 30).await;
-        let executor = Arc::new(SqlExecutor::new(
-            Arc::clone(&fixture.catalog),
-            fixture.fetcher.clone(),
-            SqlConfig::default(),
-            1 << 30,
-        ));
-        let auth = TestAuth::new(
-            &tenants
-                .iter()
-                .map(|(tenant, _)| (tenant.as_str(), *tenant))
-                .collect::<Vec<_>>(),
-        );
-        let clock = TestClock::at(NOW_NS);
-        // The window the fixture's data lives in is not "the last hour before
-        // NOW_NS", so the request names it explicitly through the metadata
-        // keys, exactly as an HTTP caller names `start`/`end`.
-        let service = RavelFlightSqlService::new(
-            Arc::clone(&executor),
-            auth,
-            Arc::clone(&clock) as Arc<dyn FlightClock>,
-            FlightSqlConfig {
-                max_deadline: Duration::from_secs(30),
-                ..FlightSqlConfig::default()
-            },
-        );
-        Harness {
-            service,
-            executor,
-            clock,
-            store,
-        }
-    }
-
-    async fn memory(tenants: &[(&TenantId, &[SegSpec])]) -> Self {
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        Harness::build(store, tenants).await
-    }
-
-    /// `GetFlightInfo` for `sql` as `token`, over the fixture's full window.
-    async fn get_flight_info(&self, token: &str, sql: &str) -> Result<Ticket, Status> {
-        let mut request = Request::new(FlightDescriptor::new_cmd(sql.as_bytes().to_vec()));
-        insert(request.metadata_mut(), TOKEN_KEY, token);
-        window_metadata(request.metadata_mut());
-
-        let info = self
-            .service
-            .get_flight_info_statement(
-                CommandStatementQuery {
-                    query: sql.to_string(),
-                    transaction_id: None,
-                },
-                request,
-            )
-            .await?
-            .into_inner();
-        let endpoint = info.endpoint.first().expect("one endpoint");
-        Ok(endpoint.ticket.clone().expect("endpoint carries a ticket"))
-    }
-
-    /// `DoGet` for a ticket as `token`, returning the decoded batches.
-    async fn do_get(&self, token: &str, ticket: &Ticket) -> Result<Vec<RecordBatch>, Status> {
-        let statement = statement_ticket(ticket);
-        let mut request = Request::new(ticket.clone());
-        insert(request.metadata_mut(), TOKEN_KEY, token);
-
-        let stream = self
-            .service
-            .do_get_statement(statement, request)
-            .await?
-            .into_inner();
-        collect(stream).await
-    }
-}
-
-/// Re-read the `TicketStatementQuery` out of the opaque ticket bytes, which is
-/// what arrow-flight's `do_get` dispatcher does before calling
-/// `do_get_statement`.
-fn statement_ticket(ticket: &Ticket) -> TicketStatementQuery {
-    use prost::Message;
-    let any = arrow_flight::sql::Any::decode(&*ticket.ticket).expect("ticket is an Any");
-    any.unpack::<TicketStatementQuery>()
-        .expect("ticket decodes")
-        .expect("ticket is a TicketStatementQuery")
-}
-
-fn insert(metadata: &mut MetadataMap, key: &'static str, value: &str) {
-    metadata.insert(key, value.parse().expect("ascii metadata value"));
-}
-
-/// The fixture window, expressed the way a Flight client expresses it.
-fn window_metadata(metadata: &mut MetadataMap) {
-    let window = full_window();
-    insert(
-        metadata,
-        ravel_sql::flight::START_KEY,
-        &format!("{}", window.start_ns as f64 / 1e9),
-    );
-    insert(
-        metadata,
-        ravel_sql::flight::END_KEY,
-        &format!("{}", window.end_ns as f64 / 1e9),
-    );
-}
-
-async fn collect(
-    stream: std::pin::Pin<
-        Box<dyn futures::Stream<Item = Result<arrow_flight::FlightData, Status>> + Send + 'static>,
-    >,
-) -> Result<Vec<RecordBatch>, Status> {
-    let decoded = FlightRecordBatchStream::new_from_flight_data(
-        stream.map_err(|status| FlightError::Tonic(Box::new(status))),
-    );
-    decoded
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|err| match err {
-            FlightError::Tonic(status) => *status,
-            other => Status::internal(other.to_string()),
-        })
-}
-
-/// One batch holding every row, so a comparison never depends on how either
-/// side happened to chunk its output.
-fn merged(batches: &[RecordBatch]) -> RecordBatch {
-    let schema = batches.first().expect("at least one batch").schema();
-    concat_batches(&schema, batches).expect("concat")
-}
 
 // ---------------------------------------------------------------------------
 // Parity with the HTTP path
