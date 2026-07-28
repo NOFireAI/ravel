@@ -1,0 +1,231 @@
+//! End-to-end compaction against the `MemoryStore` oracle, including listing
+//! pagination via `with_page_size(2)` (docs/compaction-retention-plan.md P4
+//! test list).
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+mod common;
+
+use common::*;
+use ravel_maintain::{
+    CompactionOutcome, CompactorConfig, FixedClock, PublishOutcome, compact_bucket,
+};
+use ravel_object_store::memory::MemoryStore;
+use uuid::Uuid;
+
+fn cfg() -> CompactorConfig {
+    CompactorConfig::default()
+}
+
+fn three_inputs() -> Vec<InputSpec> {
+    let w1 = Uuid::from_u128(1);
+    let w2 = Uuid::from_u128(2);
+    let w3 = Uuid::from_u128(3);
+    vec![
+        InputSpec::new(
+            w1,
+            10,
+            1,
+            vec![
+                raw_series(
+                    "http_requests",
+                    &[("job", "a")],
+                    &[(1_000, 1.0), (2_000, 2.0)],
+                ),
+                raw_series("http_requests", &[("job", "b")], &[(1_000, 10.0)]),
+            ],
+        ),
+        InputSpec::new(
+            w2,
+            10,
+            2,
+            vec![
+                // Same series as w1's job=a, later flush: a second run.
+                raw_series("http_requests", &[("job", "a")], &[(3_000, 3.0)]),
+                raw_series("cpu_seconds", &[("core", "0")], &[(1_500, -0.0)]),
+            ],
+        ),
+        InputSpec::new(
+            w3,
+            10,
+            3,
+            vec![raw_series(
+                "cpu_seconds",
+                &[("core", "0")],
+                &[(2_500, f64::NAN)],
+            )],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn compacts_bucket_and_preserves_all_samples() {
+    let store = MemoryStore::new();
+    let specs = three_inputs();
+    for s in &specs {
+        seed_input(&store, s).await;
+    }
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = bucket();
+
+    let outcome = compact_bucket(&store, &clock, &cfg(), &bucket)
+        .await
+        .expect("compact");
+    match outcome {
+        CompactionOutcome::Compacted { parts, publish } => {
+            assert!(parts >= 1);
+            assert_eq!(publish, PublishOutcome::Published);
+        }
+        other => panic!("expected Compacted, got {other:?}"),
+    }
+
+    let record = fetch_compaction_record(&store, &bucket).await;
+    // Inputs recorded in canonical order (writer_id, epoch, seq).
+    assert_eq!(record.inputs.len(), 3);
+    assert_eq!(record.level, 1);
+    let ids: Vec<(&str, u64, u64)> = record
+        .inputs
+        .iter()
+        .map(|i| (i.writer_id.as_str(), i.writer_epoch, i.writer_seq))
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "inputs must be canonically ordered");
+    for p in &record.parts {
+        assert_eq!(p.segment_format_version, 5, "v5 output (ADR-0026/0027)");
+    }
+
+    // Every input sample survives, byte-for-byte (union view; dedup is a
+    // query-time concern, plan §7).
+    let got = read_record_samples(&store, &record).await;
+    let expected = expected_samples(&specs);
+    assert_eq!(got, expected);
+}
+
+#[tokio::test]
+async fn not_sealed_is_skipped() {
+    let store = MemoryStore::new();
+    for s in &three_inputs() {
+        seed_input(&store, s).await;
+    }
+    // Now is before the seal margin.
+    let clock = FixedClock::new((i64::from(HOUR) + 1) * NS_PER_HOUR);
+    let outcome = compact_bucket(&store, &clock, &cfg(), &bucket())
+        .await
+        .expect("compact");
+    assert_eq!(outcome, CompactionOutcome::NotSealed);
+}
+
+#[tokio::test]
+async fn single_input_is_below_min() {
+    let store = MemoryStore::new();
+    let spec = InputSpec::new(
+        Uuid::from_u128(1),
+        10,
+        1,
+        vec![raw_series("m", &[], &[(1, 1.0)])],
+    );
+    seed_input(&store, &spec).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let outcome = compact_bucket(&store, &clock, &cfg(), &bucket())
+        .await
+        .expect("compact");
+    assert_eq!(outcome, CompactionOutcome::BelowMinInputs { count: 1 });
+}
+
+#[tokio::test]
+async fn second_run_sees_already_compacted() {
+    let store = MemoryStore::new();
+    for s in &three_inputs() {
+        seed_input(&store, s).await;
+    }
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = bucket();
+    compact_bucket(&store, &clock, &cfg(), &bucket)
+        .await
+        .expect("first");
+    let second = compact_bucket(&store, &clock, &cfg(), &bucket)
+        .await
+        .expect("second");
+    assert_eq!(second, CompactionOutcome::AlreadyCompacted);
+}
+
+#[tokio::test]
+async fn listing_pagination_is_handled() {
+    // page_size 2 forces multi-page listing of the bucket's records.
+    let store = MemoryStore::with_page_size(2);
+    let mut specs = Vec::new();
+    for i in 0..7u128 {
+        specs.push(InputSpec::new(
+            Uuid::from_u128(i + 1),
+            10,
+            (i + 1) as u64,
+            vec![raw_series(
+                "m",
+                &[("i", &i.to_string())],
+                &[(1_000, i as f64)],
+            )],
+        ));
+    }
+    for s in &specs {
+        seed_input(&store, s).await;
+    }
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = bucket();
+    let outcome = compact_bucket(&store, &clock, &cfg(), &bucket)
+        .await
+        .expect("compact");
+    assert!(matches!(outcome, CompactionOutcome::Compacted { .. }));
+    let record = fetch_compaction_record(&store, &bucket).await;
+    assert_eq!(record.inputs.len(), 7);
+    let got = read_record_samples(&store, &record).await;
+    assert_eq!(got, expected_samples(&specs));
+}
+
+#[tokio::test]
+async fn part_splitting_keeps_series_whole_and_disjoint() {
+    let store = MemoryStore::new();
+    // Many distinct series so a tiny part cap forces several parts.
+    let mut series = Vec::new();
+    for i in 0..40u32 {
+        series.push(raw_series(
+            "m",
+            &[("id", &format!("{i:03}"))],
+            &[(1_000, i as f64), (2_000, (i * 2) as f64)],
+        ));
+    }
+    let specs = vec![
+        InputSpec::new(Uuid::from_u128(1), 10, 1, series.clone()),
+        InputSpec::new(Uuid::from_u128(2), 10, 2, series),
+    ];
+    for s in &specs {
+        seed_input(&store, s).await;
+    }
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = bucket();
+    let mut config = cfg();
+    config.max_l1_part_bytes = 512; // force splits on series boundaries
+
+    let outcome = compact_bucket(&store, &clock, &config, &bucket)
+        .await
+        .expect("compact");
+    assert!(matches!(outcome, CompactionOutcome::Compacted { .. }));
+
+    let record = fetch_compaction_record(&store, &bucket).await;
+    assert!(record.parts.len() >= 2, "tiny cap must split into parts");
+
+    // Part id ranges are disjoint and ascending (series never straddle).
+    let mut prev_last: Option<[u8; 16]> = None;
+    for p in &record.parts {
+        let first: [u8; 16] = p.first_series_id.as_slice().try_into().unwrap();
+        let last: [u8; 16] = p.last_series_id.as_slice().try_into().unwrap();
+        assert!(first <= last);
+        if let Some(pl) = prev_last {
+            assert!(pl < first, "part id ranges must be disjoint and ordered");
+        }
+        prev_last = Some(last);
+    }
+
+    // Content still complete.
+    let got = read_record_samples(&store, &record).await;
+    assert_eq!(got, expected_samples(&specs));
+}
