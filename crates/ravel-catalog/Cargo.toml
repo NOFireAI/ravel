@@ -18,12 +18,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }
 crc32c = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 ravel-test-util = { workspace = true }
 proptest = { workspace = true }
-blake3 = { workspace = true }
-bytes = { workspace = true }
 
 [lints]
 workspace = true
