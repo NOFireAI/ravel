@@ -4,8 +4,11 @@
 #![allow(clippy::expect_used)]
 
 use proptest::prelude::*;
-use ravel_catalog::{PartLimits, decode_head, decode_part, encode_head, encode_part};
-use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef};
+use ravel_catalog::{
+    NamePostings, PartLimits, PostingsLimits, decode_head, decode_part, decode_postings,
+    encode_head, encode_part, encode_postings,
+};
+use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
 
 fn entry_key(e: &SnapshotEntry) -> (u32, u32, Vec<u8>, u64, u64) {
     (
@@ -129,24 +132,51 @@ fn arb_part_ref() -> impl Strategy<Value = SnapshotPartRef> {
         )
 }
 
+fn arb_postings_ref(
+    parts: &[SnapshotPartRef],
+) -> impl Strategy<Value = Option<SnapshotPostingsRef>> + use<> {
+    let part_blake3: Vec<Vec<u8>> = parts.iter().map(|p| p.blake3.clone()).collect();
+    prop_oneof![
+        Just(None),
+        (
+            "[a-z0-9/]{1,40}",
+            prop::collection::vec(any::<u8>(), 32),
+            any::<u64>(),
+            any::<u32>(),
+        )
+            .prop_map(move |(key, blake3, size, name_count)| {
+                Some(SnapshotPostingsRef {
+                    key,
+                    blake3,
+                    size,
+                    name_count,
+                    part_blake3: part_blake3.clone(),
+                })
+            }),
+    ]
+}
+
 fn arb_head() -> impl Strategy<Value = SnapshotHead> {
     (
         prop::collection::vec(arb_part_ref(), 1..5),
         prop::collection::vec(any::<u8>(), 16),
         any::<i64>(),
     )
-        .prop_map(|(parts, folder_id, created_unix_ns)| {
-            let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
-            SnapshotHead {
-                format_version: 1,
-                tenant_hash: vec![0x33u8; 16],
-                signal: 1,
-                shard_count: 8,
-                watermark_hour,
-                parts,
-                folder_id,
-                created_unix_ns,
-            }
+        .prop_flat_map(|(parts, folder_id, created_unix_ns)| {
+            arb_postings_ref(&parts).prop_map(move |postings| {
+                let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
+                SnapshotHead {
+                    format_version: 1,
+                    tenant_hash: vec![0x33u8; 16],
+                    signal: 1,
+                    shard_count: 8,
+                    watermark_hour,
+                    parts: parts.clone(),
+                    postings,
+                    folder_id: folder_id.clone(),
+                    created_unix_ns,
+                }
+            })
         })
 }
 
@@ -162,6 +192,56 @@ proptest! {
     fn head_encode_is_deterministic(head in arb_head()) {
         let a = encode_head(&head).expect("encode a");
         let b = encode_head(&head).expect("encode b");
+        prop_assert_eq!(a, b);
+    }
+}
+
+fn watermark_and_names() -> impl Strategy<Value = (u64, Vec<NamePostings>)> {
+    (1u64..50).prop_flat_map(|entry_count| {
+        prop::collection::btree_map(
+            "[a-z]{1,8}",
+            prop::collection::btree_set(0..entry_count, 0..6),
+            0..8,
+        )
+        .prop_map(move |map| {
+            let names = map
+                .into_iter()
+                .map(|(name, ordinals)| NamePostings {
+                    name,
+                    ordinals: ordinals.into_iter().collect(),
+                })
+                .collect();
+            (entry_count, names)
+        })
+    })
+}
+
+proptest! {
+    #[test]
+    fn postings_roundtrip((entry_count, names) in watermark_and_names()) {
+        let tenant_hash = [0x11u8; 16];
+        let part_blake3 = [[0x22u8; 32]];
+        let encoded = encode_postings(tenant_hash, 1, &part_blake3, entry_count, &names)
+            .expect("encode");
+        let decoded = decode_postings(&encoded, &PostingsLimits::default(), &part_blake3)
+            .expect("decode");
+
+        prop_assert_eq!(decoded.header.format_version, 1);
+        prop_assert_eq!(decoded.header.tenant_hash, tenant_hash.to_vec());
+        prop_assert_eq!(decoded.header.signal, 1);
+        prop_assert_eq!(decoded.header.entry_count, entry_count);
+        prop_assert_eq!(decoded.header.name_count, names.len() as u32);
+        prop_assert_eq!(decoded.names, names);
+    }
+
+    #[test]
+    fn postings_encode_is_deterministic((entry_count, names) in watermark_and_names()) {
+        let tenant_hash = [0x22u8; 16];
+        let part_blake3 = [[0x33u8; 32]];
+        let a = encode_postings(tenant_hash, 1, &part_blake3, entry_count, &names)
+            .expect("encode a");
+        let b = encode_postings(tenant_hash, 1, &part_blake3, entry_count, &names)
+            .expect("encode b");
         prop_assert_eq!(a, b);
     }
 }

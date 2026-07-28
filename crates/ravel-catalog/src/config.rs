@@ -72,6 +72,10 @@ pub struct CatalogConfig {
     /// at resolve time (docs/metric-index-plan.md 3.1). Default
     /// [`snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES`].
     pub max_snapshot_part_bytes: u64,
+    /// Resource cap applied to a name-postings object's declared
+    /// decompressed body size at decode time (docs/metric-index-plan.md
+    /// 3.3). Default [`snapshot_format::DEFAULT_MAX_POSTINGS_BYTES`].
+    pub max_postings_bytes: u64,
 }
 
 impl Default for CatalogConfig {
@@ -86,6 +90,7 @@ impl Default for CatalogConfig {
             head_cache_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS,
             snapshot_cache_parts: DEFAULT_SNAPSHOT_CACHE_PARTS,
             max_snapshot_part_bytes: snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
+            max_postings_bytes: snapshot_format::DEFAULT_MAX_POSTINGS_BYTES,
         }
     }
 }

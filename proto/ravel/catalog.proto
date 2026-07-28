@@ -43,6 +43,10 @@ message SnapshotHead {
   repeated SnapshotPartRef parts = 6;
   bytes folder_id = 7;      // 16; UUIDv4 per folder process start
   sint64 created_unix_ns = 8;  // informational
+  // Additive, phase P5a (docs/metric-index-plan.md). Absent when no
+  // postings index has been built yet, or when the last fold's postings
+  // build failed; readers must never treat absence as an error.
+  SnapshotPostingsRef postings = 9;
 }
 
 message SnapshotPartRef {
@@ -51,4 +55,28 @@ message SnapshotPartRef {
   uint64 size = 3;
   uint64 entry_count = 4;
   uint32 watermark_hour = 5;
+}
+
+// Reference to a name-postings object (RNP1 envelope), phase P5a
+// (docs/metric-index-plan.md). Bound to the exact set of parts it was
+// built from: a postings object is only trustworthy against the parts
+// whose blake3 hashes it names here, in the same order as
+// `SnapshotHead.parts`.
+message SnapshotPostingsRef {
+  string key = 1;              // full object key of the postings object
+  bytes blake3 = 2;             // 32, of the postings object's full bytes
+  uint64 size = 3;
+  uint32 name_count = 4;
+  repeated bytes part_blake3 = 5;  // covered parts' blake3, same order as parts
+}
+
+message SnapshotPostingsHeader {
+  uint32 format_version = 1;  // 1; must match envelope version
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;
+  repeated bytes part_blake3 = 4;  // covered parts' blake3, binds this
+                                    // postings object to an exact part set
+  uint64 entry_count = 5;      // total entries across the covered parts
+  uint32 name_count = 6;
+  uint64 body_uncompressed_len = 7;
 }
