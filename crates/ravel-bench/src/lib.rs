@@ -5,4 +5,5 @@ pub mod codecs;
 pub mod generator;
 #[cfg(feature = "parquet-baseline")]
 pub mod read_accounting;
+pub mod section_accounting;
 pub mod segment_support;

@@ -134,6 +134,11 @@ name = "codec_roundtrip"
 path = "tests/codec_roundtrip.rs"
 bench = false
 
+[[test]]
+name = "catalog_byte_gates"
+path = "tests/catalog_byte_gates.rs"
+bench = false
+
 [[bench]]
 name = "segment_encode"
 harness = false
