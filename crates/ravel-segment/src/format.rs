@@ -18,9 +18,9 @@ pub const VERSION_V2: u16 = 2;
 /// RSEG v3 trailer version (ADR-0017, docs/rseg-v3-plan.md). Strict
 /// superset of v2: adds the HIST_PAGES section, a HIST_SPANS page
 /// encoding, and three SERIES_META column blocks for native-histogram
-/// values. Same magic and trailer layout as v1/v2. Not yet written or read
-/// by this crate (writer: docs/rseg-v3-plan.md C3; reader: C4).
-#[allow(dead_code)] // wired into writer/reader in C3/C4; pinned by the constants test until then
+/// values. Same magic and trailer layout as v1/v2. Written by
+/// `SegmentWriter::write_v3` (docs/rseg-v3-plan.md C3); not yet read by
+/// this crate's reader (C4).
 pub const VERSION_V3: u16 = 3;
 
 /// Signal byte for metric segments.
@@ -49,8 +49,8 @@ pub mod section_kind {
     pub const SERIES_META: u32 = 6;
     /// RSEG v3 only (ADR-0017); v1/v2 objects never emit this kind.
     /// Histogram-value pages, one per histogram series
-    /// (docs/segment-format.md "RSEG v3 amendment").
-    #[allow(dead_code)] // wired into writer/reader in C3/C4; pinned by the constants test until then
+    /// (docs/segment-format.md "RSEG v3 amendment"). Emitted by
+    /// `SegmentWriter::write_v3` (docs/rseg-v3-plan.md C3).
     pub const HIST_PAGES: u32 = 7;
 }
 
@@ -67,8 +67,8 @@ pub mod page_enc {
     pub const VAL_GORILLA: u8 = 16;
     pub const VAL_RAW_F64: u8 = 17;
     /// RSEG v3 only (ADR-0017); native-histogram record grammar
-    /// (docs/segment-format.md "RSEG v3 amendment", HIST_PAGES).
-    #[allow(dead_code)] // wired into writer/reader in C3/C4; pinned by the constants test until then
+    /// (docs/segment-format.md "RSEG v3 amendment", HIST_PAGES). Emitted by
+    /// `SegmentWriter::write_v3` (docs/rseg-v3-plan.md C3).
     pub const HIST_SPANS: u8 = 32;
 }
 
