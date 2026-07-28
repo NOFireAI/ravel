@@ -9,10 +9,48 @@
 //! bit-significant. Result vectors compare label-set-sorted unless the
 //! corpus entry is marked order-sensitive. Errors compare by `errorType`
 //! class string equality. Warnings compare by presence only.
+//!
+//! A corpus entry may opt into a bounded ULP tolerance (ADR-0025's
+//! allowlist: a named, measured, per-entry exception, not a global fuzzy
+//! comparison). `-0.0` vs `0.0` never matches under any tolerance: this
+//! project's `-0.0` bit-significance rule is a matter of principle, not
+//! magnitude, so the zero boundary is always exact-bit-compared.
 
 use serde_json::Value as Json;
 
 use crate::corpus::ComparisonMode;
+
+/// Maps an f64's bit pattern to a `u64` whose ordering matches the float's
+/// numeric ordering (for any non-NaN value): the standard "flip the sign
+/// bit for non-negative, flip every bit for negative" transform. Adjacent
+/// floats map to adjacent integers, so the difference between two keys is
+/// exactly their ULP distance.
+fn ordered_key(x: f64) -> u64 {
+    let bits = x.to_bits();
+    if bits & (1u64 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1u64 << 63)
+    }
+}
+
+/// True if `a` and `b` are within `max_ulps` representable f64 steps of
+/// each other. Deliberately exact-bit only (never "close") across the zero
+/// boundary, across a sign change, or when either side is non-finite: a
+/// tolerance is for two answers that are the same real number to within a
+/// few representable steps, not a general closeness measure.
+fn within_ulps(a: f64, b: f64, max_ulps: u32) -> bool {
+    if a.to_bits() == b.to_bits() {
+        return true;
+    }
+    if a == 0.0 || b == 0.0 || !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    if a.is_sign_negative() != b.is_sign_negative() {
+        return false;
+    }
+    ordered_key(a).abs_diff(ordered_key(b)) <= u64::from(max_ulps)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -33,14 +71,17 @@ fn parse_sample_value(s: &str) -> Result<f64, String> {
     }
 }
 
-fn values_equal(a: f64, b: f64) -> bool {
+fn values_equal(a: f64, b: f64, tolerance_ulps: Option<u32>) -> bool {
     if a.is_nan() && b.is_nan() {
         return true;
     }
-    a.to_bits() == b.to_bits()
+    match tolerance_ulps {
+        Some(max_ulps) => within_ulps(a, b, max_ulps),
+        None => a.to_bits() == b.to_bits(),
+    }
 }
 
-fn sample_pair_equal(a: &Json, b: &Json) -> Result<bool, String> {
+fn sample_pair_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
     let (a_ts, a_val) = sample_pair(a)?;
     let (b_ts, b_val) = sample_pair(b)?;
     if a_ts != b_ts {
@@ -49,6 +90,7 @@ fn sample_pair_equal(a: &Json, b: &Json) -> Result<bool, String> {
     Ok(values_equal(
         parse_sample_value(&a_val)?,
         parse_sample_value(&b_val)?,
+        tolerance_ulps,
     ))
 }
 
@@ -83,14 +125,14 @@ fn label_key(metric: &Json) -> String {
         .join(",")
 }
 
-fn vector_result_equal(a: &Json, b: &Json) -> Result<bool, String> {
+fn vector_result_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
     if a["metric"] != b["metric"] {
         return Ok(false);
     }
-    sample_pair_equal(&a["value"], &b["value"])
+    sample_pair_equal(&a["value"], &b["value"], tolerance_ulps)
 }
 
-fn matrix_result_equal(a: &Json, b: &Json) -> Result<bool, String> {
+fn matrix_result_equal(a: &Json, b: &Json, tolerance_ulps: Option<u32>) -> Result<bool, String> {
     if a["metric"] != b["metric"] {
         return Ok(false);
     }
@@ -100,7 +142,7 @@ fn matrix_result_equal(a: &Json, b: &Json) -> Result<bool, String> {
         return Ok(false);
     }
     for (av, bv) in a_values.iter().zip(b_values.iter()) {
-        if !sample_pair_equal(av, bv)? {
+        if !sample_pair_equal(av, bv, tolerance_ulps)? {
             return Ok(false);
         }
     }
@@ -124,12 +166,19 @@ fn error_type(body: &Json) -> Option<&str> {
 }
 
 /// Compares two full `/api/v1/query` or `/api/v1/query_range` JSON envelope
-/// bodies (already parsed) per `mode`.
-pub fn compare(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Verdict {
+/// bodies (already parsed) per `mode`. `tolerance_ulps` is the corpus
+/// entry's own ADR-0025 allowlist tolerance, if any; `None` means the
+/// default bit-exact comparison.
+pub fn compare(
+    mode: ComparisonMode,
+    tolerance_ulps: Option<u32>,
+    prometheus: &Json,
+    ravel: &Json,
+) -> Verdict {
     match mode {
         ComparisonMode::ExpectError => compare_error(prometheus, ravel),
         ComparisonMode::Unordered | ComparisonMode::Ordered => {
-            compare_success(mode, prometheus, ravel)
+            compare_success(mode, tolerance_ulps, prometheus, ravel)
         }
     }
 }
@@ -152,7 +201,12 @@ fn compare_error(prometheus: &Json, ravel: &Json) -> Verdict {
     Verdict::Match
 }
 
-fn compare_success(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Verdict {
+fn compare_success(
+    mode: ComparisonMode,
+    tolerance_ulps: Option<u32>,
+    prometheus: &Json,
+    ravel: &Json,
+) -> Verdict {
     let prom_status = prometheus["status"].as_str().unwrap_or_default();
     let ravel_status = ravel["status"].as_str().unwrap_or_default();
     if prom_status != "success" || ravel_status != "success" {
@@ -182,9 +236,13 @@ fn compare_success(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Ver
     }
 
     match prom_type {
-        "vector" => compare_vector(mode, prometheus, ravel),
-        "matrix" => compare_matrix(mode, prometheus, ravel),
-        "scalar" => compare_pair(&prometheus["data"]["result"], &ravel["data"]["result"]),
+        "vector" => compare_vector(mode, tolerance_ulps, prometheus, ravel),
+        "matrix" => compare_matrix(mode, tolerance_ulps, prometheus, ravel),
+        "scalar" => compare_pair(
+            &prometheus["data"]["result"],
+            &ravel["data"]["result"],
+            tolerance_ulps,
+        ),
         "string" => {
             if prometheus["data"]["result"] == ravel["data"]["result"] {
                 Verdict::Match
@@ -199,15 +257,20 @@ fn compare_success(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Ver
     }
 }
 
-fn compare_pair(prom: &Json, ravel: &Json) -> Verdict {
-    match sample_pair_equal(prom, ravel) {
+fn compare_pair(prom: &Json, ravel: &Json, tolerance_ulps: Option<u32>) -> Verdict {
+    match sample_pair_equal(prom, ravel, tolerance_ulps) {
         Ok(true) => Verdict::Match,
         Ok(false) => Verdict::Mismatch(format!("scalar mismatch: prometheus={prom} ravel={ravel}")),
         Err(e) => Verdict::Mismatch(e),
     }
 }
 
-fn compare_vector(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Verdict {
+fn compare_vector(
+    mode: ComparisonMode,
+    tolerance_ulps: Option<u32>,
+    prometheus: &Json,
+    ravel: &Json,
+) -> Verdict {
     let (prom_results, ravel_results) = match (
         prometheus["data"]["result"].as_array(),
         ravel["data"]["result"].as_array(),
@@ -215,10 +278,17 @@ fn compare_vector(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Verd
         (Some(a), Some(b)) => (a.clone(), b.clone()),
         _ => return Verdict::Mismatch("vector result is not an array".to_string()),
     };
-    compare_series(mode, prom_results, ravel_results, vector_result_equal)
+    compare_series(mode, prom_results, ravel_results, |a, b| {
+        vector_result_equal(a, b, tolerance_ulps)
+    })
 }
 
-fn compare_matrix(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Verdict {
+fn compare_matrix(
+    mode: ComparisonMode,
+    tolerance_ulps: Option<u32>,
+    prometheus: &Json,
+    ravel: &Json,
+) -> Verdict {
     let (prom_results, ravel_results) = match (
         prometheus["data"]["result"].as_array(),
         ravel["data"]["result"].as_array(),
@@ -226,7 +296,9 @@ fn compare_matrix(mode: ComparisonMode, prometheus: &Json, ravel: &Json) -> Verd
         (Some(a), Some(b)) => (a.clone(), b.clone()),
         _ => return Verdict::Mismatch("matrix result is not an array".to_string()),
     };
-    compare_series(mode, prom_results, ravel_results, matrix_result_equal)
+    compare_series(mode, prom_results, ravel_results, |a, b| {
+        matrix_result_equal(a, b, tolerance_ulps)
+    })
 }
 
 fn compare_series(
@@ -279,7 +351,7 @@ mod tests {
             }
         });
         assert_eq!(
-            compare(ComparisonMode::Unordered, &body, &body),
+            compare(ComparisonMode::Unordered, None, &body, &body),
             Verdict::Match
         );
     }
@@ -307,7 +379,7 @@ mod tests {
             }
         });
         assert_eq!(
-            compare(ComparisonMode::Unordered, &prom, &ravel),
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
             Verdict::Match
         );
     }
@@ -335,7 +407,7 @@ mod tests {
             }
         });
         assert!(matches!(
-            compare(ComparisonMode::Ordered, &prom, &ravel),
+            compare(ComparisonMode::Ordered, None, &prom, &ravel),
             Verdict::Mismatch(_)
         ));
     }
@@ -351,7 +423,7 @@ mod tests {
             "data": {"resultType": "scalar", "result": [1.0, "NaN"]}
         });
         assert_eq!(
-            compare(ComparisonMode::Unordered, &prom, &ravel),
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
             Verdict::Match
         );
     }
@@ -367,7 +439,77 @@ mod tests {
             "data": {"resultType": "scalar", "result": [1.0, "0"]}
         });
         assert!(matches!(
-            compare(ComparisonMode::Unordered, &prom, &ravel),
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn a_value_outside_tolerance_still_mismatches() {
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, "1.0"]}
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, "1.5"]}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, Some(4), &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn a_value_within_tolerance_matches() {
+        let a = 1.0_f64;
+        let b = f64::from_bits(a.to_bits() + 3); // three representable steps above `a`
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, a.to_string()]}
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, b.to_string()]}
+        });
+        assert_eq!(
+            compare(ComparisonMode::Unordered, Some(4), &prom, &ravel),
+            Verdict::Match
+        );
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, Some(2), &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn negative_zero_never_matches_under_any_tolerance() {
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, "-0"]}
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, "0"]}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, Some(u32::MAX), &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn opposite_signs_never_match_under_tolerance() {
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, "0.0000001"]}
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, "-0.0000001"]}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, Some(u32::MAX), &prom, &ravel),
             Verdict::Mismatch(_)
         ));
     }
@@ -378,7 +520,7 @@ mod tests {
             json!({"status": "error", "errorType": "bad_data", "error": "prometheus wording"});
         let ravel = json!({"status": "error", "errorType": "bad_data", "error": "ravel wording"});
         assert_eq!(
-            compare(ComparisonMode::ExpectError, &prom, &ravel),
+            compare(ComparisonMode::ExpectError, None, &prom, &ravel),
             Verdict::Match
         );
     }
@@ -388,7 +530,7 @@ mod tests {
         let prom = json!({"status": "error", "errorType": "bad_data", "error": "x"});
         let ravel = json!({"status": "error", "errorType": "execution", "error": "y"});
         assert!(matches!(
-            compare(ComparisonMode::ExpectError, &prom, &ravel),
+            compare(ComparisonMode::ExpectError, None, &prom, &ravel),
             Verdict::Mismatch(_)
         ));
     }
@@ -398,7 +540,7 @@ mod tests {
         let prom = json!({"status": "error", "errorType": "bad_data", "error": "x"});
         let ravel = json!({"status": "success", "data": {"resultType": "vector", "result": []}});
         assert!(matches!(
-            compare(ComparisonMode::ExpectError, &prom, &ravel),
+            compare(ComparisonMode::ExpectError, None, &prom, &ravel),
             Verdict::Mismatch(_)
         ));
     }
@@ -415,7 +557,7 @@ mod tests {
             "data": {"resultType": "vector", "result": []}
         });
         assert!(matches!(
-            compare(ComparisonMode::Unordered, &prom, &ravel),
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
             Verdict::Mismatch(_)
         ));
     }

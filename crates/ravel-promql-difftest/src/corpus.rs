@@ -24,7 +24,21 @@
 //! kind: instant
 //! time: +0s
 //! mode: error
+//!
+//! name: atanh_off_by_a_few_ulps
+//! query: atanh(diff_gauge_walk)
+//! kind: instant
+//! time: +0s
+//! mode: unordered
+//! tolerance: 256
 //! ```
+//!
+//! `tolerance` is optional (ADR-0025's allowlist): a non-negative integer
+//! count of representable f64 steps the comparator accepts between the two
+//! sides' values, in place of the default bit-exact comparison. Every use
+//! needs a comment above the entry explaining why exact bits are
+//! unattainable and where the tolerance number came from; see
+//! docs/adrs/0025-promql-differential-float-precision-residue.md.
 
 use std::fmt;
 
@@ -56,6 +70,12 @@ pub struct CorpusEntry {
     pub query: String,
     pub eval: Eval,
     pub mode: ComparisonMode,
+    /// ADR-0025's allowlist: an optional, named ULP tolerance for this
+    /// entry's value comparison, from an optional `tolerance:` field.
+    /// Absent by default, meaning the usual bit-exact comparison; present
+    /// only on entries with a written justification in the corpus file
+    /// itself for why exact bits are unattainable.
+    pub tolerance_ulps: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,11 +230,23 @@ fn build_entry(
         }
     };
 
+    let tolerance_ulps = match get("tolerance") {
+        Some((value, line)) => Some(value.parse::<u32>().map_err(|_| {
+            err(
+                index,
+                line,
+                format!("invalid tolerance '{value}', expected a non-negative integer"),
+            )
+        })?),
+        None => None,
+    };
+
     Ok(CorpusEntry {
         name: name.to_string(),
         query: query.to_string(),
         eval,
         mode,
+        tolerance_ulps,
     })
 }
 
@@ -236,6 +268,25 @@ mod tests {
             _ => panic!("expected instant"),
         }
         assert_eq!(entries[0].mode, ComparisonMode::Unordered);
+        assert_eq!(entries[0].tolerance_ulps, None);
+    }
+
+    #[test]
+    fn parses_an_optional_tolerance_field() {
+        let entries = parse_corpus(
+            "name: simple\nquery: up\nkind: instant\ntime: +30s\nmode: unordered\ntolerance: 256\n",
+        )
+        .expect("parse");
+        assert_eq!(entries[0].tolerance_ulps, Some(256));
+    }
+
+    #[test]
+    fn rejects_a_non_integer_tolerance() {
+        let err = parse_corpus(
+            "name: simple\nquery: up\nkind: instant\ntime: +30s\nmode: unordered\ntolerance: not-a-number\n",
+        )
+        .expect_err("must reject a non-integer tolerance");
+        assert!(matches!(err, CorpusError::Malformed { .. }));
     }
 
     #[test]
