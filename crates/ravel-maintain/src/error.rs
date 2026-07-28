@@ -35,4 +35,6 @@ pub enum MaintainError {
     MixedValueKindAcrossInputs { series_id: String },
     #[error("hour bucket {0} overflows scan range (u32 exhausted)")]
     HourBucketOverflow(u32),
+    #[error("merge internal invariant violated: {0}")]
+    MergeInvariant(&'static str),
 }
