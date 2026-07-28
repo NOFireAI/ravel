@@ -42,7 +42,11 @@
 use ravel_bench::section_accounting::{
     CatalogBytes, measure_catalog, shape_many_small, shape_wide_15,
 };
-use ravel_bench::segment_support::{build_segment, build_segment_v2, build_segment_v3};
+use ravel_bench::segment_support::{
+    SERIES_IDX, SERIES_META, SERIES_META_CHUNKS, build_segment, build_segment_v2, build_segment_v3,
+    build_segment_v4, build_segment_v5,
+};
+use ravel_segment::{ReaderLimits, open_from_full};
 
 /// 10k `many_small` series, 20k total samples: same series/sample ratio as
 /// the 100k report (`section_bytes_report`), a fraction of its runtime.
@@ -201,6 +205,66 @@ fn v3_wide_15_total_below_v1() {
         m.v1_total,
     );
     assert_total_and_dict_gates("v3 wide_15", &m);
+}
+
+/// The v5 sparse sections (SERIES_IDX + chunked SERIES_META) must cost under
+/// this fraction of the object at the 10k shape (ADR-0026: write-side total
+/// +0.48% at 100k; the 10k shape sits a little higher but well under 1%).
+const V5_SPARSE_OVERHEAD_RATIO_MAX: f64 = 0.01;
+
+fn section_len(bytes: &[u8], kind: u32) -> u64 {
+    let loc = open_from_full(bytes, ReaderLimits::default()).expect("open");
+    loc.footer
+        .sections
+        .iter()
+        .find(|s| s.kind == kind)
+        .map(|s| s.len)
+        .unwrap_or(0)
+}
+
+/// v5 sparse byte gate (ADR-0026, issue #176): at the 10k `many_small` shape
+/// (>= the 4096 sparse-emission threshold) the sparse sections cost under 1%
+/// of object bytes. The cost is the object's growth over the v4 object of the
+/// same batch: SERIES_IDX plus the chunked-vs-whole SERIES_META delta. The
+/// measured numbers are printed for the record.
+#[test]
+fn v5_sparse_sections_under_one_percent_of_object() {
+    let raw = shape_many_small(SERIES, TOTAL_SAMPLES);
+    let v4 = build_segment_v4(raw.clone());
+    let v5 = build_segment_v5(raw);
+    let v4_total = v4.bytes.len() as u64;
+    let v5_total = v5.bytes.len() as u64;
+
+    // The sparse sections must actually be present at this shape.
+    let series_idx = section_len(&v5.bytes, SERIES_IDX);
+    let meta_chunks = section_len(&v5.bytes, SERIES_META_CHUNKS);
+    let meta_whole = section_len(&v4.bytes, SERIES_META);
+    assert!(
+        series_idx > 0,
+        "SERIES_IDX must be present at the 10k shape"
+    );
+    assert!(
+        meta_chunks > 0,
+        "SERIES_META_CHUNKS must be present at the 10k shape"
+    );
+    assert_eq!(
+        section_len(&v5.bytes, SERIES_META),
+        0,
+        "v5 sparse object drops the whole SERIES_META"
+    );
+
+    let overhead = v5_total as i64 - v4_total as i64;
+    let ratio = overhead as f64 / v5_total as f64;
+    println!(
+        "[v5 sparse 10k] v4={v4_total}B v5={v5_total}B overhead={overhead:+}B ({:+.4}%)  \
+         SERIES_IDX={series_idx}B ({:.4}% of obj)  meta whole={meta_whole}B chunked={meta_chunks}B",
+        ratio * 100.0,
+        series_idx as f64 / v5_total as f64 * 100.0,
+    );
+    assert!(
+        ratio < V5_SPARSE_OVERHEAD_RATIO_MAX,
+        "v5 sparse-section overhead ratio {ratio:.4} exceeds gate {V5_SPARSE_OVERHEAD_RATIO_MAX}",
+    );
 }
 
 /// Determinism: the whole measurement pipeline (fixed-seed generator ->
