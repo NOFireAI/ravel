@@ -9,10 +9,12 @@ use ravel_types::{Label, LabelSet, Sample, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION, VERSION_V2, compression, page_comp,
-    page_enc, section_kind,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, compression,
+    page_comp, page_enc, section_kind,
 };
-use crate::varint::read_uvarint;
+use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
+use crate::varint::{read_uvarint, read_zigzag_varint};
+use crate::writer::HistogramSample;
 
 const TRAILER_LEN_USIZE: usize = crate::format::TRAILER_LEN as usize;
 
@@ -26,10 +28,11 @@ pub struct FooterLocation {
     /// Absolute offset of the 16-byte trailer within the object.
     pub trailer_offset: u64,
     pub total_size: u64,
-    /// Trailer format version (1 or 2; `parse_footer` rejects any other
+    /// Trailer format version (1, 2, or 3; `parse_footer` rejects any other
     /// value). Determines which catalog decode path
     /// (`decode_catalog`/`decode_catalog_matching` for v1,
-    /// `decode_catalog_v2`/`decode_catalog_matching_v2` for v2) and which
+    /// `decode_catalog_v2`/`decode_catalog_matching_v2` for v2,
+    /// `decode_catalog_v3`/`decode_catalog_matching_v3` for v3) and which
     /// `validate_sections` mandatory-kind set applies.
     pub version: u16,
 }
@@ -75,7 +78,7 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     if magic != MAGIC {
         return Err(SegmentError::BadMagic);
     }
-    if version != VERSION && version != VERSION_V2 {
+    if version != VERSION && version != VERSION_V2 && version != VERSION_V3 {
         return Err(SegmentError::UnsupportedVersion(version));
     }
     if signal != SIGNAL_METRICS {
@@ -125,7 +128,7 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
 }
 
 /// Validates footer-level section invariants (docs/segment-format.md),
-/// dispatching on the trailer `version` (1 or 2; anything else is
+/// dispatching on the trailer `version` (1, 2, or 3; anything else is
 /// `UnsupportedVersion`, matching `parse_footer`'s accepted set): at most
 /// one section per known kind, every mandatory kind for that version
 /// present, every section range within `[0, page_region_end)` with checked
@@ -138,7 +141,9 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
 /// payload bytes, which this function -- called immediately after
 /// `parse_footer`, before any section byte GET -- never has. It is
 /// performed in `decode_catalog_v2` and `decode_catalog_matching_v2`
-/// instead, which do have those bytes.
+/// instead, which do have those bytes. Same deferral applies to v3's
+/// `value_kind`-vs-page-presence check (`decode_catalog_v3`,
+/// `decode_catalog_matching_v3`).
 pub fn validate_sections(
     footer: &Footer,
     version: u16,
@@ -148,6 +153,7 @@ pub fn validate_sections(
     match version {
         VERSION => validate_sections_v1(footer, page_region_end, limits),
         VERSION_V2 => validate_sections_v2(footer, page_region_end, limits),
+        VERSION_V3 => validate_sections_v3(footer, page_region_end, limits),
         other => Err(SegmentError::UnsupportedVersion(other)),
     }
 }
@@ -251,6 +257,67 @@ fn validate_sections_v2(
     Ok(())
 }
 
+/// v3 mandatory-kind validation (docs/rseg-v3-plan.md section 3.2):
+/// LABEL_DICT, SERIES_IDS, SERIES_META, TS_PAGES are always mandatory;
+/// VAL_PAGES and HIST_PAGES are each optional, but at least one of the two
+/// must be present whenever the segment has any series at all
+/// (`footer.series_count > 0`) -- an empty segment (zero series) omits
+/// both, per the merged `write_v3` behavior
+/// (`empty_segment_omits_val_and_hist_sections`).
+///
+/// Whether a *present* VAL_PAGES/HIST_PAGES section actually matches the
+/// segment's scalar/histogram series counts (the "value_kind count must
+/// equal non-empty page count" rule, and "a section for a kind whose
+/// mandatory count is zero is Corrupted") needs each series' decoded
+/// `value_kind`, which this function does not have; that check is
+/// performed in `decode_catalog_v3`/`decode_catalog_matching_v3`, mirroring
+/// v2's count-equality deferral above.
+fn validate_sections_v3(
+    footer: &Footer,
+    page_region_end: u64,
+    limits: ReaderLimits,
+) -> Result<(), SegmentError> {
+    let mut seen = [false; 6];
+    for section in &footer.sections {
+        let end = section
+            .offset
+            .checked_add(section.len)
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+        if end > page_region_end {
+            return Err(SegmentError::SectionOutOfBounds);
+        }
+        let idx = match section.kind {
+            section_kind::LABEL_DICT => 0,
+            section_kind::SERIES_IDS => 1,
+            section_kind::SERIES_META => 2,
+            section_kind::TS_PAGES => 3,
+            section_kind::VAL_PAGES => 4,
+            section_kind::HIST_PAGES => 5,
+            _ => continue,
+        };
+        if seen[idx] {
+            return Err(SegmentError::DuplicateSection(section.kind));
+        }
+        seen[idx] = true;
+        if section.uncompressed_len > limits.max_section_uncompressed_bytes {
+            return Err(SegmentError::SectionTooLarge {
+                len: section.uncompressed_len,
+                cap: limits.max_section_uncompressed_bytes,
+            });
+        }
+    }
+    const NAMES: [&str; 4] = ["LABEL_DICT", "SERIES_IDS", "SERIES_META", "TS_PAGES"];
+    for (i, name) in NAMES.iter().enumerate() {
+        if !seen[i] {
+            return Err(SegmentError::MissingSection(name));
+        }
+    }
+    if footer.series_count > 0 && !seen[4] && !seen[5] {
+        return Err(SegmentError::MissingSection("VAL_PAGES or HIST_PAGES"));
+    }
+    Ok(())
+}
+
 /// Convenience: parse and validate a footer from the complete object bytes.
 pub fn open_from_full(bytes: &[u8], limits: ReaderLimits) -> Result<FooterLocation, SegmentError> {
     match parse_footer(bytes.len() as u64, bytes)? {
@@ -279,9 +346,19 @@ pub fn open_from_suffix(
     }
 }
 
-/// A decoded SERIES_TABLE entry with its labels materialized from
-/// LABEL_DICT. Page offsets/lengths are relative to their respective
-/// section's start.
+/// A series' value model, from SERIES_META column 10 in v3
+/// (docs/rseg-v3-plan.md section 3.4). v1/v2 series are always `Scalar`
+/// (the column does not exist pre-v3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Scalar,
+    Histogram,
+}
+
+/// A decoded SERIES_TABLE/SERIES_META entry with its labels materialized
+/// from LABEL_DICT. Page offsets/lengths are relative to their respective
+/// section's start. `value_kind`/`hist_page` are v3-only (section 3.4);
+/// v1/v2 entries always carry `ValueKind::Scalar` and `hist_page: (0, 0)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesEntry {
     pub series_id: SeriesId,
@@ -291,6 +368,8 @@ pub struct SeriesEntry {
     pub max_ts_ns: i64,
     pub ts_page: (u64, u64),
     pub val_page: (u64, u64),
+    pub value_kind: ValueKind,
+    pub hist_page: (u64, u64),
 }
 
 fn find_section(footer: &Footer, kind: u32) -> Option<&Section> {
@@ -610,6 +689,8 @@ pub fn decode_catalog(
             max_ts_ns: raw.max_ts_ns,
             ts_page: raw.ts_page,
             val_page: raw.val_page,
+            value_kind: ValueKind::Scalar,
+            hist_page: (0, 0),
         });
         Ok(())
     })?;
@@ -696,6 +777,8 @@ pub fn decode_catalog_matching(
             max_ts_ns: raw.max_ts_ns,
             ts_page: raw.ts_page,
             val_page: raw.val_page,
+            value_kind: ValueKind::Scalar,
+            hist_page: (0, 0),
         });
         Ok(())
     })?;
@@ -721,12 +804,19 @@ pub fn select<'a>(
 }
 
 /// Absolute (offset, len) byte ranges within the object for one series'
-/// TS and VAL pages.
+/// TS, VAL, and (v3 only) HIST pages. `val_range`/`hist_range` are `(0, 0)`
+/// for the page kind a series doesn't have (v1/v2 entries are always
+/// scalar, so `hist_range` is always `(0, 0)` for them; a v3 histogram-kind
+/// entry has no VAL page, so `val_range` is `(0, 0)` for it), mirroring the
+/// same "(0, 0) means not applicable" convention SERIES_META's own
+/// `val_page`/`hist_page` columns already use (docs/rseg-v3-plan.md
+/// section 3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannedRange {
     pub series_id: SeriesId,
     pub ts_range: (u64, u64),
     pub val_range: (u64, u64),
+    pub hist_range: (u64, u64),
 }
 
 /// Computes exact absolute byte ranges for the TS/VAL pages of `selected`
@@ -771,6 +861,86 @@ pub fn plan_ranges(
             series_id: entry.series_id,
             ts_range: (ts_abs, ts_len),
             val_range: (val_abs, val_len),
+            hist_range: (0, 0),
+        });
+    }
+    Ok(out)
+}
+
+/// v3 counterpart of [`plan_ranges`]: computes TS/VAL/HIST ranges for
+/// `selected` series, looking up VAL_PAGES only if at least one selected
+/// entry is `ValueKind::Scalar` and HIST_PAGES only if at least one is
+/// `ValueKind::Histogram` -- a segment legitimately omits either section
+/// when no series needs it (docs/rseg-v3-plan.md section 3.2), so an
+/// unconditional `find_section` lookup (as `plan_ranges` does for v1/v2,
+/// where every series is scalar) would wrongly fail a valid all-histogram
+/// or all-scalar v3 segment.
+pub fn plan_ranges_v3(
+    footer: &Footer,
+    selected: &[&SeriesEntry],
+) -> Result<Vec<PlannedRange>, SegmentError> {
+    let ts_section = find_section(footer, section_kind::TS_PAGES)
+        .ok_or(SegmentError::MissingSection("TS_PAGES"))?;
+
+    let mut out = Vec::new();
+    for entry in selected {
+        let (ts_off, ts_len) = entry.ts_page;
+        let ts_end = ts_off
+            .checked_add(ts_len)
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+        if ts_end > ts_section.len {
+            return Err(SegmentError::SectionOutOfBounds);
+        }
+        let ts_abs = ts_section
+            .offset
+            .checked_add(ts_off)
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+
+        let val_range = match entry.value_kind {
+            ValueKind::Scalar => {
+                let val_section = find_section(footer, section_kind::VAL_PAGES)
+                    .ok_or(SegmentError::MissingSection("VAL_PAGES"))?;
+                let (val_off, val_len) = entry.val_page;
+                let val_end = val_off
+                    .checked_add(val_len)
+                    .ok_or(SegmentError::SectionOutOfBounds)?;
+                if val_end > val_section.len {
+                    return Err(SegmentError::SectionOutOfBounds);
+                }
+                let val_abs = val_section
+                    .offset
+                    .checked_add(val_off)
+                    .ok_or(SegmentError::SectionOutOfBounds)?;
+                (val_abs, val_len)
+            }
+            ValueKind::Histogram => (0, 0),
+        };
+
+        let hist_range = match entry.value_kind {
+            ValueKind::Histogram => {
+                let hist_section = find_section(footer, section_kind::HIST_PAGES)
+                    .ok_or(SegmentError::MissingSection("HIST_PAGES"))?;
+                let (hist_off, hist_len) = entry.hist_page;
+                let hist_end = hist_off
+                    .checked_add(hist_len)
+                    .ok_or(SegmentError::SectionOutOfBounds)?;
+                if hist_end > hist_section.len {
+                    return Err(SegmentError::SectionOutOfBounds);
+                }
+                let hist_abs = hist_section
+                    .offset
+                    .checked_add(hist_off)
+                    .ok_or(SegmentError::SectionOutOfBounds)?;
+                (hist_abs, hist_len)
+            }
+            ValueKind::Scalar => (0, 0),
+        };
+
+        out.push(PlannedRange {
+            series_id: entry.series_id,
+            ts_range: (ts_abs, ts_len),
+            val_range,
+            hist_range,
         });
     }
     Ok(out)
@@ -982,6 +1152,253 @@ pub fn decode_pages_soa(
         return Err(SegmentError::Truncated);
     }
     Ok(val_kind)
+}
+
+// --- RSEG v3 HIST_PAGES decode (ADR-0017, docs/rseg-v3-plan.md section
+// 3.5). Byte-for-byte inverse of `encode_histogram_record_into`
+// (histogram.rs); every business-logic check that function's doc comment
+// defers to "the future reader" is enforced here, since every byte read
+// here is untrusted.
+
+fn take_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, SegmentError> {
+    let s = take_bytes(bytes, pos, 1)?;
+    Ok(s[0])
+}
+
+fn take_f64_le(bytes: &[u8], pos: &mut usize) -> Result<f64, SegmentError> {
+    let s = take_bytes(bytes, pos, 8)?;
+    let arr: [u8; 8] = s.try_into().map_err(|_| SegmentError::Truncated)?;
+    Ok(f64::from_le_bytes(arr))
+}
+
+/// Decodes one histogram side's spans (docs/rseg-v3-plan.md section 3.5):
+/// `uvarint span_count`, then `span_count` pairs of `(zigzag varint offset,
+/// uvarint length)`. Every `length` MUST be `> 0`. Returns the spans and
+/// the side's total bucket count (`sum(length)`, overflow-checked).
+fn decode_hist_spans(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> Result<(Vec<HistogramSpan>, u64), SegmentError> {
+    let span_count = to_usize(read_uvarint(bytes, pos)?)?;
+    let mut spans = Vec::with_capacity(span_count.min(bytes.len()));
+    let mut total: u64 = 0;
+    for _ in 0..span_count {
+        let offset = read_zigzag_varint(bytes, pos)?;
+        let offset = i32::try_from(offset).map_err(|_| SegmentError::FieldOverflow)?;
+        let length = read_uvarint(bytes, pos)?;
+        if length == 0 {
+            return Err(SegmentError::HistogramSpanLengthZero);
+        }
+        let length_u32 = u32::try_from(length).map_err(|_| SegmentError::FieldOverflow)?;
+        total = total
+            .checked_add(length)
+            .ok_or(SegmentError::FieldOverflow)?;
+        spans.push(HistogramSpan {
+            offset,
+            length: length_u32,
+        });
+    }
+    Ok((spans, total))
+}
+
+fn decode_hist_int_counts(bytes: &[u8], pos: &mut usize, n: u64) -> Result<Vec<u64>, SegmentError> {
+    let n = to_usize(n)?;
+    let mut out = Vec::with_capacity(n.min(bytes.len()));
+    for _ in 0..n {
+        out.push(read_uvarint(bytes, pos)?);
+    }
+    Ok(out)
+}
+
+fn decode_hist_float_counts(
+    bytes: &[u8],
+    pos: &mut usize,
+    n: u64,
+) -> Result<Vec<f64>, SegmentError> {
+    let n = to_usize(n)?;
+    let mut out = Vec::with_capacity(n.min(bytes.len()));
+    for _ in 0..n {
+        out.push(take_f64_le(bytes, pos)?);
+    }
+    Ok(out)
+}
+
+/// Decodes one HIST_SPANS record (docs/rseg-v3-plan.md section 3.5),
+/// enforcing every Corrupted rule: reserved flag bits zero, `scale >=
+/// -53`, `custom_values` present (non-empty, strictly ascending) iff
+/// `scale == -53`, every span `length > 0`, and `count >= zero_count`
+/// and `>= sum(all bucket_counts, both sides)`. The count check uses
+/// `<` (not `!(>=)`) for the float case so NaN/Inf payloads -- legal
+/// per section 3.5 -- pass through unchanged rather than being
+/// rejected (NaN comparisons are always false, matching the Gorilla
+/// page's NaN/-0.0 transparency rule).
+fn decode_histogram_record(bytes: &[u8], pos: &mut usize) -> Result<HistogramValue, SegmentError> {
+    let flags = take_u8(bytes, pos)?;
+    if flags >> 4 != 0 {
+        return Err(SegmentError::HistogramReservedFlagsNonZero);
+    }
+    let count_kind = flags & 0b1;
+    let has_sum = (flags >> 1) & 0b1 == 1;
+    let reset_hint = match (flags >> 2) & 0b11 {
+        0 => ResetHint::Unknown,
+        1 => ResetHint::Yes,
+        2 => ResetHint::No,
+        _ => ResetHint::Gauge,
+    };
+
+    let scale =
+        i32::try_from(read_zigzag_varint(bytes, pos)?).map_err(|_| SegmentError::FieldOverflow)?;
+    if scale < -53 {
+        return Err(SegmentError::HistogramScaleTooSmall(scale));
+    }
+    let zero_threshold = take_f64_le(bytes, pos)?;
+
+    let (zero_count_u64, count_u64, zero_count_f64, count_f64) = if count_kind == 0 {
+        (
+            read_uvarint(bytes, pos)?,
+            read_uvarint(bytes, pos)?,
+            0.0,
+            0.0,
+        )
+    } else {
+        (0, 0, take_f64_le(bytes, pos)?, take_f64_le(bytes, pos)?)
+    };
+
+    let sum = if has_sum {
+        Some(take_f64_le(bytes, pos)?)
+    } else {
+        None
+    };
+
+    let custom_values = if scale == -53 {
+        let n = to_usize(read_uvarint(bytes, pos)?)?;
+        if n == 0 {
+            return Err(SegmentError::HistogramCustomValuesMismatch);
+        }
+        let mut bounds = Vec::with_capacity(n.min(bytes.len()));
+        for _ in 0..n {
+            bounds.push(take_f64_le(bytes, pos)?);
+        }
+        if !bounds.windows(2).all(|w| w[0] < w[1]) {
+            return Err(SegmentError::HistogramCustomValuesMismatch);
+        }
+        Some(bounds)
+    } else {
+        None
+    };
+
+    let (positive_spans, positive_len) = decode_hist_spans(bytes, pos)?;
+    let (counts, negative_spans) = if count_kind == 0 {
+        let positive = decode_hist_int_counts(bytes, pos, positive_len)?;
+        let (negative_spans, negative_len) = decode_hist_spans(bytes, pos)?;
+        let negative = decode_hist_int_counts(bytes, pos, negative_len)?;
+        let mut total: u64 = 0;
+        for &v in positive.iter().chain(negative.iter()) {
+            total = total
+                .checked_add(v)
+                .ok_or(SegmentError::HistogramCountInconsistent)?;
+        }
+        if count_u64 < zero_count_u64 || count_u64 < total {
+            return Err(SegmentError::HistogramCountInconsistent);
+        }
+        (
+            HistogramCounts::Int {
+                zero_count: zero_count_u64,
+                count: count_u64,
+                positive,
+                negative,
+            },
+            negative_spans,
+        )
+    } else {
+        let positive = decode_hist_float_counts(bytes, pos, positive_len)?;
+        let (negative_spans, negative_len) = decode_hist_spans(bytes, pos)?;
+        let negative = decode_hist_float_counts(bytes, pos, negative_len)?;
+        let mut total = 0.0f64;
+        for &v in positive.iter().chain(negative.iter()) {
+            total += v;
+        }
+        if count_f64 < zero_count_f64 || count_f64 < total {
+            return Err(SegmentError::HistogramCountInconsistent);
+        }
+        (
+            HistogramCounts::Float {
+                zero_count: zero_count_f64,
+                count: count_f64,
+                positive,
+                negative,
+            },
+            negative_spans,
+        )
+    };
+
+    Ok(HistogramValue {
+        scale,
+        zero_threshold,
+        sum,
+        custom_values,
+        positive_spans,
+        negative_spans,
+        counts,
+        reset_hint,
+    })
+}
+
+/// Decodes one HIST_SPANS page (docs/rseg-v3-plan.md section 3.5): verifies
+/// the page header/crc, requires `enc == HIST_SPANS`, decompresses via the
+/// generic page-payload path (`comp` is writer policy, not a format
+/// restriction -- a HIST page may legally use the same `comp` enum as
+/// VAL/TS pages), then decodes exactly `entry.sample_count` records and
+/// requires the payload to end exactly there.
+fn decode_hist_page_into(
+    entry: &SeriesEntry,
+    page: &[u8],
+    limits: ReaderLimits,
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<HistogramValue>,
+) -> Result<(), SegmentError> {
+    let (enc, comp, payload) = split_page_header(&entry.series_id, page)?;
+    if enc != page_enc::HIST_SPANS {
+        return Err(SegmentError::InvalidEncoding(enc));
+    }
+    decompress_page_payload_into(comp, payload, limits, scratch)?;
+    let count = to_usize(u64::from(entry.sample_count))?;
+    out.clear();
+    out.reserve(count.min(scratch.len()));
+    let mut pos = 0usize;
+    for _ in 0..count {
+        out.push(decode_histogram_record(scratch, &mut pos)?);
+    }
+    if pos != scratch.len() {
+        return Err(SegmentError::TrailingBytes);
+    }
+    Ok(())
+}
+
+/// Decodes one histogram series' TS and HIST pages into samples, verifying
+/// page crc (with the series_id prefix binding), enc/comp validity, and
+/// every HIST_SPANS record's Corrupted rule (docs/rseg-v3-plan.md section
+/// 3.5). Preserves on-disk order, including duplicate timestamps. The
+/// histogram counterpart of [`decode_pages`].
+pub fn decode_histogram_pages(
+    entry: &SeriesEntry,
+    ts_page_bytes: &[u8],
+    hist_page_bytes: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<HistogramSample>, SegmentError> {
+    let mut scratch = Vec::new();
+    let mut timestamps = Vec::new();
+    decode_ts_page_into(entry, ts_page_bytes, limits, &mut scratch, &mut timestamps)?;
+    let mut values = Vec::new();
+    decode_hist_page_into(entry, hist_page_bytes, limits, &mut scratch, &mut values)?;
+    if timestamps.len() != values.len() {
+        return Err(SegmentError::Truncated);
+    }
+    Ok(timestamps
+        .into_iter()
+        .zip(values)
+        .map(|(ts_ns, value)| HistogramSample { ts_ns, value })
+        .collect())
 }
 
 // --- RSEG v2 decode path (ADR-0014, docs/segment-format.md "RSEG v2
@@ -1441,6 +1858,8 @@ pub fn decode_catalog_v2(
             max_ts_ns: tail.max_ts_ns[i],
             ts_page: tail.ts_page[i],
             val_page: tail.val_page[i],
+            value_kind: ValueKind::Scalar,
+            hist_page: (0, 0),
         });
     }
     Ok(entries)
@@ -1582,6 +2001,8 @@ pub fn decode_catalog_matching_v2(
             max_ts_ns: tail.max_ts_ns[i],
             ts_page: tail.ts_page[i],
             val_page: tail.val_page[i],
+            value_kind: ValueKind::Scalar,
+            hist_page: (0, 0),
         });
     }
     Ok(entries)

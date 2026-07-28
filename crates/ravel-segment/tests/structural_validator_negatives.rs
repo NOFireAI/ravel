@@ -217,15 +217,15 @@ fn v1_unknown_kind_is_skipped_not_rejected() {
     );
 }
 
-/// Pins: `validate_sections` rejects any trailer version other than 1 or 2
-/// (reader.rs `other => UnsupportedVersion(other)` dispatch arm), matching
-/// `parse_footer`'s accepted set.
+/// Pins: `validate_sections` rejects any trailer version other than 1, 2,
+/// or 3 (reader.rs `other => UnsupportedVersion(other)` dispatch arm),
+/// matching `parse_footer`'s accepted set.
 #[test]
 fn unsupported_version_rejected() {
     let (footer, region) = valid_footer();
     assert_eq!(
-        validate_sections(&footer, 3, region, ReaderLimits::default()),
-        Err(SegmentError::UnsupportedVersion(3))
+        validate_sections(&footer, 4, region, ReaderLimits::default()),
+        Err(SegmentError::UnsupportedVersion(4))
     );
 }
 
