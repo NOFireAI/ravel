@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestClock, commit_and_trailer_versions, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, SEGMENT_FORMAT_V2, WriteMode};
+use ravel_ingest::{IngestConfig, IngestRouter, SEGMENT_FORMAT_VERSION, WriteMode};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
@@ -83,9 +83,9 @@ async fn retried_data_put_is_idempotent_and_commits_exactly_once() {
 /// already-serialized, pinned segment bytes and never branches on RSEG
 /// version, so a duplicate-delivery fault on the data PUT must still
 /// resolve to exactly one data object and one commit record, and that
-/// object's trailer must still genuinely be v2.
+/// object's trailer must still genuinely be v5.
 #[tokio::test]
-async fn retried_data_put_is_idempotent_and_commits_exactly_once_with_v2() {
+async fn retried_data_put_is_idempotent_and_commits_exactly_once_with_v5() {
     let plan = FaultPlan::empty().with_rule(
         Rule::new(Op::Put, ScriptedFault::DuplicateDelivery)
             .with_key_contains("/l0/")
@@ -93,16 +93,7 @@ async fn retried_data_put_is_idempotent_and_commits_exactly_once_with_v2() {
     );
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let clock = TestClock::new(1_700_000_000_000_000_000);
-    let v2_config = IngestConfig {
-        segment_format_version: SEGMENT_FORMAT_V2,
-        ..config()
-    };
-    let router = IngestRouter::new(
-        v2_config,
-        Arc::clone(&store),
-        Signal::Metrics,
-        clock.clone(),
-    );
+    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
 
     let tenant = tenant("acme");
     let points = vec![make_point(
@@ -147,10 +138,10 @@ async fn retried_data_put_is_idempotent_and_commits_exactly_once_with_v2() {
         &receipt.tokens[0],
     )
     .await;
-    assert_eq!(record_version, u32::from(SEGMENT_FORMAT_V2));
+    assert_eq!(record_version, u32::from(SEGMENT_FORMAT_VERSION));
     assert_eq!(
-        trailer_version, SEGMENT_FORMAT_V2,
-        "the retried-and-deduplicated object must still be a genuine v2 object"
+        trailer_version, SEGMENT_FORMAT_VERSION,
+        "the retried-and-deduplicated object must still be a genuine v5 object"
     );
 
     router.shutdown().await;

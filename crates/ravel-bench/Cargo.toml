@@ -98,20 +98,6 @@ name = "ingest_bench"
 path = "src/bin/ingest_bench.rs"
 bench = false
 
-[[bin]]
-name = "codec_bakeoff"
-path = "src/bin/codec_bakeoff.rs"
-bench = false
-
-[[bin]]
-name = "profile_hotspots"
-path = "src/bin/profile_hotspots.rs"
-bench = false
-
-[[bin]]
-name = "section_bytes_report"
-path = "src/bin/section_bytes_report.rs"
-bench = false
 
 [[bin]]
 name = "segment_alloc_profile"
@@ -176,19 +162,7 @@ name = "segment_encode"
 harness = false
 
 [[bench]]
-name = "segment_decode_full"
-harness = false
-
-[[bench]]
-name = "segment_decode_selective"
-harness = false
-
-[[bench]]
 name = "series_id_hash"
-harness = false
-
-[[bench]]
-name = "matcher_scaling"
 harness = false
 
 [lints]

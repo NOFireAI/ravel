@@ -5,13 +5,10 @@
 //! would, then reads compaction output back down to samples for equivalence
 //! checks.
 //!
-//! Bootstrapping note (flagged in the task report): there is no public
-//! raw-samples -> v5 writer in this checkout (ingest still calls `write_v3`,
-//! shard.rs:468), and `write_v5` takes pre-framed runs. So this fixture
-//! bootstraps sample encoding through `write_v3` and slices the verbatim
-//! pages into single-run v5 objects, the same technique ravel-bench's
-//! `raw_to_v4_inputs` uses. This is the only `write_v3` reference in the
-//! crate and it lives entirely in test code.
+//! Bootstrapping note: sample encoding goes through the production
+//! raw-samples adapter (`SegmentWriter::write`, #179), and the framed
+//! pages are then sliced into single-run v5 inputs so each seeded
+//! object carries this fixture's explicit per-run provenance.
 #![allow(clippy::expect_used, clippy::unwrap_used, dead_code)]
 
 use std::collections::BTreeMap;
@@ -22,8 +19,8 @@ use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_segment::{
     CompactionMetaV4, ReaderLimits, RunInputV4, RunValuePageV4, SegmentIdentity, SegmentWriter,
-    SeriesEntryV4, SeriesInputV3, SeriesInputV4, SeriesValues, ValueKind, decode_catalog_v3,
-    decode_catalog_v5, decode_run_pages_soa, open_from_full, plan_ranges_v4,
+    SeriesEntryV4, SeriesInput, SeriesInputV4, ValueKind, decode_catalog_v5,
+    decode_run_pages_soa, open_from_full, plan_ranges_v4,
 };
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use uuid::Uuid;
@@ -150,17 +147,19 @@ pub fn build_v5_l0(
         min_ingest_ts_ns: provenance.0,
         max_ingest_ts_ns: provenance.0,
     };
-    // Bootstrap: encode to v3 to get framed pages, slice, rebuild as v5.
-    let v3_series: Vec<SeriesInputV3> = raw
+    // Bootstrap: encode through the production raw adapter (one run per
+    // series, v5), then slice the framed pages so this fixture keeps
+    // explicit control of per-run provenance.
+    let raw_series: Vec<SeriesInput> = raw
         .iter()
-        .map(|(id, ls, samples)| SeriesInputV3 {
+        .map(|(id, ls, samples)| SeriesInput {
             series_id: *id,
             labels: ls.clone(),
-            values: SeriesValues::Scalar(samples.clone()),
+            samples: samples.clone(),
         })
         .collect();
-    let v3 = SegmentWriter::write_v3(
-        v3_series,
+    let l0 = SegmentWriter::write(
+        raw_series,
         SegmentIdentity {
             tenant_hash: tenant_hash().0,
             shard: SHARD,
@@ -173,19 +172,12 @@ pub fn build_v5_l0(
             max_ingest_ts_ns: provenance.0,
         },
     )
-    .expect("write v3 bootstrap");
-    let obj = v3.bytes.as_ref();
+    .expect("write v5 bootstrap");
+    let obj = l0.bytes.as_ref();
     let limits = ReaderLimits::default();
-    let loc = open_from_full(obj, limits).expect("open v3");
+    let loc = open_from_full(obj, limits).expect("open v5");
     let footer = &loc.footer;
-    let entries = decode_catalog_v3(
-        footer,
-        section_bytes(obj, footer, LABEL_DICT),
-        section_bytes(obj, footer, SERIES_IDS),
-        section_bytes(obj, footer, SERIES_META),
-        limits,
-    )
-    .expect("decode v3 catalog");
+    let entries = decode_catalog_v5(footer, obj, limits).expect("decode v5 catalog");
     let ts_sec = footer.sections.iter().find(|s| s.kind == TS_PAGES).unwrap();
     let val_sec = footer
         .sections
@@ -195,22 +187,24 @@ pub fn build_v5_l0(
     let inputs: Vec<SeriesInputV4> = entries
         .iter()
         .map(|e| {
-            let (o, l) = e.ts_page;
+            // The raw adapter frames exactly one run per series.
+            let run = &e.runs[0];
+            let (o, l) = run.ts_page;
             let a = (ts_sec.offset + o) as usize;
             let ts_page = obj[a..a + l as usize].to_vec();
-            let (o, l) = e.val_page;
+            let (o, l) = run.val_page;
             let a = (val_sec.offset + o) as usize;
             let val_page = obj[a..a + l as usize].to_vec();
             SeriesInputV4 {
-                series_id: e.series_id,
-                labels: e.labels.clone(),
+                series_id: e.entry.series_id,
+                labels: e.entry.labels.clone(),
                 runs: vec![RunInputV4 {
                     created_unix_ns: provenance.0,
                     writer_epoch: provenance.1,
                     writer_seq: provenance.2,
-                    min_ts_ns: e.min_ts_ns,
-                    max_ts_ns: e.max_ts_ns,
-                    sample_count: e.sample_count,
+                    min_ts_ns: run.min_ts_ns,
+                    max_ts_ns: run.max_ts_ns,
+                    sample_count: run.sample_count,
                     ts_page,
                     value_page: RunValuePageV4::Scalar(val_page),
                 }],

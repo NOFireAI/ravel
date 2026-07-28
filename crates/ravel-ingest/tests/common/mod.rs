@@ -15,7 +15,7 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_ingest::{Clock, SEGMENT_FORMAT_V2};
+use ravel_ingest::{Clock, SEGMENT_FORMAT_VERSION};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -159,17 +159,15 @@ pub fn series_input(
     }
 }
 
-/// Writes a real RSEG segment (v1 via `SegmentWriter::write`, v2 via
-/// `SegmentWriter::write_v2` depending on `segment_format_version`) and
-/// publishes its commit record directly, bypassing `IngestRouter`. Used by
-/// tests that need to pin exact commit identity (writer_seq,
-/// ingest_hour_bucket, created_unix_ns) or mix RSEG versions within one
-/// catalog snapshot, which a single `IngestRouter` cannot produce in one
-/// flush.
+/// Writes a real RSEG v5 segment (`SegmentWriter::write`, the raw-sample
+/// adapter) and publishes its commit record directly, bypassing
+/// `IngestRouter`. Used by tests that need to pin exact commit identity
+/// (writer_seq, ingest_hour_bucket, created_unix_ns) that a single
+/// `IngestRouter` cannot produce in one flush. ADR-0027: v5 is the only
+/// version, so there is no version to choose.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_segment(
     store: &dyn ObjectStoreBackend,
-    segment_format_version: u16,
     tenant_hash: TenantHash,
     shard: u32,
     writer_id: Uuid,
@@ -190,11 +188,7 @@ pub async fn publish_segment(
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
     };
-    let written = if segment_format_version == SEGMENT_FORMAT_V2 {
-        SegmentWriter::write_v2(series, identity, bounds).expect("write v2 segment")
-    } else {
-        SegmentWriter::write(series, identity, bounds).expect("write v1 segment")
-    };
+    let written = SegmentWriter::write(series, identity, bounds).expect("write v5 segment");
 
     let new_record = NewCommitRecord {
         tenant_hash,
@@ -211,7 +205,7 @@ pub async fn publish_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: u32::from(segment_format_version),
+        segment_format_version: u32::from(SEGMENT_FORMAT_VERSION),
         created_unix_ns,
         ingest_hour_bucket,
     };

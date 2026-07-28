@@ -10,7 +10,7 @@
 #![allow(clippy::expect_used)]
 
 use ravel_segment::{
-    IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesEntry, SeriesInput,
+    IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesEntryV4, SeriesInput,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -64,15 +64,6 @@ fn slice(bytes: &[u8], range: (u64, u64)) -> &[u8] {
     &bytes[range.0 as usize..(range.0 + range.1) as usize]
 }
 
-/// Absolute (offset, len) of a section by kind, from a footer.
-fn section_range(footer: &ravel_segment::Footer, kind: u32) -> Option<(u64, u64)> {
-    footer
-        .sections
-        .iter()
-        .find(|s| s.kind == kind)
-        .map(|s| (s.offset, s.len))
-}
-
 // --- a1-F01 -----------------------------------------------------------------
 //
 // `decompress_page_payload_into`'s `comp = NONE` branch copied the payload
@@ -89,20 +80,12 @@ fn f01_none_page_ignores_max_page_uncompressed_cap() {
     let catalog_limits = ReaderLimits::default();
 
     let loc = ravel_segment::open_from_full(&object, catalog_limits).expect("opens");
-    let dict = slice(
-        &object,
-        section_range(&loc.footer, 1).expect("LABEL_DICT present"),
-    );
-    let table = slice(
-        &object,
-        section_range(&loc.footer, 2).expect("SERIES_TABLE present"),
-    );
     let entries =
-        ravel_segment::decode_catalog(&loc.footer, dict, table, catalog_limits).expect("catalog");
+        ravel_segment::decode_catalog_v5(&loc.footer, &object, catalog_limits).expect("catalog");
     assert_eq!(entries.len(), 1);
 
-    let selected: Vec<&SeriesEntry> = entries.iter().collect();
-    let ranges = ravel_segment::plan_ranges(&loc.footer, &selected).expect("ranges");
+    let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v4(&loc.footer, &selected).expect("ranges");
     let ts_bytes = slice(&object, ranges[0].ts_range);
     let val_bytes = slice(&object, ranges[0].val_range);
 
@@ -114,7 +97,20 @@ fn f01_none_page_ignores_max_page_uncompressed_cap() {
         max_page_uncompressed_bytes: 4,
     };
 
-    let result = ravel_segment::decode_pages(&entries[0], ts_bytes, val_bytes, tight);
+    let run = &entries[0].runs[0];
+    let mut scratch = Vec::new();
+    let mut timestamps = Vec::new();
+    let mut values = Vec::new();
+    let result = ravel_segment::decode_run_pages_soa(
+        &entries[0].entry.series_id,
+        run,
+        ts_bytes,
+        val_bytes,
+        tight,
+        &mut scratch,
+        &mut timestamps,
+        &mut values,
+    );
     assert!(
         matches!(
             result,

@@ -23,7 +23,7 @@ OTLP gRPC / OTLP HTTP-protobuf / Remote Write 1.0+2.0 (/api/v1/write)
   query frontend: /api/v1/query, /query_range, /labels, /series  -+
         |
         v
-  segment reader: suffix GET footer -> prune series via SERIES_TABLE
+  segment reader: suffix GET footer -> prune series via SERIES_META
                   -> ranged GETs for needed pages -> sample iterators
         |
         v

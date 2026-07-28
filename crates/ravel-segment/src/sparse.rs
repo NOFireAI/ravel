@@ -38,7 +38,7 @@ use crate::format::{
 };
 use crate::reader::{
     DictResolver, RunEntry, SeriesEntry, SeriesEntryV4, ValueKind, check_series_counts_v2,
-    decode_section_bytes, find_section, index_label_dict, open_from_full, parse_schema_list_v2,
+    decode_section_bytes, find_section, index_label_dict, parse_schema_list_v2,
     parse_schema_ref_block_v2, parse_series_ids_v2, parse_value_ord_block_all_v2, take_block,
     take_u32_le,
 };
@@ -1164,11 +1164,41 @@ fn build_series_idx(
 /// (which this same process just wrote and which is therefore well-formed);
 /// any decode failure is an internal invariant violation surfaced as
 /// [`WriteError::SparseAssembly`].
+/// Decodes the Footer protobuf from a trusted, freshly built v4-grammar base
+/// object's trailer, bypassing the reader's version gate (the base carries
+/// the retired v4 trailer version that `parse_footer` rejects; this is
+/// trusted in-memory input from the same process).
+fn decode_base_footer(obj: &[u8]) -> Result<Footer, WriteError> {
+    let total = obj.len();
+    let trailer_len = crate::format::TRAILER_LEN as usize;
+    if total < trailer_len {
+        return Err(WriteError::SparseAssembly(
+            "base object smaller than trailer".into(),
+        ));
+    }
+    let footer_len = u32::from_le_bytes([
+        obj[total - 16],
+        obj[total - 15],
+        obj[total - 14],
+        obj[total - 13],
+    ]) as usize;
+    let footer_end = total - trailer_len;
+    let footer_start = footer_end
+        .checked_sub(footer_len)
+        .ok_or_else(|| WriteError::SparseAssembly("base footer_len out of range".into()))?;
+    Footer::decode(&obj[footer_start..footer_end])
+        .map_err(|e| WriteError::SparseAssembly(e.to_string()))
+}
+
 pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegment, WriteError> {
     let obj = base.bytes.as_ref();
     let limits = ReaderLimits::default();
-    let loc = open_from_full(obj, limits).map_err(write_err)?;
-    let footer = &loc.footer;
+    // The base is this process's own freshly built v4-grammar object, so it
+    // carries the retired v4 trailer version that the public reader now
+    // rejects (ADR-0027). Decode its footer directly -- trusted in-memory
+    // input, not an untrusted stored object.
+    let footer = decode_base_footer(obj)?;
+    let footer = &footer;
 
     let label_dict = locate(obj, footer, section_kind::LABEL_DICT)?;
     let series_ids = locate(obj, footer, section_kind::SERIES_IDS)?;

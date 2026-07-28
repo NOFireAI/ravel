@@ -1,45 +1,40 @@
 //! Constants and small binary-layout facts from docs/segment-format.md.
 //! Kept in one place so writer and reader can't drift apart.
 
-/// Trailer magic bytes, last 4 bytes of every RSEG v1 object.
+/// Trailer magic bytes, last 4 bytes of every RSEG object.
 pub const MAGIC: [u8; 4] = *b"RSG1";
 
-/// Format version recorded in the trailer. This is the v1 layout; the
-/// writer emits this value until the v2 writer path lands
-/// (docs/rseg-v2-plan.md phase 2).
+/// Retired RSEG v1 trailer version (ADR-0027). The reader rejects it with
+/// `UnsupportedVersion`; the number is reserved forever and never reused, so
+/// a stray v1 object stays detectably foreign. Kept only to pin the retired
+/// value.
+#[allow(dead_code)]
 pub const VERSION: u16 = 1;
 
-/// RSEG v2 trailer version (ADR-0014, docs/rseg-v2-plan.md). Same magic and
-/// trailer layout as v1; only the catalog section set and LABEL_DICT
-/// ordering rule change. Written by `SegmentWriter::write_v2` (issue #30);
-/// not yet read by this crate's reader (phase 3, issue #31).
+/// Retired RSEG v2 trailer version (ADR-0014, retired by ADR-0027). Rejected
+/// by the reader; reserved, never reused.
+#[allow(dead_code)]
 pub const VERSION_V2: u16 = 2;
 
-/// RSEG v3 trailer version (ADR-0017, docs/rseg-v3-plan.md). Strict
-/// superset of v2: adds the HIST_PAGES section, a HIST_SPANS page
-/// encoding, and three SERIES_META column blocks for native-histogram
-/// values. Same magic and trailer layout as v1/v2. Written by
-/// `SegmentWriter::write_v3` (docs/rseg-v3-plan.md C3); not yet read by
-/// this crate's reader (C4).
+/// Retired RSEG v3 trailer version (ADR-0017, retired by ADR-0027). Rejected
+/// by the reader; reserved, never reused.
+#[allow(dead_code)]
 pub const VERSION_V3: u16 = 3;
 
-/// RSEG v4 trailer version (ADR-0018, docs/compaction-retention-plan.md).
-/// Strict superset of v3: SERIES_META's per-series run columns become
-/// run-major (a series may carry more than one run), and the Footer gains
-/// additive compaction-provenance fields. No new section kind or page
-/// encoding; HIST_PAGES bytes from v3 inputs are copied verbatim per run.
-/// Same magic and trailer layout as v1/v2/v3. Written by
-/// `SegmentWriter::write_v4`; not yet read by this crate's reader (P3).
+/// Retired RSEG v4 trailer version (ADR-0018, retired by ADR-0027). Rejected
+/// by the reader; reserved, never reused. The v4 grammar itself lives on as
+/// the below-threshold v5 grammar, so this number is written only
+/// transiently by the private v4 encode core before the trailer is rewritten
+/// to `VERSION_V5`.
 pub const VERSION_V4: u16 = 4;
 
-/// RSEG v5 trailer version (ADR-0026, docs/segment-format.md "RSEG v5
-/// amendment"). The v4 grammar plus two optional sparse-catalog sections:
-/// SERIES_IDX (kind 8) and chunked SERIES_META (kind 9, replacing the kind 6
-/// whole-section form when present). The sparse sections are emitted only
-/// when the output object carries [`V5_SPARSE_THRESHOLD`] or more series;
-/// below that a v5 object is byte-identical to the v4 object it would be,
-/// save the trailer version bytes. Same magic and trailer layout as
-/// v1/v2/v3/v4. Written by `SegmentWriter::write_v5`.
+/// RSEG v5 trailer version (docs/segment-format.md). ADR-0027 leaves this the
+/// only readable and writable version: the run-major grammar plus two
+/// optional sparse-catalog sections, SERIES_IDX (kind 8) and chunked
+/// SERIES_META (kind 9, replacing the kind 6 whole-section form when
+/// present). The sparse sections are emitted only when the output object
+/// carries [`V5_SPARSE_THRESHOLD`] or more series; below that the object omits
+/// them and uses the whole SERIES_META. Written by every writer.
 pub const VERSION_V5: u16 = 5;
 
 /// Series-count threshold at or above which `SegmentWriter::write_v5` emits
@@ -72,32 +67,32 @@ pub const TRAILER_LEN: u64 = 16;
 /// MUST be skipped by readers.
 pub mod section_kind {
     pub const LABEL_DICT: u32 = 1;
+    /// Retired with RSEG v1 (ADR-0027): the old row-major catalog. The kind
+    /// number is reserved forever and never reused, so a stray v1 object
+    /// stays detectably foreign; no v5 object ever emits it. Kept to pin the
+    /// retired value.
+    #[allow(dead_code)]
     pub const SERIES_TABLE: u32 = 2;
     pub const TS_PAGES: u32 = 3;
     pub const VAL_PAGES: u32 = 4;
-    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Emitted by
-    /// `SegmentWriter::write_v2` (issue #30).
+    /// The columnar series-id list. Emitted by every v5 object.
     pub const SERIES_IDS: u32 = 5;
-    /// RSEG v2 only (ADR-0014); v1 objects never emit this kind. Emitted by
-    /// `SegmentWriter::write_v2` (issue #30).
+    /// The whole-section columnar SERIES_META, emitted by a v5 object below
+    /// the sparse threshold (replaced by SERIES_META_CHUNKS above it).
     pub const SERIES_META: u32 = 6;
-    /// RSEG v3 only (ADR-0017); v1/v2 objects never emit this kind.
-    /// Histogram-value pages, one per histogram series
-    /// (docs/segment-format.md "RSEG v3 amendment"). Emitted by
-    /// `SegmentWriter::write_v3` (docs/rseg-v3-plan.md C3).
+    /// Histogram-value pages, one per histogram run
+    /// (docs/segment-format.md). Present only when the object carries a
+    /// histogram-kind series.
     pub const HIST_PAGES: u32 = 7;
-    /// RSEG v5 only (ADR-0026); v1-v4 objects never emit this kind. The
-    /// sparse series-id index: every Kth series id plus its SERIES_IDS byte
-    /// window (offset/len/crc32c) and the meta-chunk directory (each chunk's
-    /// stored range plus crc32c). Present only in a v5 object that met the
-    /// sparse-emission threshold (docs/segment-format.md "RSEG v5
-    /// amendment"). Emitted by `SegmentWriter::write_v5`.
+    /// The sparse series-id index: every Kth series id plus its SERIES_IDS
+    /// byte window (offset/len/crc32c) and the meta-chunk directory (each
+    /// chunk's stored range plus crc32c). Present only in a v5 object that
+    /// met the sparse-emission threshold (docs/segment-format.md).
     pub const SERIES_IDX: u32 = 8;
-    /// RSEG v5 only (ADR-0026); v1-v4 objects never emit this kind. The
-    /// chunked SERIES_META form: a small schema header followed by per-chunk
-    /// zstd frames, replacing the kind 6 whole-section SERIES_META when
-    /// present (docs/segment-format.md "RSEG v5 amendment"). Present only
-    /// alongside SERIES_IDX. Emitted by `SegmentWriter::write_v5`.
+    /// The chunked SERIES_META form: a small schema header followed by
+    /// per-chunk zstd frames, replacing the kind 6 whole-section SERIES_META
+    /// when present (docs/segment-format.md). Present only alongside
+    /// SERIES_IDX.
     pub const SERIES_META_CHUNKS: u32 = 9;
 }
 

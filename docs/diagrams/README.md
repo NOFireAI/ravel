@@ -42,40 +42,34 @@ commit crates match this sequence end to end against MinIO/S3).
 
 ## rseg-layout.svg
 
-The byte layout of an RSEG object. The main drawing is the v1 baseline:
-LABEL_DICT and SERIES_TABLE sections, the TS_PAGES and VAL_PAGES
-containers with per-page headers (enc, comp, and a crc computed over
-series_id plus enc plus comp plus payload), the protobuf footer, and the
-16-byte trailer with its field breakdown. Brackets show exactly what
-footer_crc32c, a section's crc32c, and a page's crc each cover. A format
-evolution panel at the bottom shows the section tape of each version:
-v2 (ADR-0014, columnar SERIES_IDS + SERIES_META catalog, sorted dict,
-VAL_RAW_F64 alignment), v3 (ADR-0017, native histograms, HIST_PAGES),
-v4 (ADR-0018, multi-run L1 compaction output), and v5 (ADR-0026, the
-compacted-tier sparse catalog: SERIES_IDX kind 8 + chunked SERIES_META
-kind 9, emitted at >= 4096 series, with per-window and per-chunk crc32c
-so a range-GET verifies what it touches; below the threshold a v5 object
-is the v4 object plus a version bump). Trailer, reader protocol, and
-checksum rules are shared by all five versions.
+The byte layout of an RSEG v5 object (the only supported version,
+ADR-0027). The main drawing is the v5 layout: LABEL_DICT and SERIES_IDS,
+the run-major SERIES_META catalog (or, at/above the 4096-series threshold,
+the sparse SERIES_IDX kind 8 + chunked SERIES_META_CHUNKS kind 9 pair),
+the TS_PAGES / VAL_PAGES / HIST_PAGES containers with per-page headers
+(enc, comp, and a crc computed over series_id plus enc plus comp plus
+payload), the protobuf footer, and the 16-byte trailer with its field
+breakdown. Brackets show exactly what footer_crc32c, a section's crc32c,
+each sparse partial-fetch crc32c (id window, meta chunk frame), and a
+page's crc each cover. A short history note points at the ADRs that built
+up the layout.
 
-Illustrates: docs/segment-format.md (v1 plus the v2/v3/v4/v5 amendment
-sections), docs/adrs/0004-rseg-format.md,
+Illustrates: docs/segment-format.md (the self-contained v5 spec),
+docs/adrs/0004-rseg-format.md,
 docs/adrs/0010-spec-amendments-review-1.md (§4, checksum coverage),
-docs/adrs/0014, 0017, 0018, 0026.
+docs/adrs/0014, 0017, 0018, 0026, 0027.
 
-Last verified against the code: 2026-07-28 (v1 frozen and proved
-byte-identical by the golden-bytes test; v2/v3 writers emit sorted
-LABEL_DICT since issue #146, v4 since #155; v2 byte gates measured and
-enforced by the deterministic catalog_byte_gates test in ravel-bench,
-issue #166; v5 sparse sections added by #176, byte-gated < 1% of object
-at the 10k shape and golden-pinned by golden_bytes_v5).
+Last verified against the code: 2026-07-28 (v5 is the only readable and
+writable version, ADR-0027; frozen and proved byte-identical by the
+golden_bytes_v5 test; the sparse sections are byte-gated < 1% of object at
+the 10k shape by the deterministic catalog_byte_gates test in ravel-bench).
 
 ## query-path.svg
 
 The query path from an incoming PromQL request to the JSON response:
 catalog snapshot resolution (the listing window plus exact-key token
 reads), a suffix GET of each segment's footer, series pruning through
-SERIES_TABLE and LABEL_DICT, range coalescing into a small number of GETs,
+SERIES_META and LABEL_DICT, range coalescing into a small number of GETs,
 page decode, cross-segment dedup order, the PromQL evaluator, and the
 Prometheus JSON envelope.
 
