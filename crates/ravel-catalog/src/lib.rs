@@ -11,6 +11,7 @@ mod error;
 mod fold;
 mod snapshot;
 mod snapshot_format;
+mod snapshot_resolve;
 
 pub use catalog::Catalog;
 pub use config::{
