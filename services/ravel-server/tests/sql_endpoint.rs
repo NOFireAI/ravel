@@ -329,14 +329,20 @@ async fn rejected_statement_kinds_return_400_over_http() {
     }
 }
 
+/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): the
+/// sequential-fold UDAF now answers over HTTP like any other aggregate.
+/// Bit-exactness against the reference fold is gated in
+/// crates/ravel-sql/tests/differential.rs; this only checks the endpoint
+/// wires the result through instead of rejecting it.
 #[tokio::test]
-async fn avg_is_rejected_with_a_message_naming_the_workaround() {
-    let app = one_tenant_app("m", &[(1, 1.0)]).await;
+async fn avg_returns_a_json_result() {
+    let app = one_tenant_app("m", &[(1, 1.0), (2, 2.0), (3, 3.0)]).await;
     let (status, value) = post_json(&app, "acme-token", "SELECT avg(value) FROM samples").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let message = value["error"].as_str().expect("message");
-    assert!(message.contains("sum"), "{message}");
-    assert!(message.contains("count"), "{message}");
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], serde_json::json!(2.0));
 }
 
 // ---------------------------------------------------------------------------
