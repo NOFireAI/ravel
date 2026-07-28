@@ -1,11 +1,11 @@
 //! PromQL evaluator core (ADR-0007, ADR-0021). A typed recursive-descent
 //! interpreter over the promql-parser AST: [`Value`] is the internal result
 //! type (scalar, string, instant vector, range matrix), and [`Evaluator`]
-//! walks paren expressions, unary minus, number/string literals, and vector
-//! and matrix selectors (with `offset` and the `@` modifier, including
-//! `start()`/`end()`). Every other AST node (aggregation, binary expression,
-//! subquery, function call) is rejected with [`Error::Unsupported`], naming
-//! the construct.
+//! walks paren expressions, unary minus, number/string literals, vector and
+//! matrix selectors (with `offset` and the `@` modifier, including
+//! `start()`/`end()`), function calls (`crate::functions`), and binary
+//! expressions (`crate::binop`). Every other AST node (aggregation,
+//! subquery) is rejected with [`Error::Unsupported`], naming the construct.
 //!
 //! ## Time precision
 //!
@@ -149,6 +149,8 @@ pub enum Error {
     InvalidLabelName { label: String },
     #[error("invalid regular expression {pattern:?}: {reason}")]
     InvalidRegex { pattern: String, reason: String },
+    #[error("multiple matches for labels: {detail}")]
+    AmbiguousMatch { detail: String },
 }
 
 /// Default PromQL lookback: 5 minutes, in nanoseconds (ADR-0007). This is
@@ -347,6 +349,13 @@ impl Evaluator {
                 };
                 Ok(Value::Matrix(matrix))
             }
+            RangeCore::Generic(e) => {
+                let matrix =
+                    crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+                        self.eval_expr(source, e, t, &ctx)
+                    })?;
+                Ok(Value::Matrix(matrix))
+            }
         }
     }
 
@@ -408,6 +417,7 @@ impl Evaluator {
                 .eval_matrix_selector(source, ms, eval_ts_ns, ctx)
                 .map(Value::Matrix),
             Expr::Call(c) => crate::functions::eval_call(self, source, c, eval_ts_ns, ctx),
+            Expr::Binary(b) => crate::binop::eval_binary(self, source, b, eval_ts_ns, ctx),
             _ => Err(unsupported_construct_error(expr)),
         }
     }
@@ -674,6 +684,14 @@ enum RangeCore<'a> {
     Str(&'a str),
     Selector(&'a promql_parser::parser::VectorSelector),
     Call(&'a promql_parser::parser::Call),
+    /// A binary expression: re-evaluated per grid step through the general
+    /// `eval_expr` (not a single selector, so unlike the other arms it
+    /// cannot be range-fetched in one storage call). Holds the outermost
+    /// `expr` passed to `resolve_range_core`, not the `Paren`/`Unary`-
+    /// peeled `cur`, so any enclosing negation or parens are re-applied by
+    /// `eval_expr` itself at each step rather than needing a second
+    /// `negate` bit here.
+    Generic(&'a promql_parser::parser::Expr),
 }
 
 /// Strip `Paren`/`Unary` wrappers from `expr`, returning the core construct
@@ -709,6 +727,7 @@ fn resolve_range_core(expr: &promql_parser::parser::Expr) -> Result<(RangeCore<'
             // "function call: {name}" error a future family's addition
             // would otherwise have to update this match to keep producing).
             Expr::Call(c) => return Ok((RangeCore::Call(c), negate)),
+            Expr::Binary(_) => return Ok((RangeCore::Generic(expr), false)),
             _ => return Err(unsupported_construct_error(cur)),
         }
     }
@@ -727,9 +746,6 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
         Expr::Aggregate(a) => Error::Unsupported {
             construct: format!("aggregation: {}", a.op),
         },
-        Expr::Binary(b) => Error::Unsupported {
-            construct: format!("binary expression: {}", b.op),
-        },
         Expr::Subquery(_) => Error::Unsupported {
             construct: "subquery".to_string(),
         },
@@ -742,7 +758,8 @@ fn unsupported_construct_error(expr: &promql_parser::parser::Expr) -> Error {
         | Expr::StringLiteral(_)
         | Expr::VectorSelector(_)
         | Expr::MatrixSelector(_)
-        | Expr::Call(_) => {
+        | Expr::Call(_)
+        | Expr::Binary(_) => {
             unreachable!("caller must handle every supported construct before falling back")
         }
     }
@@ -1251,7 +1268,6 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("sort_by_label(up)", "sort_by_label"),
             ("sum(up)", "sum"),
-            ("up + down", "binary expression"),
             ("up[5m:1m]", "subquery"),
         ];
         for (query, expected_substr) in cases {

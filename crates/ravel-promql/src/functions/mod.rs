@@ -348,7 +348,7 @@ pub(crate) fn eval_range_call(
 /// [`FunctionKind::Instant`] function without needing anything from
 /// `eval.rs`'s own selector/matrix machinery beyond the `Value` it already
 /// returns.
-fn eval_instant_over_grid(
+pub(crate) fn eval_instant_over_grid(
     start_ns: i64,
     end_ns: i64,
     step_ns: i64,
