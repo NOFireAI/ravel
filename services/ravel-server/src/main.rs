@@ -22,6 +22,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    ravel_server::warn_dev_insecure_tenant_header(cli.dev_insecure_tenant_header);
+
     let tenant_tokens = cli.parse_tenant_tokens()?;
     let tenant_resolver =
         ravel_server::tenant::build_resolver(tenant_tokens, cli.dev_insecure_tenant_header);

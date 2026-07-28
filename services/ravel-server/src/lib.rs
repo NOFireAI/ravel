@@ -28,6 +28,23 @@ pub use config::{Cli, Mode, StoreKind};
 
 const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Emits a prominent startup warning when the dev-only insecure tenant header
+/// is enabled. The `--dev-insecure-tenant-header` flag lets a client name its
+/// own tenant via `x-ravel-tenant`, bypassing authenticated tenant resolution.
+/// ADR-0009 requires this dev-only escape hatch to be logged loudly so an
+/// operator who leaves it on in a real deployment has a signal. No-op when the
+/// flag is off. Call this once at startup after CLI parsing.
+pub fn warn_dev_insecure_tenant_header(enabled: bool) {
+    if enabled {
+        tracing::warn!(
+            "SECURITY: --dev-insecure-tenant-header is ENABLED. Tenant isolation is bypassed: \
+             any client can name its own tenant via the x-ravel-tenant header, without \
+             authentication. This is for local development only and must NEVER be used in \
+             production."
+        );
+    }
+}
+
 pub struct ServerConfig {
     pub mode: Mode,
     pub listen_http: SocketAddr,
