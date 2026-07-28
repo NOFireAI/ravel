@@ -365,6 +365,13 @@ mode: error
         let entries =
             parse_corpus(include_str!("../corpus/aggregate.txt")).expect("parse aggregate corpus");
         assert!(entries.len() >= 15);
-        assert!(entries.iter().any(|e| e.mode == ComparisonMode::Ordered));
+        // No entry here uses `mode: ordered` (issue #177 moved the two
+        // topk/bottomk tie-boundary entries to `unordered`: this dataset's
+        // only values produce a tie at both the top and bottom, so there is
+        // no tie-free query left to assert a specific rank order against;
+        // rank-order correctness itself stays covered by aggregate.rs's own
+        // unit tests, e.g. topk_returns_original_series_identity_in_
+        // descending_order).
+        assert!(entries.iter().any(|e| e.mode == ComparisonMode::Unordered));
     }
 }
