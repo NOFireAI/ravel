@@ -136,8 +136,13 @@ pub enum Error {
     },
 }
 
-/// Default PromQL lookback: 5 minutes, in nanoseconds.
-pub(crate) const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
+/// Default PromQL lookback: 5 minutes, in nanoseconds (ADR-0007). This is
+/// the single source of truth for the lookback delta. The evaluator uses it
+/// as its default lookback window ([`Evaluator::default`]) and `ravel-query`
+/// consumes it (re-exported from the crate root) so its pre-fetch padding
+/// (`padded_range`, docs/query-engine.md) can never drift from the window
+/// evaluation actually selects over.
+pub const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 
 /// Default cap on the number of evaluation points (grid steps) a single
 /// range query may produce, counting both endpoints when the range is
