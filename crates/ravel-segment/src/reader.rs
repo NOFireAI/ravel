@@ -2008,6 +2008,463 @@ pub fn decode_catalog_matching_v2(
     Ok(entries)
 }
 
+// --- RSEG v3 SERIES_IDS/SERIES_META decode (ADR-0017, docs/rseg-v3-plan.md
+// section 3.4). Reuses every version-agnostic v2 primitive (`take_block`,
+// `parse_series_ids_v2`, `parse_schema_list_v2`, `check_series_counts_v2`,
+// `parse_schema_ref_block_v2`, `parse_value_ord_block_all_v2`/
+// `_selective_v2`, `reconstruct_ranges_v2`) exactly as v2's SERIES_IDS/
+// LABEL_DICT grammar and section-compression envelope are unchanged in v3;
+// only SERIES_META's tail (blocks 3-12, vs. v2's blocks 3-9) and the
+// catalog decoders themselves are new, mirroring the reuse boundary v2's
+// own decode path documents above.
+
+/// Per-series output of SERIES_META's v3 blocks 3-12 (docs/rseg-v3-plan.md
+/// section 3.4): the shared blocks 3-9 (identical grammar to v2's
+/// `SeriesMetaTailV2`) plus the three v3-only blocks (`value_kind`,
+/// `hist_page_gap`, `hist_page_len`).
+struct SeriesMetaTailV3 {
+    sample_count: Vec<u32>,
+    min_ts_ns: Vec<i64>,
+    max_ts_ns: Vec<i64>,
+    ts_page: Vec<(u64, u64)>,
+    val_page: Vec<(u64, u64)>,
+    value_kind: Vec<ValueKind>,
+    hist_page: Vec<(u64, u64)>,
+}
+
+/// SERIES_META blocks 3-12 (docs/rseg-v3-plan.md section 3.4): identical
+/// work to [`parse_series_meta_tail_v2`] for blocks 3-9, then the three
+/// v3-only columns. VAL_PAGES/HIST_PAGES are each optional in v3 (section
+/// 3.2), so their gap/len columns are reconstructed against the section's
+/// `len` when present, or against `0` when absent -- a series with no
+/// bytes in that kind (gap=0, len=0) reconstructs to `(0, 0)` either way,
+/// while a series claiming bytes in a wholly absent section fails the
+/// existing `SectionOutOfBounds` bounds check. The value_kind-vs-page
+/// cross-check (`ScalarSeriesHasHistPage`, `HistogramSeriesHasValPage`,
+/// `ZeroHistPageLen`) runs after all three new columns are parsed, moving
+/// the final trailing-bytes check to after block 12. The aggregate
+/// value_kind-count-vs-page-count equality check and the
+/// section-present-but-unneeded check (`ValueKindPageCountMismatch`,
+/// `UnexpectedSectionPresent`) need the footer's section list alongside
+/// the fully parsed tail, so those run in the caller (`decode_catalog_v3`/
+/// `decode_catalog_matching_v3`) via `check_value_kind_pages_v3`, not here.
+fn parse_series_meta_tail_v3(
+    meta_bytes: &[u8],
+    pos: &mut usize,
+    footer: &Footer,
+    count: u32,
+) -> Result<SeriesMetaTailV3, SegmentError> {
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut sample_count = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        let v = read_uvarint(block, &mut bpos)?;
+        let v = u32::try_from(v).map_err(|_| SegmentError::FieldOverflow)?;
+        if v == 0 {
+            return Err(SegmentError::ZeroSampleCount);
+        }
+        sample_count.push(v);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut min_ts_ns = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        let delta = read_uvarint(block, &mut bpos)?;
+        let sum = i128::from(footer.min_event_ts_ns) + i128::from(delta);
+        min_ts_ns.push(i64::try_from(sum).map_err(|_| SegmentError::TimestampBoundsOverflow)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut max_ts_ns = Vec::with_capacity((count as usize).min(block.len()));
+    for &min_ts in min_ts_ns.iter().take(count as usize) {
+        let span = read_uvarint(block, &mut bpos)?;
+        let sum = i128::from(min_ts) + i128::from(span);
+        max_ts_ns.push(i64::try_from(sum).map_err(|_| SegmentError::TimestampBoundsOverflow)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    let ts_section = find_section(footer, section_kind::TS_PAGES)
+        .ok_or(SegmentError::MissingSection("TS_PAGES"))?;
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut ts_gap = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        ts_gap.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut ts_len = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        ts_len.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let ts_page = reconstruct_ranges_v2(&ts_gap, &ts_len, ts_section.len)?;
+
+    // VAL_PAGES is optional in v3: absent (zero scalar series) is treated
+    // as a zero-length region, so a series legitimately carrying (0, 0)
+    // here still reconstructs cleanly, while a series claiming real bytes
+    // against an absent section fails the same bounds check v2 relies on.
+    let val_section_len = find_section(footer, section_kind::VAL_PAGES)
+        .map(|s| s.len)
+        .unwrap_or(0);
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut val_gap = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        val_gap.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut val_len = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        val_len.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let val_page = reconstruct_ranges_v2(&val_gap, &val_len, val_section_len)?;
+
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut value_kind = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        match take_u8(block, &mut bpos)? {
+            0 => value_kind.push(ValueKind::Scalar),
+            1 => value_kind.push(ValueKind::Histogram),
+            other => return Err(SegmentError::InvalidValueKind(other)),
+        }
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+
+    // HIST_PAGES is optional in v3 symmetrically to VAL_PAGES above.
+    let hist_section_len = find_section(footer, section_kind::HIST_PAGES)
+        .map(|s| s.len)
+        .unwrap_or(0);
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut hist_gap = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        hist_gap.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let block = take_block(meta_bytes, pos)?;
+    let mut bpos = 0usize;
+    let mut hist_len = Vec::with_capacity((count as usize).min(block.len()));
+    for _ in 0..count {
+        hist_len.push(read_uvarint(block, &mut bpos)?);
+    }
+    if bpos != block.len() {
+        return Err(SegmentError::BadBlockLen);
+    }
+    let hist_page = reconstruct_ranges_v2(&hist_gap, &hist_len, hist_section_len)?;
+
+    if *pos != meta_bytes.len() {
+        return Err(SegmentError::TrailingBytes);
+    }
+
+    for i in 0..count as usize {
+        match value_kind[i] {
+            ValueKind::Scalar => {
+                if hist_page[i] != (0, 0) {
+                    return Err(SegmentError::ScalarSeriesHasHistPage);
+                }
+            }
+            ValueKind::Histogram => {
+                if val_page[i] != (0, 0) {
+                    return Err(SegmentError::HistogramSeriesHasValPage);
+                }
+                if hist_page[i].1 == 0 {
+                    return Err(SegmentError::ZeroHistPageLen);
+                }
+            }
+        }
+    }
+
+    Ok(SeriesMetaTailV3 {
+        sample_count,
+        min_ts_ns,
+        max_ts_ns,
+        ts_page,
+        val_page,
+        value_kind,
+        hist_page,
+    })
+}
+
+/// Footer-level cross-checks that need the fully parsed SERIES_META tail
+/// (docs/rseg-v3-plan.md section 3.2): the count of `value_kind = Scalar`
+/// series must equal the number of `val_page_len != 0` entries, and
+/// symmetrically for `Histogram` against `hist_page_len != 0`; and a
+/// VAL_PAGES/HIST_PAGES section present in the footer with zero series of
+/// the matching kind is Corrupted (a mandatory-count-zero section entry).
+/// Shared by [`decode_catalog_v3`] and [`decode_catalog_matching_v3`]:
+/// both must apply this regardless of which series a matcher selects,
+/// exactly as v2's `check_series_counts_v2` is shared by its two catalog
+/// decoders.
+fn check_value_kind_pages_v3(
+    footer: &Footer,
+    value_kind: &[ValueKind],
+    val_page: &[(u64, u64)],
+    hist_page: &[(u64, u64)],
+) -> Result<(), SegmentError> {
+    let scalar_count = value_kind
+        .iter()
+        .filter(|k| **k == ValueKind::Scalar)
+        .count() as u64;
+    let hist_count = value_kind
+        .iter()
+        .filter(|k| **k == ValueKind::Histogram)
+        .count() as u64;
+
+    if scalar_count == 0 && find_section(footer, section_kind::VAL_PAGES).is_some() {
+        return Err(SegmentError::UnexpectedSectionPresent("VAL_PAGES"));
+    }
+    if hist_count == 0 && find_section(footer, section_kind::HIST_PAGES).is_some() {
+        return Err(SegmentError::UnexpectedSectionPresent("HIST_PAGES"));
+    }
+
+    let val_page_nonempty = val_page.iter().filter(|(_, len)| *len != 0).count() as u64;
+    if scalar_count != val_page_nonempty {
+        return Err(SegmentError::ValueKindPageCountMismatch {
+            kind: "VAL_SCALAR",
+            value_kind_count: scalar_count,
+            page_count: val_page_nonempty,
+        });
+    }
+    let hist_page_nonempty = hist_page.iter().filter(|(_, len)| *len != 0).count() as u64;
+    if hist_count != hist_page_nonempty {
+        return Err(SegmentError::ValueKindPageCountMismatch {
+            kind: "HIST_SPANS",
+            value_kind_count: hist_count,
+            page_count: hist_page_nonempty,
+        });
+    }
+    Ok(())
+}
+
+/// Decodes LABEL_DICT + SERIES_IDS + SERIES_META (verifying section crcs)
+/// into [`SeriesEntry`] values with materialized [`LabelSet`]s, including
+/// the v3-only `value_kind`/`hist_page` columns (docs/rseg-v3-plan.md
+/// section 3.4). The v3 counterpart of [`decode_catalog_v2`]: same output
+/// shape, same eager (everyone materialized) semantics, plus the
+/// value_kind-vs-page-count and unexpected-section checks section 3.2
+/// requires.
+pub fn decode_catalog_v3(
+    footer: &Footer,
+    label_dict_bytes: &[u8],
+    series_ids_bytes: &[u8],
+    series_meta_bytes: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntry>, SegmentError> {
+    let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let series_ids_section = find_section(footer, section_kind::SERIES_IDS)
+        .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
+    let series_meta_section = find_section(footer, section_kind::SERIES_META)
+        .ok_or(SegmentError::MissingSection("SERIES_META"))?;
+
+    let dict_bytes = decode_section_bytes(label_dict_section, label_dict_bytes, limits)?;
+    let ids_bytes = decode_section_bytes(series_ids_section, series_ids_bytes, limits)?;
+    let meta_bytes = decode_section_bytes(series_meta_section, series_meta_bytes, limits)?;
+
+    let dict_index = index_label_dict(&dict_bytes)?;
+    let series_ids = parse_series_ids_v2(&ids_bytes)?;
+    let series_ids_count = series_ids.len() as u64;
+
+    let mut pos = 0usize;
+    let (meta_count, schemas) =
+        parse_schema_list_v2(&meta_bytes, &mut pos, &dict_bytes, &dict_index)?;
+    check_series_counts_v2(series_ids_count, u64::from(meta_count), footer.series_count)?;
+
+    let schema_count = schemas.len() as u32;
+    let schema_ref = parse_schema_ref_block_v2(&meta_bytes, &mut pos, meta_count, schema_count)?;
+    let value_ord =
+        parse_value_ord_block_all_v2(&meta_bytes, &mut pos, meta_count, &schema_ref, &schemas)?;
+    let tail = parse_series_meta_tail_v3(&meta_bytes, &mut pos, footer, meta_count)?;
+    check_value_kind_pages_v3(footer, &tail.value_kind, &tail.val_page, &tail.hist_page)?;
+
+    let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
+    let mut entries = Vec::with_capacity(series_ids.len());
+    let mut voff = 0usize;
+    for i in 0..series_ids.len() {
+        let schema = &schemas[schema_ref[i] as usize];
+        let n = schema.name_ords.len();
+        let vals = &value_ord[voff..voff + n];
+        voff += n;
+        let mut label_pairs = Vec::with_capacity(n);
+        for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
+            let name = resolver.get(name_ord)?;
+            let value = resolver.get(val_ord)?;
+            label_pairs.push(Label {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+        let label_set = LabelSet::new(label_pairs)?;
+        entries.push(SeriesEntry {
+            series_id: SeriesId(series_ids[i]),
+            labels: label_set,
+            sample_count: tail.sample_count[i],
+            min_ts_ns: tail.min_ts_ns[i],
+            max_ts_ns: tail.max_ts_ns[i],
+            ts_page: tail.ts_page[i],
+            val_page: tail.val_page[i],
+            value_kind: tail.value_kind[i],
+            hist_page: tail.hist_page[i],
+        });
+    }
+    Ok(entries)
+}
+
+/// Decodes only the series whose labels satisfy every `(name, value)`
+/// equality in `equals`, the v3 counterpart of [`decode_catalog_matching_v2`].
+/// Column skipping and the schema-plausibility precomputation are
+/// unchanged from v2 (docs/rseg-v2-plan.md section 3.4); the v3-only
+/// checks (`check_value_kind_pages_v3`) still run over the whole tail
+/// regardless of match, exactly as [`decode_catalog_matching_v2`] still
+/// structurally validates every v2 row.
+pub fn decode_catalog_matching_v3(
+    footer: &Footer,
+    label_dict_bytes: &[u8],
+    series_ids_bytes: &[u8],
+    series_meta_bytes: &[u8],
+    equals: &[(&str, &str)],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntry>, SegmentError> {
+    let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let series_ids_section = find_section(footer, section_kind::SERIES_IDS)
+        .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
+    let series_meta_section = find_section(footer, section_kind::SERIES_META)
+        .ok_or(SegmentError::MissingSection("SERIES_META"))?;
+
+    let dict_bytes = decode_section_bytes(label_dict_section, label_dict_bytes, limits)?;
+    let ids_bytes = decode_section_bytes(series_ids_section, series_ids_bytes, limits)?;
+    let meta_bytes = decode_section_bytes(series_meta_section, series_meta_bytes, limits)?;
+
+    let dict_index = index_label_dict(&dict_bytes)?;
+    let series_ids = parse_series_ids_v2(&ids_bytes)?;
+    let series_ids_count = series_ids.len() as u64;
+
+    let mut pos = 0usize;
+    let (meta_count, schemas) =
+        parse_schema_list_v2(&meta_bytes, &mut pos, &dict_bytes, &dict_index)?;
+    check_series_counts_v2(series_ids_count, u64::from(meta_count), footer.series_count)?;
+
+    let find_ordinal = |needle: &str| -> Option<u64> {
+        let needle = needle.as_bytes();
+        dict_index
+            .iter()
+            .position(|&(start, len)| {
+                dict_bytes
+                    .get(start..start + len)
+                    .is_some_and(|s| s == needle)
+            })
+            .map(|i| i as u64)
+    };
+    let mut matcher_ords: Vec<(u64, u64)> = Vec::with_capacity(equals.len());
+    let mut resolvable = true;
+    for (name, value) in equals {
+        match (find_ordinal(name), find_ordinal(value)) {
+            (Some(n), Some(v)) => matcher_ords.push((n, v)),
+            _ => {
+                resolvable = false;
+                break;
+            }
+        }
+    }
+
+    let schema_count = schemas.len() as u32;
+    let schema_ref = parse_schema_ref_block_v2(&meta_bytes, &mut pos, meta_count, schema_count)?;
+
+    let schema_plausible: Vec<bool> = if resolvable {
+        schemas
+            .iter()
+            .map(|schema| {
+                matcher_ords
+                    .iter()
+                    .all(|(name_ord, _)| schema.name_ords.contains(name_ord))
+            })
+            .collect()
+    } else {
+        vec![false; schemas.len()]
+    };
+
+    let value_ord = parse_value_ord_block_selective_v2(
+        &meta_bytes,
+        &mut pos,
+        meta_count,
+        &schema_ref,
+        &schemas,
+        &schema_plausible,
+    )?;
+    let tail = parse_series_meta_tail_v3(&meta_bytes, &mut pos, footer, meta_count)?;
+    check_value_kind_pages_v3(footer, &tail.value_kind, &tail.val_page, &tail.hist_page)?;
+
+    let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
+    let mut entries = Vec::new();
+    for i in 0..series_ids.len() {
+        let Some(vals) = &value_ord[i] else {
+            continue;
+        };
+        let schema = &schemas[schema_ref[i] as usize];
+        let is_match = matcher_ords.iter().all(|(name_ord, wanted_val_ord)| {
+            schema
+                .name_ords
+                .iter()
+                .position(|n| n == name_ord)
+                .is_some_and(|j| vals[j] == *wanted_val_ord)
+        });
+        if !is_match {
+            continue;
+        }
+        let mut label_pairs = Vec::with_capacity(schema.name_ords.len());
+        for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
+            let name = resolver.get(name_ord)?;
+            let value = resolver.get(val_ord)?;
+            label_pairs.push(Label {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+        let label_set = LabelSet::new(label_pairs)?;
+        entries.push(SeriesEntry {
+            series_id: SeriesId(series_ids[i]),
+            labels: label_set,
+            sample_count: tail.sample_count[i],
+            min_ts_ns: tail.min_ts_ns[i],
+            max_ts_ns: tail.max_ts_ns[i],
+            ts_page: tail.ts_page[i],
+            val_page: tail.val_page[i],
+            value_kind: tail.value_kind[i],
+            hist_page: tail.hist_page[i],
+        });
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod dict_resolver_tests {

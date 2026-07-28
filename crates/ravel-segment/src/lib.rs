@@ -21,9 +21,10 @@ pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
     FooterLocation, FooterOutcome, PlannedRange, SeriesEntry, ValPageKind, ValueKind,
-    decode_catalog, decode_catalog_matching, decode_catalog_matching_v2, decode_catalog_v2,
-    decode_histogram_pages, decode_pages, decode_pages_soa, open_from_full, open_from_suffix,
-    parse_footer, plan_ranges, plan_ranges_v3, select, validate_sections,
+    decode_catalog, decode_catalog_matching, decode_catalog_matching_v2,
+    decode_catalog_matching_v3, decode_catalog_v2, decode_catalog_v3, decode_histogram_pages,
+    decode_pages, decode_pages_soa, open_from_full, open_from_suffix, parse_footer, plan_ranges,
+    plan_ranges_v3, select, validate_sections,
 };
 pub use writer::{
     HistogramSample, IngestBounds, SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput,
