@@ -18,6 +18,7 @@ use crate::config::IngestConfig;
 use crate::error::WriteError;
 use crate::metrics::IngestMetrics;
 use crate::shard::{ShardActor, ShardMsg};
+use crate::value::IngestPoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
@@ -117,8 +118,41 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<WriteReceipt, WriteError> {
+        self.write_points(
+            tenant,
+            points.into_iter().map(IngestPoint::from).collect(),
+            mode,
+            ack_deadline,
+        )
+        .await
+    }
+
+    /// Like [`Self::write`], but for points that already carry their value
+    /// shape (scalar or histogram) rather than OTLP's `NormalizedPoint`
+    /// (docs/rseg-v3-plan.md section 7). Native histograms are rejected at
+    /// wire admission (docs/rseg-v3-plan.md's phase C8); this is the entry
+    /// point that proves the shard buffer and segment-write plumbing for
+    /// histogram values end to end ahead of that, via directly-constructed
+    /// [`IngestPoint`]s rather than OTLP/remote-write decode.
+    pub async fn write_values(
+        &self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<WriteReceipt, WriteError> {
+        self.write_points(tenant, points, mode, ack_deadline).await
+    }
+
+    async fn write_points(
+        &self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<WriteReceipt, WriteError> {
         let shard_count = self.config.shard_count;
-        let mut by_shard: HashMap<u32, Vec<NormalizedPoint>> = HashMap::new();
+        let mut by_shard: HashMap<u32, Vec<IngestPoint>> = HashMap::new();
         for point in points {
             let shard = shard_for(&point.series_id, shard_count);
             by_shard.entry(shard).or_default().push(point);
