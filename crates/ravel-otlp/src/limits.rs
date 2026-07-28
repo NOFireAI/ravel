@@ -190,6 +190,22 @@ pub enum Rejection {
     /// ADR-0017's exemplar decision.
     #[error("histogram exemplar(s) dropped: no Prometheus-convention representation")]
     HistogramExemplarsDropped { count: usize },
+
+    /// Informational, not an admission failure: the data point was admitted
+    /// and stored, but its OTLP `as_int` value has a magnitude above 2^53 and
+    /// is not exactly representable as the `f64` the segment format stores, so
+    /// the persisted sample is the nearest `f64` rather than the exact integer.
+    /// `rejected_count()` returns 0 so it never inflates the sender-facing
+    /// rejected-points count. Emitting it makes the (given `f64`-only storage,
+    /// unavoidable) approximation visible rather than silent, per the
+    /// "exact semantics by default; approximation is opt-in and visible"
+    /// invariant. `value` is the original integer; the stored `f64` is shown
+    /// in the message.
+    #[error(
+        "integer value {value} has magnitude above 2^53 and was stored as the nearest f64 {}",
+        *value as f64
+    )]
+    IntegerValuePrecisionLoss { value: i64 },
 }
 
 impl Rejection {
@@ -205,7 +221,8 @@ impl Rejection {
             | Rejection::UnsupportedMetricType { count, .. }
             | Rejection::UnsupportedTemporality { count } => *count,
             Rejection::HistogramMinMaxDropped { .. }
-            | Rejection::HistogramExemplarsDropped { .. } => 0,
+            | Rejection::HistogramExemplarsDropped { .. }
+            | Rejection::IntegerValuePrecisionLoss { .. } => 0,
             _ => 1,
         }
     }
