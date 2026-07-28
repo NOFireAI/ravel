@@ -289,6 +289,35 @@ async fn information_schema_is_not_reachable() {
     assert_eq!(err.client_message(), ravel_sql::MSG_PLAN);
 }
 
+/// `range`/`generate_series` are DataFusion table functions registered by
+/// `with_default_features()` regardless of what this crate wants exposed
+/// (checkpoint review finding): they generate rows in memory, so
+/// `EmptyObjectStoreRegistry` does not block them the way it blocks
+/// `CREATE EXTERNAL TABLE`/`COPY`. `samples` must be the only table a query
+/// can read from.
+#[tokio::test]
+async fn table_functions_are_not_reachable() {
+    let tenant = tenant_id("acme");
+    let specs = one_segment();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    for sql in [
+        "SELECT * FROM range(0, 10)",
+        "SELECT * FROM generate_series(0, 10)",
+    ] {
+        let err = fixture
+            .executor
+            .execute(tenant.hash(), &request(sql))
+            .await
+            .expect_err("table function must not resolve");
+        assert!(
+            matches!(err, SqlError::Plan(_)),
+            "{sql}: expected a planning failure, got {err}"
+        );
+        assert_eq!(err.client_message(), ravel_sql::MSG_PLAN);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

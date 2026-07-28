@@ -25,6 +25,14 @@
 //!   through `SegmentFetcher` and never consults this registry.
 //! - The `avg` UDAF is deregistered, backstopping the subset check in
 //!   crate::validate.
+//! - The `range`/`generate_series` table functions are deregistered
+//!   (checkpoint review finding, not in the original design):
+//!   `SessionContext::new_with_config_rt` calls DataFusion's
+//!   `with_default_features()`, which registers these unconditionally --
+//!   `EmptyObjectStoreRegistry` blocks reading anything, but a table
+//!   function generates rows in memory and needs no store, so
+//!   `SELECT count(*) FROM range(0, 1e18)` would otherwise reach the
+//!   planner as a second, ungoverned data source alongside `samples`.
 //!
 //! Determinism (docs/arrow-datafusion-plan.md section 2 "Exactness"):
 //! every `repartition_*` knob is turned off. Float aggregation is
@@ -119,6 +127,12 @@ pub fn build_session(
     // form the AST walk missed cannot resolve an avg accumulator here.
     ctx.deregister_udaf("avg");
     ctx.deregister_udaf("mean");
+    // `with_default_features()` (inside `new_with_config_rt` above)
+    // registers these unconditionally; they generate rows in memory and so
+    // are not blocked by `EmptyObjectStoreRegistry`. `samples` must be the
+    // only table this session can query.
+    ctx.deregister_udtf("range");
+    ctx.deregister_udtf("generate_series");
 
     ctx.register_table(SAMPLES_TABLE, provider)?;
     Ok(ctx)

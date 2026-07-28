@@ -133,6 +133,19 @@ pub enum SqlError {
     /// downcast failure). These are bugs, not input errors.
     #[error("internal ravel-sql error: {0}")]
     Internal(String),
+
+    /// Reconstructed from a `DataFusionError::Shared` (checkpoint review
+    /// finding, not in the original design): DataFusion wraps some errors
+    /// in an `Arc` to hand the same error to multiple stream consumers, so
+    /// the original `SqlError` cannot be moved out of it. `classify_shared`
+    /// (crate::executor) captures this variant's `class()`/`client_message()`
+    /// from the original error *before* it is behind the `Arc`, so a
+    /// `TooManySamples` or `ResourcesExhausted` that happens to cross a
+    /// `Shared` boundary still keeps its own class and text instead of
+    /// collapsing into a generic execution failure. Never constructed
+    /// outside `classify_shared`.
+    #[error("{message}")]
+    Shared { class: ErrorClass, message: String },
 }
 
 impl SqlError {
@@ -150,6 +163,7 @@ impl SqlError {
             | SqlError::Plan(_)
             | SqlError::Execution(_)
             | SqlError::Internal(_) => ErrorClass::Unsupported,
+            SqlError::Shared { class, .. } => *class,
         }
     }
 
@@ -178,6 +192,7 @@ impl SqlError {
             SqlError::Plan(_) => MSG_PLAN.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
             SqlError::Internal(_) => MSG_INTERNAL.to_string(),
+            SqlError::Shared { message, .. } => message.clone(),
         }
     }
 

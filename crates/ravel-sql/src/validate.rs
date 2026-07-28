@@ -25,7 +25,8 @@
 //! therefore walks the whole query tree -- body, set operations, CTEs, and
 //! parenthesized subqueries -- and rejects any statement-bearing node.
 //!
-//! Subset validation (`avg`) rides along here rather than in a second pass:
+//! Subset validation (`avg`, grouped `min`/`max`) rides along here rather
+//! than in a second pass:
 //! `avg` is excluded from the v1 SQL subset because DataFusion's avg
 //! accumulator has its own intermediate typing and no naive reference is
 //! bit-identical to it (docs/arrow-datafusion-plan.md section 2 "Exactness",
@@ -34,16 +35,36 @@
 //! UDAF (crate::session) so a syntactic form this walk failed to spot still
 //! cannot execute; the walk exists for the good error message, the
 //! deregistration is the backstop.
+//!
+//! `min`/`max` are excluded from the v1 subset **only when grouped**
+//! (discovered during the B3 checkpoint review, not in the original plan):
+//! DataFusion's ungrouped min/max accumulator compares with `total_cmp`, but
+//! the grouped accumulator folds `partial_cmp` from an `f64::MAX`/`f64::MIN`
+//! seed. That means grouped min/max disagrees with ungrouped min/max on NaN
+//! and signed zero, and for a group whose only value is +/-Inf it returns
+//! the unseeded `f64::MAX`/`f64::MIN` rather than the actual value -- a
+//! silently wrong answer, not an approximation ("Exact semantics by
+//! default"). A differential gate cannot catch this because an independent
+//! reference for a grouped accumulator would just be a second copy of the
+//! same seed-and-fold algorithm. Ungrouped `min`/`max` are unaffected and
+//! stay in the v1 subset.
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SetExpr, Statement,
-    TableFactor, Visit, Visitor,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query, Select,
+    SetExpr, Statement, TableFactor, Visit, Visitor,
 };
 use std::ops::ControlFlow;
 
 /// The v1 SQL subset rejects `avg`; the message names the workaround.
 const AVG_MESSAGE: &str = "AVG is not part of the v1 SQL subset; use SUM(x) / COUNT(x) instead \
+     (docs/arrow-datafusion-plan.md section 2 \"Exactness\")";
+
+/// The v1 SQL subset rejects `min`/`max` combined with `GROUP BY`.
+const GROUPED_MIN_MAX_MESSAGE: &str = "MIN/MAX combined with GROUP BY is not part of the v1 SQL \
+     subset (DataFusion's grouped accumulator does not use a total order and can return a \
+     wrong extreme for NaN, signed zero, or all-infinite groups); \
+     run MIN/MAX without GROUP BY \
      (docs/arrow-datafusion-plan.md section 2 \"Exactness\")";
 
 /// A request rejected by the read-only single-statement gate, before any
@@ -81,6 +102,10 @@ pub enum ValidationError {
     /// `avg` is outside the v1 subset.
     #[error("{AVG_MESSAGE}")]
     AvgUnsupported,
+
+    /// `min`/`max` combined with `GROUP BY` is outside the v1 subset.
+    #[error("{GROUPED_MIN_MAX_MESSAGE}")]
+    GroupedMinMaxUnsupported,
 }
 
 /// Parse `sql` and accept it only if it is exactly one read-only
@@ -123,6 +148,7 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
 
     reject_writes_in_query(query)?;
     reject_avg(query)?;
+    reject_grouped_min_max(query)?;
     Ok(())
 }
 
@@ -289,6 +315,58 @@ impl Visitor for AvgFinder {
     }
 }
 
+/// Reject `min`/`max` in any select whose own `GROUP BY` is non-trivial.
+fn reject_grouped_min_max(query: &Query) -> Result<(), ValidationError> {
+    let mut finder = GroupedMinMaxFinder {
+        grouped_stack: Vec::new(),
+    };
+    let flow = query.visit(&mut finder);
+    if flow.is_break() {
+        return Err(ValidationError::GroupedMinMaxUnsupported);
+    }
+    Ok(())
+}
+
+/// Tracks, per nested select, whether it groups -- a `min`/`max` call is
+/// only rejected while the innermost enclosing select is grouped, so a
+/// grouped subquery does not reject an ungrouped `min`/`max` in the outer
+/// query and vice versa.
+struct GroupedMinMaxFinder {
+    grouped_stack: Vec<bool>,
+}
+
+impl Visitor for GroupedMinMaxFinder {
+    type Break = ();
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        let grouped = match &select.group_by {
+            GroupByExpr::All(_) => true,
+            GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        };
+        self.grouped_stack.push(grouped);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_select(&mut self, _select: &Select) -> ControlFlow<()> {
+        self.grouped_stack.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+        if !*self.grouped_stack.last().unwrap_or(&false) {
+            return ControlFlow::Continue(());
+        }
+        if let SqlExpr::Function(func) = expr {
+            let name = func.name.to_string().to_ascii_lowercase();
+            let bare = name.rsplit('.').next().unwrap_or(name.as_str());
+            if bare == "min" || bare == "max" {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -307,10 +385,68 @@ mod tests {
     #[test]
     fn aggregates_in_the_v1_subset_are_accepted() {
         validate(
-            "SELECT series_id, count(value), sum(value), min(value), max(value) \
+            "SELECT series_id, count(value), sum(value) \
              FROM samples GROUP BY series_id ORDER BY series_id",
         )
         .expect("v1 aggregate subset");
+    }
+
+    #[test]
+    fn ungrouped_min_max_are_accepted() {
+        validate("SELECT min(value), max(value) FROM samples").expect("ungrouped min/max");
+    }
+
+    #[test]
+    fn grouped_min_max_is_rejected_case_insensitively() {
+        assert_eq!(
+            reject("SELECT series_id, min(value) FROM samples GROUP BY series_id"),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+        assert_eq!(
+            reject("SELECT series_id, MAX(value) FROM samples GROUP BY series_id"),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+        assert_eq!(
+            reject("SELECT series_id FROM samples GROUP BY series_id HAVING max(value) > 1"),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+    }
+
+    #[test]
+    fn group_by_all_with_min_max_is_rejected() {
+        assert_eq!(
+            reject("SELECT series_id, min(value) FROM samples GROUP BY ALL"),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+    }
+
+    /// A grouped `min`/`max` inside a subquery is rejected even when the
+    /// outer query is not grouped, and an outer grouped `min`/`max` is
+    /// rejected even when the inner subquery is not -- the rejection is
+    /// scoped to whichever select actually owns the aggregate.
+    #[test]
+    fn grouped_min_max_scoping_follows_the_owning_select() {
+        assert_eq!(
+            reject(
+                "SELECT s FROM (SELECT series_id, min(value) AS s FROM samples \
+                 GROUP BY series_id)"
+            ),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+        assert_eq!(
+            reject(
+                "SELECT series_id, min(value) FROM (SELECT series_id, value FROM samples) \
+                 GROUP BY series_id"
+            ),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+        // Ungrouped min/max over a grouped subquery's output is fine: the
+        // aggregate itself is not grouped.
+        validate(
+            "SELECT min(s) FROM (SELECT series_id, sum(value) AS s FROM samples \
+             GROUP BY series_id)",
+        )
+        .expect("ungrouped min over a grouped subquery's output");
     }
 
     #[test]

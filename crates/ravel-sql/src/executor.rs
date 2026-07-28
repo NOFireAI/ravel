@@ -416,8 +416,11 @@ fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusionError> {
 }
 
 /// Best-effort classification of a `DataFusionError` we can only borrow.
-/// Only the classes the retry contract and the redaction boundary act on
-/// are reconstructed; everything else stays as-is.
+/// The retry contract needs the not-found case reconstructed exactly (it
+/// drives `retry_decision`); everything else is captured through its own
+/// `class()`/`client_message()` rather than collapsed into a generic
+/// execution failure, so a budget error that happens to cross a `Shared`
+/// boundary keeps its own HTTP class and text (checkpoint review finding).
 fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
     match err {
         DataFusionError::External(boxed) => {
@@ -428,7 +431,10 @@ fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
                     source: ravel_object_store::StoreError::NotFound,
                 })
             } else {
-                SqlError::Execution(sql.to_string())
+                SqlError::Shared {
+                    class: sql.class(),
+                    message: sql.client_message(),
+                }
             })
         }
         DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
@@ -487,6 +493,25 @@ mod tests {
         let shared = DataFusionError::Shared(Arc::new(df));
         let recovered = take_sql_error(shared).expect("recovered");
         assert!(recovered.is_segment_not_found());
+    }
+
+    /// Checkpoint review finding: a budget error crossing a `Shared`
+    /// boundary must keep its own class and message, not collapse into a
+    /// generic execution failure that loses the count/limit text and
+    /// reports the wrong HTTP status.
+    #[test]
+    fn a_shared_budget_error_keeps_its_own_class_and_message() {
+        let inner = SqlError::TooManySamples { count: 20, max: 10 };
+        let want_class = inner.class();
+        let want_message = inner.client_message();
+        let df: DataFusionError = inner.into();
+        let shared = DataFusionError::Shared(Arc::new(df));
+
+        let recovered = take_sql_error(shared).expect("recovered");
+        assert_eq!(recovered.class(), want_class);
+        assert_eq!(recovered.client_message(), want_message);
+        assert!(recovered.client_message().contains("20"));
+        assert!(recovered.client_message().contains("10"));
     }
 
     #[test]
