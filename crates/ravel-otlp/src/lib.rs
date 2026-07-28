@@ -5,6 +5,7 @@
 
 pub mod limits;
 pub mod normalize;
+pub mod promcompat;
 
 pub use limits::{IngestLimits, Rejection};
 pub use normalize::{NormalizeOutput, NormalizedPoint, normalize_metrics};
