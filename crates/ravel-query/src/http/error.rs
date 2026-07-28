@@ -41,6 +41,14 @@ const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; retr
 pub enum ApiError {
     BadData(String),
     Unsupported(String),
+    /// A permanent server-side data-integrity fault: stored data decoded but
+    /// failed validation (corrupt segment, unreconstructable or mismatched
+    /// commit record, non-monotonic run). Maps to HTTP 500 `internal`, a
+    /// non-retryable 5xx: the corruption is in already-stored objects, so a
+    /// retry re-reads the same bytes and never clears (a7-F05, #62). Kept
+    /// distinct from `Unavailable` so a client does not retry forever against
+    /// permanently corrupt data.
+    Corrupt(String),
     Unavailable(String),
     Timeout(String),
     Unauthenticated,
@@ -69,7 +77,15 @@ impl From<QueryError> for ApiError {
                 client_message = redacted,
                 "storage-layer query error redacted from client response",
             );
-            return ApiError::Unavailable(redacted.to_string());
+            // A corruption fault is a permanent server-side data problem, not a
+            // transient outage: map it to the non-retryable 500 `internal` so a
+            // client stops retrying against permanently corrupt data (a7-F05,
+            // #62). Transient storage faults keep the retryable 503.
+            return if redacted == MSG_CORRUPT {
+                ApiError::Corrupt(redacted.to_string())
+            } else {
+                ApiError::Unavailable(redacted.to_string())
+            };
         }
         match &e {
             QueryError::Parse(_)
@@ -99,10 +115,11 @@ impl From<QueryError> for ApiError {
 /// carry only counts and limits, deadlines carry only a duration).
 ///
 /// The four client-visible classes required by a7-F02 are kept distinct:
-/// `corrupt`, `unavailable`, and unsatisfiable-token all share HTTP 503 here
-/// (the status mapping is unchanged, tracked separately by #62) but carry
-/// distinct stable messages so diagnosability survives redaction; the budget
-/// class keeps its own 422 mapping and unredacted counts.
+/// `corrupt` maps to HTTP 500 `internal` (a permanent, non-retryable
+/// server-side data fault; a7-F05, #62), while `unavailable` and
+/// unsatisfiable-token map to the retryable HTTP 503; each carries its own
+/// stable message so diagnosability survives redaction; the budget class
+/// keeps its own 422 mapping and unredacted counts.
 fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
     match err {
         QueryError::Fetch(fetch) => Some(match fetch {
@@ -161,6 +178,7 @@ impl IntoResponse for ApiError {
         let (status, error_type, message) = match self {
             ApiError::BadData(msg) => (StatusCode::BAD_REQUEST, "bad_data", msg),
             ApiError::Unsupported(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "execution", msg),
+            ApiError::Corrupt(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
             ApiError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable", msg),
             ApiError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "timeout", msg),
             ApiError::Unauthenticated => (
@@ -212,10 +230,16 @@ mod tests {
 
     fn client_message(err: QueryError) -> String {
         match ApiError::from(err) {
-            ApiError::Unavailable(msg) => msg,
+            ApiError::Unavailable(msg) | ApiError::Corrupt(msg) => msg,
             ApiError::BadData(msg) | ApiError::Unsupported(msg) | ApiError::Timeout(msg) => msg,
             ApiError::Unauthenticated => "authentication required".to_string(),
         }
+    }
+
+    /// The HTTP status a `QueryError` maps to, as a `u16`, exercising the full
+    /// `From` + `IntoResponse` path.
+    fn status_code(err: QueryError) -> u16 {
+        ApiError::from(err).into_response().status().as_u16()
     }
 
     #[test]
@@ -319,6 +343,63 @@ mod tests {
             ApiError::Unsupported(_) => {}
             other => panic!("expected Unsupported, got a different ApiError variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_monotonic_samples_is_not_a_retryable_503() {
+        // a7-F05 (#62): NonMonotonicSamples is a permanent decode-corruption
+        // condition. It must not map to 503 `unavailable` (which a Prometheus
+        // client retries forever against the same corrupt stored data); it maps
+        // to the non-retryable 500 `internal`.
+        let err = QueryError::NonMonotonicSamples { prev: 2, next: 1 };
+        assert_eq!(status_code(err), 500, "corruption must not be a 503");
+
+        // Explicit: the mapped variant is Corrupt, and it is 500, not 503.
+        match ApiError::from(QueryError::NonMonotonicSamples { prev: 2, next: 1 }) {
+            ApiError::Corrupt(_) => {}
+            other => panic!("expected Corrupt, got a different ApiError variant: {other:?}"),
+        }
+        assert_ne!(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn sibling_corruption_decode_errors_are_500_not_503() {
+        // The other permanent-corruption faults that previously shared the
+        // MSG_CORRUPT/503 mapping now also carry the non-retryable 500.
+        let fetch_corrupt = QueryError::Fetch(FetchError::Corrupt {
+            key: LEAKY_KEY.to_string(),
+            source: ravel_segment::SegmentError::BadMagic,
+        });
+        assert_eq!(status_code(fetch_corrupt), 500);
+
+        let catalog_mismatch = QueryError::Catalog(CatalogError::FieldMismatch {
+            key: LEAKY_KEY.to_string(),
+            field: "tenant_hash",
+            expected: "aaaa".to_string(),
+            actual: TENANT_HASH.to_string(),
+        });
+        assert_eq!(status_code(catalog_mismatch), 500);
+    }
+
+    #[test]
+    fn transient_storage_faults_stay_retryable_503() {
+        // The remapping touches only the corruption class: genuinely transient
+        // faults keep the retryable 503 `unavailable` so clients still retry.
+        let store = QueryError::Fetch(FetchError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::Transient(RAW_STORE_TEXT.to_string()),
+        });
+        assert_eq!(status_code(store), 503);
+
+        let etag = QueryError::Fetch(FetchError::EtagChanged {
+            key: LEAKY_KEY.to_string(),
+        });
+        assert_eq!(status_code(etag), 503);
+
+        assert_eq!(status_code(QueryError::SnapshotInvalidated), 503);
     }
 
     #[test]

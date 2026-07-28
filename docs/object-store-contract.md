@@ -103,10 +103,14 @@ leases. MinIO: full support.
 2. `FaultStore<S>`: wraps any backend; deterministic seeded fault plan
    injecting: timeouts, throttling, partial-write-then-error (object must
    NOT become visible), failed conditional writes, duplicate delivery (op
-   applied, error returned, modeling ack loss), reordered completion,
-   corrupt range responses, `NotFound` blips, transient/permanent errors.
-   Every fault site counted; plans scriptable per-operation-index and
-   per-key-pattern.
+   applied, error returned, modeling ack loss), corrupt range responses,
+   etag change between reads (real bytes under a new etag, so a
+   snapshot-pinning caller must abort), `NotFound` blips, transient/permanent
+   errors. Every fault site counted; plans scriptable per-operation-index and
+   per-key-pattern, and as ordered per-key sequences (a distinct outcome on
+   each successive matching call). Reordered completion is deliberately NOT
+   implemented: it is an aspiration recorded in the fault module docs, not an
+   injectable fault, so no reordering test can be built on this store today.
 3. `S3Store`: `object_store` crate adapter (AWS S3 + MinIO via endpoint
    override), honoring every MUST above.
 
