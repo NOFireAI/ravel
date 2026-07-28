@@ -1,0 +1,54 @@
+// Metric index: catalog snapshot part and HEAD formats
+// (docs/metric-index-plan.md, ADR-0020). Persistent contract: field
+// numbers are frozen; only additive changes are allowed.
+syntax = "proto3";
+
+package ravel.catalog.v1;
+
+message SnapshotPartHeader {
+  uint32 format_version = 1;  // 1; must match envelope version
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;          // same enum domain as CommitRecord
+  uint32 shard_count = 4;     // config at fold time (ADR-0010 §9)
+  uint32 watermark_hour = 5;  // unix hours; all entries <= this
+  uint64 entry_count = 6;
+  uint64 entries_uncompressed_len = 7;
+}
+
+message SnapshotEntry {
+  // 0 = L0. Reserved for compaction outputs (docs/metric-index-plan.md
+  // section 7); readers reject levels they do not understand.
+  uint32 level = 1;
+  uint32 shard = 2;
+  uint32 ingest_hour_bucket = 3;
+  bytes writer_id = 4;  // 16 raw bytes
+  uint64 writer_epoch = 5;
+  uint64 writer_seq = 6;
+  bytes content_hash = 7;  // 32
+  uint64 object_size = 8;
+  sint64 min_event_ts_ns = 9;
+  sint64 max_event_ts_ns = 10;
+  uint64 sample_count = 11;
+  uint64 series_count = 12;
+  uint32 segment_format_version = 13;
+  sint64 created_unix_ns = 14;
+}
+
+message SnapshotHead {
+  uint32 format_version = 1;  // 1
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;
+  uint32 shard_count = 4;
+  uint32 watermark_hour = 5;  // max over parts
+  repeated SnapshotPartRef parts = 6;
+  bytes folder_id = 7;      // 16; UUIDv4 per folder process start
+  sint64 created_unix_ns = 8;  // informational
+}
+
+message SnapshotPartRef {
+  string key = 1;    // full object key of the part
+  bytes blake3 = 2;  // 32, of the part's full bytes
+  uint64 size = 3;
+  uint64 entry_count = 4;
+  uint32 watermark_hour = 5;
+}

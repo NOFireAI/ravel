@@ -5,6 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let files = [
         root.join("ravel/segment.proto"),
         root.join("ravel/commit.proto"),
+        root.join("ravel/catalog.proto"),
     ];
     for f in &files {
         println!("cargo:rerun-if-changed={}", f.display());
