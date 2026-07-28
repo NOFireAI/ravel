@@ -1,6 +1,8 @@
 # ADR-0014: RSEG v2: compact columnar series catalog, raw-f64 page alignment
 
-Status: Accepted (2026-07-27). Plan and byte-exact layout:
+Status: Accepted (2026-07-27); superseded by ADR-0027 (2026-07-28):
+RSEG v2 support was removed pre-release, and this ADR remains the
+record of the v2 design. Plan and byte-exact layout:
 docs/rseg-v2-plan.md. docs/segment-format.md stays the authoritative v1
 spec until implementation phase 1 lands the v2 amendment; this ADR
 records the decision, not the amendment.
