@@ -29,6 +29,7 @@ tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }
 criterion = { workspace = true }
+async-trait = { workspace = true }
 
 [[bench]]
 name = "fetch_soa_vs_fetch"
