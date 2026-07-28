@@ -1,6 +1,6 @@
 # ADR-0023: Grouped MIN/MAX restored via a total-order min/max UDAF replacing the built-ins
 
-Status: Proposed (2026-07-28). Resolves the design gap recorded in issue
+Status: Accepted (2026-07-28). Resolves the design gap recorded in issue
 #143; builds on ADR-0013 and the exactness regime of
 docs/arrow-datafusion-plan.md section 2. Sibling decision: ADR-0022 covers
 the `avg`/`stddev` exactness exclusion (review F7); this ADR decides
