@@ -12,10 +12,12 @@
 //! bytes as untrusted and returns [`LogSegError`] on any violation, never
 //! panicking.
 
+pub mod block;
 pub mod bloom;
 pub mod encoding;
 pub mod error;
 pub mod page;
+pub mod record;
 pub mod tokenizer;
 pub mod varint;
 
