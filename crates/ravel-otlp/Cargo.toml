@@ -11,7 +11,6 @@ opentelemetry-proto = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-ravel-test-util = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 
