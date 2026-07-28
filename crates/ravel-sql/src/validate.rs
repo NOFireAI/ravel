@@ -331,19 +331,54 @@ fn reject_grouped_min_max(query: &Query) -> Result<(), ValidationError> {
 /// only rejected while the innermost enclosing select is grouped, so a
 /// grouped subquery does not reject an ungrouped `min`/`max` in the outer
 /// query and vice versa.
+///
+/// A statement's top-level `ORDER BY` is a field of `Query`, not of `Select`,
+/// so the derived visitor reaches it *after* the body `Select` has been
+/// visited and popped. A grouped `min`/`max` there binds to the body's
+/// grouped hash accumulator exactly as `HAVING` does, so `pre_visit_query`
+/// pushes the body `Select`'s grouping for the whole query scope (`ORDER BY`,
+/// `LIMIT`, and so on), keeping the stack non-empty while those clauses are
+/// visited. `pre_visit_select` still pushes the same grouping again for the
+/// body's own projection/`HAVING`; `.last()` sees the same value either way,
+/// and both pushes are balanced by their matching post-visit pops.
 struct GroupedMinMaxFinder {
     grouped_stack: Vec<bool>,
+}
+
+/// Whether a `SELECT`'s own `GROUP BY` routes its `min`/`max` to the grouped
+/// accumulator. `GROUP BY ()` (empty expression list) is ungrouped and takes
+/// the total-order ungrouped accumulator, so it stays in the v1 subset.
+fn select_is_grouped(select: &Select) -> bool {
+    match &select.group_by {
+        GroupByExpr::All(_) => true,
+        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+    }
 }
 
 impl Visitor for GroupedMinMaxFinder {
     type Break = ();
 
-    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
-        let grouped = match &select.group_by {
-            GroupByExpr::All(_) => true,
-            GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        // Query-level clauses (`ORDER BY`, `LIMIT`) bind to the body select's
+        // grouping. Only a plain `Select` body carries a grouped accumulator;
+        // a set operation body pushes `false` (its `ORDER BY` sorts the union
+        // output, not a grouped aggregate), and each operand select still
+        // pushes its own grouping through `pre_visit_select`.
+        let grouped = match query.body.as_ref() {
+            SetExpr::Select(select) => select_is_grouped(select),
+            _ => false,
         };
         self.grouped_stack.push(grouped);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        self.grouped_stack.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        self.grouped_stack.push(select_is_grouped(select));
         ControlFlow::Continue(())
     }
 
@@ -447,6 +482,32 @@ mod tests {
              GROUP BY series_id)",
         )
         .expect("ungrouped min over a grouped subquery's output");
+    }
+
+    /// A query-level `ORDER BY` is a field of `Query`, not of `Select`, so it
+    /// is visited after the body select is popped. A grouped `min`/`max` there
+    /// binds to the same grouped accumulator as the `HAVING` case and must be
+    /// rejected too; an arithmetic expression over the aggregate must not slip
+    /// through either.
+    #[test]
+    fn grouped_min_max_in_query_order_by_is_rejected() {
+        assert_eq!(
+            reject("SELECT series_id FROM samples GROUP BY series_id ORDER BY max(value)"),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+        assert_eq!(
+            reject("SELECT series_id FROM samples GROUP BY series_id ORDER BY min(value) + 1"),
+            ValidationError::GroupedMinMaxUnsupported
+        );
+    }
+
+    /// An ungrouped query keeps `min`/`max` in `ORDER BY`: it uses the
+    /// total-order ungrouped accumulator, so the query-scope push of `false`
+    /// must leave it accepted.
+    #[test]
+    fn ungrouped_min_max_in_query_order_by_is_accepted() {
+        validate("SELECT max(value) FROM samples ORDER BY max(value)")
+            .expect("ungrouped min/max in ORDER BY");
     }
 
     #[test]
