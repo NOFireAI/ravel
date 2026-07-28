@@ -41,8 +41,14 @@ pub struct ResolvedSeries {
 /// has no per-series correlation (unlike RW2's per-`TimeSeries` `metadata`
 /// field), so it is dropped with one request-level counter rather than
 /// distributed across series.
+///
+/// `created_timestamps_count` tallies non-zero `start_timestamp` fields
+/// (RW2's `Sample.start_timestamp` and `Histogram.start_timestamp`; RW1's
+/// `prometheus.Sample` has no such field, so RW1 always resolves this to
+/// 0).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedRequest {
     pub series: Vec<ResolvedSeries>,
     pub metadata_count: usize,
+    pub created_timestamps_count: usize,
 }
