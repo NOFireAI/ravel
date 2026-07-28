@@ -1417,3 +1417,320 @@ proptest! {
         prop_assert_eq!(&got1, &got3, "v1 and v3 diverged on the same logical scalar input");
     }
 }
+
+// --- 7. HIST_SPANS record-level byte mutation at every structural       ---
+// --- boundary (C5, RSEG v3 phase 4, issue #137): docs/rseg-v3-plan.md    ---
+// --- section 10's C5 entry calls for "byte-level mutations at every new ---
+// --- structural boundary (flags byte, scale, span/length pairs,         ---
+// --- count-kind-dependent varint-vs-f64 branches)". tests/fuzz_mutation ---
+// --- .rs's whole-object seed corpus already fuzzes at the object level; ---
+// --- CRC gates on the page/section framing mean a random single-bit     ---
+// --- flip almost never reaches the record decoder itself. This section ---
+// --- targets that decoder directly: build one minimal HIST_SPANS        ---
+// --- record with a known byte layout, flip one deliberately-chosen      ---
+// --- byte at a time, patch the page's crc32c so the mutated bytes pass  ---
+// --- the framing gate, and assert the exact typed error the record      ---
+// --- decoder (`decode_histogram_record`, src/reader.rs) is documented   ---
+// --- to raise for that boundary.
+
+/// One histogram series, one sample, chosen so every field of the encoded
+/// HIST_SPANS record is exactly one byte wide except the 8-byte
+/// `zero_threshold` f64: flags=0 (int, no sum, `ResetHint::Unknown`),
+/// scale=0, zero_threshold=0.0, zero_count=0, count=1, one positive span
+/// (offset=0, length=1, bucket=[1]), zero negative spans. Encodes to
+/// exactly 17 bytes, verified by `hist_mutation_record_layout_is_stable`
+/// below, which pins the byte-for-byte layout the other tests in this
+/// section index into by fixed offset.
+fn hist_mutation_fixture() -> Vec<SeriesInputV3> {
+    vec![SeriesInputV3 {
+        series_id: SeriesId([0x09; 16]),
+        labels: labels(&[(METRIC_NAME_LABEL, "hist_mutation_target")]),
+        values: SeriesValues::Histogram(vec![HistogramSample {
+            ts_ns: 0,
+            value: HistogramValue {
+                scale: 0,
+                zero_threshold: 0.0,
+                sum: None,
+                custom_values: None,
+                positive_spans: vec![ravel_segment::HistogramSpan {
+                    offset: 0,
+                    length: 1,
+                }],
+                negative_spans: vec![],
+                counts: HistogramCounts::Int {
+                    zero_count: 0,
+                    count: 1,
+                    positive: vec![1],
+                    negative: vec![],
+                },
+                reset_hint: ravel_segment::ResetHint::Unknown,
+            },
+        }]),
+    }]
+}
+
+/// Byte offsets into `hist_mutation_fixture`'s single encoded record,
+/// relative to the record's own first byte (docs/rseg-v3-plan.md section
+/// 3.5's field order).
+const HIST_REC_FLAGS: usize = 0;
+const HIST_REC_SCALE: usize = 1;
+const HIST_REC_ZERO_COUNT: usize = 10;
+const HIST_REC_COUNT: usize = 11;
+const HIST_REC_POS_SPAN_COUNT: usize = 12;
+const HIST_REC_POS_SPAN_LENGTH: usize = 14;
+const HIST_REC_NEG_SPAN_COUNT: usize = 16;
+const HIST_MUTATION_RECORD_LEN: usize = 17;
+
+/// zigzag-varint encodings (single byte each, values in [-64, 63]) of the
+/// two scale boundaries this section mutates into: -54 is one past the
+/// `scale >= -53` floor, and -53 itself switches the record into
+/// custom-boundaries mode.
+const ZIGZAG_SCALE_NEG_54: u8 = 107;
+const ZIGZAG_SCALE_NEG_53: u8 = 105;
+
+/// Locates `hist_mutation_fixture`'s single HIST_SPANS record within a
+/// freshly written v3 object: the absolute byte range of its containing
+/// page, and the absolute offset of the record's first byte within that
+/// page (immediately after the 6-byte page header, since a single-sample
+/// page holds exactly one record with no per-record length prefix -- see
+/// `decode_hist_page_into`, src/reader.rs).
+fn locate_hist_mutation_record(bytes: &[u8]) -> ((usize, usize), usize) {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits).expect("opens");
+    let dict = section_bytes(bytes, &loc.footer, LABEL_DICT);
+    let ids = section_bytes(bytes, &loc.footer, SERIES_IDS);
+    let meta = section_bytes(bytes, &loc.footer, SERIES_META);
+    let entries = ravel_segment::decode_catalog_v3(&loc.footer, dict, ids, meta, limits)
+        .expect("decodes catalog");
+    assert_eq!(entries.len(), 1);
+    let selected: Vec<&SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v3(&loc.footer, &selected).expect("plans ranges");
+    let page_start = ranges[0].hist_range.0 as usize;
+    let page_len = ranges[0].hist_range.1 as usize;
+    let record_start = page_start + 6;
+    ((page_start, page_len), record_start)
+}
+
+/// Recomputes and patches a HIST_SPANS page's crc32c after a record byte
+/// has been mutated in place, so the mutation reaches the record decoder
+/// instead of being rejected earlier by the page-framing crc check.
+/// Reimplements `src/crc.rs::page_crc`'s algorithm locally (that function
+/// is crate-private, not part of `ravel_segment`'s public API): crc32c
+/// over `series_id || enc || comp || payload`, matching
+/// `split_page_header`'s own field order.
+fn recompute_hist_page_crc(
+    bytes: &mut [u8],
+    page_start: usize,
+    page_len: usize,
+    series_id: &[u8; 16],
+) {
+    let enc = bytes[page_start];
+    let comp = bytes[page_start + 1];
+    let payload_start = page_start + 6;
+    let payload_end = page_start + page_len;
+    let mut crc = crc32c::crc32c(series_id);
+    crc = crc32c::crc32c_append(crc, &[enc, comp]);
+    crc = crc32c::crc32c_append(crc, &bytes[payload_start..payload_end]);
+    bytes[page_start + 2..page_start + 6].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Builds `hist_mutation_fixture`, flips the record byte at
+/// `record_offset` to `new_byte`, patches the page crc, and returns the
+/// mutated whole-object bytes plus everything needed to decode it again.
+fn mutate_hist_record(record_offset: usize, new_byte: u8) -> Vec<u8> {
+    let written = SegmentWriter::write_v3(hist_mutation_fixture(), test_identity(), test_bounds())
+        .expect("writes v3");
+    let mut bytes = written.bytes.as_ref().to_vec();
+    let ((page_start, page_len), record_start) = locate_hist_mutation_record(&bytes);
+    bytes[record_start + record_offset] = new_byte;
+    recompute_hist_page_crc(&mut bytes, page_start, page_len, &[0x09; 16]);
+    bytes
+}
+
+/// Runs the full v3 read pipeline (catalog -> plan -> histogram page
+/// decode) over mutated bytes and returns the single series' decode
+/// result, so each mutation test asserts on the exact typed error (or
+/// success) `decode_histogram_pages` produces.
+fn decode_hist_mutation(bytes: &[u8]) -> Result<Vec<HistogramValue>, SegmentError> {
+    let limits = ReaderLimits::default();
+    let loc = ravel_segment::open_from_full(bytes, limits)?;
+    let dict = section_bytes(bytes, &loc.footer, LABEL_DICT);
+    let ids = section_bytes(bytes, &loc.footer, SERIES_IDS);
+    let meta = section_bytes(bytes, &loc.footer, SERIES_META);
+    let entries = ravel_segment::decode_catalog_v3(&loc.footer, dict, ids, meta, limits)?;
+    let selected: Vec<&SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v3(&loc.footer, &selected)?;
+    let entry = &entries[0];
+    let range = &ranges[0];
+    let ts_bytes = slice_range(bytes, range.ts_range);
+    let hist_bytes = slice_range(bytes, range.hist_range);
+    let samples = ravel_segment::decode_histogram_pages(entry, ts_bytes, hist_bytes, limits)?;
+    Ok(samples.into_iter().map(|s| s.value).collect())
+}
+
+/// Pins the byte layout every other test in this section indexes into by
+/// fixed offset, decoding the unmutated fixture back to its original
+/// logical value first.
+#[test]
+fn hist_mutation_record_layout_is_stable() {
+    let written = SegmentWriter::write_v3(hist_mutation_fixture(), test_identity(), test_bounds())
+        .expect("writes v3");
+    let bytes = written.bytes.as_ref();
+    let ((page_start, page_len), record_start) = locate_hist_mutation_record(bytes);
+    assert_eq!(record_start - page_start, 6);
+    assert_eq!(page_len - 6, HIST_MUTATION_RECORD_LEN);
+
+    let values = decode_hist_mutation(bytes).expect("unmutated record decodes");
+    assert_eq!(values.len(), 1);
+    assert_eq!(
+        values[0],
+        HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: None,
+            custom_values: None,
+            positive_spans: vec![ravel_segment::HistogramSpan {
+                offset: 0,
+                length: 1
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: vec![],
+            },
+            reset_hint: ravel_segment::ResetHint::Unknown,
+        }
+    );
+}
+
+/// Flags byte bits 4-7 are reserved and must be zero (docs/rseg-v3-plan.md
+/// section 3.5).
+#[test]
+fn hist_mutation_reserved_flags_bits_rejected() {
+    let bytes = mutate_hist_record(HIST_REC_FLAGS, 0b0001_0000);
+    assert_eq!(
+        decode_hist_mutation(&bytes),
+        Err(SegmentError::HistogramReservedFlagsNonZero)
+    );
+}
+
+/// Flipping the count-kind bit (bit0) without changing anything else
+/// desyncs the rest of the record: the decoder now expects `zero_count`
+/// and `count` as two 8-byte f64 fields instead of two 1-byte uvarints,
+/// reading past the 17-byte record (and the page it lives in) before it
+/// can find a valid stopping point. Must be a typed error, never a panic
+/// or a wrong-but-successful decode.
+#[test]
+fn hist_mutation_count_kind_bit_flip_desyncs_but_never_panics() {
+    let bytes = mutate_hist_record(HIST_REC_FLAGS, 0b0000_0001);
+    let result = std::panic::catch_unwind(|| decode_hist_mutation(&bytes));
+    let result = result.expect("must not panic");
+    assert!(result.is_err(), "a desynced count-kind bit must not decode");
+}
+
+/// `scale >= -53` is required; one past that floor is rejected by name.
+#[test]
+fn hist_mutation_scale_below_floor_rejected() {
+    let bytes = mutate_hist_record(HIST_REC_SCALE, ZIGZAG_SCALE_NEG_54);
+    assert_eq!(
+        decode_hist_mutation(&bytes),
+        Err(SegmentError::HistogramScaleTooSmall(-54))
+    );
+}
+
+/// `scale == -53` switches the record into custom-boundaries mode, which
+/// expects a `custom_values` count-and-array this fixture's bytes don't
+/// contain; the decoder must fail typed (reading into whatever bytes
+/// happen to follow, then running out), never panic or fabricate a
+/// decode.
+#[test]
+fn hist_mutation_scale_switched_to_custom_boundaries_never_panics() {
+    let bytes = mutate_hist_record(HIST_REC_SCALE, ZIGZAG_SCALE_NEG_53);
+    let result = std::panic::catch_unwind(|| decode_hist_mutation(&bytes));
+    let result = result.expect("must not panic");
+    assert!(
+        result.is_err(),
+        "scale=-53 with no custom_values bytes present must not decode"
+    );
+}
+
+/// A span with `length == 0` is rejected by name, per `decode_hist_spans`.
+#[test]
+fn hist_mutation_zero_length_span_rejected() {
+    let bytes = mutate_hist_record(HIST_REC_POS_SPAN_LENGTH, 0);
+    assert_eq!(
+        decode_hist_mutation(&bytes),
+        Err(SegmentError::HistogramSpanLengthZero)
+    );
+}
+
+/// `count` (1) must be >= the sum of every bucket (also 1 here) plus
+/// `zero_count` (0); dropping `count` to 0 violates that.
+#[test]
+fn hist_mutation_count_below_bucket_sum_rejected() {
+    let bytes = mutate_hist_record(HIST_REC_COUNT, 0);
+    assert_eq!(
+        decode_hist_mutation(&bytes),
+        Err(SegmentError::HistogramCountInconsistent)
+    );
+}
+
+/// `count` (1) must also be >= `zero_count`; raising `zero_count` above
+/// it violates that half of the same check.
+#[test]
+fn hist_mutation_zero_count_above_count_rejected() {
+    let bytes = mutate_hist_record(HIST_REC_ZERO_COUNT, 2);
+    assert_eq!(
+        decode_hist_mutation(&bytes),
+        Err(SegmentError::HistogramCountInconsistent)
+    );
+}
+
+/// Claiming a positive span count of 2 when only one span's bytes (and
+/// only one bucket's worth of trailing data) actually exist must fail
+/// typed rather than reading uninitialized-looking trailing bytes as a
+/// second span.
+#[test]
+fn hist_mutation_span_count_overclaim_never_panics() {
+    let bytes = mutate_hist_record(HIST_REC_POS_SPAN_COUNT, 2);
+    let result = std::panic::catch_unwind(|| decode_hist_mutation(&bytes));
+    let result = result.expect("must not panic");
+    assert!(result.is_err(), "an overclaimed span count must not decode");
+}
+
+/// Claiming a negative span where the record has none (no negative span
+/// bytes exist at all past the record's declared end) must fail typed,
+/// never panic.
+#[test]
+fn hist_mutation_negative_span_count_overclaim_never_panics() {
+    let bytes = mutate_hist_record(HIST_REC_NEG_SPAN_COUNT, 1);
+    let result = std::panic::catch_unwind(|| decode_hist_mutation(&bytes));
+    let result = result.expect("must not panic");
+    assert!(
+        result.is_err(),
+        "a negative span claimed out of no data must not decode"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Every single byte of the record, flipped to every value that byte
+    /// doesn't already hold, must decode to a typed error or a valid
+    /// (Ok) result -- never panic. This is the structural-boundary
+    /// counterpart to tests/fuzz_mutation.rs's whole-object random
+    /// mutation: it guarantees single-bit/single-byte coverage of the
+    /// record's own bytes specifically, which a whole-object crc-gated
+    /// random mutation would essentially never reach unmutated.
+    #[test]
+    fn hist_mutation_any_record_byte_never_panics(
+        byte_offset in 0usize..HIST_MUTATION_RECORD_LEN,
+        new_byte in any::<u8>(),
+    ) {
+        let bytes = mutate_hist_record(byte_offset, new_byte);
+        let result = std::panic::catch_unwind(|| decode_hist_mutation(&bytes));
+        prop_assert!(result.is_ok(), "panicked mutating record byte {byte_offset} to {new_byte:#04x}");
+    }
+}
