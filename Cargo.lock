@@ -3818,6 +3818,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-logseg"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "proptest",
+ "prost",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
 name = "ravel-maintain"
 version = "0.1.0"
 dependencies = [
@@ -4069,6 +4081,7 @@ dependencies = [
  "base64 0.23.0",
  "blake3",
  "hex",
+ "proptest",
  "thiserror",
  "uuid",
 ]
