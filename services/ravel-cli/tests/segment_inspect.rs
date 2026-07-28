@@ -6,16 +6,19 @@
 //! Fixtures are read directly from `ravel-segment`'s own test corpus
 //! (`crates/ravel-segment/tests/fixtures/`) by absolute path rather than
 //! copied here, so there is exactly one source of truth for what a valid
-//! RSEG v1/v2 object looks like: `golden_v1_a3.bin` is the same fixture
-//! `ravel-segment/tests/golden_bytes.rs` pins for the v1 writer, and
+//! RSEG v1/v2/v3 object looks like: `golden_v1_a3.bin` is the same fixture
+//! `ravel-segment/tests/golden_bytes.rs` pins for the v1 writer,
 //! `golden_v2_multi_schema.bin` / `golden_v2_raw_f64_padding.bin` are two of
-//! the six `golden_bytes_v2.rs` pins for the v2 writer.
+//! the six `golden_bytes_v2.rs` pins for the v2 writer, and
+//! `golden_v3_mixed_scalar_and_histogram.bin` is one of the
+//! `golden_bytes_v3.rs` pins for the v3 writer (docs/rseg-v3-plan.md phase
+//! C6).
 //!
 //! Expected `segment inspect` stdout is itself pinned as a golden fixture
 //! under `tests/fixtures/` (captured from a real run of this binary against
 //! the corresponding RSEG fixture): a regression in the inspect output
-//! (v1 or v2) fails these tests exactly the way `golden_bytes.rs` catches a
-//! regression in the writer's output.
+//! (v1, v2, or v3) fails these tests exactly the way `golden_bytes.rs`
+//! catches a regression in the writer's output.
 #![allow(clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -142,6 +145,124 @@ fn corrupt_v2_object_prints_typed_error_not_panic() {
     assert!(
         stderr.contains("section crc32c mismatch")
             || stderr.contains("failed to decode series catalog"),
+        "expected the typed SegmentError text on stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn v3_mixed_scalar_and_histogram_inspect_output_matches_golden_fixture() {
+    let output = run_inspect(&segment_fixture("golden_v3_mixed_scalar_and_histogram.bin"));
+    assert!(
+        output.status.success(),
+        "ravel-cli segment inspect failed on a known-good v3 fixture, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let expected = inspect_fixture("golden_v3_mixed_scalar_and_histogram_inspect.txt");
+    assert_eq!(stdout, expected, "v3 `segment inspect` output regressed");
+    assert!(
+        expected.contains("HIST_PAGES") && expected.contains("value_kind=HIST_SPANS"),
+        "this fixture is named for exercising v3's histogram series; if the \
+         golden text stops containing HIST_PAGES/HIST_SPANS, the fixture or \
+         the v3 dispatch silently stopped exercising it"
+    );
+}
+
+/// A corrupt v3 object must fail with the typed `SegmentError` text on
+/// stderr and a non-zero exit status, never a panic. Flips one byte inside
+/// the SERIES_META section's stored bytes of
+/// `golden_v3_mixed_scalar_and_histogram.bin`, which corrupts that
+/// section's crc32c, checked before any SERIES_META (including the v3-only
+/// `value_kind`/`hist_page_gap`/`hist_page_len` columns) is parsed.
+#[test]
+fn corrupt_v3_series_meta_prints_typed_error_not_panic() {
+    let good = std::fs::read(segment_fixture("golden_v3_mixed_scalar_and_histogram.bin"))
+        .expect("reads fixture");
+    let mut corrupt = good.clone();
+    // SERIES_META section per the captured golden fixture's footer: offset
+    // 113, len 61 (see tests/fixtures/
+    // golden_v3_mixed_scalar_and_histogram_inspect.txt's `kind=6
+    // name=SERIES_META offset=113 len=61`).
+    let flip_at = 113 + 30;
+    assert!(
+        flip_at < corrupt.len(),
+        "flip offset must land inside the object"
+    );
+    corrupt[flip_at] ^= 0xFF;
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "ravel-cli-corrupt-v3-meta-{}-{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos()
+    ));
+    std::fs::write(&path, &corrupt).expect("writes corrupt fixture");
+
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !output.status.success(),
+        "a corrupt v3 object must not be reported as successfully inspected"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("section crc32c mismatch")
+            || stderr.contains("failed to decode series catalog"),
+        "expected the typed SegmentError text on stderr, got: {stderr}"
+    );
+}
+
+/// A corrupt HIST_PAGES payload (as opposed to a corrupt SERIES_META
+/// section above) must also fail with the typed error, never a panic. This
+/// exercises the page-crc check inside `decode_histogram_pages`
+/// specifically (docs/rseg-v3-plan.md section 4's checksum coverage
+/// review: "HIST_PAGES page header + payload ... per page, on the
+/// selective access path"), a different failure path than the
+/// SERIES_META-section corruption test above.
+#[test]
+fn corrupt_v3_hist_page_prints_typed_error_not_panic() {
+    let good = std::fs::read(segment_fixture("golden_v3_mixed_scalar_and_histogram.bin"))
+        .expect("reads fixture");
+    let mut corrupt = good.clone();
+    // HIST_PAGES section per the captured golden fixture's footer: offset
+    // 240, len 32 (see tests/fixtures/
+    // golden_v3_mixed_scalar_and_histogram_inspect.txt's `kind=7
+    // name=HIST_PAGES offset=240 len=32`). Flip a byte inside the one
+    // page's payload, past its 6-byte header (enc/comp/crc), so this is
+    // caught by the page crc check, not the section crc.
+    let flip_at = 240 + 10;
+    assert!(
+        flip_at < corrupt.len(),
+        "flip offset must land inside the object"
+    );
+    corrupt[flip_at] ^= 0xFF;
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "ravel-cli-corrupt-v3-hist-{}-{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos()
+    ));
+    std::fs::write(&path, &corrupt).expect("writes corrupt fixture");
+
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !output.status.success(),
+        "a corrupt v3 object must not be reported as successfully inspected"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("page crc32c mismatch")
+            || stderr.contains("failed to decode histogram pages"),
         "expected the typed SegmentError text on stderr, got: {stderr}"
     );
 }

@@ -18,10 +18,15 @@ const SECTION_KIND_VAL_PAGES: u32 = 4;
 // v2-only kinds (ADR-0014, docs/segment-format.md "RSEG v2 amendment").
 const SECTION_KIND_SERIES_IDS: u32 = 5;
 const SECTION_KIND_SERIES_META: u32 = 6;
+// v3-only kind (ADR-0017, docs/rseg-v3-plan.md "RSEG v3 amendment").
+const SECTION_KIND_HIST_PAGES: u32 = 7;
 
 // Frozen trailer `version` value for RSEG v2 (ADR-0014,
 // docs/segment-format.md "RSEG v2 amendment").
 const TRAILER_VERSION_V2: u16 = 2;
+// Frozen trailer `version` value for RSEG v3 (ADR-0017,
+// docs/rseg-v3-plan.md "RSEG v3 amendment").
+const TRAILER_VERSION_V3: u16 = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "ravel-cli", about = "Ravel dev inspection CLI")]
@@ -143,7 +148,130 @@ fn section_kind_name(kind: u32) -> &'static str {
         SECTION_KIND_VAL_PAGES => "VAL_PAGES",
         SECTION_KIND_SERIES_IDS => "SERIES_IDS",
         SECTION_KIND_SERIES_META => "SERIES_META",
+        SECTION_KIND_HIST_PAGES => "HIST_PAGES",
         _ => "UNKNOWN",
+    }
+}
+
+/// Human-readable name for a `ravel_segment::ValueKind`, matching the wire
+/// names from SERIES_META column 10 (docs/rseg-v3-plan.md section 3.4:
+/// `0 = VAL_SCALAR, 1 = HIST_SPANS`), not `ValueKind`'s Rust variant names.
+fn value_kind_name(kind: ravel_segment::ValueKind) -> &'static str {
+    match kind {
+        ravel_segment::ValueKind::Scalar => "VAL_SCALAR",
+        ravel_segment::ValueKind::Histogram => "HIST_SPANS",
+    }
+}
+
+/// Human-readable name for a `ravel_segment::ResetHint`, matching
+/// Prometheus's four reset-hint states (docs/rseg-v3-plan.md section 3.5).
+fn reset_hint_name(hint: ravel_segment::ResetHint) -> &'static str {
+    match hint {
+        ravel_segment::ResetHint::Unknown => "UNKNOWN",
+        ravel_segment::ResetHint::Yes => "YES",
+        ravel_segment::ResetHint::No => "NO",
+        ravel_segment::ResetHint::Gauge => "GAUGE",
+    }
+}
+
+fn format_spans(spans: &[ravel_segment::HistogramSpan]) -> String {
+    spans
+        .iter()
+        .map(|s| format!("({}, {})", s.offset, s.length))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_f64_list(values: &[f64]) -> String {
+    values
+        .iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_u64_list(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Absolute `[start, start+len)` slice of `bytes`, for the ranges
+/// `plan_ranges_v3` computes (already section-bounds-checked; this only
+/// guards the final slice against the object's own total size).
+fn absolute_range(bytes: &[u8], range: (u64, u64)) -> anyhow::Result<&[u8]> {
+    let start = usize::try_from(range.0)?;
+    let end = start
+        .checked_add(usize::try_from(range.1)?)
+        .ok_or_else(|| anyhow::anyhow!("byte range overflows"))?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("byte range is out of bounds"))
+}
+
+/// Prints one decoded histogram record (docs/rseg-v3-plan.md section 3.5):
+/// scale, zero bucket, count, sum, reset_hint, then per-side spans and
+/// bucket counts. A histogram series can hold more than one sample
+/// (`sample_count` in its SERIES_META row), so this is called once per
+/// decoded `HistogramSample`, indexed within its series.
+fn print_histogram_sample(index: usize, sample: &ravel_segment::HistogramSample) {
+    let value = &sample.value;
+    let custom_values = match &value.custom_values {
+        Some(bounds) => format!(" custom_values=[{}]", format_f64_list(bounds)),
+        None => String::new(),
+    };
+    let sum = value
+        .sum
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    println!(
+        "    hist[{index}]: ts_ns={} scale={} zero_threshold={} sum={} reset_hint={}{}",
+        sample.ts_ns,
+        value.scale,
+        value.zero_threshold,
+        sum,
+        reset_hint_name(value.reset_hint),
+        custom_values
+    );
+    match &value.counts {
+        ravel_segment::HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => {
+            println!("      count_kind=INT zero_count={zero_count} count={count}");
+            println!(
+                "      positive: spans=[{}] counts=[{}]",
+                format_spans(&value.positive_spans),
+                format_u64_list(positive)
+            );
+            println!(
+                "      negative: spans=[{}] counts=[{}]",
+                format_spans(&value.negative_spans),
+                format_u64_list(negative)
+            );
+        }
+        ravel_segment::HistogramCounts::Float {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => {
+            println!("      count_kind=FLOAT zero_count={zero_count} count={count}");
+            println!(
+                "      positive: spans=[{}] counts=[{}]",
+                format_spans(&value.positive_spans),
+                format_f64_list(positive)
+            );
+            println!(
+                "      negative: spans=[{}] counts=[{}]",
+                format_spans(&value.negative_spans),
+                format_f64_list(negative)
+            );
+        }
     }
 }
 
@@ -170,7 +298,7 @@ fn segment_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     println!("series_count (footer): {}", footer.series_count);
     println!("sections:");
     for section in &footer.sections {
-        if location.version == TRAILER_VERSION_V2 {
+        if location.version == TRAILER_VERSION_V2 || location.version == TRAILER_VERSION_V3 {
             println!(
                 "  kind={} name={} offset={} len={} uncompressed_len={} comp={:?}",
                 section.kind,
@@ -188,7 +316,9 @@ fn segment_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         }
     }
 
-    if location.version == TRAILER_VERSION_V2 {
+    if location.version == TRAILER_VERSION_V3 {
+        segment_inspect_v3(bytes, footer, limits)
+    } else if location.version == TRAILER_VERSION_V2 {
         segment_inspect_v2(bytes, footer, limits)
     } else {
         segment_inspect_v1(bytes, footer, limits)
@@ -327,6 +457,165 @@ fn segment_inspect_v2(
             range.val_range.0.saturating_add(range.val_range.1),
             flag
         );
+    }
+
+    Ok(())
+}
+
+/// v3 catalog decode and print (docs/segment-format.md "RSEG v3 amendment").
+/// Same schema/series listing `segment_inspect_v2` prints (same derived
+/// `schema_count`, same per-series id/labels/sample_count/ts-bounds
+/// fields), extended two ways per docs/rseg-v3-plan.md phase C6:
+///
+/// - Each series row gains `value_kind` and prints whichever page range
+///   applies (`val_range` for `VAL_SCALAR`, `hist_range` for `HIST_SPANS`);
+///   a v3 segment can omit either VAL_PAGES or HIST_PAGES entirely (section
+///   3.2), so only the range that exists for that series is shown.
+///   `ALIGNMENT_GAP` tracks `ts_page_gap` plus whichever of `val_page_gap`/
+///   `hist_page_gap` applies, each reconstructed as its own independent
+///   running sum (section 3.4) since a series only ever advances one of
+///   the two.
+/// - For `HIST_SPANS` series, decodes its HIST/TS pages
+///   (`decode_histogram_pages`) and prints every histogram record's full
+///   field detail: scale, zero bucket, count, sum, reset_hint, and
+///   per-side spans/bucket counts (section 3.5).
+fn segment_inspect_v3(
+    bytes: &[u8],
+    footer: &Footer,
+    limits: ravel_segment::ReaderLimits,
+) -> anyhow::Result<()> {
+    let label_dict_bytes = section_bytes(bytes, footer, SECTION_KIND_LABEL_DICT)?;
+    let series_ids_bytes = section_bytes(bytes, footer, SECTION_KIND_SERIES_IDS)?;
+    let series_meta_bytes = section_bytes(bytes, footer, SECTION_KIND_SERIES_META)?;
+    let entries = ravel_segment::decode_catalog_v3(
+        footer,
+        label_dict_bytes,
+        series_ids_bytes,
+        series_meta_bytes,
+        limits,
+    )
+    .map_err(|err| anyhow::anyhow!("failed to decode series catalog: {err}"))?;
+
+    let mut schemas: Vec<Vec<String>> = Vec::new();
+    for entry in &entries {
+        let names: Vec<String> = entry.labels.iter().map(|l| l.name.clone()).collect();
+        if !schemas.contains(&names) {
+            schemas.push(names);
+        }
+    }
+    println!("schema_count (derived): {}", schemas.len());
+    for (i, schema) in schemas.iter().enumerate() {
+        println!("  schema[{i}]: {}", schema.join(","));
+    }
+
+    println!("series_count (decoded): {}", entries.len());
+
+    let selected: Vec<&ravel_segment::SeriesEntry> = entries.iter().collect();
+    let ranges = ravel_segment::plan_ranges_v3(footer, &selected)
+        .map_err(|err| anyhow::anyhow!("failed to plan page ranges: {err}"))?;
+
+    println!("series:");
+    // Independent running sums for ts/val/hist gaps, same reconstruction
+    // principle as `segment_inspect_v2`: only the page kind a series
+    // actually has (`val_page` for VAL_SCALAR, `hist_page` for HIST_SPANS)
+    // advances its running end, since the other is always `(0, 0)` for
+    // that series (docs/rseg-v3-plan.md section 3.4) and isn't a gap at
+    // all.
+    let mut ts_end = 0u64;
+    let mut val_end = 0u64;
+    let mut hist_end = 0u64;
+    for (entry, range) in entries.iter().zip(&ranges) {
+        let ts_gap = entry
+            .ts_page
+            .0
+            .checked_sub(ts_end)
+            .ok_or_else(|| anyhow::anyhow!("ts_page offset precedes running end"))?;
+        ts_end = entry
+            .ts_page
+            .0
+            .checked_add(entry.ts_page.1)
+            .ok_or_else(|| anyhow::anyhow!("ts_page range overflows u64"))?;
+
+        let labels_str = entry
+            .labels
+            .iter()
+            .map(|l| format!("{}={}", l.name, l.value))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let (page_range_str, flag) =
+            match entry.value_kind {
+                ravel_segment::ValueKind::Scalar => {
+                    let val_gap =
+                        entry.val_page.0.checked_sub(val_end).ok_or_else(|| {
+                            anyhow::anyhow!("val_page offset precedes running end")
+                        })?;
+                    val_end = entry
+                        .val_page
+                        .0
+                        .checked_add(entry.val_page.1)
+                        .ok_or_else(|| anyhow::anyhow!("val_page range overflows u64"))?;
+                    let range_str = format!(
+                        "val_range=[{}, {})",
+                        range.val_range.0,
+                        range.val_range.0.saturating_add(range.val_range.1)
+                    );
+                    let flag = if ts_gap != 0 || val_gap != 0 {
+                        format!(" ALIGNMENT_GAP(ts_page_gap={ts_gap}, val_page_gap={val_gap})")
+                    } else {
+                        String::new()
+                    };
+                    (range_str, flag)
+                }
+                ravel_segment::ValueKind::Histogram => {
+                    let hist_gap =
+                        entry.hist_page.0.checked_sub(hist_end).ok_or_else(|| {
+                            anyhow::anyhow!("hist_page offset precedes running end")
+                        })?;
+                    hist_end = entry
+                        .hist_page
+                        .0
+                        .checked_add(entry.hist_page.1)
+                        .ok_or_else(|| anyhow::anyhow!("hist_page range overflows u64"))?;
+                    let range_str = format!(
+                        "hist_range=[{}, {})",
+                        range.hist_range.0,
+                        range.hist_range.0.saturating_add(range.hist_range.1)
+                    );
+                    let flag = if ts_gap != 0 || hist_gap != 0 {
+                        format!(" ALIGNMENT_GAP(ts_page_gap={ts_gap}, hist_page_gap={hist_gap})")
+                    } else {
+                        String::new()
+                    };
+                    (range_str, flag)
+                }
+            };
+
+        println!(
+            "  series_id={} labels={} sample_count={} min_ts_ns={} max_ts_ns={} value_kind={} \
+             ts_range=[{}, {}) {}{}",
+            hex::encode(entry.series_id.0),
+            labels_str,
+            entry.sample_count,
+            entry.min_ts_ns,
+            entry.max_ts_ns,
+            value_kind_name(entry.value_kind),
+            range.ts_range.0,
+            range.ts_range.0.saturating_add(range.ts_range.1),
+            page_range_str,
+            flag
+        );
+
+        if entry.value_kind == ravel_segment::ValueKind::Histogram {
+            let ts_bytes = absolute_range(bytes, range.ts_range)?;
+            let hist_bytes = absolute_range(bytes, range.hist_range)?;
+            let samples =
+                ravel_segment::decode_histogram_pages(entry, ts_bytes, hist_bytes, limits)
+                    .map_err(|err| anyhow::anyhow!("failed to decode histogram pages: {err}"))?;
+            for (i, sample) in samples.iter().enumerate() {
+                print_histogram_sample(i, sample);
+            }
+        }
     }
 
     Ok(())
