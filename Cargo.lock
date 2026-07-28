@@ -3656,7 +3656,6 @@ dependencies = [
  "bytes",
  "crc32c",
  "hex",
- "proptest",
  "prost",
  "rand 0.10.2",
  "ravel-object-store",
@@ -3696,7 +3695,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "proptest",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
@@ -3723,7 +3721,6 @@ dependencies = [
  "futures",
  "object_store 0.14.1",
  "parking_lot",
- "proptest",
  "rand 0.10.2",
  "thiserror",
  "tokio",
@@ -3760,7 +3757,6 @@ name = "ravel-otlp"
 version = "0.1.0"
 dependencies = [
  "opentelemetry-proto",
- "proptest",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3930,7 +3926,6 @@ dependencies = [
  "base64 0.23.0",
  "blake3",
  "hex",
- "proptest",
  "thiserror",
  "uuid",
 ]
