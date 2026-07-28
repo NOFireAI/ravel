@@ -182,16 +182,21 @@ pub(crate) fn eval_call(
             })))
         }
         FunctionKind::RangeVectorFloatOrHist { float, hist } => {
-            let ms = matrix_arg(&call.args.args[0])?;
-            let window = range_window(ms, eval_ts_ns, ctx)?;
-            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            let arg = matrix_arg(&call.args.args[0])?;
+            let window = range_window(arg, eval_ts_ns, ctx)?;
+            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             let mut out = apply_reduce(matrix, eval_ts_ns, |samples| float(samples, window));
             // Native-histogram series matching the same selector: reduce each
-            // window to a histogram and emit it as a histogram element.
-            let hmatrix = evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx)?;
-            for (labels, samples) in hmatrix {
-                if let Some(h) = hist(&samples, window) {
-                    out.push(InstantSample::histogram(labels, eval_ts_ns, eval_ts_ns, h));
+            // window to a histogram and emit it as a histogram element. A
+            // subquery argument contributes no histogram series: subquery
+            // evaluation produces float grids only.
+            if let MatrixArg::Selector(ms) = arg {
+                let hmatrix =
+                    evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+                for (labels, samples) in hmatrix {
+                    if let Some(h) = hist(&samples, window) {
+                        out.push(InstantSample::histogram(labels, eval_ts_ns, eval_ts_ns, h));
+                    }
                 }
             }
             Ok(Value::Vector(out))
@@ -316,10 +321,11 @@ pub(crate) fn eval_range_call(
             // range result cannot be rendered by the HTTP JSON layer and no
             // read path feeds native histograms into a range query yet (P11
             // report). The float reduction is identical to `RangeVector`.
-            let ms = matrix_arg(&call.args.args[0])?;
-            evaluator.eval_range_matrix_reduction(
+            let arg = matrix_arg(&call.args.args[0])?;
+            eval_matrix_arg_range_reduction(
+                evaluator,
                 source,
-                ms,
+                arg,
                 start_ns,
                 end_ns,
                 step_ns,
