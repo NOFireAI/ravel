@@ -1,5 +1,7 @@
 //! Catalog configuration (docs/catalog-and-mvcc.md).
 
+use crate::snapshot_format;
+
 /// Default `max_ingest_lag`: 2 hours, in nanoseconds.
 pub const DEFAULT_MAX_INGEST_LAG_NS: i64 = 2 * 60 * 60 * 1_000_000_000;
 /// Default `clock_skew_allowance`: 5 minutes, in nanoseconds.
@@ -17,6 +19,13 @@ pub const DEFAULT_MAX_FLUSH_LIFETIME_NS: i64 = 60 * 60 * 1_000_000_000;
 /// past `max_flush_lifetime + clock_skew_allowance` before a fold trusts an
 /// ingest hour to be sealed (docs/metric-index-plan.md, ADR-0020).
 pub const DEFAULT_FOLD_SAFETY_MARGIN_NS: i64 = 15 * 60 * 1_000_000_000;
+/// Default `head_cache_ttl`: 30 seconds, in nanoseconds
+/// (docs/metric-index-plan.md 5.1, ADR-0020).
+pub const DEFAULT_HEAD_CACHE_TTL_NS: i64 = 30 * 1_000_000_000;
+/// Default bound on decoded snapshot parts cached per tenant. Parts are
+/// content-addressed and immutable, so this cache never invalidates on
+/// write, only evicts by capacity.
+pub const DEFAULT_SNAPSHOT_CACHE_PARTS: usize = 32;
 
 /// Catalog configuration.
 ///
@@ -51,6 +60,18 @@ pub struct CatalogConfig {
     /// clock_skew_allowance_ns` before a fold trusts an ingest hour to be
     /// sealed, in nanoseconds. Default [`DEFAULT_FOLD_SAFETY_MARGIN_NS`].
     pub fold_safety_margin_ns: i64,
+    /// How long a decoded HEAD may be served from cache before `resolve`
+    /// re-reads it, in nanoseconds (docs/metric-index-plan.md 5.1, 5.3: a
+    /// stale cache only ever widens the listed suffix by up to this much,
+    /// never a correctness issue). Default [`DEFAULT_HEAD_CACHE_TTL_NS`].
+    pub head_cache_ttl_ns: i64,
+    /// Bound on decoded snapshot parts cached per tenant. Default
+    /// [`DEFAULT_SNAPSHOT_CACHE_PARTS`].
+    pub snapshot_cache_parts: usize,
+    /// Resource cap applied to a snapshot part's declared decompressed size
+    /// at resolve time (docs/metric-index-plan.md 3.1). Default
+    /// [`snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES`].
+    pub max_snapshot_part_bytes: u64,
 }
 
 impl Default for CatalogConfig {
@@ -62,6 +83,9 @@ impl Default for CatalogConfig {
             cache_capacity_per_tenant: DEFAULT_CACHE_CAPACITY_PER_TENANT,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
             fold_safety_margin_ns: DEFAULT_FOLD_SAFETY_MARGIN_NS,
+            head_cache_ttl_ns: DEFAULT_HEAD_CACHE_TTL_NS,
+            snapshot_cache_parts: DEFAULT_SNAPSHOT_CACHE_PARTS,
+            max_snapshot_part_bytes: snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
         }
     }
 }
