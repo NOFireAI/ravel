@@ -2260,48 +2260,52 @@ fn zstd_compress_v3(data: &[u8]) -> Result<Vec<u8>, WriteError> {
 /// v1/v2/v3. A pre-encoded run page shorter than this cannot be valid.
 const RUN_PAGE_HEADER_LEN_V4: usize = 6;
 
-/// Identical grammar and first-occurrence-order rule as v3's
-/// `DictionaryV3` (section 4: "SERIES_IDS / LABEL_DICT ... as v2/v3").
+/// Identical grammar and sorted-order rule as v3's `DictionaryV3` (section
+/// 4: "SERIES_IDS / LABEL_DICT ... as v2/v3"; issue #146 restored the sort in
+/// v2/v3, issue #155 carries it here). `__name__` at ordinal 0, every other
+/// distinct string in sorted (byte) order.
 struct DictionaryV4<'a> {
+    /// Distinct non-`__name__` strings in sorted order (ordinals 1..).
     order: Vec<&'a str>,
     occurrence_ordinals: Vec<u32>,
     count: u32,
 }
 
+/// Interns every occurrence to a pre-rank distinct index in series-then-label
+/// iteration order, then assigns sorted ordinals via the shared
+/// `sort_and_rank_dict` pass (`__name__` pinned to 0), the same scheme as
+/// `build_dictionary_v2` / `build_dictionary_v3`. LABEL_DICT is "as v2/v3"
+/// (section 4), so this inherits the issue #146 sort (issue #155): v4 is the
+/// L1 compaction output, whose objects are larger and longer-lived than L0
+/// segments, so the compression win the sort buys is worth more here. The
+/// order rule stays relaxed (readers locate strings by ordinal), so this is a
+/// writer-side change: no version bump, no ADR.
 fn build_dictionary_v4(series: &[SeriesInputV4]) -> Result<DictionaryV4<'_>, WriteError> {
     let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
     let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
-        HashMap::with_capacity_and_hasher(total_strings + 1, BuildHasherDefault::default());
-    interner.insert(METRIC_NAME_LABEL, 0);
-
-    let mut order: Vec<&str> = Vec::new();
+        HashMap::with_capacity_and_hasher(total_strings, BuildHasherDefault::default());
+    let mut distinct: Vec<&str> = Vec::new();
     let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
-    let mut next_ordinal: u32 = 1;
 
     for s in series {
         for label in s.labels.iter() {
             for text in [label.name.as_str(), label.value.as_str()] {
-                let id = match interner.entry(text) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let id = next_ordinal;
-                        next_ordinal = next_ordinal
-                            .checked_add(1)
-                            .ok_or(WriteError::TooManyDictStrings)?;
-                        order.push(text);
-                        e.insert(id);
-                        id
-                    }
-                };
-                occurrence_ordinals.push(id);
+                occurrence_ordinals.push(intern_dict(&mut interner, &mut distinct, text)?);
             }
         }
     }
 
+    let (order, rank, count) = sort_and_rank_dict(&distinct)?;
+
+    let occurrence_ordinals = occurrence_ordinals
+        .into_iter()
+        .map(|id| rank[id as usize])
+        .collect();
+
     Ok(DictionaryV4 {
         order,
         occurrence_ordinals,
-        count: next_ordinal,
+        count,
     })
 }
 
@@ -4339,6 +4343,20 @@ mod v4_tests {
         .expect("valid labels")
     }
 
+    fn labels_kv(metric: &str, k: &str, v: &str) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: metric.to_string(),
+            },
+            Label {
+                name: k.to_string(),
+                value: v.to_string(),
+            },
+        ])
+        .expect("valid labels")
+    }
+
     /// Parses the 16-byte trailer and decodes the footer protobuf, for an
     /// object written at `expected_version` (v3 fixtures are decoded here
     /// too, to pull real histogram page bytes out of a `write_v3` object
@@ -4393,6 +4411,24 @@ mod v4_tests {
             out.push(read_uvarint(block, &mut pos).expect("varint"));
         }
         assert_eq!(pos, block.len(), "trailing bytes in column block");
+        out
+    }
+
+    /// LABEL_DICT decoded into ordinal-indexed strings (index 0 =
+    /// `__name__`), same grammar as the v2/v3 test helpers.
+    fn parse_label_dict(raw: &[u8]) -> Vec<String> {
+        let count = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes")) as usize;
+        let mut pos = 4usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = read_uvarint(raw, &mut pos).expect("string len varint") as usize;
+            let s = std::str::from_utf8(&raw[pos..pos + len])
+                .expect("utf-8")
+                .to_string();
+            pos += len;
+            out.push(s);
+        }
+        assert_eq!(pos, raw.len(), "trailing bytes in LABEL_DICT");
         out
     }
 
@@ -4576,6 +4612,62 @@ mod v4_tests {
             },
             reset_hint: ResetHint::Unknown,
         }
+    }
+
+    /// Issue #155: v4's LABEL_DICT is "as v2/v3" (section 4), so it inherits
+    /// the restored sort (issue #146) -- `__name__` at ordinal 0, every other
+    /// distinct string in sorted (byte) order. Inputs are chosen so
+    /// first-occurrence order differs from sorted order.
+    #[test]
+    fn v4_label_dict_is_sorted() {
+        let mk = |id: u8, metric: &str, k: &str, v: &str| {
+            let series_id = SeriesId([id; 16]);
+            SeriesInputV4 {
+                series_id,
+                labels: labels_kv(metric, k, v),
+                runs: vec![scalar_run(100, 1, 1, &series_id, &[10], &[1.0], false)],
+            }
+        };
+        let series = vec![
+            mk(0x01, "zeta", "zzz", "yyy"),
+            mk(0x02, "alpha", "aaa", "bbb"),
+            mk(0x03, "mu", "mmm", "nnn"),
+        ];
+        let written = SegmentWriter::write_v4(
+            series,
+            test_identity(),
+            test_bounds(),
+            test_compaction_meta(),
+        )
+        .expect("writes");
+        let object = written.bytes.as_ref();
+        let footer = decode_footer(object, VERSION_V4);
+        let dict_desc =
+            section_desc(&footer, section_kind::LABEL_DICT).expect("LABEL_DICT present");
+        let dict_raw = decompress_section(
+            section(object, &footer, section_kind::LABEL_DICT),
+            dict_desc.uncompressed_len,
+        );
+        let dict = parse_label_dict(&dict_raw);
+
+        assert_eq!(
+            dict[0].as_str(),
+            METRIC_NAME_LABEL,
+            "__name__ pinned at ordinal 0"
+        );
+        let rest = &dict[1..];
+        let mut expected = rest.to_vec();
+        expected.sort();
+        assert_eq!(
+            rest,
+            expected.as_slice(),
+            "v4 LABEL_DICT past ordinal 0 must be byte-sorted (as v2/v3, issue #155)"
+        );
+        assert_ne!(
+            rest[0].as_str(),
+            "zeta",
+            "test setup must make sorted order differ from first-occurrence order"
+        );
     }
 
     // --- drop rules (docs/compaction-retention-plan.md section 4: a run

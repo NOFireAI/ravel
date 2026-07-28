@@ -120,7 +120,7 @@ fn report(shape: &str, raw: Raw) {
         raw_len(&f2, LABEL_DICT)
     );
     println!("  LABEL_DICT zstd -3 v1 (sorted):  {dict_v1}");
-    println!("  LABEL_DICT zstd -3 v2 (1st-occ): {dict_v2}");
+    println!("  LABEL_DICT zstd -3 v2 (sorted):  {dict_v2}");
     println!(
         "  LABEL_DICT delta v2-v1:          {dict_delta:+} bytes ({dict_delta_pct:+.2}%)  <=+10%: {}",
         verdict(dict_delta_pct <= 10.0),
