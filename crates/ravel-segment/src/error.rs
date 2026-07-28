@@ -27,6 +27,19 @@ pub enum WriteError {
     DictionaryInvariant,
     #[error("more than u32::MAX distinct label-name schemas in one segment")]
     TooManySchemas,
+
+    // --- RSEG v3 only (ADR-0017, docs/rseg-v3-plan.md section 3.5):
+    // HIST_SPANS record encoding. v1/v2 objects never produce these. ---
+    #[error("histogram scale {0} is below the -53 custom-boundaries sentinel")]
+    HistogramScaleTooSmall(i32),
+    #[error(
+        "histogram custom_values presence and content must match scale == -53 with strictly ascending boundaries"
+    )]
+    HistogramCustomValuesMismatch,
+    #[error("histogram span length is zero")]
+    HistogramSpanLengthZero,
+    #[error("histogram bucket count vector length does not match its spans' total length")]
+    HistogramBucketCountLenMismatch,
 }
 
 /// Errors that can occur while parsing or decoding a segment. All violations
