@@ -15,7 +15,10 @@ ravel-ingest = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
+ravel-promql = { workspace = true }
+ravel-query = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
@@ -43,19 +46,19 @@ parquet = { version = "59", optional = true, features = ["async", "object_store"
 # RSEG path still goes through ravel-object-store (0.14) unchanged.
 object_store = { version = "0.13", optional = true, features = ["aws"] }
 futures = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
 
 [features]
 # Parquet baseline harness (issue #97). Off by default: the standard build
 # and gates never compile arrow/parquet/object_store or the gated bins.
 # Phase a (write-side `parquet_baseline`) and phase b (read-side
-# `read_path_accounting`) share this one feature.
+# `read_path_accounting`) share this one feature. `async-trait` moved to a
+# required dependency when `catalog_resolve_bench` needed it for a plain
+# (non-Parquet) `ObjectStoreBackend` impl, so it is no longer listed here.
 parquet-baseline = [
     "dep:arrow",
     "dep:parquet",
     "dep:object_store",
     "dep:futures",
-    "dep:async-trait",
 ]
 
 [dev-dependencies]
@@ -92,6 +95,11 @@ bench = false
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
+bench = false
+
+[[bin]]
+name = "catalog_resolve_bench"
+path = "src/bin/catalog_resolve_bench.rs"
 bench = false
 
 [[bin]]
