@@ -361,6 +361,19 @@ mode: error
     }
 
     #[test]
+    fn histogram_native_corpus_file_parses_cleanly() {
+        let entries = parse_corpus(include_str!("../corpus/histogram_native.txt"))
+            .expect("parse histogram_native corpus");
+        assert!(entries.len() >= 8);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.query.starts_with("histogram_count"))
+        );
+        assert!(entries.iter().any(|e| e.query.contains("rate(")));
+    }
+
+    #[test]
     fn aggregate_corpus_file_parses_cleanly() {
         let entries =
             parse_corpus(include_str!("../corpus/aggregate.txt")).expect("parse aggregate corpus");

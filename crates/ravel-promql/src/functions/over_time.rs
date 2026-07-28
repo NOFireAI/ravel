@@ -248,6 +248,7 @@ pub(crate) fn absent_over_time_instant(
         ts_ns: eval_ts_ns,
         orig_sample_ts_ns: eval_ts_ns,
         value: 1.0,
+        histogram: None,
     }]
 }
 

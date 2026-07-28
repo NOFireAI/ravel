@@ -19,11 +19,12 @@
 //! Prometheus does for these cases: `ravel-promql`'s `Value` type carries no
 //! warnings at all yet (see this ticket's final report).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ravel_types::{Label, LabelSet};
 
-use crate::eval::InstantVector;
+use crate::eval::{InstantVector, drop_metric_name};
+use crate::histogram::{self, FloatHistogram};
 
 use super::{FunctionDef, FunctionKind};
 
@@ -179,11 +180,56 @@ fn quantile_for_group(phi: f64, buckets: Vec<Bucket>) -> f64 {
     }
 }
 
+/// Split an input vector into native-histogram elements (keyed by their
+/// labels with `__name__` dropped) and the remaining float elements (the
+/// classic `le`-bucket series). A native histogram and a classic bucket family
+/// that would land on the same output label set is the mixed case Prometheus
+/// warns about (#178); the native value wins here (see [`histogram_quantile`]).
+fn split_native_classic(vector: InstantVector) -> (Vec<(LabelSet, FloatHistogram)>, InstantVector) {
+    let mut native = Vec::new();
+    let mut classic = Vec::new();
+    for sample in vector {
+        match sample.histogram {
+            Some(h) => native.push((drop_metric_name(sample.labels), h)),
+            None => classic.push(sample),
+        }
+    }
+    (native, classic)
+}
+
+/// `phi` argument edges for the native path, checked ahead of the histogram
+/// (matching the pinned Prometheus, same order the classic path uses).
+fn native_quantile(phi: f64, h: &FloatHistogram) -> f64 {
+    if phi.is_nan() {
+        return f64::NAN;
+    }
+    if phi < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if phi > 1.0 {
+        return f64::INFINITY;
+    }
+    histogram::histogram_quantile(phi, h)
+}
+
 fn histogram_quantile(phi: f64, vector: InstantVector) -> Vec<(LabelSet, f64)> {
-    group_by_bucket(vector)
-        .into_iter()
-        .map(|(labels, buckets)| (labels, quantile_for_group(phi, buckets)))
-        .collect()
+    let (native, classic) = split_native_classic(vector);
+    let mut out = Vec::new();
+    let mut seen: HashSet<LabelSet> = HashSet::new();
+    for (labels, h) in native {
+        out.push((labels.clone(), native_quantile(phi, &h)));
+        seen.insert(labels);
+    }
+    for (labels, buckets) in group_by_bucket(classic) {
+        // Mixed native+classic on the same output labels: native already
+        // produced this group; drop the classic form (Prometheus keeps the
+        // native value and warns, #178).
+        if seen.contains(&labels) {
+            continue;
+        }
+        out.push((labels, quantile_for_group(phi, buckets)));
+    }
+    out
 }
 
 /// The observation rank (cumulative count) at value `v`, by inverting
@@ -251,11 +297,30 @@ fn fraction_for_group(lower: f64, upper: f64, buckets: Vec<Bucket>) -> f64 {
     bucket_fraction(lower, upper, &prepared)
 }
 
+/// `lower`/`upper` edges for the native path (NaN argument -> NaN), then the
+/// native fraction.
+fn native_fraction(lower: f64, upper: f64, h: &FloatHistogram) -> f64 {
+    if lower.is_nan() || upper.is_nan() {
+        return f64::NAN;
+    }
+    histogram::histogram_fraction(lower, upper, h)
+}
+
 fn histogram_fraction(lower: f64, upper: f64, vector: InstantVector) -> Vec<(LabelSet, f64)> {
-    group_by_bucket(vector)
-        .into_iter()
-        .map(|(labels, buckets)| (labels, fraction_for_group(lower, upper, buckets)))
-        .collect()
+    let (native, classic) = split_native_classic(vector);
+    let mut out = Vec::new();
+    let mut seen: HashSet<LabelSet> = HashSet::new();
+    for (labels, h) in native {
+        out.push((labels.clone(), native_fraction(lower, upper, &h)));
+        seen.insert(labels);
+    }
+    for (labels, buckets) in group_by_bucket(classic) {
+        if seen.contains(&labels) {
+            continue;
+        }
+        out.push((labels, fraction_for_group(lower, upper, buckets)));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -282,6 +347,7 @@ mod tests {
             ts_ns: 0,
             orig_sample_ts_ns: 0,
             value,
+            histogram: None,
         }
     }
 

@@ -172,6 +172,7 @@ fn elementwise(v: InstantVector, op: impl Fn(f64) -> f64) -> InstantVector {
             ts_ns: s.ts_ns,
             orig_sample_ts_ns: s.ts_ns,
             value: op(s.value),
+            histogram: None,
         })
         .collect()
 }
@@ -193,6 +194,7 @@ fn reorder(v: InstantVector, desc: bool) -> InstantVector {
             ts_ns: s.ts_ns,
             orig_sample_ts_ns: s.ts_ns,
             value: s.value,
+            histogram: None,
         })
         .collect();
     out.sort_by(|a, b| cmp_by_value(a.value, b.value, desc));
@@ -329,6 +331,7 @@ mod tests {
             ts_ns: 1_000,
             orig_sample_ts_ns: 500,
             value,
+            histogram: None,
         }
     }
 
