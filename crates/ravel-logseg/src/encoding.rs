@@ -404,6 +404,329 @@ pub fn decode_bitmap(bytes: &[u8], count: usize) -> Result<Vec<bool>, LogSegErro
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Dictionary id bodies, shared by the string, f64-bits, and fixed codecs.
+// A body is `bit_width: u8` then `count` ids FOR-bit-packed LSB-first.
+// ---------------------------------------------------------------------------
+
+fn encode_dict_ids(out: &mut Vec<u8>, ids: &[u64], dict_count: usize) {
+    let bit_width = width_for((dict_count.saturating_sub(1)) as u64);
+    out.push(bit_width as u8);
+    pack_bits(out, ids, bit_width);
+}
+
+/// Reads a dict id body starting at `*pos` and running to the end of `buf`
+/// (ids are always the trailing part of a dictionary payload). Validates
+/// every id is `< dict_count`.
+fn decode_dict_ids(
+    buf: &[u8],
+    pos: &mut usize,
+    count: usize,
+    dict_count: usize,
+) -> Result<Vec<u64>, LogSegError> {
+    let bit_width = u32::from(
+        *buf.get(*pos)
+            .ok_or_else(|| LogSegError::Corrupted("dict ids truncated".into()))?,
+    );
+    *pos += 1;
+    let ids = unpack_bits(&buf[*pos..], count, bit_width)?;
+    *pos = buf.len();
+    for &id in &ids {
+        if id >= dict_count as u64 {
+            return Err(LogSegError::Corrupted(format!(
+                "dict id {id} >= dict_count {dict_count}"
+            )));
+        }
+    }
+    Ok(ids)
+}
+
+/// Distinct-ratio dictionary heuristic: dictionary-encode when at most half
+/// the values are distinct.
+fn dict_is_worth_it(distinct: usize, total: usize) -> bool {
+    total > 0 && distinct.saturating_mul(2) <= total
+}
+
+// ---------------------------------------------------------------------------
+// String codecs
+// ---------------------------------------------------------------------------
+
+fn enc_plain_strings(values: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in values {
+        put_uvarint(&mut out, v.len() as u64);
+    }
+    for v in values {
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+fn enc_dict_strings(values: &[&[u8]], sorted: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_uvarint(&mut out, sorted.len() as u64);
+    for entry in sorted {
+        put_uvarint(&mut out, entry.len() as u64);
+        out.extend_from_slice(entry);
+    }
+    let ids: Vec<u64> = values
+        .iter()
+        .map(|v| sorted.partition_point(|e| e < v) as u64)
+        .collect();
+    encode_dict_ids(&mut out, &ids, sorted.len());
+    out
+}
+
+/// Encodes byte-string values. Uses a sorted-dictionary page when at most
+/// half the values are distinct, else a plain lengths+blob page.
+pub fn encode_strings(values: &[&[u8]]) -> (Enc, Vec<u8>) {
+    if values.is_empty() {
+        return (Enc::Plain, Vec::new());
+    }
+    let mut sorted: Vec<&[u8]> = values.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if dict_is_worth_it(sorted.len(), values.len()) {
+        (Enc::Dict, enc_dict_strings(values, &sorted))
+    } else {
+        (Enc::Plain, enc_plain_strings(values))
+    }
+}
+
+/// Decodes `count` byte-string values encoded with `enc`.
+pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, LogSegError> {
+    let mut pos = 0usize;
+    let out = match enc {
+        Enc::Plain => {
+            let mut lens = Vec::with_capacity(cap(count));
+            let mut total: u64 = 0;
+            for _ in 0..count {
+                let len = get_uvarint(bytes, &mut pos)?;
+                total = total
+                    .checked_add(len)
+                    .ok_or_else(|| LogSegError::Corrupted("string length overflow".into()))?;
+                lens.push(len);
+            }
+            let blob = &bytes[pos..];
+            if blob.len() as u64 != total {
+                return Err(LogSegError::Corrupted(format!(
+                    "string blob {} != declared {total}",
+                    blob.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(cap(count));
+            let mut off = 0usize;
+            for len in lens {
+                let len = len as usize;
+                out.push(blob[off..off + len].to_vec());
+                off += len;
+            }
+            pos = bytes.len();
+            out
+        }
+        Enc::Dict => {
+            let dict_count = get_uvarint(bytes, &mut pos)? as usize;
+            if dict_count > cap(bytes.len() + 1) {
+                return Err(LogSegError::Corrupted("dict_count too large".into()));
+            }
+            let mut dict: Vec<Vec<u8>> = Vec::with_capacity(dict_count);
+            for _ in 0..dict_count {
+                let len = get_uvarint(bytes, &mut pos)? as usize;
+                let entry = bytes
+                    .get(pos..pos + len)
+                    .ok_or_else(|| LogSegError::Corrupted("dict entry truncated".into()))?;
+                dict.push(entry.to_vec());
+                pos += len;
+            }
+            let ids = decode_dict_ids(bytes, &mut pos, count, dict_count)?;
+            ids.into_iter()
+                .map(|id| dict[id as usize].clone())
+                .collect()
+        }
+        other => {
+            return Err(LogSegError::Corrupted(format!(
+                "enc {other:?} is not a string codec"
+            )));
+        }
+    };
+    expect_consumed(pos, bytes.len())?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// f64-bits codecs (callers pass f64::to_bits so NaN payloads and -0.0 are
+// significant and survive round-trips exactly).
+// ---------------------------------------------------------------------------
+
+/// Encodes f64 values as their `u64` bit patterns. Constant when all equal,
+/// else a sorted dictionary when at most half are distinct, else plain LE.
+pub fn encode_f64(values: &[u64]) -> (Enc, Vec<u8>) {
+    if values.is_empty() {
+        return (Enc::Plain, Vec::new());
+    }
+    if values.iter().all(|&v| v == values[0]) {
+        return (Enc::Constant, values[0].to_le_bytes().to_vec());
+    }
+    let mut sorted: Vec<u64> = values.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if dict_is_worth_it(sorted.len(), values.len()) {
+        let mut out = Vec::new();
+        put_uvarint(&mut out, sorted.len() as u64);
+        for &v in &sorted {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let ids: Vec<u64> = values
+            .iter()
+            .map(|v| sorted.partition_point(|e| e < v) as u64)
+            .collect();
+        encode_dict_ids(&mut out, &ids, sorted.len());
+        (Enc::Dict, out)
+    } else {
+        let mut out = Vec::with_capacity(values.len() * 8);
+        for &v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        (Enc::Plain, out)
+    }
+}
+
+fn read_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64, LogSegError> {
+    let slice = bytes
+        .get(*pos..*pos + 8)
+        .ok_or_else(|| LogSegError::Corrupted("f64 bits truncated".into()))?;
+    let mut a = [0u8; 8];
+    a.copy_from_slice(slice);
+    *pos += 8;
+    Ok(u64::from_le_bytes(a))
+}
+
+/// Decodes `count` f64 bit patterns encoded with `enc`.
+pub fn decode_f64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<u64>, LogSegError> {
+    let mut pos = 0usize;
+    let out = match enc {
+        Enc::Plain => {
+            let mut out = Vec::with_capacity(cap(count));
+            for _ in 0..count {
+                out.push(read_u64_le(bytes, &mut pos)?);
+            }
+            out
+        }
+        Enc::Constant => {
+            let v = read_u64_le(bytes, &mut pos)?;
+            vec![v; count]
+        }
+        Enc::Dict => {
+            let dict_count = get_uvarint(bytes, &mut pos)? as usize;
+            if dict_count > cap(bytes.len() + 1) {
+                return Err(LogSegError::Corrupted("dict_count too large".into()));
+            }
+            let mut dict = Vec::with_capacity(dict_count);
+            for _ in 0..dict_count {
+                dict.push(read_u64_le(bytes, &mut pos)?);
+            }
+            let ids = decode_dict_ids(bytes, &mut pos, count, dict_count)?;
+            ids.into_iter().map(|id| dict[id as usize]).collect()
+        }
+        other => {
+            return Err(LogSegError::Corrupted(format!(
+                "enc {other:?} is not an f64 codec"
+            )));
+        }
+    };
+    expect_consumed(pos, bytes.len())?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-width codecs (trace_id 16B, span_id 8B)
+// ---------------------------------------------------------------------------
+
+/// Encodes fixed-`width` values. Uses a sorted dictionary when at most half
+/// are distinct, else a raw concatenation. Callers guarantee every value is
+/// exactly `width` bytes.
+pub fn encode_fixed(values: &[&[u8]], width: usize) -> (Enc, Vec<u8>) {
+    if values.is_empty() {
+        return (Enc::FixedWidth, Vec::new());
+    }
+    let mut sorted: Vec<&[u8]> = values.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if dict_is_worth_it(sorted.len(), values.len()) {
+        let mut out = Vec::new();
+        put_uvarint(&mut out, sorted.len() as u64);
+        for entry in &sorted {
+            out.extend_from_slice(entry);
+        }
+        let ids: Vec<u64> = values
+            .iter()
+            .map(|v| sorted.partition_point(|e| e < v) as u64)
+            .collect();
+        encode_dict_ids(&mut out, &ids, sorted.len());
+        (Enc::Dict, out)
+    } else {
+        let mut out = Vec::with_capacity(values.len() * width);
+        for v in values {
+            out.extend_from_slice(v);
+        }
+        (Enc::FixedWidth, out)
+    }
+}
+
+/// Decodes `count` fixed-`width` values encoded with `enc`.
+pub fn decode_fixed(
+    enc: Enc,
+    bytes: &[u8],
+    count: usize,
+    width: usize,
+) -> Result<Vec<Vec<u8>>, LogSegError> {
+    let mut pos = 0usize;
+    let out = match enc {
+        Enc::FixedWidth => {
+            let need = count
+                .checked_mul(width)
+                .ok_or_else(|| LogSegError::Corrupted("fixed length overflow".into()))?;
+            if bytes.len() != need {
+                return Err(LogSegError::Corrupted(format!(
+                    "fixed length {} != {need}",
+                    bytes.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(cap(count));
+            for i in 0..count {
+                out.push(bytes[i * width..i * width + width].to_vec());
+            }
+            pos = bytes.len();
+            out
+        }
+        Enc::Dict => {
+            let dict_count = get_uvarint(bytes, &mut pos)? as usize;
+            if dict_count > cap(bytes.len() + 1) {
+                return Err(LogSegError::Corrupted("dict_count too large".into()));
+            }
+            let mut dict: Vec<Vec<u8>> = Vec::with_capacity(dict_count);
+            for _ in 0..dict_count {
+                let entry = bytes
+                    .get(pos..pos + width)
+                    .ok_or_else(|| LogSegError::Corrupted("fixed dict entry truncated".into()))?;
+                dict.push(entry.to_vec());
+                pos += width;
+            }
+            let ids = decode_dict_ids(bytes, &mut pos, count, dict_count)?;
+            ids.into_iter()
+                .map(|id| dict[id as usize].clone())
+                .collect()
+        }
+        other => {
+            return Err(LogSegError::Corrupted(format!(
+                "enc {other:?} is not a fixed-width codec"
+            )));
+        }
+    };
+    expect_consumed(pos, bytes.len())?;
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -580,6 +903,173 @@ mod proptests {
             count in 0usize..2000,
         ) {
             let _ = decode_bitmap(&bytes, count);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod string_dict_tests {
+    use super::*;
+
+    #[test]
+    fn dict_strings_exact_bytes() {
+        let vals: Vec<&[u8]> = vec![b"b", b"a", b"a", b"b"];
+        let (enc, bytes) = encode_strings(&vals);
+        assert_eq!(enc, Enc::Dict);
+        // dict_count 2; "a"(1,0x61); "b"(1,0x62); ids width 1; packed [1,0,0,1]=0x09
+        assert_eq!(bytes, vec![0x02, 0x01, 0x61, 0x01, 0x62, 0x01, 0x09]);
+        let got = decode_strings(enc, &bytes, 4).expect("decode");
+        let got: Vec<&[u8]> = got.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(got, vals);
+    }
+
+    #[test]
+    fn plain_strings_roundtrip() {
+        let vals: Vec<&[u8]> = vec![b"get", b"", b"timeout", b"x"];
+        let (enc, bytes) = encode_strings(&vals);
+        assert_eq!(enc, Enc::Plain); // 4 distinct of 4 -> plain
+        let got = decode_strings(enc, &bytes, 4).expect("decode");
+        let got: Vec<&[u8]> = got.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(got, vals);
+    }
+
+    #[test]
+    fn f64_constant_and_nan_and_neg_zero() {
+        // Constant.
+        let same = vec![3.5f64.to_bits(); 4];
+        let (enc, bytes) = encode_f64(&same);
+        assert_eq!(enc, Enc::Constant);
+        assert_eq!(decode_f64(enc, &bytes, 4).expect("decode"), same);
+
+        // NaN payloads and -0.0 survive bit-exactly.
+        let vals = vec![
+            (-0.0f64).to_bits(),
+            0.0f64.to_bits(),
+            f64::NAN.to_bits() | 0x1,
+            f64::NAN.to_bits() | 0x7,
+        ];
+        let (enc, bytes) = encode_f64(&vals);
+        assert_eq!(decode_f64(enc, &bytes, 4).expect("decode"), vals);
+    }
+
+    #[test]
+    fn f64_dict_roundtrip() {
+        let a = 1.0f64.to_bits();
+        let b = 2.0f64.to_bits();
+        let vals = vec![a, b, a, b, a, b];
+        let (enc, bytes) = encode_f64(&vals);
+        assert_eq!(enc, Enc::Dict);
+        assert_eq!(decode_f64(enc, &bytes, 6).expect("decode"), vals);
+    }
+
+    #[test]
+    fn fixed_roundtrip_and_dict() {
+        let id1 = [1u8; 16];
+        let id2 = [2u8; 16];
+        // All distinct -> FixedWidth.
+        let a = [3u8; 16];
+        let distinct: Vec<&[u8]> = vec![&id1, &id2, &a];
+        let (enc, bytes) = encode_fixed(&distinct, 16);
+        assert_eq!(enc, Enc::FixedWidth);
+        let got = decode_fixed(enc, &bytes, 3, 16).expect("decode");
+        let got: Vec<&[u8]> = got.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(got, distinct);
+        // Repetitive -> Dict.
+        let rep: Vec<&[u8]> = vec![&id1, &id2, &id1, &id2];
+        let (enc, bytes) = encode_fixed(&rep, 16);
+        assert_eq!(enc, Enc::Dict);
+        let got = decode_fixed(enc, &bytes, 4, 16).expect("decode");
+        let got: Vec<&[u8]> = got.iter().map(|v| v.as_slice()).collect();
+        assert_eq!(got, rep);
+    }
+
+    #[test]
+    fn dict_rejects_id_out_of_range() {
+        // dict_count 2, entries "a","b", then width=2 with a single id = 3.
+        let bytes = vec![0x02, 0x01, 0x61, 0x01, 0x62, 0x02, 0x03];
+        assert!(matches!(
+            decode_strings(Enc::Dict, &bytes, 1),
+            Err(LogSegError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn dict_rejects_lying_dict_count() {
+        // dict_count says 5 but only one entry is present.
+        let bytes = vec![0x05, 0x01, 0x61];
+        assert!(matches!(
+            decode_strings(Enc::Dict, &bytes, 1),
+            Err(LogSegError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn plain_rejects_short_blob() {
+        // length says 5 but blob is 2 bytes.
+        let bytes = vec![0x05, 0x61, 0x62];
+        assert!(matches!(
+            decode_strings(Enc::Plain, &bytes, 1),
+            Err(LogSegError::Corrupted(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod string_dict_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn strings_roundtrip(
+            vals in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..16), 0..400)
+        ) {
+            let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+            let (enc, bytes) = encode_strings(&refs);
+            let got = decode_strings(enc, &bytes, refs.len()).expect("decode");
+            prop_assert_eq!(got, vals);
+        }
+
+        #[test]
+        fn f64_roundtrip_with_nan_payloads(
+            vals in proptest::collection::vec(
+                prop_oneof![
+                    any::<u64>(),
+                    Just(f64::NAN.to_bits()),
+                    (0u64..0x8).prop_map(|p| f64::NAN.to_bits() | p),
+                    Just((-0.0f64).to_bits()),
+                    Just(0.0f64.to_bits()),
+                ], 0..400)
+        ) {
+            let (enc, bytes) = encode_f64(&vals);
+            prop_assert_eq!(decode_f64(enc, &bytes, vals.len()).expect("decode"), vals);
+        }
+
+        #[test]
+        fn fixed_roundtrip(
+            vals in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 8..=8), 0..400)
+        ) {
+            let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+            let (enc, bytes) = encode_fixed(&refs, 8);
+            let got = decode_fixed(enc, &bytes, refs.len(), 8).expect("decode");
+            prop_assert_eq!(got, vals);
+        }
+
+        #[test]
+        fn string_decode_never_panics(
+            tag in 1u8..=9,
+            bytes in proptest::collection::vec(any::<u8>(), 0..256),
+            count in 0usize..500,
+        ) {
+            if let Ok(e) = Enc::from_u8(tag) {
+                let _ = decode_strings(e, &bytes, count);
+                let _ = decode_f64(e, &bytes, count);
+                let _ = decode_fixed(e, &bytes, count, 8);
+            }
         }
     }
 }
