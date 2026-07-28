@@ -109,17 +109,22 @@ docs/compaction-retention-plan.md §7.
    count >= `min_compaction_inputs` (default 2; 1 is legal config for v1
    retirement campaigns). Compaction across multiple hours (L2) is out of
    scope and gets its own ADR.
-2. **Output format: RSEG v3.** Trailer version 3, magic unchanged. Page
+2. **Output format: RSEG v4.** Trailer version 4, magic unchanged. Page
    format, encodings, checksums, and the suffix protocol are unchanged
-   from v1/v2. The v2 catalog (SERIES_IDS + SERIES_META) is extended so a
-   series holds an ordered list of runs, each run carrying its provenance
-   `(created_unix_ns, writer_epoch, writer_seq)` and its own page pair
-   and event-time bounds. Inputs may be RSEG v1 or v2; their page bytes
-   are copied verbatim either way (the page grammar is identical across
-   versions), and raw-f64 alignment (ADR-0014 §3.5) is applied to the
-   output via the existing gap columns. The format-change procedure
-   applies in full: spec amendment, checksum coverage review, fuzz and
-   property coverage over all three versions, inspector support.
+   from v1/v2/v3. The v2 catalog (SERIES_IDS + SERIES_META) is extended so
+   a series holds an ordered list of runs, each run carrying its
+   provenance `(created_unix_ns, writer_epoch, writer_seq)` and its own
+   page pair (or HIST_PAGES pair, for histogram series) and event-time
+   bounds. Inputs may be RSEG v1, v2, or v3; their page bytes are copied
+   verbatim regardless of input version (the page grammar is identical
+   across versions, and v3's HIST_PAGES bytes are copied as an opaque
+   per-run blob, never re-encoded), and raw-f64 alignment (ADR-0014 §3.5)
+   is applied to the output via the existing gap columns. Trailer
+   version 3 was already claimed by ADR-0017's native-histogram writer
+   before this ADR's format work landed; version 4 is the resolution
+   (see docs/compaction-retention-plan.md §8). The format-change
+   procedure applies in full: spec amendment, checksum coverage review,
+   fuzz and property coverage over all four versions, inspector support.
 3. **Output partitioning.** 1..N part objects per bucket, split by
    disjoint series-id ranges when a size cap (`max_l1_part_bytes`) would
    be exceeded, built via multipart upload. The multipart capability
@@ -129,7 +134,7 @@ docs/compaction-retention-plan.md §7.
    level = 1, the full input identity list [(writer_id, epoch, seq)],
    `input_set_hash` = blake3 over the sorted input identities, per-part
    entries (part_index, series-id range, content_hash, size, counts,
-   event-time bounds, segment_format_version = 3), created_unix_ns.
+   event-time bounds, segment_format_version = 4), created_unix_ns.
    Key layout extension (documented in catalog-and-mvcc.md):
 
    ```
@@ -188,8 +193,8 @@ docs/compaction-retention-plan.md §7.
    precedent) only bounds rescans. Losing the cursor costs a rescan,
    never correctness. No leader election, no locks: concurrent
    maintainers converge through CreateIfAbsent.
-8. **v1 retirement is in scope.** Compaction output is always v3, so
-   every compacted bucket removes v1 (and v2) objects from the
+8. **v1 retirement is in scope.** Compaction output is always v4, so
+   every compacted bucket removes v1 (and v2, and v3) objects from the
    population once the sweep completes, and retention (ADR-0019) bounds
    the tail of never-compacted buckets. This is the concrete path
    ADR-0014 left open: once an audit shows the stored population no
@@ -218,10 +223,10 @@ compaction record.
   plan phase 1: the compaction paragraph is replaced by the
   overlap-harmless publish-then-supersede protocol, deletion/GC gains the
   supersession trigger, and token resolution gains the coverage fallback.
-- docs/segment-format.md gains the v3 amendment; the property/fuzz
-  matrix, golden corpus, and inspector permanently carry three grammars
-  (until v1 retirement lands, then two).
-- ravel-query's fetcher stops being fully version-blind: for v3 it emits
+- docs/segment-format.md gains the v4 amendment; the property/fuzz
+  matrix, golden corpus, and inspector permanently carry four grammars
+  (until v1 retirement lands, then three).
+- ravel-query's fetcher stops being fully version-blind: for v4 it emits
   one SoA run per (series, run) with per-run provenance from the catalog
   instead of one per series with provenance from the commit record. The
   change is contained in ravel-catalog's SegmentRef and ravel-query's
