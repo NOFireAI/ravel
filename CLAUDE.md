@@ -55,6 +55,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p <your-crate>        # plus --workspace when your change is cross-crate
 ```
 
+### Fast local iteration
+
+While iterating, use `cargo check -p <crate>` for fast feedback (or
+`cargo check --workspace` only when the change is genuinely cross-crate).
+Run the full gate list above (fmt, clippy, test) once, right before
+committing, not after every edit. This is a local development-loop cadence
+only. It changes nothing about what CI enforces on a pull request: CI still
+runs the full fmt, clippy, and test gates on every push.
+
 ## Commits
 
 Conventional Commits: imperative header <=72 chars (feat/fix/docs/test/
