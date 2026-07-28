@@ -91,9 +91,10 @@ Field by field:
   the very end gives the footer's length and checksum, so a reader only
   needs one suffix GET to find and validate the footer before fetching
   anything else.
-- `version`: the trailer format version, `1` here. `ravel-cli` reads both
-  RSEG v1 and v2 objects (ADR-0014); see "`segment inspect`: RSEG v2
-  objects" below for what changes when this reads `2`.
+- `version`: the trailer format version, `1` here. `ravel-cli` reads RSEG
+  v1, v2, and v3 objects (ADR-0014, ADR-0017); see "`segment inspect`: RSEG
+  v2 objects" and "`segment inspect`: RSEG v3 objects (native histograms)"
+  below for what changes when this reads `2` or `3`.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
   same identity components embedded in the object's key and in its commit
   token, which is how you confirm a segment and a commit token/record
@@ -197,6 +198,79 @@ What's different from v1, field by field:
   up. Series `0x33...` and `0x44...` above both needed `val_page_gap`
   padding; neither needed `ts_page_gap` padding (TS pages are never
   aligned).
+
+## `segment inspect`: RSEG v3 objects (native histograms)
+
+`segment inspect` reads a v3 object (trailer `version = 3`, ADR-0017,
+docs/rseg-v3-plan.md) the same way, over the same command:
+
+```sh
+cargo run -p ravel-cli -- segment inspect \
+  "t/3f2a.../m/l0/0000/9a1f....rseg"
+```
+
+```
+total_size: 456
+trailer_offset: 440
+version: 3
+footer_offset: 272
+tenant_hash: efefefefefefefefefefefefefefefef
+shard: 7
+writer_id: golden-v3-writer
+writer_epoch: 3
+writer_seq: 90
+min_event_ts_ns: 0
+max_event_ts_ns: 4000
+min_ingest_ts_ns: -5000
+max_ingest_ts_ns: 20000
+sample_count: 7
+series_count (footer): 3
+sections:
+  kind=1 name=LABEL_DICT offset=0 len=61 uncompressed_len=52 comp=2
+  kind=5 name=SERIES_IDS offset=61 len=52 uncompressed_len=52 comp=0
+  kind=6 name=SERIES_META offset=113 len=61 uncompressed_len=59 comp=2
+  kind=3 name=TS_PAGES offset=174 len=29 uncompressed_len=29 comp=0
+  kind=4 name=VAL_PAGES offset=208 len=32 uncompressed_len=32 comp=0
+  kind=7 name=HIST_PAGES offset=240 len=32 uncompressed_len=32 comp=0
+schema_count (derived): 1
+  schema[0]: __name__
+series_count (decoded): 3
+series:
+  series_id=07070707070707070707070707070707 labels=__name__=up sample_count=5 min_ts_ns=0 max_ts_ns=4000 value_kind=VAL_SCALAR ts_range=[174, 189) val_range=[208, 223)
+  series_id=08080808080808080808080808080808 labels=__name__=latency_histogram sample_count=1 min_ts_ns=0 max_ts_ns=0 value_kind=HIST_SPANS ts_range=[189, 196) hist_range=[240, 272)
+    hist[0]: ts_ns=0 scale=1 zero_threshold=0.000000001 sum=4.5 reset_hint=UNKNOWN
+      count_kind=INT zero_count=1 count=5
+      positive: spans=[(0, 2)] counts=[2,2]
+      negative: spans=[] counts=[]
+  series_id=09090909090909090909090909090909 labels=__name__=cpu_seconds_total sample_count=1 min_ts_ns=42 max_ts_ns=42 value_kind=VAL_SCALAR ts_range=[196, 203) val_range=[226, 240) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=3)
+```
+
+What's different from v2, field by field:
+
+- `sections`: v3 objects add `kind=7`/`HIST_PAGES`, the native-histogram
+  value pages (docs/segment-format.md "RSEG v3 amendment"). A segment with
+  no histogram series omits it entirely, symmetrically with a segment with
+  no scalar series omitting `VAL_PAGES` (both series `07...` and `09...`
+  above are scalar, so this object still carries `VAL_PAGES`; a
+  histogram-only segment would omit it instead).
+- `series`: each row gains `value_kind` (`VAL_SCALAR` or `HIST_SPANS`,
+  SERIES_META column 10) and prints whichever page range applies to that
+  series: `val_range` for `VAL_SCALAR`, `hist_range` for `HIST_SPANS` (a
+  histogram series has no VAL page and vice versa, section 3.4).
+  `ALIGNMENT_GAP` is unchanged for `VAL_SCALAR` rows; a `HIST_SPANS` row
+  would show `hist_page_gap` instead of `val_page_gap` if its HIST page
+  needed one (v3 writers never pad HIST_PAGES today, so this is normally
+  absent).
+- Every `HIST_SPANS` row is followed by one `hist[N]:` line per decoded
+  histogram sample (a series can carry more than one, same as scalar
+  series carry more than one value): `scale`, `zero_threshold`, `sum`
+  (`none` if the sample didn't carry one), and `reset_hint`
+  (`UNKNOWN`/`YES`/`NO`/`GAUGE`), followed by `count_kind` (`INT` or
+  `FLOAT`) with `zero_count`/`count`, then the positive and negative
+  sides' spans (`(offset, length)` pairs) and bucket counts, in the exact
+  order stored (docs/rseg-v3-plan.md section 3.5). `latency_histogram`
+  above is a one-sample integer histogram with a populated positive side
+  and an empty negative side.
 
 ## `commit decode`: what a commit record says
 
