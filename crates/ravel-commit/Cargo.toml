@@ -20,7 +20,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-ravel-test-util = { workspace = true }
 proptest = { workspace = true }
 blake3 = { workspace = true }
 

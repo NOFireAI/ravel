@@ -25,7 +25,6 @@ tonic-prost-build = { workspace = true }
 protox = { workspace = true }
 
 [dev-dependencies]
-ravel-test-util = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 opentelemetry-proto = { workspace = true }

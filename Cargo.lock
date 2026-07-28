@@ -3622,7 +3622,6 @@ dependencies = [
  "ravel-commit",
  "ravel-object-store",
  "ravel-proto",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3662,7 +3661,6 @@ dependencies = [
  "rand 0.10.2",
  "ravel-object-store",
  "ravel-proto",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3708,7 +3706,6 @@ dependencies = [
  "ravel-proto",
  "ravel-query",
  "ravel-segment",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3747,7 +3744,6 @@ dependencies = [
  "prost-build",
  "protox",
  "ravel-otlp",
- "ravel-test-util",
  "ravel-types",
  "stats_alloc",
  "thiserror",
@@ -3765,7 +3761,6 @@ version = "0.1.0"
 dependencies = [
  "opentelemetry-proto",
  "proptest",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3777,7 +3772,6 @@ version = "0.1.0"
 dependencies = [
  "promql-parser",
  "proptest",
- "ravel-test-util",
  "ravel-types",
  "regex",
  "thiserror",
@@ -3836,7 +3830,6 @@ dependencies = [
  "ravel-object-store",
  "ravel-promql",
  "ravel-segment",
- "ravel-test-util",
  "ravel-types",
  "serde",
  "serde_json",
@@ -3875,7 +3868,6 @@ dependencies = [
  "proptest",
  "prost",
  "ravel-proto",
- "ravel-test-util",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3929,18 +3921,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "ravel-test-util"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "proptest",
- "rand 0.10.2",
- "ravel-object-store",
- "ravel-types",
- "tokio",
 ]
 
 [[package]]

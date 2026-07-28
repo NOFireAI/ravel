@@ -22,7 +22,6 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
-ravel-test-util = { workspace = true }
 proptest = { workspace = true }
 async-trait = { workspace = true }
 
