@@ -36,14 +36,31 @@ rand = { workspace = true }
 # internal crate is pinned.
 ravel-sql = { path = "../../crates/ravel-sql", version = "0.1.0", optional = true }
 
+# Flight service codegen for the `flight-sql` feature. This is arrow 58's
+# arrow-flight, a different arrow major than the `arrow` dev-dependency below;
+# the two never exchange types.
+arrow-flight = { workspace = true, optional = true }
+
 [features]
 # `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
 # server binary, and the SQL surface is opt-in per deployment
 # (docs/arrow-datafusion-plan.md section 3, ADR-0013 structural isolation).
 sql = ["dep:ravel-sql"]
 
+# Flight SQL on the gRPC listener. Implies `sql`: both surfaces execute through
+# ravel-sql, so there is no deployment that wants Flight without it
+# (docs/arrow-datafusion-plan.md section 3 feature matrix). Off by default for
+# the same reason `sql` is. Today this registers an unimplemented service so
+# the wiring and the version pairing are proven; the real methods arrive with
+# ravel-sql's `flight` module under issue #152.
+flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
+
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["json", "query"] }
+# Test-only: `channel` is not in tonic's default feature set, and the Flight
+# startup test needs a gRPC client to call the server it just started. The
+# server binary itself keeps the default (server-only) tonic.
+tonic = { workspace = true, features = ["channel"] }
 async-trait = { workspace = true }
 snap = { workspace = true }
 tower = { workspace = true }
