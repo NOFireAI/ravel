@@ -1,0 +1,85 @@
+# Subquery corpus (ticket P10, docs/promql-evaluator-plan.md section 8):
+# `expr[range:step]` evaluation against
+# crates/ravel-promql-difftest/src/generator.rs's fixed dataset. Every
+# offset is relative to the dataset's base_ts_ms, so a corpus file never
+# encodes an absolute timestamp, except where the query text itself
+# requires one for the `@` modifier (matching selectors.txt's own
+# precedent: the absolute value is base_ts_ms/1000 plus a stated offset).
+#
+# `diff_gauge_walk` and `diff_counter_total{shape="reset"}` are both
+# regularly sampled every 30s across the dataset's full ~1170s span
+# (generator.rs's `regular_timestamps`), so every subquery window below
+# stays inside real sample coverage.
+#
+# `mode: unordered` is correct for every success entry here, for the same
+# reason as selectors.txt (ADR-0021 decision 3).
+
+name: instant_rate_over_subquery_of_a_recording_style_expression
+query: rate(sum(diff_counter_total{shape="reset"})[5m:1m])
+kind: instant
+time: +900s
+mode: unordered
+
+name: instant_nested_subquery_through_an_intervening_range_function
+query: max_over_time(rate(diff_counter_total{shape="reset"}[2m])[5m:1m])[10m:2m]
+kind: instant
+time: +1080s
+mode: unordered
+
+name: instant_subquery_step_defaults_to_the_evaluation_interval
+query: avg_over_time(diff_gauge_walk[5m:])
+kind: instant
+time: +900s
+mode: unordered
+
+name: instant_subquery_grid_start_is_epoch_aligned_not_window_relative
+# base_ts_ms (1_700_000_000_000 ms) is 20s past the nearest absolute
+# minute boundary, so this subquery's nominal (window-relative) start
+# never lands on a 1m-epoch multiple: the point count only comes out
+# right if both engines align the grid to the epoch, not to the window.
+query: count_over_time(diff_gauge_walk[3m:1m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: range_subquery_over_a_stepped_grid
+query: avg_over_time(diff_gauge_walk[3m:1m])
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: instant_subquery_offset_shifts_the_grids_own_end
+query: avg_over_time(diff_gauge_walk[3m:1m] offset 2m)
+kind: instant
+time: +900s
+mode: unordered
+
+name: instant_subquery_at_modifier_pins_the_grids_own_end
+query: avg_over_time(diff_gauge_walk[3m:1m] @ 1700000600.000)
+kind: instant
+time: +0s
+mode: unordered
+
+# Cap-exceeded entries: Ravel enforces a resolution cap (11_000 points,
+# docs/query-engine.md "Budgets") independently at every subquery
+# evaluation node, before that node's grid is built. Both entries below
+# ask for a single node's grid alone to exceed it, one directly and one
+# through one level of nesting. `mode: error` here only compares the
+# `errorType` class, per comparator.rs; whether the pinned Prometheus
+# binary raises the same class for an equivalently oversized subquery
+# grid has not been verified against a live binary (this sandbox has no
+# network egress to it) and is flagged in the P10 completion report.
+
+name: error_subquery_grid_exceeds_the_point_cap
+query: max_over_time(diff_gauge_walk[100d:1s])
+kind: instant
+time: +0s
+mode: error
+
+name: error_nested_subquery_inner_grid_exceeds_the_point_cap
+query: avg_over_time(max_over_time(diff_gauge_walk[50d:1s])[1m:1s])
+kind: instant
+time: +0s
+mode: error

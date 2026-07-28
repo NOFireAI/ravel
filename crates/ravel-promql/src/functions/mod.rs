@@ -22,7 +22,7 @@ use ravel_types::{LabelSet, Sample};
 
 use crate::eval::{
     Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix, Value,
-    drop_metric_name, duration_to_ns, selector_eval_ts,
+    drop_metric_name, duration_to_ns, resolve_eval_ts, selector_eval_ts,
 };
 use crate::source::SeriesSource;
 
@@ -152,18 +152,18 @@ pub(crate) fn eval_call(
     let def = lookup(call.func.name).ok_or_else(|| unregistered_function_error(call.func.name))?;
     match def.kind {
         FunctionKind::RangeVector(f) => {
-            let ms = matrix_arg(&call.args.args[0])?;
-            let window = range_window(ms, eval_ts_ns, ctx)?;
-            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            let arg = matrix_arg(&call.args.args[0])?;
+            let window = range_window(arg, eval_ts_ns, ctx)?;
+            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
                 f(samples, window)
             })))
         }
         FunctionKind::RangeVectorScalar(f) => {
-            let ms = matrix_arg(&call.args.args[0])?;
+            let arg = matrix_arg(&call.args.args[0])?;
             let t = scalar_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
-            let window = range_window(ms, eval_ts_ns, ctx)?;
-            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            let window = range_window(arg, eval_ts_ns, ctx)?;
+            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
                 f(samples, window, t)
             })))
@@ -184,18 +184,20 @@ pub(crate) fn eval_call(
         }
         FunctionKind::ScalarRangeVector(f) => {
             let q = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
-            let ms = matrix_arg(&call.args.args[1])?;
-            let window = range_window(ms, eval_ts_ns, ctx)?;
-            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            let arg = matrix_arg(&call.args.args[1])?;
+            let window = range_window(arg, eval_ts_ns, ctx)?;
+            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
                 f(q, samples, window)
             })))
         }
         FunctionKind::AbsentOverTime => {
-            let ms = matrix_arg(&call.args.args[0])?;
-            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            let arg = matrix_arg(&call.args.args[0])?;
+            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(over_time::absent_over_time_instant(
-                &ms.vs, matrix, eval_ts_ns,
+                over_time::matrix_arg_absent_labels(arg),
+                matrix,
+                eval_ts_ns,
             )))
         }
         FunctionKind::VectorMap(f) => {
@@ -225,10 +227,11 @@ pub(crate) fn eval_range_call(
     let def = lookup(call.func.name).ok_or_else(|| unregistered_function_error(call.func.name))?;
     match def.kind {
         FunctionKind::RangeVector(f) => {
-            let ms = matrix_arg(&call.args.args[0])?;
-            evaluator.eval_range_matrix_reduction(
+            let arg = matrix_arg(&call.args.args[0])?;
+            eval_matrix_arg_range_reduction(
+                evaluator,
                 source,
-                ms,
+                arg,
                 start_ns,
                 end_ns,
                 step_ns,
@@ -248,7 +251,7 @@ pub(crate) fn eval_range_call(
             )
         }
         FunctionKind::RangeVectorScalar(f) => {
-            let ms = matrix_arg(&call.args.args[0])?;
+            let arg = matrix_arg(&call.args.args[0])?;
             // The scalar argument is evaluated once, at the query's own
             // (un-shifted) instant, same as Prometheus evaluates a
             // non-selector argument expression once per step using that
@@ -257,9 +260,10 @@ pub(crate) fn eval_range_call(
             // per-step variance), it is resolved up front rather than once
             // per grid point.
             let t = scalar_arg(evaluator, source, &call.args.args[1], start_ns, ctx)?;
-            evaluator.eval_range_matrix_reduction(
+            eval_matrix_arg_range_reduction(
+                evaluator,
                 source,
-                ms,
+                arg,
                 start_ns,
                 end_ns,
                 step_ns,
@@ -294,15 +298,16 @@ pub(crate) fn eval_range_call(
             })
         }
         FunctionKind::ScalarRangeVector(f) => {
-            let ms = matrix_arg(&call.args.args[1])?;
+            let arg = matrix_arg(&call.args.args[1])?;
             // Same up-front, once-per-call resolution as
             // `RangeVectorScalar` above, and for the same reason: P5's only
             // such argument is a constant/scalar-only expression tree, so
             // it cannot vary per grid step.
             let q = scalar_arg(evaluator, source, &call.args.args[0], start_ns, ctx)?;
-            evaluator.eval_range_matrix_reduction(
+            eval_matrix_arg_range_reduction(
+                evaluator,
                 source,
-                ms,
+                arg,
                 start_ns,
                 end_ns,
                 step_ns,
@@ -323,8 +328,10 @@ pub(crate) fn eval_range_call(
             )
         }
         FunctionKind::AbsentOverTime => {
-            let ms = matrix_arg(&call.args.args[0])?;
-            over_time::absent_over_time_range(evaluator, source, ms, start_ns, end_ns, step_ns, ctx)
+            let arg = matrix_arg(&call.args.args[0])?;
+            over_time::absent_over_time_range(
+                evaluator, source, arg, start_ns, end_ns, step_ns, ctx,
+            )
         }
         FunctionKind::VectorMap(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             let v = vector_arg(evaluator, source, &call.args.args[0], t, ctx)?;
@@ -394,6 +401,58 @@ pub(crate) fn eval_instant_over_grid(
     Ok(series)
 }
 
+/// Evaluate a matrix-typed argument's reduction across a whole range query's
+/// grid, dispatching on which kind of matrix-typed node it is. A matrix
+/// selector reuses [`Evaluator::eval_range_matrix_reduction`]'s single-query,
+/// forward-only-cursor discipline. A subquery has no single raw sample
+/// stream to cursor over (each grid step's inner expression is its own
+/// recursive evaluation, per [`Evaluator::eval_subquery_matrix`]), so it is
+/// re-evaluated fully at each outer step instead: exactly the "no cross-step
+/// caching" discipline plan section 3.1 requires, generalized to the
+/// two-grids-deep case a subquery nested in a range query produces.
+#[allow(clippy::too_many_arguments)]
+fn eval_matrix_arg_range_reduction(
+    evaluator: &Evaluator,
+    source: &dyn SeriesSource,
+    arg: MatrixArg,
+    start_ns: i64,
+    end_ns: i64,
+    step_ns: i64,
+    points: u64,
+    ctx: &QueryWindow,
+    reduce: impl Fn(&[Sample], i64, i64, i64, i64) -> Option<f64>,
+) -> Result<RangeMatrix, Error> {
+    match arg {
+        MatrixArg::Selector(ms) => evaluator.eval_range_matrix_reduction(
+            source, ms, start_ns, end_ns, step_ns, points, ctx, reduce,
+        ),
+        MatrixArg::Subquery(sq) => {
+            let range_ns = duration_to_ns(sq.range)?;
+            let mut series: Vec<(LabelSet, Vec<Sample>)> = Vec::new();
+            let mut t = start_ns;
+            while t <= end_ns {
+                let matrix = evaluator.eval_subquery_matrix(source, sq, t, ctx)?;
+                let sel_ts_ns = resolve_eval_ts(sq.offset.as_ref(), sq.at.as_ref(), t, ctx)?;
+                let window_start_ns = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+                for (labels, samples) in matrix {
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    if let Some(value) = reduce(&samples, window_start_ns, sel_ts_ns, range_ns, t) {
+                        let labels = drop_metric_name(labels);
+                        match series.iter_mut().find(|(l, _)| *l == labels) {
+                            Some((_, out)) => out.push(Sample { ts_ns: t, value }),
+                            None => series.push((labels, vec![Sample { ts_ns: t, value }])),
+                        }
+                    }
+                }
+                t = t.checked_add(step_ns).ok_or(Error::TimeOverflow)?;
+            }
+            Ok(series)
+        }
+    }
+}
+
 /// Evaluate a function argument known (by promql-parser's parse-time type
 /// check) to be String-typed (a quoted literal; promql-parser rejects any
 /// other String-typed expression at parse time).
@@ -413,46 +472,82 @@ pub(crate) fn string_arg(
     }
 }
 
-/// Compute a matrix selector's window bounds the same way
-/// [`Evaluator::eval_matrix_selector`] does internally, for the instant-call
-/// path (the range-call path gets these per grid step from
-/// [`Evaluator::eval_range_matrix_reduction`] instead).
-fn range_window(
-    ms: &promql_parser::parser::MatrixSelector,
-    eval_ts_ns: i64,
-    ctx: &QueryWindow,
-) -> Result<RangeWindow, Error> {
-    let sel_ts_ns = selector_eval_ts(&ms.vs, eval_ts_ns, ctx)?;
-    let range_ns = duration_to_ns(ms.range)?;
-    let start_ns = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
-    Ok(RangeWindow {
-        start_ns,
-        end_ns: sel_ts_ns,
-        range_ns,
-        eval_ts_ns,
-    })
+/// A function's Matrix-typed argument: either a matrix selector (`x[5m]`) or
+/// a subquery (`x[5m:1m]`). Every call site downstream of [`matrix_arg`] is
+/// agnostic to which one it got: [`range_window`] computes the same
+/// [`RangeWindow`] shape for either, and [`Evaluator::eval_matrix_selector`]/
+/// [`Evaluator::eval_subquery_matrix`] produce the same [`RangeMatrix`]
+/// shape for a reducer to consume.
+#[derive(Clone, Copy)]
+pub(crate) enum MatrixArg<'a> {
+    Selector(&'a promql_parser::parser::MatrixSelector),
+    Subquery(&'a promql_parser::parser::SubqueryExpr),
 }
 
-/// Extract the matrix selector from a function argument known (by
+/// Compute a matrix-typed argument's nominal window bounds: the left-open
+/// window's exclusive start and inclusive end, and the range literal's own
+/// duration (`rate`'s per-second divisor). For a subquery this is the
+/// *declared* window (`end - range`), not the epoch-aligned grid
+/// [`Evaluator::eval_subquery_matrix`] actually steps over internally
+/// (which starts no earlier than this bound, but may start later): the
+/// window a reducer like `rate` extrapolates against is the query's own
+/// declared range, matching Prometheus, which computes `rate`'s boundary
+/// extrapolation from the subquery's nominal range regardless of alignment.
+fn range_window(arg: MatrixArg, eval_ts_ns: i64, ctx: &QueryWindow) -> Result<RangeWindow, Error> {
+    match arg {
+        MatrixArg::Selector(ms) => {
+            let sel_ts_ns = selector_eval_ts(&ms.vs, eval_ts_ns, ctx)?;
+            let range_ns = duration_to_ns(ms.range)?;
+            let start_ns = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+            Ok(RangeWindow {
+                start_ns,
+                end_ns: sel_ts_ns,
+                range_ns,
+                eval_ts_ns,
+            })
+        }
+        MatrixArg::Subquery(sq) => {
+            let end_ns = resolve_eval_ts(sq.offset.as_ref(), sq.at.as_ref(), eval_ts_ns, ctx)?;
+            let range_ns = duration_to_ns(sq.range)?;
+            let start_ns = end_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+            Ok(RangeWindow {
+                start_ns,
+                end_ns,
+                range_ns,
+                eval_ts_ns,
+            })
+        }
+    }
+}
+
+/// Evaluate a matrix-typed argument at one instant into a [`RangeMatrix`],
+/// dispatching on which kind of matrix-typed node it is.
+fn eval_matrix_arg(
+    evaluator: &Evaluator,
+    source: &dyn SeriesSource,
+    arg: MatrixArg,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> Result<RangeMatrix, Error> {
+    match arg {
+        MatrixArg::Selector(ms) => evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx),
+        MatrixArg::Subquery(sq) => evaluator.eval_subquery_matrix(source, sq, eval_ts_ns, ctx),
+    }
+}
+
+/// Extract the matrix-typed node from a function argument known (by
 /// promql-parser's own parse-time type check) to be Matrix-typed:
-/// `MatrixSelector` directly, `Paren` wrapping one, or `Subquery` (which
-/// parses but is not yet supported by this evaluator). Any other node is
-/// unreachable, since the parser rejects the query before this evaluator
+/// `MatrixSelector`, `Subquery`, or `Paren` wrapping either. Any other node
+/// is unreachable, since the parser rejects the query before this evaluator
 /// ever sees it otherwise.
-fn matrix_arg(
-    expr: &promql_parser::parser::Expr,
-) -> Result<&promql_parser::parser::MatrixSelector, Error> {
+fn matrix_arg(expr: &promql_parser::parser::Expr) -> Result<MatrixArg<'_>, Error> {
     use promql_parser::parser::Expr;
     let mut cur = expr;
     loop {
         match cur {
             Expr::Paren(p) => cur = &p.expr,
-            Expr::MatrixSelector(ms) => return Ok(ms),
-            Expr::Subquery(_) => {
-                return Err(Error::Unsupported {
-                    construct: "subquery".to_string(),
-                });
-            }
+            Expr::MatrixSelector(ms) => return Ok(MatrixArg::Selector(ms)),
+            Expr::Subquery(sq) => return Ok(MatrixArg::Subquery(sq)),
             _ => unreachable!(
                 "promql-parser only ever type-checks a Matrix-typed argument to one of these \
                  forms before this evaluator sees it"
