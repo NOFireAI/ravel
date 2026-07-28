@@ -26,3 +26,9 @@ pub mod catalog {
         include!(concat!(env!("OUT_DIR"), "/ravel.catalog.v1.rs"));
     }
 }
+
+pub mod logseg {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/ravel.logseg.v1.rs"));
+    }
+}
