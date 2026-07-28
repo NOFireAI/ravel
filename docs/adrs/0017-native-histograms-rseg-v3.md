@@ -1,6 +1,9 @@
 # ADR-0017: Native exponential histograms: span-based value model, RSEG v3 after RSEG v2 phase 6 closes
 
-Status: Accepted (2026-07-27). Implementation plan and tickets:
+Status: Accepted (2026-07-27); amended by ADR-0027 (2026-07-28): v3 as
+a readable version is retired, while the histogram value model and
+HIST_PAGES sections decided here continue in v5. Implementation plan
+and tickets:
 docs/ingest-breadth-plan.md (track C). The byte-exact v3 grammar is a
 deliverable of that track's first ticket, produced under the
 format-change procedure; this ADR records the decision, the internal
