@@ -143,7 +143,8 @@ struct Report {
     flushes_by_age: u64,
     flushes_manual: u64,
     put_retries: u64,
-    abandoned_flushes: u64,
+    abandoned_retry_exhausted: u64,
+    abandoned_input_rejected: u64,
     acks_ok: u64,
     acks_err: u64,
     /// Derived: one data-object PUT and one commit-record PUT per flush
@@ -436,7 +437,8 @@ async fn run(args: &Args) -> Report {
         flushes_by_age: metrics.flushes_by_age,
         flushes_manual: metrics.flushes_manual,
         put_retries: metrics.put_retries,
-        abandoned_flushes: metrics.abandoned_flushes,
+        abandoned_retry_exhausted: metrics.abandoned_retry_exhausted,
+        abandoned_input_rejected: metrics.abandoned_input_rejected,
         acks_ok: metrics.acks_ok,
         acks_err: metrics.acks_err,
         estimated_put_count,
@@ -474,7 +476,10 @@ fn print_human_table(report: &Report) {
         report.flushes_by_size, report.flushes_by_age, report.flushes_manual
     );
     println!("  put_retries       : {}", report.put_retries);
-    println!("  abandoned_flushes : {}", report.abandoned_flushes);
+    println!(
+        "  abandoned         : retry_exhausted={} input_rejected={}",
+        report.abandoned_retry_exhausted, report.abandoned_input_rejected
+    );
     println!(
         "  acks ok/err       : {}/{}",
         report.acks_ok, report.acks_err
