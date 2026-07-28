@@ -29,3 +29,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0023](0023-grouped-min-max-total-order-udaf.md) | Grouped MIN/MAX restored via a total-order min/max UDAF replacing the built-ins | Accepted |
 | [0024](0024-sum-sequential-fold.md) | Replace the built-in `sum` aggregate with a sequential-fold UDAF | Proposed, not decided |
 | [0025](0025-promql-differential-float-precision-residue.md) | PromQL differential float-precision residue: rate/deriv/predict_linear vs. atanh | Proposed, not decided |
+| [0026](0026-rseg-v5-sparse-id-index.md) | RSEG v5: sparse id index and chunked SERIES_META as the default compaction output | Accepted |
