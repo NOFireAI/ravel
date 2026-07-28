@@ -9,6 +9,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Phase C (ticket C1/C1b). For now this only gates the snapshot-pinning
+# ticket codec (crates/ravel-sql/src/flight_ticket.rs, issue #150); the later
+# C1 ticket adds the FlightSqlService and, at that point, an implied `sql`
+# feature per docs/arrow-datafusion-plan.md section 3.
+flight-sql = []
+
 [dependencies]
 ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
