@@ -540,8 +540,9 @@ impl Evaluator {
     ///
     /// The grid's end is the subquery's own `offset`/`@`-shifted instant
     /// (relative to `eval_ts_ns`, the ambient step); its start is the
-    /// smallest epoch-aligned multiple of the step that is `>=
-    /// end - range` ([`align_up_to_step`]). The step count is checked
+    /// smallest epoch-aligned multiple of the step that is strictly
+    /// greater than `end - range` ([`align_up_to_step`]), left-open like
+    /// this crate's matrix-selector window. The step count is checked
     /// against [`Self::max_range_points`] *before* any grid is built or the
     /// inner `expr` is evaluated even once, exactly like a top-level range
     /// query's own budget check: a subquery nested inside a range query or
@@ -988,23 +989,29 @@ fn step_count(start_ns: i64, end_ns: i64, step_ns: i64) -> u64 {
 }
 
 /// The smallest multiple of `step_ns`, measured from the Unix epoch (time
-/// zero), that is `>= target_ns`. This is Prometheus' subquery step-alignment
-/// rule (`promql/engine.go`'s `evalSubquery`): a subquery's grid is aligned to
-/// epoch-relative step boundaries (`0, step, 2*step, ...`), not to the
-/// subquery's own window start or the outer query's step boundaries, so two
-/// subqueries with the same step line up on the same instants regardless of
-/// where their windows happen to start.
+/// zero), that is strictly greater than `target_ns`. Left-open, exactly like
+/// this crate's matrix-selector window ([`Evaluator::eval_matrix_selector`]):
+/// a grid point sitting exactly at `target_ns` (a subquery's `end - range`)
+/// is excluded, not admitted, matching Prometheus' own subquery alignment
+/// (`promql/engine.go`'s `evalSubquery`). Subquery grids are otherwise
+/// aligned to epoch-relative step boundaries (`0, step, 2*step, ...`), not to
+/// the subquery's own window start or the outer query's step boundaries, so
+/// two subqueries with the same step line up on the same instants regardless
+/// of where their windows happen to start.
 ///
 /// Computed in `i128` for the same reason [`step_count`] is: `target_ns`'s
 /// floor division by `step_ns` must not overflow for extreme-but-
 /// representable inputs, and `div_euclid` (floor, not truncating) division is
 /// required so a negative `target_ns` (a window before the Unix epoch) aligns
 /// the same way Prometheus' Go integer-division-with-manual-correction does.
+/// The floor is always `<= target_ns` by construction, so advancing one more
+/// step always lands strictly above `target_ns`: no separate `==` case is
+/// needed.
 fn align_up_to_step(target_ns: i64, step_ns: i64) -> Result<i64, Error> {
     let target = i128::from(target_ns);
     let step = i128::from(step_ns);
     let floor = target.div_euclid(step) * step;
-    let aligned = if floor < target { floor + step } else { floor };
+    let aligned = floor + step;
     i64::try_from(aligned).map_err(|_| Error::TimeOverflow)
 }
 
@@ -1447,8 +1454,9 @@ mod tests {
     fn align_up_to_step_rounds_up_to_the_next_epoch_multiple() {
         // 90 is not a multiple of 60; the next one up is 120.
         assert_eq!(align_up_to_step(90, 60).expect("fits"), 120);
-        // Already a multiple: unchanged.
-        assert_eq!(align_up_to_step(120, 60).expect("fits"), 120);
+        // Already a multiple: left-open, so it still advances past it
+        // rather than returning it (issue #190).
+        assert_eq!(align_up_to_step(120, 60).expect("fits"), 180);
     }
 
     #[test]
@@ -1456,7 +1464,9 @@ mod tests {
         // -90 sits between -120 and -60; the next multiple up is -60, not
         // -120 (a truncating, non-floor division would wrongly land there).
         assert_eq!(align_up_to_step(-90, 60).expect("fits"), -60);
-        assert_eq!(align_up_to_step(-120, 60).expect("fits"), -120);
+        // -120 is itself a multiple; left-open means the result still
+        // advances past it, landing on the same -60 as the -90 case above.
+        assert_eq!(align_up_to_step(-120, 60).expect("fits"), -60);
     }
 
     #[test]
@@ -1501,10 +1511,15 @@ mod tests {
     fn nested_subquery_recurses_through_an_intervening_function() {
         // The inner subquery `up[2m:1m]` feeds `count_over_time`, whose
         // instant-vector result is itself subqueried by the outer
-        // `[2m:1m]`. The single sample sits far enough in the past
-        // (-240s) that every inner grid point, at every outer step, still
-        // finds it within the default 5m lookback, so `count_over_time`
-        // over the always-3-point inner grid is 3 at every outer step.
+        // `[2m:1m]`. At eval_ts=0 both the outer grid's own target
+        // (0 - 2m = -120s) and, at every outer step, the inner grid's own
+        // target land exactly on a 1m step multiple; the left-open rule
+        // (issue #190) excludes that boundary point from each grid, so
+        // both grids have 2 points instead of 3. The single sample sits far
+        // enough in the past (-240s) that every remaining inner grid point,
+        // at every outer step, still finds it within the default 5m
+        // lookback, so `count_over_time` over the always-2-point inner grid
+        // is 2 at every outer step.
         let source = TestSource::new()
             .with_series(&[("__name__", "up")], &[(-240 * NS_PER_MS * 1000, 1.0)])
             .expect("valid series");
@@ -1516,16 +1531,20 @@ mod tests {
         };
         assert_eq!(matrix.len(), 1);
         let (_, samples) = &matrix[0];
-        assert_eq!(samples.len(), 3);
-        assert!(samples.iter().all(|s| s.value == 3.0));
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|s| s.value == 2.0));
     }
 
     #[test]
     fn subquery_offset_and_at_shift_the_grids_own_end() {
         // `up[2m:1m] offset 1m` at t=0 ends its grid at -1m (the grid start
         // is then epoch-aligned from that shifted end), not at t=0 itself.
-        // The sample sits at -180s so it is within lookback of every grid
-        // point exercised below, in both the offset and the `@` case.
+        // The target (-1m - 2m = -180s) lands exactly on a 1m step
+        // multiple, so the left-open rule (issue #190) excludes it: the
+        // grid starts at -120s, not -180s, one point short of the
+        // pre-fix grid. The sample sits at -180s, still within lookback of
+        // every remaining grid point exercised below, in both the offset
+        // and the `@` case.
         let source = TestSource::new()
             .with_series(&[("__name__", "up")], &[(-180_000_000_000, 1.0)])
             .expect("valid series");
@@ -1537,7 +1556,7 @@ mod tests {
         };
         let (_, samples) = &matrix[0];
         let timestamps_ms: Vec<i64> = samples.iter().map(|s| s.ts_ns / NS_PER_MS).collect();
-        assert_eq!(timestamps_ms, vec![-180_000, -120_000, -60_000]);
+        assert_eq!(timestamps_ms, vec![-120_000, -60_000]);
 
         // `@ 0` pins the grid's end to t=0 regardless of the query's own
         // evaluation timestamp.
@@ -1548,6 +1567,71 @@ mod tests {
             .eval_instant(&source, "up[2m:1m]", 0)
             .expect("subquery evaluates");
         assert_eq!(at, bare_at_zero, "@0 pins the grid as if evaluated at t=0");
+    }
+
+    #[test]
+    fn subquery_grid_excludes_a_boundary_point_exactly_at_end_minus_range() {
+        // Regression test for issue #190: the subquery grid's start must be
+        // left-open (`> end - range`), matching this crate's own
+        // matrix-selector windows, not closed (`>= end - range`).
+        //
+        // Samples every 30s from 0 to 120s. `count_over_time(x[2m:1m])`
+        // evaluated at t=120s (a step-aligned instant): range=2m, so
+        // target = end - range = 120s - 120s = 0s, which is itself a
+        // multiple of the 1m step. Before the fix, the closed rule admitted
+        // 0s into the grid (points 0, 60, 120 -> count 3); the corrected
+        // left-open rule excludes it (points 60, 120 -> count 2), one fewer
+        // point than before the fix.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "x")],
+                &[
+                    (0, 1.0),
+                    (30_000_000_000, 1.0),
+                    (60_000_000_000, 1.0),
+                    (90_000_000_000, 1.0),
+                    (120_000_000_000, 1.0),
+                ],
+            )
+            .expect("valid series");
+        let result = Evaluator::new()
+            .instant(&source, "count_over_time(x[2m:1m])", 120_000)
+            .expect("subquery evaluates");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 2.0);
+    }
+
+    #[test]
+    fn subquery_grid_is_unchanged_when_the_boundary_is_not_step_aligned() {
+        // Regression guard: when `end - range` does NOT land on a step
+        // multiple, the left-open fix (issue #190) must not change the
+        // grid at all, since `align_up_to_step` already rounded strictly
+        // past a non-aligned target before and after the fix.
+        //
+        // Same series as above, but evaluated at t=135s: range=2m (120s)
+        // gives target = 135s - 120s = 15s, which is not a multiple of the
+        // 1m step. The smallest 1m-multiple strictly greater than 15s is
+        // 60s, exactly what the pre-fix `>=` rule would also have produced
+        // (60s was already `> 15s`, so old and new rule agree here).
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "x")],
+                &[
+                    (0, 1.0),
+                    (30_000_000_000, 1.0),
+                    (60_000_000_000, 1.0),
+                    (90_000_000_000, 1.0),
+                    (120_000_000_000, 1.0),
+                ],
+            )
+            .expect("valid series");
+        let result = Evaluator::new()
+            .instant(&source, "count_over_time(x[2m:1m])", 135_000)
+            .expect("subquery evaluates");
+        assert_eq!(result.len(), 1);
+        // Grid: 60s, 120s (start_ns=60s from align_up_to_step(15s, 60s),
+        // end_ns=135s) -> 2 points, both find a sample.
+        assert_eq!(result[0].value, 2.0);
     }
 
     #[test]
@@ -1953,13 +2037,17 @@ mod tests {
 
     #[test]
     fn over_wide_nested_subquery_is_rejected_without_large_allocation() {
-        // Outer subquery: 61 points (1m at 1s step), each step evaluating
+        // Outer subquery: ~60 points (1m at 1s step), each step evaluating
         // `max_over_time(up[10d:1s])`. The inner subquery alone asks for
-        // 10 days at a 1s step: 864_001 points, far over the default
-        // 11_000 cap. The very first outer step must already trip the
-        // inner cap check before building the inner grid or touching
-        // storage, so this test terminates immediately rather than
-        // attempting an 864_001-entry allocation (repeated 61 times).
+        // 10 days at a 1s step. Every outer grid step lands on a whole
+        // second, so the inner target (`t - 10d`) is always an exact
+        // multiple of the inner 1s step; the left-open rule (issue #190)
+        // excludes that boundary point, giving 864_000 points, not
+        // 864_001, still far over the default 11_000 cap. The very first
+        // outer step must already trip the inner cap check before building
+        // the inner grid or touching storage, so this test terminates
+        // immediately rather than attempting an 864_000-entry allocation
+        // (repeated across outer steps).
         let source = one_series_source();
         let err = Evaluator::new()
             .instant(&source, "max_over_time(up[10d:1s])[1m:1s]", 0)
@@ -1967,7 +2055,7 @@ mod tests {
         let Error::TooManyPoints { points, max } = err else {
             panic!("expected TooManyPoints, got {err:?}");
         };
-        assert_eq!(points, 864_001);
+        assert_eq!(points, 864_000);
         assert_eq!(max, DEFAULT_MAX_RANGE_POINTS);
         assert_eq!(
             source.query_count(),
