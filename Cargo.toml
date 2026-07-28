@@ -55,6 +55,16 @@ object_store = { version = "0.14", features = ["aws"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-ipc = { version = "59", features = ["zstd"] }
 
+# Flight SQL transport, used only by ravel-sql and services/ravel-server behind
+# their `flight-sql` features (docs/arrow-datafusion-plan.md section 3). Pinned
+# to 58 on purpose: it must share arrow with the arrow 58 that datafusion 54
+# carries, which is a different major than the direct `arrow = "59"` pin above
+# that ravel-otap and ravel-segment use. The two arrow majors coexist in the
+# graph; nothing passes arrow types across the boundary. 58.4.0 resolves tonic
+# 0.14, matching the workspace `tonic` pin, so the Flight service registers on
+# the same tonic server as the OTLP one.
+arrow-flight = { version = "58.4.0", default-features = false, features = ["flight-sql"] }
+
 # encoding / compression / hashing
 bytes = "1"
 blake3 = "1.8"
