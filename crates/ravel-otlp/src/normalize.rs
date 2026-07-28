@@ -177,7 +177,10 @@ fn normalize_resource(
     let resource_labels = match build_resource_labels(resource, limits) {
         Ok(labels) => labels,
         Err(reason) => {
-            rejected.extend(std::iter::repeat_n(reason, resource_point_count));
+            rejected.push(Rejection::Grouped {
+                reason: Box::new(reason),
+                count: resource_point_count,
+            });
             return;
         }
     };
@@ -1704,8 +1707,8 @@ mod tests {
     #[test]
     fn resource_complex_attribute_value_rejects_every_point_under_it() {
         // service.name as a bytes value is invalid; every point under this
-        // resource is rejected, one Rejection per point (the `repeat_n`
-        // path in `normalize_resource`), not one shared entry.
+        // resource is rejected via one aggregated `Rejection::Grouped` entry
+        // carrying the point count, not one clone per point (#209).
         let rm = resource_metrics(
             vec![bytes_kv("service.name")],
             vec![gauge_metric(
@@ -1725,11 +1728,51 @@ mod tests {
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
-            vec![
-                Rejection::ComplexAttributeValue,
-                Rejection::ComplexAttributeValue,
-            ]
+            vec![Rejection::Grouped {
+                reason: Box::new(Rejection::ComplexAttributeValue),
+                count: 2,
+            }]
         );
+        assert_eq!(out.rejected[0].rejected_count(), 2);
+    }
+
+    #[test]
+    fn whole_resource_rejection_over_many_points_is_one_aggregated_entry() {
+        // The scenario issue #209 targets: a request with a huge number of
+        // data points, all under one resource whose labels fail to build.
+        // The fix must produce exactly one `Rejection` value (not N clones)
+        // whose `rejected_count()` still equals the point total (the #69
+        // counting invariant), so the response can be built without
+        // materializing or joining one string per point.
+        const POINT_COUNT: usize = 50_000;
+        let points = (0..POINT_COUNT)
+            .map(|i| number_point(vec![], 1_000, NumberValue::AsDouble(i as f64)))
+            .collect();
+        let rm = resource_metrics(
+            vec![bytes_kv("service.name")],
+            vec![gauge_metric("w", points)],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected.len(),
+            1,
+            "expected one aggregated entry, not one per point"
+        );
+        assert_eq!(
+            out.rejected[0],
+            Rejection::Grouped {
+                reason: Box::new(Rejection::ComplexAttributeValue),
+                count: POINT_COUNT,
+            }
+        );
+        let total: usize = out.rejected.iter().map(Rejection::rejected_count).sum();
+        assert_eq!(total, POINT_COUNT);
     }
 
     #[test]
@@ -1749,7 +1792,10 @@ mod tests {
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
-            vec![Rejection::LabelValueTooLong { len: 7, max: 3 }]
+            vec![Rejection::Grouped {
+                reason: Box::new(Rejection::LabelValueTooLong { len: 7, max: 3 }),
+                count: 1,
+            }]
         );
     }
 
@@ -1776,7 +1822,10 @@ mod tests {
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
-            vec![Rejection::LabelValueTooLong { len: 6, max: 5 }]
+            vec![Rejection::Grouped {
+                reason: Box::new(Rejection::LabelValueTooLong { len: 6, max: 5 }),
+                count: 1,
+            }]
         );
     }
 
