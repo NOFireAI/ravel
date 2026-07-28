@@ -1,9 +1,9 @@
-//! Gated differential test: runs the selector and error corpora against a
-//! real pinned Prometheus binary and the in-process Ravel stack
-//! (docs/promql-evaluator-plan.md section 5.5). Skips cleanly unless both
-//! `RAVEL_DIFFTEST=1` and `RAVEL_DIFFTEST_PROM_BIN` are set, since the
-//! pinned binary is not available in every environment (this sandbox has
-//! no network egress to fetch it, for one).
+//! Gated differential test: runs the selector, error, and counter/regression
+//! function (P4) corpora against a real pinned Prometheus binary and the
+//! in-process Ravel stack (docs/promql-evaluator-plan.md section 5.5). Skips
+//! cleanly unless both `RAVEL_DIFFTEST=1` and `RAVEL_DIFFTEST_PROM_BIN` are
+//! set, since the pinned binary is not available in every environment (this
+//! sandbox has no network egress to fetch it, for one).
 
 use std::env;
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ use ravel_types::TenantId;
 
 const SELECTORS_CORPUS: &str = include_str!("../corpus/selectors.txt");
 const ERRORS_CORPUS: &str = include_str!("../corpus/errors.txt");
+const RATE_CORPUS: &str = include_str!("../corpus/rate.txt");
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used)]
@@ -62,6 +63,7 @@ async fn selector_and_error_corpus_match_pinned_prometheus() {
 
     let mut entries = parse_corpus(SELECTORS_CORPUS).expect("parse selector corpus");
     entries.extend(parse_corpus(ERRORS_CORPUS).expect("parse error corpus"));
+    entries.extend(parse_corpus(RATE_CORPUS).expect("parse rate corpus"));
 
     let report = run_corpus(
         &entries,

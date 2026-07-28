@@ -1,0 +1,122 @@
+# Counter/regression function corpus (ticket P4, docs/promql-evaluator-plan.md
+# section 8): rate, irate, increase, delta, idelta, resets, changes, deriv,
+# predict_linear, all against crates/ravel-promql-difftest/src/generator.rs's
+# fixed dataset. Every offset is relative to the dataset's base_ts_ms.
+#
+# The dataset's strictly-ascending, no-duplicate-timestamp invariant
+# (generator.rs's own doc comment) means a zero-sampled-interval scenario
+# (irate/idelta's shared "last two samples share a timestamp" guard) cannot
+# be expressed here without changing the generator, which is out of scope
+# for this ticket; that edge is covered instead by
+# `functions::rate::tests::zero_sampled_interval_drops_the_series_for_irate_and_idelta`.
+#
+# `mode: unordered` is correct for every entry here, for the same reason as
+# selectors.txt (ADR-0021 decision 3).
+
+name: instant_rate_counter_reset_inside_window
+query: rate(diff_counter_total{shape="reset"}[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_increase_counter_before_reset
+query: increase(diff_counter_total{shape="reset"}[5m])
+kind: instant
+time: +300s
+mode: unordered
+
+name: range_rate_across_reset_at_boundary
+query: rate(diff_counter_total{shape="reset_at_boundary"}[5m])
+kind: range
+start: +0s
+end: +1170s
+step: 60s
+mode: unordered
+
+name: instant_delta_gauge_walk_short_window
+query: delta(diff_gauge_walk[1m])
+kind: instant
+time: +90s
+mode: unordered
+
+name: instant_idelta_gauge_walk
+query: idelta(diff_gauge_walk[2m])
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_irate_across_counter_reset
+query: irate(diff_counter_total{shape="reset"}[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_resets_spanning_the_reset
+query: resets(diff_counter_total{shape="reset"}[15m])
+kind: instant
+time: +900s
+mode: unordered
+
+name: range_changes_over_a_monotonic_counter
+query: changes(diff_counter_total{shape="reset"}[20m])
+kind: range
+start: +600s
+end: +1170s
+step: 60s
+mode: unordered
+
+name: instant_deriv_gauge_walk
+query: deriv(diff_gauge_walk[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_predict_linear_gauge_walk
+query: predict_linear(diff_gauge_walk[5m], 120)
+kind: instant
+time: +600s
+mode: unordered
+
+name: range_predict_linear_over_a_grid
+query: predict_linear(diff_gauge_walk[5m], 60)
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: instant_rate_over_irregularly_spaced_samples
+query: rate(diff_sparse_jitter[3m])
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_increase_short_series_two_samples
+query: increase(diff_boundary[10m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_rate_single_sample_in_window_is_absent
+query: rate(diff_boundary[5m])
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_delta_over_nan_and_inf_special_values
+query: delta(diff_special_values[3m])
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_changes_over_special_values
+query: changes(diff_special_values[7m])
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_rate_window_containing_a_stale_marker
+query: rate(diff_stale[3m])
+kind: instant
+time: +60s
+mode: unordered
