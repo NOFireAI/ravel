@@ -3811,6 +3811,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-maintain"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "crc32c",
+ "hex",
+ "prost",
+ "ravel-commit",
+ "ravel-object-store",
+ "ravel-proto",
+ "ravel-segment",
+ "ravel-types",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ravel-object-store"
 version = "0.1.0"
 dependencies = [
