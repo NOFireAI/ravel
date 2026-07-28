@@ -26,11 +26,13 @@
 //! - Aggregate registration is an allowlist (ADR-0022 decision 2): every
 //!   aggregate UDAF the default session registers is enumerated and every name
 //!   outside the admitted set ([`ADMITTED_AGGREGATES`]: `count`, `sum`, `min`,
-//!   `max`) is deregistered. This backstops the subset check in crate::validate
-//!   and fails closed under DataFusion upgrades -- a newly added default
-//!   aggregate is excluded by default rather than silently reachable.
-//!   `avg`/`mean` are admitted by a later ticket (issue #172); until then they
-//!   fall outside the admitted set and are removed here with the rest.
+//!   `max`, `avg`, `mean`) is deregistered. This backstops the subset check in
+//!   crate::validate and fails closed under DataFusion upgrades -- a newly added
+//!   default aggregate is excluded by default rather than silently reachable.
+//!   `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): they stay
+//!   in the admitted set so the deregistration loop keeps them, and their
+//!   built-in accumulator is then replaced by the sequential-fold UDAF
+//!   (crate::avg), the same registry-replacement pattern min/max use.
 //! - The `range`/`generate_series` table functions are deregistered
 //!   (checkpoint review finding, not in the original design):
 //!   `SessionContext::new_with_config_rt` calls DataFusion's
@@ -60,6 +62,7 @@ use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use url::Url;
 
+use crate::avg::sequential_avg_udaf;
 use crate::config::SqlConfig;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::provider::RavelTableProvider;
@@ -78,7 +81,11 @@ pub const SAMPLES_TABLE: &str = "samples";
 /// The complement within the default registrations lives in
 /// [`crate::validate::EXCLUDED_AGGREGATES`]; the two are kept exhaustive by
 /// `admitted_and_excluded_aggregates_cover_the_default_registrations` below.
-pub const ADMITTED_AGGREGATES: [&str; 4] = ["count", "sum", "min", "max"];
+///
+/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): kept here so
+/// the deregistration loop does not drop them, then their built-in accumulator
+/// is displaced by the sequential-fold UDAF (crate::avg).
+pub const ADMITTED_AGGREGATES: [&str; 6] = ["count", "sum", "min", "max", "avg", "mean"];
 
 /// An `ObjectStoreRegistry` that holds nothing and registers nothing.
 ///
@@ -167,6 +174,14 @@ pub fn build_session(
     // grouped min/max.
     ctx.register_udaf(total_order_min_udaf());
     ctx.register_udaf(total_order_max_udaf());
+    // Replace the built-in avg/mean with the sequential-fold UDAF (ADR-0022
+    // decisions 3, 4): `register_udaf` inserts by name and by the `mean` alias,
+    // displacing both built-in entries so avg's numerator is a naive f64 fold
+    // in deterministic order rather than arrow's lane-parallel batch sum. avg
+    // stays in `ADMITTED_AGGREGATES` so the loop above keeps the built-in until
+    // this line replaces it. This is independent of the public `sum` UDAF,
+    // which is untouched (ADR-0024).
+    ctx.register_udaf(sequential_avg_udaf());
     // `with_default_features()` (inside `new_with_config_rt` above)
     // registers these unconditionally; they generate rows in memory and so
     // are not blocked by `EmptyObjectStoreRegistry`. `samples` must be the
