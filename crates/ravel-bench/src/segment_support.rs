@@ -15,10 +15,10 @@
 //! not a runtime condition to recover from.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use ravel_segment::experiment_api::{ExperimentFlags, write_v2_experimental};
 use ravel_segment::{
-    Footer, IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesEntry, SeriesInput,
-    SeriesInputV3, SeriesValues, WrittenSegment, decode_catalog, decode_catalog_matching,
+    CompactionMetaV4, Footer, IngestBounds, ReaderLimits, RunInputV4, RunValuePageV4,
+    SegmentIdentity, SegmentWriter, SeriesEntry, SeriesInput, SeriesInputV3, SeriesInputV4,
+    SeriesValues, WrittenSegment, decode_catalog, decode_catalog_matching,
     decode_catalog_matching_v2, decode_catalog_v2, open_from_full,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
@@ -27,12 +27,12 @@ pub const LABEL_DICT: u32 = 1;
 pub const SERIES_TABLE: u32 = 2;
 pub const TS_PAGES: u32 = 3;
 pub const VAL_PAGES: u32 = 4;
-/// v2-only sections (v1 objects never emit these; ADR-0014).
+/// v2+ sections (v1 objects never emit these; ADR-0014).
 pub const SERIES_IDS: u32 = 5;
 pub const SERIES_META: u32 = 6;
-/// Prototype sections (issue #167 experiment; never on the default writer
-/// path). Defined in `ravel_segment::experiment_api`, mirrored here for the
-/// selective-read bench.
+/// RSEG v5 sparse-catalog sections (ADR-0026, kinds frozen in
+/// `ravel_segment::format::section_kind`). Named here for the selective-read
+/// bench and byte gates.
 pub const SERIES_IDX: u32 = 8;
 pub const SERIES_META_CHUNKS: u32 = 9;
 
@@ -50,6 +50,15 @@ pub fn bench_bounds() -> IngestBounds {
     IngestBounds {
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
+    }
+}
+
+pub fn bench_meta() -> CompactionMetaV4 {
+    CompactionMetaV4 {
+        ingest_hour_bucket: 0,
+        input_set_hash: [0u8; 32],
+        part_index: 0,
+        level: 1,
     }
 }
 
@@ -99,23 +108,80 @@ pub fn build_segment_v3(raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>) -> WrittenS
         .expect("encode bench segment v3")
 }
 
-/// Selective-read experiment counterpart of [`build_segment_v2`] (issue #167):
-/// encodes `raw` via `write_v2_experimental` under the given prototype flags.
-/// With `ExperimentFlags::none()` this is byte-identical to `build_segment_v2`.
-pub fn build_segment_v2_experimental(
-    raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>,
-    flags: ExperimentFlags,
-) -> WrittenSegment {
-    let series = raw
-        .into_iter()
-        .map(|(series_id, labels, samples)| SeriesInput {
-            series_id,
-            labels,
-            samples,
+/// Converts a scalar workload into single-run RSEG v4 inputs by writing one
+/// v2 object over the whole batch and slicing each series' verbatim
+/// TS_PAGES/VAL_PAGES bytes (page crc32c is bound to series_id, preserved).
+/// This is the bench counterpart of the compaction pipeline's real
+/// verbatim-page copy: v4/v5 writers take pre-framed runs, never raw samples.
+pub fn raw_to_v4_inputs(raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>) -> Vec<SeriesInputV4> {
+    let v2 = build_segment_v2(raw);
+    let obj = v2.bytes.as_ref();
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(obj, limits).expect("open v2 for v4 inputs");
+    let footer = &loc.footer;
+    let entries = decode_catalog_v2(
+        footer,
+        section_bytes(obj, footer, LABEL_DICT),
+        section_bytes(obj, footer, SERIES_IDS),
+        section_bytes(obj, footer, SERIES_META),
+        limits,
+    )
+    .expect("decode v2 catalog for v4 inputs");
+    let ts_sec = footer.sections.iter().find(|s| s.kind == TS_PAGES).unwrap();
+    let val_sec = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == VAL_PAGES)
+        .unwrap();
+    entries
+        .iter()
+        .map(|e| {
+            let (o, l) = e.ts_page;
+            let a = (ts_sec.offset + o) as usize;
+            let ts_page = obj[a..a + l as usize].to_vec();
+            let (o, l) = e.val_page;
+            let a = (val_sec.offset + o) as usize;
+            let val_page = obj[a..a + l as usize].to_vec();
+            SeriesInputV4 {
+                series_id: e.series_id,
+                labels: e.labels.clone(),
+                runs: vec![RunInputV4 {
+                    created_unix_ns: 0,
+                    writer_epoch: 0,
+                    writer_seq: 0,
+                    min_ts_ns: e.min_ts_ns,
+                    max_ts_ns: e.max_ts_ns,
+                    sample_count: e.sample_count,
+                    ts_page,
+                    value_page: RunValuePageV4::Scalar(val_page),
+                }],
+            }
         })
-        .collect();
-    write_v2_experimental(series, bench_identity(), bench_bounds(), flags)
-        .expect("encode experimental bench segment")
+        .collect()
+}
+
+/// v4 counterpart of [`build_segment_v2`]: encodes `raw` as single-run v4.
+pub fn build_segment_v4(raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>) -> WrittenSegment {
+    SegmentWriter::write_v4(
+        raw_to_v4_inputs(raw),
+        bench_identity(),
+        bench_bounds(),
+        bench_meta(),
+    )
+    .expect("encode bench segment v4")
+}
+
+/// v5 counterpart of [`build_segment_v2`]: encodes `raw` as single-run v5,
+/// which emits the sparse SERIES_IDX + chunked SERIES_META sections when the
+/// object carries at least the v5 threshold of series (ADR-0026).
+pub fn build_segment_v5(raw: Vec<(SeriesId, LabelSet, Vec<Sample>)>) -> WrittenSegment {
+    SegmentWriter::write_v5(
+        raw_to_v4_inputs(raw),
+        bench_identity(),
+        bench_bounds(),
+        bench_meta(),
+    )
+    .expect("encode bench segment v5")
 }
 
 pub fn slice_range(bytes: &[u8], range: (u64, u64)) -> &[u8] {

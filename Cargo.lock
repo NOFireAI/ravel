@@ -3668,6 +3668,7 @@ name = "ravel-bench"
 version = "0.1.0"
 dependencies = [
  "arrow 59.1.0",
+ "arrow-flight",
  "async-trait",
  "blake3",
  "bytes",
@@ -3679,6 +3680,7 @@ dependencies = [
  "object_store 0.13.2",
  "parquet",
  "proptest",
+ "prost",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
@@ -3689,12 +3691,14 @@ dependencies = [
  "ravel-proto",
  "ravel-query",
  "ravel-segment",
+ "ravel-sql",
  "ravel-types",
  "serde",
  "serde_json",
  "stats_alloc",
  "thiserror",
  "tokio",
+ "tonic",
  "uuid",
  "zstd",
 ]

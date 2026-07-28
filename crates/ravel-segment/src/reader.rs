@@ -10,7 +10,7 @@ use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
     MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION, VERSION_V2, VERSION_V3, VERSION_V4,
-    compression, page_comp, page_enc, section_kind,
+    VERSION_V5, compression, page_comp, page_enc, section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use crate::varint::{read_uvarint, read_zigzag_varint};
@@ -79,7 +79,11 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     if magic != MAGIC {
         return Err(SegmentError::BadMagic);
     }
-    if version != VERSION && version != VERSION_V2 && version != VERSION_V3 && version != VERSION_V4
+    if version != VERSION
+        && version != VERSION_V2
+        && version != VERSION_V3
+        && version != VERSION_V4
+        && version != VERSION_V5
     {
         return Err(SegmentError::UnsupportedVersion(version));
     }
@@ -159,6 +163,7 @@ pub fn validate_sections(
         VERSION_V2 => validate_sections_v2(footer, page_region_end, limits),
         VERSION_V3 => validate_sections_v3(footer, page_region_end, limits),
         VERSION_V4 => validate_sections_v4(footer, page_region_end, limits),
+        VERSION_V5 => validate_sections_v5(footer, page_region_end, limits),
         other => Err(SegmentError::UnsupportedVersion(other)),
     }
 }
@@ -383,6 +388,84 @@ fn validate_sections_v4(
     Ok(())
 }
 
+/// v5 mandatory-kind validation (ADR-0026, docs/segment-format.md "RSEG v5
+/// amendment"). LABEL_DICT, SERIES_IDS, TS_PAGES are always mandatory, as in
+/// v4. The catalog body is carried either by the v4-shaped whole-section
+/// SERIES_META (kind 6, below the sparse-emission threshold) or by the
+/// chunked SERIES_META_CHUNKS (kind 9) paired with SERIES_IDX (kind 8):
+/// exactly one of {kind 6} / {kind 8 + kind 9} must be present. VAL_PAGES and
+/// HIST_PAGES stay each optional, at least one present when
+/// `footer.series_count > 0`, unchanged from v4. Whether the *chunked* form's
+/// per-chunk crc32c and page columns are internally consistent needs the
+/// section bytes this function never has; that is checked on the read path
+/// (`decode_catalog_v5` and the sparse probe), mirroring v2/v3/v4's
+/// count-equality deferrals.
+fn validate_sections_v5(
+    footer: &Footer,
+    page_region_end: u64,
+    limits: ReaderLimits,
+) -> Result<(), SegmentError> {
+    // 0 LABEL_DICT, 1 SERIES_IDS, 2 SERIES_META, 3 TS_PAGES, 4 VAL_PAGES,
+    // 5 HIST_PAGES, 6 SERIES_IDX, 7 SERIES_META_CHUNKS.
+    let mut seen = [false; 8];
+    for section in &footer.sections {
+        let end = section
+            .offset
+            .checked_add(section.len)
+            .ok_or(SegmentError::SectionOutOfBounds)?;
+        if end > page_region_end {
+            return Err(SegmentError::SectionOutOfBounds);
+        }
+        let idx = match section.kind {
+            section_kind::LABEL_DICT => 0,
+            section_kind::SERIES_IDS => 1,
+            section_kind::SERIES_META => 2,
+            section_kind::TS_PAGES => 3,
+            section_kind::VAL_PAGES => 4,
+            section_kind::HIST_PAGES => 5,
+            section_kind::SERIES_IDX => 6,
+            section_kind::SERIES_META_CHUNKS => 7,
+            _ => continue,
+        };
+        if seen[idx] {
+            return Err(SegmentError::DuplicateSection(section.kind));
+        }
+        seen[idx] = true;
+        if section.uncompressed_len > limits.max_section_uncompressed_bytes {
+            return Err(SegmentError::SectionTooLarge {
+                len: section.uncompressed_len,
+                cap: limits.max_section_uncompressed_bytes,
+            });
+        }
+    }
+    const NAMES: [&str; 2] = ["LABEL_DICT", "SERIES_IDS"];
+    for (i, name) in NAMES.iter().enumerate() {
+        if !seen[i] {
+            return Err(SegmentError::MissingSection(name));
+        }
+    }
+    if !seen[3] {
+        return Err(SegmentError::MissingSection("TS_PAGES"));
+    }
+    // Catalog body: exactly one of the whole-section (kind 6) or the chunked
+    // (kind 8 + kind 9) form.
+    let whole = seen[2];
+    let chunked = seen[6] || seen[7];
+    if whole && chunked {
+        return Err(SegmentError::DuplicateSection(section_kind::SERIES_META));
+    }
+    if chunked && !(seen[6] && seen[7]) {
+        return Err(SegmentError::SparseSectionsIncomplete);
+    }
+    if !whole && !chunked {
+        return Err(SegmentError::MissingSection("SERIES_META"));
+    }
+    if footer.series_count > 0 && !seen[4] && !seen[5] {
+        return Err(SegmentError::MissingSection("VAL_PAGES or HIST_PAGES"));
+    }
+    Ok(())
+}
+
 /// Convenience: parse and validate a footer from the complete object bytes.
 pub fn open_from_full(bytes: &[u8], limits: ReaderLimits) -> Result<FooterLocation, SegmentError> {
     match parse_footer(bytes.len() as u64, bytes)? {
@@ -470,18 +553,18 @@ pub struct SeriesEntryV4 {
     pub runs: Vec<RunEntry>,
 }
 
-fn find_section(footer: &Footer, kind: u32) -> Option<&Section> {
+pub(crate) fn find_section(footer: &Footer, kind: u32) -> Option<&Section> {
     footer.sections.iter().find(|s| s.kind == kind)
 }
 
-fn to_usize(v: u64) -> Result<usize, SegmentError> {
+pub(crate) fn to_usize(v: u64) -> Result<usize, SegmentError> {
     usize::try_from(v).map_err(|_| SegmentError::SectionOutOfBounds)
 }
 
 /// Decompresses and crc-verifies a whole section's stored bytes, per
 /// docs/segment-format.md ("Section crc32c covers the stored bytes";
 /// "uncompressed_len must match the decompressed size exactly").
-fn decode_section_bytes(
+pub(crate) fn decode_section_bytes(
     section: &Section,
     stored: &[u8],
     limits: ReaderLimits,
@@ -549,7 +632,7 @@ fn take_u16_le(bytes: &[u8], pos: &mut usize) -> Result<u16, SegmentError> {
     Ok(u16::from_le_bytes([s[0], s[1]]))
 }
 
-fn take_u32_le(bytes: &[u8], pos: &mut usize) -> Result<u32, SegmentError> {
+pub(crate) fn take_u32_le(bytes: &[u8], pos: &mut usize) -> Result<u32, SegmentError> {
     let s = take_bytes(bytes, pos, 4)?;
     Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
@@ -589,7 +672,7 @@ fn parse_label_dict(bytes: &[u8]) -> Result<Vec<String>, SegmentError> {
 /// LABEL_DICT payload, in ordinal order. Bounds are validated during the
 /// indexing pass; UTF-8 validation is deferred until a string is actually
 /// materialized.
-fn index_label_dict(bytes: &[u8]) -> Result<Vec<(usize, usize)>, SegmentError> {
+pub(crate) fn index_label_dict(bytes: &[u8]) -> Result<Vec<(usize, usize)>, SegmentError> {
     let mut pos = 0usize;
     let count = take_u32_le(bytes, &mut pos)?;
     let mut out = Vec::with_capacity((count as usize).min(bytes.len()));
@@ -641,14 +724,14 @@ fn dict_str<'a>(
 /// before), and the first `BadOrdinal`/`Truncated`/`BadUtf8` encountered is
 /// the same one `dict_str` would return, because a cached hit only ever
 /// replaces a repeat of an already-successful validation.
-struct DictResolver<'a> {
+pub(crate) struct DictResolver<'a> {
     dict_bytes: &'a [u8],
     index: &'a [(usize, usize)],
     cache: Vec<Option<&'a str>>,
 }
 
 impl<'a> DictResolver<'a> {
-    fn new(dict_bytes: &'a [u8], index: &'a [(usize, usize)]) -> Self {
+    pub(crate) fn new(dict_bytes: &'a [u8], index: &'a [(usize, usize)]) -> Self {
         Self {
             dict_bytes,
             index,
@@ -656,7 +739,7 @@ impl<'a> DictResolver<'a> {
         }
     }
 
-    fn get(&mut self, ord: u64) -> Result<&'a str, SegmentError> {
+    pub(crate) fn get(&mut self, ord: u64) -> Result<&'a str, SegmentError> {
         let i = to_usize(ord)?;
         let (start, len) = *self.index.get(i).ok_or(SegmentError::BadOrdinal(ord))?;
         // `i < index.len() == cache.len()`, so indexing `cache[i]` after a
@@ -1742,8 +1825,8 @@ pub fn decode_run_histogram_pages(
 /// label names, validated at decode time to be strictly ascending by the
 /// referenced dictionary string's bytes (docs/segment-format.md v2
 /// amendment).
-struct SchemaMetaV2 {
-    name_ords: Vec<u64>,
+pub(crate) struct SchemaMetaV2 {
+    pub(crate) name_ords: Vec<u64>,
 }
 
 /// Per-series output of SERIES_META's blocks 3-9 (docs/segment-format.md
@@ -1760,7 +1843,7 @@ struct SeriesMetaTailV2 {
 
 /// Reads a `block_len: varint` prefix, then slices out exactly that many
 /// bytes (`Truncated` if the section doesn't have that many bytes left).
-fn take_block<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], SegmentError> {
+pub(crate) fn take_block<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], SegmentError> {
     let block_len = read_uvarint(bytes, pos)?;
     let block_len = to_usize(block_len)?;
     take_bytes(bytes, pos, block_len)
@@ -1770,7 +1853,7 @@ fn take_block<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], SegmentE
 /// u32` then `count` 16-byte ids, strictly ascending by byte comparison.
 /// Rejects non-ascending ids and any trailing bytes (equivalently, any
 /// section length other than exactly `4 + 16*count`).
-fn parse_series_ids_v2(bytes: &[u8]) -> Result<Vec<[u8; 16]>, SegmentError> {
+pub(crate) fn parse_series_ids_v2(bytes: &[u8]) -> Result<Vec<[u8; 16]>, SegmentError> {
     let mut pos = 0usize;
     let count = take_u32_le(bytes, &mut pos)?;
     let mut out = Vec::with_capacity((count as usize).min(bytes.len() / 16));
@@ -1801,7 +1884,7 @@ fn parse_series_ids_v2(bytes: &[u8]) -> Result<Vec<[u8; 16]>, SegmentError> {
 /// `dict_str`) so this never UTF-8-validates a name that a caller doesn't
 /// go on to materialize (matches v1's `decode_catalog_matching` contract
 /// that non-materialized dictionary strings are never UTF-8-checked).
-fn parse_schema_list_v2(
+pub(crate) fn parse_schema_list_v2(
     meta_bytes: &[u8],
     pos: &mut usize,
     dict_bytes: &[u8],
@@ -1845,7 +1928,7 @@ fn parse_schema_list_v2(
 
 /// Checks the v2 amendment's count-equality rule: SERIES_IDS `count`,
 /// SERIES_META `count`, and `Footer.series_count` must all be equal.
-fn check_series_counts_v2(
+pub(crate) fn check_series_counts_v2(
     series_ids: u64,
     series_meta: u64,
     footer_count: u64,
@@ -1862,7 +1945,7 @@ fn check_series_counts_v2(
 
 /// SERIES_META block 1 (`schema_ref`, docs/segment-format.md v2
 /// amendment): `count` varints, each `< schema_count`.
-fn parse_schema_ref_block_v2(
+pub(crate) fn parse_schema_ref_block_v2(
     meta_bytes: &[u8],
     pos: &mut usize,
     count: u32,
@@ -1898,7 +1981,7 @@ fn parse_schema_ref_block_v2(
 /// preserving the exact series-major order the block already stores. This
 /// was the residual half of the RSEG v2 eager-decode regression (issue #94)
 /// after per-reference dictionary UTF-8 revalidation was fixed.
-fn parse_value_ord_block_all_v2(
+pub(crate) fn parse_value_ord_block_all_v2(
     meta_bytes: &[u8],
     pos: &mut usize,
     count: u32,
@@ -1968,7 +2051,7 @@ fn parse_value_ord_block_selective_v2(
 /// VAL_PAGES) column pairs. Error choice mirrors `plan_ranges`' precedent
 /// for v1: `SectionOutOfBounds` for both arithmetic overflow and a range
 /// exceeding its section's length.
-fn reconstruct_ranges_v2(
+pub(crate) fn reconstruct_ranges_v2(
     gaps: &[u64],
     lens: &[u64],
     section_len: u64,

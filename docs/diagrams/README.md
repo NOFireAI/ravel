@@ -51,19 +51,24 @@ footer_crc32c, a section's crc32c, and a page's crc each cover. A format
 evolution panel at the bottom shows the section tape of each version:
 v2 (ADR-0014, columnar SERIES_IDS + SERIES_META catalog, sorted dict,
 VAL_RAW_F64 alignment), v3 (ADR-0017, native histograms, HIST_PAGES),
-and v4 (ADR-0018, multi-run L1 compaction output). Trailer, reader
-protocol, and checksum rules are shared by all four versions.
+v4 (ADR-0018, multi-run L1 compaction output), and v5 (ADR-0026, the
+compacted-tier sparse catalog: SERIES_IDX kind 8 + chunked SERIES_META
+kind 9, emitted at >= 4096 series, with per-window and per-chunk crc32c
+so a range-GET verifies what it touches; below the threshold a v5 object
+is the v4 object plus a version bump). Trailer, reader protocol, and
+checksum rules are shared by all five versions.
 
-Illustrates: docs/segment-format.md (v1 plus the v2/v3/v4 amendment
+Illustrates: docs/segment-format.md (v1 plus the v2/v3/v4/v5 amendment
 sections), docs/adrs/0004-rseg-format.md,
 docs/adrs/0010-spec-amendments-review-1.md (§4, checksum coverage),
-docs/adrs/0014, 0017, 0018.
+docs/adrs/0014, 0017, 0018, 0026.
 
 Last verified against the code: 2026-07-28 (v1 frozen and proved
 byte-identical by the golden-bytes test; v2/v3 writers emit sorted
 LABEL_DICT since issue #146, v4 since #155; v2 byte gates measured and
 enforced by the deterministic catalog_byte_gates test in ravel-bench,
-issue #166).
+issue #166; v5 sparse sections added by #176, byte-gated < 1% of object
+at the 10k shape and golden-pinned by golden_bytes_v5).
 
 ## query-path.svg
 

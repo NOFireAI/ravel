@@ -1,6 +1,8 @@
 # ADR-0018: L0 to L1 compaction: verbatim rewrite of sealed ingest-hour buckets
 
-Status: Accepted (2026-07-27). Implementation plan and tickets:
+Status: Accepted (2026-07-27); amended by ADR-0026 (v5 replaces v4 as
+the compaction output) and ADR-0027 (v4 support removed pre-release).
+The compaction design itself stands. Implementation plan and tickets:
 docs/compaction-retention-plan.md. This ADR records the decision;
 docs/consistency-model.md, docs/catalog-and-mvcc.md, and
 docs/segment-format.md remain authoritative as written until plan phase 1

@@ -169,7 +169,9 @@ pub async fn start(
     // Held past the HTTP wiring so the Flight SQL service can register
     // against the same executor rather than building a second one; `None`
     // in a gateway-only process, which serves no query surface at all.
-    #[cfg(feature = "sql")]
+    // Only Flight SQL reads this back (below); a plain `sql`-feature build
+    // (no `flight-sql`) has no consumer for it at all.
+    #[cfg(feature = "flight-sql")]
     let mut sql_state: Option<sql::SqlState> = None;
 
     if matches!(config.mode, Mode::All | Mode::Query) {
@@ -189,7 +191,10 @@ pub async fn start(
                 config.tenant_resolver.clone(),
             )?;
             http_router = http_router.merge(sql::router(state.clone()));
-            sql_state = Some(state);
+            #[cfg(feature = "flight-sql")]
+            {
+                sql_state = Some(state);
+            }
         }
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }

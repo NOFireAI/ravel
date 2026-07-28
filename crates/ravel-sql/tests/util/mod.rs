@@ -21,6 +21,16 @@
 
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 
+/// The shared v1 SQL differential grammar (query shapes, dataset strategies,
+/// reference folds, comparable rows), used by both the HTTP-path oracle gate
+/// and the Flight-vs-HTTP transport parity gate (issue #153).
+pub mod gate;
+
+/// The in-process Flight SQL harness, shared across the Flight test suites.
+/// Only compiled under `flight-sql`, which is what links arrow-flight/tonic.
+#[cfg(feature = "flight-sql")]
+pub mod flight_harness;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

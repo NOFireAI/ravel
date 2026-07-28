@@ -70,7 +70,7 @@ pub use flight::{
 };
 #[cfg(feature = "flight-sql")]
 pub use flight_ticket::{FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin};
-pub use memory::{TenantDelegatingPool, TenantMemoryAccountant};
+pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
