@@ -25,3 +25,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0019](0019-age-based-retention.md) | Age-based retention via bucket tombstones and horizon-gated sweep | Accepted |
 | [0020](0020-metric-index.md) | Metric index: catalog snapshots as the commit index, async fold, name postings gated | Accepted |
 | [0021](0021-promql-full-evaluator.md) | Full PromQL evaluator scope and phasing, differential harness against pinned Prometheus | Accepted |
+| [0023](0023-grouped-min-max-total-order-udaf.md) | Grouped MIN/MAX restored via a total-order min/max UDAF replacing the built-ins | Proposed |
