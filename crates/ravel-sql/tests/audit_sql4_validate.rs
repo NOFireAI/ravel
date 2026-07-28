@@ -53,11 +53,9 @@ fn grouped_min_max_in_order_by_must_be_rejected() {
 /// `crate::session::build_session` (only `avg`/`mean` are), so they plan and
 /// execute unverified by the exactness regime.
 ///
-/// Expected (post-fix): rejected the same way `avg` is (or explicitly covered
-/// by the differential/reference executor). Fails today: `validate` returns
-/// `Ok(())`.
+/// Fixed by the sql4-F02 REJECT change: `validate` now excludes the family
+/// exactly as `avg` is, so each call returns `Err`.
 #[test]
-#[ignore = "audit sql4-F02: documents an exactness-exclusion gap, fails against baseline"]
 fn stddev_and_variance_family_must_be_handled_like_avg() {
     for sql in [
         "SELECT stddev(value) FROM samples",

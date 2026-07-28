@@ -2,11 +2,12 @@
 //! belong in the v1 SQL subset, or must it be excluded like `avg`?
 //!
 //! docs/reviews/2026-07-28-ravel-sql-audit/sql4-validate-error-tenant.md
-//! confirmed the *validation* half of sql4-F02: `crate::validate` rejects only
-//! `avg`/`mean` and grouped `min`/`max`, and `crate::session::build_session`
-//! deregisters only the `avg`/`mean` UDAFs. `stddev`, `var`, `stddev_pop`,
-//! `var_pop` (and `covar_*`/`corr`) are registered by DataFusion's
-//! `with_default_features()` and left in place, so they plan and execute.
+//! confirmed the *validation* half of sql4-F02: at the audit baseline
+//! `crate::validate` rejected only `avg`/`mean` and grouped `min`/`max`, and
+//! `crate::session::build_session` deregistered only the `avg`/`mean` UDAFs.
+//! `stddev`, `var`, `stddev_pop`, `var_pop` (and `covar_*`/`corr`) were
+//! registered by DataFusion's `with_default_features()` and left in place, so
+//! they planned and executed.
 //!
 //! Each of them computes a floating mean internally -- exactly the property
 //! that disqualified `avg`. `avg` was excluded (docs/arrow-datafusion-plan.md
@@ -18,15 +19,7 @@
 //! validation instead, because "exact semantics by default" leaves no room for
 //! a silently-different-but-plausible answer.
 //!
-//! This probe answers the deciding question the audit left open (its
-//! "mis-execution half"): **can a naive reference of the kind the differential
-//! suite's reference executor uses be bit-identical to DataFusion's
-//! stddev/variance accumulators?** If not, the family shares `avg`'s exact
-//! disqualifying property and the correct fix is to REJECT it (add it to the
-//! `reject_*` walk and the session UDAF deregistration, mirroring `avg`), not
-//! to gate it.
-//!
-//! # Why a naive reference cannot match
+//! # Why a naive reference cannot match (the historical finding)
 //!
 //! DataFusion's `VarianceAccumulator` computes variance with Welford's online
 //! algorithm: it folds one value at a time, maintaining a running `mean` and a
@@ -48,124 +41,32 @@
 //! independent) or would have to weaken to a tolerance (the exact failure mode
 //! review F7 forbids).
 //!
-//! # Reading the result
+//! # Resolution (issue #160)
 //!
-//! [`stddev_var_family_is_not_bit_identical_to_a_naive_reference`] is
-//! `#[ignore]`d: it asserts the bit-identity that would be *required* to bring
-//! the family under the differential gate, and it fails, so it documents the
-//! gap rather than gating on it (the same convention the sql4 reproducers use).
-//! Run it explicitly to see the differing bit patterns:
-//!
-//! ```text
-//! cargo test -p ravel-sql --test audit_sql4_stddev_probe -- --ignored --nocapture
-//! ```
-//!
-//! [`stddev_var_family_is_registered_and_executes`] is *not* ignored: it runs
-//! in the normal suite and pins the live fact behind the finding -- that all
-//! four functions plan and execute today, unguarded by validation.
+//! The probe answered the deciding question the audit left open, and the
+//! decision was REJECT, mirroring `avg`. `crate::validate` now rejects the
+//! whole family with `ValidationError::StddevVarUnsupported`, and
+//! `crate::session::build_session` deregisters the family's UDAFs as a
+//! backstop. The `#[ignore]`d bit-identity probe that used to run the
+//! aggregates through the live path and show the differing bit patterns has
+//! been removed: the family no longer plans or executes, so there is no live
+//! DataFusion value left to compare against, and the argument above is the
+//! historical record. The tests below now assert the family is rejected.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod util;
 
-use datafusion::arrow::array::{Array, Float64Array};
-use ravel_sql::QueryOutput;
-use ravel_types::TenantId;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
 // ---------------------------------------------------------------------------
-// The naive two-pass reference (what an independent reference executor would
-// implement -- the differential suite's reference is naive by design)
-// ---------------------------------------------------------------------------
-
-/// The four members of the family, computed two-pass in one place.
-struct NaiveStats {
-    var_samp: f64,
-    var_pop: f64,
-    stddev_samp: f64,
-    stddev_pop: f64,
-}
-
-/// Textbook two-pass variance over `values` in the given order: one pass for
-/// the mean, one pass for the sum of squared deviations. This is the naive
-/// reference the exactness policy weighs `avg` (and now this family) against;
-/// it is deliberately *not* Welford's online algorithm, because a reference
-/// that re-implements Welford would not be independent of the accumulator
-/// under test.
-fn naive_stats(values: &[f64]) -> NaiveStats {
-    let n = values.len() as f64;
-    let mut sum = 0.0f64;
-    for &v in values {
-        sum += v;
-    }
-    let mean = sum / n;
-    let mut m2 = 0.0f64;
-    for &v in values {
-        let d = v - mean;
-        m2 += d * d;
-    }
-    let var_pop = m2 / n;
-    let var_samp = m2 / (n - 1.0);
-    NaiveStats {
-        var_samp,
-        var_pop,
-        stddev_samp: var_samp.sqrt(),
-        stddev_pop: var_pop.sqrt(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Running one scalar aggregate through the real SQL path
-// ---------------------------------------------------------------------------
-
-/// Execute a single-row, single-column `Float64` query and return the cell.
-async fn scalar_f64(fixture: &Fixture, tenant: &TenantId, sql: &str) -> f64 {
-    let outcome = fixture
-        .executor
-        .execute(tenant.hash(), &request(sql))
-        .await
-        .unwrap_or_else(|e| panic!("query failed: {sql}\n{e}"));
-    cell_f64(&outcome.output, sql)
-}
-
-fn cell_f64(output: &QueryOutput, sql: &str) -> f64 {
-    assert_eq!(output.num_rows(), 1, "expected exactly one row for: {sql}");
-    let batch = output
-        .batches()
-        .iter()
-        .find(|b| b.num_rows() == 1)
-        .unwrap_or_else(|| panic!("no single-row batch for: {sql}"));
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap_or_else(|| panic!("column 0 is not Float64 for: {sql}"));
-    col.value(0)
-}
-
-/// Pull every deduplicated value the ungrouped aggregate sees, in the
-/// canonical `(series_id, ts)` order the scan emits them -- so the naive
-/// reference folds the identical values in the identical order the
-/// accumulator does. Any bit divergence is then attributable to the algorithm
-/// alone, not to input order.
-async fn aggregated_values(fixture: &Fixture, tenant: &TenantId) -> Vec<f64> {
-    let snapshot = fixture.snapshot(tenant).await;
-    util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot)
-        .await
-        .into_iter()
-        .map(|r| r.value)
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Datasets
+// Dataset
 // ---------------------------------------------------------------------------
 
 /// Cancellation-prone, large-magnitude, finite values in one series with
-/// unique timestamps (so dedup is the identity and the reference values equal
-/// the raw samples). Mixing `+1e9` and `-1e9` drives the mean near a small
-/// value while the squared deviations are near `1e18`, the regime where a
-/// running-mean fold and a batch-mean fold visibly disagree.
+/// unique timestamps. This was the regime where a running-mean fold and a
+/// batch-mean fold visibly disagreed (see the module docs); it is kept so the
+/// rejection is exercised against real fixture data rather than an empty scan.
 fn cancellation_dataset() -> Vec<SegSpec> {
     let base = 1.0e9f64;
     let values = [
@@ -199,11 +100,56 @@ fn cancellation_dataset() -> Vec<SegSpec> {
     )]
 }
 
-/// A dataset that additionally carries a NaN, to document how the family
-/// behaves on non-finite input.
-fn nan_dataset() -> Vec<SegSpec> {
+// ---------------------------------------------------------------------------
+// The new fact: the family is rejected, exactly as `avg` is
+// ---------------------------------------------------------------------------
+
+/// Every member of the stddev/variance/covariance/correlation family is now
+/// rejected before execution: `crate::validate` refuses the query text and,
+/// as a backstop, `crate::session::build_session` deregisters the UDAFs. This
+/// replaces the audit-baseline probe that pinned the family planning and
+/// executing unguarded; it runs in the normal suite.
+#[tokio::test]
+async fn stddev_var_family_is_rejected() {
+    let tenant = tenant_id("probe");
+    let specs = cancellation_dataset();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    let single_arg = ["stddev", "var", "stddev_pop", "var_pop"];
+    let double_arg = ["covar_samp", "covar_pop", "corr"];
+
+    for func in single_arg {
+        let sql = format!("SELECT {func}(value) FROM samples");
+        let result = fixture
+            .executor
+            .execute(tenant.hash(), &request(&sql))
+            .await;
+        assert!(
+            result.is_err(),
+            "{func} must be rejected (validate + UDAF deregistration), but it executed"
+        );
+    }
+    for func in double_arg {
+        let sql = format!("SELECT {func}(value, value) FROM samples");
+        let result = fixture
+            .executor
+            .execute(tenant.hash(), &request(&sql))
+            .await;
+        assert!(
+            result.is_err(),
+            "{func} must be rejected (validate + UDAF deregistration), but it executed"
+        );
+    }
+}
+
+/// The rejection is purely syntactic (it inspects the query text before any
+/// planning or scan), so it fires regardless of the data -- including a
+/// dataset carrying a NaN. This documents that the non-finite corner the
+/// audit called out is closed by rejection, not by any NaN-specific handling.
+#[tokio::test]
+async fn stddev_var_family_is_rejected_even_over_nan_input() {
     const NAN_POS: u64 = 0x7ff8_0000_0000_0001;
-    vec![SegSpec::new(
+    let specs = vec![SegSpec::new(
         1,
         1,
         1,
@@ -216,117 +162,19 @@ fn nan_dataset() -> Vec<SegSpec> {
                 (4, 2.5),
             ],
         )],
-    )]
-}
-
-// ---------------------------------------------------------------------------
-// (b) The live fact: the family is unguarded and executes today
-// ---------------------------------------------------------------------------
-
-/// All four aggregates plan and execute against the current session -- neither
-/// validation (`crate::validate`) nor the session UDAF deregistration
-/// (`crate::session::build_session`) blocks them, unlike `avg`. This is the
-/// standing state finding sql4-F02 describes; it runs in the normal suite.
-#[tokio::test]
-async fn stddev_var_family_is_registered_and_executes() {
+    )];
     let tenant = tenant_id("probe");
-    let specs = cancellation_dataset();
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
     for func in ["stddev", "var", "stddev_pop", "var_pop"] {
         let sql = format!("SELECT {func}(value) FROM samples");
-        let outcome = fixture
+        let result = fixture
             .executor
             .execute(tenant.hash(), &request(&sql))
-            .await
-            .unwrap_or_else(|e| {
-                panic!("{func} should execute (it is registered and unvalidated): {e}")
-            });
-        assert_eq!(
-            outcome.output.num_rows(),
-            1,
-            "{func} must return one aggregate row"
-        );
-    }
-}
-
-/// NaN input propagates to a NaN result on both the DataFusion path and the
-/// naive reference: neither errors, both return NaN. This documents the
-/// non-finite corner (part of the sql4-F02 dataset requirement) and shows the
-/// family is not merely broken on NaN -- it is silently *un-gated* on ordinary
-/// finite data, which is the real hazard the ignored probe below pins down.
-#[tokio::test]
-async fn nan_input_yields_nan_on_both_paths() {
-    let tenant = tenant_id("probe");
-    let specs = nan_dataset();
-    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
-
-    let values = aggregated_values(&fixture, &tenant).await;
-    let reference = naive_stats(&values);
-    assert!(
-        reference.var_samp.is_nan() && reference.stddev_pop.is_nan(),
-        "naive reference over NaN input must be NaN"
-    );
-
-    for func in ["stddev", "var", "stddev_pop", "var_pop"] {
-        let got = scalar_f64(
-            &fixture,
-            &tenant,
-            &format!("SELECT {func}(value) FROM samples"),
-        )
-        .await;
-        assert!(got.is_nan(), "{func} over NaN input must be NaN, got {got}");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// (a) The deciding probe: DataFusion vs a naive reference, bit-for-bit
-// ---------------------------------------------------------------------------
-
-/// The bit-identity a differential gate would require, asserted against a naive
-/// two-pass reference over cancellation-prone, large-magnitude finite data.
-///
-/// It FAILS: DataFusion's Welford accumulator and the naive two-pass reference
-/// produce different f64 bits for every member of the family. That is the
-/// answer to finding sql4-F02's open question -- the family is *not*
-/// reproducible by an independent naive reference, so it shares `avg`'s
-/// disqualifying property and must be REJECTED, not gated.
-///
-/// `#[ignore]`d so the standing suite stays green while this documents the gap.
-/// Run with `--ignored --nocapture` to see the differing bit patterns.
-#[tokio::test]
-#[ignore = "documents sql4-F02: stddev/var are not bit-identical to a naive reference; \
-            the recommended fix is REJECT (see module docs), not to weaken this assertion"]
-async fn stddev_var_family_is_not_bit_identical_to_a_naive_reference() {
-    let tenant = tenant_id("probe");
-    let specs = cancellation_dataset();
-    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
-
-    let values = aggregated_values(&fixture, &tenant).await;
-    let reference = naive_stats(&values);
-
-    let cases = [
-        ("var", reference.var_samp),
-        ("var_pop", reference.var_pop),
-        ("stddev", reference.stddev_samp),
-        ("stddev_pop", reference.stddev_pop),
-    ];
-
-    for (func, want) in cases {
-        let got = scalar_f64(
-            &fixture,
-            &tenant,
-            &format!("SELECT {func}(value) FROM samples"),
-        )
-        .await;
-        assert_eq!(
-            got.to_bits(),
-            want.to_bits(),
-            "{func}: DataFusion {got:?} (bits {:#018x}) vs naive reference {want:?} \
-             (bits {:#018x}) -- a naive reference is not bit-identical, so {func} \
-             cannot be brought under the differential gate and must be rejected",
-            got.to_bits(),
-            want.to_bits(),
+            .await;
+        assert!(
+            result.is_err(),
+            "{func} over NaN input must still be rejected, not executed"
         );
     }
 }
