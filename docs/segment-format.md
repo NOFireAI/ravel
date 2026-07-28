@@ -625,3 +625,217 @@ SERIES_META columns 1-9. The writer edge rules (zero-sample series
 dropped, duplicate ids rejected, empty segment bounds = 0) carry over
 verbatim and extend naturally to histogram series (a histogram series
 with zero samples is dropped the same as a scalar one).
+
+## RSEG v4 amendment (ADR-0018)
+
+Persistent contract, same status as v1, v2, and v3 above. Decision
+record: docs/adrs/0018-l0-l1-compaction.md. Full derivation and phased
+implementation plan: docs/compaction-retention-plan.md. This section is
+normative for v4 objects; the v1, v2, and v3 sections above are
+unchanged and remain normative for v1, v2, and v3 objects respectively.
+Readers dispatch on the trailer `version` field and must accept 1, 2, 3,
+and 4 indefinitely until the v1 retirement path in
+docs/compaction-retention-plan.md lands (docs/consistency-model.md).
+
+v4 is the L0->L1 compaction output format, and a strict superset of the
+real, already-merged v3 (ADR-0017, native histograms): v3's page format,
+page encodings, section kinds, LABEL_DICT/SERIES_IDS grammars, and
+HIST_PAGES grammar are unchanged. v4 adds no new section kind and no new
+page encoding. It changes only two things: SERIES_META's per-series
+columns 3-9 (v3 numbering) become per-*run* columns, because compaction
+never deduplicates at rest -- a series that appears in more than one
+input segment carries every input's samples forward as a separate run,
+preserving each run's original dedup priority tuple
+(`created_unix_ns`, `writer_epoch`, `writer_seq`, in-page index); and the
+Footer gains five additive compaction-provenance fields. Trailer version
+3 was already claimed by ADR-0017's native-histogram writer before this
+compaction format's design landed; version 4 is the resolution recorded
+in docs/compaction-retention-plan.md section 8.
+
+A v4 writer never decodes or re-encodes a sample. TS, VAL, and HIST page
+bytes are already fully framed (6-byte page header, then payload) in the
+input objects the compactor read; `write_v4` copies each run's pages
+verbatim into the output's TS_PAGES/VAL_PAGES/HIST_PAGES sections,
+including HIST_PAGES bytes carried over from v3 histogram inputs, which
+are treated as an opaque per-run blob and never touch the histogram
+encoding described in the v3 section above.
+
+### Trailer and versioning
+
+Trailer layout, `footer_crc32c` computation, and reader protocol steps
+1-4 are unchanged. `version = 4`. `magic` stays `"RSG1"`; a v1/v2/v3-only
+reader that meets a v4 object fails closed with
+`UnsupportedVersion(4)`, checksum-covered exactly as the v2 and v3
+cases. Versions other than 1, 2, 3, 4 are `UnsupportedVersion`.
+
+### Section kinds v4
+
+Unchanged from v3: kinds 1 (LABEL_DICT), 3 (TS_PAGES), 4 (VAL_PAGES), 5
+(SERIES_IDS), 7 (HIST_PAGES) carry the same content and comp policy as
+v3; kind 6 (SERIES_META) carries the v4 grammar below instead of v3's.
+Kind 2 (SERIES_TABLE) is still never emitted. Mandatory kinds, physical
+section order (1, 5, 6, 3, 4, 7), VAL_PAGES 8-byte alignment, and
+HIST_PAGES's lack of an alignment requirement are all unchanged from v3.
+Footer validation additions from v3 (SERIES_IDS/SERIES_META/footer count
+equality; scalar-kind and histogram-kind series counts against
+`val_page_len`/`hist_page_len` nonzero counts) carry over unchanged; v4
+does not relax any of them, it only adds the run dimension underneath
+`value_kind`.
+
+### SERIES_META in v4
+
+v3's schema preamble (`count`, `schema_count`, schemas) is unchanged,
+verbatim. Immediately after the schemas, v4 inserts one new fixed field,
+`run_total: u32` (little-endian, same width and placement style as
+`count`/`schema_count`), then 16 column blocks, in exactly this order,
+each framed with the same `block_len: varint` prefix as v2/v3:
+
+```
+count: u32
+schema_count: u32
+schema_count schemas                      (unchanged from v2/v3)
+run_total: u32                            (new: total runs, all series)
+
+ 1 schema_ref:         series-major, count * varint
+ 2 value_ord:          series-major, unchanged shape from v2/v3
+ 3 value_kind:         series-major, count * u8   (0 = VAL_SCALAR,
+                        1 = HIST_SPANS; fixed for a series' whole run
+                        list, same rule as v3)
+ 4 run_count:          series-major, count * varint (> 0; a series
+                        surviving to this point always has >= 1 run)
+ 5 run_created_delta:  run-major, run_total * varint
+                        (run.created_unix_ns - footer.base_created_unix_ns)
+ 6 run_epoch:          run-major, run_total * varint (run.writer_epoch)
+ 7 run_seq:            run-major, run_total * varint (run.writer_seq)
+ 8 run_sample_count:   run-major, run_total * varint (> 0)
+ 9 run_min_ts_delta:   run-major, run_total * varint
+                        (run.min_ts_ns - footer.min_event_ts_ns)
+10 run_ts_span:        run-major, run_total * varint
+                        (run.max_ts_ns - run.min_ts_ns)
+11 ts_page_gap:        run-major, run_total * varint (always 0: TS pages
+                        are never alignment-padded, same as v1/v2/v3)
+12 ts_page_len:        run-major, run_total * varint
+13 val_page_gap:       run-major, run_total * varint (0 for HIST_SPANS
+                        runs)
+14 val_page_len:       run-major, run_total * varint (0 for HIST_SPANS
+                        runs)
+15 hist_page_gap:      run-major, run_total * varint (always 0, same as
+                        v3)
+16 hist_page_len:      run-major, run_total * varint (0 for VAL_SCALAR
+                        runs)
+```
+
+"Series-major" means one entry per series, positionally matching
+SERIES_IDS exactly as v1/v2/v3. "Run-major" means one entry per run,
+runs ordered first by series (ascending series id), then within a
+series by ascending `(created_unix_ns, writer_epoch, writer_seq)`; block
+4 (`run_count`) is what lets a reader locate which contiguous run-major
+slice belongs to which series, by running total over `run_count` the
+same way v1 readers locate a series' labels by running total over
+`name_count`.
+
+Semantics and validation, on top of v2/v3's (all violations Corrupted,
+never panics):
+
+- `run_total` MUST equal the sum of `run_count` over all series; a
+  mismatch is Corrupted (`SeriesCountMismatch`'s run-major counterpart).
+- Every `run_count[i]` MUST be `> 0`. A series with zero runs must not
+  appear in SERIES_IDS at all (the writer drops it, the same "zero-
+  sample series dropped" principle v1 established for scalar samples,
+  now applied at run granularity: a run with `sample_count == 0` is
+  dropped first, and a series left with no runs afterward is dropped
+  entirely).
+- `value_kind[i]` fixes the kind for every run belonging to series `i`.
+  A histogram-kind series' runs all have `val_page_gap`/`val_page_len ==
+  0` and non-zero `hist_page_len`; a scalar-kind series' runs are the
+  mirror image. Violating either is Corrupted, same rule as v3 applied
+  per-run instead of per-series.
+- `run_created_delta` reconstructs as `created_unix_ns =
+  footer.base_created_unix_ns + run_created_delta`, non-negative by
+  writer construction (the footer field is the minimum over all runs),
+  overflow-checked i64 arithmetic.
+- `run_min_ts_delta`/`run_ts_span` reconstruct a run's timestamp bounds
+  exactly as v1/v2/v3 reconstruct a series' bounds, but per run:
+  `min_ts_ns = footer.min_event_ts_ns + run_min_ts_delta`, `max_ts_ns =
+  min_ts_ns + run_ts_span`.
+- Page locations reconstruct per run, independently for TS
+  (blocks 11/12), VAL (blocks 13/14), and HIST (blocks 15/16), using the
+  same running-sum rule as v1/v2/v3: `offset_0 = gap_0; offset_i =
+  end_{i-1} + gap_i; end_i = offset_i + len_i`, overflow-checked, `end_i
+  <=` the owning section's `len`. Unlike v1/v2/v3, the running sum is
+  over runs, not series -- a series with more than one run has more than
+  one TS/VAL(or HIST) page, one per run, back to back in run order.
+- Each of the 16 blocks must consume exactly its `block_len` and contain
+  exactly its declared element count (`count` for blocks 1-4, `run_total`
+  for blocks 5-16); the last block (16) must end exactly at SERIES_META's
+  uncompressed end. Trailing bytes anywhere are Corrupted.
+- Pre-allocation from `run_total` and every `block_len` is capped by
+  remaining input size, the same discipline as every existing
+  count/length field.
+
+Readers that only need per-series identity (schema, labels, value_kind)
+parse blocks 1-4 and can skip blocks 5-16 wholesale via their
+`block_len` prefixes, at zero cost, the same lazy-skip property v2/v3
+already give.
+
+### Footer additive fields, v4
+
+`proto/ravel/segment.proto`'s `Footer` message gains five fields,
+additive only, field numbers 13-17, following the existing pattern of
+v2's SERIES_IDS/SERIES_META section kinds:
+
+```
+sfixed64 base_created_unix_ns = 13;  // min created_unix_ns over all runs
+uint32   ingest_hour_bucket   = 14;  // caller-supplied
+bytes    input_set_hash       = 15;  // caller-supplied
+uint32   part_index           = 16;  // caller-supplied
+uint32   level                = 17;  // caller-supplied
+```
+
+All five are zero (or empty, for `input_set_hash`) and unused on v1, v2,
+and v3 objects; v1/v2/v3 writers never populate them. `base_created_unix_ns`
+is the only one of the five the writer derives itself (as the minimum
+`created_unix_ns` across every run in the segment, the same way
+`min_event_ts_ns` is derived from run bounds rather than taken from the
+caller); the other four are opaque compaction provenance the caller
+(the compactor) supplies and `write_v4` passes through unchanged.
+`proto/ravel/commit.proto`'s `CommitRecord.segment_format_version` (field
+17, `uint32`, already wide enough) stamps `4` for v4 writes.
+
+### Checksum coverage, v4
+
+Every byte a v4 reader interprets is covered exactly as strictly as the
+corresponding v1/v2/v3 bytes: `footer_crc32c` covers the trailer
+(including the version byte) and FooterProto, including the five new
+Footer fields; SERIES_META's `run_total` field and all 16 column blocks
+ride the section's existing `Section.crc32c`, verified before any
+column (old or new) is decoded, identical to how v3 added its three
+histogram blocks under the same crc v1/v2 already used; TS_PAGES,
+VAL_PAGES, and HIST_PAGES pages copied verbatim from input runs keep
+their original per-page crc unchanged (the crc binds `series_id || enc
+|| comp || payload`, none of which a verbatim copy alters), and that crc
+is re-verified by the v4 writer's caller before the copy the same as any
+other page read, never re-derived by `write_v4` itself. No checksum is
+weakened, removed, or moved.
+
+### Unchanged in v4
+
+Page format, all three page encodings and HIST_SPANS, the raw-fallback
+rule, sample ordering and stable-sort duplicate semantics within a run,
+footer/trailer mechanics apart from `version` and the five new additive
+fields, the suffix-read protocol, section crc mechanics, reader resource
+caps, whole-object blake3 in the commit record, the object key layout,
+series identity, LABEL_DICT/SERIES_IDS grammars, VAL_RAW_F64 page
+alignment, HIST_PAGES grammar, and SERIES_META blocks 1-2 (schema_ref,
+value_ord). The writer edge rules (zero-sample run dropped, a series
+left with zero runs dropped, duplicate series ids rejected, empty
+segment bounds = 0) carry over and extend naturally to run granularity.
+
+Reader support for v4 (quad-version dispatch) and a `ravel-cli` inspector
+update are out of scope for this amendment and tracked separately
+(docs/compaction-retention-plan.md, ticket P3); until that reader lands,
+v4 objects can only be produced, not consumed, by this crate. This is a
+deliberate, visible gap, not a silent one: no reader in this crate
+claims to accept `version = 4` today, so a v4 object reaching an
+unpatched reader fails closed with `UnsupportedVersion(4)` rather than
+being silently misread as v3.
