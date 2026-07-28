@@ -39,6 +39,14 @@ pub enum WriteError {
     /// reproduces the same collision.
     #[error("series id collision: {0}")]
     SeriesIdCollision(String),
+    /// Two points in one shard buffer carried the same `series_id` but one
+    /// was scalar and the other was a histogram: a series is one value kind
+    /// for its whole life in a segment (`value_kind`, docs/rseg-v3-plan.md
+    /// section 3.4). The batch is rejected fail-loud rather than silently
+    /// picking one kind and dropping the other's points. Not retryable:
+    /// identical input reproduces the same mismatch.
+    #[error("series value-kind mismatch: {0}")]
+    SeriesValueKindMismatch(String),
 }
 
 impl WriteError {
@@ -65,6 +73,11 @@ mod tests {
     #[test]
     fn series_id_collision_is_not_retryable() {
         assert!(!WriteError::SeriesIdCollision("collision".into()).is_retryable());
+    }
+
+    #[test]
+    fn series_value_kind_mismatch_is_not_retryable() {
+        assert!(!WriteError::SeriesValueKindMismatch("mismatch".into()).is_retryable());
     }
 
     #[test]
