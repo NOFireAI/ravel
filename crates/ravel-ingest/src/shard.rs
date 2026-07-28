@@ -180,9 +180,24 @@ impl ShardActor {
     }
 
     pub(crate) async fn run(mut self) {
-        let mut ticker = tokio::time::interval(self.config.flush_tick);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The flush-tick cadence runs on the injected `Clock`, not the tokio
+        // timer, so age-based flush timing shares the one clock the age check
+        // itself reads (docs/ingest.md "Shard actor"; finding a8-F04). A test
+        // that advances the injected clock past `max_flush_delay` therefore
+        // drives a flush tick deterministically, with no real sleep.
+        //
+        // `next_tick_ns` is the next tick deadline in injected-clock
+        // nanoseconds, recomputed after every tick. Anchoring the deadline
+        // rather than restarting a relative sleep each loop iteration keeps
+        // the cadence fixed under a burst of writes: a busy shard cannot
+        // starve the age check of a quiet tenant sharing the actor, matching
+        // the old `tokio::time::interval` with `MissedTickBehavior::Delay`.
+        let clock = Arc::clone(&self.clock);
+        let flush_tick_ns = i64::try_from(self.config.flush_tick.as_nanos()).unwrap_or(i64::MAX);
+        let mut next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
         loop {
+            let until_ns = next_tick_ns.saturating_sub(clock.now_ns()).max(0);
+            let until = Duration::from_nanos(u64::try_from(until_ns).unwrap_or(u64::MAX));
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
@@ -225,8 +240,9 @@ impl ShardActor {
                         }
                     }
                 }
-                _ = ticker.tick() => {
+                _ = clock.sleep(until) => {
                     self.flush_aged().await;
+                    next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
                 }
             }
         }

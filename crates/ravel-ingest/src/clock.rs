@@ -4,21 +4,44 @@
 //! clock read goes through this trait so tests can pin, replay, and advance
 //! time across retries and hour boundaries.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub trait Clock: Send + Sync + 'static {
     /// Current time as unix nanoseconds.
     fn now_ns(&self) -> i64;
+
+    /// A future that completes once `dur` of this clock's time has elapsed.
+    ///
+    /// The default implementation sleeps on the real tokio timer, which is
+    /// correct for a wall-clock [`SystemClock`]. A deterministic test clock
+    /// overrides this to complete the future once the test advances the
+    /// injected clock past the deadline. Routing the shard actor's flush tick
+    /// through this method (crate `shard.rs`) puts the age-based flush cadence
+    /// on the same injected clock as the age check itself, so a test can drive
+    /// a flush tick deterministically by advancing the clock, with no
+    /// wall-clock sleep (finding a8-F04).
+    fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(dur))
+    }
 }
 
 impl<C: Clock + ?Sized> Clock for Arc<C> {
     fn now_ns(&self) -> i64 {
         (**self).now_ns()
     }
+
+    // Forward to the inner clock so an `Arc<dyn Clock>` (how the shard actor
+    // and router hold it) uses that clock's own `sleep`, not the default.
+    fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        (**self).sleep(dur)
+    }
 }
 
-/// Production clock backed by the OS wall clock.
+/// Production clock backed by the OS wall clock. Uses the default real-timer
+/// [`Clock::sleep`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 
