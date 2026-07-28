@@ -23,7 +23,9 @@
 //!   replaced here, so a `CREATE EXTERNAL TABLE`/`COPY` that somehow slipped
 //!   the parse gate has nothing to bind to. `RsegScanExec` does its own I/O
 //!   through `SegmentFetcher` and never consults this registry.
-//! - The `avg` UDAF is deregistered, backstopping the subset check in
+//! - The `avg` UDAF and the stddev/variance family (`stddev`, `var`,
+//!   `stddev_pop`, `var_pop`, `covar_samp`, `covar_pop`, `corr`, and their
+//!   aliases) are deregistered, backstopping the subset check in
 //!   crate::validate.
 //! - The `range`/`generate_series` table functions are deregistered
 //!   (checkpoint review finding, not in the original design):
@@ -127,6 +129,25 @@ pub fn build_session(
     // form the AST walk missed cannot resolve an avg accumulator here.
     ctx.deregister_udaf("avg");
     ctx.deregister_udaf("mean");
+    // The stddev/variance family shares avg's excluded floating-mean property
+    // (Welford's online algorithm, no bit-identical naive reference); reject in
+    // crate::validate, deregister here so a missed syntactic form cannot
+    // resolve the accumulator. Every registered spelling and alias is removed.
+    for name in [
+        "stddev",
+        "stddev_samp",
+        "stddev_pop",
+        "var",
+        "var_samp",
+        "variance",
+        "var_pop",
+        "covar",
+        "covar_samp",
+        "covar_pop",
+        "corr",
+    ] {
+        ctx.deregister_udaf(name);
+    }
     // `with_default_features()` (inside `new_with_config_rt` above)
     // registers these unconditionally; they generate rows in memory and so
     // are not blocked by `EmptyObjectStoreRegistry`. `samples` must be the

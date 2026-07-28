@@ -36,6 +36,14 @@
 //! cannot execute; the walk exists for the good error message, the
 //! deregistration is the backstop.
 //!
+//! The stddev/variance family (`stddev`, `var`, `stddev_pop`, `var_pop`,
+//! `covar_samp`, `covar_pop`, `corr`, and their aliases) is excluded for the
+//! same reason: DataFusion computes them with Welford's online algorithm, so
+//! no independent naive reference is bit-identical to the accumulator and the
+//! differential gate cannot admit them (docs/reviews/2026-07-28-ravel-sql-\
+//! audit/sql4-validate-error-tenant.md, finding sql4-F02). They are rejected
+//! here and their UDAFs are deregistered in crate::session, mirroring `avg`.
+//!
 //! `min`/`max` are excluded from the v1 subset **only when grouped**
 //! (discovered during the B3 checkpoint review, not in the original plan):
 //! DataFusion's ungrouped min/max accumulator compares with `total_cmp`, but
@@ -58,6 +66,13 @@ use std::ops::ControlFlow;
 
 /// The v1 SQL subset rejects `avg`; the message names the workaround.
 const AVG_MESSAGE: &str = "AVG is not part of the v1 SQL subset; use SUM(x) / COUNT(x) instead \
+     (docs/arrow-datafusion-plan.md section 2 \"Exactness\")";
+
+/// The v1 SQL subset rejects the stddev/variance/covariance/correlation
+/// family; the message names the excluded property, exactly as `avg` does.
+const STDDEV_VAR_MESSAGE: &str = "STDDEV/VARIANCE (and COVAR/CORR) are not part of the v1 SQL \
+     subset: DataFusion computes them with Welford's online algorithm and no naive reference is \
+     bit-identical to it, the same floating-mean property that excludes AVG \
      (docs/arrow-datafusion-plan.md section 2 \"Exactness\")";
 
 /// The v1 SQL subset rejects `min`/`max` combined with `GROUP BY`.
@@ -102,6 +117,11 @@ pub enum ValidationError {
     /// `avg` is outside the v1 subset.
     #[error("{AVG_MESSAGE}")]
     AvgUnsupported,
+
+    /// The stddev/variance/covariance/correlation family is outside the v1
+    /// subset.
+    #[error("{STDDEV_VAR_MESSAGE}")]
+    StddevVarUnsupported,
 
     /// `min`/`max` combined with `GROUP BY` is outside the v1 subset.
     #[error("{GROUPED_MIN_MAX_MESSAGE}")]
@@ -148,6 +168,7 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
 
     reject_writes_in_query(query)?;
     reject_avg(query)?;
+    reject_stddev_var(query)?;
     reject_grouped_min_max(query)?;
     Ok(())
 }
@@ -296,6 +317,74 @@ impl Visitor for AvgFinder {
             // expressions from `pre_visit_expr` on the enclosing call in
             // every version; walk them explicitly so `sum(avg(x))`-shaped
             // nesting cannot hide an avg.
+            if let FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    let inner = match arg {
+                        FunctionArg::Named { arg, .. }
+                        | FunctionArg::ExprNamed { arg, .. }
+                        | FunctionArg::Unnamed(arg) => arg,
+                    };
+                    if let FunctionArgExpr::Expr(inner) = inner
+                        && inner.visit(self).is_break()
+                    {
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether `bare` names a member of the excluded stddev/variance family,
+/// including DataFusion's registered aliases (`variance`, the `_samp`
+/// spellings, `covar`).
+fn is_stddev_var_family(bare: &str) -> bool {
+    matches!(
+        bare,
+        "stddev"
+            | "stddev_samp"
+            | "stddev_pop"
+            | "var"
+            | "var_samp"
+            | "variance"
+            | "var_pop"
+            | "covar"
+            | "covar_samp"
+            | "covar_pop"
+            | "corr"
+    )
+}
+
+/// Reject the stddev/variance/covariance/correlation family anywhere in the
+/// query, including inside subqueries and nested function arguments. These
+/// share `avg`'s excluded floating-mean property (Welford's online algorithm
+/// has no bit-identical naive reference), so they are handled exactly like
+/// `avg`: rejected here, and deregistered as a backstop in crate::session.
+fn reject_stddev_var(query: &Query) -> Result<(), ValidationError> {
+    let flow = query.visit(&mut StddevVarFinder);
+    if flow.is_break() {
+        return Err(ValidationError::StddevVarUnsupported);
+    }
+    Ok(())
+}
+
+struct StddevVarFinder;
+
+impl Visitor for StddevVarFinder {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+        if let SqlExpr::Function(func) = expr {
+            let name = func.name.to_string().to_ascii_lowercase();
+            // Match the bare name and any schema-qualified spelling
+            // (`public.stddev`), which the planner resolves to the same UDAF.
+            let bare = name.rsplit('.').next().unwrap_or(name.as_str());
+            if is_stddev_var_family(bare) {
+                return ControlFlow::Break(());
+            }
+            // Walk nested call arguments explicitly, as `AvgFinder` does, so a
+            // `sum(stddev(x))`-shaped nesting cannot hide a family member.
             if let FunctionArguments::List(list) = &func.args {
                 for arg in &list.args {
                     let inner = match arg {
@@ -626,6 +715,60 @@ mod tests {
         assert_eq!(
             reject("SELECT max(value) FROM samples HAVING Avg(value) > 1"),
             ValidationError::AvgUnsupported
+        );
+    }
+
+    #[test]
+    fn stddev_and_variance_family_is_rejected() {
+        for func in [
+            "stddev",
+            "stddev_samp",
+            "stddev_pop",
+            "var",
+            "var_samp",
+            "variance",
+            "var_pop",
+        ] {
+            assert_eq!(
+                reject(&format!("SELECT {func}(value) FROM samples")),
+                ValidationError::StddevVarUnsupported,
+                "ungrouped {func} must be rejected"
+            );
+            assert_eq!(
+                reject(&format!(
+                    "SELECT series_id, {func}(value) FROM samples GROUP BY series_id"
+                )),
+                ValidationError::StddevVarUnsupported,
+                "grouped {func} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn covariance_and_correlation_are_rejected() {
+        for func in ["covar_samp", "covar_pop", "corr"] {
+            assert_eq!(
+                reject(&format!("SELECT {func}(value, value) FROM samples")),
+                ValidationError::StddevVarUnsupported,
+                "{func} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn stddev_var_is_rejected_in_a_subquery_and_case_insensitively() {
+        assert_eq!(
+            reject("SELECT s FROM (SELECT STDDEV(value) AS s FROM samples)"),
+            ValidationError::StddevVarUnsupported
+        );
+        assert_eq!(
+            reject("SELECT sum(value) FROM samples HAVING Var_Pop(value) > 1"),
+            ValidationError::StddevVarUnsupported
+        );
+        // Nested inside another call, as `sum(stddev(x))`.
+        assert_eq!(
+            reject("SELECT sum(stddev(value)) FROM samples"),
+            ValidationError::StddevVarUnsupported
         );
     }
 
