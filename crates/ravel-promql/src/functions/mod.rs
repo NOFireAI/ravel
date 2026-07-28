@@ -12,8 +12,11 @@
 //! `const` arrays with no allocation or dynamic dispatch.
 
 mod histogram_classic;
+mod label;
 mod over_time;
 mod rate;
+mod time;
+mod transform;
 
 use ravel_types::{LabelSet, Sample};
 
@@ -30,10 +33,19 @@ pub(crate) struct FunctionDef {
     pub(crate) kind: FunctionKind,
 }
 
-/// A function's evaluation shape. Every P4 function is `RangeVector`
-/// (`f(v range-vector) -> instant-vector`, reduced from one series' matrix
-/// window per step) except `predict_linear`, which additionally takes a
-/// scalar (`RangeVectorScalar`).
+/// A function's evaluation shape.
+///
+/// * `RangeVector`/`RangeVectorScalar` (P4): `f(v range-vector) ->
+///   instant-vector`, reduced from one series' matrix window per step
+///   (`predict_linear` additionally takes a scalar).
+/// * `VectorMap` (P6): `f(v instant-vector) -> instant-vector`, the whole
+///   evaluated argument vector in, a whole vector out (elementwise math,
+///   `sort`/`sort_desc`, `timestamp`). No other arguments.
+/// * `Instant` (P6): every other shape (extra scalar/string arguments,
+///   optional arguments, zero vector arguments, or access to the call's own
+///   AST for argument introspection like `absent`). Given the evaluator and
+///   full call context directly so each function evaluates its own
+///   arguments however its shape requires.
 #[derive(Clone, Copy)]
 pub(crate) enum FunctionKind {
     RangeVector(fn(&[Sample], RangeWindow) -> Option<f64>),
@@ -62,7 +74,29 @@ pub(crate) enum FunctionKind {
     /// function pointer; `eval_call`/`eval_range_call` special-case it
     /// directly.
     AbsentOverTime,
+    /// `f(v instant-vector) -> instant-vector`: the whole evaluated
+    /// argument vector in, a whole vector out (elementwise math,
+    /// `sort`/`sort_desc`, `timestamp`). No other arguments (P6).
+    VectorMap(fn(InstantVector) -> InstantVector),
+    /// Every other shape (extra scalar/string arguments, optional
+    /// arguments, zero vector arguments, or access to the call's own AST
+    /// for argument introspection like `absent`). Given the evaluator and
+    /// full call context directly so each function evaluates its own
+    /// arguments however its shape requires (P6).
+    Instant(InstantFn),
 }
+
+/// An [`FunctionKind::Instant`] function: given the evaluator and full call
+/// context, evaluates its own arguments and produces a [`Value`] however its
+/// shape requires (factored out of the enum variant purely to keep the type
+/// short enough for clippy's `type_complexity` lint).
+pub(crate) type InstantFn = fn(
+    &Evaluator,
+    &dyn SeriesSource,
+    &promql_parser::parser::Call,
+    i64,
+    &QueryWindow,
+) -> Result<Value, Error>;
 
 /// The window bounds a range-vector function needs beyond the raw samples:
 /// the left-open window's exclusive start and inclusive end (matching
@@ -84,6 +118,9 @@ const FAMILIES: &[&[FunctionDef]] = &[
     rate::FUNCTIONS,
     histogram_classic::FUNCTIONS,
     over_time::FUNCTIONS,
+    transform::FUNCTIONS,
+    label::FUNCTIONS,
+    time::FUNCTIONS,
 ];
 
 fn lookup(name: &str) -> Option<FunctionDef> {
@@ -161,6 +198,11 @@ pub(crate) fn eval_call(
                 &ms.vs, matrix, eval_ts_ns,
             )))
         }
+        FunctionKind::VectorMap(f) => {
+            let v = vector_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
+            Ok(Value::Vector(f(v)))
+        }
+        FunctionKind::Instant(f) => f(evaluator, source, call, eval_ts_ns, ctx),
     }
 }
 
@@ -284,6 +326,90 @@ pub(crate) fn eval_range_call(
             let ms = matrix_arg(&call.args.args[0])?;
             over_time::absent_over_time_range(evaluator, source, ms, start_ns, end_ns, step_ns, ctx)
         }
+        FunctionKind::VectorMap(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+            let v = vector_arg(evaluator, source, &call.args.args[0], t, ctx)?;
+            Ok(Value::Vector(f(v)))
+        }),
+        FunctionKind::Instant(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+            f(evaluator, source, call, t, ctx)
+        }),
+    }
+}
+
+/// Evaluate an [`FunctionKind::VectorMap`] or [`FunctionKind::Instant`]
+/// function over a range query's grid by calling `step_fn` once per
+/// timestamp and merging each step's `Value` into a matrix, exactly the
+/// generalization Prometheus itself applies to instant-only function
+/// expressions inside a range query: evaluate the whole expression fresh at
+/// every grid point and stitch the per-step instant vectors (or the single
+/// no-label series a per-step scalar becomes) into one range matrix by label
+/// set. Kept local to this module (not a method on `Evaluator`) since this
+/// generalization applies uniformly to every [`FunctionKind::VectorMap`]/
+/// [`FunctionKind::Instant`] function without needing anything from
+/// `eval.rs`'s own selector/matrix machinery beyond the `Value` it already
+/// returns.
+fn eval_instant_over_grid(
+    start_ns: i64,
+    end_ns: i64,
+    step_ns: i64,
+    mut step_fn: impl FnMut(i64) -> Result<Value, Error>,
+) -> Result<RangeMatrix, Error> {
+    let mut series: Vec<(LabelSet, Vec<Sample>)> = Vec::new();
+    let mut t = start_ns;
+    while t <= end_ns {
+        match step_fn(t)? {
+            Value::Vector(v) => {
+                for s in v {
+                    match series.iter_mut().find(|(labels, _)| *labels == s.labels) {
+                        Some((_, samples)) => samples.push(Sample {
+                            ts_ns: t,
+                            value: s.value,
+                        }),
+                        None => series.push((
+                            s.labels,
+                            vec![Sample {
+                                ts_ns: t,
+                                value: s.value,
+                            }],
+                        )),
+                    }
+                }
+            }
+            Value::Scalar(x) => {
+                let labels = LabelSet::default();
+                match series.iter_mut().find(|(l, _)| *l == labels) {
+                    Some((_, samples)) => samples.push(Sample { ts_ns: t, value: x }),
+                    None => series.push((labels, vec![Sample { ts_ns: t, value: x }])),
+                }
+            }
+            other => {
+                return Err(Error::WrongType {
+                    expected: "instant vector or scalar",
+                    got: other.type_name(),
+                });
+            }
+        }
+        t = t.checked_add(step_ns).ok_or(Error::TimeOverflow)?;
+    }
+    Ok(series)
+}
+
+/// Evaluate a function argument known (by promql-parser's parse-time type
+/// check) to be String-typed (a quoted literal; promql-parser rejects any
+/// other String-typed expression at parse time).
+pub(crate) fn string_arg(
+    evaluator: &Evaluator,
+    source: &dyn SeriesSource,
+    expr: &promql_parser::parser::Expr,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> Result<String, Error> {
+    match evaluator.eval_expr(source, expr, eval_ts_ns, ctx)? {
+        Value::String(s) => Ok(s),
+        other => Err(Error::WrongType {
+            expected: "string",
+            got: other.type_name(),
+        }),
     }
 }
 
@@ -384,6 +510,7 @@ fn to_instant_vector(groups: Vec<(LabelSet, f64)>, eval_ts_ns: i64) -> InstantVe
         .map(|(labels, value)| InstantSample {
             labels,
             ts_ns: eval_ts_ns,
+            orig_sample_ts_ns: eval_ts_ns,
             value,
         })
         .collect()
@@ -401,9 +528,10 @@ fn apply_reduce(
     let mut out = Vec::with_capacity(matrix.len());
     for (labels, samples) in matrix {
         if let Some(value) = reduce(&samples) {
-            out.push(crate::eval::InstantSample {
+            out.push(InstantSample {
                 labels: drop_metric_name(labels),
                 ts_ns: eval_ts_ns,
+                orig_sample_ts_ns: eval_ts_ns,
                 value,
             });
         }

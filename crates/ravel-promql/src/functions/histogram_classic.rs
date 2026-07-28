@@ -280,6 +280,7 @@ mod tests {
         crate::eval::InstantSample {
             labels: label_set(labels),
             ts_ns: 0,
+            orig_sample_ts_ns: 0,
             value,
         }
     }
