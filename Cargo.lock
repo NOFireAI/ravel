@@ -3664,6 +3664,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-analytics"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ravel-bench"
 version = "0.1.0"
 dependencies = [
