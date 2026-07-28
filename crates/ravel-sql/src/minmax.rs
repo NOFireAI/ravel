@@ -255,11 +255,14 @@ impl TotalOrderAccumulator {
         } else {
             cast(array, &DataType::Float64)?
         };
-        let float = float.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-            DataFusionError::Internal(
-                "total-order min/max: cast to Float64 did not yield a Float64Array".to_string(),
-            )
-        })?;
+        let float = float
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "total-order min/max: cast to Float64 did not yield a Float64Array".to_string(),
+                )
+            })?;
         for i in 0..float.len() {
             if float.is_valid(i) {
                 self.fold(float.value(i));
