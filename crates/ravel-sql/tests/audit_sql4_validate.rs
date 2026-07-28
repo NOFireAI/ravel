@@ -12,36 +12,35 @@
 
 #![allow(clippy::expect_used)]
 
-use ravel_sql::{ValidationError, validate};
+use ravel_sql::validate;
 
-/// sql4-F01 (S2): a grouped `MIN`/`MAX` that appears only in a query-level
-/// `ORDER BY` escapes `reject_grouped_min_max`. The walk tracks "is the
-/// innermost SELECT grouped?" on a stack that is pushed in `pre_visit_select`
-/// and popped in `post_visit_select`; the query-level `ORDER BY` is visited
-/// *after* the SELECT has been popped, so the stack is empty and the
-/// `min`/`max` call is not rejected. DataFusion still binds the aggregate to
-/// the grouped hash accumulator, which the crate's own docs
-/// (crates/ravel-sql/src/validate.rs:38) say returns a wrong extreme for NaN,
-/// signed zero, or all-infinite groups. Unlike `avg`, grouped min/max has no
-/// session-level backstop, so this walk is the only guard.
+/// sql4-F01 (S2), resolved by ADR-0023: a grouped `MIN`/`MAX` reachable only
+/// through a query-level `ORDER BY` (a field of `Query`, not `Select`) once
+/// escaped the `reject_grouped_min_max` walk (issue #159), reaching the
+/// grouped hash accumulator the rejection existed to avoid. Rather than keep
+/// patching a syntactic walk, ADR-0023 removed the rejection entirely and made
+/// grouped MIN/MAX correct: crate::session registers a total-order MIN/MAX
+/// UDAF that uses `f64::total_cmp` for grouped and ungrouped execution alike,
+/// so the accumulator is no longer wrong for NaN, signed zero, or all-infinite
+/// groups. The guard moved from a fragile walk to a structural registry
+/// replacement, the same shift the `avg` deregistration backstop already made.
 ///
-/// Expected (post-fix): rejected with `GroupedMinMaxUnsupported`, exactly as
-/// the `HAVING max(value)` case already is. Fails today: `validate` returns
-/// `Ok(())`.
+/// This reproducer therefore converts from "must be rejected" to "must be
+/// accepted". The correctness half -- that these exact shapes now execute to
+/// the right results -- lives in the differential gate, which needs a
+/// DataFusion session this validate-only file deliberately avoids:
+/// `differential.rs::grouped_min_max_issue_159_shapes_execute_correctly`
+/// (the `ORDER BY max(value)` and `HAVING min(value)` shapes) and
+/// `golden_grouped_min_max_use_total_order` (the pinned NaN/signed-zero/
+/// infinity bits).
 #[test]
-fn grouped_min_max_in_order_by_must_be_rejected() {
-    assert_eq!(
-        validate("SELECT series_id FROM samples GROUP BY series_id ORDER BY max(value)")
-            .expect_err("grouped max() in ORDER BY must be rejected"),
-        ValidationError::GroupedMinMaxUnsupported,
-    );
-    // Symmetric MIN case, and the same hole reached through arithmetic on the
+fn grouped_min_max_in_order_by_is_now_accepted() {
+    validate("SELECT series_id FROM samples GROUP BY series_id ORDER BY max(value)")
+        .expect("grouped max() in ORDER BY is in the v1 subset (ADR-0023)");
+    // Symmetric MIN case, and the same shape reached through arithmetic on the
     // aggregate rather than a bare call.
-    assert_eq!(
-        validate("SELECT series_id FROM samples GROUP BY series_id ORDER BY min(value) + 1")
-            .expect_err("grouped min() in ORDER BY must be rejected"),
-        ValidationError::GroupedMinMaxUnsupported,
-    );
+    validate("SELECT series_id FROM samples GROUP BY series_id ORDER BY min(value) + 1")
+        .expect("grouped min() in ORDER BY is in the v1 subset (ADR-0023)");
 }
 
 /// sql4-F02 (S2): the exactness-exclusion list rejects `avg`/`mean` (whose

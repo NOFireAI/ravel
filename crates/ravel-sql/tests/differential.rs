@@ -21,30 +21,27 @@
 //!   *true* for NaN and `-0.0 < 0.0` is *true*. A reference using Rust's `>`
 //!   would disagree on every NaN row. [`Pred::eval`] uses `total_cmp`.
 //!
-//! - **min/max have two different implementations**, chosen by whether the
-//!   query has a GROUP BY, and only one of them is in the v1 subset:
-//!   - No GROUP BY: `AggregateExec` takes the `AggregateStream` path, whose
-//!     `MinAccumulator`/`MaxAccumulator` call arrow's `min`/`max` kernels and
-//!     combine partials with `f64::total_cmp`. Result: a true total order,
-//!     where negative NaN is the minimum and positive NaN the maximum, and
-//!     -0.0 < 0.0. [`min_total_order`]/[`max_total_order`] implement this
-//!     exactly, and it is the only form the gate exercises.
-//!   - With GROUP BY: `GroupedHashAggregateStream` uses
-//!     `PrimitiveGroupsAccumulator` with `|cur, new| if
-//!     new.partial_cmp(cur) is Some(Less) | None { cur = new }`, seeded with
-//!     `f64::MAX` (min) / `f64::MIN` (max). That is *not* a total order: it
-//!     is order-dependent, NaN latches then releases, `-0.0` never displaces
-//!     `0.0` because they compare `Equal`, and a group whose only value is
-//!     `+Inf` returns the unseeded `f64::MAX` instead of `+Inf` because the
-//!     seed is never displaced. This is a silently wrong answer, not an
-//!     approximation, and it cannot be caught by a differential gate: an
-//!     independent reference for a grouped accumulator is just a second copy
-//!     of the same seed-and-fold algorithm (checkpoint review finding, not
-//!     in the original plan). `min`/`max` combined with `GROUP BY` is
-//!     therefore outside the v1 subset and rejected at validation
-//!     (crate::validate::reject_grouped_min_max), the same way `avg` is;
-//!     `grouped_min_max_is_rejected_before_planning` below tests the
-//!     rejection, not the accumulator.
+//! - **min/max use one total-order implementation** for floating point,
+//!   grouped and ungrouped alike (ADR-0023). DataFusion's built-ins disagree
+//!   between the two paths: the ungrouped `MinAccumulator`/`MaxAccumulator`
+//!   combine with `f64::total_cmp` (negative NaN is the minimum, positive NaN
+//!   the maximum, -0.0 < 0.0), but the grouped `PrimitiveGroupsAccumulator`
+//!   folds `partial_cmp` from an `f64::MAX`/`f64::MIN` seed, which is
+//!   order-dependent, lets a NaN poison later comparisons, treats `-0.0` and
+//!   `0.0` as `Equal`, and returns the unseeded `f64::MAX`/`f64::MIN` for an
+//!   all-infinite group. crate::session replaces both built-ins with a
+//!   total-order UDAF (crate::minmax) that uses `f64::total_cmp` everywhere,
+//!   so grouped and ungrouped MIN/MAX over the same multiset agree bit for
+//!   bit. Defining the semantics as a total order is what makes an
+//!   *independent* scalar reference possible: [`min_total_order`] and
+//!   [`max_total_order`] implement that order once, and the gate applies them
+//!   both ungrouped (over the whole selection) and per group. This is the
+//!   grouped differential gate the interim design (issue #143) called
+//!   impossible while the semantics were only the accumulator's fold order.
+//!   Non-float MIN/MAX (for example `min(ts)` over a Timestamp column)
+//!   delegate to the built-in, whose `partial_cmp` is already total there;
+//!   [`golden_grouped_min_max_over_ts_delegates`] pins that path against an
+//!   integer reference fold.
 //!
 //! - **`avg` is out of the v1 subset** and rejected at validation
 //!   (crate::validate), so it never reaches this gate.
@@ -299,10 +296,11 @@ enum Shape {
     Projection { limit: Option<usize> },
     /// `SELECT count(value), min(value), max(value) ...`
     SelectionAggregates,
-    /// `SELECT series_id, count(value) ... GROUP BY series_id ORDER BY
-    /// series_id`. No `min`/`max` here: they are rejected by validation
-    /// when grouped (see `crates/ravel-sql/src/validate.rs`), so this shape
-    /// only exercises grouped `count`.
+    /// `SELECT series_id, count(value), min(value), max(value) ... GROUP BY
+    /// series_id ORDER BY series_id`. Grouped `min`/`max` are in the v1 subset
+    /// (ADR-0023): the total-order UDAF (crate::minmax) makes them agree with
+    /// the ungrouped path bit for bit, so the per-group reference folds
+    /// [`min_total_order`]/[`max_total_order`] are an independent oracle.
     GroupedSelectionAggregates,
     /// `SELECT sum(value) ...`
     Sum,
@@ -332,7 +330,7 @@ impl Query {
                 format!("SELECT count(value), min(value), max(value) FROM samples {where_clause}")
             }
             Shape::GroupedSelectionAggregates => format!(
-                "SELECT series_id, count(value) \
+                "SELECT series_id, count(value), min(value), max(value) \
                  FROM samples {where_clause} GROUP BY series_id ORDER BY series_id"
             ),
             Shape::Sum => format!("SELECT sum(value) FROM samples {where_clause}"),
@@ -367,7 +365,12 @@ impl Query {
             Shape::GroupedSelectionAggregates => group_by_series(&kept)
                 .into_iter()
                 .map(|(sid, values)| {
-                    vec![Cell::Bytes(sid.to_vec()), Cell::Int(values.len() as i64)]
+                    vec![
+                        Cell::Bytes(sid.to_vec()),
+                        Cell::Int(values.len() as i64),
+                        optional_float(min_total_order(&values)),
+                        optional_float(max_total_order(&values)),
+                    ]
                 })
                 .collect(),
             Shape::Sum => {
@@ -515,6 +518,25 @@ fn arb_dataset(value: ValuePool) -> impl Strategy<Value = Vec<SegSpec>> {
     })
 }
 
+/// A dataset that collapses to exactly one series (one group): every segment
+/// carries a single series under the same metric, drawn from the full float
+/// edge-case pool. Used to assert grouped and ungrouped MIN/MAX agree bit for
+/// bit (ADR-0023 decision 1).
+fn arb_single_group_dataset() -> impl Strategy<Value = Vec<SegSpec>> {
+    let samples = prop::collection::vec((0i64..6, interesting_value()), 1..8);
+    let segment = (0i64..4, 1u64..3, 1u64..3, samples).prop_map(
+        |(created_unix_ns, writer_epoch, writer_seq, samples)| {
+            SegSpec::new(
+                created_unix_ns,
+                writer_epoch,
+                writer_seq,
+                vec![SeriesSpec::new("solo", samples)],
+            )
+        },
+    );
+    prop::collection::vec(segment, 1..4)
+}
+
 fn arb_pred() -> impl Strategy<Value = Pred> {
     let leaf = prop_oneof![
         Just(Pred::True),
@@ -601,6 +623,39 @@ proptest! {
                 Query { shape: Shape::SelectionAggregates, pred },
             ];
             assert_all(&fixture, &tenant, &queries).await;
+        });
+    }
+
+    /// ADR-0023 decision 1: grouped and ungrouped MIN/MAX over the same
+    /// multiset agree bit for bit. On a single-group dataset the grouped query
+    /// returns one `[min, max]` row that must equal the ungrouped one over the
+    /// full float edge-case pool (NaN payloads of both signs, both infinities,
+    /// signed zeros, denormals). Ungrouped MIN/MAX is itself gated against the
+    /// independent reference above, so agreement here ties the grouped path to
+    /// the same total-order oracle.
+    #[test]
+    fn grouped_and_ungrouped_min_max_agree_bit_for_bit(
+        specs in arb_single_group_dataset(),
+    ) {
+        block_on(async move {
+            let tenant = tenant_id("gate");
+            let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+            let grouped = scalar(
+                &fixture,
+                &tenant,
+                "SELECT min(value), max(value) FROM samples GROUP BY series_id",
+            )
+            .await;
+            let ungrouped = scalar(
+                &fixture,
+                &tenant,
+                "SELECT min(value), max(value) FROM samples",
+            )
+            .await;
+            assert_eq!(
+                grouped, ungrouped,
+                "grouped and ungrouped min/max must agree bit for bit"
+            );
         });
     }
 }
@@ -759,47 +814,203 @@ async fn golden_ungrouped_min_max_use_total_order_nan_semantics() {
     );
 }
 
-/// Grouped min/max are rejected before planning (checkpoint review finding,
-/// not in the original plan): DataFusion's grouped accumulator folds
-/// `partial_cmp` from an `f64::MAX`/`f64::MIN` seed rather than using a total
-/// order. A NaN in the group latches the running value so every later
-/// comparison is also `None` and the accumulator just takes the newest row;
-/// `-0.0`/`0.0` compare `Equal` so the first one seen wins, disagreeing with
-/// the ungrouped, `total_cmp`-based accumulator; and a group whose only
-/// value is `+Inf`/`-Inf` never displaces the seed, so `min`/`max` returns
-/// `f64::MAX`/`f64::MIN` instead of the actual value. None of that is
-/// reachable through this endpoint: `crate::validate` rejects `min`/`max`
-/// combined with `GROUP BY` with a typed error before any of it can run.
-/// Ungrouped `min`/`max` are unaffected (see
-/// `golden_ungrouped_min_max_use_total_order_nan_semantics` above) and stay
-/// in the v1 subset.
+/// Grouped MIN/MAX use the `f64::total_cmp` total order (ADR-0023), pinned by
+/// bits against datafusion 54.1.0. Each series is one group, so a grouped
+/// query filtered to that series returns a single `[min, max]` row. The bits
+/// are literal, not derived from the reference folds, so this pins both the
+/// UDAF (crate::minmax) and, transitively, the reference the proptests trust.
+///
+/// The four behaviors the interim rejection existed to avoid (issue #143) are
+/// all correct here, where the old `PrimitiveGroupsAccumulator` was wrong:
+/// a NaN survives as the group's extreme with its payload intact; a NaN plus a
+/// smaller value does not poison MIN; `-0.0`/`0.0` resolve by sign in both
+/// arrival orders; and an all-infinite group returns the infinity, never the
+/// `f64::MAX`/`f64::MIN` seed.
 #[tokio::test]
-async fn grouped_min_max_is_rejected_before_planning() {
+async fn golden_grouped_min_max_use_total_order() {
     let tenant = tenant_id("golden");
     let specs = vec![SegSpec::new(
         1,
         1,
         1,
-        vec![SeriesSpec::new("z", vec![(1, 0.0), (2, -0.0)])],
+        vec![
+            // Positive NaN is above +Inf: it is the MAX and its payload is
+            // preserved.
+            SeriesSpec::new(
+                "nanmax",
+                vec![(1, 1.0), (2, f64::from_bits(NAN_POS)), (3, 2.0)],
+            ),
+            // Negative NaN is below -Inf: it is the MIN, payload preserved.
+            SeriesSpec::new(
+                "nanmin",
+                vec![(1, f64::from_bits(NAN_NEG)), (2, -1.0), (3, 5.0)],
+            ),
+            // NaN first, then a smaller finite value: MIN is the finite value,
+            // not poisoned to NaN or to the newest row.
+            SeriesSpec::new("nanpoison", vec![(1, f64::from_bits(NAN_POS)), (2, -3.0)]),
+            // Signed zero in both arrival orders: MIN is -0.0, MAX is 0.0.
+            SeriesSpec::new("zeropf", vec![(1, 0.0), (2, -0.0)]),
+            SeriesSpec::new("zeronf", vec![(1, -0.0), (2, 0.0)]),
+            // All-infinite groups return the infinity, never the seed.
+            SeriesSpec::new("allpinf", vec![(1, f64::INFINITY), (2, f64::INFINITY)]),
+            SeriesSpec::new(
+                "allninf",
+                vec![(1, f64::NEG_INFINITY), (2, f64::NEG_INFINITY)],
+            ),
+        ],
     )];
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
-    for sql in [
-        "SELECT min(value), max(value) FROM samples GROUP BY series_id",
-        "SELECT min(value) FROM samples GROUP BY series_id",
-        "SELECT series_id, max(value) FROM samples GROUP BY series_id HAVING min(value) > 0",
-    ] {
-        let err = fixture
-            .executor
-            .execute(tenant.hash(), &request(sql))
-            .await
-            .expect_err("grouped min/max must be rejected before planning");
-        let message = err.client_message();
-        assert!(
-            message.contains("MIN/MAX") && message.contains("GROUP BY"),
-            "{sql}: {message}"
+    // (metric, expected MIN cell, expected MAX cell), pinned by bits.
+    let cases = [
+        ("nanmax", Cell::float(1.0), Cell::FloatBits(NAN_POS)),
+        ("nanmin", Cell::FloatBits(NAN_NEG), Cell::float(5.0)),
+        ("nanpoison", Cell::float(-3.0), Cell::FloatBits(NAN_POS)),
+        ("zeropf", Cell::float(-0.0), Cell::float(0.0)),
+        ("zeronf", Cell::float(-0.0), Cell::float(0.0)),
+        (
+            "allpinf",
+            Cell::float(f64::INFINITY),
+            Cell::float(f64::INFINITY),
+        ),
+        (
+            "allninf",
+            Cell::float(f64::NEG_INFINITY),
+            Cell::float(f64::NEG_INFINITY),
+        ),
+    ];
+
+    for (metric, want_min, want_max) in cases {
+        let sql = format!(
+            "SELECT min(value), max(value) FROM samples \
+             WHERE label(labels, '__name__') = '{metric}' GROUP BY series_id"
+        );
+        let row = scalar(&fixture, &tenant, &sql).await;
+        assert_eq!(
+            row,
+            vec![want_min.clone(), want_max.clone()],
+            "grouped min/max for {metric}"
         );
     }
+}
+
+/// The issue #159 shapes: a grouped `min`/`max` reachable only through a
+/// query-level `ORDER BY` (a field of `Query`, not `Select`) and through
+/// `HAVING`. The interim validation walk had a hole for the `ORDER BY` case
+/// (#159) and rejected the `HAVING` case; both now execute to correct results
+/// against a per-group reference fold.
+#[tokio::test]
+async fn grouped_min_max_issue_159_shapes_execute_correctly() {
+    let tenant = tenant_id("golden");
+    let specs = overlap_dataset();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+    let snapshot = fixture.snapshot(&tenant).await;
+    let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
+    let groups = group_by_series(&reference.iter().collect::<Vec<_>>());
+
+    // `GROUP BY ... ORDER BY max(value)`: rows ordered by each group's
+    // total-order max. overlap_dataset's two groups have distinct maxes, so
+    // the order is unambiguous.
+    let mut by_max: Vec<([u8; 16], f64)> = groups
+        .iter()
+        .map(|(sid, values)| (*sid, max_total_order(values).expect("non-empty group")))
+        .collect();
+    by_max.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let want_order_by: Vec<Row> = by_max
+        .iter()
+        .map(|(sid, m)| vec![Cell::Bytes(sid.to_vec()), Cell::float(*m)])
+        .collect();
+    let got_order_by = actual_rows(
+        &fixture
+            .executor
+            .execute(
+                tenant.hash(),
+                &request(
+                    "SELECT series_id, max(value) FROM samples \
+                     GROUP BY series_id ORDER BY max(value)",
+                ),
+            )
+            .await
+            .expect("order by max(value)")
+            .output,
+    );
+    assert_eq!(
+        got_order_by, want_order_by,
+        "GROUP BY ... ORDER BY max(value)"
+    );
+
+    // `HAVING min(value) > 0`: keep only groups whose total-order min is
+    // strictly greater than zero, ordered by series_id.
+    let want_having: Vec<Row> = groups
+        .iter()
+        .filter_map(|(sid, values)| {
+            let min = min_total_order(values).expect("non-empty group");
+            (min.total_cmp(&0.0) == Ordering::Greater)
+                .then(|| vec![Cell::Bytes(sid.to_vec()), Cell::float(min)])
+        })
+        .collect();
+    let got_having = actual_rows(
+        &fixture
+            .executor
+            .execute(
+                tenant.hash(),
+                &request(
+                    "SELECT series_id, min(value) FROM samples \
+                     GROUP BY series_id HAVING min(value) > 0 ORDER BY series_id",
+                ),
+            )
+            .await
+            .expect("having min(value)")
+            .output,
+    );
+    assert_eq!(
+        got_having, want_having,
+        "GROUP BY ... HAVING min(value) > 0"
+    );
+}
+
+/// Non-float grouped MIN/MAX delegate to the built-in accumulator, whose
+/// `partial_cmp` is already a total order for integers. `min(ts)`/`max(ts)`
+/// over the Timestamp column must match an integer reference fold per group
+/// (ADR-0023 decision 4).
+#[tokio::test]
+async fn golden_grouped_min_max_over_ts_delegates() {
+    let tenant = tenant_id("golden");
+    let specs = overlap_dataset();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+    let snapshot = fixture.snapshot(&tenant).await;
+    let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
+
+    let mut groups: BTreeMap<[u8; 16], Vec<i64>> = BTreeMap::new();
+    for row in &reference {
+        groups.entry(row.series_id).or_default().push(row.ts);
+    }
+    let want: Vec<Row> = groups
+        .iter()
+        .map(|(sid, ts)| {
+            vec![
+                Cell::Bytes(sid.to_vec()),
+                Cell::Int(*ts.iter().min().expect("non-empty group")),
+                Cell::Int(*ts.iter().max().expect("non-empty group")),
+            ]
+        })
+        .collect();
+
+    let got = actual_rows(
+        &fixture
+            .executor
+            .execute(
+                tenant.hash(),
+                &request(
+                    "SELECT series_id, min(ts), max(ts) FROM samples \
+                     GROUP BY series_id ORDER BY series_id",
+                ),
+            )
+            .await
+            .expect("min/max over ts")
+            .output,
+    );
+    assert_eq!(got, want, "grouped min/max over ts");
 }
 
 /// `sum` with non-finite input. The properties pinned here are the ones that
