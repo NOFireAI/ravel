@@ -55,222 +55,108 @@ key to feed into `segment inspect` or `commit decode`.
 
 ![RSEG layout](../diagrams/rseg-layout.svg)
 
+Every segment is RSEG v5 (ADR-0027 left it the only version). The command:
+
 ```sh
 cargo run -p ravel-cli -- segment inspect \
-  "t/3f2a.../m/l0/0000/6a9c....rseg"
+  "t/c5c5.../m/l0/0000/6a9c....rseg"
 ```
 
 ```
-total_size: 8421
-trailer_offset: 8405
-version: 1
-footer_offset: 8112
-tenant_hash: 3f2a...
-shard: 0
-writer_id: <uuid>
-writer_epoch: 0
-writer_seq: 0
-min_event_ts_ns: 1732400000000000000
-max_event_ts_ns: 1732400059000000000
-min_ingest_ts_ns: 1732400060000000000
-max_ingest_ts_ns: 1732400060050000000
-sample_count: 120
-series_count (footer): 3
+total_size: 949
+trailer_offset: 933
+version: 5
+footer_offset: 699
+tenant_hash: c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5
+shard: 5
+writer_id: golden-v5-writer
+writer_epoch: 5
+writer_seq: 50
+min_event_ts_ns: 1650000000000000000
+max_event_ts_ns: 1650000000000000758
+min_ingest_ts_ns: -2000
+max_ingest_ts_ns: 30000
+sample_count: 15
+series_count (footer): 9
+base_created_unix_ns: 219
+level: 1
+part_index: 2
 sections:
-  kind=1 offset=0 len=64 uncompressed_len=64 comp=2
-  kind=2 offset=64 len=512 uncompressed_len=512 comp=2
-  kind=3 offset=576 len=1200 uncompressed_len=1200 comp=0
-  kind=4 offset=1776 len=6336 uncompressed_len=6336 comp=0
-series_count (decoded): 3
+  kind=1 name=LABEL_DICT offset=0 len=88 uncompressed_len=89 comp=2
+  kind=5 name=SERIES_IDS offset=88 len=148 uncompressed_len=148 comp=0
+  kind=6 name=SERIES_META offset=236 len=117 uncompressed_len=200 comp=2
+  kind=3 name=TS_PAGES offset=353 len=147 uncompressed_len=147 comp=0
+  kind=4 name=VAL_PAGES offset=504 len=99 uncompressed_len=99 comp=0
+  kind=7 name=HIST_PAGES offset=603 len=96 uncompressed_len=96 comp=0
+schema_count (derived): 1
+  schema[0]: __name__,inst,job
+series_count (decoded): 9
+series:
+  series_id=00000000000000000000000000000000 labels=__name__=golden_v5,inst=i0,job=job0 sample_count=1 min_ts_ns=1650000000000000000 max_ts_ns=1650000000000000000 value_kind=HIST_SPANS run_count=1
+    run[0] created_unix_ns=219 writer_epoch=2 writer_seq=3 sample_count=1 ts_range=[353, 368) hist_range=[603, 635)
+    hist[0]: ts_ns=1650000000000000000 scale=2 zero_threshold=0.000001 sum=0.125 reset_hint=UNKNOWN
+      count_kind=INT zero_count=1 count=4
+      positive: spans=[(0, 2)] counts=[2,1]
+      negative: spans=[] counts=[]
+  series_id=010000000000010000000100000001b3 labels=__name__=golden_v5,inst=i1,job=job1 sample_count=2 min_ts_ns=1650000000000000001 max_ts_ns=1650000000000000751 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=220 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[368, 385) val_range=[504, 522)
+  ... (7 more series)
 ```
 
 Field by field:
 
 - `total_size`, `trailer_offset`, `footer_offset`: byte layout of the
   object. RSEG segments are footer-first-readable: the 16-byte trailer at
-  the very end gives the footer's length and checksum, so a reader only
-  needs one suffix GET to find and validate the footer before fetching
-  anything else.
-- `version`: the trailer format version, `1` here. `ravel-cli` reads RSEG
-  v1, v2, and v3 objects (ADR-0014, ADR-0017); see "`segment inspect`: RSEG
-  v2 objects" and "`segment inspect`: RSEG v3 objects (native histograms)"
-  below for what changes when this reads `2` or `3`.
+  the very end gives the footer's length and checksum, so a reader needs
+  one suffix GET to find and validate the footer before fetching anything
+  else.
+- `version`: the trailer format version, always `5`. A non-5 version (a
+  stray pre-release object) is rejected with a typed error, never
+  half-parsed.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
-  same identity components embedded in the object's key and in its commit
-  token, which is how you confirm a segment and a commit token/record
-  agree on what wrote it.
-- `min/max_event_ts_ns`: the span of sample timestamps inside the segment,
-  as reported by the client.
-- `min/max_ingest_ts_ns`: the span of when this server received those
-  points, always close to `created_unix_ns` below since Phase 1 flushes
-  promptly.
-- `sample_count`, `series_count (footer)`: totals the footer itself
-  claims.
-- `sections`: the four mandatory v1 sections and their byte ranges inside
-  the object. `kind=1` is `LABEL_DICT` (the string table backing every
-  label name/value in this segment), `kind=2` is `SERIES_TABLE` (one entry
-  per series: its label set, sample count, timestamp span, and where its
-  data pages live), `kind=3` is `TS_PAGES` (delta-encoded timestamps),
-  `kind=4` is `VAL_PAGES` (Gorilla-encoded or raw f64 values, whichever is
-  smaller for that series). `comp` is the section's compression as the raw
-  wire integer (`ravel.segment.v1.Compression`: `0` none, `1` lz4, `2`
-  zstd) -- `ravel-cli` prints the field as stored, not the resolved enum
-  name. LABEL_DICT and SERIES_TABLE (v1) or SERIES_META (v2) are zstd by
-  writer policy (`comp=2`); TS_PAGES/VAL_PAGES containers are never
-  compressed as a whole section (`comp=0`), since the pages inside are
-  individually compressed instead.
-- `series_count (decoded)`: series count from actually decoding
-  `LABEL_DICT` + `SERIES_TABLE`, not just trusting the footer's claimed
-  count. Matching `series_count (footer)` means the segment is internally
-  consistent.
+  identity components embedded in the object's key and its commit token, so
+  a segment and a commit token/record can be confirmed to agree on what
+  wrote it.
+- `min/max_event_ts_ns`: the span of sample timestamps inside the segment.
+- `min/max_ingest_ts_ns`: when this server received those points.
+- `base_created_unix_ns`, `level`, `part_index`: compaction provenance from
+  the footer. An L0 flush stamps `level = 0`, `part_index = 0`; a compacted
+  object carries real values (as here). `base_created_unix_ns` is the
+  minimum run creation time, the base the per-run `created_unix_ns` deltas
+  reconstruct against.
+- `sample_count`, `series_count (footer)`: totals the footer claims.
+- `sections`: the object's sections and byte ranges. `kind=1` `LABEL_DICT`
+  (the string table), `kind=5` `SERIES_IDS` (the sorted ids), `kind=6`
+  `SERIES_META` (the run-major catalog: each series' schema, value kind,
+  and per-run provenance and page ranges), `kind=3` `TS_PAGES`, `kind=4`
+  `VAL_PAGES` (scalar values), `kind=7` `HIST_PAGES` (histogram values). A
+  large object (`series_count >= 4096`) instead carries `kind=8`
+  `SERIES_IDX` and `kind=9` `SERIES_META_CHUNKS` in place of the whole
+  `SERIES_META` -- the sparse catalog. `VAL_PAGES` is omitted when no series
+  is scalar, `HIST_PAGES` when none is a histogram. `comp` is the raw wire
+  integer (`0` none, `1` lz4, `2` zstd).
+- `schema_count (derived)` / `schema[N]:`: SERIES_META groups series by
+  distinct label-*name* set (a "schema"); each line lists that schema's
+  names, resolved through `LABEL_DICT`. Derived by `ravel-cli` from the
+  decoded per-series label sets.
+- `series`: one line per series -- id, resolved labels, sample count,
+  event-timestamp bounds, `value_kind` (`VAL_SCALAR` or `HIST_SPANS`), and
+  `run_count`. Each series then prints one `run[N]` line per run: its
+  provenance (`created_unix_ns`, `writer_epoch`, `writer_seq`), sample
+  count, and the **absolute** byte ranges of that run's TS and
+  VAL-or-HIST pages (`ts_range`/`val_range`/`hist_range`, half-open
+  `[start, end)`), reconstructed from SERIES_META the way the reader does
+  before fetching the bytes. An L0 flush produces one run per series; a
+  compacted object can carry several.
+- Every `HIST_SPANS` run is followed by one `hist[N]:` line per decoded
+  histogram sample: `scale`, `zero_threshold`, `sum` (`none` if absent),
+  `reset_hint`, then `count_kind` (`INT`/`FLOAT`) with `zero_count`/`count`,
+  then the positive and negative sides' spans (`(offset, length)` pairs)
+  and bucket counts, in stored order.
+- `series_count (decoded)`: series count from decoding the catalog, not
+  just trusting the footer; matching `series_count (footer)` means the
+  segment is internally consistent.
 
-## `segment inspect`: RSEG v2 objects
-
-`segment inspect` reads a v2 object (trailer `version = 2`, ADR-0014,
-docs/segment-format.md "RSEG v2 amendment") exactly the same way, over the
-same command:
-
-```sh
-cargo run -p ravel-cli -- segment inspect \
-  "t/3f2a.../m/l0/0000/7c1e....rseg"
-```
-
-```
-total_size: 837
-trailer_offset: 821
-version: 2
-footer_offset: 656
-tenant_hash: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
-shard: 11
-writer_id: golden-v2-writer
-writer_epoch: 5
-writer_seq: 200
-min_event_ts_ns: -200
-max_event_ts_ns: 1900
-min_ingest_ts_ns: -2000
-max_ingest_ts_ns: 9000
-sample_count: 67
-series_count (footer): 4
-sections:
-  kind=1 name=LABEL_DICT offset=0 len=103 uncompressed_len=102 comp=2
-  kind=5 name=SERIES_IDS offset=103 len=68 uncompressed_len=68 comp=0
-  kind=6 name=SERIES_META offset=171 len=85 uncompressed_len=76 comp=2
-  kind=3 name=TS_PAGES offset=256 len=115 uncompressed_len=115 comp=0
-  kind=4 name=VAL_PAGES offset=376 len=280 uncompressed_len=280 comp=0
-schema_count (derived): 3
-  schema[0]: __name__,instance,method
-  schema[1]: __name__
-  schema[2]: __name__,instance,region
-series_count (decoded): 4
-series:
-  series_id=11111111111111111111111111111111 labels=__name__=http_requests_total,instance=a,method=GET sample_count=40 min_ts_ns=1000 max_ts_ns=1663 ts_range=[256, 303) val_range=[376, 442)
-  series_id=22222222222222222222222222222222 labels=__name__=http_requests_total,instance=b,method=POST sample_count=6 min_ts_ns=-200 max_ts_ns=900 ts_range=[303, 319) val_range=[442, 469)
-  series_id=33333333333333333333333333333333 labels=__name__=cpu_seconds sample_count=1 min_ts_ns=42 max_ts_ns=42 ts_range=[319, 326) val_range=[474, 488) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=5)
-  series_id=44444444444444444444444444444444 labels=__name__=memory_bytes,instance=a,region=us-east sample_count=20 min_ts_ns=0 max_ts_ns=1900 ts_range=[326, 371) val_range=[490, 656) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=2)
-```
-
-What's different from v1, field by field:
-
-- `sections`: v2 objects carry `LABEL_DICT`, `SERIES_IDS`, and
-  `SERIES_META` in place of v1's `SERIES_TABLE` (`kind=2`, never emitted by
-  v2); `TS_PAGES`/`VAL_PAGES` are unchanged. Each line also carries a
-  resolved `name=` for its `kind`, which v1's `sections` output doesn't
-  print (v1's `sections` block is intentionally unchanged by v2 support;
-  see the v1 example above).
-- `schema_count (derived)` and the `schema[N]:` lines: SERIES_META groups
-  series by their distinct label-*name* sets (a "schema"); each line lists
-  that schema's label names, sorted, resolved through `LABEL_DICT`. This
-  count is derived by `ravel-cli` from the decoded per-series label sets,
-  not read directly from SERIES_META's on-disk schema dictionary (that
-  dictionary isn't part of `ravel-segment`'s public decode API) -- for any
-  segment this system's own writer produced, that's the same number,
-  since every schema it writes is referenced by at least one series.
-- `series`: one line per series, the v2 counterpart of what v1's
-  `series_count (decoded)` count represents without enumerating -- series
-  id, its resolved labels, sample count, event-timestamp bounds, and the
-  **absolute** byte ranges of its TS/VAL pages (`ts_range`/`val_range`,
-  half-open `[start, end)`), reconstructed from SERIES_META's
-  gap/length columns the same way the reader itself does before fetching
-  those bytes. A trailing `ALIGNMENT_GAP(ts_page_gap=…, val_page_gap=…)`
-  appears only when either gap is nonzero: v2 pads `VAL_PAGES` so every
-  raw-f64-encoded page starts 8-byte aligned (docs/segment-format.md
-  "VAL_RAW_F64 page alignment, v2"), and this is where that padding shows
-  up. Series `0x33...` and `0x44...` above both needed `val_page_gap`
-  padding; neither needed `ts_page_gap` padding (TS pages are never
-  aligned).
-
-## `segment inspect`: RSEG v3 objects (native histograms)
-
-`segment inspect` reads a v3 object (trailer `version = 3`, ADR-0017,
-docs/rseg-v3-plan.md) the same way, over the same command:
-
-```sh
-cargo run -p ravel-cli -- segment inspect \
-  "t/3f2a.../m/l0/0000/9a1f....rseg"
-```
-
-```
-total_size: 456
-trailer_offset: 440
-version: 3
-footer_offset: 272
-tenant_hash: efefefefefefefefefefefefefefefef
-shard: 7
-writer_id: golden-v3-writer
-writer_epoch: 3
-writer_seq: 90
-min_event_ts_ns: 0
-max_event_ts_ns: 4000
-min_ingest_ts_ns: -5000
-max_ingest_ts_ns: 20000
-sample_count: 7
-series_count (footer): 3
-sections:
-  kind=1 name=LABEL_DICT offset=0 len=61 uncompressed_len=52 comp=2
-  kind=5 name=SERIES_IDS offset=61 len=52 uncompressed_len=52 comp=0
-  kind=6 name=SERIES_META offset=113 len=61 uncompressed_len=59 comp=2
-  kind=3 name=TS_PAGES offset=174 len=29 uncompressed_len=29 comp=0
-  kind=4 name=VAL_PAGES offset=208 len=32 uncompressed_len=32 comp=0
-  kind=7 name=HIST_PAGES offset=240 len=32 uncompressed_len=32 comp=0
-schema_count (derived): 1
-  schema[0]: __name__
-series_count (decoded): 3
-series:
-  series_id=07070707070707070707070707070707 labels=__name__=up sample_count=5 min_ts_ns=0 max_ts_ns=4000 value_kind=VAL_SCALAR ts_range=[174, 189) val_range=[208, 223)
-  series_id=08080808080808080808080808080808 labels=__name__=latency_histogram sample_count=1 min_ts_ns=0 max_ts_ns=0 value_kind=HIST_SPANS ts_range=[189, 196) hist_range=[240, 272)
-    hist[0]: ts_ns=0 scale=1 zero_threshold=0.000000001 sum=4.5 reset_hint=UNKNOWN
-      count_kind=INT zero_count=1 count=5
-      positive: spans=[(0, 2)] counts=[2,2]
-      negative: spans=[] counts=[]
-  series_id=09090909090909090909090909090909 labels=__name__=cpu_seconds_total sample_count=1 min_ts_ns=42 max_ts_ns=42 value_kind=VAL_SCALAR ts_range=[196, 203) val_range=[226, 240) ALIGNMENT_GAP(ts_page_gap=0, val_page_gap=3)
-```
-
-What's different from v2, field by field:
-
-- `sections`: v3 objects add `kind=7`/`HIST_PAGES`, the native-histogram
-  value pages (docs/segment-format.md "RSEG v3 amendment"). A segment with
-  no histogram series omits it entirely, symmetrically with a segment with
-  no scalar series omitting `VAL_PAGES` (both series `07...` and `09...`
-  above are scalar, so this object still carries `VAL_PAGES`; a
-  histogram-only segment would omit it instead).
-- `series`: each row gains `value_kind` (`VAL_SCALAR` or `HIST_SPANS`,
-  SERIES_META column 10) and prints whichever page range applies to that
-  series: `val_range` for `VAL_SCALAR`, `hist_range` for `HIST_SPANS` (a
-  histogram series has no VAL page and vice versa, section 3.4).
-  `ALIGNMENT_GAP` is unchanged for `VAL_SCALAR` rows; a `HIST_SPANS` row
-  would show `hist_page_gap` instead of `val_page_gap` if its HIST page
-  needed one (v3 writers never pad HIST_PAGES today, so this is normally
-  absent).
-- Every `HIST_SPANS` row is followed by one `hist[N]:` line per decoded
-  histogram sample (a series can carry more than one, same as scalar
-  series carry more than one value): `scale`, `zero_threshold`, `sum`
-  (`none` if the sample didn't carry one), and `reset_hint`
-  (`UNKNOWN`/`YES`/`NO`/`GAUGE`), followed by `count_kind` (`INT` or
-  `FLOAT`) with `zero_count`/`count`, then the positive and negative
-  sides' spans (`(offset, length)` pairs) and bucket counts, in the exact
-  order stored (docs/rseg-v3-plan.md section 3.5). `latency_histogram`
-  above is a one-sample integer histogram with a populated positive side
-  and an empty negative side.
 
 ## `commit decode`: what a commit record says
 
@@ -296,7 +182,7 @@ min_event_ts_ns: 1732400000000000000
 max_event_ts_ns: 1732400059000000000
 min_ingest_ts_ns: 1732400060000000000
 max_ingest_ts_ns: 1732400060050000000
-segment_format_version: 1
+segment_format_version: 5
 created_unix_ns: 1732400060123456789
 ingest_hour_bucket: 2025112718
 ```

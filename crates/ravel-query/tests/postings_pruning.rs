@@ -62,15 +62,17 @@ fn series_input(tenant_id: &TenantId, metric: &str, ts_ns: i64, value: f64) -> S
     }
 }
 
-/// Writes one real RSEG segment (v2 if `use_v2`, else v1) and publishes its
-/// commit record, mirroring `postings_exactness.rs`'s `publish_real_segment`.
+/// Writes one real RSEG v5 segment and publishes its commit record,
+/// mirroring `postings_exactness.rs`'s `publish_real_segment`. ADR-0027 left
+/// v5 the only version; the trailing `_use_v2` flag is retained (ignored) so
+/// the many call sites need not change.
 async fn publish_segment(
     store: &dyn ObjectStoreBackend,
     tenant_hash: TenantHash,
     writer_id: Uuid,
     writer_seq: u64,
     ingest_hour_bucket: u32,
-    use_v2: bool,
+    _use_v2: bool,
     inputs: Vec<SeriesInput>,
 ) {
     let identity = SegmentIdentity {
@@ -84,11 +86,8 @@ async fn publish_segment(
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
     };
-    let written: WrittenSegment = if use_v2 {
-        SegmentWriter::write_v2(inputs, identity, bounds).expect("write v2 segment")
-    } else {
-        SegmentWriter::write(inputs, identity, bounds).expect("write v1 segment")
-    };
+    let written: WrittenSegment =
+        SegmentWriter::write(inputs, identity, bounds).expect("write v5 segment");
 
     let new_record = NewCommitRecord {
         tenant_hash,
@@ -105,7 +104,7 @@ async fn publish_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: if use_v2 { 2 } else { 1 },
+        segment_format_version: 5,
         created_unix_ns: 0,
         ingest_hour_bucket,
     };

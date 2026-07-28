@@ -26,8 +26,8 @@ use ravel_proto::segment::v1::Footer;
 use ravel_segment::{
     CompactionMetaV4, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue,
     IngestBounds, ReaderLimits, ResetHint, RunInputV4, RunValuePageV4, SegmentIdentity,
-    SegmentWriter, SeriesInputV3, SeriesInputV4, SeriesValues, ValueKind, decode_catalog_v3,
-    decode_catalog_v5, open_from_full,
+    SegmentWriter, SeriesInputV3, SeriesInputV4, SeriesValues, ValueKind, decode_catalog_v5,
+    open_from_full,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -103,10 +103,12 @@ fn section_bytes<'a>(bytes: &'a [u8], footer: &Footer, kind: u32) -> &'a [u8] {
     &bytes[s.offset as usize..(s.offset + s.len) as usize]
 }
 
-/// Fully deterministic single-run v4 inputs, built by writing one v3 object
-/// over the whole batch and slicing each series' verbatim page bytes (page
-/// crc32c is bound to series_id, preserved). Deterministic input in, so the
-/// v5 output is deterministic and golden-pinnable.
+/// Fully deterministic single-run v4 inputs, built by writing one v5 object
+/// over the whole batch (via the raw-sample adapter, which frames pages the
+/// same way the old v3 writer did) and slicing each series' verbatim page
+/// bytes (page crc32c is bound to series_id, preserved). Deterministic input
+/// in, so the v5 output under the fixed run provenance below is deterministic
+/// and golden-pinnable.
 fn v5_golden_inputs(n: usize, hist_every: usize) -> Vec<SeriesInputV4> {
     let base = 1_650_000_000_000_000_000i64;
     let mut v3: Vec<SeriesInputV3> = Vec::with_capacity(n);
@@ -145,20 +147,14 @@ fn v5_golden_inputs(n: usize, hist_every: usize) -> Vec<SeriesInputV4> {
         });
     }
 
-    let written = SegmentWriter::write_v3(v3, fixed_identity(), fixed_bounds())
-        .expect("write v3 source for v5 golden");
+    let written = SegmentWriter::write_histograms(v3, fixed_identity(), fixed_bounds())
+        .expect("write v5 source for v5 golden");
     let obj = written.bytes.as_ref();
     let limits = ReaderLimits::default();
-    let loc = open_from_full(obj, limits).expect("open v3 source");
+    let loc = open_from_full(obj, limits).expect("open v5 source");
     let footer = &loc.footer;
-    let entries = decode_catalog_v3(
-        footer,
-        section_bytes(obj, footer, 1),
-        section_bytes(obj, footer, 5),
-        section_bytes(obj, footer, 6),
-        limits,
-    )
-    .expect("decode v3 source");
+    let _ = section_bytes(obj, footer, 1);
+    let entries = decode_catalog_v5(footer, obj, limits).expect("decode v5 source");
     let ts_sec = footer.sections.iter().find(|s| s.kind == 3).unwrap();
     let val_sec = footer.sections.iter().find(|s| s.kind == 4);
     let hist_sec = footer.sections.iter().find(|s| s.kind == 7);
@@ -166,33 +162,34 @@ fn v5_golden_inputs(n: usize, hist_every: usize) -> Vec<SeriesInputV4> {
     entries
         .iter()
         .map(|e| {
-            let (o, l) = e.ts_page;
+            let run = &e.runs[0];
+            let (o, l) = run.ts_page;
             let a = (ts_sec.offset + o) as usize;
             let ts_page = obj[a..a + l as usize].to_vec();
-            let value_page = match e.value_kind {
+            let value_page = match e.entry.value_kind {
                 ValueKind::Scalar => {
                     let s = val_sec.expect("val");
-                    let (o, l) = e.val_page;
+                    let (o, l) = run.val_page;
                     let a = (s.offset + o) as usize;
                     RunValuePageV4::Scalar(obj[a..a + l as usize].to_vec())
                 }
                 ValueKind::Histogram => {
                     let s = hist_sec.expect("hist");
-                    let (o, l) = e.hist_page;
+                    let (o, l) = run.hist_page;
                     let a = (s.offset + o) as usize;
                     RunValuePageV4::Histogram(obj[a..a + l as usize].to_vec())
                 }
             };
             SeriesInputV4 {
-                series_id: e.series_id,
-                labels: e.labels.clone(),
+                series_id: e.entry.series_id,
+                labels: e.entry.labels.clone(),
                 runs: vec![RunInputV4 {
-                    created_unix_ns: 200 + (e.min_ts_ns % 89),
+                    created_unix_ns: 200 + (e.entry.min_ts_ns % 89),
                     writer_epoch: 2,
                     writer_seq: 3,
-                    min_ts_ns: e.min_ts_ns,
-                    max_ts_ns: e.max_ts_ns,
-                    sample_count: e.sample_count,
+                    min_ts_ns: e.entry.min_ts_ns,
+                    max_ts_ns: e.entry.max_ts_ns,
+                    sample_count: e.entry.sample_count,
                     ts_page,
                     value_page,
                 }],

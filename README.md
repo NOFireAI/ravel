@@ -196,8 +196,10 @@ built this way.
 
 - [docs/README.md](docs/README.md): index of every guide and spec
 - [docs/segment-format.md](docs/segment-format.md): the RSEG data format —
-  v1 baseline plus the v2 (columnar catalog), v3 (native histograms), and
-  v4 (compaction) amendments, with the byte-layout diagram in
+  a self-contained specification of RSEG v5 (the columnar catalog, native
+  histograms, multi-run compaction layout, and the optional sparse catalog),
+  the only version readable or writable pre-release (ADR-0027), with the
+  byte-layout diagram in
   [docs/diagrams/rseg-layout.svg](docs/diagrams/rseg-layout.svg)
 - [docs/guides/](docs/guides/): getting started, ingest, query, operations,
   inspecting data

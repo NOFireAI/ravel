@@ -22,9 +22,5 @@ tokio = { workspace = true }
 criterion = { workspace = true }
 crc32c = { workspace = true }
 
-[[bench]]
-name = "decode_soa_vs_aos"
-harness = false
-
 [lints]
 workspace = true

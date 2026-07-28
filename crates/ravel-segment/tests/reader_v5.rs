@@ -2,18 +2,14 @@
 //! amendment"): the sparse SERIES_IDX + chunked SERIES_META selective-read
 //! path and the whole-catalog v5 decode.
 //!
-//! These migrate the two properties the #167 prototype's tests proved, onto
-//! the production paths:
+//! The central property: the sparse point-lookup path reads bit-identically
+//! to the whole-catalog path on the same object
+//! (`sparse_probe_matches_whole_catalog`, plus the proptest-driven
+//! `sparse_probe_matches_for_random_index`).
 //!
-//! - below the sparse-emission threshold a v5 object is the v4 object save the
-//!   trailer version bytes (`below_threshold_v5_is_v4_plus_version_bump`),
-//! - the sparse point-lookup path reads bit-identically to the whole-catalog
-//!   path on the same object (`sparse_reads_match_whole_catalog`,
-//!   proptest-driven over every series).
-//!
-//! Plus the v5-specific coverage ADR-0026 point 6 and the task require:
-//! corrupt id-window and corrupt meta-chunk range-GETs must produce typed
-//! errors, and v5 inherits v4's histogram runs.
+//! Plus the v5-specific coverage the task requires: corrupt id-window and
+//! corrupt meta-chunk range-GETs must produce typed errors, and v5 exercises
+//! histogram runs.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use proptest::prelude::*;
@@ -22,8 +18,8 @@ use ravel_segment::{
     CompactionMetaV4, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue,
     IngestBounds, ReaderLimits, ResetHint, RunInputV4, RunValuePageV4, SegmentError,
     SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesInputV4, SeriesValues, ValueKind,
-    decode_catalog_v4, decode_catalog_v5, decode_chunk_runs, find_index_in_window, open_from_full,
-    parse_series_idx, verify_and_decompress_chunk_frame, verify_id_window,
+    decode_catalog_v5, decode_chunk_runs, find_index_in_window, open_from_full, parse_series_idx,
+    verify_and_decompress_chunk_frame, verify_id_window,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -128,9 +124,10 @@ fn series_id(i: usize) -> SeriesId {
 }
 
 /// Builds the same logical batch as single-run v4 inputs, sourcing each run's
-/// verbatim page bytes from one v3 object built over the whole batch (page
-/// crc32c is bound to series_id, preserved here). `hist_every > 0` makes every
-/// `hist_every`-th series a histogram series, so v5 exercises HIST runs too.
+/// verbatim page bytes from one v5 object built over the whole batch via the
+/// raw-sample adapter (which frames pages exactly as the old v3 writer did;
+/// page crc32c is bound to series_id, preserved here). `hist_every > 0` makes
+/// every `hist_every`-th series a histogram series, so v5 exercises HIST runs.
 fn v4_inputs(n: usize, hist_every: usize) -> Vec<SeriesInputV4> {
     let base = 1_700_000_000_000_000_000i64;
     let mut v3: Vec<SeriesInputV3> = Vec::with_capacity(n);
@@ -173,16 +170,13 @@ fn v4_inputs(n: usize, hist_every: usize) -> Vec<SeriesInputV4> {
         });
     }
 
-    let written = SegmentWriter::write_v3(v3, identity(), bounds()).expect("write v3 source");
+    let written =
+        SegmentWriter::write_histograms(v3, identity(), bounds()).expect("write v5 source");
     let obj = written.bytes.as_ref();
-    let loc = open_from_full(obj, ReaderLimits::default()).expect("open v3 source");
+    let loc = open_from_full(obj, ReaderLimits::default()).expect("open v5 source");
     let footer = &loc.footer;
-    let dict = section_bytes(obj, footer, 1);
-    let ids = section_bytes(obj, footer, SERIES_IDS);
-    let smeta = section_bytes(obj, footer, 6);
     let entries =
-        ravel_segment::decode_catalog_v3(footer, dict, ids, smeta, ReaderLimits::default())
-            .expect("decode v3 source catalog");
+        decode_catalog_v5(footer, obj, ReaderLimits::default()).expect("decode v5 source catalog");
 
     let ts_section = footer.sections.iter().find(|s| s.kind == TS_PAGES).unwrap();
     let val_section = footer.sections.iter().find(|s| s.kind == VAL_PAGES);
@@ -191,46 +185,40 @@ fn v4_inputs(n: usize, hist_every: usize) -> Vec<SeriesInputV4> {
     entries
         .iter()
         .map(|e| {
-            let (ts_off, ts_len) = e.ts_page;
+            let run = &e.runs[0];
+            let (ts_off, ts_len) = run.ts_page;
             let ts_abs = (ts_section.offset + ts_off) as usize;
             let ts_page = obj[ts_abs..ts_abs + ts_len as usize].to_vec();
-            let value_page = match e.value_kind {
+            let value_page = match e.entry.value_kind {
                 ValueKind::Scalar => {
                     let vs = val_section.expect("val section for scalar");
-                    let (o, l) = e.val_page;
+                    let (o, l) = run.val_page;
                     let a = (vs.offset + o) as usize;
                     RunValuePageV4::Scalar(obj[a..a + l as usize].to_vec())
                 }
                 ValueKind::Histogram => {
                     let hs = hist_section.expect("hist section for histogram");
-                    let (o, l) = e.hist_page;
+                    let (o, l) = run.hist_page;
                     let a = (hs.offset + o) as usize;
                     RunValuePageV4::Histogram(obj[a..a + l as usize].to_vec())
                 }
             };
             SeriesInputV4 {
-                series_id: e.series_id,
-                labels: e.labels.clone(),
+                series_id: e.entry.series_id,
+                labels: e.entry.labels.clone(),
                 runs: vec![RunInputV4 {
-                    created_unix_ns: 1_000 + (e.min_ts_ns % 97),
+                    created_unix_ns: 1_000 + (e.entry.min_ts_ns % 97),
                     writer_epoch: 1,
                     writer_seq: 1,
-                    min_ts_ns: e.min_ts_ns,
-                    max_ts_ns: e.max_ts_ns,
-                    sample_count: e.sample_count,
+                    min_ts_ns: e.entry.min_ts_ns,
+                    max_ts_ns: e.entry.max_ts_ns,
+                    sample_count: e.entry.sample_count,
                     ts_page,
                     value_page,
                 }],
             }
         })
         .collect()
-}
-
-fn build_v4(n: usize, hist_every: usize) -> Vec<u8> {
-    SegmentWriter::write_v4(v4_inputs(n, hist_every), identity(), bounds(), meta())
-        .expect("write v4")
-        .bytes
-        .to_vec()
 }
 
 fn build_v5(n: usize, hist_every: usize) -> Vec<u8> {
@@ -241,39 +229,6 @@ fn build_v5(n: usize, hist_every: usize) -> Vec<u8> {
 }
 
 #[test]
-fn below_threshold_v5_is_v4_plus_version_bump() {
-    // n well below 4096: no sparse sections, so the v5 object is the v4 object
-    // save the trailer version field (and the footer_crc it feeds).
-    let n = 200;
-    let v4 = build_v4(n, 0);
-    let v5 = build_v5(n, 0);
-    assert_eq!(v4.len(), v5.len(), "same length below threshold");
-
-    let total = v4.len();
-    // Trailer: [footer_len(4) crc(4) version(2) signal(1) reserved(1) magic(4)].
-    // Only version (total-8..total-6) and the crc it feeds (total-12..total-8)
-    // may differ.
-    let allow_start = total - 12;
-    let allow_end = total - 6;
-    for (i, (a, b)) in v4.iter().zip(&v5).enumerate() {
-        if (allow_start..allow_end).contains(&i) {
-            continue;
-        }
-        assert_eq!(a, b, "byte {i} differs outside the version/crc window");
-    }
-    // The version field is exactly 4 -> 5.
-    assert_eq!(u16::from_le_bytes([v4[total - 8], v4[total - 7]]), 4);
-    assert_eq!(u16::from_le_bytes([v5[total - 8], v5[total - 7]]), 5);
-
-    // And it reads back as a valid v5 object with the v4-shaped catalog.
-    let loc = open_from_full(&v5, ReaderLimits::default()).expect("open below-threshold v5");
-    assert_eq!(loc.version, 5);
-    assert!(!section_present(&loc.footer, SERIES_IDX));
-    assert!(!section_present(&loc.footer, SERIES_META_CHUNKS));
-    assert!(section_present(&loc.footer, 6), "whole SERIES_META present");
-}
-
-#[test]
 fn sparse_object_has_the_sparse_sections() {
     let v5 = build_v5(SPARSE_N, 0);
     let loc = open_from_full(&v5, ReaderLimits::default()).expect("open sparse v5");
@@ -281,33 +236,6 @@ fn sparse_object_has_the_sparse_sections() {
     assert!(section_present(&loc.footer, SERIES_IDX));
     assert!(section_present(&loc.footer, SERIES_META_CHUNKS));
     assert!(!section_present(&loc.footer, 6), "no whole SERIES_META");
-}
-
-#[test]
-fn v5_catalog_matches_v4_catalog() {
-    // The chunked v5 catalog decodes to exactly the same folded entries and
-    // per-run views as the v4 object of the same batch: page ranges are
-    // relative to their (verbatim-copied) sections, so they match despite the
-    // sparse sections shifting absolute offsets.
-    for hist_every in [0usize, 5] {
-        let v4 = build_v4(SPARSE_N, hist_every);
-        let v5 = build_v5(SPARSE_N, hist_every);
-        let l4 = open_from_full(&v4, ReaderLimits::default()).unwrap();
-        let l5 = open_from_full(&v5, ReaderLimits::default()).unwrap();
-        let e4 = decode_catalog_v4(
-            &l4.footer,
-            section_bytes(&v4, &l4.footer, 1),
-            section_bytes(&v4, &l4.footer, SERIES_IDS),
-            section_bytes(&v4, &l4.footer, 6),
-            ReaderLimits::default(),
-        )
-        .unwrap();
-        let e5 = decode_catalog_v5(&l5.footer, &v5, ReaderLimits::default()).unwrap();
-        assert_eq!(
-            e4, e5,
-            "v5 catalog must equal v4 catalog (hist_every={hist_every})"
-        );
-    }
 }
 
 /// Runs of every series read via the sparse point-probe path.
@@ -441,7 +369,7 @@ fn corrupt_chunk_frame_is_typed_error() {
 #[test]
 fn unknown_version_still_fails_closed() {
     // A v5 object with its version field hand-set to an unknown 6 must fail
-    // closed, the same pattern v1-v4 readers use when they meet a v5 object.
+    // closed, the same way the reader rejects a retired v1-v4 object.
     let mut v5 = build_v5(200, 0);
     let total = v5.len();
     v5[total - 8] = 6;
