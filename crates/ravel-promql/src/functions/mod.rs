@@ -12,6 +12,7 @@
 //! `const` arrays with no allocation or dynamic dispatch.
 
 mod histogram_classic;
+mod histogram_native;
 pub(crate) mod label;
 pub(crate) mod over_time;
 mod rate;
@@ -24,6 +25,7 @@ use crate::eval::{
     Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix, Value,
     drop_metric_name, duration_to_ns, resolve_eval_ts, selector_eval_ts,
 };
+use crate::histogram::{FloatHistogram, TimedHistogram};
 use crate::source::SeriesSource;
 
 /// One registered function: its promql-parser name and evaluation shape.
@@ -50,6 +52,16 @@ pub(crate) struct FunctionDef {
 pub(crate) enum FunctionKind {
     RangeVector(fn(&[Sample], RangeWindow) -> Option<f64>),
     RangeVectorScalar(fn(&[Sample], RangeWindow, f64) -> Option<f64>),
+    /// `rate`/`increase`/`delta` (P11): a float window reducer plus a native-
+    /// histogram window reducer, so one registration serves both sample
+    /// kinds. In an instant query both the float and histogram matrix
+    /// selectors are evaluated and their outputs unioned; in a range query
+    /// only the float reducer runs (a histogram-valued range result has no
+    /// JSON rendering and no read path to feed it yet, see the P11 report).
+    RangeVectorFloatOrHist {
+        float: fn(&[Sample], RangeWindow) -> Option<f64>,
+        hist: fn(&[TimedHistogram], RangeWindow) -> Option<FloatHistogram>,
+    },
     /// `f(phi, v instant-vector) -> instant-vector`: many-to-fewer,
     /// grouping `v` by its own labels rather than reducing one series'
     /// matrix window, so it does not fit either `RangeVector` shape above
@@ -117,6 +129,7 @@ pub(crate) struct RangeWindow {
 const FAMILIES: &[&[FunctionDef]] = &[
     rate::FUNCTIONS,
     histogram_classic::FUNCTIONS,
+    histogram_native::FUNCTIONS,
     over_time::FUNCTIONS,
     transform::FUNCTIONS,
     label::FUNCTIONS,
@@ -167,6 +180,21 @@ pub(crate) fn eval_call(
             Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
                 f(samples, window, t)
             })))
+        }
+        FunctionKind::RangeVectorFloatOrHist { float, hist } => {
+            let ms = matrix_arg(&call.args.args[0])?;
+            let window = range_window(ms, eval_ts_ns, ctx)?;
+            let matrix = evaluator.eval_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            let mut out = apply_reduce(matrix, eval_ts_ns, |samples| float(samples, window));
+            // Native-histogram series matching the same selector: reduce each
+            // window to a histogram and emit it as a histogram element.
+            let hmatrix = evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx)?;
+            for (labels, samples) in hmatrix {
+                if let Some(h) = hist(&samples, window) {
+                    out.push(InstantSample::histogram(labels, eval_ts_ns, eval_ts_ns, h));
+                }
+            }
+            Ok(Value::Vector(out))
         }
         FunctionKind::HistogramQuantile(f) => {
             let phi = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
@@ -279,6 +307,33 @@ pub(crate) fn eval_range_call(
                             eval_ts_ns: reported_ts_ns,
                         },
                         t,
+                    )
+                },
+            )
+        }
+        FunctionKind::RangeVectorFloatOrHist { float, hist: _ } => {
+            // Range queries reduce only the float series: a histogram-valued
+            // range result cannot be rendered by the HTTP JSON layer and no
+            // read path feeds native histograms into a range query yet (P11
+            // report). The float reduction is identical to `RangeVector`.
+            let ms = matrix_arg(&call.args.args[0])?;
+            evaluator.eval_range_matrix_reduction(
+                source,
+                ms,
+                start_ns,
+                end_ns,
+                step_ns,
+                points,
+                ctx,
+                |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
+                    float(
+                        samples,
+                        RangeWindow {
+                            start_ns: window_start_ns,
+                            end_ns: sel_ts_ns,
+                            range_ns,
+                            eval_ts_ns: reported_ts_ns,
+                        },
                     )
                 },
             )
@@ -607,6 +662,7 @@ fn to_instant_vector(groups: Vec<(LabelSet, f64)>, eval_ts_ns: i64) -> InstantVe
             ts_ns: eval_ts_ns,
             orig_sample_ts_ns: eval_ts_ns,
             value,
+            histogram: None,
         })
         .collect()
 }
@@ -628,6 +684,7 @@ fn apply_reduce(
                 ts_ns: eval_ts_ns,
                 orig_sample_ts_ns: eval_ts_ns,
                 value,
+                histogram: None,
             });
         }
     }

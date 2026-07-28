@@ -42,9 +42,55 @@ impl GeneratedSeries {
     }
 }
 
+/// One native-histogram sample in the generated dataset (P11). Deliberately
+/// minimal: positive buckets only, integer counts, a fixed schema, which is
+/// enough to exercise the native `histogram_count`/`_sum`/`_avg`,
+/// `histogram_quantile`, `rate`, and `sum`/`avg` forms. `positive_buckets`
+/// are absolute counts (the remote-write encoder delta-encodes them);
+/// `positive_spans` are `(offset, length)` pairs.
+#[derive(Debug, Clone)]
+pub struct GeneratedHistogramPoint {
+    pub ts_ms: i64,
+    pub schema: i32,
+    pub zero_threshold: f64,
+    pub zero_count: u64,
+    pub count: u64,
+    pub sum: f64,
+    pub positive_spans: Vec<(i32, u32)>,
+    pub positive_buckets: Vec<u64>,
+    /// Prometheus `Histogram.ResetHint` value (0 UNKNOWN, 1 YES, 2 NO,
+    /// 3 GAUGE).
+    pub reset_hint: i32,
+}
+
+/// One generated native-histogram series: label set and histogram samples in
+/// ascending timestamp order (P11).
+#[derive(Debug, Clone)]
+pub struct GeneratedHistogramSeries {
+    pub labels: Vec<(String, String)>,
+    pub points: Vec<GeneratedHistogramPoint>,
+}
+
+impl GeneratedHistogramSeries {
+    pub fn metric_name(&self) -> &str {
+        self.labels
+            .first()
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub series: Vec<GeneratedSeries>,
+    /// Native-histogram series (P11). Pushed to Prometheus over remote write
+    /// by the encoder. NOTE: the in-process Ravel side (`ravel_stack`) cannot
+    /// ingest these yet: its ingest path (`NormalizedPoint`) and the query
+    /// read path are still f64-only (see the P11 report), so a native-
+    /// histogram corpus entry has no Ravel data to compare against until that
+    /// gap closes. Kept here so the generator and remote-write encoder support
+    /// lands with P11, ready for the moment the read path carries histograms.
+    pub histogram_series: Vec<GeneratedHistogramSeries>,
 }
 
 /// Knobs for [`generate`]. `base_ts_ms` anchors every series' first sample;
@@ -104,7 +150,79 @@ pub fn generate(config: &DatasetConfig) -> Dataset {
     series.extend(aggregation_group(config));
     series.extend(aggregation_special(config));
 
-    Dataset { series }
+    let histogram_series = native_histogram_families(config);
+    Dataset {
+        series,
+        histogram_series,
+    }
+}
+
+/// Native-histogram series for the P11 corpus: a monotonic counter histogram
+/// (`diff_native_hist`, cumulative bucket counts growing each scrape, reset
+/// hint NO after the first sample) and a two-series family
+/// (`diff_native_hist_agg`, `i="1"`/`i="2"`) for `sum`/`avg` aggregation.
+/// Schema 0, three positive buckets from index 1, zero bucket populated, so
+/// `histogram_quantile` has interior buckets to interpolate.
+fn native_histogram_families(config: &DatasetConfig) -> Vec<GeneratedHistogramSeries> {
+    let timestamps = regular_timestamps(config);
+
+    // Monotonic counter: each scrape adds a fixed increment per bucket.
+    let counter = GeneratedHistogramSeries {
+        labels: metric("diff_native_hist", &[("kind", "counter")]),
+        points: timestamps
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                let step = (i + 1) as u64;
+                let buckets = vec![2 * step, 3 * step, step];
+                histogram_point(*ts, buckets, 1, i)
+            })
+            .collect(),
+    };
+
+    // Aggregation family: two series with distinct but overlapping bucket
+    // populations, constant across time so `sum`/`avg` are stable.
+    let agg = |instance: &str, buckets: Vec<u64>| GeneratedHistogramSeries {
+        labels: metric("diff_native_hist_agg", &[("i", instance)]),
+        points: timestamps
+            .iter()
+            .map(|ts| histogram_point(*ts, buckets.clone(), 0, 0))
+            .collect(),
+    };
+
+    vec![counter, agg("1", vec![1, 2, 3]), agg("2", vec![4, 5, 6])]
+}
+
+/// Build one histogram point from absolute positive bucket counts at schema 0.
+/// `zero_count` fixed at 1, `sum` derived so it is monotonic with the
+/// populations. `reset_hint`: 2 (NO) for `sample_index > 0`, else 0 (UNKNOWN).
+fn histogram_point(
+    ts_ms: i64,
+    positive_buckets: Vec<u64>,
+    zero_count: u64,
+    sample_index: usize,
+) -> GeneratedHistogramPoint {
+    let bucket_total: u64 = positive_buckets.iter().sum();
+    let count = bucket_total + zero_count;
+    // A representative sum: each bucket contributes its count times a value
+    // near the bucket's own scale (bucket i covers up to 2^i at schema 0).
+    let sum = positive_buckets
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| c as f64 * 2f64.powi(i as i32))
+        .sum();
+    let reset_hint = if sample_index > 0 { 2 } else { 0 };
+    GeneratedHistogramPoint {
+        ts_ms,
+        schema: 0,
+        zero_threshold: 1e-9,
+        zero_count,
+        count,
+        sum,
+        positive_spans: vec![(1, positive_buckets.len() as u32)],
+        positive_buckets,
+        reset_hint,
+    }
 }
 
 fn regular_timestamps(config: &DatasetConfig) -> Vec<i64> {
@@ -404,6 +522,55 @@ mod tests {
             for ((ts_a, va), (ts_b, vb)) in x.samples.iter().zip(y.samples.iter()) {
                 assert_eq!(ts_a, ts_b);
                 assert_eq!(va.to_bits(), vb.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn native_histogram_family_is_generated_and_monotonic() {
+        let dataset = generate(&DatasetConfig::default());
+        assert!(
+            dataset
+                .histogram_series
+                .iter()
+                .any(|s| s.metric_name() == "diff_native_hist"),
+            "counter native histogram present"
+        );
+        let counter = dataset
+            .histogram_series
+            .iter()
+            .find(|s| s.metric_name() == "diff_native_hist")
+            .expect("counter series");
+        // Counter total count strictly increases scrape over scrape.
+        for pair in counter.points.windows(2) {
+            assert!(
+                pair[1].count > pair[0].count,
+                "counter histogram count must be monotonic"
+            );
+            assert_eq!(pair[1].reset_hint, 2, "post-first samples hint NO reset");
+        }
+        // Two aggregation series exist.
+        let agg = dataset
+            .histogram_series
+            .iter()
+            .filter(|s| s.metric_name() == "diff_native_hist_agg")
+            .count();
+        assert_eq!(agg, 2);
+    }
+
+    #[test]
+    fn native_histogram_generation_is_deterministic_by_seed() {
+        let config = DatasetConfig::default();
+        let a = generate(&config);
+        let b = generate(&config);
+        assert_eq!(a.histogram_series.len(), b.histogram_series.len());
+        for (x, y) in a.histogram_series.iter().zip(b.histogram_series.iter()) {
+            assert_eq!(x.labels, y.labels);
+            for (px, py) in x.points.iter().zip(y.points.iter()) {
+                assert_eq!(px.ts_ms, py.ts_ms);
+                assert_eq!(px.count, py.count);
+                assert_eq!(px.positive_buckets, py.positive_buckets);
+                assert_eq!(px.sum.to_bits(), py.sum.to_bits());
             }
         }
     }

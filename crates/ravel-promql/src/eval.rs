@@ -90,6 +90,48 @@ pub struct InstantSample {
     pub ts_ns: i64,
     pub orig_sample_ts_ns: i64,
     pub value: f64,
+    /// The native histogram this element carries, when the underlying series
+    /// is a native (exponential) histogram (P11). `None` for an ordinary
+    /// float sample, which is every element produced by the pre-P11 evaluator.
+    /// When `Some`, `value` is not meaningful and is left `0.0`; histogram-
+    /// aware functions (`histogram_count`/`_sum`/`_avg`, native
+    /// `histogram_quantile`/`_fraction`, `rate`/`sum`/`avg` over histograms)
+    /// read this field instead. A float function applied to a histogram
+    /// element ignores it, matching Prometheus dropping histogram samples from
+    /// float-only operations.
+    pub histogram: Option<crate::histogram::FloatHistogram>,
+}
+
+impl InstantSample {
+    /// A plain float element (`histogram: None`): the constructor every
+    /// pre-P11 code path uses so adding the histogram field stayed a
+    /// single-line change at each call site.
+    pub(crate) fn scalar(labels: LabelSet, ts_ns: i64, orig_sample_ts_ns: i64, value: f64) -> Self {
+        InstantSample {
+            labels,
+            ts_ns,
+            orig_sample_ts_ns,
+            value,
+            histogram: None,
+        }
+    }
+
+    /// A native-histogram element (P11): carries the histogram value with a
+    /// placeholder `value` of `0.0`.
+    pub(crate) fn histogram(
+        labels: LabelSet,
+        ts_ns: i64,
+        orig_sample_ts_ns: i64,
+        histogram: crate::histogram::FloatHistogram,
+    ) -> Self {
+        InstantSample {
+            labels,
+            ts_ns,
+            orig_sample_ts_ns,
+            value: 0.0,
+            histogram: Some(histogram),
+        }
+    }
 }
 
 /// Result of an instant query: one entry per matched series.
@@ -99,6 +141,13 @@ pub type InstantVector = Vec<InstantSample>;
 /// per evaluated step at which that series had a value in the lookback
 /// window. Series with no value at any step are omitted entirely.
 pub type RangeMatrix = Vec<(LabelSet, Vec<Sample>)>;
+
+/// The native-histogram counterpart of [`RangeMatrix`] for one instant: one
+/// entry per matched histogram series, each carrying that series' in-window
+/// histogram samples (P11). Only used internally by the histogram
+/// `rate`/`increase`/`delta` path; native histograms have no range-query
+/// result rendering yet (see the P11 report).
+pub(crate) type HistogramMatrix = Vec<(LabelSet, Vec<crate::histogram::TimedHistogram>)>;
 
 /// A typed evaluation result. Internal to `ravel-promql`: AST types from
 /// promql-parser still do not leak from the crate (ADR-0007 consequence).
@@ -474,12 +523,30 @@ impl Evaluator {
             if let Some((value, orig_sample_ts_ns)) =
                 pick_sample(&s.samples, sel_ts_ns, self.lookback_delta_ns)
             {
-                out.push(InstantSample {
-                    labels: s.labels,
-                    ts_ns: eval_ts_ns,
+                out.push(InstantSample::scalar(
+                    s.labels,
+                    eval_ts_ns,
                     orig_sample_ts_ns,
                     value,
-                });
+                ));
+            }
+        }
+
+        // Native-histogram series matching the same selector (P11). A series
+        // is either float or histogram in storage, so these never collide with
+        // the float results above; the lookback pick is the same left-open
+        // `(sel_ts - lookback, sel_ts]` rule.
+        let hist_series = source.query_histograms(&selector_matchers, window)?;
+        for s in hist_series {
+            if let Some((value, orig_sample_ts_ns)) =
+                pick_histogram(&s.samples, sel_ts_ns, self.lookback_delta_ns)
+            {
+                out.push(InstantSample::histogram(
+                    s.labels,
+                    eval_ts_ns,
+                    orig_sample_ts_ns,
+                    value,
+                ));
             }
         }
         Ok(out)
@@ -588,6 +655,45 @@ impl Evaluator {
         crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             self.eval_expr(source, &sq.expr, t, ctx)
         })
+    }
+
+    /// The native-histogram counterpart of [`Self::eval_matrix_selector`] at
+    /// one instant (P11): every native histogram in the left-open window
+    /// `(sel_ts - range, sel_ts]`, per matched histogram series, with
+    /// `__name__` dropped (every function result drops it). Used by the
+    /// histogram `rate`/`increase`/`delta` path; the float and histogram
+    /// matrix selectors are queried independently, so a series contributes to
+    /// exactly one of them.
+    pub(crate) fn eval_histogram_matrix_selector(
+        &self,
+        source: &dyn SeriesSource,
+        ms: &promql_parser::parser::MatrixSelector,
+        eval_ts_ns: i64,
+        ctx: &QueryWindow,
+    ) -> Result<HistogramMatrix, Error> {
+        let selector_matchers = build_matchers(&ms.vs)?;
+        let sel_ts_ns = selector_eval_ts(&ms.vs, eval_ts_ns, ctx)?;
+        let range_ns = duration_to_ns(ms.range)?;
+        let window_start = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
+        let window = TimeRange {
+            start_ns: window_start,
+            end_ns: sel_ts_ns,
+        };
+
+        let series = source.query_histograms(&selector_matchers, window)?;
+        let mut out = Vec::with_capacity(series.len());
+        for s in series {
+            let samples: Vec<crate::histogram::TimedHistogram> = s
+                .samples
+                .into_iter()
+                .filter(|sample| sample.ts_ns > window_start)
+                .map(|sample| (sample.ts_ns, sample.value))
+                .collect();
+            if !samples.is_empty() {
+                out.push((drop_metric_name(s.labels), samples));
+            }
+        }
+        Ok(out)
     }
 
     /// Build the range matrix for a single top-level vector selector
@@ -928,11 +1034,19 @@ pub(crate) fn duration_to_ns(d: std::time::Duration) -> Result<i64, Error> {
 /// of any numeric operation, unary minus included.
 fn negate_vector(v: InstantVector) -> InstantVector {
     v.into_iter()
-        .map(|s| InstantSample {
-            labels: drop_metric_name(s.labels),
-            ts_ns: s.ts_ns,
-            orig_sample_ts_ns: s.ts_ns,
-            value: -s.value,
+        .map(|s| {
+            // Unary minus over a native-histogram element negates every
+            // population (Prometheus multiplies the histogram by -1); a float
+            // element negates its value.
+            match s.histogram {
+                Some(mut h) => {
+                    h.mul(-1.0);
+                    InstantSample::histogram(drop_metric_name(s.labels), s.ts_ns, s.ts_ns, h)
+                }
+                None => {
+                    InstantSample::scalar(drop_metric_name(s.labels), s.ts_ns, s.ts_ns, -s.value)
+                }
+            }
         })
         .collect()
 }
@@ -1058,6 +1172,28 @@ fn pick_sample(samples: &[Sample], sel_ts_ns: i64, lookback_delta_ns: i64) -> Op
         return None;
     }
     Some((f64::from_bits(best_bits), candidate_ts_ns))
+}
+
+/// Pick the native histogram at the most recent timestamp in `(sel_ts -
+/// lookback, sel_ts]`, the histogram counterpart of [`pick_sample`]. Native
+/// histograms carry no staleness-marker bit pattern (that is a float NaN
+/// payload), so there is no stale-drop here; the most recent in-window sample
+/// wins. Returns `(value, orig_sample_ts_ns)`.
+fn pick_histogram(
+    samples: &[crate::source::HistogramSample],
+    sel_ts_ns: i64,
+    lookback_delta_ns: i64,
+) -> Option<(crate::histogram::FloatHistogram, i64)> {
+    let idx = samples.partition_point(|s| s.ts_ns <= sel_ts_ns);
+    if idx == 0 {
+        return None;
+    }
+    let candidate = &samples[idx - 1];
+    let window_start = sel_ts_ns.checked_sub(lookback_delta_ns)?;
+    if candidate.ts_ns <= window_start {
+        return None;
+    }
+    Some((candidate.value.clone(), candidate.ts_ns))
 }
 
 /// Build the full matcher list for a vector selector, including the

@@ -1,0 +1,88 @@
+# Native-histogram function forms (docs/promql-evaluator-plan.md P11).
+#
+# BLOCKED END TO END: the Ravel side of the harness cannot ingest native
+# histograms yet. Its ingest path (ravel-ingest `NormalizedPoint`) and query
+# read path (ravel-query fetcher/merge, ravel-promql `SeriesData`/
+# `SeriesSource`) are still f64-only, so a native-histogram sample never
+# reaches Ravel's evaluator (see the P11 report and src/ravel_stack.rs). Until
+# that read path lands, running these entries against a live Prometheus will
+# report the histogram series as present on the Prometheus side and absent on
+# the Ravel side. They are checked in now, with the generator and remote-write
+# support, so the corpus is ready the moment the read path carries histograms
+# and no separate change is needed to turn the P11 differential gate green.
+#
+# Every query below reduces native histograms to float results so the existing
+# bit-exact float comparator applies; raw histogram-valued results (a bare
+# `diff_native_hist` selector, or `sum(diff_native_hist_agg)` without a
+# `histogram_count`/`histogram_sum` wrapper) need a histogram-aware comparator,
+# deferred with the read path. Entries that would make Prometheus emit a
+# warning/info annotation (mixed classic+native, float+histogram aggregation)
+# are deliberately excluded: Ravel has no annotation channel yet (#178) and the
+# comparator matches warning presence, so such entries would mismatch on the
+# annotation rather than the value. Those behaviors are pinned by ravel-promql
+# unit tests instead (tests/histogram_native.rs) and listed in the P11 report.
+#
+# Dataset: diff_native_hist{kind="counter"} is a monotonic counter native
+# histogram (schema 0, three positive buckets, populated zero bucket).
+# diff_native_hist_agg{i="1"|"2"} are two constant native histograms for
+# aggregation.
+
+name: native_histogram_count
+query: histogram_count(diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_sum
+query: histogram_sum(diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_avg
+query: histogram_avg(diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_quantile_median
+query: histogram_quantile(0.5, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_quantile_phi_out_of_range
+query: histogram_quantile(1.5, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_fraction
+query: histogram_fraction(0, 4, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_rate_count
+query: histogram_count(rate(diff_native_hist[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_increase_sum
+query: histogram_sum(increase(diff_native_hist[5m]))
+kind: instant
+time: +600s
+mode: unordered
+
+name: native_histogram_sum_aggregation_count
+query: histogram_count(sum(diff_native_hist_agg))
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_avg_aggregation_sum
+query: histogram_sum(avg(diff_native_hist_agg))
+kind: instant
+time: +0s
+mode: unordered

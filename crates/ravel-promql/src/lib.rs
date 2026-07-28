@@ -22,6 +22,7 @@ mod aggregate;
 mod binop;
 mod eval;
 mod functions;
+pub mod histogram;
 mod matchers;
 mod plan;
 mod source;
@@ -31,6 +32,10 @@ pub use eval::{
     DEFAULT_LOOKBACK_NS, DEFAULT_MAX_RANGE_POINTS, DEFAULT_SUBQUERY_STEP_NS, Error, Evaluator,
     InstantSample, InstantVector, RangeMatrix, Value, ms_to_ns, ns_to_ms_floor,
 };
+pub use histogram::{FloatHistogram, ResetHint, Span};
 pub use matchers::{from_ast_matcher, from_ast_matchers, has_or_group, matches_series};
 pub use plan::{PlanAnchor, SelectorPlan, plan_selectors};
-pub use source::{LabelMatcher, MatchOp, MatcherError, SeriesData, SeriesSource, SourceError};
+pub use source::{
+    HistogramSample, HistogramSeriesData, LabelMatcher, MatchOp, MatcherError, SeriesData,
+    SeriesSource, SourceError,
+};
