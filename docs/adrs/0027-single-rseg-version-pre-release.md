@@ -42,6 +42,12 @@ data nobody depends on.
    not the writer tier, is what protects small objects. The one-flip
    question tracked in #140 (which version L0 should move to)
    dissolves: there is only one version to write.
+   Addendum (2026-07-28, from the #179 implementation): an L0 flush is
+   not a compaction output, so the raw-sample write adapters stamp
+   sentinel compaction-meta values: level 0, part_index 0, an all-zero
+   input_set_hash, and per-run created_unix_ns equal to
+   ingest_bounds.max_ingest_ts_ns. This is the normative L0 provenance
+   convention; the compactor and sweeper key off these fields.
 3. v1-v4 write paths, reader fallbacks, golden files, fuzz seeds, and
    bench builders are deleted, not deprecated. v5 goldens become the
    baseline. Corrupt-input seeds carrying trailer versions 1-4 stay,
