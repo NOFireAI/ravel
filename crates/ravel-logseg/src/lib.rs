@@ -16,8 +16,10 @@ pub mod block;
 pub mod bloom;
 pub mod encoding;
 pub mod error;
+pub mod field_dir;
 pub mod page;
 pub mod record;
+pub mod stream_dir;
 pub mod tokenizer;
 pub mod varint;
 
