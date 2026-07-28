@@ -1,11 +1,17 @@
-# ADR-0022: Floating aggregate exactness: allowlisted v1 subset, sequential sum and avg UDAFs, second-moment family excluded
+# ADR-0022: Floating aggregate exactness: allowlisted v1 subset, avg admitted via a sequential UDAF, second-moment family excluded
 
-Status: Proposed (2026-07-28). Resolves the half of review finding F7
+Status: Accepted (2026-07-28). Resolves the half of review finding F7
 (docs/reviews/2026-07-27-arrow-datafusion-plan-review.md) that the plan
 deferred to a future ADR, and issue #160. Companion to ADR-0013; amends
 the v1 aggregate subset in docs/arrow-datafusion-plan.md section 2.
 Grouped min/max total-order semantics (issue #143) are a sibling gap
-decided separately in ADR-0023; this ADR does not touch them.
+decided separately in ADR-0023; this ADR does not touch them. Whether
+the built-in `sum` should also move to a sequential-fold UDAF (for
+architecture-independent results and so it agrees bit-for-bit with the
+`avg` UDAF this ADR admits) is intentionally out of scope: `sum` is
+already an admitted, shipping, gated aggregate, and changing its output
+bits is a separate decision from the admission policy this ADR sets.
+That question is tracked, not decided, in ADR-0024 (Proposed).
 
 ## Context
 
@@ -86,11 +92,17 @@ What the pinned datafusion 54.1.0 accumulators actually do
    promised `avg` returns when an ADR pins its semantics. Rejected for
    `avg`, adopted for the second-moment family.
 4. Hybrid with allowlist enforcement (chosen): admit `avg` as a custom
-   sequential UDAF, replace the built-in `sum` with the same summation
-   so `avg(x)` equals `sum(x)/count(x)` bit-for-bit on the engine
-   surface, exclude the second-moment family, and flip enforcement from
-   blacklist to allowlist so exclusion is the default state for
-   everything not explicitly admitted.
+   sequential UDAF with its own internal, independent summation over its
+   own operands (not derived from or shared with the public `sum`
+   aggregate), exclude the second-moment family, and flip enforcement
+   from blacklist to allowlist so exclusion is the default state for
+   everything not explicitly admitted. This does not make `avg(x)`
+   bit-identical to `sum(x)/count(x)` against today's built-in `sum` (a
+   lane-parallel kernel, unpinnable per the Context section); that
+   coherence property is real but is a reason to consider changing
+   `sum`, a separate, already-shipping, already-gated surface, which
+   ADR-0024 takes up on its own rather than folding into this admission
+   decision.
 
 ## Decision
 
@@ -117,40 +129,33 @@ What the pinned datafusion 54.1.0 accumulators actually do
    the default session registers, so a version bump that adds an
    aggregate breaks the test instead of silently widening the surface.
    `reject_grouped_min_max` remains a separate check owned by ADR-0023.
-3. **Summation semantics** (for `sum`, and inside `avg`): the left fold
-   of plain IEEE f64 addition over the non-null input values in the
+3. **Summation semantics inside `avg`'s own UDAF** (this does not touch
+   the public `sum` aggregate, which stays DataFusion's built-in,
+   unchanged; see ADR-0024): `avg`'s internal numerator is the left fold
+   of plain IEEE f64 addition over its own non-null input values in the
    deterministic (series_id, ts) order, initialized with the first value
-   rather than a zero seed. Empty input yields NULL; a group of all
-   -0.0 values sums to -0.0. Naive summation, not Kahan: compensation
-   buys no exactness here (the gate compares against a reference running
-   the identical algorithm either way), it would diverge from the
-   grouped `sum` fold already shipped and golden-pinned, and it would
-   break the `SUM`/`COUNT` identity the `avg` rejection message has been
-   promising as the workaround. Higher-accuracy summation is a different
-   decision and re-enters through this same admission rule if ever
-   wanted.
-4. **`avg`/`mean` are admitted via a custom UDAF**: the decision-3 sum
-   divided by the non-null row count in one correctly rounded IEEE
+   rather than a zero seed. Empty input yields NULL; a group of all -0.0
+   values folds to -0.0. Naive summation, not Kahan: compensation buys no
+   exactness here, since the gate compares against a reference running
+   the identical algorithm either way, and higher-accuracy summation is a
+   different decision that re-enters through this same admission rule if
+   ever wanted.
+4. **`avg`/`mean` are admitted via a custom UDAF**: decision 3's internal
+   fold divided by the non-null row count in one correctly rounded IEEE
    division; a zero count yields NULL, never NaN or infinity. The row
    materialization cap keeps counts far below 2^53, so the count is
    exact as f64. Registered under both names, replacing the built-in
-   whose lane-reduced batch sum is unpinnable.
-5. **The built-in `sum` is replaced** by a custom UDAF with decision-3
-   semantics. This lifts the restricted proptest pool for ungrouped
-   `sum` (the documented B3 deviation) to the full adversarial pool. Two
-   edge behaviors change: ungrouped sums over values with inexact
-   partial sums move from architecture-dependent lane-order bits to the
-   sequential fold's bits, and an all-(-0.0) group changes from +0.0
-   (the built-in grouped accumulator's zero seed) to -0.0. Golden pins
-   update in the same commit.
-6. **The second-moment family is excluded**: `stddev`, `stddev_pop`,
+   `avg`/`mean` whose lane-reduced batch sum is unpinnable. This
+   replacement is scoped to the `avg`/`mean` names only and has no effect
+   on the separately-registered `sum` UDAF.
+5. **The second-moment family is excluded**: `stddev`, `stddev_pop`,
    `var`, `var_pop`, `covar_samp`, `covar_pop`, `corr`, their aliases,
    and the `regr_*` regression aggregates, along with every other
    default aggregate outside the admitted set, all through decision 2.
    Readmission of any of them is a custom UDAF meeting decision 1 with
    its recurrence named in the plan document; that is an implementation
    ticket plus a plan amendment, not a new ADR.
-7. **Gate evidence before an admitted function ships**: (a) golden cases
+6. **Gate evidence before an admitted function ships**: (a) golden cases
    with stored expected bits for architecture-independent results:
    exact finite sums, signed infinities, -0.0 preservation, empty and
    all-NULL inputs; (b) golden NaN cases asserting engine-vs-reference
@@ -162,11 +167,11 @@ What the pinned datafusion 54.1.0 accumulators actually do
    synthesizes one; (c) proptest over the full adversarial pool, grouped
    and ungrouped, asserting bit-identical results; (d) the suite re-runs
    on every DataFusion version bump per the plan's upgrade policy.
-8. **Sequencing**: two tickets. First, exclusion: decision 2 lands with
+7. **Sequencing**: two tickets. First, exclusion: decision 2 lands with
    `avg`/`mean` still excluded, closing issue #160's live unverified
-   surface immediately. Second, admission: decisions 3 to 5 and 7 land
+   surface immediately. Second, admission: decisions 3, 4 and 6 land
    together, flipping `avg`/`mean` into the allowlist in the same commit
-   as the UDAFs and their gate evidence.
+   as the UDAF and its gate evidence.
 
 ## Consequences
 
@@ -180,13 +185,15 @@ What the pinned datafusion 54.1.0 accumulators actually do
   and registration. The audit acceptance test
   (`stddev_and_variance_family_must_be_handled_like_avg`) passes without
   a per-function reject list to maintain.
-- `sum`'s bits change in the two edges named in decision 5. The prior
-  ungrouped behavior was architecture-dependent and never a stable
-  contract, and -0.0 preservation is the IEEE-consistent answer, but any
-  consumer bit-comparing results across the upgrade sees the change.
-- Ravel takes on two small custom UDAFs to maintain; in exchange the
-  differential gate loses its one documented deviation and the reference
-  executor stays independent instead of mirroring upstream internals.
+- The public `sum` aggregate is untouched by this ADR: its bits, and its
+  documented restricted-pool gate deviation (crates/ravel-sql/tests/
+  differential.rs), stay exactly as they are today. `avg(x)` computed by
+  the new UDAF is therefore not guaranteed bit-identical to
+  `sum(x)/count(x)` computed via the current built-in `sum` in every
+  case; ADR-0024 (Proposed, undecided) takes up whether to change that.
+- Ravel takes on one small custom UDAF (`avg`/`mean`) to maintain; the
+  differential gate gains full-pool coverage for it without needing to
+  mirror upstream's unpinnable internals.
 - Dispersion statistics stay unavailable on the SQL surface. A user can
   compose them from admitted aggregates (`sum(v*v)`, `sum(v)`,
   `count(v)`); each admitted aggregate is exact, and the numerical
