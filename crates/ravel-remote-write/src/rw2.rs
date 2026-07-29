@@ -90,26 +90,49 @@ pub enum Rw2DecodeError {
         symbol_ref: u32,
         symbols_len: usize,
     },
+
+    #[error(
+        "resolved label bytes {resolved_bytes} exceed the budget of {budget_bytes} bytes ({RESOLVED_LABEL_BUDGET_MULTIPLIER}x max_decompressed_bytes)"
+    )]
+    ResolvedLabelBudgetExceeded {
+        resolved_bytes: usize,
+        budget_bytes: usize,
+    },
 }
+
+/// `labels_refs` indexes are cheap on the wire (a handful of varint bytes
+/// each) but every occurrence clones a full symbol string on resolution.
+/// `symbols` itself already costs one byte of the decompressed body per
+/// byte of string, so legitimate reuse of a small label vocabulary across
+/// many series is what the decompressed-size cap is already sized for;
+/// this multiplier gives that reuse generous headroom while still bounding
+/// how many multiples of the wire size an adversarial `labels_refs` list
+/// (many refs, few but large symbols) can blow up into.
+const RESOLVED_LABEL_BUDGET_MULTIPLIER: usize = 16;
 
 /// Decompress and decode `body` as an RW2 `Request`.
 ///
 /// `max_decompressed_bytes` bounds the snappy output size, checked before
-/// the output buffer is allocated (see [`crate::snappy::decompress`]).
+/// the output buffer is allocated (see [`crate::snappy::decompress`]), and
+/// also derives the budget for cumulative resolved label bytes (see
+/// [`Rw2DecodeError::ResolvedLabelBudgetExceeded`]).
 pub fn decode_request(
     body: &[u8],
     max_decompressed_bytes: usize,
 ) -> Result<ResolvedRequest, Rw2DecodeError> {
     let raw = snappy::decompress(body, max_decompressed_bytes)?;
     let req = Request::decode(raw.as_slice())?;
-    resolve(req)
+    let resolved_label_budget =
+        max_decompressed_bytes.saturating_mul(RESOLVED_LABEL_BUDGET_MULTIPLIER);
+    resolve(req, resolved_label_budget)
 }
 
-fn resolve(req: Request) -> Result<ResolvedRequest, Rw2DecodeError> {
+fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest, Rw2DecodeError> {
     let symbols = req.symbols;
     let mut series = Vec::with_capacity(req.timeseries.len());
     let mut metadata_count = 0usize;
     let mut created_timestamps_count = 0usize;
+    let mut resolved_label_bytes = 0usize;
     for (series_index, ts) in req.timeseries.into_iter().enumerate() {
         series.push(resolve_series(
             series_index,
@@ -117,6 +140,8 @@ fn resolve(req: Request) -> Result<ResolvedRequest, Rw2DecodeError> {
             &symbols,
             &mut metadata_count,
             &mut created_timestamps_count,
+            &mut resolved_label_bytes,
+            resolved_label_budget,
         )?);
     }
     Ok(ResolvedRequest {
@@ -126,14 +151,23 @@ fn resolve(req: Request) -> Result<ResolvedRequest, Rw2DecodeError> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_series(
     series_index: usize,
     ts: ProtoTimeSeriesV2,
     symbols: &[String],
     metadata_count: &mut usize,
     created_timestamps_count: &mut usize,
+    resolved_label_bytes: &mut usize,
+    resolved_label_budget: usize,
 ) -> Result<ResolvedSeries, Rw2DecodeError> {
-    let labels = resolve_label_refs(series_index, &ts.labels_refs, symbols)?;
+    let labels = resolve_label_refs(
+        series_index,
+        &ts.labels_refs,
+        symbols,
+        resolved_label_bytes,
+        resolved_label_budget,
+    )?;
 
     for (exemplar_index, exemplar) in ts.exemplars.iter().enumerate() {
         validate_exemplar_label_refs(
@@ -194,6 +228,8 @@ fn resolve_label_refs(
     series_index: usize,
     labels_refs: &[u32],
     symbols: &[String],
+    resolved_label_bytes: &mut usize,
+    resolved_label_budget: usize,
 ) -> Result<Vec<Label>, Rw2DecodeError> {
     if !labels_refs.len().is_multiple_of(2) {
         return Err(Rw2DecodeError::OddLabelRefsLength {
@@ -229,6 +265,13 @@ fn resolve_label_refs(
                 symbol_ref: value_ref,
                 symbols_len: symbols.len(),
             })?;
+        *resolved_label_bytes += name.len() + value.len();
+        if *resolved_label_bytes > resolved_label_budget {
+            return Err(Rw2DecodeError::ResolvedLabelBudgetExceeded {
+                resolved_bytes: *resolved_label_bytes,
+                budget_bytes: resolved_label_budget,
+            });
+        }
         labels.push(Label {
             name: name.clone(),
             value: value.clone(),
@@ -599,6 +642,47 @@ mod tests {
                 symbol_ref: 99,
                 ..
             }
+        ));
+    }
+
+    // --- resolved-label byte budget: bounds clones, not just wire bytes ---
+
+    #[test]
+    fn resolved_label_budget_exceeded_before_full_resolution() {
+        // A small symbol table (one 10-byte name, one 100-byte value) with
+        // labels_refs repeating the same pair 500 times: the wire and
+        // decompressed body stay tiny (cheap u32 indices), but resolution
+        // would clone 500 * (10 + 100) = 55_000 bytes, far past the budget
+        // derived from a 2_000-byte decompressed cap.
+        let name = "n".repeat(10);
+        let value = "v".repeat(100);
+        let syms = symbols(&[&name, &value]);
+        let mut labels_refs = Vec::with_capacity(1_000);
+        for _ in 0..500 {
+            labels_refs.push(1u32);
+            labels_refs.push(2u32);
+        }
+        let req = request(
+            syms,
+            vec![ProtoTimeSeriesV2 {
+                labels_refs,
+                samples: vec![],
+                histograms: vec![],
+                exemplars: vec![],
+                metadata: None,
+            }],
+        );
+        let body = compress(&req.encode_to_vec());
+        assert!(
+            body.len() < 2_000,
+            "test body must stay small to prove the rejection isn't just the decompression cap: {}",
+            body.len()
+        );
+
+        let err = decode_request(&body, 2_000).expect_err("resolved label budget must reject");
+        assert!(matches!(
+            err,
+            Rw2DecodeError::ResolvedLabelBudgetExceeded { .. }
         ));
     }
 
