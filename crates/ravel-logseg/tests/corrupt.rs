@@ -8,13 +8,24 @@
 use proptest::prelude::*;
 use ravel_logseg::{
     AttrValue, LogRecord, LogStreamId, ObjectIdentity, Predicate, RlogConfig, RlogReader,
-    RlogWriter,
+    RlogWriter, stream_attrs_bytes,
 };
 
 fn sid(n: u8) -> LogStreamId {
     let mut a = [0u8; 16];
     a[0] = n;
     LogStreamId(a)
+}
+
+/// The canonical resource+scope blob for synthetic stream `n`. Every record of
+/// a stream must carry the same bytes, so it is derived from `n` alone.
+fn stream_blob(n: u8) -> Vec<u8> {
+    stream_attrs_bytes(
+        &[("service.name".to_string(), AttrValue::Str(format!("s{n}")))],
+        "scope",
+        "1",
+        &[],
+    )
 }
 
 /// A varied fixture: several streams, attrs of every scalar type plus bytes,
@@ -46,6 +57,7 @@ fn fixture() -> (Vec<LogRecord>, Vec<u8>) {
         }
         corpus.push(LogRecord {
             stream_id: sid(stream),
+            stream_attrs: stream_blob(stream),
             ts_ns: i,
             observed_ts_ns: i + 1,
             severity_num: (i % 24) as u8,
