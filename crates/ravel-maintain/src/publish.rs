@@ -27,7 +27,10 @@ pub enum PublishOutcome {
     Converged { parts_repaired: usize },
     /// The `max_compaction_lifetime` deadline passed before the record PUT;
     /// the run abandoned and did NOT publish (plan §3.4 point 4). Its parts
-    /// age out as unreferenced (sweep, phase 6).
+    /// age out as unreferenced (sweep rule 3) only once some compaction record
+    /// already exists for the bucket; parts of a bucket that has never had a
+    /// successful compaction record published are not collectable by rule 3
+    /// (its standing precondition; docs/consistency-model.md, plan §5).
     Abandoned,
 }
 

@@ -47,6 +47,7 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
+use crate::read::verify_commit_key;
 
 /// A hook the sweeper consults before every delete, in all three rules. The
 /// only implementation today is [`NoLeases`] (nothing is ever protected); this
@@ -247,6 +248,12 @@ pub async fn sweep_superseded(
             match store.get(&commit_key, GetRange::Full).await {
                 Ok(got) => {
                     let rec = record::decode(&got.data)?;
+                    // The record's key must reconstruct to the key we fetched
+                    // it at (ADR-0010 §7): a corrupted-but-decodable input
+                    // record's own fields, which reconstruct_data_key trusts,
+                    // must not name a data object outside the bucket this key
+                    // implies (mirrors read::load_inputs).
+                    verify_commit_key(&rec, &commit_key)?;
                     let data_key = keys::reconstruct_data_key(&rec)?;
                     record_keys.push(commit_key);
                     data_keys.push(data_key);
