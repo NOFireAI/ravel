@@ -298,8 +298,12 @@ impl Catalog {
         }
 
         // Tombstone present: the bucket contributes nothing (ADR-0019,
-        // docs/catalog-and-mvcc.md step 3).
+        // docs/catalog-and-mvcc.md step 3). Observing the tombstone also
+        // invalidates this bucket's cached commit and compaction records
+        // (ADR-0010 §10's promised trigger), so a later token-fallback GET
+        // cannot serve a record the retention sweep is about to remove.
         if has_tombstone {
+            self.invalidate_bucket_cache(tenant, &prefix);
             return Ok(());
         }
 
@@ -455,6 +459,18 @@ impl Catalog {
         Ok(record)
     }
 
+    /// Drop the cached commit and compaction records for one bucket, keyed by
+    /// its `c/<shard>/<hour>/` prefix. The single tombstone-observation
+    /// invalidation path (ADR-0010 §10): called from both the listing resolve
+    /// and the token fallback the moment a tombstone is seen. Both record
+    /// caches key by full object key, and every record in a bucket shares this
+    /// prefix, so one prefix drop clears the bucket from both.
+    fn invalidate_bucket_cache(&self, tenant: &TenantHash, bucket_prefix: &str) {
+        self.cache.invalidate_prefix(tenant, bucket_prefix);
+        self.compaction_cache
+            .invalidate_prefix(tenant, bucket_prefix);
+    }
+
     async fn resolve_min_token(
         &self,
         tenant: &TenantHash,
@@ -551,7 +567,13 @@ impl Catalog {
         let mut compaction_keys: Vec<String> = Vec::new();
         for meta in objects {
             match keys::partition_bucket_entry(&meta.key)? {
-                BucketEntry::Tombstone(_) => return Ok(()),
+                BucketEntry::Tombstone(_) => {
+                    // Satisfied with zero segments (ADR-0019 decision 3), and
+                    // observing the tombstone invalidates this bucket's cached
+                    // records (ADR-0010 §10), same as the listing path.
+                    self.invalidate_bucket_cache(tenant, &prefix);
+                    return Ok(());
+                }
                 BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
                 BucketEntry::CommitRecord(_) => {}
             }
@@ -1494,6 +1516,168 @@ mod tests {
             store.fault_count(Op::Get, FaultKind::NotFoundBlip),
             2,
             "both NotFound blips fired"
+        );
+    }
+
+    // --- Retention (ADR-0019): tombstone exclusion, token semantics, and the
+    // ADR-0010 §10 cache-invalidation-on-tombstone trigger. ---
+
+    /// Write a retention tombstone into a bucket, exactly as ravel-maintain's
+    /// retention sweep would.
+    async fn write_tombstone(store: &MemoryStore, shard: u32, ingest_hour_bucket: u32) {
+        let tombstone = ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket,
+            retired_at_ns: 0,
+            retention_window_ns: 0,
+            record_count_observed: 0,
+        };
+        let key = keys::retention_tombstone_key_for(&tombstone).expect("tombstone key");
+        store
+            .put(
+                &key,
+                tombstone.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put tombstone");
+    }
+
+    /// A resolver that lists a tombstone excludes the entire bucket from the
+    /// snapshot (ADR-0019 decision 3).
+    #[tokio::test]
+    async fn tombstoned_bucket_is_excluded_from_resolution() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = 500_000 * NS_PER_HOUR;
+        publish_segment(&store, 0, 1, 500_000, now, now - 100, now).await;
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+
+        // Baseline: the segment resolves.
+        let before = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect("resolve");
+        assert_eq!(before.segments.len(), 1);
+
+        // Tombstone the bucket: it now contributes nothing.
+        write_tombstone(&store, 0, 500_000).await;
+        let after = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect("resolve");
+        assert!(after.segments.is_empty(), "tombstoned bucket excluded");
+    }
+
+    /// A `min_commit_token` whose bucket is tombstoned resolves as satisfied
+    /// with zero segments, not `unsatisfiable token`: the data was retired on
+    /// purpose (ADR-0019 decision 3). Uses a skewed bucket outside the listing
+    /// window so only the exact-token path is exercised.
+    #[tokio::test]
+    async fn token_over_tombstoned_bucket_is_satisfied_with_zero_segments() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        let skewed_bucket = 500_000 - 10;
+        let skewed_created = i64::from(skewed_bucket) * NS_PER_HOUR + 10 * 60_000_000_000;
+        let record = publish_segment(
+            &store,
+            0,
+            1,
+            skewed_bucket,
+            skewed_created,
+            skewed_created,
+            skewed_created + 1_000,
+        )
+        .await;
+        let token = record::token_for(&record).expect("token");
+
+        // Retire the bucket and remove the commit record (post physical sweep).
+        write_tombstone(&store, 0, skewed_bucket).await;
+        let commit_key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("commit key");
+        store.delete(&commit_key).await.expect("delete commit record");
+
+        let snapshot = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+            .await
+            .expect("tombstoned token is satisfied, not unsatisfiable");
+        assert!(snapshot.segments.is_empty(), "satisfied with zero segments");
+    }
+
+    /// Observing a tombstone during resolution invalidates that bucket's
+    /// cached commit records (ADR-0010 §10). Proven on the token path: a
+    /// record cached before the tombstone would otherwise be served straight
+    /// from cache (bypassing the tombstone), but the listing pass's
+    /// invalidation drops it, so the token then resolves as satisfied-empty.
+    #[tokio::test]
+    async fn tombstone_observation_invalidates_cached_commit_records() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        // In-window bucket, so the listing pass observes the tombstone.
+        let bucket_hour = 500_000;
+        let record = publish_segment(&store, 0, 1, bucket_hour, now, now - 100, now).await;
+        let token = record::token_for(&record).expect("token");
+
+        // First resolve WITH the token: caches the commit record (listing pass
+        // and the exact-token path both populate the record cache).
+        let first = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(first.segments.len(), 1);
+
+        // Tombstone the bucket and delete the underlying commit record (a
+        // mid-sweep state: record gone, tombstone present). The cache still
+        // holds the record.
+        write_tombstone(&store, 0, bucket_hour).await;
+        let commit_key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("commit key");
+        store.delete(&commit_key).await.expect("delete commit record");
+
+        // Resolve WITH the token again. The listing pass observes the tombstone
+        // and invalidates the bucket's cache; the token path then misses the
+        // cache, GETs NotFound, falls back, sees the tombstone, and is
+        // satisfied with zero segments. Without invalidation, the token path
+        // would hit the stale cache and wrongly return the segment.
+        let second = catalog
+            .resolve(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+            .await
+            .expect("resolve");
+        assert!(
+            second.segments.is_empty(),
+            "invalidated cache: tombstoned bucket serves nothing on the token path"
         );
     }
 }
