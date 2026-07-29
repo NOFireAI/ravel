@@ -2,17 +2,26 @@
 
 ## Endpoints
 
-`ravel-server` accepts OTLP metrics on two transports, both bound by
-`--listen-http` (default `127.0.0.1:4318`) and `--listen-grpc` (default
+`ravel-server` accepts OTLP metrics and logs on two transports, both bound
+by `--listen-http` (default `127.0.0.1:4318`) and `--listen-grpc` (default
 `127.0.0.1:4317`):
 
 - `POST /v1/metrics` over HTTP, body is a binary-encoded
   `ExportMetricsServiceRequest` (`Content-Type: application/x-protobuf`).
 - `opentelemetry.proto.collector.metrics.v1.MetricsService/Export` over
   gRPC.
+- `POST /v1/logs` over HTTP, body is a binary-encoded
+  `ExportLogsServiceRequest` (`Content-Type: application/x-protobuf`).
+  Responds with a binary `ExportLogsServiceResponse`.
+- `opentelemetry.proto.collector.logs.v1.LogsService/Export` over gRPC.
 
-Both are only present when `ravel-server` runs in `--mode all` (the
-default) or `--mode gateway`; `--mode query` starts neither.
+All four are only present when `ravel-server` runs in `--mode all` (the
+default) or `--mode gateway`; `--mode query` starts none of them.
+
+Authentication, the strict/buffered mode header, the commit-token
+header, and the status-code mapping are identical on all four: a log export
+is a metrics export with a different payload and a different keyspace
+underneath. Traces and profiles are not accepted on any transport yet.
 
 ## Authentication
 
@@ -162,3 +171,90 @@ event time close enough to ingest time that this holds:
 
 Both bounds are inclusive: a skew or lag exactly equal to the limit is
 accepted, one nanosecond past it is rejected.
+
+## Logs
+
+Everything above about authentication, strict vs. buffered acknowledgement,
+and commit tokens applies unchanged to `POST /v1/logs` and the gRPC
+`LogsService`. What follows is what differs.
+
+```sh
+curl -X POST http://127.0.0.1:4318/v1/logs \
+  -H 'authorization: Bearer devtoken' \
+  -H 'content-type: application/x-protobuf' \
+  --data-binary @logs.pb
+```
+
+A strict-mode log export returns `200` with a binary
+`ExportLogsServiceResponse` body and one `x-ravel-commit-token` per shard
+that flushed, exactly like a metrics export. An unresolvable tenant is
+`401`, an undecodable protobuf body is `400`, and a write the log pipeline
+could not accept is `503`.
+
+Log records are durable in RLOG objects under the tenant's `l` keyspace once
+the strict ack returns. **There is no query surface over logs yet**: the
+catalog fold task still runs for metrics only, so a log commit token cannot
+be passed as `min_commit_token` to any endpoint, and no PromQL or SQL query
+reads log data. Today the way to read a log object back is
+`ravel-cli rlog inspect`
+([inspecting-data.md](inspecting-data.md)). Log query is a later phase.
+
+### Log admission limits
+
+Defaults ([crates/ravel-otlp/src/logs_limits.rs](../../crates/ravel-otlp/src/logs_limits.rs)),
+not currently configurable via `ravel-server` flags:
+
+| Limit | Default |
+|---|---|
+| `max_records_per_request` | 100,000 |
+| `max_attributes_per_record` | 128 |
+| `max_attribute_key_len` | 256 bytes |
+| `max_attribute_value_len` | 8,192 bytes |
+| `max_body_len` | 65,536 bytes |
+| `max_resource_attributes` | 128 |
+| `max_scope_attributes` | 64 |
+
+The body and attribute-value ceilings are deliberately wider than the metric
+equivalents: a log body carries a message or a stack trace where a metric
+label value carries an identifier. The asymmetry is intentional.
+
+Admission ordering: these limits are checked after the whole request has
+been decoded into memory, on both transports. They bound per-record work and
+what reaches the shard buffer; they do not bound decode-time allocation,
+which only the transport's body/message size limit bounds.
+
+### Log rejections
+
+Same partial-success contract as metrics, with
+`ExportLogsPartialSuccess.rejected_log_records` and a combined
+`error_message`. Admitted records are still ingested and acknowledged. The
+`error_message` aggregates by distinct reason with a per-reason count and is
+capped in length, so a request rejected wholesale does not produce a
+response string proportional to its record count.
+
+Every rejection reason ([crates/ravel-otlp/src/logs_limits.rs](../../crates/ravel-otlp/src/logs_limits.rs)):
+
+| Rejection | Meaning |
+|---|---|
+| `TooManyRecords` | Whole request exceeds `max_records_per_request`; nothing in the request is admitted. |
+| `TooManyResourceAttributes` | A `Resource` has more attributes than `max_resource_attributes`. Resource attributes are part of log stream identity, so nothing under that resource can be given one; every record under it is rejected. |
+| `TooManyScopeAttributes` | An instrumentation scope has more attributes than `max_scope_attributes`. Also part of stream identity, so every record under that scope is rejected. |
+| `TooManyAttributes` | One record has more attributes than `max_attributes_per_record`; that record is rejected. |
+| `AttributeKeyTooLong` | An attribute key exceeds `max_attribute_key_len`; that one attribute is dropped, not the record. |
+| `AttributeValueTooLong` | An attribute value's payload exceeds `max_attribute_value_len` (nested list and map entries count toward it); that one attribute is dropped, not the record. |
+| `BodyTooLong` | The record body, after normalization to a string, exceeds `max_body_len`; that record is rejected. |
+| `UnsupportedBodyKind` | The body is an OTLP `ArrayValue`, `KvlistValue`, or string-table reference. A structured body has no lossless string form, so the record is rejected rather than stringified by guess. |
+| `MissingAttributeValue` | An attribute arrived with its `value` field unset; that one attribute is dropped and reported, never silently discarded. |
+| `UnsupportedAttributeValue` | An attribute value is a string-table reference (`strindex`), which carries no value of its own; that one attribute is dropped. |
+| `Grouped` | Not a reason of its own: carries one of the reasons above plus the number of records it applies to, for a rejection that covers a whole resource or scope. Reported as that inner reason with a count. |
+
+Body normalization: a `StringValue` body passes through verbatim. `BoolValue`
+and `IntValue` become their plain string form, `DoubleValue` uses the same
+float formatting the metrics path uses, and `BytesValue` becomes a hex
+string. A record with no body at all normalizes to an empty body, which is
+legal OTLP, not a rejection.
+
+Malformed `trace_id`/`span_id` byte lengths normalize to absent rather than
+being padded or truncated: padding would fabricate an id that never existed.
+A record with neither `time_unix_nano` nor `observed_time_unix_nano` set
+(legal OTLP) takes the server's ingest timestamp for both.

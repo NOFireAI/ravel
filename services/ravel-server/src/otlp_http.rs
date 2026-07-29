@@ -1,4 +1,7 @@
-//! `POST /v1/metrics`: OTLP HTTP-protobuf metrics ingest.
+//! `POST /v1/metrics` and `POST /v1/logs`: OTLP HTTP-protobuf ingest. Both
+//! endpoints share this file's tenant resolution, write-mode header, and
+//! commit-token header handling; the signal-specific logic lives in
+//! [`crate::ingest`] and [`crate::logs_ingest`].
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,12 +12,14 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
 use ravel_ingest::WriteMode;
 use ravel_query::http::TenantResolver;
 
 use crate::ingest::IngestState;
+use crate::logs_ingest::LogIngestState;
 
 pub const INGEST_MODE_HEADER: &str = "x-ravel-ingest-mode";
 pub const COMMIT_TOKEN_HEADER: &str = "x-ravel-commit-token";
@@ -22,12 +27,40 @@ pub const COMMIT_TOKEN_HEADER: &str = "x-ravel-commit-token";
 pub struct GatewayState {
     pub tenant_resolver: Arc<dyn TenantResolver>,
     pub ingest: IngestState,
+    /// The log pipeline's counterpart of `ingest`. Separate router, separate
+    /// limits: logs flush RLOG objects under the `l` keyspace, metrics flush
+    /// RSEG under `m`, and nothing is shared between them but this struct.
+    pub logs_ingest: LogIngestState,
 }
 
 pub fn router(state: Arc<GatewayState>) -> Router {
     Router::new()
         .route("/v1/metrics", post(export_metrics))
+        .route("/v1/logs", post(export_logs))
         .with_state(state)
+}
+
+/// Attaches the encoded protobuf `body` as an OTLP response, plus the
+/// commit-token header when the write produced tokens. Shared by both
+/// endpoints: the header name is the same for either signal, and a client
+/// distinguishes them by which endpoint it called.
+fn otlp_response(body: Vec<u8>, tokens: &[ravel_types::CommitToken]) -> Response {
+    let mut response = Bytes::from(body).into_response();
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("application/x-protobuf"),
+    );
+    if !tokens.is_empty() {
+        let encoded = tokens
+            .iter()
+            .map(|token| token.encode())
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Ok(value) = HeaderValue::from_str(&encoded) {
+            response.headers_mut().insert(COMMIT_TOKEN_HEADER, value);
+        }
+    }
+    response
 }
 
 pub(crate) fn now_ns() -> i64 {
@@ -73,25 +106,47 @@ async fn export_metrics(
     };
 
     match crate::ingest::handle_export(&state.ingest, tenant, mode, request, now_ns()).await {
-        Ok(outcome) => {
-            let mut response = Bytes::from(outcome.response.encode_to_vec()).into_response();
-            response.headers_mut().insert(
-                "content-type",
-                HeaderValue::from_static("application/x-protobuf"),
-            );
-            if !outcome.tokens.is_empty() {
-                let encoded = outcome
-                    .tokens
-                    .iter()
-                    .map(|token| token.encode())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                if let Ok(value) = HeaderValue::from_str(&encoded) {
-                    response.headers_mut().insert(COMMIT_TOKEN_HEADER, value);
-                }
-            }
-            response
+        Ok(outcome) => otlp_response(outcome.response.encode_to_vec(), &outcome.tokens),
+        Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /v1/logs`. Same shape as [`export_metrics`], down to the status
+/// codes: 401 for an unresolvable tenant, 400 for an undecodable body, 503
+/// for a write the log pipeline could not accept.
+async fn export_logs(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let tenant = match state.tenant_resolver.resolve(&headers) {
+        Ok(tenant) => tenant,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let mode = write_mode_from_headers(&headers);
+
+    let request = match ExportLogsServiceRequest::decode(body.as_ref()) {
+        Ok(request) => request,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid OTLP payload: {err}"),
+            )
+                .into_response();
         }
+    };
+
+    match crate::logs_ingest::handle_export_logs(
+        &state.logs_ingest,
+        tenant,
+        mode,
+        request,
+        now_ns(),
+    )
+    .await
+    {
+        Ok(outcome) => otlp_response(outcome.response.encode_to_vec(), &outcome.tokens),
         Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
     }
 }

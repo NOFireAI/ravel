@@ -92,6 +92,65 @@ ordering falls out. If PUT latency limits per-shard throughput, Phase 2 can
 pipeline flushes (seq allocated at flush start, commits may land out of
 order; catalog tolerates seq gaps already).
 
+## Log pipeline
+
+Logs run a parallel pipeline, not a mode of the metrics one
+(ADR-0029, docs/superpowers/specs/2026-07-28-log-storage-design.md):
+
+```
+POST /v1/logs (axum) | logs.v1.LogsService/Export (tonic)
+  -> auth + tenant resolve (the same TenantResolver both metrics surfaces use)
+  -> normalize_logs (ravel-otlp::logs_normalize) -> Vec<NormalizedLogRecord> + rejects
+  -> LogIngestRouter::write(tenant, records, mode) -> LogWriteReceipt
+```
+
+`LogIngestRouter` and `LogShardActor` mirror `IngestRouter`/`ShardActor`
+structurally (one bounded mpsc channel and one actor task per shard, the
+same `IngestConfig` knobs, the same flush triggers, the same pinned
+writer identity, the same commit sequence) and diverge in exactly four
+places:
+
+- Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
+  with `SegmentWriter`. They land under the `l` keyspace
+  (`t/<tenant>/l/l0/...`); commit records under `t/<tenant>/l/c/...`.
+  `keys::data_key` and the commit protocol are already
+  `Signal`-parameterized, so nothing in `ravel-commit` changed for logs.
+- Routing is by log stream, `shard_for_log(stream_id, shard_count)`, with
+  the identical leading-8-bytes-mod-shard_count math `shard_for` uses on a
+  `SeriesId`. Unlike a `SeriesId`, a `LogStreamId` does not itself carry
+  the tenant: routing is tenant-scoped because each shard's buffer is keyed
+  by tenant, not because the id is.
+- There is no series-value-kind concept, so no per-series kind check on
+  merge. A log record's unit of identity is its `stream_id` plus the
+  canonical `stream_attrs` bytes that id was hashed from.
+- The fail-loud identity check does not live in the shard buffer. Where
+  `TenantBuf::merge` checks an incoming point's `series_id` against the
+  label set that id already claims (ADR-0005), `LogTenantBuf::merge` checks
+  nothing: `RlogWriter::finish()` already compares every buffered record's
+  `stream_attrs` for a shared `stream_id` and rejects the whole object with
+  `LogSegError::InconsistentStreamAttrs` (issue #225). The flush step maps
+  that one variant to `LogWriteError::StreamIdCollision` and counts it in
+  `stream_id_collisions`; every other `LogSegError` becomes
+  `LogWriteError::SegmentBuild`. Duplicating the check in the buffer would
+  be dead code with a second chance to drift.
+
+Commit-record fields the log flush fills differently: `sample_count` is the
+log record count (a record is the RLOG analogue of a sample), `series_count`
+is the number of distinct `stream_id`s in the batch (tracked in the actor,
+since `finish()` does not report it back), and `segment_format_version` is
+`LOG_SEGMENT_FORMAT_VERSION`, RLOG's own trailer version, not
+`SEGMENT_FORMAT_VERSION`.
+
+`LogIngestMetrics` mirrors `IngestMetrics` counter for counter under two
+renames that follow the unit change: `buffered_records_total` for
+`buffered_points_total`, `stream_id_collisions` for `series_id_collisions`.
+
+Snapshot resolution for logs is not wired: `services/ravel-server/src/fold.rs`
+still folds `Signal::Metrics` only, so `catalog/l/HEAD` is never produced
+and there is no query path over log objects yet. Ingest durability does not
+depend on it (a commit token resolves to its commit record directly), but a
+catalog-based read does; that is the log query phase's prerequisite.
+
 ## Modes
 
 `mode=strict` (default): ack after step 3 for every flush the request's
