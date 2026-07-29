@@ -16,12 +16,6 @@
 //! chance to drift, so the flush step maps that one `finish()` error variant
 //! to [`LogWriteError::StreamIdCollision`] instead.
 
-// The log router (next task in this phase) is the only non-test constructor of
-// `LogShardActor`; until it lands nothing in a non-test build references this
-// module, so `dead_code` would fire on every item. Removed once the router
-// wires `LogShardActor::new`/`run` in.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;

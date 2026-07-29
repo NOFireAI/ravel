@@ -10,6 +10,7 @@ mod config;
 mod error;
 mod log_error;
 mod log_metrics;
+mod log_router;
 mod log_shard;
 mod metrics;
 mod router;
@@ -21,6 +22,7 @@ pub use config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSIO
 pub use error::WriteError;
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
+pub use log_router::{LogIngestRouter, LogWriteReceipt};
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};
 pub use value::{IngestPoint, IngestValue};
