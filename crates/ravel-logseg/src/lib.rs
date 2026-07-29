@@ -29,7 +29,7 @@ pub mod varint;
 pub mod writer;
 
 pub use error::LogSegError;
-pub use reader::{RlogReader, ScanStats};
+pub use reader::{RlogReader, ScanStats, read_section};
 pub use record::{FieldSel, LogRecord, Predicate};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
 
