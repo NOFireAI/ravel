@@ -59,21 +59,6 @@ pub enum CatalogError {
     /// envelope codec's own validation (docs/metric-index-plan.md 3.1, 3.2).
     #[error("snapshot format error: {0}")]
     SnapshotFormat(#[from] SnapshotFormatError),
-    /// `fold` found two commit records sharing the same identity
-    /// (ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq)
-    /// while building a snapshot part. `encode_part` would also reject this,
-    /// but fold checks first so the error names the exact colliding
-    /// identity (docs/metric-index-plan.md section 4, step 5).
-    #[error(
-        "duplicate commit identity while folding: shard={shard} ingest_hour_bucket={ingest_hour_bucket} writer_id={writer_id} writer_epoch={writer_epoch} writer_seq={writer_seq}"
-    )]
-    DuplicateEntryIdentity {
-        shard: u32,
-        ingest_hour_bucket: u32,
-        writer_id: String,
-        writer_epoch: u64,
-        writer_seq: u64,
-    },
     /// `fold`'s HEAD CAS lost to a concurrent folder more times than the
     /// bounded retry budget allows (docs/metric-index-plan.md section 4,
     /// step 7). Not a correctness failure: the winning folder's HEAD is
