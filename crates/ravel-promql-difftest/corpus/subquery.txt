@@ -20,11 +20,23 @@ kind: instant
 time: +900s
 mode: unordered
 
+# ADR-0025 allowlist (arithmetic residue, same class as rate.txt's
+# rate/deriv/predict_linear entries): the inner rate() extrapolates over an
+# IEEE 754 delta/divide, then max_over_time and the outer subquery grid
+# carry that residue forward, so any gap is arithmetic residue rather than a
+# transcendental libm difference. Measured 1 ULP against the pinned
+# Prometheus v3.13.1 binary: the last grid point, 0.0952088821309351 vs
+# 0.09520888213093512, is a single f64::to_bits step apart, and it is the
+# only point in this matrix that differs (a fully observed value, not a
+# sampled worst case). tolerance: 2 is 1 ULP of headroom, matching the
+# sibling `instant_subquery_at_modifier_pins_the_grids_own_end` entry below
+# and rate.txt's own 1-ULP entries.
 name: instant_nested_subquery_through_an_intervening_range_function
 query: max_over_time(rate(diff_counter_total{shape="reset"}[2m])[5m:1m])[10m:2m]
 kind: instant
 time: +1080s
 mode: unordered
+tolerance: 2
 
 name: instant_subquery_step_defaults_to_the_evaluation_interval
 query: avg_over_time(diff_gauge_walk[5m:])
@@ -151,21 +163,24 @@ mode: unordered
 # docs/adrs/0030-promql-subquery-point-cap-divergence.md for the full
 # investigation and decision.
 #
-# These stay `mode: error`: it encodes Ravel's own expected behavior,
-# and the per-node cap itself stays covered by ravel-promql's eval.rs
-# unit tests. The comparator (comparator.rs) has no mode for "Ravel
-# errors by design, Prometheus succeeds"; ADR-0030 records that gap and
-# the harness follow-up needed to turn these green rather than
-# known-divergent, which is outside this corpus-only change.
+# These use `mode: ravel_error_prom_success`, the comparator's ADR-0030
+# one-sided-divergence allowlist (comparator.rs): it asserts exactly this
+# shape, Ravel errors by design and Prometheus succeeds, and treats any
+# other outcome (both erroring, both succeeding, Prometheus erroring) as a
+# real mismatch. ADR-0030 recorded this as a follow-up when it first
+# accepted the divergence with the entries still `mode: error`; issue #228
+# is that follow-up, adding the comparator mode so the entries turn green
+# rather than staying manually known-divergent. The per-node cap itself
+# stays covered by ravel-promql's eval.rs unit tests.
 
 name: error_subquery_grid_exceeds_the_point_cap
 query: max_over_time(diff_gauge_walk[100d:1s])
 kind: instant
 time: +0s
-mode: error
+mode: ravel_error_prom_success
 
 name: error_nested_subquery_inner_grid_exceeds_the_point_cap
 query: avg_over_time(max_over_time(diff_gauge_walk[50d:1s])[1m:1s])
 kind: instant
 time: +0s
-mode: error
+mode: ravel_error_prom_success
