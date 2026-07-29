@@ -24,7 +24,7 @@ use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
-use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -227,6 +227,7 @@ async fn write_segment(
         writer_epoch: spec.writer_epoch,
         writer_seq: spec.writer_seq,
         created_unix_ns: spec.created_unix_ns,
+        level: SegmentLevel::L0,
     }
 }
 
