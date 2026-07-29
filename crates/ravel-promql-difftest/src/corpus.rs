@@ -39,6 +39,13 @@
 //! needs a comment above the entry explaining why exact bits are
 //! unattainable and where the tolerance number came from; see
 //! docs/adrs/0025-promql-differential-float-precision-residue.md.
+//!
+//! `mode` is one of `unordered`, `ordered`, `error`, or
+//! `ravel_error_prom_success`. The last (ADR-0030's allowlist) marks an
+//! accepted one-sided divergence: Ravel rejects the query by design and
+//! Prometheus accepts it. Like `tolerance`, every use needs a comment above
+//! the entry citing the accepting ADR; see
+//! docs/adrs/0030-promql-subquery-point-cap-divergence.md.
 
 use std::fmt;
 
@@ -50,6 +57,15 @@ pub enum ComparisonMode {
     Ordered,
     /// Both sides must reject the query; compared by `errorType` class.
     ExpectError,
+    /// ADR-0030 one-sided divergence allowlist: Ravel rejects the query by
+    /// design (a per-subquery-node point-cap budget with no Prometheus
+    /// counterpart) while Prometheus accepts it. The comparator asserts
+    /// exactly that shape (Ravel errors, Prometheus succeeds); it is not a
+    /// blanket "any disagreement is fine". Every use needs a comment above
+    /// the entry citing the ADR that accepts the divergence, mirroring the
+    /// `tolerance` field's ADR-0025 justification rule. See
+    /// docs/adrs/0030-promql-subquery-point-cap-divergence.md.
+    RavelErrorPromSuccess,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -221,11 +237,15 @@ fn build_entry(
         "unordered" => ComparisonMode::Unordered,
         "ordered" => ComparisonMode::Ordered,
         "error" => ComparisonMode::ExpectError,
+        "ravel_error_prom_success" => ComparisonMode::RavelErrorPromSuccess,
         other => {
             return Err(err(
                 index,
                 mode_line,
-                format!("unknown mode '{other}', expected 'unordered', 'ordered', or 'error'"),
+                format!(
+                    "unknown mode '{other}', expected 'unordered', 'ordered', 'error', or \
+                     'ravel_error_prom_success'"
+                ),
             ));
         }
     };
@@ -393,10 +413,23 @@ mode: error
         let entries =
             parse_corpus(include_str!("../corpus/subquery.txt")).expect("parse subquery corpus");
         assert!(entries.len() >= 9);
+        // The two point-cap entries are the accepted ADR-0030 one-sided
+        // divergence (Ravel errors by design, Prometheus succeeds); they
+        // used to be `mode: error` before the comparator gained a mode for
+        // that shape (issue #228).
         assert!(
             entries
                 .iter()
-                .any(|e| e.mode == ComparisonMode::ExpectError)
+                .any(|e| e.mode == ComparisonMode::RavelErrorPromSuccess)
         );
+    }
+
+    #[test]
+    fn parses_the_ravel_error_prom_success_mode() {
+        let entries = parse_corpus(
+            "name: cap\nquery: up\nkind: instant\ntime: +0s\nmode: ravel_error_prom_success\n",
+        )
+        .expect("parse");
+        assert_eq!(entries[0].mode, ComparisonMode::RavelErrorPromSuccess);
     }
 }

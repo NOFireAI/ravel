@@ -15,6 +15,15 @@
 //! comparison). `-0.0` vs `0.0` never matches under any tolerance: this
 //! project's `-0.0` bit-significance rule is a matter of principle, not
 //! magnitude, so the zero boundary is always exact-bit-compared.
+//!
+//! A corpus entry may also opt into the one-sided
+//! [`ComparisonMode::RavelErrorPromSuccess`] mode (ADR-0030's allowlist):
+//! an accepted, per-entry, by-design divergence where Ravel rejects a query
+//! and Prometheus accepts it. Like the ULP tolerance, it is a named
+//! exception with a written justification in the corpus file, never a
+//! blanket "any disagreement is fine": the comparator still requires Ravel
+//! to error and Prometheus to succeed, so a spurious both-error or
+//! both-success result is caught.
 
 use serde_json::Value as Json;
 
@@ -177,10 +186,38 @@ pub fn compare(
 ) -> Verdict {
     match mode {
         ComparisonMode::ExpectError => compare_error(prometheus, ravel),
+        ComparisonMode::RavelErrorPromSuccess => {
+            compare_ravel_error_prom_success(prometheus, ravel)
+        }
         ComparisonMode::Unordered | ComparisonMode::Ordered => {
             compare_success(mode, tolerance_ulps, prometheus, ravel)
         }
     }
+}
+
+/// ADR-0030 one-sided divergence: the entry documents a query that Ravel
+/// rejects by design (a per-subquery-node point-cap budget with no
+/// Prometheus counterpart) while Prometheus accepts it. The mismatch is not
+/// a PromQL semantic difference to fix, so there is nothing for the two
+/// engines to agree on; the comparator only asserts the divergence has the
+/// exact shape ADR-0030 accepts. Anything else (both erroring, both
+/// succeeding, or Prometheus erroring) is still a real mismatch: it would
+/// mean the divergence has changed and the allowlist entry is now wrong.
+fn compare_ravel_error_prom_success(prometheus: &Json, ravel: &Json) -> Verdict {
+    let prom_status = prometheus["status"].as_str().unwrap_or_default();
+    let ravel_status = ravel["status"].as_str().unwrap_or_default();
+    if prom_status != "success" {
+        return Verdict::Mismatch(format!(
+            "expected prometheus to succeed (ADR-0030 one-sided divergence): status={prom_status:?} error={:?}",
+            prometheus.get("error")
+        ));
+    }
+    if ravel_status != "error" {
+        return Verdict::Mismatch(format!(
+            "expected ravel to error by design (ADR-0030 one-sided divergence): status={ravel_status:?}"
+        ));
+    }
+    Verdict::Match
 }
 
 fn compare_error(prometheus: &Json, ravel: &Json) -> Verdict {
@@ -316,7 +353,9 @@ fn compare_series(
     }
     let (prom_ordered, ravel_ordered) = match mode {
         ComparisonMode::Ordered => (prom_results, ravel_results),
-        ComparisonMode::Unordered | ComparisonMode::ExpectError => (
+        ComparisonMode::Unordered
+        | ComparisonMode::ExpectError
+        | ComparisonMode::RavelErrorPromSuccess => (
             sort_by_label_key(&prom_results),
             sort_by_label_key(&ravel_results),
         ),
@@ -541,6 +580,55 @@ mod tests {
         let ravel = json!({"status": "success", "data": {"resultType": "vector", "result": []}});
         assert!(matches!(
             compare(ComparisonMode::ExpectError, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn ravel_error_prom_success_matches_the_accepted_one_sided_divergence() {
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": [{"metric": {}, "value": [1.0, "1"]}]}
+        });
+        let ravel =
+            json!({"status": "error", "errorType": "execution", "error": "too many points"});
+        assert_eq!(
+            compare(ComparisonMode::RavelErrorPromSuccess, None, &prom, &ravel),
+            Verdict::Match
+        );
+    }
+
+    #[test]
+    fn ravel_error_prom_success_rejects_both_erroring() {
+        let prom = json!({"status": "error", "errorType": "bad_data", "error": "x"});
+        let ravel = json!({"status": "error", "errorType": "execution", "error": "y"});
+        assert!(matches!(
+            compare(ComparisonMode::RavelErrorPromSuccess, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn ravel_error_prom_success_rejects_both_succeeding() {
+        let body = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::RavelErrorPromSuccess, None, &body, &body),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn ravel_error_prom_success_rejects_prometheus_erroring() {
+        let prom = json!({"status": "error", "errorType": "bad_data", "error": "x"});
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::RavelErrorPromSuccess, None, &prom, &ravel),
             Verdict::Mismatch(_)
         ));
     }
