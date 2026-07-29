@@ -82,7 +82,13 @@ and passes through bit-exactly (issue #75).
   as a `matrix` with one synthetic empty-labeled series repeating that
   value at every evaluated grid step (`ravel-promql`'s `eval_range`
   resolves it once; materializing the repetition is this HTTP layer's
-  job, not the evaluator's).
+  job, not the evaluator's). `/api/v1/query` (instant) can also return
+  `matrix`, not just `vector`/`scalar`/`string`: when the top-level
+  expression is itself a range vector (for example a bare subquery, or a
+  range function nested inside an outer subquery), Prometheus renders
+  `resultType: matrix`, and Ravel matches that. Such a matrix already
+  carries its own per-series timestamps from the evaluator, so no grid
+  repetition is synthesized.
 
 ## Budgets (Phase 1: static config)
 
@@ -108,6 +114,16 @@ global `evaluation_interval` default). Subquery grids are epoch-aligned:
 the grid start is the smallest multiple of the step (measured from Unix
 time zero) that is `>= end - range`, matching Prometheus' own subquery
 alignment, not the query's own step or window start.
+
+A subquery whose inner expression matches native-histogram data is not yet
+supported: the subquery grid reducer keeps only the float value of each
+step, so a histogram element would be silently dropped. When histogram data
+is actually present in the fetched window, the evaluator returns
+`Error::Unsupported` (`subquery over native histograms`, HTTP 422) instead
+of a wrong empty answer. The trigger is the presence of matched histogram
+data, not the syntactic shape: a float-only subquery, including
+`rate(x[5m:1m])` over float series, is unaffected. Real histogram subquery
+support is tracked by issue #220.
 
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly
