@@ -34,6 +34,16 @@
 //!   `"too many requests"`, ...). This is not as precise as inspecting a
 //!   status code directly, but it is the only option available outside the
 //!   `object_store` crate itself.
+//! - **`upload_checksum` is unsupported (`capabilities().upload_checksum ==
+//!   false`), by contract design, not oversight.** `object_store` 0.14's
+//!   `AmazonS3` client offers only a whole-client, crate-computed checksum
+//!   algorithm (`AmazonS3Builder::with_checksum_algorithm`, SHA-256 or
+//!   CRC64NVME only) with no per-request hook and no way to attach a
+//!   caller-supplied precomputed value; `PutOptions::checksum`'s CRC32C has
+//!   nowhere to go on the wire. `put()` still runs it as a local pre-flight
+//!   against the input buffer, catching a caller/payload mismatch before we
+//!   even talk to S3, but that check proves nothing about bytes actually
+//!   received by the server. See `capabilities()` below.
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -254,6 +264,13 @@ impl ObjectStoreBackend for S3Store {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
+        // Cheap pre-flight only: this recomputes CRC32C over the same buffer
+        // we are about to hand to `object_store`, so it catches a checksum
+        // the caller mismatched against its own payload before encoding it,
+        // but it is never attached to the outgoing request and proves
+        // nothing about bytes actually landing on S3/MinIO. See the doc
+        // comment on `capabilities()` for why this crate cannot close that
+        // gap with `object_store` 0.14's `AmazonS3` client.
         if let Some(UploadChecksum::Crc32c(expected)) = opts.checksum {
             let actual = crc32c::crc32c(&data);
             if actual != expected {
@@ -407,7 +424,25 @@ impl ObjectStoreBackend for S3Store {
             create_if_absent: true,
             cas_version: true,
             suffix_range: true,
-            upload_checksum: true,
+            // `false`, not a placeholder: `object_store` 0.14's `AmazonS3`
+            // client has no per-request checksum hook at all. Its only
+            // upload-integrity knob is `AmazonS3Builder::with_checksum_algorithm`,
+            // which (a) is a whole-client setting, not something `put()` can
+            // apply per-call from `PutOptions::checksum`, (b) only offers
+            // `Checksum::SHA256` / `Checksum::CRC64NVME`, not CRC32C, and (c)
+            // always has the crate compute the digest itself from the
+            // payload it is about to send -- there is no way to hand it a
+            // caller-supplied precomputed value to attach to the wire
+            // request (see `Client::with_payload` in `object_store`'s
+            // `aws/client.rs`). So `put()`'s CRC32C check above can only ever
+            // be a local pre-flight against our own input buffer; it cannot
+            // catch corruption introduced in transit. Per the contract doc's
+            // mandatory-capabilities table, a backend that cannot honor
+            // `upload_checksum` must report it as unsupported so production
+            // startup fails loudly instead of trusting integrity this
+            // adapter does not provide (docs/object-store-contract.md
+            // "Mandatory capabilities").
+            upload_checksum: false,
             prefix_list: true,
             multipart: false,
         }
