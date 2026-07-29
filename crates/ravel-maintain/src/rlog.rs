@@ -765,6 +765,34 @@ mod tests {
                 "the merged block survived bloom pruning for {word}"
             );
         }
+
+        // Negative control: "gamma" is in neither input's body, so the rebuilt
+        // bloom must PRUNE the merged block, not merely be non-empty. This
+        // distinguishes a real bloom from an all-ones (vacuously-present) bloom
+        // or from no bloom pruning at all -- both of which would still pass the
+        // positive asserts above. The signal is `blocks_after_bloom`: the block
+        // is a skip-index candidate (no ts/stream predicate excludes it, so
+        // `blocks_after_skip >= 1`) yet the bloom removes it before the scan
+        // (`blocks_after_bloom == 0`). `blocks_scanned == 0` and no rows follow.
+        // `bloom_degraded` must be false, or the "pruning" would just be a
+        // parse failure, not the bloom proving absence.
+        let (rows, stats) = reader
+            .scan(&Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "gamma".into(),
+            })
+            .expect("scan");
+        assert!(rows.is_empty(), "gamma is in neither input");
+        assert!(!stats.bloom_degraded, "bloom must parse, not degrade");
+        assert!(
+            stats.blocks_after_skip >= 1,
+            "the merged block is a skip-index candidate for gamma"
+        );
+        assert_eq!(
+            stats.blocks_after_bloom, 0,
+            "the rebuilt bloom must prune the block for the absent word gamma"
+        );
+        assert_eq!(stats.blocks_scanned, 0, "a pruned block is never scanned");
     }
 
     #[tokio::test]
@@ -863,7 +891,7 @@ mod tests {
         prop::collection::vec(prop::collection::vec(rec_strategy(), 1..15), 2..6)
     }
 
-    async fn differential_check(corpus: Vec<Vec<RecSpec>>) {
+    async fn differential_check(corpus: Vec<Vec<RecSpec>>, max_l1_part_bytes: u64) {
         let store = MemoryStore::new();
         let mut all_input_records: Vec<LogRecord> = Vec::new();
         for (i, input) in corpus.iter().enumerate() {
@@ -882,7 +910,11 @@ mod tests {
         }
 
         let clock = FixedClock::new(sealed_now_ns());
-        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+        let config = CompactorConfig {
+            max_l1_part_bytes,
+            ..CompactorConfig::default()
+        };
+        compact_bucket(&store, &clock, &config, &bucket())
             .await
             .expect("compact");
         let (rec, parts) = read_output(&store).await;
@@ -918,14 +950,31 @@ mod tests {
         /// The correctness core (ADR-0032, issue #231): for a random corpus of
         /// log records split across N L0 objects, the full decoded record set is
         /// identical whether the N L0 inputs are decoded and concatenated or the
-        /// single compacted L1 output is decoded.
+        /// single compacted L1 output is decoded. Default part cap: a single L1
+        /// part.
         #[test]
         fn differential_l0_union_equals_l1_output(corpus in corpus_strategy()) {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(differential_check(corpus));
+            rt.block_on(differential_check(corpus, CompactorConfig::default().max_l1_part_bytes));
+        }
+
+        /// The same union-equality property under a tiny part cap that forces
+        /// the merge to split across multiple parts on stream boundaries, so the
+        /// "concatenate all parts" side of the differential actually crosses part
+        /// boundaries (the large-cap test above never leaves one part). 512 bytes
+        /// is below a handful of records' estimate, so any multi-stream corpus
+        /// splits; single-stream corpora stay one part (a stream never straddles)
+        /// and still exercise the property.
+        #[test]
+        fn differential_holds_across_part_boundaries(corpus in corpus_strategy()) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(differential_check(corpus, 512));
         }
     }
 }
