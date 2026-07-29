@@ -51,7 +51,22 @@ fn now_ns() -> i64 {
 }
 
 fn success<T: serde::Serialize>(data: T) -> Response {
-    (StatusCode::OK, Json(ApiResponse::Success { data })).into_response()
+    (StatusCode::OK, Json(ApiResponse::success(data))).into_response()
+}
+
+/// Like [`success`], but carries the query's evaluation annotations into the
+/// envelope's separate `warnings` and `infos` arrays (issue #178). Both are
+/// omitted from the wire when empty (Prometheus' `omitempty`).
+fn success_annotated<T: serde::Serialize>(
+    data: T,
+    warnings: Vec<String>,
+    infos: Vec<String>,
+) -> Response {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_annotations(data, warnings, infos)),
+    )
+        .into_response()
 }
 
 async fn authenticate(
@@ -63,12 +78,15 @@ async fn authenticate(
 
 pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Response {
     match handle_query(&state, req).await {
-        Ok(data) => success(data),
+        Ok((data, warnings, infos)) => success_annotated(data, warnings, infos),
         Err(e) => e.into_response(),
     }
 }
 
-async fn handle_query(state: &AppState, req: Request<Body>) -> Result<QueryResponseData, ApiError> {
+async fn handle_query(
+    state: &AppState,
+    req: Request<Body>,
+) -> Result<(QueryResponseData, Vec<String>, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
@@ -82,16 +100,21 @@ async fn handle_query(state: &AppState, req: Request<Body>) -> Result<QueryRespo
     let min_tokens = decode_commit_tokens(params.all("min_commit_token"))?;
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
 
-    let (value, stats) = state
+    let (value, annotations, stats) = state
         .engine
-        .instant_with_stats(tenant_hash, query, time_ms, &min_tokens, now, deadline)
+        .instant_with_stats_annotated(tenant_hash, query, time_ms, &min_tokens, now, deadline)
         .await?;
-    Ok(with_stats(instant_value_to_json(value, time_ms)?, stats))
+    let (warnings, infos) = annotations.into_parts();
+    Ok((
+        with_stats(instant_value_to_json(value, time_ms)?, stats),
+        warnings,
+        infos,
+    ))
 }
 
 pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> Response {
     match handle_query_range(&state, req).await {
-        Ok(data) => success(data),
+        Ok((data, warnings, infos)) => success_annotated(data, warnings, infos),
         Err(e) => e.into_response(),
     }
 }
@@ -99,7 +122,7 @@ pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> R
 async fn handle_query_range(
     state: &AppState,
     req: Request<Body>,
-) -> Result<QueryResponseData, ApiError> {
+) -> Result<(QueryResponseData, Vec<String>, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
@@ -112,9 +135,9 @@ async fn handle_query_range(
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
     let now = now_ns();
 
-    let (value, stats) = state
+    let (value, annotations, stats) = state
         .engine
-        .range_with_stats(
+        .range_with_stats_annotated(
             tenant_hash,
             query,
             start_ms,
@@ -125,9 +148,14 @@ async fn handle_query_range(
             deadline,
         )
         .await?;
-    Ok(with_stats(
-        range_value_to_json(value, start_ms, end_ms, step_ms)?,
-        stats,
+    let (warnings, infos) = annotations.into_parts();
+    Ok((
+        with_stats(
+            range_value_to_json(value, start_ms, end_ms, step_ms)?,
+            stats,
+        ),
+        warnings,
+        infos,
     ))
 }
 

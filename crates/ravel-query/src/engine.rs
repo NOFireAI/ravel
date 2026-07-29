@@ -12,8 +12,9 @@ use promql_parser::parser::{Expr, Offset};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
-    Evaluator, LabelMatcher, MatchOp, PlanAnchor, SelectorPlan, SeriesData, SeriesSource,
-    SourceError, Value, from_ast_matchers, has_or_group, matches_series, ms_to_ns, plan_selectors,
+    Annotations, Evaluator, LabelMatcher, MatchOp, PlanAnchor, SelectorPlan, SeriesData,
+    SeriesSource, SourceError, Value, from_ast_matchers, has_or_group, matches_series, ms_to_ns,
+    plan_selectors,
 };
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
@@ -117,6 +118,26 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Value, QueryStats), QueryError> {
+        let (value, _annotations, stats) = self
+            .instant_with_stats_annotated(tenant_hash, query, t_ms, min_tokens, now_ns, deadline)
+            .await?;
+        Ok((value, stats))
+    }
+
+    /// Same as [`Self::instant_with_stats`], additionally returning the
+    /// evaluation [`Annotations`] (Prometheus' separate `warnings` and
+    /// `infos`). The HTTP query handlers use this so both fields reach the
+    /// response envelope; the stats-only and value-only wrappers discard the
+    /// annotations, keeping their original signatures.
+    pub async fn instant_with_stats_annotated(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        t_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+    ) -> Result<(Value, Annotations, QueryStats), QueryError> {
         let eval_deadline = Instant::now() + deadline;
         let outcome = tokio::time::timeout(
             deadline,
@@ -134,7 +155,7 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         eval_deadline: Instant,
-    ) -> Result<(Value, QueryStats), QueryError> {
+    ) -> Result<(Value, Annotations, QueryStats), QueryError> {
         let t_ns = ms_to_ns(t_ms)?;
         let plans = plan_selectors(query, t_ms, t_ms)?;
         let eval_window = EvalWindow::Instant { t_ns };
@@ -144,8 +165,8 @@ impl QueryEngine {
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
             .with_deadline(eval_deadline);
-        let value = evaluator.eval_instant(&source, query, t_ms)?;
-        Ok((value, stats))
+        let (value, annotations) = evaluator.eval_instant_annotated(&source, query, t_ms)?;
+        Ok((value, annotations, stats))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -191,6 +212,36 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Value, QueryStats), QueryError> {
+        let (value, _annotations, stats) = self
+            .range_with_stats_annotated(
+                tenant_hash,
+                query,
+                start_ms,
+                end_ms,
+                step_ms,
+                min_tokens,
+                now_ns,
+                deadline,
+            )
+            .await?;
+        Ok((value, stats))
+    }
+
+    /// Same as [`Self::range_with_stats`], additionally returning the
+    /// evaluation [`Annotations`] (Prometheus' separate `warnings` and
+    /// `infos`), for the HTTP range-query handler's response envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_with_stats_annotated(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+    ) -> Result<(Value, Annotations, QueryStats), QueryError> {
         let eval_deadline = Instant::now() + deadline;
         let outcome = tokio::time::timeout(
             deadline,
@@ -220,7 +271,7 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         eval_deadline: Instant,
-    ) -> Result<(Value, QueryStats), QueryError> {
+    ) -> Result<(Value, Annotations, QueryStats), QueryError> {
         if step_ms <= 0 {
             return Err(QueryError::NonPositiveStep { step_ms });
         }
@@ -242,8 +293,9 @@ impl QueryEngine {
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
             .with_deadline(eval_deadline);
-        let value = evaluator.eval_range(&source, query, start_ms, end_ms, step_ms)?;
-        Ok((value, stats))
+        let (value, annotations) =
+            evaluator.eval_range_annotated(&source, query, start_ms, end_ms, step_ms)?;
+        Ok((value, annotations, stats))
     }
 
     /// Resolves the series (labels only, no samples) matching `matchers` in
