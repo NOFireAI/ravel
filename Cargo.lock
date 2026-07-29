@@ -3898,6 +3898,7 @@ name = "ravel-otlp"
 version = "0.1.0"
 dependencies = [
  "opentelemetry-proto",
+ "ravel-segment",
  "ravel-types",
  "thiserror",
  "tokio",
