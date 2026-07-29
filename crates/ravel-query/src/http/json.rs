@@ -136,13 +136,14 @@ fn ts_ns_to_seconds(ts_ns: i64) -> Timestamp {
 }
 
 /// Render an [`Evaluator::eval_instant`] result as a Prometheus-shaped
-/// `/api/v1/query` payload. A bare top-level range vector is rejected here
-/// rather than in `ravel-promql`: `eval_instant`'s own doc contract says a
-/// top-level matrix selector is a type error, but the evaluator itself does
-/// not enforce that (it always returns whatever the AST resolves to), so
-/// the HTTP layer is what actually applies Prometheus' instant-query type
-/// check (a real, reachable case, not a dead branch: flagged separately as
-/// a `ravel-promql` doc/code mismatch, out of scope for this ticket).
+/// `/api/v1/query` payload. A top-level range vector is a valid instant
+/// result: Prometheus renders `resultType: matrix` for an instant query
+/// whose top-level expression is itself a range vector (e.g. a bare
+/// subquery, or `max_over_time(rate(...)[5m:1m])[10m:2m]`), and Ravel now
+/// matches that. Unlike the scalar/string case in `range_value_to_json`,
+/// which repeats a constant across the query-range grid, a matrix from an
+/// instant query already carries its own per-series timestamps from the
+/// evaluator, so no grid bounds are needed to render it.
 pub fn instant_value_to_json(value: Value, time_ms: i64) -> Result<QueryData, ApiError> {
     match value {
         Value::Vector(vector) => Ok(QueryData::Vector(
@@ -159,12 +160,17 @@ pub fn instant_value_to_json(value: Value, time_ms: i64) -> Result<QueryData, Ap
             format_value(v),
         ))),
         Value::String(s) => Ok(QueryData::String((ms_to_seconds(time_ms)?, s))),
-        Value::Matrix(_) => Err(ApiError::BadData(
-            ravel_promql::Error::WrongType {
-                expected: "scalar, string, or instant vector",
-                got: "range vector",
-            }
-            .to_string(),
+        Value::Matrix(matrix) => Ok(QueryData::Matrix(
+            matrix
+                .into_iter()
+                .map(|(labels, samples)| MatrixResult {
+                    metric: labels_to_map(&labels),
+                    values: samples
+                        .into_iter()
+                        .map(|s| (ts_ns_to_seconds(s.ts_ns), format_value(s.value)))
+                        .collect(),
+                })
+                .collect(),
         )),
     }
 }
@@ -294,19 +300,48 @@ mod tests {
     }
 
     #[test]
-    fn instant_matrix_is_rejected_as_wrong_type() {
-        // The evaluator's own contract says a bare top-level matrix selector
-        // never survives to this layer, but the HTTP layer enforces it
-        // itself (a real, reachable defensive check; see the ravel-promql
-        // doc/code mismatch flagged in this ticket's final report), so a
-        // Value::Matrix reaching here must still be rejected, not panic or
-        // silently render.
-        let err = instant_value_to_json(Value::Matrix(vec![]), 1_700_000_000_000)
-            .expect_err("matrix must be rejected at instant type-check");
-        match err {
-            ApiError::BadData(msg) => assert!(msg.contains("range vector")),
-            other => panic!("expected BadData, got a different ApiError: {other:?}"),
-        }
+    fn instant_matrix_renders_as_matrix_with_its_own_timestamps() {
+        // An instant query whose top-level expression is itself a range
+        // vector (e.g. a bare subquery, or a range function nested inside an
+        // outer subquery) evaluates to a Value::Matrix. Prometheus renders
+        // that as resultType: matrix for /api/v1/query, using the per-series
+        // timestamps the evaluator already produced, not the single query
+        // time. Ravel matches that here.
+        use ravel_types::{Label, LabelSet, Sample};
+
+        let labels = LabelSet::new(vec![Label {
+            name: "job".to_string(),
+            value: "api".to_string(),
+        }])
+        .expect("valid label set");
+        let matrix = vec![(
+            labels,
+            vec![
+                Sample {
+                    ts_ns: 1_700_000_000_000_000_000,
+                    value: 1.0,
+                },
+                Sample {
+                    ts_ns: 1_700_000_120_000_000_000,
+                    value: 2.5,
+                },
+            ],
+        )];
+
+        // time_ms is deliberately unrelated to the sample timestamps: the
+        // matrix arm must ignore it and use each sample's own ts_ns.
+        let data = instant_value_to_json(Value::Matrix(matrix), 9_999_999_999_000)
+            .expect("matrix renders");
+        let result = matrix_result(data);
+        assert_eq!(result.len(), 1, "one series");
+        assert_eq!(result[0].metric.get("job").map(String::as_str), Some("api"));
+        assert_eq!(
+            result[0].values,
+            vec![
+                (Timestamp(1_700_000_000.0), "1".to_string()),
+                (Timestamp(1_700_000_120.0), "2.5".to_string()),
+            ],
+        );
     }
 
     #[test]
