@@ -218,4 +218,6 @@ pub enum SegmentError {
     BadChunkFrame,
     #[error("a v5 object carries SERIES_IDX/SERIES_META_CHUNKS without the other")]
     SparseSectionsIncomplete,
+    #[error("SERIES_IDX structural validation failed: {0}")]
+    BadSparseIndex(&'static str),
 }

@@ -13,13 +13,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use proptest::prelude::*;
+use prost::Message;
 use ravel_proto::segment::v1::Footer;
 use ravel_segment::{
     CompactionMetaV4, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue,
     IngestBounds, ReaderLimits, ResetHint, RunInputV4, RunValuePageV4, SegmentError,
-    SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesInputV4, SeriesValues, ValueKind,
-    decode_catalog_v5, decode_chunk_runs, find_index_in_window, open_from_full, parse_series_idx,
-    verify_and_decompress_chunk_frame, verify_id_window,
+    SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesInputV4, SeriesValues, V5_STRIDE,
+    ValueKind, decode_catalog_v5, decode_chunk_runs, find_index_in_window, open_from_full,
+    parse_series_idx, verify_and_decompress_chunk_frame, verify_id_window,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -378,4 +379,331 @@ fn unknown_version_still_fails_closed() {
         open_from_full(&v5, ReaderLimits::default()),
         Err(SegmentError::UnsupportedVersion(_)) | Err(SegmentError::FooterCrcMismatch)
     ));
+}
+
+// ===========================================================================
+// Issue #195 / #196 / #199 regression tests: each hand-tampers one on-disk
+// invariant that a corrupt-but-crc-consistent object could otherwise violate
+// silently, then proves the reader fails closed with the specific typed
+// error rather than the field-level crc32c catching it (crc32c is
+// recomputed after every tamper below, so only the new structural/semantic
+// check under test can fire).
+// ===========================================================================
+
+/// Recomputes every checksum layer above a section after an in-place tamper
+/// that does not change the object's total length (a same-width field
+/// overwrite): the section's own `Section.crc32c`, the footer protobuf
+/// bytes, and `footer_crc32c`. This isolates the check under test: without
+/// this repair, a tamper would be caught by `SectionCrcMismatch` or
+/// `FooterCrcMismatch` instead of the new structural/semantic error.
+fn refix_after_inplace_tamper(v5: &mut [u8], tampered_kind: u32) {
+    let loc = open_from_full(v5, ReaderLimits::default()).expect("open before refix");
+    let mut footer = loc.footer.clone();
+    let section = *footer
+        .sections
+        .iter()
+        .find(|s| s.kind == tampered_kind)
+        .unwrap_or_else(|| panic!("section kind {tampered_kind} present"));
+    let start = section.offset as usize;
+    let end = start + section.len as usize;
+    let new_crc = crc32c::crc32c(&v5[start..end]);
+    for s in &mut footer.sections {
+        if s.kind == tampered_kind {
+            s.crc32c = new_crc;
+        }
+    }
+
+    let footer_bytes = footer.encode_to_vec();
+    let old_footer_len = (loc.trailer_offset - loc.footer_offset) as usize;
+    assert_eq!(
+        footer_bytes.len(),
+        old_footer_len,
+        "in-place tamper must not change the footer protobuf's encoded length"
+    );
+    let footer_start = loc.footer_offset as usize;
+    v5[footer_start..footer_start + old_footer_len].copy_from_slice(&footer_bytes);
+
+    let trailer_start = loc.trailer_offset as usize;
+    let footer_len = old_footer_len as u32;
+    let version = loc.version;
+    let signal = v5[trailer_start + 10];
+    let reserved = v5[trailer_start + 11];
+    let magic = [
+        v5[trailer_start + 12],
+        v5[trailer_start + 13],
+        v5[trailer_start + 14],
+        v5[trailer_start + 15],
+    ];
+    let mut crc = crc32c::crc32c(&footer_bytes);
+    crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &version.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &[signal, reserved]);
+    crc = crc32c::crc32c_append(crc, &magic);
+    v5[trailer_start + 4..trailer_start + 8].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Byte offset of chunk directory entry `chunk_index` within a SERIES_IDX
+/// section body, mirroring the layout `parse_series_idx`/`build_series_idx`
+/// use: 16-byte header, `sparse_count` 36-byte sparse entries, 8-byte
+/// chunk_stride/chunk_count, then 36-byte chunk entries
+/// (frame_offset:8, frame_stored_len:8, frame_uncompressed_len:8,
+/// first_index:4, n:4, frame_crc32c:4).
+fn series_idx_chunk_entry_offset(series_count: u32, chunk_index: u32) -> usize {
+    let sparse_count = series_count.div_ceil(V5_STRIDE);
+    16 + sparse_count as usize * 36 + 8 + chunk_index as usize * 36
+}
+
+#[test]
+fn tampered_run_total_fails_with_run_count_sum_mismatch() {
+    // Issue #195: decode_catalog_v5 parsed the v5 chunked SERIES_META
+    // header's run_total but never cross-checked it against the sum of
+    // per-chunk run counts, unlike the dense v4 path and the per-chunk-frame
+    // check. Overwrite run_total (the last 4 bytes of the section header,
+    // which chunk 0's frame_offset -- always relative to the section start
+    // -- pins exactly) with a wrong value and confirm the whole-catalog
+    // decode now rejects it.
+    let mut v5 = build_v5(SPARSE_N, 5);
+    let loc = open_from_full(&v5, ReaderLimits::default()).unwrap();
+    let footer = loc.footer.clone();
+    let idx = parse_series_idx(section_bytes(&v5, &footer, SERIES_IDX)).unwrap();
+    let chunk0 = idx.chunk_for(0).unwrap();
+    let chunks_section = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SERIES_META_CHUNKS)
+        .unwrap();
+    let run_total_abs = chunks_section.offset as usize + chunk0.frame_offset as usize - 4;
+
+    let mut run_total_bytes: [u8; 4] = v5[run_total_abs..run_total_abs + 4].try_into().unwrap();
+    let original = u32::from_le_bytes(run_total_bytes);
+    run_total_bytes = (original.wrapping_add(1)).to_le_bytes();
+    v5[run_total_abs..run_total_abs + 4].copy_from_slice(&run_total_bytes);
+
+    refix_after_inplace_tamper(&mut v5, SERIES_META_CHUNKS);
+
+    let loc2 = open_from_full(&v5, ReaderLimits::default()).expect("footer still valid");
+    let err = decode_catalog_v5(&loc2.footer, &v5, ReaderLimits::default())
+        .expect_err("tampered run_total must be rejected");
+    assert!(
+        matches!(err, SegmentError::RunCountSumMismatch { .. }),
+        "expected RunCountSumMismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn corrupt_series_idx_chunk_chain_fails_to_parse() {
+    // Issue #196: parse_series_idx validated per-field truncation and id
+    // sortedness but never the chunk directory's dense first_index chain
+    // (0, K, 2K, ...), which only decode_catalog_v5's now-removed ad hoc
+    // check enforced -- and locate/chunk_for never called that. A
+    // corrupt-but-crc-consistent directory used to let chunk_for silently
+    // answer "absent" for a present id instead of failing to parse. Break
+    // chunk 1's first_index (still crc-consistent afterward) and confirm
+    // parse_series_idx now rejects the whole index up front.
+    let v5_base = build_v5(SPARSE_N, 0);
+    let loc = open_from_full(&v5_base, ReaderLimits::default()).unwrap();
+    let series_count = loc.footer.series_count as u32;
+    assert!(
+        series_count.div_ceil(V5_STRIDE) >= 3,
+        "fixture must have at least 3 chunks to tamper chunk index 1 safely"
+    );
+
+    let mut v5 = v5_base;
+    let idx_section = loc
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SERIES_IDX)
+        .unwrap();
+    let entry_off = idx_section.offset as usize
+        + series_idx_chunk_entry_offset(series_count, 1 /* chunk index */);
+    let first_index_off = entry_off + 24;
+
+    let mut first_index_bytes: [u8; 4] =
+        v5[first_index_off..first_index_off + 4].try_into().unwrap();
+    let original = u32::from_le_bytes(first_index_bytes);
+    assert_eq!(original, V5_STRIDE, "chunk 1's dense first_index");
+    first_index_bytes = (original + 1).to_le_bytes(); // breaks the dense chain
+    v5[first_index_off..first_index_off + 4].copy_from_slice(&first_index_bytes);
+
+    refix_after_inplace_tamper(&mut v5, SERIES_IDX);
+
+    let loc2 = open_from_full(&v5, ReaderLimits::default()).expect("footer still valid");
+    let idx_bytes = section_bytes(&v5, &loc2.footer, SERIES_IDX);
+    let err = parse_series_idx(idx_bytes)
+        .expect_err("corrupt chunk chain must fail to parse, not decode");
+    assert!(
+        matches!(err, SegmentError::BadSparseIndex(_)),
+        "expected BadSparseIndex, got {err:?}"
+    );
+
+    // The whole-catalog decode path goes through the same parse and must
+    // fail the same way, not silently drop series or answer any id absent.
+    let err2 = decode_catalog_v5(&loc2.footer, &v5, ReaderLimits::default())
+        .expect_err("whole-catalog decode must also fail closed");
+    assert!(matches!(err2, SegmentError::BadSparseIndex(_)));
+}
+
+#[test]
+fn chunk_frame_trailing_value_ord_bytes_fail_closed() {
+    // Issue #199: the v5 frame's value_ord block decode never asserted the
+    // per-series materialization consumed the whole block, unlike
+    // parse_value_ord_block_all_v2 (v2/v3/v4), which returns BadBlockLen on
+    // a mismatch. Every fixture series here carries a 3-label schema, so the
+    // last chunk's value_ord block is consumed exactly by materialization;
+    // append one extra ordinal past what any series' schema needs and
+    // confirm decode_catalog_v5 now rejects it instead of silently ignoring
+    // the trailing varint.
+    let v5_base = build_v5(SPARSE_N, 0);
+    let loc = open_from_full(&v5_base, ReaderLimits::default()).unwrap();
+    let footer = loc.footer.clone();
+    let series_count = footer.series_count as u32;
+    let idx = parse_series_idx(section_bytes(&v5_base, &footer, SERIES_IDX)).unwrap();
+    let last_index = u64::from(series_count - 1);
+    let cl = idx.chunk_for(last_index).unwrap();
+
+    let chunks_section = *footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SERIES_META_CHUNKS)
+        .unwrap();
+    let abs_start = chunks_section.offset as usize + cl.frame_offset as usize;
+    let old_len = cl.frame_stored_len as usize;
+    let stored = v5_base[abs_start..abs_start + old_len].to_vec();
+    let frame_raw =
+        verify_and_decompress_chunk_frame(&stored, &cl, ReaderLimits::default()).unwrap();
+
+    // Walk the frame header (n:u32, frame_run_total:u32, 3 base uvarints,
+    // then the length-prefixed schema_ref block) to find where the
+    // length-prefixed value_ord block starts.
+    fn read_uvarint(bytes: &[u8], pos: &mut usize) -> u64 {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = bytes[*pos];
+            *pos += 1;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return result;
+            }
+            shift += 7;
+        }
+    }
+    fn write_uvarint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    let mut pos = 8usize; // n:u32 + frame_run_total:u32
+    read_uvarint(&frame_raw, &mut pos); // ts_base
+    read_uvarint(&frame_raw, &mut pos); // val_base
+    read_uvarint(&frame_raw, &mut pos); // hist_base
+    let schema_ref_len = read_uvarint(&frame_raw, &mut pos) as usize;
+    pos += schema_ref_len; // skip the whole schema_ref block
+
+    let value_ord_block_start = pos;
+    let value_ord_len = read_uvarint(&frame_raw, &mut pos) as usize;
+    let value_ord_payload_start = pos;
+    let value_ord_payload_end = value_ord_payload_start + value_ord_len;
+
+    let mut new_frame_raw = Vec::with_capacity(frame_raw.len() + 2);
+    new_frame_raw.extend_from_slice(&frame_raw[..value_ord_block_start]);
+    write_uvarint(&mut new_frame_raw, (value_ord_len + 1) as u64);
+    new_frame_raw.extend_from_slice(&frame_raw[value_ord_payload_start..value_ord_payload_end]);
+    new_frame_raw.push(0x00); // one extra ordinal no series' schema will consume
+    new_frame_raw.extend_from_slice(&frame_raw[value_ord_payload_end..]);
+
+    let new_stored = zstd::bulk::compress(&new_frame_raw, 3).unwrap();
+    let new_crc = crc32c::crc32c(&new_stored);
+    let delta = new_stored.len() as i64 - old_len as i64;
+
+    let body_len = loc.footer_offset as usize;
+    let mut body = v5_base[..body_len].to_vec();
+    body.splice(abs_start..abs_start + old_len, new_stored.iter().copied());
+
+    let mut new_footer = footer.clone();
+    for s in &mut new_footer.sections {
+        if s.kind == SERIES_META_CHUNKS {
+            s.len = (s.len as i64 + delta) as u64;
+        } else if s.offset as usize >= abs_start + old_len {
+            s.offset = (s.offset as i64 + delta) as u64;
+        }
+    }
+
+    // Patch the tampered chunk's own directory entry (frame_stored_len,
+    // frame_uncompressed_len, frame_crc32c) inside SERIES_IDX's content,
+    // which physically shifted with the rest of the tail but did not change
+    // size, so its field offsets within the section are unchanged.
+    let idx_section_new = *new_footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SERIES_IDX)
+        .unwrap();
+    let idx_abs = idx_section_new.offset as usize;
+    let last_chunk_index = series_count.div_ceil(V5_STRIDE) - 1;
+    let entry_off = idx_abs + series_idx_chunk_entry_offset(series_count, last_chunk_index);
+    body[entry_off + 8..entry_off + 16].copy_from_slice(&(new_stored.len() as u64).to_le_bytes());
+    body[entry_off + 16..entry_off + 24]
+        .copy_from_slice(&(new_frame_raw.len() as u64).to_le_bytes());
+    body[entry_off + 32..entry_off + 36].copy_from_slice(&new_crc.to_le_bytes());
+
+    let idx_len = idx_section_new.len as usize;
+    let idx_crc = crc32c::crc32c(&body[idx_abs..idx_abs + idx_len]);
+    let mc_abs = chunks_section.offset as usize;
+    let mc_len = new_footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SERIES_META_CHUNKS)
+        .unwrap()
+        .len as usize;
+    let mc_crc = crc32c::crc32c(&body[mc_abs..mc_abs + mc_len]);
+    for s in &mut new_footer.sections {
+        if s.kind == SERIES_IDX {
+            s.crc32c = idx_crc;
+        } else if s.kind == SERIES_META_CHUNKS {
+            s.crc32c = mc_crc;
+        }
+    }
+
+    let footer_bytes = new_footer.encode_to_vec();
+    let footer_len = footer_bytes.len() as u32;
+    body.extend_from_slice(&footer_bytes);
+
+    let old_trailer_start = loc.trailer_offset as usize;
+    let version = loc.version;
+    let signal = v5_base[old_trailer_start + 10];
+    let reserved = v5_base[old_trailer_start + 11];
+    let magic = [
+        v5_base[old_trailer_start + 12],
+        v5_base[old_trailer_start + 13],
+        v5_base[old_trailer_start + 14],
+        v5_base[old_trailer_start + 15],
+    ];
+    let mut crc = crc32c::crc32c(&footer_bytes);
+    crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &version.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &[signal, reserved]);
+    crc = crc32c::crc32c_append(crc, &magic);
+    body.extend_from_slice(&footer_len.to_le_bytes());
+    body.extend_from_slice(&crc.to_le_bytes());
+    body.extend_from_slice(&version.to_le_bytes());
+    body.push(signal);
+    body.push(reserved);
+    body.extend_from_slice(&magic);
+
+    let tampered = body;
+    let loc2 = open_from_full(&tampered, ReaderLimits::default()).expect("footer still valid");
+    let err = decode_catalog_v5(&loc2.footer, &tampered, ReaderLimits::default())
+        .expect_err("trailing value_ord bytes must be rejected");
+    assert!(
+        matches!(err, SegmentError::BadBlockLen),
+        "expected BadBlockLen, got {err:?}"
+    );
 }
