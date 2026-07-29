@@ -48,6 +48,8 @@ What exists today:
   [ADR-0028](docs/adrs/0028-analytics-stage.md).
 - `ravel-server` (dev binary, all roles in one process) and `ravel-cli`
   (segment/commit/catalog inspection).
+- Flight SQL: the same query path as `/api/v1/sql`, over Arrow Flight's gRPC
+  surface, behind `ravel-server`'s `flight-sql` cargo feature (implies `sql`).
 
 What is planned, not built:
 
@@ -63,8 +65,6 @@ What is planned, not built:
   before listing-based discovery runs out of headroom.
 - OTAP (OpenTelemetry Arrow) ingest, scaffolded but not wired into the
   gateway.
-- Flight SQL: the gRPC surface is wired but returns unimplemented (tracked in
-  issue #152).
 
 ## Quickstart
 
@@ -159,8 +159,8 @@ as a redacted `{"status":"error","errorType":...,"error":...}` body, never
 raw backend or DataFusion plan text. Send `Accept:
 application/vnd.apache.arrow.stream` instead of JSON for a bit-exact Arrow
 IPC stream (needed for `NaN`/`-0.0` payloads, which JSON cannot represent
-exactly). Flight SQL (the gRPC equivalent) is wired but not yet implemented
-(issue #152).
+exactly). Flight SQL (the gRPC equivalent) is available behind
+`ravel-server`'s `flight-sql` cargo feature.
 
 ### Analytics
 
