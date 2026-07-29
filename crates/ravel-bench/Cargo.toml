@@ -105,6 +105,11 @@ path = "src/bin/segment_alloc_profile.rs"
 bench = false
 
 [[bin]]
+name = "histogram_size"
+path = "src/bin/histogram_size.rs"
+bench = false
+
+[[bin]]
 name = "catalog_resolve_bench"
 path = "src/bin/catalog_resolve_bench.rs"
 bench = false
