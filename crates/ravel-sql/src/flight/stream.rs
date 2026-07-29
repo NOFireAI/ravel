@@ -29,11 +29,16 @@
 //!
 //! # Deadline
 //!
-//! The ticket's `deadline_ns` is the whole flow's budget. It is checked once
-//! before execution starts, and again as each batch is handed out, so a
-//! consumer slow enough to cross the GC protection horizon mid-stream fails
-//! `SnapshotInvalidated` rather than being served batches read under a pin
-//! that is no longer protected.
+//! The ticket's `deadline_ns` is a client-supplied wall-clock value, so it is
+//! never trusted verbatim: [`FlightSqlConfig::clamp_ticket_deadline_ns`]
+//! re-derives the deployment's own bound (`now_ns + max_deadline`, itself
+//! capped by the GC protection horizon) and takes the minimum with the
+//! ticket's value, so the embedded deadline can only ever shorten the
+//! effective budget, never lengthen it past what this deployment would mint
+//! today (issue #186). That effective deadline is checked once before
+//! execution starts, and again as each batch is handed out, so a consumer
+//! slow enough to cross it mid-stream fails `SnapshotInvalidated` rather than
+//! being served batches read under a pin that is no longer protected.
 //!
 //! # Cancellation
 //!
@@ -59,6 +64,7 @@ use tonic::Status;
 use crate::error::SqlError;
 use crate::executor::{PinnedStream, RetryDecision, SqlExecutor, retry_decision};
 use crate::flight::ClockRef;
+use crate::flight::FlightSqlConfig;
 use crate::flight::request::status_from_sql;
 use crate::flight_ticket::FlightTicket;
 use crate::validate::validate;
@@ -77,21 +83,25 @@ pub(super) async fn statement_stream(
     clock: ClockRef,
     tenant: TenantHash,
     ticket: FlightTicket,
+    config: &FlightSqlConfig,
 ) -> Result<DoGetStream, Status> {
     // Re-run the security gate on redemption. The statement is carried in
     // bytes a client holds, and the gate is cheap; running it again means a
     // tampered or replayed ticket cannot reach the planner even if it somehow
-    // survived the checksum.
+    // survived the MAC.
     validate(&ticket.statement).map_err(|err| status_from_sql(&SqlError::from(err), tenant))?;
 
     let now_ns = clock.now_ns();
-    if ticket.is_expired(now_ns) {
+    // The ticket's own deadline_ns is client-supplied and may only shorten
+    // the effective budget below what this deployment's config would mint
+    // today, never lengthen it (issue #186).
+    let deadline_ns = config.clamp_ticket_deadline_ns(ticket.deadline_ns, now_ns);
+    if now_ns >= deadline_ns {
         // The pin's GC protection window has closed. This is exactly the
         // "ticket replay after deadline expiry" case: never different data,
         // always SnapshotInvalidated.
         return Err(status_from_sql(&SqlError::SnapshotInvalidated, tenant));
     }
-    let deadline_ns = ticket.deadline_ns;
     let budget = remaining(now_ns, deadline_ns);
 
     let snapshot = ticket.snapshot();

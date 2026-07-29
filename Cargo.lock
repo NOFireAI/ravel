@@ -4059,11 +4059,13 @@ version = "0.1.0"
 dependencies = [
  "arrow-flight",
  "async-trait",
+ "blake3",
  "bytes",
  "datafusion",
  "futures",
  "proptest",
  "prost",
+ "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
  "ravel-object-store",
