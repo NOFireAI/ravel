@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use ravel_proto::catalog::v1::SnapshotHead;
-use ravel_proto::commit::v1::CommitRecord;
+use ravel_proto::commit::v1::{CommitRecord, CompactionRecord};
 use ravel_types::{Signal, TenantHash};
 
 use crate::snapshot_format::{DecodedPart, DecodedPostings};
@@ -60,6 +60,64 @@ impl RecordCache {
         tenant: TenantHash,
         key: String,
         record: Arc<CommitRecord>,
+        capacity: usize,
+    ) {
+        self.tenants
+            .lock()
+            .entry(tenant)
+            .or_default()
+            .insert(key, record, capacity);
+    }
+}
+
+#[derive(Default)]
+struct CompactionTenantCache {
+    entries: HashMap<String, Arc<CompactionRecord>>,
+    /// Insertion order, oldest first, for capacity-cap eviction.
+    order: std::collections::VecDeque<String>,
+}
+
+impl CompactionTenantCache {
+    fn insert(&mut self, key: String, record: Arc<CompactionRecord>, capacity: usize) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key.clone(), record);
+        self.order.push_back(key);
+        while self.order.len() > capacity.max(1) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// Decoded compaction-record cache, partitioned by tenant and keyed by full
+/// object key, exactly like [`RecordCache`] (docs/catalog-and-mvcc.md step
+/// 2: compaction records are cached the same way commit records are).
+/// Compaction records are immutable once published, so entries never need
+/// invalidating within Phase 1, only capacity-cap eviction; the promised
+/// tombstone-observation invalidation (ADR-0010 §10) is retention's job
+/// (P7) and does not affect resolution correctness, since a tombstoned
+/// bucket contributes nothing regardless of what is cached.
+#[derive(Default)]
+pub(crate) struct CompactionRecordCache {
+    tenants: Mutex<HashMap<TenantHash, CompactionTenantCache>>,
+}
+
+impl CompactionRecordCache {
+    pub(crate) fn get(&self, tenant: &TenantHash, key: &str) -> Option<Arc<CompactionRecord>> {
+        self.tenants
+            .lock()
+            .get(tenant)
+            .and_then(|c| c.entries.get(key).cloned())
+    }
+
+    pub(crate) fn insert(
+        &self,
+        tenant: TenantHash,
+        key: String,
+        record: Arc<CompactionRecord>,
         capacity: usize,
     ) {
         self.tenants
