@@ -108,12 +108,40 @@ checked against that node's own grid before it is built, so a nested
 subquery whose own grid alone exceeds the cap is rejected before any
 allocation or recursive evaluation, at whatever nesting depth it occurs.
 
+A per-node point cap alone does not bound the total cost of nested or
+repeatedly re-evaluated subqueries: an outer range query re-evaluates a
+matrix-function argument's subquery from scratch at every one of its own
+grid steps, and a subquery may itself nest another subquery, so a query
+whose every individual node sits safely under 11,000 points can still
+multiply that cost across nesting levels and re-evaluations (issue #193).
+`ravel_promql::Evaluator` therefore also charges a shared, cross-level
+evaluation budget (`Evaluator::with_max_total_eval_points`, default
+`DEFAULT_MAX_TOTAL_EVAL_POINTS` = 1,000,000 grid points): every subquery
+grid evaluation, at any nesting depth and however many times an enclosing
+grid step re-triggers it, debits this one query-wide counter, and
+exhausting it returns `Error::EvalBudgetExhausted` before the excess work
+runs.
+
+The evaluator is otherwise fully synchronous, so the wall deadline above
+used to only take effect at the `tokio::time::timeout` wrapping an
+instant/range query: a runaway evaluation ran to completion regardless,
+and the deadline only changed how long the caller waited before seeing
+the error. The evaluator now also carries its own copy of that deadline
+(`Evaluator::with_deadline`) and checks it between subquery grid steps
+(inside a subquery's own grid loop and inside the per-outer-step
+re-evaluation loop that drives it), returning `Error::DeadlineExceeded` as
+soon as it is past due. `QueryEngine::{instant,range}_with_stats` derive
+this deadline from their own `Duration` parameter before evaluation starts
+and fold whichever error surfaces first, the evaluator's own or the outer
+timeout's, into the same `QueryError::DeadlineExceeded`.
+
 A subquery that omits its own step (`expr[5m:]`) defaults to
 `EngineConfig::default_evaluation_interval` (60 s, matching Prometheus'
 global `evaluation_interval` default). Subquery grids are epoch-aligned:
 the grid start is the smallest multiple of the step (measured from Unix
-time zero) that is `>= end - range`, matching Prometheus' own subquery
-alignment, not the query's own step or window start.
+time zero) that is strictly greater than `end - range`, left-open like
+this crate's own matrix-selector window, matching Prometheus' own
+subquery alignment, not the query's own step or window start.
 
 A subquery whose inner expression matches native-histogram data is not yet
 supported: the subquery grid reducer keeps only the float value of each
