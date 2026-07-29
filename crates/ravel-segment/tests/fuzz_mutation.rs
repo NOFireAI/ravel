@@ -21,17 +21,37 @@
 //!
 //! Runs on the pinned stable toolchain (proptest only, no cargo-fuzz).
 //! Case count honours `PROPTEST_CASES`; the CI fuzz job raises it.
+//!
+//! Point-probe coverage (issue #201): `decode_catalog_v5` walks every series
+//! unconditionally, but a live point lookup ("does series id X exist, and
+//! where are its chunks") instead calls `SparseIdIndex::locate`,
+//! `find_index_in_window`, `chunk_for`, and `decode_chunk_runs`, which parse
+//! the same SERIES_IDX / SERIES_META_CHUNKS bytes through a different code
+//! path. `point_probe` below drives that chain directly over mutated object
+//! bytes so corruption mishandled only on the point-probe path (a panic, or
+//! a wrong presence/absence answer) can't hide behind
+//! `decode_catalog_v5`-only mutation coverage.
 #![allow(clippy::expect_used)]
 
 use proptest::prelude::*;
 use ravel_segment::{
-    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ReaderLimits,
-    ResetHint, SegmentError, SegmentIdentity, SegmentWriter, SeriesEntryV4, SeriesInputV3,
-    SeriesValues, ValueKind, decode_catalog_v5, decode_run_histogram_pages, decode_run_pages_soa,
-    open_from_full, parse_footer, plan_ranges_v4,
+    Footer, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds,
+    ReaderLimits, ResetHint, RunEntry, SegmentError, SegmentIdentity, SegmentWriter, SeriesEntryV4,
+    SeriesInputV3, SeriesValues, ValueKind, decode_catalog_v5, decode_chunk_runs,
+    decode_run_histogram_pages, decode_run_pages_soa, find_index_in_window, open_from_full,
+    parse_footer, parse_series_idx, plan_ranges_v4, verify_and_decompress_chunk_frame,
+    verify_id_window,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 use std::sync::OnceLock;
+
+/// v5 section kind numbers the point-probe path reads directly (frozen
+/// format, docs/segment-format.md `section_kind`; not exported by
+/// `ravel_segment` itself, so pinned here the same way the retired trailer
+/// versions are pinned elsewhere in this file).
+const SECTION_KIND_SERIES_IDS: u32 = 5;
+const SECTION_KIND_SERIES_IDX: u32 = 8;
+const SECTION_KIND_SERIES_META_CHUNKS: u32 = 9;
 
 /// Pre-v5 goldens kept only as retired-version rejection seeds (one per
 /// retired layout that has a checked-in fixture). Each must fail closed with
@@ -51,6 +71,18 @@ fn range_bytes(bytes: &[u8], range: (u64, u64)) -> Result<&[u8], SegmentError> {
     bytes
         .get(start..end)
         .ok_or(SegmentError::SectionOutOfBounds)
+}
+
+/// Finds a section's `(offset, len)` by kind in a (possibly mutated) footer.
+/// `None` means the section is absent -- either a legitimately below-
+/// threshold v5 object, or a mutation that dropped the section from the
+/// footer's own section list.
+fn find_section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
+    footer
+        .sections
+        .iter()
+        .find(|s| s.kind == kind)
+        .map(|s| (s.offset, s.len))
 }
 
 /// Drives the whole public v5 read pipeline (footer -> validate -> catalog ->
@@ -104,6 +136,72 @@ fn full_decode(bytes: &[u8]) -> Result<usize, SegmentError> {
         }
     }
     Ok(total)
+}
+
+/// Outcome of [`point_probe`], distinguishing "no sparse index to probe"
+/// from "index says this id is absent" from "id resolved to runs" -- unlike
+/// `full_decode`'s single success/error split, the point-probe chain has a
+/// legitimate not-found result that is not an error.
+#[derive(Debug)]
+enum ProbeOutcome {
+    /// The object carries no SERIES_IDX/SERIES_IDS/SERIES_META_CHUNKS triple
+    /// (a below-threshold v5 object, or a mutation that removed one of the
+    /// sections from the footer).
+    NoSparseIndex,
+    /// `locate` or `find_index_in_window` report the target id is not
+    /// present.
+    Absent,
+    /// The full chain resolved the target id's runs.
+    Found(Vec<RunEntry>),
+}
+
+/// Drives the v5 sparse point-probe surface end to end: `SparseIdIndex::
+/// locate` picks the SERIES_IDS window that must hold `target` if present,
+/// `find_index_in_window` searches that crc-verified window, `chunk_for`
+/// maps the resolved absolute index to its meta chunk, and
+/// `decode_chunk_runs` decodes just that series' runs from the crc-verified,
+/// decompressed frame. Every step returns a typed [`SegmentError`] on bad
+/// bytes; the contract this checks, mirroring [`full_decode`], is that the
+/// whole chain returns (a `ProbeOutcome` or an `Err`) instead of panicking.
+fn point_probe(bytes: &[u8], target: &[u8; 16]) -> Result<ProbeOutcome, SegmentError> {
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(bytes, limits)?;
+    let footer = &loc.footer;
+    let (Some(idx_range), Some(ids_range), Some(chunks_range)) = (
+        find_section_range(footer, SECTION_KIND_SERIES_IDX),
+        find_section_range(footer, SECTION_KIND_SERIES_IDS),
+        find_section_range(footer, SECTION_KIND_SERIES_META_CHUNKS),
+    ) else {
+        return Ok(ProbeOutcome::NoSparseIndex);
+    };
+
+    let idx_bytes = range_bytes(bytes, idx_range)?;
+    let index = parse_series_idx(idx_bytes)?;
+    let Some(window) = index.locate(target) else {
+        return Ok(ProbeOutcome::Absent);
+    };
+
+    let abs_window_offset = ids_range
+        .0
+        .checked_add(window.section_offset)
+        .ok_or(SegmentError::SectionOutOfBounds)?;
+    let window_bytes = range_bytes(bytes, (abs_window_offset, window.len))?;
+    verify_id_window(window_bytes, &window)?;
+    let Some(abs_index) = find_index_in_window(window_bytes, window.first_index, target)? else {
+        return Ok(ProbeOutcome::Absent);
+    };
+
+    let Some(chunk) = index.chunk_for(abs_index) else {
+        return Ok(ProbeOutcome::Absent);
+    };
+    let abs_frame_offset = chunks_range
+        .0
+        .checked_add(chunk.frame_offset)
+        .ok_or(SegmentError::SectionOutOfBounds)?;
+    let frame_stored = range_bytes(bytes, (abs_frame_offset, chunk.frame_stored_len))?;
+    let frame_raw = verify_and_decompress_chunk_frame(frame_stored, &chunk, limits)?;
+    let runs = decode_chunk_runs(&frame_raw, chunk.row_in_chunk, footer)?;
+    Ok(ProbeOutcome::Found(runs))
 }
 
 fn labels(pairs: &[(&str, &str)]) -> LabelSet {
@@ -223,6 +321,27 @@ fn seed(index: usize) -> &'static [u8] {
     &v5_seeds()[index % seed_count()]
 }
 
+/// The above-sparse-threshold seed (`v5_object(4096, ..)`, `v5_seeds()[1]`):
+/// the only cached seed that carries SERIES_IDX + SERIES_META_CHUNKS, the
+/// sections the point-probe path reads.
+fn sparse_seed() -> &'static [u8] {
+    &v5_seeds()[1]
+}
+
+/// A real series id from the unmutated sparse seed's own catalog, so
+/// `locate` is given a genuine target rather than an id that would trivially
+/// read `Absent` even on clean bytes. Built once and cached.
+fn sparse_seed_present_id() -> [u8; 16] {
+    static ID: OnceLock<[u8; 16]> = OnceLock::new();
+    *ID.get_or_init(|| {
+        let limits = ReaderLimits::default();
+        let loc = open_from_full(sparse_seed(), limits).expect("sparse seed opens");
+        let entries =
+            decode_catalog_v5(&loc.footer, sparse_seed(), limits).expect("sparse seed decodes");
+        entries[entries.len() / 2].entry.series_id.0
+    })
+}
+
 /// Single-bit flip at an in-bounds offset, then truncate to an in-bounds
 /// length: the seed-corpus mutation operators the finding names.
 fn mutate(bytes: &[u8], bit: usize, do_truncate: bool, truncate_to: usize) -> Vec<u8> {
@@ -244,6 +363,27 @@ fn v5_seeds_decode_cleanly_unmutated() {
             full_decode(seed(i)).is_ok(),
             "unmutated v5 seed {i} must decode cleanly"
         );
+    }
+}
+
+#[test]
+fn sparse_seed_point_probe_finds_known_id_unmutated() {
+    // Wiring sanity check before fuzzing it: a real id must resolve Found
+    // with at least one run, and a fabricated id outside the generated id
+    // space (every real id's first byte is `i % 11`, so 0xFF never occurs)
+    // must resolve Absent, never Found and never an error.
+    let target = sparse_seed_present_id();
+    match point_probe(sparse_seed(), &target).expect("point probe on clean bytes") {
+        ProbeOutcome::Found(runs) => {
+            assert!(!runs.is_empty(), "known-present id must resolve runs");
+        }
+        other => panic!("known-present id must resolve Found, got {other:?}"),
+    }
+
+    let absent = [0xFFu8; 16];
+    match point_probe(sparse_seed(), &absent).expect("point probe on clean bytes") {
+        ProbeOutcome::Absent => {}
+        other => panic!("fabricated id must resolve Absent, got {other:?}"),
     }
 }
 
@@ -305,6 +445,32 @@ proptest! {
     #[test]
     fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
         let _ = full_decode(&bytes);
+    }
+
+    /// The sparse point-probe chain (`locate` -> `find_index_in_window` ->
+    /// `chunk_for` -> `decode_chunk_runs`) parses SERIES_IDX and the
+    /// SERIES_META_CHUNKS frames through APIs `decode_catalog_v5`'s
+    /// mutation coverage above never calls. A single bit flip and/or
+    /// truncation of the sparse seed, probed for a real id that seed
+    /// carries, must yield a `ProbeOutcome` or a typed error, never a panic
+    /// -- the same criterion `seed_single_bit_and_truncation_never_panics`
+    /// checks for the whole-catalog path.
+    #[test]
+    fn point_probe_single_bit_and_truncation_never_panics(
+        bit in any::<usize>(),
+        do_truncate in any::<bool>(),
+        truncate_to in any::<usize>(),
+    ) {
+        let corrupt = mutate(sparse_seed(), bit, do_truncate, truncate_to);
+        let _ = point_probe(&corrupt, &sparse_seed_present_id());
+    }
+
+    /// Fully arbitrary bytes fed through the point-probe chain (mirroring
+    /// `arbitrary_bytes_never_panic` for the whole-catalog path) must never
+    /// panic.
+    #[test]
+    fn point_probe_arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+        let _ = point_probe(&bytes, &sparse_seed_present_id());
     }
 
     /// `parse_footer` reads the trailer from an arbitrary suffix with an
