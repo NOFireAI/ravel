@@ -10,7 +10,12 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+use arrow::array::{
+    Float64Array, Int64Array, RecordBatch, TimestampNanosecondArray, UInt16Array, UInt32Array,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -30,7 +35,7 @@ use ravel_otap::normalize::{
     AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA,
     AGGREGATION_TEMPORALITY_UNSPECIFIED, normalize_decoded,
 };
-use ravel_otap::proto::experimental::arrow::v1::BatchArrowRecords;
+use ravel_otap::proto::experimental::arrow::v1::{ArrowPayloadType, BatchArrowRecords};
 use ravel_otap::stream::{StreamConfig, StreamState};
 use ravel_otlp::{IngestLimits, NormalizeOutput, Rejection, normalize_metrics};
 use ravel_types::{SeriesId, TenantId};
@@ -55,6 +60,7 @@ struct WorkloadAttr {
 struct WorkloadPoint {
     ts_offset_ns: i64,
     value: f64,
+    flags: u32,
     attrs: Vec<WorkloadAttr>,
 }
 
@@ -136,11 +142,17 @@ fn point_strategy() -> impl Strategy<Value = WorkloadPoint> {
     (
         -1_000_000_000i64..1_000_000_000i64,
         -1000.0f64..1000.0f64,
+        any::<bool>(),
         prop::collection::vec(attr_strategy(), 0..=4),
     )
-        .prop_map(|(ts_offset_ns, value, attrs)| WorkloadPoint {
+        .prop_map(|(ts_offset_ns, value, stale, attrs)| WorkloadPoint {
             ts_offset_ns,
             value,
+            flags: if stale {
+                DataPointFlags::NoRecordedValueMask as u32
+            } else {
+                0
+            },
             attrs,
         })
 }
@@ -195,6 +207,7 @@ fn build_otlp_request(workload: &[WorkloadMetric]) -> ExportMetricsServiceReques
                     attributes: p.attrs.iter().map(otlp_kv).collect(),
                     time_unix_nano: (INGEST_TS_NS + p.ts_offset_ns) as u64,
                     value: Some(NumberValue::AsDouble(p.value)),
+                    flags: p.flags,
                     ..Default::default()
                 })
                 .collect();
@@ -268,6 +281,7 @@ fn build_otap_batch(
                 .map(|p| DataPointRow {
                     time_unix_nano: INGEST_TS_NS + p.ts_offset_ns,
                     value: p.value,
+                    flags: p.flags,
                     attrs: p.attrs.iter().map(otap_attr).collect(),
                 })
                 .collect();
@@ -349,11 +363,13 @@ fn future_skew_boundary_agrees() {
     let at_bound = WorkloadPoint {
         ts_offset_ns: limits.max_future_skew_ns,
         value: 1.0,
+        flags: 0,
         attrs: vec![],
     };
     let past_bound = WorkloadPoint {
         ts_offset_ns: limits.max_future_skew_ns + 1,
         value: 1.0,
+        flags: 0,
         attrs: vec![],
     };
     assert_paths_agree(&[WorkloadMetric {
@@ -369,11 +385,13 @@ fn too_old_boundary_agrees() {
     let at_bound = WorkloadPoint {
         ts_offset_ns: -limits.max_ingest_lag_ns,
         value: 1.0,
+        flags: 0,
         attrs: vec![],
     };
     let past_bound = WorkloadPoint {
         ts_offset_ns: -(limits.max_ingest_lag_ns + 1),
         value: 1.0,
+        flags: 0,
         attrs: vec![],
     };
     assert_paths_agree(&[WorkloadMetric {
@@ -390,6 +408,7 @@ fn duplicate_label_names_after_sanitization_agree() {
     let point = WorkloadPoint {
         ts_offset_ns: 0,
         value: 1.0,
+        flags: 0,
         attrs: vec![
             WorkloadAttr {
                 key: "foo.bar".to_string(),
@@ -400,6 +419,27 @@ fn duplicate_label_names_after_sanitization_agree() {
                 value: WorkloadValue::Str("2".to_string()),
             },
         ],
+    };
+    assert_paths_agree(&[WorkloadMetric {
+        name: "requests".to_string(),
+        kind: WorkloadKind::Gauge,
+        points: vec![point],
+    }]);
+}
+
+/// A gauge point flagged `NoRecordedValue` is stored as the Prometheus stale
+/// marker on both paths, matching `histogram_stale_marker_agrees`/
+/// `summary_stale_marker_agrees`: `ravel_otlp::build_point` never consults
+/// the value oneof for a stale point, and `flatten_dp`/`normalize_decoded`
+/// now mirror that exactly (see src/normalize.rs's `has_no_recorded_value`
+/// use just before attribute admission).
+#[test]
+fn number_stale_marker_agrees() {
+    let point = WorkloadPoint {
+        ts_offset_ns: 0,
+        value: 1.0,
+        flags: DataPointFlags::NoRecordedValueMask as u32,
+        attrs: vec![],
     };
     assert_paths_agree(&[WorkloadMetric {
         name: "requests".to_string(),
@@ -450,6 +490,7 @@ fn complex_attribute_value_rejected_on_both_paths() {
         data_points: vec![DataPointRow {
             time_unix_nano: INGEST_TS_NS,
             value: 1.0,
+            flags: 0,
             attrs: vec![AttrRow {
                 key: "blob".to_string(),
                 value: AttrValue::Complex,
@@ -508,6 +549,7 @@ fn delta_sum_rejected_on_both_paths() {
         data_points: vec![DataPointRow {
             time_unix_nano: INGEST_TS_NS,
             value: 1.0,
+            flags: 0,
             attrs: vec![],
         }],
     }];
@@ -1239,4 +1281,186 @@ fn ch1_histogram_bucket_shape_identity_vector_agrees() {
     }
     assert_eq!(bucket_seen, 4, "expected all 4 buckets present");
     assert_eq!(otlp_out.points.len(), 6, "expected 4 buckets + sum + count");
+}
+
+// --- NUMBER_DATA_POINTS int_value fallback (issue #206) -------------------
+//
+// `MetricsStreamEncoder` never emits `int_value` (see encode.rs's module
+// docs), so exercising it takes a hand-built `RecordBatch` fed straight into
+// `normalize_decoded`, bypassing the encoder's fixed schema.
+
+/// Build a root-only `DecodedBatch` (one Gauge metric at id 0, zero data
+/// points so `NUMBER_DATA_POINTS` is omitted per otap-spec.md section 3.1),
+/// then splice in `dp_batch` as its `NUMBER_DATA_POINTS` payload.
+#[allow(clippy::expect_used)]
+fn decode_with_custom_number_dp(metric_name: &str, dp_batch: RecordBatch) -> NormalizeOutput {
+    let metrics = vec![MetricRow {
+        name: metric_name.to_string(),
+        kind: MetricKind::Gauge,
+        data_points: vec![],
+    }];
+    let mut encoder = MetricsStreamEncoder::new("hand-built-number-dp").expect("new encoder");
+    let raw_batch = encoder
+        .encode_batch(0, &metrics)
+        .expect("encode root-only batch");
+    let mut state = StreamState::new(StreamConfig::default());
+    let mut decoded = state.decode(raw_batch).expect("decode root-only batch");
+    decoded
+        .payloads
+        .push((ArrowPayloadType::NumberDataPoints, dp_batch));
+    normalize_decoded(
+        &TenantId::new("acme"),
+        &decoded,
+        &IngestLimits::default(),
+        INGEST_TS_NS,
+    )
+}
+
+fn gauge_request(name: &str, data_points: Vec<NumberDataPoint>) -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: name.to_string(),
+                    data: Some(MetricData::Gauge(Gauge { data_points })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// A `NUMBER_DATA_POINTS` batch with only an `int_value` column (no
+/// `double_value` column at all) must decode instead of being silently
+/// dropped: the two value columns are alternatives, neither individually
+/// required (otap-spec.md section 5.3.2). Uses a small int (well under
+/// 2^53) so the value survives the `f64` round trip exactly and this does
+/// not exercise `IntegerValuePrecisionLoss`, which the OTAP int_value
+/// fallback does not yet track (see the crate report).
+#[test]
+fn number_data_point_int_value_only_column_decodes() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        Field::new("parent_id", DataType::UInt16, false),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("int_value", DataType::Int64, false),
+    ]);
+    let dp_batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32])),
+            Arc::new(UInt16Array::from(vec![0u16])),
+            Arc::new(TimestampNanosecondArray::from(vec![INGEST_TS_NS])),
+            Arc::new(Int64Array::from(vec![42i64])),
+        ],
+    )
+    .expect("build int-only number dp batch");
+
+    let otap_out = decode_with_custom_number_dp("widgets", dp_batch);
+    assert_eq!(
+        otap_out.rejected,
+        Vec::new(),
+        "unexpected rejections: {:?}",
+        otap_out.rejected
+    );
+    assert_eq!(otap_out.points.len(), 1);
+    assert_eq!(otap_out.points[0].sample.value.to_bits(), 42.0f64.to_bits());
+
+    let tenant = TenantId::new("acme");
+    let limits = IngestLimits::default();
+    let otlp_out = normalize_metrics(
+        &tenant,
+        gauge_request(
+            "widgets",
+            vec![NumberDataPoint {
+                time_unix_nano: INGEST_TS_NS as u64,
+                value: Some(NumberValue::AsInt(42)),
+                ..Default::default()
+            }],
+        ),
+        &limits,
+        INGEST_TS_NS,
+    );
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
+    );
+}
+
+/// A `NUMBER_DATA_POINTS` batch where `double_value` is a nullable column
+/// that is null on some rows must fall back to `int_value` for exactly
+/// those rows, not treat the null as a decode error or a silent 0.0.
+#[test]
+fn number_data_point_null_double_value_falls_back_to_int_value() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        Field::new("parent_id", DataType::UInt16, false),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("double_value", DataType::Float64, true),
+        Field::new("int_value", DataType::Int64, true),
+    ]);
+    let dp_batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32, 1u32])),
+            Arc::new(UInt16Array::from(vec![0u16, 0u16])),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                INGEST_TS_NS,
+                INGEST_TS_NS + 1_000_000,
+            ])),
+            Arc::new(Float64Array::from(vec![Some(1.5), None])),
+            Arc::new(Int64Array::from(vec![None, Some(7)])),
+        ],
+    )
+    .expect("build mixed double/int number dp batch");
+
+    let otap_out = decode_with_custom_number_dp("widgets", dp_batch);
+    assert_eq!(
+        otap_out.rejected,
+        Vec::new(),
+        "unexpected rejections: {:?}",
+        otap_out.rejected
+    );
+
+    let tenant = TenantId::new("acme");
+    let limits = IngestLimits::default();
+    let otlp_out = normalize_metrics(
+        &tenant,
+        gauge_request(
+            "widgets",
+            vec![
+                NumberDataPoint {
+                    time_unix_nano: INGEST_TS_NS as u64,
+                    value: Some(NumberValue::AsDouble(1.5)),
+                    ..Default::default()
+                },
+                NumberDataPoint {
+                    time_unix_nano: (INGEST_TS_NS + 1_000_000) as u64,
+                    value: Some(NumberValue::AsInt(7)),
+                    ..Default::default()
+                },
+            ],
+        ),
+        &limits,
+        INGEST_TS_NS,
+    );
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
+    );
 }

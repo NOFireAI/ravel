@@ -93,6 +93,7 @@ fn a9_f01_delta_sum_empty_name_rejection_classes_agree() {
         data_points: vec![DataPointRow {
             time_unix_nano: TS,
             value: 1.0,
+            flags: 0,
             attrs: vec![],
         }],
     }]);
@@ -156,6 +157,7 @@ fn a9_f01_attr_order_rejection_classes_agree() {
         data_points: vec![DataPointRow {
             time_unix_nano: TS,
             value: 1.0,
+            flags: 0,
             attrs: vec![
                 AttrRow {
                     key: "zzz".to_string(),
