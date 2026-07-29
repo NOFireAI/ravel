@@ -118,9 +118,9 @@ fn rlog_inspect_output_matches_golden_fixture() {
     let expected = inspect_fixture("rlog_inspect.txt");
     assert_eq!(
         stdout, expected,
-        "`rlog inspect` output regressed; RLOG v1 is frozen \
-         (docs/log-segment-format.md) -- this must not change without a version \
-         bump and ADR"
+        "`rlog inspect` output regressed; the RLOG format is frozen \
+         (docs/log-segment-format.md, currently trailer v2) -- this must not \
+         change without a version bump and ADR"
     );
     assert!(
         expected.contains("name=SKIP_IDX")

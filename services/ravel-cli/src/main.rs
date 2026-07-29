@@ -526,6 +526,9 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     println!("record_count: {}", footer.record_count);
     println!("block_count: {}", footer.block_count);
     println!("stream_count: {}", footer.stream_count);
+    println!("level: {}", footer.level);
+    println!("input_set_hash: {}", hex::encode(&footer.input_set_hash));
+    println!("part_index: {}", footer.part_index);
     println!("sections:");
     for section in &footer.sections {
         println!(

@@ -15,7 +15,7 @@ pub const SEGMENT_FORMAT_VERSION: u16 = 5;
 /// [`SEGMENT_FORMAT_VERSION`] it is not a configurable knob, and is stamped
 /// verbatim into the commit record's `segment_format_version`. Changing it is
 /// a format-level ADR, not a routine edit.
-pub const LOG_SEGMENT_FORMAT_VERSION: u16 = 1;
+pub const LOG_SEGMENT_FORMAT_VERSION: u16 = 2;
 
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn log_segment_format_version_is_v1() {
-        assert_eq!(LOG_SEGMENT_FORMAT_VERSION, 1);
+    fn log_segment_format_version_is_v2() {
+        assert_eq!(LOG_SEGMENT_FORMAT_VERSION, 2);
     }
 }
