@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -545,16 +546,51 @@ impl ShardActor {
         }
     }
 
+    /// Races `fut` against the remaining budget to `deadline_ns` on the
+    /// injected `Clock`, returning `None` if the deadline is already past or
+    /// elapses while `fut` is still in flight. This is what stops a store
+    /// call that is merely slow -- never errors, just never returns -- from
+    /// carrying a flush past `max_flush_lifetime` on its own (issue #182):
+    /// without this, `deadline_ns` was only ever consulted between retryable
+    /// -error attempts, never against an attempt that is still running.
+    ///
+    /// Deliberately built on `tokio::select!` racing `self.clock.sleep(..)`
+    /// rather than `tokio::time::timeout`: the latter schedules off
+    /// `tokio::time::Instant`/the real timer wheel, which is exactly the
+    /// real-time read this crate's `Clock` injection exists to keep out of
+    /// actor logic (crate module docs, `clock.rs`). Racing the injected
+    /// clock's own `sleep` keeps this on the same clock a test can pin and
+    /// advance, so a deadline can be crossed deterministically with no real
+    /// wall-clock wait.
+    async fn bound_to_deadline<F, T>(&self, deadline_ns: i64, fut: F) -> Option<T>
+    where
+        F: Future<Output = T>,
+    {
+        let remaining_ns = deadline_ns.saturating_sub(self.clock.now_ns());
+        if remaining_ns <= 0 {
+            return None;
+        }
+        let remaining = Duration::from_nanos(u64::try_from(remaining_ns).unwrap_or(u64::MAX));
+        tokio::select! {
+            result = fut => Some(result),
+            () = self.clock.sleep(remaining) => None,
+        }
+    }
+
     /// Retries the data-object PUT with the caller's own budget (separate
     /// from `ravel_commit::publish`'s internal `RetryPolicy`, which only
     /// governs the commit-record PUT). Reuses the same pinned `key`/`bytes`
-    /// on every attempt; `put_data_object` never re-derives either.
+    /// on every attempt; `put_data_object` never re-derives either. Each
+    /// attempt itself is bounded to `deadline_ns` via `bound_to_deadline`, so
+    /// a timeout (like a retryable store error) never retries past the
+    /// deadline and is treated exactly like the existing abandonment path.
     async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
         let mut attempt: u32 = 0;
         loop {
-            match publish::put_data_object(self.store.as_ref(), key, bytes.clone()).await {
-                Ok(()) => return true,
-                Err(PublishError::Store { source, .. }) if source.is_retryable() => {
+            let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
+            match self.bound_to_deadline(deadline_ns, call).await {
+                Some(Ok(())) => return true,
+                Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
                     attempt += 1;
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
@@ -564,7 +600,7 @@ impl ShardActor {
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                 }
-                Err(_) => return false,
+                Some(Err(_)) | None => return false,
             }
         }
     }
@@ -572,7 +608,9 @@ impl ShardActor {
     /// Retries the commit-record PUT with the caller's own budget. Passes
     /// `ravel_commit::publish::publish` a zero-retry policy so it attempts
     /// exactly once per call, letting this loop check `deadline_ns` between
-    /// attempts (the crate's own internal retry loop has no such hook).
+    /// attempts (the crate's own internal retry loop has no such hook). Each
+    /// attempt itself is bounded to `deadline_ns` via `bound_to_deadline`,
+    /// same as `put_data_object_with_retry`.
     async fn publish_with_retry(
         &self,
         record: &CommitRecord,
@@ -585,9 +623,10 @@ impl ShardActor {
         };
         let mut attempt: u32 = 0;
         loop {
-            match publish::publish(self.store.as_ref(), record, &single_attempt).await {
-                Ok(token) => return Some(token),
-                Err(PublishError::SplitBrain { this, stored }) => {
+            let call = publish::publish(self.store.as_ref(), record, &single_attempt);
+            match self.bound_to_deadline(deadline_ns, call).await {
+                Some(Ok(token)) => return Some(token),
+                Some(Err(PublishError::SplitBrain { this, stored })) => {
                     // Identity is pinned at flush open, so this cannot fire
                     // on a benign retry (docs/catalog-and-mvcc.md "Commit
                     // sequence"); it means the pinning invariant was broken
@@ -596,7 +635,7 @@ impl ShardActor {
                         "ravel-ingest: fatal split-brain on pinned flush identity: this={this} stored={stored}"
                     );
                 }
-                Err(PublishError::Store { source, .. }) if source.is_retryable() => {
+                Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
                     attempt += 1;
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
@@ -606,7 +645,7 @@ impl ShardActor {
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
                 }
-                Err(_) => return None,
+                Some(Err(_)) | None => return None,
             }
         }
     }
