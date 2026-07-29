@@ -117,6 +117,7 @@ impl RavelTableProvider {
             target_partitions,
             matchers,
             series_ids,
+            self.config.engine.max_series,
         )?);
         let scan_schema = scan.schema();
 

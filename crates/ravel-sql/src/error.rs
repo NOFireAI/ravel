@@ -113,6 +113,13 @@ pub enum SqlError {
     #[error("query fans out over too many segments: {count} exceeds max {max}")]
     TooManySegments { count: usize, max: usize },
 
+    /// The distinct `series_id` count exceeded `max_series` while a scan
+    /// partition was still building its runs (issues #187/#188). `count` is
+    /// the distinct count observed by the one partition that tripped, not a
+    /// cross-partition total; see crate::scan module doc.
+    #[error("query matches too many series: {count} exceeds max {max}")]
+    TooManySeries { count: usize, max: usize },
+
     /// The per-query or per-tenant byte budget was exhausted. The detail is
     /// the pool's own message (byte counts and limits only).
     #[error("query memory budget exhausted: {0}")]
@@ -159,6 +166,7 @@ impl SqlError {
             SqlError::DeadlineExceeded { .. } => ErrorClass::Timeout,
             SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
+            | SqlError::TooManySeries { .. }
             | SqlError::ResourcesExhausted(_)
             | SqlError::Plan(_)
             | SqlError::Execution(_)
@@ -188,6 +196,7 @@ impl SqlError {
             SqlError::DeadlineExceeded { .. }
             | SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
+            | SqlError::TooManySeries { .. }
             | SqlError::ResourcesExhausted(_) => self.to_string(),
             SqlError::Plan(_) => MSG_PLAN.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
