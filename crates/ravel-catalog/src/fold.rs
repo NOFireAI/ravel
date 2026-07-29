@@ -11,7 +11,9 @@
 //! falls back to full rebuild from the commit layout or returns a typed
 //! error; it never corrupts HEAD or leaves a torn snapshot visible.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ravel_commit::keys::{self, BucketEntry, KeyError};
@@ -112,6 +114,15 @@ pub struct FoldReport {
     /// Encoded size of the postings object, in bytes. `0` when
     /// `postings_built` is `false`.
     pub postings_bytes: u64,
+    /// Number of commit-bucket entries this fold skipped rather than
+    /// aborting on: an unrecognized bucket-key shape, or a commit record
+    /// whose identity duplicates one already folded. Both are layout drift
+    /// (docs/catalog-and-mvcc.md key-layout section: "layout drift must be
+    /// visible, not swallowed"), logged at `warn!` with the offending
+    /// key/identity -- satisfied by the log plus this counter, never by
+    /// aborting the fold, since either condition is a permanent property of
+    /// the sealed layout and aborting would block the watermark forever.
+    pub layout_drift_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -209,7 +220,11 @@ fn writer_id_display(bytes: &[u8]) -> String {
     }
 }
 
-fn entry_identity(entry: &SnapshotEntry) -> (u32, u32, Vec<u8>, u64, u64) {
+/// (ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq): the
+/// identity a commit record must be unique under (docs/catalog-and-mvcc.md).
+type EntryIdentity = (u32, u32, Vec<u8>, u64, u64);
+
+fn entry_identity(entry: &SnapshotEntry) -> EntryIdentity {
     (
         entry.ingest_hour_bucket,
         entry.shard,
@@ -281,8 +296,13 @@ impl Catalog {
     /// last fold. Every other failure mode that the metric index is allowed
     /// to degrade from (absent/corrupt HEAD, an unreadable previous part)
     /// falls back to a full rebuild from the commit layout rather than
-    /// erroring; only a malformed commit record, an unrecognized bucket-key
-    /// shape, a duplicate commit identity, or exhausted HEAD CAS retries
+    /// erroring. An unrecognized bucket-key shape or a duplicate commit
+    /// identity is a permanent property of the sealed layout, not a
+    /// transient fault: rather than failing every subsequent fold
+    /// identically forever, these are counted in
+    /// [`FoldReport::layout_drift_count`], logged at `warn!` with the
+    /// offending key/identity, and skipped (see the bucket-processing loop
+    /// below). Only a malformed commit record or exhausted HEAD CAS retries
     /// surface as [`CatalogError`].
     pub async fn fold(
         &self,
@@ -309,7 +329,7 @@ impl Catalog {
                 return Ok(no_op_report(Some(watermark_hour_old), counters));
             }
 
-            let (mut entries, buckets, rebuilt) = match &head_state {
+            let (mut entries, buckets, rebuilt, previous_entries_len) = match &head_state {
                 HeadState::Valid { head, .. } => match self
                     .load_previous_entries(head, &mut counters)
                     .await
@@ -317,7 +337,8 @@ impl Catalog {
                     Ok(entries) => {
                         let buckets =
                             incremental_buckets(shard_count, head.watermark_hour, watermark_hour);
-                        (entries, buckets, false)
+                        let previous_entries_len = entries.len();
+                        (entries, buckets, false, previous_entries_len)
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -334,7 +355,7 @@ impl Catalog {
                                 &mut counters,
                             )
                             .await?;
-                        (Vec::new(), buckets, true)
+                        (Vec::new(), buckets, true, 0)
                     }
                 },
                 HeadState::Absent | HeadState::Corrupt { .. } => {
@@ -347,12 +368,21 @@ impl Catalog {
                             &mut counters,
                         )
                         .await?;
-                    (Vec::new(), buckets, true)
+                    (Vec::new(), buckets, true, 0)
                 }
             };
 
-            let mut seen: HashSet<(u32, u32, Vec<u8>, u64, u64)> =
-                entries.iter().map(entry_identity).collect();
+            // Identity -> (index in `entries`, whether that occurrence sits
+            // under the hour directory its own embedded ingest_hour_bucket
+            // names). Entries loaded from a previous part already survived
+            // this same check in an earlier fold, so they seed the map as
+            // trivially canonical.
+            let mut seen: HashMap<EntryIdentity, (usize, bool)> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry_identity(entry), (index, true)))
+                .collect();
+            let mut layout_drift_count: u64 = 0;
 
             for (shard, hour) in &buckets {
                 let prefix = keys::commit_shard_hour_prefix(tenant, signal, *shard, *hour)?;
@@ -367,16 +397,30 @@ impl Catalog {
                                 .await?;
                             counters.get_requests += 1;
                             let entry = build_snapshot_entry(&meta.key, &record)?;
-                            if !seen.insert(entry_identity(&entry)) {
-                                return Err(CatalogError::DuplicateEntryIdentity {
-                                    shard: entry.shard,
-                                    ingest_hour_bucket: entry.ingest_hour_bucket,
-                                    writer_id: writer_id_display(&entry.writer_id),
-                                    writer_epoch: entry.writer_epoch,
-                                    writer_seq: entry.writer_seq,
-                                });
+                            let is_canonical = *hour == entry.ingest_hour_bucket;
+                            match seen.entry(entry_identity(&entry)) {
+                                Entry::Vacant(slot) => {
+                                    slot.insert((entries.len(), is_canonical));
+                                    entries.push(entry);
+                                }
+                                Entry::Occupied(mut slot) => {
+                                    layout_drift_count += 1;
+                                    tracing::warn!(
+                                        key = %meta.key,
+                                        shard = entry.shard,
+                                        ingest_hour_bucket = entry.ingest_hour_bucket,
+                                        writer_id = %writer_id_display(&entry.writer_id),
+                                        writer_epoch = entry.writer_epoch,
+                                        writer_seq = entry.writer_seq,
+                                        "duplicate commit identity while folding, preferring the entry in its correct hour directory"
+                                    );
+                                    let &(existing_index, existing_canonical) = slot.get();
+                                    if !existing_canonical && is_canonical {
+                                        entries[existing_index] = entry;
+                                        slot.insert((existing_index, true));
+                                    }
+                                }
                             }
-                            entries.push(entry);
                         }
                         // Compaction records and the retention tombstone
                         // live in the same bucket (docs/catalog-and-mvcc.md
@@ -385,7 +429,14 @@ impl Catalog {
                         // this phase, hence the `Transaction` extension
                         // point above.
                         Ok(BucketEntry::CompactionRecord(_)) | Ok(BucketEntry::Tombstone(_)) => {}
-                        Err(err) => return Err(CatalogError::Key(err)),
+                        Err(err) => {
+                            layout_drift_count += 1;
+                            tracing::warn!(
+                                error = %err,
+                                key = %meta.key,
+                                "unrecognized bucket-key shape, skipping key"
+                            );
+                        }
                     }
                 }
             }
@@ -439,20 +490,49 @@ impl Catalog {
             }
             counters.put_requests += 1;
 
-            // Postings are rebuilt from the whole entry set on every
-            // successful fold, never merged incrementally from a previous
-            // postings object: entries only ever gain a strictly greater
-            // ingest_hour_bucket than the entries a valid HEAD already
-            // covers (`incremental_buckets` only lists hours past the old
+            // Postings are merged forward from the previous fold's postings
+            // object rather than re-decoded from every historical segment:
+            // entries only ever gain a strictly greater ingest_hour_bucket
+            // than the entries a valid HEAD already covers
+            // (`incremental_buckets` only lists hours past the old
             // watermark), so the sort above always keeps previously-covered
-            // entries at their same ordinal prefix -- but re-deriving the
-            // whole index from the segments themselves, rather than trusting
-            // that invariant to hold under a corrupt-HEAD/rebuild fallback
-            // too, is what keeps this "exact semantics, never approximate"
-            // (docs/metric-index-plan.md P5a). A build failure at any single
-            // entry aborts the whole index, never publishes a partial one.
+            // entries at their same ordinal prefix and `decode_start` below
+            // never needs to re-fetch them. On the rebuilt path (corrupt
+            // HEAD, unreadable previous part), or when no usable previous
+            // postings baseline exists (no postings ref on HEAD, or it fails
+            // to load), decoding starts at 0 and every current entry is
+            // fetched once -- a one-time full build, not a partial merge. A
+            // build failure at any entry from `decode_start` onward aborts
+            // the whole index, never publishes a partial one
+            // (docs/metric-index-plan.md P5a).
+            let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) = if rebuilt
+            {
+                (Vec::new(), 0)
+            } else if let HeadState::Valid { head, .. } = &head_state {
+                match self
+                    .load_previous_postings(
+                        tenant,
+                        head,
+                        previous_entries_len as u64,
+                        &mut counters,
+                    )
+                    .await
+                {
+                    Some(names) => (names, previous_entries_len),
+                    None => (Vec::new(), 0),
+                }
+            } else {
+                (Vec::new(), 0)
+            };
             let postings_names = self
-                .build_postings(tenant, signal, &entries, &mut counters)
+                .build_postings(
+                    tenant,
+                    signal,
+                    &entries,
+                    postings_decode_start,
+                    postings_baseline,
+                    &mut counters,
+                )
                 .await;
             let mut postings_built = false;
             let mut postings_size = 0u64;
@@ -569,6 +649,7 @@ impl Catalog {
                         put_requests: counters.put_requests,
                         postings_built,
                         postings_bytes: postings_size,
+                        layout_drift_count,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -648,22 +729,120 @@ impl Catalog {
         Ok(entries)
     }
 
+    /// Load and verify the previous fold's postings object before trusting
+    /// it as a merge baseline (docs/metric-index-plan.md P5a): same
+    /// hash/part-binding/decode checks `snapshot_resolve`'s
+    /// `load_snapshot_postings` applies at query time, plus an
+    /// `entry_count` check against `previous_entry_count` -- the ordinal
+    /// boundary this fold's merge carries forward, not the post-fold total.
+    /// Any failure (no postings ref, cache/GET miss, hash mismatch, decode
+    /// error, entry_count mismatch) returns `None`, so the caller decodes
+    /// every current entry from scratch instead of merging.
+    async fn load_previous_postings(
+        &self,
+        tenant: &TenantHash,
+        head: &SnapshotHead,
+        previous_entry_count: u64,
+        counters: &mut RequestCounters,
+    ) -> Option<Vec<NamePostings>> {
+        let postings_ref = head.postings.as_ref()?;
+        let expected_part_blake3: Vec<[u8; 32]> = head
+            .parts
+            .iter()
+            .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
+            .collect::<Result<_, _>>()
+            .ok()?;
+
+        if let Some(cached) = self.postings_cache().get(tenant, &postings_ref.key) {
+            if cached.header.entry_count == previous_entry_count {
+                return Some(cached.names.clone());
+            }
+            tracing::warn!(
+                key = %postings_ref.key,
+                "cached previous postings entry_count mismatch, rebuilding postings from scratch"
+            );
+            return None;
+        }
+
+        let got = match self.store().get(&postings_ref.key, GetRange::Full).await {
+            Ok(got) => got,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = %postings_ref.key,
+                    tenant = %tenant.to_hex(),
+                    "previous postings GET failed, rebuilding postings from scratch"
+                );
+                return None;
+            }
+        };
+        counters.get_requests += 1;
+        let digest = blake3::hash(&got.data);
+        if digest.as_bytes().as_slice() != postings_ref.blake3.as_slice() {
+            tracing::warn!(
+                key = %postings_ref.key,
+                "previous postings hash mismatch, rebuilding postings from scratch"
+            );
+            return None;
+        }
+        let limits = snapshot_format::PostingsLimits {
+            max_postings_bytes: self.config().max_postings_bytes,
+        };
+        let decoded =
+            match snapshot_format::decode_postings(&got.data, &limits, &expected_part_blake3) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        key = %postings_ref.key,
+                        "previous postings failed to decode, rebuilding postings from scratch"
+                    );
+                    return None;
+                }
+            };
+        if decoded.header.entry_count != previous_entry_count {
+            tracing::warn!(
+                key = %postings_ref.key,
+                expected = previous_entry_count,
+                actual = decoded.header.entry_count,
+                "previous postings entry_count mismatch, rebuilding postings from scratch"
+            );
+            return None;
+        }
+
+        let decoded = Arc::new(decoded);
+        self.postings_cache().insert(
+            *tenant,
+            postings_ref.key.clone(),
+            decoded.clone(),
+            self.config().postings_cache_entries,
+        );
+        Some(decoded.names.clone())
+    }
+
     /// Build the name-postings index for `entries` (docs/metric-index-plan.md
-    /// P5a): for each entry, at its position `i` in `entries`, fetch its
-    /// segment via the `ravel-segment` reader and add `i` to the postings
-    /// list of every distinct `__name__` value found among its series.
-    /// Returns `None` on any failure (a segment fetch, identity check, or
-    /// decode error, or a series missing `__name__`), logging the cause: a
-    /// postings build is all-or-nothing, never partial.
+    /// P5a), merging forward from `baseline` rather than re-decoding every
+    /// historical segment on every fold: entries before `decode_start` keep
+    /// exactly the ordinals `baseline` already recorded for them, and only
+    /// entries at or past `decode_start` are fetched and decoded. Returns
+    /// `None` on any failure (a segment fetch, identity check, or decode
+    /// error, or a series missing `__name__`), logging the cause: a
+    /// postings build is all-or-nothing over the entries it decodes, never
+    /// partial.
     async fn build_postings(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         entries: &[SnapshotEntry],
+        decode_start: usize,
+        baseline: Vec<NamePostings>,
         counters: &mut RequestCounters,
     ) -> Option<Vec<NamePostings>> {
-        let mut by_name: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-        for (ordinal, entry) in entries.iter().enumerate() {
+        let mut by_name: BTreeMap<String, Vec<u64>> = baseline
+            .into_iter()
+            .map(|np| (np.name, np.ordinals))
+            .collect();
+        for (ordinal, entry) in entries.iter().enumerate().skip(decode_start) {
             let names = match self
                 .fetch_entry_names(tenant, signal, entry, counters)
                 .await
@@ -817,6 +996,7 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         put_requests: counters.put_requests,
         postings_built: false,
         postings_bytes: 0,
+        layout_drift_count: 0,
     }
 }
 
@@ -1226,7 +1406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_commit_identity_across_buckets_is_fatal() {
+    async fn duplicate_commit_identity_across_buckets_skips_and_advances() {
         let store = Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
         let now = now_at_seal(11);
@@ -1281,10 +1461,110 @@ mod tests {
             .await
             .expect("put b");
 
-        let err = catalog
+        let report = catalog
             .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
             .await
-            .expect_err("must detect duplicate identity");
-        assert!(matches!(err, CatalogError::DuplicateEntryIdentity { .. }));
+            .expect("duplicate identity must not be fold-fatal");
+        assert!(!report.no_op);
+        assert_eq!(report.watermark_hour, Some(11));
+        assert_eq!(
+            report.entry_count, 1,
+            "the misplaced duplicate collapses into the one entry kept in its correct hour directory"
+        );
+        assert_eq!(report.layout_drift_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unrecognized_bucket_key_shape_skips_and_advances() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_at_seal(5);
+
+        // A key sitting in a well-formed commit hour directory, but whose
+        // filename matches none of the three recognized shapes (commit
+        // record, compaction record, retention tombstone).
+        let prefix = keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, 5)
+            .expect("bucket prefix");
+        store
+            .put(
+                &format!("{prefix}not-a-recognized-shape"),
+                Bytes::from_static(b"layout drift"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put unrecognized key");
+
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .await
+            .expect("unrecognized key shape must not be fold-fatal");
+        assert!(!report.no_op);
+        assert!(report.rebuilt);
+        assert_eq!(report.watermark_hour, Some(5));
+        assert_eq!(report.entry_count, 0);
+        assert_eq!(report.layout_drift_count, 1);
+    }
+
+    /// Issue #183: a fold must decode only the entries newly folded since
+    /// the last successful fold, carrying forward the previous postings
+    /// object as a merge baseline rather than re-fetching every
+    /// historically-covered entry's segment. `get_requests` is the proof:
+    /// each fold's total is bookkeeping gets (HEAD, plus on the second
+    /// fold the previous part and previous postings) plus exactly one
+    /// commit-record load and one segment fetch per *newly* folded entry.
+    /// A fold that still rebuilt postings from every historical segment
+    /// would add one extra segment fetch on the second run (re-decoding
+    /// the first fold's entry), landing on 6 instead of 5.
+    #[tokio::test]
+    async fn incremental_fold_decodes_only_newly_folded_entries_for_postings() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert!(!first.no_op);
+        assert_eq!(first.entry_count, 1);
+        assert!(first.postings_built);
+        // HEAD get (absent) + 1 commit-record load + 1 segment fetch to
+        // decode the sole entry's names.
+        assert_eq!(first.get_requests, 3);
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["mem"],
+        )
+        .await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "a valid HEAD must fold incrementally");
+        assert!(!second.no_op);
+        assert_eq!(second.entry_count, 2);
+        assert!(second.postings_built);
+        // HEAD get + previous-part load + previous-postings load + 1 new
+        // commit-record load + 1 new segment fetch = 5: the first fold's
+        // "cpu" entry is neither re-loaded from the part nor re-decoded
+        // from its segment.
+        assert_eq!(second.get_requests, 5);
     }
 }
