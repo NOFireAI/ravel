@@ -201,8 +201,13 @@ jobs:
           # matches that one test name exactly. `--no-capture` replaces libtest's
           # `--nocapture` so the guard's skip line still reaches stdout. nextest
           # writes its run summary to stderr, so 2>&1 keeps it in the tee'd file.
+          # `--color never` overrides the workspace-wide CARGO_TERM_COLOR=always
+          # for this one command: nextest otherwise wraps the digits and words
+          # of its summary line in ANSI escapes even when piped, which breaks
+          # the pass-count grep below.
           cargo nextest run -p ravel-object-store --test contract \
-            -E 'test(=minio_contract)' --no-capture 2>&1 | tee contract-output.txt
+            -E 'test(=minio_contract)' --no-capture --color never 2>&1 \
+            | tee contract-output.txt
           # Prove the suite actually ran against MinIO rather than taking the
           # RAVEL_MINIO_URL-unset early return. If the guard printed its skip
           # line, or nextest did not report exactly one passing test, fail the
@@ -262,9 +267,13 @@ jobs:
           # The original had no positional test-name filter (the binary holds
           # exactly one test), so no `-E` filter is needed here. `--no-capture`
           # keeps the guard's skip line on stdout; 2>&1 keeps nextest's
-          # stderr summary in the tee'd file.
+          # stderr summary in the tee'd file. `--color never` overrides the
+          # workspace-wide CARGO_TERM_COLOR=always for this one command:
+          # nextest otherwise wraps the digits and words of its summary line
+          # in ANSI escapes even when piped, which breaks the pass-count grep
+          # below.
           cargo nextest run -p ravel-promql-difftest --test difftest_selectors \
-            --no-capture 2>&1 | tee difftest-output.txt
+            --no-capture --color never 2>&1 | tee difftest-output.txt
           # Prove the gated test actually ran against the pinned binary
           # rather than taking its RAVEL_DIFFTEST-unset early return.
           if grep -q "skipping: set RAVEL_DIFFTEST" difftest-output.txt; then
