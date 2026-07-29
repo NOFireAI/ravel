@@ -2,7 +2,14 @@
 //! #238). Two small RLOG objects with disjoint ts ranges and distinct stream
 //! identities exercise: ts-range pruning before any GET, stream-attribute
 //! resolution against STREAM_DIR, and an end-to-end word + ts-range scan whose
-//! records are checked against a hand-computed expected set.
+//! records are checked against a hand-computed expected set. Objects are
+//! written with a deliberately tiny `block_target_records` (see
+//! [`small_blocks`]) so that block-level pruning is observable rather than
+//! trivially satisfied by a single-block object.
+//!
+//! `matching_streams_over_approximates_nested_map_values` pins the documented
+//! false-positive behavior of stream-attribute matching, which is a byte
+//! containment search rather than an exact structured match.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -100,6 +107,25 @@ fn stream(name: &str) -> (LogStreamId, Vec<u8>) {
     (id, blob)
 }
 
+/// A record on the stream identified by an arbitrary resource attribute set
+/// (scope `("scope", "1.0")`, no scope attributes), for stream-identity cases
+/// the simple `service.name`-only helper cannot express.
+fn record_with_resource(resource: &[(String, AttrValue)], ts: i64, body: &str) -> LogRecord {
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
 fn record(name: &str, ts: i64, body: &str) -> LogRecord {
     let (stream_id, stream_attrs) = stream(name);
     LogRecord {
@@ -117,10 +143,22 @@ fn record(name: &str, ts: i64, body: &str) -> LogRecord {
     }
 }
 
+/// A writer config that cuts a block every 3 records, so the small test
+/// objects here still have several blocks and block-level pruning has something
+/// real to prove. With the default `block_target_records` of 8192 every test
+/// object would be a single block and any "pruning happened" assertion would be
+/// vacuous.
+fn small_blocks() -> RlogConfig {
+    RlogConfig {
+        block_target_records: 3,
+        ..RlogConfig::default()
+    }
+}
+
 /// Writes one RLOG object from `records`, puts it at `key`, and returns a
 /// matching L0 [`SegmentRef`] with the object's true ts span.
 async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> SegmentRef {
-    let mut w = RlogWriter::new(RlogConfig::default(), identity());
+    let mut w = RlogWriter::new(small_blocks(), identity());
     for r in records {
         w.push(r.clone()).expect("push");
     }
@@ -291,12 +329,136 @@ async fn fetch_prunes_by_ts_range_and_stream_attrs_without_full_object_scan() {
     assert_eq!(hit.stream_id, api_id);
     assert_eq!(hit.body, "connection timeout");
 
-    // The scan actually pruned blocks rather than reading the whole object:
-    // some blocks were dropped before the exact re-evaluation.
+    // The scan actually pruned blocks rather than reading the whole object.
+    // Object A is written with `small_blocks`, so it really has several blocks;
+    // the "timeout" word predicate only survives bloom in the one block holding
+    // ts=105. Guard the multi-block precondition first, otherwise the strict
+    // inequality below could pass for the wrong reason.
     assert!(
-        out_a.stats.blocks_scanned <= out_a.stats.blocks_total,
-        "scan reports its pruning counters"
+        out_a.stats.blocks_total > 1,
+        "object A must be multi-block for block pruning to be observable, got {}",
+        out_a.stats.blocks_total
     );
+    assert!(
+        out_a.stats.blocks_scanned < out_a.stats.blocks_total,
+        "bloom pruning dropped blocks before decoding: scanned {} of {}",
+        out_a.stats.blocks_scanned,
+        out_a.stats.blocks_total
+    );
+}
+
+/// Skip-index ts pruning is observable on its own, with no content predicate:
+/// a range covering only the first few records of a multi-block object leaves
+/// strictly fewer candidate blocks than the object has.
+#[tokio::test]
+async fn ts_range_prunes_blocks_within_the_object() {
+    let mem = MemoryStore::new();
+    let records: Vec<LogRecord> = (100..=130).map(|ts| record("api", ts, "ok")).collect();
+    let seg_ref = write_object(&mem, "logs/many.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+
+    let out = fetcher
+        .fetch(&seg_ref, &LogQuery::new(100, 102))
+        .await
+        .expect("fetch")
+        .expect("in range");
+
+    assert!(
+        out.stats.blocks_total > 1,
+        "31 records at 3 per block must span several blocks, got {}",
+        out.stats.blocks_total
+    );
+    assert!(
+        out.stats.blocks_after_skip < out.stats.blocks_total,
+        "skip index dropped blocks outside [100, 102]: {} of {} survived",
+        out.stats.blocks_after_skip,
+        out.stats.blocks_total
+    );
+    // The surviving records are exactly the three in range.
+    let got: Vec<i64> = out.records.iter().map(|r| r.ts_ns).collect();
+    assert_eq!(got, vec![100, 101, 102]);
+}
+
+/// Locks in the documented over-approximation of
+/// [`LogSegmentFetcher::matching_streams`]: byte containment cannot distinguish
+/// a `(key, value)` pair nested inside a map attribute value from the same pair
+/// as a genuine top-level resource attribute, because both are written with the
+/// identical byte grammar. Two distinct streams, only one of which carries a
+/// top-level `service.name`, both match the `service.name = "api"` filter.
+///
+/// This test asserts the current, now-documented behavior rather than the ideal
+/// behavior. Issue #239 owns the decision to make this exact; if it does, this
+/// test should be changed to assert the exact result (only `plain_id`), never
+/// deleted, so the change is deliberate and visible.
+#[tokio::test]
+async fn matching_streams_over_approximates_nested_map_values() {
+    let mem = MemoryStore::new();
+    // Stream (a): a genuine top-level `service.name = "api"`.
+    let plain = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    // Stream (b): no top-level `service.name` at all. The pair only appears
+    // nested inside the value of an unrelated `k8s.labels` map attribute.
+    let nested = vec![(
+        "k8s.labels".to_string(),
+        AttrValue::Map(vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )]),
+    )];
+    let plain_id = ravel_types::logstream::log_stream_id(&plain, "scope", "1.0", &[]);
+    let nested_id = ravel_types::logstream::log_stream_id(&nested, "scope", "1.0", &[]);
+    assert_ne!(plain_id, nested_id, "these are two distinct streams");
+
+    let records = vec![
+        record_with_resource(&plain, 1, "x"),
+        record_with_resource(&nested, 2, "y"),
+    ];
+    let _ = write_object(&mem, "logs/nested.rlog", &records).await;
+    let bytes = mem
+        .get("logs/nested.rlog", GetRange::Full)
+        .await
+        .expect("get")
+        .data;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let fetcher = LogSegmentFetcher::new(store);
+    let mut matched = fetcher
+        .matching_streams(
+            &bytes,
+            &[StreamAttrEquals::new(
+                "service.name",
+                AttrValue::Str("api".into()),
+            )],
+        )
+        .expect("resolve");
+    matched.sort();
+
+    let mut both = vec![plain_id, nested_id];
+    both.sort();
+    assert_eq!(
+        matched, both,
+        "documented over-approximation: the nested-map stream is a false positive"
+    );
+    // The no-false-negative direction: the stream that genuinely carries the
+    // attribute is always in the result.
+    assert!(matched.contains(&plain_id));
+
+    // The over-approximation is confined to nesting-vs-top-level ambiguity. A
+    // value that appears nowhere in the object, at any depth, still resolves to
+    // the empty set.
+    let none = fetcher
+        .matching_streams(
+            &bytes,
+            &[StreamAttrEquals::new(
+                "service.name",
+                AttrValue::Str("absent".into()),
+            )],
+        )
+        .expect("resolve");
+    assert!(none.is_empty(), "no stream carries service.name=absent");
 }
 
 #[tokio::test]
