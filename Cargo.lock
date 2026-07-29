@@ -3973,6 +3973,7 @@ dependencies = [
  "proptest",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-logseg",
  "ravel-maintain",
  "ravel-object-store",
  "ravel-promql",
