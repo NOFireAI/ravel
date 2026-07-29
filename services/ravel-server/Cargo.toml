@@ -72,6 +72,10 @@ tower = { workspace = true }
 futures = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-segment = { workspace = true }
+# Test-only: the log ingest end-to-end test decodes the RLOG object the write
+# flushed, straight out of the object store. The server binary never reads a
+# log object back; only the test does.
+ravel-logseg = { workspace = true }
 uuid = { workspace = true }
 # Test-only: decodes the Arrow IPC response. This is the workspace arrow pin
 # (59), not the arrow 58 datafusion carries, so the assertion doubles as a
