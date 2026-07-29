@@ -466,13 +466,22 @@ signal-generic. An L1 part is byte-for-byte a normal RLOG object with
 The merge is defined entirely in terms of this format:
 
 - **Global `stream_ref` remap.** The inputs' sorted `STREAM_DIR`s are
-  merged into one sorted stream set; every input's local `stream_ref`
-  values are renumbered into it. Because `stream_id` is the canonical
-  hash of a stream's resource+scope blob, two inputs may list the same
-  `stream_id` only with byte-identical blobs; a disagreement is an
-  upstream identity violation or a hash collision and is a hard,
-  typed error (the cross-object form of the single-writer
-  `InconsistentStreamAttrs` check), never a silent pick.
+  merged into one global sorted stream ordering across all inputs. This
+  ordering is used for iteration order (streams are merged in sorted
+  `stream_id` order), for the cross-object identity check, and for
+  splitting output on disjoint part boundaries (a stream never straddles
+  two parts). It is not itself written to any object: when the merge
+  splits into multiple parts, each part's own `STREAM_DIR` is built fresh
+  by `RlogWriter` from only the streams that landed in that part, with
+  dense `stream_ref` ordinals starting at zero per part, exactly as an
+  ordinary L0 write already does. So there is no single merged directory
+  shared across the output; the global ordering governs the merge, and
+  each part re-derives its own local `stream_ref` numbering. Because
+  `stream_id` is the canonical hash of a stream's resource+scope blob,
+  two inputs may list the same `stream_id` only with byte-identical
+  blobs; a disagreement is an upstream identity violation or a hash
+  collision and is a hard, typed error (the cross-object form of the
+  single-writer `InconsistentStreamAttrs` check), never a silent pick.
 - **Re-sort and re-block.** The merged records are re-sorted by
   `(stream_ref ascending, ts ascending)` and re-chunked at the same 8192
   record block target. There is no record-level dedup: distinct

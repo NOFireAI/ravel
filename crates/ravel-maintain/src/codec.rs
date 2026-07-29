@@ -17,10 +17,19 @@
 //! (2) to consume. It deliberately covers nothing else: the record assembly,
 //! key reconstruction, convergence repair, and size cap all live in the shared
 //! modules and take a [`crate::bucket::Bucket`] whose `signal` field already
-//! routes them. Both methods hold the plan's memory bound -- catalog metadata
-//! plus one in-flight part buffer, never the whole bucket's decoded data at
-//! once (`build.rs`/`read.rs` header comments) -- as a contract on the impl,
-//! not a hint.
+//! routes them. The plan's memory bound is on *decoded* data: catalog metadata
+//! plus one in-flight part buffer's decoded records, never the whole bucket's
+//! decoded data at once (`build.rs`/`read.rs` header comments). [`RsegCodec`]
+//! holds this as a contract on the impl, not a hint: its ranged reader
+//! (`ravel_segment::open_from_suffix`) fetches only the footer and the
+//! page/block bytes a part actually needs. [`crate::rlog::RlogCodec`] is a
+//! documented exception on the *raw-bytes* axis only: RLOG has no ranged
+//! `.rlog` section reader, so `build_parts` GETs every input object whole and
+//! holds all N raw buffers resident for the merge (see that module's "Memory"
+//! note). It still bounds *decoded* data to one part plus one stream, which is
+//! the part the plan's bound is about; the raw-bytes gap is tracked as a
+//! follow-up (a ranged RLOG reader), not a silent violation of a claimed
+//! universal contract.
 //!
 //! [`RsegCodec`] is a behavior-preserving thin wrapper over the existing
 //! `read.rs`/`build.rs` RSEG logic; [`crate::rlog::RlogCodec`] is the RLOG
@@ -60,7 +69,11 @@ pub trait SegmentCodec {
     /// Stream-merge every input into size-capped [`BuiltPart`]s and PUT each
     /// one `CreateIfAbsent` (build.rs's job). `catalogs` is aligned one-to-one
     /// with `inputs` in canonical input order. Fetches page/block bytes lazily;
-    /// peak memory is bounded by catalog metadata plus one in-flight part.
+    /// peak *decoded* memory is bounded by catalog metadata plus one in-flight
+    /// part. RSEG additionally bounds raw fetched bytes (ranged reader); RLOG
+    /// is a documented exception that holds all inputs' raw bytes resident
+    /// (no ranged `.rlog` reader), while still bounding decoded data as above
+    /// -- see the trait doc above and [`crate::rlog::RlogCodec`].
     async fn build_parts(
         store: &dyn ObjectStoreBackend,
         config: &CompactorConfig,
