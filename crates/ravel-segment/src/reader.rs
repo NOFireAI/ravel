@@ -1341,12 +1341,69 @@ struct SeriesMetaTailV4 {
 /// section list alongside the fully parsed tail, so they run in the
 /// caller via `check_value_kind_pages_v4`, exactly as v3 defers
 /// `check_value_kind_pages_v3`.
+/// Live-heap bytes one decoded run costs in [`parse_series_meta_tail_v4`]:
+/// eleven `u64`/`i64`-valued run-major columns (`created_unix_ns`,
+/// `writer_epoch`, `writer_seq`, `min_ts_ns`, `max_ts_ns`, `ts_gap`,
+/// `ts_len`, `val_gap`, `val_len`, `hist_gap`, `hist_len`; 8 bytes each), one
+/// `u32`-valued column (`sample_count`; 4 bytes), the three reconstructed
+/// `(u64, u64)` range vectors (`ts_page`/`val_page`/`hist_page`; 16 bytes
+/// each), and one folded [`RunEntry`] (`size_of::<RunEntry>()`, pinned at 96
+/// bytes by `format_constants_are_pinned`-style layout: nine fixed-width
+/// integer fields whose largest alignment is 8, so the 4-byte
+/// `sample_count` field pads the struct to a 96-byte total). All of these
+/// are resident simultaneously right before the final `runs` vector is
+/// built (see `SeriesMetaTailV4`'s doc comment).
+pub(crate) const RUN_LIVE_BYTES_DENSE: u64 = 11 * 8 + 4 + 3 * 16 + 96;
+
+/// Same twelve-column shape as decoded by
+/// [`crate::sparse::decode_chunk_frame`], except every run-major column
+/// there (including `sample_count`) is read via `read_uvarint_block` into a
+/// `Vec<u64>` and only narrowed to `u32` when folded into `RunEntry`, so all
+/// twelve columns cost 8 bytes each rather than eleven at 8 and one at 4.
+pub(crate) const RUN_LIVE_BYTES_CHUNK: u64 = 12 * 8 + 3 * 16 + 96;
+
+/// Rejects a `run_total`/`frame_run_total` whose live-decoded working set --
+/// the twelve run-major columns, three reconstructed range vectors, and the
+/// folded `RunEntry` vector, all resident at once just before the fold into
+/// the final structure (docs/segment-format.md SERIES_META run-major
+/// columns) -- would exceed `limits.max_section_uncompressed_bytes`.
+///
+/// That cap already bounds *input* bytes, one section (or chunk frame) at a
+/// time, in [`decode_section_bytes`]/`verify_and_decompress_chunk_frame`.
+/// But a maliciously small compressed section can decompress to a byte count
+/// near that cap consisting of nothing but 1-byte-varint runs, and the
+/// live-byte expansion per run (roughly 20-25x, per [`RUN_LIVE_BYTES_DENSE`]/
+/// [`RUN_LIVE_BYTES_CHUNK`] against the ~12-byte best-case input cost of one
+/// run) means the input-byte cap alone lets `run_total` reach a live
+/// footprint many times the configured budget before any per-column
+/// allocation would fail on its own. Reusing the same cap as a live-byte
+/// budget closes that gap without a second config knob, and this check runs
+/// before the first run-major column `Vec` is allocated.
+pub(crate) fn check_run_total_live_budget(
+    run_total: u64,
+    live_bytes_per_run: u64,
+    limits: ReaderLimits,
+) -> Result<(), SegmentError> {
+    let live_bytes = run_total
+        .checked_mul(live_bytes_per_run)
+        .ok_or(SegmentError::FieldOverflow)?;
+    if live_bytes > limits.max_section_uncompressed_bytes {
+        return Err(SegmentError::RunTotalLiveBudgetExceeded {
+            run_total,
+            live_bytes,
+            cap: limits.max_section_uncompressed_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn parse_series_meta_tail_v4(
     meta_bytes: &[u8],
     pos: &mut usize,
     footer: &Footer,
     count: u32,
     run_total: u32,
+    limits: ReaderLimits,
 ) -> Result<SeriesMetaTailV4, SegmentError> {
     let block = take_block(meta_bytes, pos)?;
     let mut bpos = 0usize;
@@ -1387,6 +1444,7 @@ fn parse_series_meta_tail_v4(
         });
     }
     let run_total_usize = to_usize(u64::from(run_total))?;
+    check_run_total_live_budget(u64::from(run_total), RUN_LIVE_BYTES_DENSE, limits)?;
 
     let block = take_block(meta_bytes, pos)?;
     let mut bpos = 0usize;
@@ -1668,7 +1726,8 @@ pub fn decode_catalog_v4(
     let schema_ref = parse_schema_ref_block_v2(&meta_bytes, &mut pos, meta_count, schema_count)?;
     let value_ord =
         parse_value_ord_block_all_v2(&meta_bytes, &mut pos, meta_count, &schema_ref, &schemas)?;
-    let tail = parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total)?;
+    let tail =
+        parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total, limits)?;
     check_value_kind_pages_v4(footer, &tail.value_kind, &tail.run_count, &tail.runs)?;
 
     let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
@@ -1809,7 +1868,8 @@ pub fn decode_catalog_matching_v4(
         &schemas,
         &schema_plausible,
     )?;
-    let tail = parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total)?;
+    let tail =
+        parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total, limits)?;
     check_value_kind_pages_v4(footer, &tail.value_kind, &tail.run_count, &tail.runs)?;
 
     let mut resolver = DictResolver::new(&dict_bytes, &dict_index);

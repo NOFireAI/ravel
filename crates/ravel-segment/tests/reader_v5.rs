@@ -263,7 +263,8 @@ fn sparse_probe_runs(obj: &[u8]) -> Vec<(SeriesId, Vec<ravel_segment::RunEntry>)
         let stored = &chunks_stored[fo..fo + cl.frame_stored_len as usize];
         let frame = verify_and_decompress_chunk_frame(stored, &cl, ReaderLimits::default())
             .expect("frame crc + decompress");
-        let runs = decode_chunk_runs(&frame, cl.row_in_chunk, footer).expect("decode chunk runs");
+        let runs = decode_chunk_runs(&frame, cl.row_in_chunk, footer, ReaderLimits::default())
+            .expect("decode chunk runs");
         out.push((SeriesId(target), runs));
     }
     out
@@ -321,7 +322,7 @@ proptest! {
             ReaderLimits::default(),
         )
         .unwrap();
-        let runs = decode_chunk_runs(&frame, cl.row_in_chunk, footer).unwrap();
+        let runs = decode_chunk_runs(&frame, cl.row_in_chunk, footer, ReaderLimits::default()).unwrap();
 
         let whole = decode_catalog_v5(footer, v5, ReaderLimits::default()).unwrap();
         let expected = whole
@@ -364,6 +365,106 @@ fn corrupt_chunk_frame_is_typed_error() {
     assert_eq!(
         verify_and_decompress_chunk_frame(&stored, &cl, ReaderLimits::default()).err(),
         Some(SegmentError::ChunkCrcMismatch),
+    );
+}
+
+/// Below the sparse threshold, v5 uses the whole-section v4 grammar
+/// (`decode_catalog_v4` via `decode_catalog_v5`'s delegation), so a tiny
+/// object still exercises `parse_series_meta_tail_v4`'s run-major columns.
+/// This reproduces the amplification the new live-byte budget check exists to
+/// close: the twelve run-major columns' live-decoded footprint for `n` runs
+/// (11 u64/i64 columns + 1 u32 column + 3 (u64,u64) range vectors + one
+/// 96-byte `RunEntry`, 236 bytes/run, see `RUN_LIVE_BYTES_DENSE` in
+/// reader.rs) vastly exceeds this tiny object's actual on-disk uncompressed
+/// SERIES_META byte count. Tightening the cap to exactly that real,
+/// already-passing byte count means the pre-existing input-byte check
+/// (`SectionTooLarge`) is satisfied, so only the new budget check --
+/// `check_run_total_live_budget`, which runs immediately after `run_total` is
+/// read and before the first run-major column `Vec::with_capacity` -- can
+/// reject this decode. That the typed error comes back at all, with the
+/// exact `run_total`/`live_bytes`/`cap` the check derives, is what proves the
+/// rejection happens at header-check time rather than after allocating.
+#[test]
+fn dense_run_total_live_budget_rejects_disproportionate_allocation() {
+    let n = 5;
+    let v5 = build_v5(n, 0);
+    let loc = open_from_full(&v5, ReaderLimits::default()).expect("open dense v5");
+    let footer = loc.footer.clone();
+    let meta_section = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == 6)
+        .expect("whole SERIES_META present below threshold");
+
+    let live_bytes_per_run = 236u64;
+    let live_bytes = n as u64 * live_bytes_per_run;
+    assert!(
+        meta_section.uncompressed_len < live_bytes,
+        "test assumption broken: section is already as large as the live footprint"
+    );
+
+    let tight = ReaderLimits {
+        max_section_uncompressed_bytes: meta_section.uncompressed_len,
+        ..ReaderLimits::default()
+    };
+    let result = decode_catalog_v5(&footer, &v5, tight);
+    assert_eq!(
+        result.err(),
+        Some(SegmentError::RunTotalLiveBudgetExceeded {
+            run_total: n as u64,
+            live_bytes,
+            cap: meta_section.uncompressed_len,
+        })
+    );
+}
+
+/// Sparse-chunk counterpart of `dense_run_total_live_budget_rejects_
+/// disproportionate_allocation`: the first SERIES_META_CHUNKS frame (stride
+/// `V5_STRIDE` = 512, one run per series from `v4_inputs`, so
+/// `frame_run_total` == 512) decodes fine at the default cap, but tightening
+/// the cap to exactly that frame's real on-disk uncompressed byte count (so
+/// the existing `verify_and_decompress_chunk_frame` input-byte check still
+/// passes, since that call keeps the default limits) makes the twelve
+/// run-major columns' live-decoded footprint (240 bytes/run, see
+/// `RUN_LIVE_BYTES_CHUNK` in reader.rs) exceed it. `decode_chunk_runs` is
+/// where `limits` is actually threaded to `check_run_total_live_budget`
+/// (`decode_chunk_frame` is private), and that check runs immediately after
+/// `frame_run_total` is read, before schema_ref/value_ord/value_kind/
+/// run_count/run-major column parsing -- so the typed error alone proves the
+/// budget is enforced before any of that allocation.
+#[test]
+fn chunk_run_total_live_budget_rejects_disproportionate_allocation() {
+    let v5 = build_v5(SPARSE_N, 0);
+    let loc = open_from_full(&v5, ReaderLimits::default()).unwrap();
+    let footer = &loc.footer;
+    let idx = parse_series_idx(section_bytes(&v5, footer, SERIES_IDX)).unwrap();
+    let chunks_stored = section_bytes(&v5, footer, SERIES_META_CHUNKS);
+    let cl = idx.chunk_for(0).unwrap();
+    let fo = cl.frame_offset as usize;
+    let stored = &chunks_stored[fo..fo + cl.frame_stored_len as usize];
+    let frame = verify_and_decompress_chunk_frame(stored, &cl, ReaderLimits::default())
+        .expect("frame crc + decompress at default limits");
+
+    let frame_run_total = V5_STRIDE as u64;
+    let live_bytes_per_run = 240u64;
+    let live_bytes = frame_run_total * live_bytes_per_run;
+    assert!(
+        cl.frame_uncompressed_len < live_bytes,
+        "test assumption broken: frame is already as large as the live footprint"
+    );
+
+    let tight = ReaderLimits {
+        max_section_uncompressed_bytes: cl.frame_uncompressed_len,
+        ..ReaderLimits::default()
+    };
+    let result = decode_chunk_runs(&frame, cl.row_in_chunk, footer, tight);
+    assert_eq!(
+        result.err(),
+        Some(SegmentError::RunTotalLiveBudgetExceeded {
+            run_total: frame_run_total,
+            live_bytes,
+            cap: cl.frame_uncompressed_len,
+        })
     );
 }
 
