@@ -8,6 +8,8 @@
 mod clock;
 mod config;
 mod error;
+mod log_error;
+mod log_metrics;
 mod metrics;
 mod router;
 mod shard;
@@ -16,6 +18,8 @@ mod value;
 pub use clock::{Clock, SystemClock};
 pub use config::{IngestConfig, SEGMENT_FORMAT_VERSION};
 pub use error::WriteError;
+pub use log_error::LogWriteError;
+pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};
 pub use value::{IngestPoint, IngestValue};
