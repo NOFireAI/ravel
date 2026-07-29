@@ -18,8 +18,13 @@
 use prost::Message;
 use ravel_types::Label;
 
-use crate::proto::write_v2::{Request, TimeSeries as ProtoTimeSeriesV2};
-use crate::resolved::{ResolvedRequest, ResolvedSample, ResolvedSeries};
+use crate::proto::write_v2::histogram::{Count, ZeroCount};
+use crate::proto::write_v2::{
+    BucketSpan, Histogram as ProtoHistogramV2, Request, TimeSeries as ProtoTimeSeriesV2,
+};
+use crate::resolved::{
+    ResolvedCount, ResolvedHistogram, ResolvedRequest, ResolvedSample, ResolvedSeries, ResolvedSpan,
+};
 use crate::snappy::{self, SnappyError};
 
 #[derive(Debug, thiserror::Error)]
@@ -206,18 +211,59 @@ fn resolve_series(
             value: s.value,
         });
     }
-    for h in &ts.histograms {
+    let exemplar_count = ts.exemplars.len();
+    let mut histograms = Vec::with_capacity(ts.histograms.len());
+    for h in ts.histograms {
         if h.start_timestamp != 0 {
             *created_timestamps_count += 1;
         }
+        histograms.push(resolve_histogram(h));
     }
 
     Ok(ResolvedSeries {
         labels,
         samples,
-        histogram_count: ts.histograms.len(),
-        exemplar_count: ts.exemplars.len(),
+        histograms,
+        exemplar_count,
     })
+}
+
+/// Field-for-field mapping of one wire `io.prometheus.write.v2.Histogram`
+/// into the version-blind [`ResolvedHistogram`]. RW2's message is
+/// field-compatible with RW1's apart from the extra `start_timestamp`
+/// (tallied by the caller as a dropped created timestamp), so this is the
+/// twin of `rw1::resolve_histogram` and validates nothing for the same
+/// reason: [`crate::normalize`] owns every admission decision.
+fn resolve_histogram(h: ProtoHistogramV2) -> ResolvedHistogram {
+    ResolvedHistogram {
+        ts_ms: h.timestamp,
+        schema: h.schema,
+        zero_threshold: h.zero_threshold,
+        sum: h.sum,
+        count: h.count.map(|c| match c {
+            Count::CountInt(v) => ResolvedCount::Int(v),
+            Count::CountFloat(v) => ResolvedCount::Float(v),
+        }),
+        zero_count: h.zero_count.map(|z| match z {
+            ZeroCount::ZeroCountInt(v) => ResolvedCount::Int(v),
+            ZeroCount::ZeroCountFloat(v) => ResolvedCount::Float(v),
+        }),
+        positive_spans: h.positive_spans.iter().map(resolve_span).collect(),
+        negative_spans: h.negative_spans.iter().map(resolve_span).collect(),
+        positive_deltas: h.positive_deltas,
+        negative_deltas: h.negative_deltas,
+        positive_counts: h.positive_counts,
+        negative_counts: h.negative_counts,
+        reset_hint: h.reset_hint,
+        custom_values: h.custom_values,
+    }
+}
+
+fn resolve_span(span: &BucketSpan) -> ResolvedSpan {
+    ResolvedSpan {
+        offset: span.offset,
+        length: span.length,
+    }
 }
 
 /// Resolve one series' `labels_refs` into owned [`Label`]s: length must be
@@ -377,7 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn tallies_histograms_and_exemplars_without_materializing_them() {
+    /// Native histograms are materialized (durable storage since RSEG v5);
+    /// exemplars stay a tally, since ADR-0017 defers exemplar storage.
+    fn materializes_histograms_and_tallies_exemplars() {
         let syms = symbols(&["__name__", "latency"]);
         let req = request(
             syms,
@@ -395,8 +443,97 @@ mod tests {
         );
 
         let resolved = decode(&req).expect("decode");
-        assert_eq!(resolved.series[0].histogram_count, 2);
+        assert_eq!(resolved.series[0].histograms.len(), 2);
         assert_eq!(resolved.series[0].exemplar_count, 1);
+    }
+
+    /// Every histogram field reaches [`ResolvedHistogram`] unreshaped, and
+    /// `start_timestamp` is still tallied as a dropped created timestamp
+    /// rather than becoming part of the resolved value.
+    #[test]
+    fn resolves_every_histogram_field_verbatim() {
+        use crate::proto::write_v2::histogram::ResetHint;
+        let syms = symbols(&["__name__", "latency"]);
+        let req = request(
+            syms,
+            vec![ProtoTimeSeriesV2 {
+                labels_refs: vec![1, 2],
+                samples: vec![],
+                histograms: vec![ProtoHistogramV2 {
+                    count: Some(Count::CountInt(14)),
+                    zero_count: Some(ZeroCount::ZeroCountInt(1)),
+                    sum: 42.5,
+                    schema: -53,
+                    zero_threshold: 1e-9,
+                    positive_spans: vec![BucketSpan {
+                        offset: -2,
+                        length: 3,
+                    }],
+                    positive_deltas: vec![2, 3, 1],
+                    negative_spans: vec![],
+                    negative_deltas: vec![],
+                    positive_counts: vec![],
+                    negative_counts: vec![],
+                    reset_hint: ResetHint::Gauge as i32,
+                    timestamp: 1_700_000_000_000,
+                    start_timestamp: 1_600_000_000_000,
+                    custom_values: vec![0.5, 1.0, 2.5],
+                }],
+                exemplars: vec![],
+                metadata: None,
+            }],
+        );
+
+        let resolved = decode(&req).expect("decode");
+        let h = &resolved.series[0].histograms[0];
+        assert_eq!(h.ts_ms, 1_700_000_000_000);
+        assert_eq!(h.schema, -53);
+        assert_eq!(h.zero_threshold.to_bits(), 1e-9f64.to_bits());
+        assert_eq!(h.sum.to_bits(), 42.5f64.to_bits());
+        assert_eq!(h.count, Some(ResolvedCount::Int(14)));
+        assert_eq!(h.zero_count, Some(ResolvedCount::Int(1)));
+        assert_eq!(
+            h.positive_spans,
+            vec![ResolvedSpan {
+                offset: -2,
+                length: 3
+            }]
+        );
+        assert_eq!(h.positive_deltas, vec![2, 3, 1]);
+        assert_eq!(h.reset_hint, ResetHint::Gauge as i32);
+        assert_eq!(h.custom_values, vec![0.5, 1.0, 2.5]);
+        assert_eq!(resolved.created_timestamps_count, 1);
+    }
+
+    #[test]
+    fn resolves_float_histogram_oneofs_as_float() {
+        let syms = symbols(&["__name__", "latency"]);
+        let req = request(
+            syms,
+            vec![ProtoTimeSeriesV2 {
+                labels_refs: vec![1, 2],
+                samples: vec![],
+                histograms: vec![ProtoHistogramV2 {
+                    count: Some(Count::CountFloat(14.5)),
+                    zero_count: Some(ZeroCount::ZeroCountFloat(1.5)),
+                    positive_spans: vec![BucketSpan {
+                        offset: 0,
+                        length: 2,
+                    }],
+                    positive_counts: vec![3.0, 4.0],
+                    ..ProtoHistogramV2::default()
+                }],
+                exemplars: vec![],
+                metadata: None,
+            }],
+        );
+
+        let resolved = decode(&req).expect("decode");
+        let h = &resolved.series[0].histograms[0];
+        assert_eq!(h.count, Some(ResolvedCount::Float(14.5)));
+        assert_eq!(h.zero_count, Some(ResolvedCount::Float(1.5)));
+        assert_eq!(h.positive_counts, vec![3.0, 4.0]);
+        assert!(h.positive_deltas.is_empty());
     }
 
     #[test]

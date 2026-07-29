@@ -1,11 +1,10 @@
 //! Generalized ingest point/value shapes (docs/rseg-v3-plan.md section 7): a
-//! point carries either a scalar sample or a native-histogram sample.
-//! Production admission (`ravel_otlp::NormalizedPoint`) still only ever
-//! produces [`IngestValue::Scalar`]; native histograms are rejected at wire
-//! admission until docs/rseg-v3-plan.md's phase C8. `IngestValue`/
-//! `IngestPoint` let the shard buffer and segment-write plumbing be proven
-//! end to end with directly-constructed histogram values ahead of that,
-//! without depending on `ravel-otlp`/`ravel-remote-write`'s own shapes.
+//! point carries either a scalar sample or a native-histogram sample. Wire
+//! admission produces both: `ravel_otlp::NormalizedPoint` (scalar) and
+//! `ravel_otlp::NormalizedHistogramPoint` (native histogram) each convert
+//! into an [`IngestPoint`], so the shard buffer and segment-write plumbing
+//! reach the same RSEG v5 writer regardless of which wire path decoded the
+//! point.
 
 use ravel_segment::HistogramSample;
 use ravel_types::{LabelSet, Sample, SeriesId};
@@ -33,6 +32,16 @@ impl From<ravel_otlp::NormalizedPoint> for IngestPoint {
             series_id: p.series_id,
             labels: p.labels,
             value: IngestValue::Scalar(p.sample),
+        }
+    }
+}
+
+impl From<ravel_otlp::NormalizedHistogramPoint> for IngestPoint {
+    fn from(p: ravel_otlp::NormalizedHistogramPoint) -> Self {
+        IngestPoint {
+            series_id: p.series_id,
+            labels: p.labels,
+            value: IngestValue::Histogram(p.sample),
         }
     }
 }

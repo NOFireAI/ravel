@@ -3800,11 +3800,13 @@ name = "ravel-ingest"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "futures",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-logseg",
  "ravel-object-store",
  "ravel-otlp",
  "ravel-promql",
@@ -3897,7 +3899,11 @@ dependencies = [
 name = "ravel-otlp"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "hex",
  "opentelemetry-proto",
+ "ravel-logseg",
+ "ravel-segment",
  "ravel-types",
  "thiserror",
  "tokio",
@@ -3989,6 +3995,7 @@ dependencies = [
  "prost-build",
  "protox",
  "ravel-otlp",
+ "ravel-segment",
  "ravel-types",
  "snap",
  "thiserror",

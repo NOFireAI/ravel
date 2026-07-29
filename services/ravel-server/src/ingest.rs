@@ -6,7 +6,7 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use ravel_ingest::{IngestRouter, WriteError, WriteMode};
+use ravel_ingest::{IngestPoint, IngestRouter, WriteError, WriteMode};
 use ravel_otlp::{IngestLimits, Rejection, normalize_metrics};
 use ravel_types::{CommitToken, TenantId};
 
@@ -40,9 +40,21 @@ pub async fn handle_export(
     let normalized = normalize_metrics(&tenant, request, &state.limits, ingest_ts_ns);
     let rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
+    // Scalar and native-histogram points arrive in separate vectors; both
+    // feed one ingest write so a request's points share a single receipt.
+    let mut points: Vec<IngestPoint> =
+        Vec::with_capacity(normalized.points.len() + normalized.histogram_points.len());
+    points.extend(normalized.points.into_iter().map(IngestPoint::from));
+    points.extend(
+        normalized
+            .histogram_points
+            .into_iter()
+            .map(IngestPoint::from),
+    );
+
     let receipt = state
         .router
-        .write(tenant, normalized.points, mode, state.ack_deadline)
+        .write_values(tenant, points, mode, state.ack_deadline)
         .await?;
 
     let partial_success = if rejected_count > 0 {

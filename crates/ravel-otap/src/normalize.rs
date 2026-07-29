@@ -241,6 +241,11 @@ pub fn normalize_decoded(
     if total_points > limits.max_data_points_per_request {
         return NormalizeOutput {
             points: Vec::new(),
+            // OTAP carries only scalar metric points; native-histogram
+            // admission is the OTLP/Remote Write surface's concern, so this
+            // vector is always empty here (ravel_otlp::NormalizeOutput gained
+            // it for those surfaces).
+            histogram_points: Vec::new(),
             rejected: vec![Rejection::TooManyDataPoints {
                 count: total_points,
                 max: limits.max_data_points_per_request,
@@ -461,7 +466,13 @@ pub fn normalize_decoded(
         }
     }
 
-    NormalizeOutput { points, rejected }
+    NormalizeOutput {
+        points,
+        // Always empty: OTAP admits only scalar points (see the early
+        // return above).
+        histogram_points: Vec::new(),
+        rejected,
+    }
 }
 
 fn payloads_of(batch: &DecodedBatch, ty: ArrowPayloadType) -> Vec<&RecordBatch> {

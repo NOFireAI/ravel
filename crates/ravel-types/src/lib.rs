@@ -221,6 +221,22 @@ pub fn shard_for(series_id: &SeriesId, shard_count: u32) -> u32 {
     (u64::from_le_bytes(prefix) % u64::from(shard_count.max(1))) as u32
 }
 
+/// Routing v1 for logs (persistent contract, mirrors [`shard_for`]): shard
+/// from the stream id's leading bytes.
+///
+/// Unlike [`shard_for`], the id itself carries no tenant:
+/// [`logstream::log_stream_id`] hashes only the OTLP resource and scope, so
+/// two tenants sending the same resource+scope produce the same
+/// [`logstream::LogStreamId`]. Routing is still tenant-scoped, because each
+/// shard buffers per `TenantId` upstream of this function, not because of
+/// anything in the id.
+pub fn shard_for_log(stream_id: &logstream::LogStreamId, shard_count: u32) -> u32 {
+    debug_assert!(shard_count > 0);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&stream_id.0[..8]);
+    (u64::from_le_bytes(prefix) % u64::from(shard_count.max(1))) as u32
+}
+
 /// Commit token returned on strict-mode acks; callers pass tokens back as
 /// `min_commit_token` for read-your-write (docs/catalog-and-mvcc.md).
 ///
@@ -289,6 +305,22 @@ pub enum TypeError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::logstream::LogStreamId;
+
+    #[test]
+    fn shard_for_log_matches_leading_bytes_mod_shard_count() {
+        let id = LogStreamId([7u8; 16]);
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&id.0[..8]);
+        let expected = (u64::from_le_bytes(prefix) % 4) as u32;
+        assert_eq!(shard_for_log(&id, 4), expected);
+    }
+
+    #[test]
+    fn shard_for_log_is_deterministic_across_calls() {
+        let id = LogStreamId([9u8; 16]);
+        assert_eq!(shard_for_log(&id, 8), shard_for_log(&id, 8));
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> LabelSet {
         LabelSet::new(

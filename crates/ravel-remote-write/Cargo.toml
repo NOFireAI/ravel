@@ -9,6 +9,7 @@ description = "Prometheus Remote Write ingest: RW1 protobuf decode, snappy block
 [dependencies]
 ravel-types = { workspace = true }
 ravel-otlp = { workspace = true }
+ravel-segment = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 snap = { workspace = true }
