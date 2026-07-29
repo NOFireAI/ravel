@@ -188,8 +188,11 @@ pub(crate) fn eval_call(
             let mut out = apply_reduce(matrix, eval_ts_ns, |samples| float(samples, window));
             // Native-histogram series matching the same selector: reduce each
             // window to a histogram and emit it as a histogram element. A
-            // subquery argument contributes no histogram series: subquery
-            // evaluation produces float grids only.
+            // subquery argument no longer reaches this histogram branch (it is
+            // gated to a matrix selector below): when a subquery's inner
+            // expression matches histogram data, `eval_subquery_matrix` errors
+            // upstream with `Error::Unsupported` rather than silently dropping
+            // the histogram series here (issue #220).
             if let MatrixArg::Selector(ms) = arg {
                 let hmatrix =
                     evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx)?;

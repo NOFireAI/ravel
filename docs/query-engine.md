@@ -109,6 +109,16 @@ the grid start is the smallest multiple of the step (measured from Unix
 time zero) that is `>= end - range`, matching Prometheus' own subquery
 alignment, not the query's own step or window start.
 
+A subquery whose inner expression matches native-histogram data is not yet
+supported: the subquery grid reducer keeps only the float value of each
+step, so a histogram element would be silently dropped. When histogram data
+is actually present in the fetched window, the evaluator returns
+`Error::Unsupported` (`subquery over native histograms`, HTTP 422) instead
+of a wrong empty answer. The trigger is the presence of matched histogram
+data, not the syntactic shape: a float-only subquery, including
+`rate(x[5m:1m])` over float series, is unaffected. Real histogram subquery
+support is tracked by issue #220.
+
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly
 `max + 1`. It does not count a fully materialized per-timestamp window

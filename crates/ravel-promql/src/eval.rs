@@ -653,7 +653,27 @@ impl Evaluator {
         }
 
         crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
-            self.eval_expr(source, &sq.expr, t, ctx)
+            let value = self.eval_expr(source, &sq.expr, t, ctx)?;
+            // Native-histogram series inside a subquery window are not yet
+            // supported. The subquery grid reducer (`eval_instant_over_grid`)
+            // keeps only the float value of each instant sample, so any
+            // histogram element the inner expression produces would be
+            // silently dropped and the subquery would return a wrong (empty)
+            // answer for that series. Detect the actual presence of matched
+            // histogram data and reject it as a typed `Error::Unsupported`
+            // (HTTP 422) instead. The trigger is real histogram data in the
+            // fetched window, not the subquery's syntactic shape: a float-only
+            // subquery (including `rate(x[5m:1m])` over float series) sees no
+            // histogram element here and keeps working exactly as before.
+            // Real histogram subquery support is tracked by issue #220.
+            if let Value::Vector(ref v) = value
+                && v.iter().any(|s| s.histogram.is_some())
+            {
+                return Err(Error::Unsupported {
+                    construct: "subquery over native histograms".to_string(),
+                });
+            }
+            Ok(value)
         })
     }
 
@@ -1684,6 +1704,118 @@ mod tests {
             .eval_instant(&source, "up[2m:1m]", 0)
             .expect("subquery evaluates");
         assert_eq!(at, bare_at_zero, "@0 pins the grid as if evaluated at t=0");
+    }
+
+    /// One native histogram, mirroring the fixture in
+    /// `functions::histogram_native`'s tests, for the subquery-over-histogram
+    /// rejection cases below (issue #220).
+    fn nh(count: f64, sum: f64) -> crate::histogram::FloatHistogram {
+        crate::histogram::FloatHistogram {
+            counter_reset_hint: crate::histogram::ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![crate::histogram::Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![count],
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    fn expect_unsupported(err: Error, query: &str) {
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Unsupported for {query:?}, got {err:?}");
+        };
+        assert!(
+            construct.contains("subquery over native histograms"),
+            "construct {construct:?} should name the histogram-subquery construct for {query:?}"
+        );
+    }
+
+    #[test]
+    fn subquery_over_native_histogram_is_unsupported_in_an_instant_query() {
+        // `rate(h[10m:1m])`: the inner selector `h` matches a native-histogram
+        // series, so the subquery grid would otherwise silently drop it and
+        // return a wrong (empty) answer. It must be a typed Unsupported error
+        // instead (issue #220).
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .instant(&source, "rate(h[10m:1m])", 0)
+            .expect_err("subquery over a histogram series must be rejected");
+        expect_unsupported(err, "rate(h[10m:1m])");
+    }
+
+    #[test]
+    fn subquery_over_native_histogram_is_unsupported_in_a_range_query() {
+        // Same shape inside a range query: the rejection is inherited by the
+        // range-dispatch subquery path, not special-cased per entry point.
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .eval_range(&source, "rate(h[10m:1m])", 0, minutes(5), minutes(1))
+            .expect_err("subquery over a histogram series must be rejected");
+        expect_unsupported(err, "rate(h[10m:1m]) (range)");
+    }
+
+    #[test]
+    fn float_only_subquery_over_the_same_source_shape_is_unaffected() {
+        // A float series queried through the identical subquery shape keeps
+        // working exactly as before: detection triggers on the actual presence
+        // of histogram data, never on the syntactic subquery form.
+        //
+        // Samples f=2 at t=0 and f=8 at t=60s. At t=120s the `[10m:1m]`
+        // subquery grid steps every 60s from -480s to 120s; only the steps at
+        // 0s, 60s, 120s pick a sample within the default 5m lookback (2, 8, 8),
+        // so the inner matrix carries exactly three points. `count_over_time`
+        // of that matrix is a concrete 3, independent of any extrapolation
+        // math, and is unchanged by this task.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "f"), ("job", "a")],
+                &[(0, 2.0), (60_000_000_000, 8.0)],
+            )
+            .expect("valid float series");
+        let counted = Evaluator::new()
+            .instant(&source, "count_over_time(f[10m:1m])", 120_000)
+            .expect("float-only subquery still evaluates");
+        assert_eq!(counted.len(), 1);
+        assert_eq!(counted[0].value.to_bits(), 3.0_f64.to_bits());
+        assert!(counted[0].histogram.is_none());
+
+        // `rate(f[10m:1m])` over the same float series (the shape the decision
+        // note calls out explicitly) still produces one finite float series,
+        // never an error and never a histogram element.
+        let rated = Evaluator::new()
+            .instant(&source, "rate(f[10m:1m])", 120_000)
+            .expect("float-only rate subquery still evaluates");
+        assert_eq!(rated.len(), 1);
+        assert!(rated[0].value.is_finite());
+        assert!(rated[0].histogram.is_none());
+    }
+
+    #[test]
+    fn mixed_float_and_histogram_subquery_is_unsupported() {
+        // The inner selector `{job="a"}` matches both a float series and a
+        // histogram series. Presence of any matched histogram data rejects the
+        // whole subquery (detect-and-reject), even alongside float series.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "f"), ("job", "a")], &[(0, 2.0)])
+            .expect("valid float series")
+            .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .instant(&source, r#"rate({job="a"}[10m:1m])"#, 0)
+            .expect_err("a mixed subquery must be rejected");
+        expect_unsupported(err, r#"rate({job="a"}[10m:1m])"#);
     }
 
     #[test]
