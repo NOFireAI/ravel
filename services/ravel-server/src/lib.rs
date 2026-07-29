@@ -8,6 +8,7 @@ pub mod flight;
 pub mod flight_auth;
 pub mod fold;
 pub mod ingest;
+pub mod logs_ingest;
 pub mod otlp_grpc;
 pub mod otlp_http;
 pub mod query;
