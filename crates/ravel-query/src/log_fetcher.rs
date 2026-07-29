@@ -15,6 +15,16 @@
 //! [`RlogReader::scan`]. Skip-index and bloom pruning stay entirely inside
 //! `scan`; nothing here duplicates format-layer logic.
 //!
+//! One part of this is approximate, and callers must know it: the
+//! stream-attribute matching in [`LogSegmentFetcher::matching_streams`] is a
+//! byte-containment search that over-approximates. It can return streams that
+//! do not carry the queried attribute as a genuine top-level resource or scope
+//! attribute, so the records [`LogSegmentFetcher::fetch`] returns can include
+//! records from such streams. Read that method's documentation before using
+//! the stream-attribute filter for anything user-facing. Everything else here
+//! is exact: ts-range pruning and the content predicates are evaluated exactly
+//! by the reader.
+//!
 //! v1 fetches the whole object with a single [`GetRange::Full`]. RLOG objects
 //! are not yet large enough to justify the suffix-then-range-chase read
 //! `SegmentFetcher` uses for RSEG; see the module note in the issue #238
@@ -40,9 +50,17 @@ const MAX_STREAMS: u64 = 1 << 24;
 /// An equality on a stream-identifying attribute: a resource or scope
 /// attribute whose `(key, value)` participates in [`LogStreamId`] identity
 /// (docs/log-segment-format.md "STREAM_DIR"). These are resolved against the
-/// object's STREAM_DIR into a concrete set of matching stream ids, never
-/// evaluated per record (per-record attributes are not part of stream
-/// identity and are matched through [`Predicate`] instead).
+/// object's STREAM_DIR into a set of matching stream ids, never evaluated per
+/// record (per-record attributes are not part of stream identity and are
+/// matched through [`Predicate`] instead).
+///
+/// This is an approximate filter, not an exact one. Resolution is byte
+/// containment over the stored canonical blob, so it also matches a stream
+/// that carries the pair only nested inside a map or list attribute value
+/// rather than as a top-level resource or scope attribute. See
+/// [`LogSegmentFetcher::matching_streams`] for the exact guarantee (no false
+/// negatives, possible false positives) and for what a caller has to do about
+/// it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamAttrEquals {
     pub key: String,
@@ -62,6 +80,11 @@ impl StreamAttrEquals {
 /// stream-attribute equalities (ANDed, resolved against STREAM_DIR), and zero
 /// or more content predicates (`HasWord`/`Equals`, ANDed, passed straight to
 /// the reader). The ts range is always applied; the other two are optional.
+///
+/// The ts range and the content predicates are exact. The `stream_attrs`
+/// filters are not: they over-approximate, and a fetch can return records from
+/// a stream that does not genuinely carry the requested attribute. See
+/// [`LogSegmentFetcher::matching_streams`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogQuery {
     pub ts_min_ns: i64,
@@ -158,18 +181,56 @@ impl LogSegmentFetcher {
 
     /// Resolves stream-attribute equalities against an already-fetched object's
     /// STREAM_DIR, returning the ids of streams whose canonical resource+scope
-    /// blob satisfies every filter (ANDed). An empty `filters` returns every
+    /// blob matches every filter (ANDed). An empty `filters` returns every
     /// stream in the object.
     ///
-    /// Matching is by canonical-byte containment: each filter's `(key, value)`
-    /// is encoded with the frozen [`canonical_attr_bytes`] grammar and searched
-    /// for as a contiguous sub-sequence of the stored blob. Because the writer
-    /// emits each attribute entry's `len(key) key encode_value(value)` bytes
-    /// contiguously (only the entry *order* is canonicalized), a stream that
-    /// truly carries the attribute always matches: there are no false
-    /// negatives. See the issue #238 report for the (theoretical) false-positive
-    /// bound and the note that an exact structured match would need a public
-    /// STREAM_DIR blob decoder in `ravel-logseg`, which this task does not add.
+    /// # This match is approximate: it over-approximates
+    ///
+    /// The returned set is a pruning hint, not an exact evaluation of the
+    /// caller's equality predicate. It can contain streams that do not carry
+    /// the queried `(key, value)` as a genuine top-level resource or scope
+    /// attribute. It is not an exact filter and must not be presented as one.
+    ///
+    /// Matching is raw-byte containment: each filter's `(key, value)` is
+    /// encoded with the frozen [`canonical_attr_bytes`] grammar and searched
+    /// for as a contiguous sub-sequence anywhere in the stored blob. Nested
+    /// `AttrValue::Map` and `AttrValue::List` values are written with the same
+    /// byte grammar as top-level entries, because `encode_attrs` and
+    /// `encode_value` in `ravel_types::logstream` recurse into each other. A
+    /// `(key, value)` pair nested inside a map or list value is therefore
+    /// byte-identical to the same pair appearing as a top-level entry, and this
+    /// search cannot tell the two apart. Concretely: a stream whose only
+    /// resource attribute is `k8s.labels = Map([("service.name", "api")])`
+    /// matches the filter `service.name = "api"`, even though it carries no
+    /// top-level `service.name` attribute at all and is a different
+    /// [`LogStreamId`] from the stream that does. Both stream ids come back.
+    ///
+    /// There are no false negatives in the other direction: a stream that
+    /// really does carry the attribute is never missed. The writer emits each
+    /// attribute entry's `len(key) key encode_value(value)` bytes contiguously
+    /// and canonicalizes only the entry *order*, so whenever the attribute is
+    /// present the needle occurs verbatim in the blob.
+    ///
+    /// # What a caller must do about it
+    ///
+    /// Treat the returned set as a pruning hint and re-apply the attribute
+    /// equality yourself, at the record level, on whatever comes back. Nothing
+    /// downstream does this for you, and nothing will report that it was
+    /// skipped. [`Predicate::StreamIn`] *is* evaluated exactly by
+    /// [`RlogReader::scan`] -- but exactly against whichever stream set it was
+    /// handed, so an over-broad set from this method silently produces
+    /// over-broad final results. The other predicate kinds (ts range,
+    /// `HasWord`, `Equals`) are exact and unaffected.
+    ///
+    /// Making this exact requires walking the blob entry by entry so that
+    /// nesting depth is known, which requires either a public STREAM_DIR blob
+    /// decoder in `ravel-logseg` or an entry-walking decoder here. Issue #238
+    /// deliberately adds neither. Issue #239, which builds the real logs query
+    /// path, owns that decision and must do one of two things: make the match
+    /// exact, or re-apply the equality on returned records and state the
+    /// limitation in its user-facing query semantics. Silently inheriting this
+    /// over-approximation into a user-facing query would violate the "exact
+    /// semantics by default, approximation is opt-in and visible" invariant.
     pub fn matching_streams(
         &self,
         bytes: &[u8],
@@ -196,6 +257,23 @@ impl LogSegmentFetcher {
     /// combined predicate (ts range AND resolved streams AND content) is handed
     /// to [`RlogReader::scan`], whose skip-index and bloom pruning do the
     /// block-level work.
+    ///
+    /// # The returned records are exact except for `stream_attrs`
+    ///
+    /// The ts range and the content predicates hold exactly on every returned
+    /// record. `query.stream_attrs` does not: it is resolved by
+    /// [`matching_streams`], which over-approximates, so the returned records
+    /// can include records from a stream that does not carry the requested
+    /// attribute as a genuine top-level resource or scope attribute (a nested
+    /// map or list value with the same bytes is enough to match). No false
+    /// negatives: every record that does match is returned.
+    ///
+    /// A caller that needs exact stream-attribute semantics must re-apply the
+    /// equality on the returned records itself. Issue #239 must either do that
+    /// or document the limitation in its user-facing query semantics; it cannot
+    /// assume this method filtered exactly.
+    ///
+    /// [`matching_streams`]: Self::matching_streams
     pub async fn fetch(
         &self,
         seg_ref: &SegmentRef,
@@ -217,7 +295,8 @@ impl LogSegmentFetcher {
         let bytes = got.data;
 
         // Resolve stream-attribute equalities against STREAM_DIR before the
-        // scan, so they become an exact StreamIn arm the reader prunes on.
+        // scan, so they become a StreamIn arm the reader prunes on. The
+        // resolution over-approximates; see `matching_streams`.
         let stream_ids = if query.stream_attrs.is_empty() {
             None
         } else {
@@ -264,7 +343,9 @@ impl LogSegmentFetcher {
 /// `(key, value)` entry as it appears inside a larger canonical attribute set,
 /// i.e. `canonical_attr_bytes([(key, value)])` with its leading one-entry count
 /// varint stripped. The count of a single-entry set is `1`, a one-byte varint,
-/// so exactly one leading byte is removed.
+/// so exactly one leading byte is removed. The result is never empty in
+/// practice; if it somehow were, [`blob_contains`] treats it as matching
+/// nothing rather than everything.
 fn stream_attr_needle(filter: &StreamAttrEquals) -> Vec<u8> {
     let full = canonical_attr_bytes(std::slice::from_ref(&(
         filter.key.clone(),
@@ -276,10 +357,11 @@ fn stream_attr_needle(filter: &StreamAttrEquals) -> Vec<u8> {
 }
 
 /// True if `needle` occurs as a contiguous sub-sequence of `blob`. An empty
-/// needle matches everything.
+/// needle matches nothing: in a filter-matching context "no bytes to find" must
+/// never mean "found in every stream", so a degenerate needle fails closed.
 fn blob_contains(blob: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
-        return true;
+        return false;
     }
     if needle.len() > blob.len() {
         return false;
