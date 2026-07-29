@@ -8,6 +8,7 @@
 //! token blooms and the skip index, compress the whole-read sections, and emit
 //! the footer and trailer. Identical input yields byte-identical output.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ravel_types::logstream::{LogStreamId, canonical_attr_bytes};
@@ -93,12 +94,30 @@ impl RlogWriter {
             return Err(LogSegError::LimitExceeded("empty object".into()));
         }
 
-        // Stream directory: distinct ids, sorted; the dense ref is the ordinal.
-        let mut ids: BTreeSet<LogStreamId> = BTreeSet::new();
+        // Stream directory: distinct ids, sorted, each with the canonical
+        // resource+scope blob from the first record seen for it. The dense ref
+        // is the ordinal. A second record claiming the same id with different
+        // `stream_attrs` bytes has no truthful blob, so the whole object is
+        // refused rather than silently keeping the first.
+        let mut streams: BTreeMap<LogStreamId, &[u8]> = BTreeMap::new();
         for r in &self.records {
-            ids.insert(r.stream_id);
+            match streams.entry(r.stream_id) {
+                Entry::Vacant(slot) => {
+                    slot.insert(r.stream_attrs.as_slice());
+                }
+                Entry::Occupied(slot) => {
+                    if *slot.get() != r.stream_attrs.as_slice() {
+                        return Err(LogSegError::InconsistentStreamAttrs(format!(
+                            "stream {} carries two different stream_attrs blobs ({} and {} bytes)",
+                            r.stream_id.to_hex(),
+                            slot.get().len(),
+                            r.stream_attrs.len(),
+                        )));
+                    }
+                }
+            }
         }
-        let sorted_ids: Vec<LogStreamId> = ids.into_iter().collect();
+        let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
         let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
         for (i, id) in sorted_ids.iter().enumerate() {
             ref_of.insert(*id, i as u32);
@@ -231,14 +250,14 @@ impl RlogWriter {
 
         // STREAM_DIR.
         let total_blocks = block_spans.len() as u32;
-        let stream_entries: Vec<StreamEntry> = sorted_ids
+        let stream_entries: Vec<StreamEntry> = streams
             .iter()
             .enumerate()
-            .map(|(i, id)| {
+            .map(|(i, (id, blob))| {
                 let r = i as u32;
                 StreamEntry {
                     stream_id: *id,
-                    blob: Vec::new(),
+                    blob: blob.to_vec(),
                     first_blk: first_blk.get(&r).copied().unwrap_or(0),
                     last_blk: last_blk
                         .get(&r)
@@ -464,7 +483,9 @@ fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32
 mod tests {
     use super::*;
     use crate::footer::open;
-    use ravel_types::logstream::AttrValue;
+    use crate::reader::{RlogReader, read_section};
+    use crate::record::{Predicate, stream_attrs_bytes};
+    use ravel_types::logstream::{AttrValue, log_stream_id};
 
     fn identity() -> ObjectIdentity {
         ObjectIdentity {
@@ -482,9 +503,21 @@ mod tests {
         LogStreamId(a)
     }
 
+    /// The canonical resource+scope blob for the synthetic stream `n`: distinct
+    /// per stream, so a wrong blob-to-stream mapping cannot pass unnoticed.
+    fn attrs_blob(n: u8) -> Vec<u8> {
+        stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str(format!("svc{n}")))],
+            "scope",
+            "1.0",
+            &[("lib".into(), AttrValue::I64(i64::from(n)))],
+        )
+    }
+
     fn base_record(stream: u8, ts: i64) -> LogRecord {
         LogRecord {
             stream_id: id(stream),
+            stream_attrs: attrs_blob(stream),
             ts_ns: ts,
             observed_ts_ns: ts,
             severity_num: 9,
@@ -557,6 +590,130 @@ mod tests {
         assert_eq!(fd.len(), 2);
         assert!(fd.column("x", FieldType::Str).is_some());
         assert!(fd.column("x", FieldType::I64).is_some());
+    }
+
+    /// Decodes the STREAM_DIR of a written object.
+    fn read_stream_dir(obj: &[u8]) -> StreamDir {
+        let cfg = RlogConfig::default();
+        let footer = open(obj).expect("open");
+        let desc = footer.section(kind::STREAM_DIR).expect("stream_dir");
+        let raw = read_section(obj, desc, &cfg).expect("read section");
+        StreamDir::decode(&raw, 1 << 24).expect("decode")
+    }
+
+    #[test]
+    fn stream_dir_blobs_carry_stream_attrs() {
+        // Three real streams: ids and blobs both come from the same
+        // resource+scope, so the object records true identity, not placeholders.
+        struct Spec {
+            resource: Vec<(String, AttrValue)>,
+            scope: &'static str,
+            version: &'static str,
+        }
+        let streams = [
+            Spec {
+                resource: vec![("service.name".into(), AttrValue::Str("api".into()))],
+                scope: "scope.a",
+                version: "1.0",
+            },
+            Spec {
+                resource: vec![("service.name".into(), AttrValue::Str("worker".into()))],
+                scope: "scope.b",
+                version: "2.3",
+            },
+            Spec {
+                resource: vec![],
+                scope: "",
+                version: "",
+            },
+        ];
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let mut want: Vec<(LogStreamId, Vec<u8>)> = Vec::new();
+        for (i, spec) in streams.iter().enumerate() {
+            let (res, scope, ver) = (&spec.resource, spec.scope, spec.version);
+            let sid = log_stream_id(res, scope, ver, &[]);
+            let blob = stream_attrs_bytes(res, scope, ver, &[]);
+            want.push((sid, blob.clone()));
+            // Two records per stream so the first-record blob is reused, not
+            // re-derived per record.
+            for ts in 0..2i64 {
+                let mut r = base_record(0, ts);
+                r.stream_id = sid;
+                r.stream_attrs = blob.clone();
+                r.body = format!("stream {i} record {ts}");
+                w.push(r).expect("push");
+            }
+        }
+        let obj = w.finish().expect("finish");
+
+        let dir = read_stream_dir(&obj);
+        assert_eq!(dir.len(), 3);
+        want.sort_by_key(|(sid, _)| *sid);
+        for (entry, (sid, blob)) in dir.entries().iter().zip(want.iter()) {
+            assert_eq!(entry.stream_id, *sid);
+            assert!(!entry.blob.is_empty(), "blob must not be empty");
+            assert_eq!(&entry.blob, blob, "blob must be the record's stream_attrs");
+            // The blob is the hash preimage: it reproduces the stream id.
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"ravel-logstream-v1");
+            hasher.update(&entry.blob);
+            assert_eq!(&hasher.finalize().as_bytes()[..16], &sid.0);
+        }
+
+        // The same blobs come back through the reader on every record.
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 6);
+        for row in &rows {
+            let expected = want
+                .iter()
+                .find(|(sid, _)| *sid == row.stream_id)
+                .map(|(_, blob)| blob)
+                .expect("known stream");
+            assert_eq!(&row.stream_attrs, expected);
+        }
+    }
+
+    #[test]
+    fn same_stream_same_attrs_succeeds() {
+        // The common case: many records per stream, all agreeing.
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        for ts in 0..3i64 {
+            w.push(base_record(4, ts)).expect("push");
+        }
+        let obj = w.finish().expect("identical stream_attrs must not collide");
+        let dir = read_stream_dir(&obj);
+        assert_eq!(dir.len(), 1);
+        assert_eq!(dir.entries()[0].blob, attrs_blob(4));
+    }
+
+    #[test]
+    fn same_stream_different_attrs_rejected() {
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.push(base_record(4, 0)).expect("push");
+        let mut clash = base_record(4, 1);
+        clash.stream_attrs = attrs_blob(9); // same stream_id, other blob
+        w.push(clash).expect("push");
+        let err = w.finish().expect_err("colliding stream_attrs must fail");
+        match err {
+            LogSegError::InconsistentStreamAttrs(msg) => {
+                assert!(
+                    msg.contains(&id(4).to_hex()),
+                    "message must name the stream: {msg}"
+                );
+            }
+            other => panic!("expected InconsistentStreamAttrs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_stream_attrs_is_a_valid_blob() {
+        // An empty resource+scope still has a non-empty canonical blob (two
+        // zero counts and two zero lengths), so no valid object has an empty
+        // STREAM_DIR blob.
+        let blob = stream_attrs_bytes(&[], "", "", &[]);
+        assert_eq!(blob, vec![0u8, 0, 0, 0]);
     }
 
     #[test]
