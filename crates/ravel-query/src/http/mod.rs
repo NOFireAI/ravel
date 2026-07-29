@@ -13,6 +13,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::get;
 
+pub use error::{MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, QueryErrorResponse};
 pub use tenant::{AuthError, DevHeaderTenantResolver, StaticBearerTokenResolver, TenantResolver};
 
 use crate::QueryEngine;

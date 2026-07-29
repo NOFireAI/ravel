@@ -24,18 +24,22 @@ use crate::http::tenant::AuthError;
 /// Stable client message for a data-integrity fault (corrupt segment,
 /// unreconstructable or mismatched commit record, non-monotonic run). The
 /// full detail, including the object key, is logged server-side only.
-const MSG_CORRUPT: &str = "stored data failed integrity validation";
+///
+/// This and its siblings are the single source of the redacted messages: any
+/// endpoint that runs the query engine reaches them through
+/// [`QueryErrorResponse`] rather than keeping its own copy.
+pub const MSG_CORRUPT: &str = "stored data failed integrity validation";
 
 /// Stable client message for a transient storage-layer fault (object-store
 /// error, changed etag between reads, invalidated snapshot). Distinct from
 /// the corruption message so a client and operator can tell a retryable
 /// outage apart from a permanent data fault without the leaked detail.
-const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
+pub const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
 
 /// Stable client message for a `min_commit_token` that did not resolve after
 /// the catalog's retry. The token fields come from the caller's own request,
 /// but the message is fixed for a stable, typed contract.
-const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; retry";
+pub const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; retry";
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -175,8 +179,42 @@ fn from_eval_error(inner: &ravel_promql::Error, outer: &QueryError) -> ApiError 
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+/// The HTTP rendering of a query error: the status code, the stable
+/// Prometheus-shaped `errorType` tag, and a client-safe message that has
+/// already passed the a7-F02 redaction boundary (storage-layer faults carry
+/// only a fixed class message here; the full detail is logged, never echoed).
+///
+/// This is the reusable, public form of the mapping the [`IntoResponse`] impl
+/// applies. An endpoint that runs the query engine outside this module (the
+/// analytics endpoint in `ravel-server`) builds its response from this so its
+/// status contract cannot drift from `/api/v1/query_range`'s; both paths share
+/// the one table in [`ApiError::into_parts`].
+#[derive(Debug, Clone)]
+pub struct QueryErrorResponse {
+    /// The HTTP status code.
+    pub status: StatusCode,
+    /// The stable `errorType` tag: `bad_data`, `execution`, `internal`,
+    /// `unavailable`, `timeout`, or `unauthorized`.
+    pub error_type: &'static str,
+    /// The client-visible message, already redacted for storage-layer faults.
+    pub message: String,
+}
+
+impl QueryErrorResponse {
+    /// Map a [`QueryError`] to its HTTP rendering. Storage-layer faults are
+    /// logged in full and redacted to a fixed class message exactly as the
+    /// [`IntoResponse`] path does: this routes through the same
+    /// [`ApiError`] conversion, so the two can never disagree.
+    pub fn from_query_error(err: QueryError) -> Self {
+        ApiError::from(err).into_parts()
+    }
+}
+
+impl ApiError {
+    /// The status, stable `errorType` tag, and message this error renders to.
+    /// Extracted so both [`IntoResponse`] and the public
+    /// [`QueryErrorResponse`] mapping share one table and cannot drift.
+    fn into_parts(self) -> QueryErrorResponse {
         let (status, error_type, message) = match self {
             ApiError::BadData(msg) => (StatusCode::BAD_REQUEST, "bad_data", msg),
             ApiError::Unsupported(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "execution", msg),
@@ -189,6 +227,21 @@ impl IntoResponse for ApiError {
                 "authentication required".to_string(),
             ),
         };
+        QueryErrorResponse {
+            status,
+            error_type,
+            message,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let QueryErrorResponse {
+            status,
+            error_type,
+            message,
+        } = self.into_parts();
         let body: ApiResponse<()> = ApiResponse::Error {
             error_type,
             error: message,
@@ -452,5 +505,132 @@ mod tests {
         );
         // Parse errors carry only the caller's own query text.
         assert!(redacted_storage_message(&QueryError::Parse("bad".to_string())).is_none());
+    }
+
+    /// The public [`QueryErrorResponse`] mapping and the `IntoResponse` path
+    /// must render every `QueryError` variant identically: same status, same
+    /// `errorType` tag, and same (redacted) message. This is what lets the
+    /// analytics endpoint in `ravel-server` consume the public mapping instead
+    /// of carrying its own copy without the two drifting. A fresh value is
+    /// built for each path so neither observes the other's consumption.
+    #[test]
+    fn public_mapping_agrees_with_into_response_for_every_variant() {
+        use std::time::Duration;
+
+        use ravel_promql::Error as PromErr;
+
+        let cases: Vec<fn() -> QueryError> = vec![
+            || QueryError::Parse("bad".to_string()),
+            || QueryError::Unsupported {
+                construct: "x".to_string(),
+            },
+            || QueryError::NonPositiveStep { step_ms: 0 },
+            || QueryError::InvalidRange {
+                start_ms: 5,
+                end_ms: 1,
+            },
+            || QueryError::TimeOverflow,
+            || QueryError::TooManySegments { count: 9, max: 3 },
+            || QueryError::TooManySeries { count: 9, max: 3 },
+            || QueryError::TooManySamples { count: 9, max: 3 },
+            || QueryError::DeadlineExceeded {
+                deadline: Duration::from_secs(1),
+            },
+            || QueryError::SnapshotInvalidated,
+            || QueryError::NonMonotonicSamples { prev: 2, next: 1 },
+            // Fetch sub-variants: corrupt (500) vs transient (503).
+            || {
+                QueryError::Fetch(FetchError::Store {
+                    key: LEAKY_KEY.to_string(),
+                    source: StoreError::Transient(RAW_STORE_TEXT.to_string()),
+                })
+            },
+            || {
+                QueryError::Fetch(FetchError::EtagChanged {
+                    key: LEAKY_KEY.to_string(),
+                })
+            },
+            || {
+                QueryError::Fetch(FetchError::Corrupt {
+                    key: LEAKY_KEY.to_string(),
+                    source: ravel_segment::SegmentError::BadMagic,
+                })
+            },
+            // Catalog sub-variants: unsatisfiable token, corruption, transient.
+            || {
+                QueryError::Catalog(CatalogError::UnsatisfiableToken {
+                    shard: 0,
+                    writer_id: "writer-7".to_string(),
+                    epoch: 1,
+                    seq: 2,
+                    ingest_hour_bucket: 3,
+                })
+            },
+            || {
+                QueryError::Catalog(CatalogError::FieldMismatch {
+                    key: LEAKY_KEY.to_string(),
+                    field: "tenant_hash",
+                    expected: "aaaa".to_string(),
+                    actual: TENANT_HASH.to_string(),
+                })
+            },
+            || {
+                QueryError::Catalog(CatalogError::Store(StoreError::Permanent(
+                    RAW_STORE_TEXT.to_string(),
+                )))
+            },
+            // Eval sub-variants: bad_data vs execution vs redacted source.
+            || {
+                QueryError::Eval(PromErr::WrongType {
+                    expected: "instant vector",
+                    got: "range vector",
+                })
+            },
+            || QueryError::Eval(PromErr::TooManyPoints { points: 9, max: 3 }),
+            || {
+                QueryError::Eval(PromErr::AmbiguousMatch {
+                    detail: "many-to-many".to_string(),
+                })
+            },
+            || {
+                QueryError::Eval(PromErr::InvalidRegex {
+                    pattern: "(".to_string(),
+                    reason: "unclosed group".to_string(),
+                })
+            },
+            || {
+                QueryError::Eval(PromErr::InvalidLabelName {
+                    label: "1bad".to_string(),
+                })
+            },
+        ];
+
+        for make in cases {
+            let public = QueryErrorResponse::from_query_error(make());
+
+            // Drive the real `IntoResponse` path and read status + body back.
+            let response = ApiError::from(make()).into_response();
+            let status = response.status();
+            let bytes =
+                futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                    .expect("read response body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("response body is JSON");
+
+            assert_eq!(public.status, status, "status disagreed for {:?}", make());
+            assert_eq!(json["status"], "error", "envelope status for {:?}", make());
+            assert_eq!(
+                json["errorType"].as_str().expect("errorType present"),
+                public.error_type,
+                "errorType disagreed for {:?}",
+                make()
+            );
+            assert_eq!(
+                json["error"].as_str().expect("error message present"),
+                public.message,
+                "message disagreed for {:?}",
+                make()
+            );
+        }
     }
 }
