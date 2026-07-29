@@ -265,6 +265,13 @@ async fn assert_idempotent_delete(store: &dyn ObjectStoreBackend, prefix: &str) 
         .expect("deleting an already-deleted key must still succeed");
 }
 
+/// Exercises the client-side CRC32C pre-flight every backend runs against
+/// its own input buffer before writing. This is NOT proof of on-the-wire
+/// integrity: for `S3Store` (see `s3::S3Store::capabilities`) `object_store`
+/// 0.14 gives no way to attach the checksum to the outgoing request, so this
+/// assertion only shows the local mismatch check works, not that corruption
+/// in transit would be caught. `s3_store_reports_upload_checksum_unsupported`
+/// below is what proves that gap is declared honestly via `capabilities()`.
 async fn assert_upload_checksum_verification(store: &dyn ObjectStoreBackend, prefix: &str) {
     let good_key = format!("{prefix}good");
     let bad_key = format!("{prefix}bad");
@@ -313,6 +320,36 @@ async fn memory_store_paged_contract() {
 async fn fault_store_empty_plan_contract() {
     let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
     run_contract_suite(&store, "fault-empty").await;
+}
+
+/// Proves the path taken for issue #181: `object_store` 0.14's `AmazonS3`
+/// client has no per-request checksum hook and no way to attach a
+/// caller-supplied CRC32C to an outgoing `put` (its only integrity knob,
+/// `AmazonS3Builder::with_checksum_algorithm`, is a whole-client setting
+/// limited to SHA-256/CRC64NVME, and always has the crate compute the
+/// digest itself). So `S3Store` must report `upload_checksum` as
+/// unsupported rather than claim a mandatory capability
+/// (docs/object-store-contract.md "Mandatory capabilities") it cannot honor
+/// on the wire; production startup must fail loudly on this, per the
+/// contract, rather than trust integrity this adapter does not provide.
+/// No `RAVEL_MINIO_URL` gate needed: `AmazonS3Builder::build` only
+/// validates configuration, it never talks to the network.
+#[test]
+fn s3_store_reports_upload_checksum_unsupported() {
+    let config = S3Config {
+        bucket: "test-bucket".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://localhost:0".to_string()),
+        access_key_id: "test".to_string(),
+        secret_access_key: "test".to_string(),
+        allow_http: true,
+        force_path_style: true,
+    };
+    let store = S3Store::new(config).expect("dummy config must build without network access");
+    assert!(
+        !store.capabilities().upload_checksum,
+        "S3Store must not claim upload_checksum support object_store 0.14 cannot provide"
+    );
 }
 
 /// Real S3/MinIO conformance test (ADR-0010 §12: the memory oracle alone
