@@ -14,11 +14,15 @@ use crate::error::LogSegError;
 
 /// Trailer magic, last 4 bytes of every RLOG object.
 pub const MAGIC: [u8; 4] = *b"RLG1";
-/// RLOG v1 trailer version.
-pub const VERSION: u16 = 1;
+/// RLOG trailer version. Bumped 1 -> 2 by ADR-0032 to carry compaction
+/// identity (`level`, `input_set_hash`, `part_index`) in the footer. The reader
+/// gates on exact equality (`open` below), so a v1 object is rejected outright;
+/// there is no dual-reader path (ADR-0032: RLOG had no data outside development
+/// when v2 landed).
+pub const VERSION: u16 = 2;
 /// Signal byte for log segments.
 pub const SIGNAL_LOGS: u8 = 2;
-/// Reserved trailer byte; must be zero in v1.
+/// Reserved trailer byte; must be zero.
 pub const RESERVED: u8 = 0;
 /// Trailer size: footer_len(4) + footer_crc32c(4) + version(2) + signal(1) +
 /// reserved(1) + magic(4).
@@ -69,6 +73,13 @@ pub struct LogFooter {
     pub block_count: u64,
     pub stream_count: u64,
     pub sections: Vec<SectionDesc>,
+    /// Compaction level: 0 = L0 flush object, 1 = L1 compacted part (ADR-0032).
+    pub level: u32,
+    /// Hash over the sorted input list of a compaction (empty on an L0 object),
+    /// same canonical convention as RSEG's `input_set_hash`.
+    pub input_set_hash: Vec<u8>,
+    /// Part ordinal within one compaction output (0 on an L0 object).
+    pub part_index: u32,
 }
 
 impl LogFooter {
@@ -103,6 +114,9 @@ impl LogFooter {
                     uncompressed_len: s.uncomp_len,
                 })
                 .collect(),
+            level: self.level,
+            input_set_hash: self.input_set_hash.clone(),
+            part_index: self.part_index,
         }
     }
 
@@ -138,11 +152,17 @@ impl LogFooter {
             block_count: p.block_count,
             stream_count: p.stream_count,
             sections,
+            level: p.level,
+            input_set_hash: p.input_set_hash,
+            part_index: p.part_index,
         })
     }
 }
 
-/// `footer_crc32c`: covers the footer protobuf bytes, then `footer_len`
+/// `footer_crc32c`: covers the footer protobuf bytes (including the v2
+/// compaction-identity fields `level`/`input_set_hash`/`part_index`, which live
+/// inside the same encoded `LogFooter` message and so need no separate
+/// checksum), then `footer_len`
 /// (u32 LE), `version` (u16 LE), `signal`, `reserved`, `magic` — every trailer
 /// byte except the crc field itself (ADR-0010 §4).
 fn footer_crc(footer_bytes: &[u8], footer_len: u32, version: u16, signal: u8, reserved: u8) -> u32 {
@@ -272,6 +292,8 @@ pub fn validate_sections(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn sample_footer(sections: Vec<SectionDesc>) -> LogFooter {
@@ -289,6 +311,9 @@ mod tests {
             block_count: 2,
             stream_count: 3,
             sections,
+            level: 0,
+            input_set_hash: Vec::new(),
+            part_index: 0,
         }
     }
 
@@ -349,6 +374,102 @@ mod tests {
         assert_eq!(got.shard, 7);
         assert_eq!(got.record_count, 42);
         assert_eq!(got.section(kind::BLOCKS).map(|s| s.offset), Some(2));
+    }
+
+    /// A v2 footer carrying non-default compaction identity round-trips exactly
+    /// through encode then decode (ADR-0032). The three new fields live inside
+    /// the same protobuf `LogFooter` the `footer_crc32c` already covers.
+    #[test]
+    fn v2_footer_round_trips_level_input_set_hash_part_index() {
+        let mut footer = sample_footer(sample_sections());
+        footer.level = 1;
+        footer.input_set_hash = vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0xff];
+        footer.part_index = 7;
+
+        let mut obj = vec![0u8; 5];
+        write_footer_and_trailer(&mut obj, &footer);
+        let got = open(&obj).expect("open");
+
+        assert_eq!(got.level, 1);
+        assert_eq!(got.input_set_hash, vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0xff]);
+        assert_eq!(got.part_index, 7);
+        assert_eq!(got, footer);
+    }
+
+    /// There is no v1 writer left (ADR-0032: no dual-reader path), so hand-build
+    /// a structurally valid v1 trailer and assert the reader rejects it with a
+    /// typed `Corrupted` error rather than panicking. Only the trailer `version`
+    /// field differs from a valid v2 object; the crc is recomputed for v1 so the
+    /// rejection is the version check, not an incidental crc mismatch.
+    #[test]
+    fn rejects_v1_trailer_as_unsupported_version() {
+        const V1: u16 = 1;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, V1, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&V1.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        match open(&obj) {
+            Err(LogSegError::Corrupted(msg)) => assert!(msg.contains("unsupported version 1")),
+            other => panic!("expected Corrupted unsupported-version, got {other:?}"),
+        }
+    }
+
+    /// An L0 object built through the normal writer path stamps the compaction
+    /// identity at its L0 defaults (ADR-0032): level=0, empty input_set_hash,
+    /// part_index=0.
+    #[test]
+    fn l0_object_stamps_level_zero_sentinels() {
+        use ravel_types::logstream::{AttrValue, LogStreamId};
+
+        use crate::record::{LogRecord, stream_attrs_bytes};
+        use crate::writer::{ObjectIdentity, RlogConfig, RlogWriter};
+
+        let stream_id = LogStreamId([3u8; 16]);
+        let stream_attrs = stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str("svc".into()))],
+            "scope",
+            "1.0",
+            &[],
+        );
+        let record = LogRecord {
+            stream_id,
+            stream_attrs,
+            ts_ns: 10,
+            observed_ts_ns: 11,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        };
+
+        let identity = ObjectIdentity {
+            tenant_hash: [1u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        w.push(record).expect("push");
+        let object = w.finish().expect("finish");
+
+        let footer = open(&object).expect("open");
+        assert_eq!(footer.level, 0);
+        assert!(footer.input_set_hash.is_empty());
+        assert_eq!(footer.part_index, 0);
     }
 
     #[test]
@@ -477,5 +598,82 @@ mod tests {
                 uncomp_len: 1,
             },
         ]
+    }
+
+    /// A footer proto whose `input_set_hash` (field 15) length prefix claims
+    /// more bytes than follow is a typed `Corrupted` error at decode, never a
+    /// panic and never a silently truncated hash. The crc is computed over the
+    /// crafted bytes so the reader reaches the prost decode step rather than
+    /// failing the crc check first.
+    #[test]
+    fn truncated_input_set_hash_is_corrupted_not_truncated() {
+        let mut footer_bytes = sample_footer(sample_sections()).to_proto().encode_to_vec();
+        // field 15, wire type 2 (LEN): tag, a claimed length of 10, then only 2
+        // payload bytes so the field runs past the buffer end.
+        footer_bytes.push((15 << 3) | 2);
+        footer_bytes.push(10);
+        footer_bytes.extend_from_slice(&[0xaa, 0xbb]);
+
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, VERSION, SIGNAL_LOGS, RESERVED);
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&VERSION.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// Arbitrary v2 compaction-identity values survive a footer
+        /// encode/decode round-trip exactly (ADR-0032).
+        #[test]
+        fn footer_v2_fields_round_trip(
+            level in any::<u32>(),
+            part_index in any::<u32>(),
+            hash in proptest::collection::vec(any::<u8>(), 0..40),
+        ) {
+            let mut footer = sample_footer(sample_sections());
+            footer.level = level;
+            footer.part_index = part_index;
+            footer.input_set_hash = hash.clone();
+
+            let mut obj = vec![0u8; 5];
+            write_footer_and_trailer(&mut obj, &footer);
+            let got = open(&obj).expect("open");
+
+            prop_assert_eq!(got.level, level);
+            prop_assert_eq!(got.part_index, part_index);
+            prop_assert_eq!(got.input_set_hash, hash);
+        }
+
+        /// Corrupting any byte inside the footer proto region (which carries
+        /// `input_set_hash`) is always caught as a typed `Corrupted` error via
+        /// the footer crc, never a panic and never a silently altered footer.
+        #[test]
+        fn footer_corruption_is_typed_error(
+            hash in proptest::collection::vec(any::<u8>(), 1..40),
+            flip in any::<usize>(),
+            xor in any::<u8>(),
+        ) {
+            let mut footer = sample_footer(sample_sections());
+            footer.input_set_hash = hash;
+            let mut obj = vec![0u8; 5];
+            write_footer_and_trailer(&mut obj, &footer);
+
+            // Footer proto bytes occupy [5, total - TRAILER_LEN).
+            let start = 5usize;
+            let end = obj.len() - TRAILER_LEN;
+            let i = start + (flip % (end - start));
+            obj[i] ^= xor | 1;
+
+            prop_assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
+        }
     }
 }
