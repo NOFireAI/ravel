@@ -233,13 +233,11 @@ jobs:
   # the selector and error corpora in crates/ravel-promql-difftest/corpus.
   #
   # scripts/fetch-prometheus.sh verifies the downloaded archive's sha256
-  # before extracting it and refuses to proceed otherwise. As of this job's
-  # introduction those checksums are still literal UNVERIFIED-PLACEHOLDER
-  # values (populated with a real published digest from
+  # before extracting it and refuses to proceed otherwise. The pinned
+  # checksums are the real published digests from
   # https://github.com/prometheus/prometheus/releases/tag/v3.13.1's
-  # sha256sums.txt) because the environment that wrote this job had no
-  # network egress to fetch and verify them. Populate them before relying
-  # on this job passing.
+  # sha256sums.txt (issue #141), so this job fetches and verifies the real
+  # binary and runs the differential comparison rather than skipping.
   promql-difftest:
     runs-on: ubuntu-latest
     env:
