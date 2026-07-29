@@ -4,6 +4,8 @@
 //! offset, length, count, and ordinal read from stored bytes is untrusted
 //! (docs/segment-format.md); every fallible path returns a typed error.
 
+use std::collections::HashSet;
+
 use ravel_proto::segment::v1::{Footer, Section};
 use ravel_types::{Label, LabelSet, SeriesId};
 
@@ -399,15 +401,28 @@ fn take_array16(bytes: &[u8], pos: &mut usize) -> Result<[u8; 16], SegmentError>
     s.try_into().map_err(|_| SegmentError::Truncated)
 }
 
+/// Indexes LABEL_DICT into `(start, len)` byte ranges, one per ordinal, and
+/// rejects a dictionary that stores the same string at two different
+/// ordinals: the matcher-resolution path (`find_ordinal` in
+/// `decode_catalog_matching_v4`, which finds the byte-equal ordinal) and
+/// the decode-then-select path (which resolves ordinals to strings and
+/// compares those) would otherwise silently disagree on which series match
+/// -- the matcher path only ever finds the first occurrence. LABEL_DICT
+/// ordering is not a contract (docs/segment-format.md), so duplicates are
+/// found with a hash set rather than by assuming adjacency.
 pub(crate) fn index_label_dict(bytes: &[u8]) -> Result<Vec<(usize, usize)>, SegmentError> {
     let mut pos = 0usize;
     let count = take_u32_le(bytes, &mut pos)?;
     let mut out = Vec::with_capacity((count as usize).min(bytes.len()));
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity((count as usize).min(bytes.len()));
     for _ in 0..count {
         let len = read_uvarint(bytes, &mut pos)?;
         let len = to_usize(len)?;
         let start = pos;
-        take_bytes(bytes, &mut pos, len)?;
+        let slice = take_bytes(bytes, &mut pos, len)?;
+        if !seen.insert(slice) {
+            return Err(SegmentError::DuplicateDictString);
+        }
         out.push((start, len));
     }
     if pos != bytes.len() {
@@ -1928,5 +1943,91 @@ mod dict_resolver_tests {
         assert!(matches!(resolver.get(9), Err(SegmentError::BadOrdinal(9))));
         assert_eq!(resolver.get(1).expect("cached"), "bb");
         assert_eq!(resolver.get(0).expect("other"), "a");
+    }
+
+    #[test]
+    fn index_rejects_adjacent_duplicate_string() {
+        let dict = build_dict(&[b"__name__", b"dup", b"dup"]);
+        assert!(matches!(
+            index_label_dict(&dict),
+            Err(SegmentError::DuplicateDictString)
+        ));
+    }
+
+    #[test]
+    fn index_rejects_non_adjacent_duplicate_string() {
+        // LABEL_DICT ordering is not a contract (docs/segment-format.md), so
+        // the duplicate check must not assume the two occurrences are
+        // adjacent.
+        let dict = build_dict(&[b"__name__", b"dup", b"other", b"dup"]);
+        assert!(matches!(
+            index_label_dict(&dict),
+            Err(SegmentError::DuplicateDictString)
+        ));
+    }
+
+    #[test]
+    fn index_accepts_distinct_strings() {
+        let dict = build_dict(&[b"__name__", b"a", b"b", b"c"]);
+        assert!(index_label_dict(&dict).is_ok());
+    }
+
+    /// Issue #200: before `index_label_dict` rejected duplicates, the
+    /// matcher-resolution path (byte-equal search over the raw dictionary,
+    /// first occurrence wins) and the decode-then-select path (resolve a
+    /// series' stored ordinal, then compare the resulting string) disagreed
+    /// whenever the same string lived at two ordinals. This reconstructs
+    /// that pre-fix disagreement directly (bypassing the new check, which
+    /// this test also confirms fires) to document exactly why a duplicate
+    /// must be rejected at the dictionary level rather than left to the two
+    /// call sites to reconcile independently.
+    #[test]
+    fn duplicate_dict_string_would_desync_matcher_and_resolve_paths() {
+        let dict = build_dict(&[b"__name__", b"dup", b"other", b"dup"]);
+
+        assert!(matches!(
+            index_label_dict(&dict),
+            Err(SegmentError::DuplicateDictString)
+        ));
+
+        // Reconstruct the index the old, unchecked `index_label_dict` would
+        // have produced, to compare the two resolution strategies directly.
+        fn index_unchecked(bytes: &[u8]) -> Vec<(usize, usize)> {
+            let count = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+            let mut pos = 4usize;
+            let mut out = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let len = bytes[pos] as usize; // single-byte varint, test-only
+                pos += 1;
+                out.push((pos, len));
+                pos += len;
+            }
+            out
+        }
+        let index = index_unchecked(&dict);
+
+        // Matcher-resolution path: byte-equal search, first occurrence wins.
+        let find_ordinal = |needle: &str| -> Option<u64> {
+            index
+                .iter()
+                .position(|&(start, len)| &dict[start..start + len] == needle.as_bytes())
+                .map(|i| i as u64)
+        };
+        let matcher_ord = find_ordinal("dup").expect("dup present");
+        assert_eq!(
+            matcher_ord, 1,
+            "matcher path finds only the first occurrence"
+        );
+
+        // Decode-then-select path: a series that actually stored ordinal 3
+        // resolves to the byte-identical string.
+        let mut resolver = DictResolver::new(&dict, &index);
+        let series_value_ord = 3u64;
+        assert_eq!(resolver.get(series_value_ord).expect("resolves"), "dup");
+
+        // The two paths disagree: decode-then-select would match this
+        // series on string equality, but the matcher path's ordinal
+        // equality check (series_value_ord == matcher_ord) rejects it.
+        assert_ne!(series_value_ord, matcher_ord);
     }
 }

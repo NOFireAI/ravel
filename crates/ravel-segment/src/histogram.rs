@@ -95,10 +95,11 @@ fn write_side_spans(out: &mut Vec<u8>, spans: &[HistogramSpan]) -> Result<(), Wr
 
 /// Validates `value` against the writer-side structural invariants
 /// (docs/rseg-v3-plan.md section 3.5) and appends its HIST_SPANS record
-/// encoding to `out`. Business-logic checks that are purely decode-time
-/// concerns (e.g. `count >= zero_count`) are left to the future reader
-/// (C4); only invariants that would make the writer itself emit an
-/// ill-formed record are enforced here.
+/// encoding to `out`. Also enforces `count >= zero_count` and `count >=
+/// sum(bucket_counts)`, the same consistency rule the reader checks at
+/// decode time (`SegmentError::HistogramCountInconsistent`), so an
+/// inconsistent value is rejected here rather than becoming permanently
+/// undecodable data once committed to object storage.
 pub(crate) fn encode_histogram_record_into(
     out: &mut Vec<u8>,
     value: &HistogramValue,
@@ -128,22 +129,40 @@ pub(crate) fn encode_histogram_record_into(
 
     let count_kind: u8 = match &value.counts {
         HistogramCounts::Int {
-            positive, negative, ..
+            zero_count,
+            count,
+            positive,
+            negative,
         } => {
             if positive.len() as u64 != positive_expected
                 || negative.len() as u64 != negative_expected
             {
                 return Err(WriteError::HistogramBucketCountLenMismatch);
             }
+            let total = positive
+                .iter()
+                .chain(negative.iter())
+                .try_fold(0u64, |acc, &v| acc.checked_add(v))
+                .ok_or(WriteError::HistogramCountInconsistent)?;
+            if *count < *zero_count || *count < total {
+                return Err(WriteError::HistogramCountInconsistent);
+            }
             0
         }
         HistogramCounts::Float {
-            positive, negative, ..
+            zero_count,
+            count,
+            positive,
+            negative,
         } => {
             if positive.len() as u64 != positive_expected
                 || negative.len() as u64 != negative_expected
             {
                 return Err(WriteError::HistogramBucketCountLenMismatch);
+            }
+            let total: f64 = positive.iter().chain(negative.iter()).sum();
+            if *count < *zero_count || *count < total {
+                return Err(WriteError::HistogramCountInconsistent);
             }
             1
         }
@@ -211,4 +230,106 @@ pub(crate) fn encode_histogram_record_into(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_value(counts: HistogramCounts) -> HistogramValue {
+        HistogramValue {
+            scale: 3,
+            zero_threshold: 0.001,
+            sum: Some(1.5),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            negative_spans: vec![],
+            counts,
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
+    #[test]
+    fn int_count_below_zero_count_is_rejected() {
+        let value = base_value(HistogramCounts::Int {
+            zero_count: 10,
+            count: 3,
+            positive: vec![1, 2],
+            negative: vec![],
+        });
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_histogram_record_into(&mut out, &value),
+            Err(WriteError::HistogramCountInconsistent)
+        );
+    }
+
+    #[test]
+    fn int_count_below_bucket_sum_is_rejected() {
+        let value = base_value(HistogramCounts::Int {
+            zero_count: 0,
+            count: 2,
+            positive: vec![1, 2],
+            negative: vec![],
+        });
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_histogram_record_into(&mut out, &value),
+            Err(WriteError::HistogramCountInconsistent)
+        );
+    }
+
+    #[test]
+    fn float_count_below_zero_count_is_rejected() {
+        let value = base_value(HistogramCounts::Float {
+            zero_count: 10.0,
+            count: 3.0,
+            positive: vec![1.0, 2.0],
+            negative: vec![],
+        });
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_histogram_record_into(&mut out, &value),
+            Err(WriteError::HistogramCountInconsistent)
+        );
+    }
+
+    #[test]
+    fn float_count_below_bucket_sum_is_rejected() {
+        let value = base_value(HistogramCounts::Float {
+            zero_count: 0.0,
+            count: 2.0,
+            positive: vec![1.0, 2.0],
+            negative: vec![],
+        });
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_histogram_record_into(&mut out, &value),
+            Err(WriteError::HistogramCountInconsistent)
+        );
+    }
+
+    #[test]
+    fn consistent_counts_are_accepted() {
+        let int_value = base_value(HistogramCounts::Int {
+            zero_count: 1,
+            count: 3,
+            positive: vec![1, 2],
+            negative: vec![],
+        });
+        let mut out = Vec::new();
+        assert!(encode_histogram_record_into(&mut out, &int_value).is_ok());
+
+        let float_value = base_value(HistogramCounts::Float {
+            zero_count: 1.0,
+            count: 3.0,
+            positive: vec![1.0, 2.0],
+            negative: vec![],
+        });
+        let mut out = Vec::new();
+        assert!(encode_histogram_record_into(&mut out, &float_value).is_ok());
+    }
 }
