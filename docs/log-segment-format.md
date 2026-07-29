@@ -103,7 +103,7 @@ count: u32
 count entries, sorted ascending by stream_id (16 bytes):
   stream_id:  [u8;16]
   blob_len:   varint
-  blob:       canonical resource+scope attribute bytes
+  blob:       blob_len bytes, the stream-identity preimage (below)
   first_blk:  varint   } block range containing
   last_blk:   varint   } this stream's records
 ```
@@ -112,6 +112,48 @@ The `stream_ref` used everywhere else is the entry's ordinal (0-based).
 Sorting by `stream_id` makes lookup a binary search and makes the
 directory mergeable at compaction with a linear pass. Readers reject a
 non-ascending sequence and an entry count exceeding the configured cap.
+
+### The identity blob
+
+`blob` is exactly the byte string that `stream_id` is the hash of, minus
+the domain string, in this concatenation order:
+
+```
+canonical(resource_attrs)         self-delimiting: leading entry count
+varint(len(scope_name))    scope_name     UTF-8, no terminator
+varint(len(scope_version)) scope_version  UTF-8, no terminator
+canonical(scope_attrs)            self-delimiting: leading entry count
+```
+
+`canonical(..)` is the frozen canonical attribute-set encoding of
+ADR-0029 (`ravel_types::logstream::canonical_attr_bytes`): a LEB128 entry
+count, then each entry as `len(key) key encode_value(value)`, entries
+sorted by `(key bytes, encoded value bytes)`. `varint(..)` is LEB128.
+Both attribute sets carry their own entry count and both scope strings
+are length-prefixed, so the concatenation is injective: no two distinct
+resource+scope inputs produce the same blob.
+
+It follows that
+
+```
+stream_id == blake3("ravel-logstream-v1" || blob)[..16]
+```
+
+for the recipe in ADR-0029, so a reader can verify a STREAM_DIR entry's
+identity from the object alone, and log stream identity is recoverable
+without a side table. The blob is never empty: an empty resource+scope
+still encodes as four zero bytes (two zero entry counts, two zero string
+lengths).
+
+Writers build the blob with `ravel_logseg::stream_attrs_bytes` and hand
+it to the writer in every record's `stream_attrs` field; the writer
+stores the bytes from the first record seen for each `stream_id`
+verbatim. Every record sharing a `stream_id` must carry identical
+`stream_attrs`. A disagreement means either a caller bug or a stream-id
+hash collision, and neither has a truthful blob, so the writer rejects
+the whole object with `LogSegError::InconsistentStreamAttrs` rather than
+silently keeping one of them. That is writer input validation, not object
+corruption.
 
 ## FIELD_DIR (uncompressed form)
 

@@ -11,13 +11,23 @@
 /// contract in docs/log-segment-format.md: a bad tag, an out-of-range
 /// offset, an overflowing accumulation, a checksum mismatch, or trailing
 /// bytes. `LimitExceeded` is a caller/config bound (too many columns, an
-/// empty object). `Io` wraps compression backend failures.
+/// empty object). `InconsistentStreamAttrs` is writer-side input validation:
+/// two records claiming one stream id but disagreeing on the resource+scope
+/// bytes behind it. `Io` wraps compression backend failures.
 #[derive(Debug, thiserror::Error)]
 pub enum LogSegError {
     #[error("corrupted segment: {0}")]
     Corrupted(String),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+    /// Records handed to one writer share a `stream_id` but carry different
+    /// `stream_attrs` bytes, so the object has no single truthful STREAM_DIR
+    /// blob for that stream. Either a caller bug or a stream-id hash
+    /// collision; the writer refuses the whole object instead of silently
+    /// picking one blob. This is input validation, not object corruption:
+    /// nothing has been decoded yet, so it is never `Corrupted`.
+    #[error("inconsistent stream attrs: {0}")]
+    InconsistentStreamAttrs(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
