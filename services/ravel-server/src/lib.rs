@@ -8,7 +8,9 @@ pub mod flight;
 pub mod flight_auth;
 pub mod fold;
 pub mod ingest;
+pub mod logs_ingest;
 pub mod otlp_grpc;
+pub mod otlp_grpc_logs;
 pub mod otlp_http;
 pub mod query;
 pub mod remote_write;
@@ -22,10 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
-use ravel_ingest::{IngestConfig, IngestRouter, SystemClock};
+use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SystemClock};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::IngestLimits;
+use ravel_otlp::{IngestLimits, LogIngestLimits};
 use ravel_query::http::TenantResolver;
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
@@ -77,12 +80,14 @@ pub struct Running {
     grpc_shutdown: Option<oneshot::Sender<()>>,
     grpc_task: Option<JoinHandle<anyhow::Result<()>>>,
     ingest_router: Option<Arc<IngestRouter>>,
+    log_ingest_router: Option<Arc<LogIngestRouter>>,
     fold_tasks: fold::FoldTasks,
 }
 
 impl Running {
     /// Stops accepting new connections, waits for both listeners to drain,
-    /// then flushes and joins every ingest shard actor.
+    /// then flushes and joins every ingest shard actor, metrics and logs
+    /// alike.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let _ = self.http_shutdown.send(());
         self.http_task.await??;
@@ -105,6 +110,18 @@ impl Running {
             }
         }
 
+        if let Some(router) = self.log_ingest_router {
+            match Arc::try_unwrap(router) {
+                Ok(router) => router.shutdown().await,
+                Err(_) => {
+                    tracing::warn!(
+                        "log ingest router still has outstanding references; shard actors not \
+                         drained"
+                    );
+                }
+            }
+        }
+
         self.fold_tasks.shutdown().await;
 
         Ok(())
@@ -113,6 +130,7 @@ impl Running {
 
 fn gateway_state(
     ingest_router: &Arc<IngestRouter>,
+    log_ingest_router: &Arc<LogIngestRouter>,
     tenant_resolver: Arc<dyn TenantResolver>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
@@ -120,6 +138,11 @@ fn gateway_state(
         ingest: ingest::IngestState {
             router: ingest_router.clone(),
             limits: IngestLimits::default(),
+            ack_deadline: DEFAULT_ACK_DEADLINE,
+        },
+        logs_ingest: logs_ingest::LogIngestState {
+            router: log_ingest_router.clone(),
+            limits: LogIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
         },
     })
@@ -158,9 +181,26 @@ pub async fn start(
         None
     };
 
+    // The log pipeline is a parallel router, not a mode of the metrics one:
+    // same shard count, same store, same clock, but RLOG objects under the
+    // `l` keyspace (docs/ingest.md "Log pipeline"). It exists in exactly the
+    // modes that serve ingest, so the two options are always Some together.
+    let log_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+        Some(Arc::new(LogIngestRouter::new(
+            IngestConfig {
+                shard_count: config.shard_count,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Arc::new(SystemClock),
+        )))
+    } else {
+        None
+    };
+
     let mut http_router = Router::new();
-    if let Some(router) = &ingest_router {
-        let state = gateway_state(router, config.tenant_resolver.clone());
+    if let (Some(router), Some(log_router)) = (&ingest_router, &log_ingest_router) {
+        let state = gateway_state(router, log_router, config.tenant_resolver.clone());
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(router, config.tenant_resolver.clone());
         http_router = http_router.merge(remote_write::router(rw_state));
@@ -224,10 +264,22 @@ pub async fn start(
         Ok(())
     });
 
-    let metrics_service = ingest_router.as_ref().map(|router| {
-        let state = gateway_state(router, config.tenant_resolver.clone());
-        MetricsServiceServer::new(otlp_grpc::GrpcMetricsService::new(state))
-    });
+    // Both OTLP services share one `GatewayState`: they resolve tenants and
+    // read write-mode metadata identically, and each dispatches to its own
+    // signal's ingest state inside it.
+    let otlp_grpc_state =
+        ingest_router
+            .as_ref()
+            .zip(log_ingest_router.as_ref())
+            .map(|(router, log_router)| {
+                gateway_state(router, log_router, config.tenant_resolver.clone())
+            });
+    let metrics_service = otlp_grpc_state
+        .as_ref()
+        .map(|state| MetricsServiceServer::new(otlp_grpc::GrpcMetricsService::new(state.clone())));
+    let logs_service = otlp_grpc_state
+        .as_ref()
+        .map(|state| LogsServiceServer::new(otlp_grpc_logs::GrpcLogsService::new(state.clone())));
 
     // The gRPC listener carries OTLP ingest, so gateway modes always bind it.
     // With `flight-sql` on it also carries Flight SQL, which is a query
@@ -240,7 +292,9 @@ pub async fn start(
     let serve_grpc = metrics_service.is_some();
 
     let (grpc_addr, grpc_shutdown, grpc_task) = if serve_grpc {
-        let grpc = tonic::transport::Server::builder().add_optional_service(metrics_service);
+        let grpc = tonic::transport::Server::builder()
+            .add_optional_service(metrics_service)
+            .add_optional_service(logs_service);
         #[cfg(feature = "flight-sql")]
         let grpc = grpc.add_optional_service(flight_service);
         let (tx, rx) = oneshot::channel::<()>();
@@ -272,6 +326,7 @@ pub async fn start(
         grpc_shutdown,
         grpc_task,
         ingest_router,
+        log_ingest_router,
         fold_tasks,
     })
 }
