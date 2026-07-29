@@ -48,6 +48,9 @@
 //! future phase to consume; `instant`/`range` unwrap the `Vector`/`Matrix`
 //! case and turn anything else into [`Error::WrongType`].
 
+use std::cell::Cell;
+use std::time::Instant;
+
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
 
 use crate::matchers;
@@ -191,6 +194,12 @@ pub enum Error {
         "range query resolution of {points} evaluation points exceeds the maximum of {max}; widen step_ms or narrow the range"
     )]
     TooManyPoints { points: u64, max: usize },
+    #[error(
+        "nested subquery evaluation touched {touched} evaluation points across every nesting level, exceeding the shared budget of {max}; narrow the range, widen the step, or reduce subquery nesting"
+    )]
+    EvalBudgetExhausted { touched: u64, max: u64 },
+    #[error("evaluation exceeded its deadline before finishing")]
+    DeadlineExceeded,
     #[error("query evaluates to {got}, but this operation requires {expected}")]
     WrongType {
         expected: &'static str,
@@ -225,6 +234,19 @@ pub const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 /// does not constrain the grid.
 pub const DEFAULT_MAX_RANGE_POINTS: usize = 11_000;
 
+/// Default shared budget on total evaluation-grid points touched across
+/// *every* subquery nesting level of one query (issue #193). Unlike
+/// [`DEFAULT_MAX_RANGE_POINTS`], which caps a single subquery/range node's
+/// own grid independently, this one counter accumulates across the whole
+/// recursive evaluation tree ([`QueryWindow::charge_budget`], charged by
+/// [`Evaluator::eval_subquery_matrix`] on every call): a subquery nested
+/// inside another subquery, or re-evaluated once per enclosing grid step,
+/// cannot multiply its cost past any single node's own cap. 1,000,000
+/// comfortably covers a legitimate multi-thousand-step range query wrapping
+/// a modest subquery, while still stopping a multi-level nested blowup
+/// within a handful of nesting levels.
+pub const DEFAULT_MAX_TOTAL_EVAL_POINTS: u64 = 1_000_000;
+
 /// Default step for a subquery that does not specify its own (`expr[5m:]`),
 /// in nanoseconds: 1 minute, matching Prometheus' global `evaluation_interval`
 /// default (`NoStepSubqueryIntervalFn`). `ravel-query`'s engine config carries
@@ -250,6 +272,49 @@ const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 pub(crate) struct QueryWindow {
     start_ns: i64,
     end_ns: i64,
+    /// Shared cross-level evaluation-grid-point budget (issue #193), charged
+    /// down by [`Self::charge_budget`] on every subquery-grid evaluation
+    /// ([`Evaluator::eval_subquery_matrix`]) regardless of nesting depth or
+    /// how many times an enclosing grid re-evaluates it from scratch.
+    budget: Cell<u64>,
+    /// Wall-clock instant after which evaluation must stop with
+    /// [`Error::DeadlineExceeded`], checked by [`Self::check_deadline`] once
+    /// per subquery grid step (issue #193): the evaluator is otherwise fully
+    /// synchronous with no yield point for `ravel-query`'s
+    /// `tokio::time::timeout` to preempt at, so a runaway nested evaluation
+    /// would otherwise always run to completion before the timeout could
+    /// fire. `None` (the default, [`Evaluator::new`]) never cancels.
+    deadline: Option<Instant>,
+}
+
+impl QueryWindow {
+    /// Charge `points` (one subquery-grid evaluation's own size) against the
+    /// shared cross-level budget. `max` is the configured ceiling
+    /// ([`Evaluator::max_total_eval_points`]), reported back in the error so
+    /// callers can name it; `touched` is the running total that would have
+    /// been reached had this charge been allowed, so it always exceeds `max`
+    /// when this returns an error.
+    fn charge_budget(&self, points: u64, max: u64) -> Result<(), Error> {
+        let remaining = self.budget.get();
+        if points > remaining {
+            let already_touched = max.saturating_sub(remaining);
+            return Err(Error::EvalBudgetExhausted {
+                touched: already_touched.saturating_add(points),
+                max,
+            });
+        }
+        self.budget.set(remaining - points);
+        Ok(())
+    }
+
+    /// `Err(Error::DeadlineExceeded)` once [`Self::deadline`] has passed;
+    /// `Ok(())` otherwise, including when no deadline was set.
+    pub(crate) fn check_deadline(&self) -> Result<(), Error> {
+        match self.deadline {
+            Some(deadline) if Instant::now() >= deadline => Err(Error::DeadlineExceeded),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// PromQL evaluator. Stateless besides its lookback and resolution
@@ -259,6 +324,8 @@ pub struct Evaluator {
     lookback_delta_ns: i64,
     max_range_points: usize,
     default_step_ns: i64,
+    max_total_eval_points: u64,
+    deadline: Option<Instant>,
 }
 
 impl Default for Evaluator {
@@ -267,6 +334,8 @@ impl Default for Evaluator {
             lookback_delta_ns: DEFAULT_LOOKBACK_NS,
             max_range_points: DEFAULT_MAX_RANGE_POINTS,
             default_step_ns: DEFAULT_SUBQUERY_STEP_NS,
+            max_total_eval_points: DEFAULT_MAX_TOTAL_EVAL_POINTS,
+            deadline: None,
         }
     }
 }
@@ -309,6 +378,33 @@ impl Evaluator {
         self.default_step_ns
     }
 
+    /// Override the default shared cross-level evaluation budget
+    /// ([`DEFAULT_MAX_TOTAL_EVAL_POINTS`]): the total number of evaluation-
+    /// grid points a query may touch across every subquery nesting level,
+    /// as opposed to [`Self::with_max_range_points`]'s per-node cap.
+    pub fn with_max_total_eval_points(mut self, max_total_eval_points: u64) -> Self {
+        self.max_total_eval_points = max_total_eval_points;
+        self
+    }
+
+    /// The configured shared cross-level evaluation budget, in grid points.
+    pub fn max_total_eval_points(&self) -> u64 {
+        self.max_total_eval_points
+    }
+
+    /// Set a wall-clock deadline: once past, evaluation stops with
+    /// [`Error::DeadlineExceeded`] the next time a subquery grid step checks
+    /// it (issue #193), rather than running to completion regardless of an
+    /// enclosing caller's own timeout. `ravel-query`'s `QueryEngine` derives
+    /// this from its own `deadline: Duration` parameter
+    /// (`Instant::now() + deadline`) before evaluating. Unset by default
+    /// ([`Evaluator::new`]), so an `Evaluator` built without this call never
+    /// self-cancels.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     /// Evaluate `query` at `t_ms`, returning the full [`Value`] the query
     /// resolves to (scalar, string, or instant vector; a bare matrix
     /// selector at top level is a [`Error::WrongType`], matching
@@ -324,6 +420,8 @@ impl Evaluator {
         let ctx = QueryWindow {
             start_ns: t_ns,
             end_ns: t_ns,
+            budget: Cell::new(self.max_total_eval_points),
+            deadline: self.deadline,
         };
         self.eval_expr(source, &expr, t_ns, &ctx)
     }
@@ -390,7 +488,12 @@ impl Evaluator {
         }
 
         let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
-        let ctx = QueryWindow { start_ns, end_ns };
+        let ctx = QueryWindow {
+            start_ns,
+            end_ns,
+            budget: Cell::new(self.max_total_eval_points),
+            deadline: self.deadline,
+        };
 
         // P1's supported grammar (paren, unary minus, literals, one
         // selector) can contain at most one selector, so unlike a general
@@ -425,6 +528,7 @@ impl Evaluator {
             RangeCore::Generic(e) => {
                 let matrix =
                     crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+                        ctx.check_deadline()?;
                         self.eval_expr(source, e, t, &ctx)
                     })?;
                 Ok(Value::Matrix(matrix))
@@ -607,8 +711,9 @@ impl Evaluator {
     ///
     /// The grid's end is the subquery's own `offset`/`@`-shifted instant
     /// (relative to `eval_ts_ns`, the ambient step); its start is the
-    /// smallest epoch-aligned multiple of the step that is `>=
-    /// end - range` ([`align_up_to_step`]). The step count is checked
+    /// smallest epoch-aligned multiple of the step that is strictly
+    /// greater than `end - range` ([`align_up_to_step`]), left-open like
+    /// this crate's matrix-selector window. The step count is checked
     /// against [`Self::max_range_points`] *before* any grid is built or the
     /// inner `expr` is evaluated even once, exactly like a top-level range
     /// query's own budget check: a subquery nested inside a range query or
@@ -651,8 +756,10 @@ impl Evaluator {
                 max: self.max_range_points,
             });
         }
+        ctx.charge_budget(points, self.max_total_eval_points)?;
 
         crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+            ctx.check_deadline()?;
             let value = self.eval_expr(source, &sq.expr, t, ctx)?;
             // Native-histogram series inside a subquery window are not yet
             // supported. The subquery grid reducer (`eval_instant_over_grid`)
@@ -1122,23 +1229,29 @@ fn step_count(start_ns: i64, end_ns: i64, step_ns: i64) -> u64 {
 }
 
 /// The smallest multiple of `step_ns`, measured from the Unix epoch (time
-/// zero), that is `>= target_ns`. This is Prometheus' subquery step-alignment
-/// rule (`promql/engine.go`'s `evalSubquery`): a subquery's grid is aligned to
-/// epoch-relative step boundaries (`0, step, 2*step, ...`), not to the
-/// subquery's own window start or the outer query's step boundaries, so two
-/// subqueries with the same step line up on the same instants regardless of
-/// where their windows happen to start.
+/// zero), that is strictly greater than `target_ns`. Left-open, exactly like
+/// this crate's matrix-selector window ([`Evaluator::eval_matrix_selector`]):
+/// a grid point sitting exactly at `target_ns` (a subquery's `end - range`)
+/// is excluded, not admitted, matching Prometheus' own subquery alignment
+/// (`promql/engine.go`'s `evalSubquery`). Subquery grids are otherwise
+/// aligned to epoch-relative step boundaries (`0, step, 2*step, ...`), not to
+/// the subquery's own window start or the outer query's step boundaries, so
+/// two subqueries with the same step line up on the same instants regardless
+/// of where their windows happen to start.
 ///
 /// Computed in `i128` for the same reason [`step_count`] is: `target_ns`'s
 /// floor division by `step_ns` must not overflow for extreme-but-
 /// representable inputs, and `div_euclid` (floor, not truncating) division is
 /// required so a negative `target_ns` (a window before the Unix epoch) aligns
 /// the same way Prometheus' Go integer-division-with-manual-correction does.
+/// The floor is always `<= target_ns` by construction, so advancing one more
+/// step always lands strictly above `target_ns`: no separate `==` case is
+/// needed.
 fn align_up_to_step(target_ns: i64, step_ns: i64) -> Result<i64, Error> {
     let target = i128::from(target_ns);
     let step = i128::from(step_ns);
     let floor = target.div_euclid(step) * step;
-    let aligned = if floor < target { floor + step } else { floor };
+    let aligned = floor + step;
     i64::try_from(aligned).map_err(|_| Error::TimeOverflow)
 }
 
@@ -1603,8 +1716,9 @@ mod tests {
     fn align_up_to_step_rounds_up_to_the_next_epoch_multiple() {
         // 90 is not a multiple of 60; the next one up is 120.
         assert_eq!(align_up_to_step(90, 60).expect("fits"), 120);
-        // Already a multiple: unchanged.
-        assert_eq!(align_up_to_step(120, 60).expect("fits"), 120);
+        // Already a multiple: left-open, so it still advances past it
+        // rather than returning it (issue #190).
+        assert_eq!(align_up_to_step(120, 60).expect("fits"), 180);
     }
 
     #[test]
@@ -1612,7 +1726,9 @@ mod tests {
         // -90 sits between -120 and -60; the next multiple up is -60, not
         // -120 (a truncating, non-floor division would wrongly land there).
         assert_eq!(align_up_to_step(-90, 60).expect("fits"), -60);
-        assert_eq!(align_up_to_step(-120, 60).expect("fits"), -120);
+        // -120 is itself a multiple; left-open means the result still
+        // advances past it, landing on the same -60 as the -90 case above.
+        assert_eq!(align_up_to_step(-120, 60).expect("fits"), -60);
     }
 
     #[test]
@@ -1657,10 +1773,15 @@ mod tests {
     fn nested_subquery_recurses_through_an_intervening_function() {
         // The inner subquery `up[2m:1m]` feeds `count_over_time`, whose
         // instant-vector result is itself subqueried by the outer
-        // `[2m:1m]`. The single sample sits far enough in the past
-        // (-240s) that every inner grid point, at every outer step, still
-        // finds it within the default 5m lookback, so `count_over_time`
-        // over the always-3-point inner grid is 3 at every outer step.
+        // `[2m:1m]`. At eval_ts=0 both the outer grid's own target
+        // (0 - 2m = -120s) and, at every outer step, the inner grid's own
+        // target land exactly on a 1m step multiple; the left-open rule
+        // (issue #190) excludes that boundary point from each grid, so
+        // both grids have 2 points instead of 3. The single sample sits far
+        // enough in the past (-240s) that every remaining inner grid point,
+        // at every outer step, still finds it within the default 5m
+        // lookback, so `count_over_time` over the always-2-point inner grid
+        // is 2 at every outer step.
         let source = TestSource::new()
             .with_series(&[("__name__", "up")], &[(-240 * NS_PER_MS * 1000, 1.0)])
             .expect("valid series");
@@ -1672,8 +1793,8 @@ mod tests {
         };
         assert_eq!(matrix.len(), 1);
         let (_, samples) = &matrix[0];
-        assert_eq!(samples.len(), 3);
-        assert!(samples.iter().all(|s| s.value == 3.0));
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|s| s.value == 2.0));
     }
 
     #[test]
@@ -1739,9 +1860,10 @@ mod tests {
         };
         assert_eq!(matrix.len(), 1);
         let (_, samples) = &matrix[0];
-        // Outer grid: end 18m, range 10m, step 2m -> epoch-aligned points at
-        // 8m, 10m, 12m, 14m, 16m, 18m.
-        assert_eq!(samples.len(), 6);
+        // Outer grid: end 18m, range 10m, step 2m -> target is 8m exactly,
+        // excluded by the left-open grid-start rule (issue #190), so the
+        // grid starts at the next step multiple: 10m, 12m, 14m, 16m, 18m.
+        assert_eq!(samples.len(), 5);
         assert!(samples.iter().all(|s| (s.value - 1.0 / 30.0).abs() < 1e-9));
     }
 
@@ -1749,8 +1871,12 @@ mod tests {
     fn subquery_offset_and_at_shift_the_grids_own_end() {
         // `up[2m:1m] offset 1m` at t=0 ends its grid at -1m (the grid start
         // is then epoch-aligned from that shifted end), not at t=0 itself.
-        // The sample sits at -180s so it is within lookback of every grid
-        // point exercised below, in both the offset and the `@` case.
+        // The target (-1m - 2m = -180s) lands exactly on a 1m step
+        // multiple, so the left-open rule (issue #190) excludes it: the
+        // grid starts at -120s, not -180s, one point short of the
+        // pre-fix grid. The sample sits at -180s, still within lookback of
+        // every remaining grid point exercised below, in both the offset
+        // and the `@` case.
         let source = TestSource::new()
             .with_series(&[("__name__", "up")], &[(-180_000_000_000, 1.0)])
             .expect("valid series");
@@ -1762,7 +1888,7 @@ mod tests {
         };
         let (_, samples) = &matrix[0];
         let timestamps_ms: Vec<i64> = samples.iter().map(|s| s.ts_ns / NS_PER_MS).collect();
-        assert_eq!(timestamps_ms, vec![-180_000, -120_000, -60_000]);
+        assert_eq!(timestamps_ms, vec![-120_000, -60_000]);
 
         // `@ 0` pins the grid's end to t=0 regardless of the query's own
         // evaluation timestamp.
@@ -1885,6 +2011,71 @@ mod tests {
             .instant(&source, r#"rate({job="a"}[10m:1m])"#, 0)
             .expect_err("a mixed subquery must be rejected");
         expect_unsupported(err, r#"rate({job="a"}[10m:1m])"#);
+    }
+
+    #[test]
+    fn subquery_grid_excludes_a_boundary_point_exactly_at_end_minus_range() {
+        // Regression test for issue #190: the subquery grid's start must be
+        // left-open (`> end - range`), matching this crate's own
+        // matrix-selector windows, not closed (`>= end - range`).
+        //
+        // Samples every 30s from 0 to 120s. `count_over_time(x[2m:1m])`
+        // evaluated at t=120s (a step-aligned instant): range=2m, so
+        // target = end - range = 120s - 120s = 0s, which is itself a
+        // multiple of the 1m step. Before the fix, the closed rule admitted
+        // 0s into the grid (points 0, 60, 120 -> count 3); the corrected
+        // left-open rule excludes it (points 60, 120 -> count 2), one fewer
+        // point than before the fix.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "x")],
+                &[
+                    (0, 1.0),
+                    (30_000_000_000, 1.0),
+                    (60_000_000_000, 1.0),
+                    (90_000_000_000, 1.0),
+                    (120_000_000_000, 1.0),
+                ],
+            )
+            .expect("valid series");
+        let result = Evaluator::new()
+            .instant(&source, "count_over_time(x[2m:1m])", 120_000)
+            .expect("subquery evaluates");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 2.0);
+    }
+
+    #[test]
+    fn subquery_grid_is_unchanged_when_the_boundary_is_not_step_aligned() {
+        // Regression guard: when `end - range` does NOT land on a step
+        // multiple, the left-open fix (issue #190) must not change the
+        // grid at all, since `align_up_to_step` already rounded strictly
+        // past a non-aligned target before and after the fix.
+        //
+        // Same series as above, but evaluated at t=135s: range=2m (120s)
+        // gives target = 135s - 120s = 15s, which is not a multiple of the
+        // 1m step. The smallest 1m-multiple strictly greater than 15s is
+        // 60s, exactly what the pre-fix `>=` rule would also have produced
+        // (60s was already `> 15s`, so old and new rule agree here).
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "x")],
+                &[
+                    (0, 1.0),
+                    (30_000_000_000, 1.0),
+                    (60_000_000_000, 1.0),
+                    (90_000_000_000, 1.0),
+                    (120_000_000_000, 1.0),
+                ],
+            )
+            .expect("valid series");
+        let result = Evaluator::new()
+            .instant(&source, "count_over_time(x[2m:1m])", 135_000)
+            .expect("subquery evaluates");
+        assert_eq!(result.len(), 1);
+        // Grid: 60s, 120s (start_ns=60s from align_up_to_step(15s, 60s),
+        // end_ns=135s) -> 2 points, both find a sample.
+        assert_eq!(result[0].value, 2.0);
     }
 
     #[test]
@@ -2080,6 +2271,8 @@ mod tests {
         let ctx = QueryWindow {
             start_ns: sel_ts_ns,
             end_ns: sel_ts_ns,
+            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
+            deadline: None,
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
@@ -2111,6 +2304,8 @@ mod tests {
         let ctx = QueryWindow {
             start_ns: sel_ts_ns,
             end_ns: sel_ts_ns,
+            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
+            deadline: None,
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
@@ -2290,13 +2485,17 @@ mod tests {
 
     #[test]
     fn over_wide_nested_subquery_is_rejected_without_large_allocation() {
-        // Outer subquery: 61 points (1m at 1s step), each step evaluating
+        // Outer subquery: ~60 points (1m at 1s step), each step evaluating
         // `max_over_time(up[10d:1s])`. The inner subquery alone asks for
-        // 10 days at a 1s step: 864_001 points, far over the default
-        // 11_000 cap. The very first outer step must already trip the
-        // inner cap check before building the inner grid or touching
-        // storage, so this test terminates immediately rather than
-        // attempting an 864_001-entry allocation (repeated 61 times).
+        // 10 days at a 1s step. Every outer grid step lands on a whole
+        // second, so the inner target (`t - 10d`) is always an exact
+        // multiple of the inner 1s step; the left-open rule (issue #190)
+        // excludes that boundary point, giving 864_000 points, not
+        // 864_001, still far over the default 11_000 cap. The very first
+        // outer step must already trip the inner cap check before building
+        // the inner grid or touching storage, so this test terminates
+        // immediately rather than attempting an 864_000-entry allocation
+        // (repeated across outer steps).
         let source = one_series_source();
         let err = Evaluator::new()
             .instant(&source, "max_over_time(up[10d:1s])[1m:1s]", 0)
@@ -2304,12 +2503,106 @@ mod tests {
         let Error::TooManyPoints { points, max } = err else {
             panic!("expected TooManyPoints, got {err:?}");
         };
-        assert_eq!(points, 864_001);
+        assert_eq!(points, 864_000);
         assert_eq!(max, DEFAULT_MAX_RANGE_POINTS);
         assert_eq!(
             source.query_count(),
             0,
             "rejection must happen before any grid step reaches storage"
+        );
+    }
+
+    #[test]
+    fn default_shared_eval_budget_has_the_documented_value() {
+        assert_eq!(DEFAULT_MAX_TOTAL_EVAL_POINTS, 1_000_000);
+        assert_eq!(
+            Evaluator::new().max_total_eval_points(),
+            DEFAULT_MAX_TOTAL_EVAL_POINTS
+        );
+    }
+
+    #[test]
+    fn repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget() {
+        // A range query over `max_over_time(up[5m:1m])` re-evaluates the
+        // inner `up[5m:1m]` subquery from scratch at every one of its 6
+        // outer grid steps (issue #193): each step's own inner grid is only
+        // 5 points (one `source.query` call apiece, since the inner
+        // expression is the bare selector `up`), far under any per-node
+        // `max_range_points` cap, so `TooManyPoints` never fires no matter
+        // how many outer steps run. Left uncapped, the full query would
+        // touch 6 * 5 = 30 evaluation points and issue 30 storage queries.
+        // The shared cross-level budget must still catch the multiplied
+        // cost: with a budget of 10, exactly the first two outer steps'
+        // worth of points (10) are charged before the third step's charge
+        // (which would bring the running total to 15) is rejected.
+        let source = one_series_source();
+        let err = Evaluator::new()
+            .with_max_total_eval_points(10)
+            .range(
+                &source,
+                "max_over_time(up[5m:1m])",
+                minutes(5),
+                minutes(10),
+                minutes(1),
+            )
+            .expect_err("shared cross-level budget must be exhausted");
+        let Error::EvalBudgetExhausted { touched, max } = err else {
+            panic!("expected EvalBudgetExhausted, got {err:?}");
+        };
+        assert_eq!(max, 10);
+        assert_eq!(touched, 15);
+        assert_eq!(
+            source.query_count(),
+            10,
+            "only the first two outer steps' worth of points may reach storage \
+             before the shared budget rejects the third"
+        );
+        assert!(
+            source.query_count() < 30,
+            "rejection must happen well before the outer grid's full 30-point \
+             cost (6 outer steps * 5 inner points each) is reached; got {} \
+             storage queries",
+            source.query_count()
+        );
+    }
+
+    #[test]
+    fn short_deadline_cancels_a_long_running_nested_subquery_evaluation() {
+        // `max_over_time(up[1000s:1s])` over a 1000-step outer range (1000
+        // points, 1s step) re-evaluates its ~1000-point inner subquery from
+        // scratch at every outer step (issue #193): ~1,000,000 total
+        // evaluation points, comfortably under both the per-node
+        // `max_range_points` cap and the shared `max_total_eval_points`
+        // budget, so without a deadline this runs to completion -- measured
+        // separately at just over 1.5s in this same debug build. With a
+        // 20ms deadline, the evaluator's own `check_deadline` (fired inside
+        // the per-outer-step subquery re-evaluation loop, once per inner
+        // grid point too) must notice and stop well before that, not after
+        // running the full ~1,000,000-point computation and only then
+        // reporting a timeout: the assertion on `elapsed` is what tells the
+        // two apart, since a bug that dropped every `check_deadline` call
+        // would still return `DeadlineExceeded` eventually (via a future
+        // outer wrapper) but only after the full ~1.5s of work.
+        let source = one_series_source();
+        let deadline = Instant::now() + std::time::Duration::from_millis(20);
+        let start = Instant::now();
+        let err = Evaluator::new()
+            .with_deadline(deadline)
+            .range(
+                &source,
+                "max_over_time(up[1000s:1s])",
+                1_000_000,
+                1_000_000 + 999_000,
+                1_000,
+            )
+            .expect_err("a deadline in the past relative to the workload must fire");
+        let elapsed = start.elapsed();
+        assert!(matches!(err, Error::DeadlineExceeded));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "evaluation must be cancelled soon after the 20ms deadline, not \
+             after running the full ~1,000,000-point computation (which \
+             takes over 1.5s in this same debug build); took {elapsed:?}"
         );
     }
 

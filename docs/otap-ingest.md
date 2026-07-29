@@ -70,6 +70,31 @@ Safety (spec §19 applies in full):
 - A malformed batch nacks that `batch_id`; it never tears down the whole
   stream unless the stream state itself is corrupt.
 
+## Id column transport encodings
+
+otap-spec.md section 6.4 lets `id`/`parent_id` columns ride the wire DELTA-
+or QUASI-DELTA-encoded instead of as literal values, declared via an
+`encoding` Arrow field-metadata key (absent metadata means DELTA, the
+spec's default). The normalizer (`ravel-otap::normalize`) decodes:
+
+- `UNIVARIATE_METRICS.id` (section 5.3.1) and `id`/`parent_id` on
+  `NUMBER_DATA_POINTS`, `HISTOGRAM_DATA_POINTS`, and `SUMMARY_DATA_POINTS`
+  (sections 5.3.2-5.3.4): DELTA, applied whenever declared or when the
+  `encoding` metadata is absent; PLAIN only when explicitly declared. A
+  declared encoding that is neither `plain` nor `delta` is a typed
+  rejection, not a guess.
+
+Not yet decoded, read as literal PLAIN values regardless of declaration:
+
+- `parent_id` on the `*Attrs` tables (`RESOURCE_ATTRS`, `SCOPE_ATTRS`,
+  `NUMBER_DP_ATTRS`, `HISTOGRAM_DP_ATTRS`, `SUMMARY_DP_ATTRS`) and on
+  `HISTOGRAM_DP_EXEMPLARS`, whose spec default is QUASI-DELTA (section
+  6.4.3), not DELTA. A batch that relies on the QUASI-DELTA default for
+  these columns will normalize incorrectly today; tracked as a follow-up
+  to the DELTA work above.
+- `EXP_HISTOGRAM_DATA_POINTS` is unaffected either way: the normalizer
+  already rejects that table outright as unsupported.
+
 ## Phasing
 
 1. Spike (fleet task): vendor protos at a pinned otel-arrow release; build
