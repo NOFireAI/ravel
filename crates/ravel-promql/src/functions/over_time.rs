@@ -297,27 +297,14 @@ pub(crate) fn absent_over_time_range(
 /// Derive `absent_over_time`'s synthesized label set for a matrix-typed
 /// argument ([`matrix_arg`](super::matrix_arg)'s result): a matrix selector
 /// derives it from its own selector's equality matchers, exactly Prometheus'
-/// `createLabelsForAbsentFunction` ([`absent_labels`]). A subquery has no
-/// selector of its own; when its inner expression is itself a bare vector
-/// selector (after unwrapping `Paren`), that selector's matchers are used
-/// the same way; any other inner expression (a call, a binary expression,
-/// ...) has no single selector to derive from, so no labels are synthesized
-/// (an empty set), the same fallback Prometheus applies to any
-/// argument shape it cannot derive matchers from.
+/// `createLabelsForAbsentFunction` ([`absent_labels`]). Prometheus'
+/// `createLabelsForAbsentFunction` has no subquery arm at all; a subquery
+/// argument falls through to its default, an empty label set, regardless of
+/// what the subquery's inner expression looks like.
 pub(crate) fn matrix_arg_absent_labels(arg: MatrixArg) -> LabelSet {
-    use promql_parser::parser::Expr;
     match arg {
         MatrixArg::Selector(ms) => absent_labels(&ms.vs),
-        MatrixArg::Subquery(sq) => {
-            let mut cur = &*sq.expr;
-            loop {
-                match cur {
-                    Expr::Paren(p) => cur = &p.expr,
-                    Expr::VectorSelector(vs) => return absent_labels(vs),
-                    _ => return LabelSet::default(),
-                }
-            }
-        }
+        MatrixArg::Subquery(_) => LabelSet::default(),
     }
 }
 
@@ -636,5 +623,42 @@ mod tests {
         let vs = matchers_of(r#"up{job="api"}[5m]"#);
         let got = absent_labels(&vs);
         assert!(got.iter().all(|l| l.name != METRIC_NAME_LABEL));
+    }
+
+    #[test]
+    fn matrix_arg_absent_labels_is_always_empty_for_a_subquery() {
+        // Prometheus' `createLabelsForAbsentFunction` has no subquery arm at
+        // all, so any subquery argument (whatever its inner expression looks
+        // like) falls through to an empty label set, never the inner
+        // selector's matchers.
+        let sq = matchers_of_subquery(r#"nosuch{job="x"}[10m:1m]"#);
+        let got = matrix_arg_absent_labels(MatrixArg::Subquery(&sq));
+        assert_eq!(got.iter().count(), 0);
+    }
+
+    #[test]
+    fn absent_over_time_over_a_subquery_returns_empty_label_set_end_to_end() {
+        use crate::eval::Evaluator;
+        use crate::testsource::TestSource;
+
+        let source = TestSource::new();
+        let result = Evaluator::new()
+            .instant(&source, r#"absent_over_time(nosuch{job="x"}[10m:1m])"#, 0)
+            .expect("evaluates");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].labels.iter().count(),
+            0,
+            "absent_over_time over a subquery must not synthesize labels from \
+             the inner selector's matchers"
+        );
+    }
+
+    fn matchers_of_subquery(query: &str) -> promql_parser::parser::SubqueryExpr {
+        let expr = promql_parser::parser::parse(query).expect("valid query");
+        match expr {
+            promql_parser::parser::Expr::Subquery(sq) => sq,
+            other => panic!("expected a subquery, got {other:?}"),
+        }
     }
 }
