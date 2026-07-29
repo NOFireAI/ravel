@@ -7,10 +7,12 @@
 //! the standard Prometheus mapping; see ADR-0005 note.
 
 pub mod limits;
+pub mod logs_limits;
 pub mod normalize;
 pub mod promcompat;
 
 pub use limits::{IngestLimits, Rejection};
+pub use logs_limits::{LogIngestLimits, LogRejection};
 pub use normalize::{
     NormalizeOutput, NormalizedHistogramPoint, NormalizedPoint, normalize_metrics,
 };
