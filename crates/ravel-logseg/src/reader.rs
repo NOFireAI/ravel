@@ -395,10 +395,16 @@ impl<'a> RlogReader<'a> {
     fn rebuild_record(&self, block: &DecodedBlock, row: usize) -> Result<LogRecord, LogSegError> {
         let sref = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
             .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-        let stream_id = *self
+        // The STREAM_DIR entry carries both the stream id and the canonical
+        // resource+scope blob it was derived from, so a rebuilt record is a
+        // faithful round-trip of what the writer was handed.
+        let stream_entry = self
             .stream_dir
-            .stream_id(sref)
+            .entries()
+            .get(sref as usize)
             .ok_or_else(|| LogSegError::Corrupted("stream_ref out of range".into()))?;
+        let stream_id = stream_entry.stream_id;
+        let stream_attrs = stream_entry.blob.clone();
         let severity_text = str_at(block, COL_SEVERITY_TEXT, row)
             .map(string_from_bytes)
             .transpose()?
@@ -430,6 +436,7 @@ impl<'a> RlogReader<'a> {
 
         Ok(LogRecord {
             stream_id,
+            stream_attrs,
             ts_ns: i64_at(block, COL_TS, row)?,
             observed_ts_ns: i64_at(block, COL_OBSERVED_TS, row)?,
             severity_num: i64_at(block, COL_SEVERITY_NUM, row)? as u8,
@@ -754,6 +761,15 @@ mod tests {
     fn rec(stream: u8, ts: i64, body: &str) -> LogRecord {
         LogRecord {
             stream_id: sid(stream),
+            stream_attrs: crate::record::stream_attrs_bytes(
+                &[(
+                    "service.name".into(),
+                    AttrValue::Str(format!("svc{stream}")),
+                )],
+                "scope",
+                "1",
+                &[],
+            ),
             ts_ns: ts,
             observed_ts_ns: ts,
             severity_num: 9,
