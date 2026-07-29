@@ -82,18 +82,25 @@ spec's default). The normalizer (`ravel-otap::normalize`) decodes:
   (sections 5.3.2-5.3.4): DELTA, applied whenever declared or when the
   `encoding` metadata is absent; PLAIN only when explicitly declared. A
   declared encoding that is neither `plain` nor `delta` is a typed
-  rejection, not a guess.
-
-Not yet decoded, read as literal PLAIN values regardless of declaration:
-
+  rejection, not a guess. `quasidelta` is one such rejection on this core
+  chain: it is a valid encoding only on the `*Attrs`/`*DpExemplars` columns
+  below, never here.
 - `parent_id` on the `*Attrs` tables (`RESOURCE_ATTRS`, `SCOPE_ATTRS`,
   `NUMBER_DP_ATTRS`, `HISTOGRAM_DP_ATTRS`, `SUMMARY_DP_ATTRS`) and on
-  `HISTOGRAM_DP_EXEMPLARS`, whose spec default is QUASI-DELTA (section
-  6.4.3), not DELTA. A batch that relies on the QUASI-DELTA default for
-  these columns will normalize incorrectly today; tracked as a follow-up
-  to the DELTA work above.
-- `EXP_HISTOGRAM_DATA_POINTS` is unaffected either way: the normalizer
-  already rejects that table outright as unsupported.
+  `HISTOGRAM_DP_EXEMPLARS`: QUASI-DELTA (section 6.4.3), applied whenever
+  declared or when the `encoding` metadata is absent, since QUASI-DELTA is
+  the spec default for these columns; PLAIN or DELTA only when explicitly
+  declared. The equality columns that gate each run's delta-vs-absolute
+  choice are the spec's: `type`, `key`, and the type's Active Field value
+  for the `*Attrs` tables (Map/Slice types and null values are never delta,
+  per section 6.4.3), and `int_value`/`double_value` for
+  `*DpExemplars`. An unrecognized declaration is the same typed rejection
+  as on the core chain, not a guess.
+
+Not decoded:
+
+- `EXP_HISTOGRAM_DATA_POINTS` is unaffected by any of the above: the
+  normalizer already rejects that table outright as unsupported.
 
 ## Phasing
 

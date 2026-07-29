@@ -118,36 +118,60 @@ const UNKNOWN_OTAP_METRIC_TYPE: &str = "unknown_otap_metric_type";
 /// bespoke "malformed batch" variant (see the crate report for that gap).
 const MALFORMED_NUMBER_DATA_POINTS_BATCH: &str = "malformed_number_data_points_batch";
 
-/// otap-spec.md section 6.4: the two `id`/`parent_id` transport encodings
-/// this pass decodes. Quasi-delta (`*Attrs.parent_id`, `*DpExemplars.parent_id`)
-/// is not decoded yet -- those columns are still read as literal values (see
-/// docs/otap-ingest.md).
+/// otap-spec.md section 6.4: the three `id`/`parent_id` transport encodings
+/// this pass understands. `Delta` is the default and only non-`Plain`
+/// encoding allowed on the core metric/data-point id chain (section 6.4.2);
+/// `QuasiDelta` (section 6.4.3) is the default for the `*Attrs.parent_id` and
+/// `*DpExemplars.parent_id` columns and is decoded only there (a `quasidelta`
+/// declaration on the core chain stays a typed rejection, see [`id_encoding`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IdEncoding {
     Plain,
     Delta,
+    QuasiDelta,
 }
 
 /// Tag for a whole batch whose `id`/`parent_id` field metadata declares an
-/// `encoding` value this pass does not recognize as a valid encoding for
-/// that column (anything other than `"plain"`/`"delta"`, including
-/// `"quasidelta"` on a column this pass does not decode as quasi-delta).
-/// Rejected outright via the same counted mechanism as
+/// `encoding` value this pass does not recognize as valid for that column:
+/// anything other than `"plain"`/`"delta"` on the core id chain (including
+/// `"quasidelta"`, which is valid only on the `*Attrs`/`*DpExemplars`
+/// columns), or anything other than `"plain"`/`"delta"`/`"quasidelta"` on
+/// those columns. Rejected outright via the same counted mechanism as
 /// [`MALFORMED_NUMBER_DATA_POINTS_BATCH`], never guessed.
 const UNRECOGNIZED_ID_ENCODING: &str = "unrecognized_id_encoding";
 
-/// Resolve the declared encoding of an `id`/`parent_id` column from its
-/// Arrow field metadata (otap-spec.md section 6.4: key `"encoding"`, values
-/// `"plain"`, `"delta"`, `"quasidelta"`). No declaration defaults to
-/// [`IdEncoding::Delta`], the spec's stated default for these columns. `Err`
-/// means the column is missing (caller already checked for this) or the
-/// declaration is something this call site does not recognize.
+/// Resolve the declared encoding of a core `id`/`parent_id` column (the
+/// metric/data-point chain #205 handles) from its Arrow field metadata
+/// (otap-spec.md section 6.4: key `"encoding"`). No declaration defaults to
+/// [`IdEncoding::Delta`], the spec's stated default for these columns
+/// (sections 5.3.1-5.3.4). Only `"plain"` and `"delta"` are valid here:
+/// `"quasidelta"` is a valid encoding for the `*Attrs`/`*DpExemplars`
+/// columns (see [`quasi_delta_default_encoding`]), never for this chain, so
+/// it maps to `Err` and the caller rejects it rather than guessing. `Err`
+/// also means the column is missing (caller already checked for this).
 fn id_encoding(rb: &RecordBatch, column: &str) -> Result<IdEncoding, ()> {
     let field = rb.schema_ref().field_with_name(column).map_err(|_| ())?;
     match field.metadata().get("encoding").map(String::as_str) {
         None => Ok(IdEncoding::Delta),
         Some("plain") => Ok(IdEncoding::Plain),
         Some("delta") => Ok(IdEncoding::Delta),
+        Some(_) => Err(()),
+    }
+}
+
+/// Resolve the declared encoding of a `*Attrs.parent_id` or
+/// `*DpExemplars.parent_id` column, whose spec default is QUASI-DELTA
+/// (otap-spec.md section 6.4.3), unlike the DELTA default [`id_encoding`]
+/// applies to the core id chain. Accepts `"plain"`, `"delta"`, and
+/// `"quasidelta"`; anything else is `Err` (rejected, never guessed). `Err`
+/// also means the column is missing (caller already checked for this).
+fn quasi_delta_default_encoding(rb: &RecordBatch, column: &str) -> Result<IdEncoding, ()> {
+    let field = rb.schema_ref().field_with_name(column).map_err(|_| ())?;
+    match field.metadata().get("encoding").map(String::as_str) {
+        None => Ok(IdEncoding::QuasiDelta),
+        Some("plain") => Ok(IdEncoding::Plain),
+        Some("delta") => Ok(IdEncoding::Delta),
+        Some("quasidelta") => Ok(IdEncoding::QuasiDelta),
         Some(_) => Err(()),
     }
 }
@@ -194,7 +218,10 @@ fn decode_id_column_u32(
     match id_encoding(rb, column) {
         Ok(IdEncoding::Plain) => Some(values.values().to_vec()),
         Ok(IdEncoding::Delta) => Some(decode_delta_u32(values)),
-        Err(()) => {
+        // `id_encoding` never yields `QuasiDelta` for the core chain (it maps
+        // a `quasidelta` declaration to `Err`); this arm keeps the match
+        // exhaustive and rejects it explicitly, never guessing an encoding.
+        Ok(IdEncoding::QuasiDelta) | Err(()) => {
             rejected.push(Rejection::UnsupportedMetricType {
                 metric_type: UNRECOGNIZED_ID_ENCODING,
                 count: rb.num_rows(),
@@ -214,6 +241,139 @@ fn decode_id_column_u16(
     match id_encoding(rb, column) {
         Ok(IdEncoding::Plain) => Some(values.values().to_vec()),
         Ok(IdEncoding::Delta) => Some(decode_delta_u16(values)),
+        // See [`decode_id_column_u32`]: `QuasiDelta` is unreachable here but
+        // kept exhaustive and rejected, never guessed.
+        Ok(IdEncoding::QuasiDelta) | Err(()) => {
+            rejected.push(Rejection::UnsupportedMetricType {
+                metric_type: UNRECOGNIZED_ID_ENCODING,
+                count: rb.num_rows(),
+            });
+            None
+        }
+    }
+}
+
+/// Equality-column value for one `*Attrs` row: the Active Field value
+/// selected by the row's `type` discriminant (otap-spec.md section 5.5.1).
+/// Doubles compare by bit pattern, matching this crate's float-in-dedup-paths
+/// convention. Only scalar-valued types produce a variant; empty/complex
+/// types (which have no populated scalar column here) make the row ineligible
+/// for delta encoding entirely (see [`decode_quasi_delta_attrs`]).
+#[derive(Clone, Copy, PartialEq)]
+enum AttrEqValue<'b> {
+    Str(&'b str),
+    Bool(bool),
+    Int(i64),
+    Double(u64),
+}
+
+/// Decode a QUASI-DELTA `*Attrs.parent_id` column (otap-spec.md section
+/// 6.4.3): each row's `parent_id` is a delta from the previous row when that
+/// row's equality columns -- `type`, `key`, and the type's Active Field value
+/// -- all match, and an absolute value otherwise. Rows whose type has no
+/// scalar Active Field (empty, and the complex Bytes/Array/Map arms this
+/// crate reads no value column for) or whose active value is null are never
+/// delta-encoded and always read absolute, matching the spec's "Map and Slice
+/// ... and null values" exceptions. The running sum wraps rather than panics
+/// on adversarial input, matching [`decode_delta_u32`]; a null `parent_id`
+/// carries the accumulator through unchanged, as delta decoding does.
+fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32> {
+    let types = column_as::<UInt8Array>(rb, "type");
+    let keys = column_as::<StringArray>(rb, "key");
+    let strs = column_as::<StringArray>(rb, "str");
+    let bools = column_as::<BooleanArray>(rb, "bool");
+    let ints = column_as::<Int64Array>(rb, "int");
+    let doubles = column_as::<Float64Array>(rb, "double");
+
+    // The row's (type, key, Active Field value), or `None` when the row is
+    // ineligible for delta encoding (missing key/type column, null key, a
+    // non-scalar type, or a null active value).
+    let eq_key = |i: usize| -> Option<(u8, &str, AttrEqValue)> {
+        let types = types?;
+        let keys = keys?;
+        if keys.is_null(i) {
+            return None;
+        }
+        let ty = types.value(i);
+        let value = match ty {
+            ANY_VALUE_TYPE_STRING => AttrEqValue::Str(opt_str(strs, i)?),
+            ANY_VALUE_TYPE_BOOL => AttrEqValue::Bool(opt_bool(bools, i)?),
+            ANY_VALUE_TYPE_INT => AttrEqValue::Int(opt_i64(ints, i)?),
+            ANY_VALUE_TYPE_DOUBLE => AttrEqValue::Double(opt_f64(doubles, i)?.to_bits()),
+            _ => return None,
+        };
+        Some((ty, keys.value(i), value))
+    };
+
+    let mut acc: u32 = 0;
+    let mut prev: Option<(u8, &str, AttrEqValue)> = None;
+    let mut out = Vec::with_capacity(encoded.len());
+    for i in 0..encoded.len() {
+        let key = eq_key(i);
+        if encoded.is_null(i) {
+            out.push(acc);
+            prev = key;
+            continue;
+        }
+        match (prev, key) {
+            (Some(p), Some(k)) if p == k => acc = acc.wrapping_add(encoded.value(i)),
+            _ => acc = encoded.value(i),
+        }
+        out.push(acc);
+        prev = key;
+    }
+    out
+}
+
+/// Decode a QUASI-DELTA `*DpExemplars.parent_id` column (otap-spec.md section
+/// 6.4.3): the equality columns for exemplar tables are `int_value` and
+/// `double_value`, so a row's `parent_id` is a delta from the previous row
+/// when both of those match the previous row, and absolute otherwise. Doubles
+/// compare by bit pattern; a missing equality column reads as absent for
+/// every row (all rows then share one equality key), matching the spec's
+/// "if the column ... is not present, the value ... is empty" rule. Wraps
+/// rather than panics, and carries a null `parent_id` through unchanged, like
+/// [`decode_quasi_delta_attrs`].
+fn decode_quasi_delta_exemplars(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32> {
+    let ints = column_as::<Int64Array>(rb, "int_value");
+    let doubles = column_as::<Float64Array>(rb, "double_value");
+
+    let mut acc: u32 = 0;
+    let mut prev: Option<(Option<i64>, Option<u64>)> = None;
+    let mut out = Vec::with_capacity(encoded.len());
+    for i in 0..encoded.len() {
+        let key = (opt_i64(ints, i), opt_f64(doubles, i).map(f64::to_bits));
+        if encoded.is_null(i) {
+            out.push(acc);
+            prev = Some(key);
+            continue;
+        }
+        match prev {
+            Some(p) if p == key => acc = acc.wrapping_add(encoded.value(i)),
+            _ => acc = encoded.value(i),
+        }
+        out.push(acc);
+        prev = Some(key);
+    }
+    out
+}
+
+/// Resolve a `*Attrs`/`*DpExemplars` `parent_id` column's encoding (default
+/// QUASI-DELTA) and decode it into absolute values. `quasi` decodes the
+/// QUASI-DELTA case with that table's equality columns
+/// ([`decode_quasi_delta_attrs`] or [`decode_quasi_delta_exemplars`]). Pushes
+/// [`UNRECOGNIZED_ID_ENCODING`] (tagged with `rb`'s row count) and returns
+/// `None` if the declaration is not recognized, never guessing.
+fn decode_quasi_delta_column(
+    rb: &RecordBatch,
+    encoded: &UInt32Array,
+    rejected: &mut Vec<Rejection>,
+    quasi: impl Fn(&RecordBatch, &UInt32Array) -> Vec<u32>,
+) -> Option<Vec<u32>> {
+    match quasi_delta_default_encoding(rb, "parent_id") {
+        Ok(IdEncoding::Plain) => Some(encoded.values().to_vec()),
+        Ok(IdEncoding::Delta) => Some(decode_delta_u32(encoded)),
+        Ok(IdEncoding::QuasiDelta) => Some(quasi(rb, encoded)),
         Err(()) => {
             rejected.push(Rejection::UnsupportedMetricType {
                 metric_type: UNRECOGNIZED_ID_ENCODING,
@@ -271,12 +431,12 @@ pub fn normalize_decoded(
         payloads_of(batch, ArrowPayloadType::SummaryDpAttrs);
 
     let flat_dp = flatten_dp(&dp_batches, &mut rejected);
-    let flat_attrs = flatten_attrs(&attr_batches);
+    let flat_attrs = flatten_attrs(&attr_batches, &mut rejected);
     let flat_hist_dp = flatten_histogram_dp(&hist_dp_batches, &mut rejected);
-    let flat_hist_attrs = flatten_attrs(&hist_attr_batches);
-    let hist_exemplar_counts = count_by_parent_id(&hist_exemplar_batches);
+    let flat_hist_attrs = flatten_attrs(&hist_attr_batches, &mut rejected);
+    let hist_exemplar_counts = count_by_parent_id(&hist_exemplar_batches, &mut rejected);
     let flat_summary_dp = flatten_summary_dp(&summary_dp_batches, &mut rejected);
-    let flat_summary_attrs = flatten_attrs(&summary_attr_batches);
+    let flat_summary_attrs = flatten_attrs(&summary_attr_batches, &mut rejected);
 
     let root_ids = decode_root_ids(&root_batches, &mut rejected);
     let dense_size = dense_size_for(
@@ -808,7 +968,10 @@ fn flatten_dp(dp_batches: &[&RecordBatch], rejected: &mut Vec<Rejection>) -> Vec
     out
 }
 
-fn flatten_attrs<'b>(attr_batches: &[&'b RecordBatch]) -> Vec<FlatAttr<'b>> {
+fn flatten_attrs<'b>(
+    attr_batches: &[&'b RecordBatch],
+    rejected: &mut Vec<Rejection>,
+) -> Vec<FlatAttr<'b>> {
     let mut out = Vec::new();
     for rb in attr_batches {
         let Some(parents) = column_as::<UInt32Array>(rb, "parent_id") else {
@@ -824,9 +987,17 @@ fn flatten_attrs<'b>(attr_batches: &[&'b RecordBatch]) -> Vec<FlatAttr<'b>> {
         let bools = column_as::<BooleanArray>(rb, "bool");
         let ints = column_as::<Int64Array>(rb, "int");
         let doubles = column_as::<Float64Array>(rb, "double");
-        for i in 0..rb.num_rows() {
+        // otap-spec.md section 6.4.3: `*Attrs.parent_id` defaults to
+        // QUASI-DELTA (equality columns `type`, `key`, and the type's Active
+        // Field value), not the DELTA default of the core id chain.
+        let Some(decoded_parents) =
+            decode_quasi_delta_column(rb, parents, rejected, decode_quasi_delta_attrs)
+        else {
+            continue;
+        };
+        for (i, &parent_id) in decoded_parents.iter().enumerate() {
             out.push(FlatAttr {
-                parent_id: parents.value(i),
+                parent_id,
                 key: keys.value(i),
                 ty: types.value(i),
                 str_val: opt_str(strs, i),
@@ -1320,14 +1491,24 @@ fn flatten_summary_dp(
 /// exemplar count per histogram data-point id (OTAP carries exemplars in
 /// their own table joined by `parent_id`; OTLP embeds them inline on the
 /// data point as `dp.exemplars`).
-fn count_by_parent_id(batches: &[&RecordBatch]) -> HashMap<u32, usize> {
+fn count_by_parent_id(
+    batches: &[&RecordBatch],
+    rejected: &mut Vec<Rejection>,
+) -> HashMap<u32, usize> {
     let mut counts = HashMap::new();
     for rb in batches {
         let Some(parents) = column_as::<UInt32Array>(rb, "parent_id") else {
             continue;
         };
-        for i in 0..rb.num_rows() {
-            *counts.entry(parents.value(i)).or_insert(0) += 1;
+        // otap-spec.md section 6.4.3: `*DpExemplars.parent_id` defaults to
+        // QUASI-DELTA with `int_value`/`double_value` as its equality columns.
+        let Some(decoded) =
+            decode_quasi_delta_column(rb, parents, rejected, decode_quasi_delta_exemplars)
+        else {
+            continue;
+        };
+        for &pid in &decoded {
+            *counts.entry(pid).or_insert(0) += 1;
         }
     }
     counts

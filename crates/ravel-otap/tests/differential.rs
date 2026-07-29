@@ -13,9 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{
-    Float64Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray, UInt8Array,
-    UInt16Array, UInt32Array,
+    BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
@@ -35,7 +36,7 @@ use ravel_otap::encode::{
 use ravel_otap::normalize::{
     AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA,
     AGGREGATION_TEMPORALITY_UNSPECIFIED, ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE,
-    normalize_decoded,
+    METRIC_TYPE_HISTOGRAM, normalize_decoded,
 };
 use ravel_otap::proto::experimental::arrow::v1::{ArrowPayloadType, BatchArrowRecords};
 use ravel_otap::stream::{DecodedBatch, StreamConfig, StreamState};
@@ -1561,9 +1562,13 @@ fn number_dp_batch(
 }
 
 /// A `NUMBER_DP_ATTRS` batch with one string attribute per row. `parent_ids`
-/// must be the *decoded* `NUMBER_DATA_POINTS.id` values: this table's own
-/// `parent_id` column is quasi-delta per the spec but is not decoded by this
-/// change (see docs/otap-ingest.md) and is always read as a literal value.
+/// must be the *decoded* `NUMBER_DATA_POINTS.id` values. This batch declares
+/// no `encoding` on its `parent_id` column, so it takes the QUASI-DELTA
+/// default (otap-spec.md section 6.4.3, decoded since #226); because the two
+/// rows carry different `str` values they never match as equality columns and
+/// each decodes to its own absolute value, so the literal `parent_ids` here
+/// are exactly what QUASI-DELTA yields. See the dedicated QUASI-DELTA tests
+/// below for a run of matching rows that actually accumulates.
 fn number_dp_attrs_batch(parent_ids: [u32; 2], values: [&str; 2]) -> RecordBatch {
     let schema = Schema::new(vec![
         Field::new("parent_id", DataType::UInt32, false),
@@ -1754,5 +1759,349 @@ fn number_data_points_unrecognized_id_encoding_declaration_is_rejected() {
             metric_type: "unrecognized_id_encoding",
             count: 2,
         }]
+    );
+}
+
+// --- Issue #226: QUASI-DELTA-decode the `parent_id` column of the `*Attrs`
+// and `*DpExemplars` tables (otap-spec.md section 6.4.3), the gap #205 left
+// open. These, like the #205 tests above, hand-build every payload
+// `RecordBatch` so the encoded column and the decoded value can differ, the
+// only way to observe that decoding actually happened. ---
+
+/// A single-metric `UNIVARIATE_METRICS` batch (`id` plain) for one gauge.
+fn single_gauge_root(name: &str) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("id", DataType::UInt16, Some("plain")),
+        Field::new("metric_type", DataType::UInt8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt16Array::from(vec![0u16])),
+            Arc::new(UInt8Array::from(vec![METRIC_TYPE_GAUGE])),
+            Arc::new(StringArray::from(vec![name])),
+        ],
+    )
+    .expect("build single gauge root batch")
+}
+
+/// A single-metric `UNIVARIATE_METRICS` batch (`id` plain) for one cumulative
+/// histogram.
+fn single_histogram_root(name: &str) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("id", DataType::UInt16, Some("plain")),
+        Field::new("metric_type", DataType::UInt8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("aggregation_temporality", DataType::Int32, true),
+        Field::new("is_monotonic", DataType::Boolean, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt16Array::from(vec![0u16])),
+            Arc::new(UInt8Array::from(vec![METRIC_TYPE_HISTOGRAM])),
+            Arc::new(StringArray::from(vec![name])),
+            Arc::new(Int32Array::from(vec![Some(
+                AGGREGATION_TEMPORALITY_CUMULATIVE,
+            )])),
+            Arc::new(BooleanArray::from(vec![None::<bool>])),
+        ],
+    )
+    .expect("build single histogram root batch")
+}
+
+/// A plain-encoded `NUMBER_DATA_POINTS` batch, all rows on one `parent`
+/// metric, with the given decoded `ids`.
+fn plain_number_dp_batch(ids: &[u32], parent: u16, values: &[f64], times: &[i64]) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("id", DataType::UInt32, Some("plain")),
+        id_field("parent_id", DataType::UInt16, Some("plain")),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("double_value", DataType::Float64, false),
+    ]);
+    let n = ids.len();
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(ids.to_vec())),
+            Arc::new(UInt16Array::from(vec![parent; n])),
+            Arc::new(TimestampNanosecondArray::from(times.to_vec())),
+            Arc::new(Float64Array::from(values.to_vec())),
+        ],
+    )
+    .expect("build plain number dp batch")
+}
+
+/// A `*Attrs` batch of string attributes whose `parent_id` column carries the
+/// still-encoded values; `encoding` controls its field-metadata declaration
+/// (absent = the QUASI-DELTA default). Equality columns for QUASI-DELTA are
+/// `type`, `key`, and (here always the `str`) Active Field.
+fn quasi_delta_str_attrs_batch(
+    encoded_parents: &[u32],
+    keys: &[&str],
+    strs: &[&str],
+    encoding: Option<&str>,
+) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("parent_id", DataType::UInt32, encoding),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("type", DataType::UInt8, false),
+        Field::new("str", DataType::Utf8, true),
+    ]);
+    let types: Vec<u8> = vec![ANY_VALUE_TYPE_STRING; keys.len()];
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(encoded_parents.to_vec())),
+            Arc::new(StringArray::from(keys.to_vec())),
+            Arc::new(UInt8Array::from(types)),
+            Arc::new(StringArray::from(
+                strs.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("build quasi-delta attrs batch")
+}
+
+fn u64_list(rows: &[&[u64]]) -> ListArray {
+    let item = Arc::new(Field::new("item", DataType::UInt64, true));
+    let offsets = OffsetBuffer::from_lengths(rows.iter().map(|r| r.len()));
+    let values: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+    ListArray::try_new(item, offsets, Arc::new(UInt64Array::from(values)), None)
+        .expect("build u64 list array")
+}
+
+fn f64_list(rows: &[&[f64]]) -> ListArray {
+    let item = Arc::new(Field::new("item", DataType::Float64, true));
+    let offsets = OffsetBuffer::from_lengths(rows.iter().map(|r| r.len()));
+    let values: Vec<f64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+    ListArray::try_new(item, offsets, Arc::new(Float64Array::from(values)), None)
+        .expect("build f64 list array")
+}
+
+/// A plain-encoded `HISTOGRAM_DATA_POINTS` batch, all rows on one `parent`
+/// metric, with a single bucket (`explicit_bounds` empty) per row so each
+/// point admits and its exemplar count is observable.
+fn histogram_dp_batch(ids: &[u32], parent: u16, counts: &[u64], times: &[i64]) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("id", DataType::UInt32, Some("plain")),
+        id_field("parent_id", DataType::UInt16, Some("plain")),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("count", DataType::UInt64, false),
+        Field::new(
+            "bucket_counts",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
+            true,
+        ),
+        Field::new(
+            "explicit_bounds",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ),
+    ]);
+    let n = ids.len();
+    let bucket_rows: Vec<&[u64]> = counts.iter().map(std::slice::from_ref).collect();
+    let empty: [f64; 0] = [];
+    let bound_rows: Vec<&[f64]> = vec![&empty[..]; n];
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(ids.to_vec())),
+            Arc::new(UInt16Array::from(vec![parent; n])),
+            Arc::new(TimestampNanosecondArray::from(times.to_vec())),
+            Arc::new(UInt64Array::from(counts.to_vec())),
+            Arc::new(u64_list(&bucket_rows)),
+            Arc::new(f64_list(&bound_rows)),
+        ],
+    )
+    .expect("build histogram dp batch")
+}
+
+/// A `*DpExemplars` batch whose `parent_id` column carries the still-encoded
+/// values; `encoding` controls its field-metadata declaration (absent = the
+/// QUASI-DELTA default). Equality columns for QUASI-DELTA are `int_value` and
+/// `double_value`; this helper populates only `double_value`.
+fn quasi_delta_exemplars_batch(
+    encoded_parents: &[u32],
+    doubles: &[Option<f64>],
+    encoding: Option<&str>,
+) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("parent_id", DataType::UInt32, encoding),
+        Field::new("int_value", DataType::Int64, true),
+        Field::new("double_value", DataType::Float64, true),
+    ]);
+    let n = encoded_parents.len();
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(encoded_parents.to_vec())),
+            Arc::new(Int64Array::from(vec![None::<i64>; n])),
+            Arc::new(Float64Array::from(doubles.to_vec())),
+        ],
+    )
+    .expect("build quasi-delta exemplars batch")
+}
+
+fn region_of(point: &ravel_otlp::NormalizedPoint) -> Option<String> {
+    point
+        .labels
+        .iter()
+        .find(|l| l.name == "region")
+        .map(|l| l.value.clone())
+}
+
+/// A `NUMBER_DP_ATTRS.parent_id` column defaults to QUASI-DELTA (otap-spec.md
+/// section 6.4.3). Encoded `[0, 1, 3, 1]` with a run of matching `region`
+/// values that breaks when the value changes decodes to `[0, 1, 3, 4]`: the
+/// first row is absolute, the second deltas onto it (`0 + 1`), the third
+/// resets to absolute because `str` changed (`us` -> `eu`), and the fourth
+/// deltas again (`3 + 1`). Read literally the column would be `[0, 1, 3, 1]`,
+/// which would give data point id 1 two `region` labels (a duplicate-label
+/// rejection) and strand data point id 4 without one.
+#[test]
+fn attrs_quasi_delta_parent_id_decodes_to_literal_values() {
+    let root = single_gauge_root("widgets");
+    let ids = [0u32, 1, 3, 4];
+    let values = [10.0, 20.0, 30.0, 40.0];
+    let times = [
+        INGEST_TS_NS,
+        INGEST_TS_NS + 1,
+        INGEST_TS_NS + 2,
+        INGEST_TS_NS + 3,
+    ];
+    let dp = plain_number_dp_batch(&ids, 0, &values, &times);
+    let attrs = quasi_delta_str_attrs_batch(
+        &[0, 1, 3, 1],
+        &["region", "region", "region", "region"],
+        &["us", "us", "eu", "eu"],
+        Some("quasidelta"),
+    );
+
+    let out = decode_custom_batch(vec![
+        (ArrowPayloadType::UnivariateMetrics, root),
+        (ArrowPayloadType::NumberDataPoints, dp),
+        (ArrowPayloadType::NumberDpAttrs, attrs),
+    ]);
+    assert_eq!(
+        out.rejected,
+        Vec::new(),
+        "unexpected rejections: {:?}",
+        out.rejected
+    );
+    assert_eq!(out.points.len(), 4);
+
+    let mut by_value: BTreeMap<u64, Option<String>> = BTreeMap::new();
+    for p in &out.points {
+        by_value.insert(p.sample.value.to_bits(), region_of(p));
+    }
+    assert_eq!(by_value[&10.0f64.to_bits()].as_deref(), Some("us"));
+    assert_eq!(by_value[&20.0f64.to_bits()].as_deref(), Some("us"));
+    assert_eq!(by_value[&30.0f64.to_bits()].as_deref(), Some("eu"));
+    assert_eq!(by_value[&40.0f64.to_bits()].as_deref(), Some("eu"));
+}
+
+/// A `HISTOGRAM_DP_EXEMPLARS.parent_id` column defaults to QUASI-DELTA with
+/// `int_value`/`double_value` as its equality columns (otap-spec.md section
+/// 6.4.3). Encoded `[0, 3, 0, 3, 0]` with `double_value` `[1, 1, 7, 7, 7]`
+/// decodes to `[0, 3, 0, 3, 3]`: the third row resets to absolute because the
+/// value changed (`1` -> `7`), so two exemplars join histogram data point 0
+/// and three join data point 3. Read literally the column would be
+/// `[0, 3, 0, 3, 0]`, giving data point 0 three exemplars and data point 3
+/// two, so the per-point `HistogramExemplarsDropped` counts observe the
+/// decode.
+#[test]
+fn exemplars_quasi_delta_parent_id_decodes_to_literal_values() {
+    let root = single_histogram_root("latency");
+    let hist_dp = histogram_dp_batch(&[0, 3], 0, &[5, 5], &[INGEST_TS_NS, INGEST_TS_NS + 1]);
+    let exemplars = quasi_delta_exemplars_batch(
+        &[0, 3, 0, 3, 0],
+        &[Some(1.0), Some(1.0), Some(7.0), Some(7.0), Some(7.0)],
+        Some("quasidelta"),
+    );
+
+    let out = decode_custom_batch(vec![
+        (ArrowPayloadType::UnivariateMetrics, root),
+        (ArrowPayloadType::HistogramDataPoints, hist_dp),
+        (ArrowPayloadType::HistogramDpExemplars, exemplars),
+    ]);
+
+    // Each histogram data point (bounds empty) explodes into `_bucket{le=+Inf}`
+    // and `_count`, so two points admit -> four points total.
+    assert_eq!(out.points.len(), 4);
+    // The informational HistogramExemplarsDropped rejections are emitted in
+    // data-point row order (id 0 then id 3): 2 exemplars, then 3.
+    assert_eq!(
+        out.rejected,
+        vec![
+            Rejection::HistogramExemplarsDropped { count: 2 },
+            Rejection::HistogramExemplarsDropped { count: 3 },
+        ]
+    );
+}
+
+/// A single batch mixing all three encodings proves QUASI-DELTA attrs
+/// decoding does not regress the DELTA id/parent decoding #205 added: the
+/// root ids and the data-point id/parent_id ride DELTA while the attrs
+/// `parent_id` rides QUASI-DELTA (a matching `region` run that accumulates
+/// `[5, 1]` -> `[5, 6]`), and the whole thing must still agree with the OTLP
+/// oracle. If the attrs column were read literally, the second point's
+/// `region` label would be stranded on non-existent data point id 1.
+#[test]
+fn quasi_delta_attrs_alongside_delta_ids_in_one_batch() {
+    // root id DELTA: encoded [0, 1] -> decoded [0, 1]; "widgets" is metric 0.
+    let root = root_batch([0, 1], ["widgets", "spare"], Some("delta"));
+    // dp id DELTA: encoded [5, 1] -> [5, 6]; parent_id DELTA [0, 0] -> [0, 0].
+    let dp = number_dp_batch([5, 1], [0, 0], [1.0, 2.0], Some("delta"), Some("delta"));
+    // attrs parent_id QUASI-DELTA: encoded [5, 1], both region=us (equality
+    // columns match) -> decoded [5, 6], joining both data points.
+    let attrs = quasi_delta_str_attrs_batch(
+        &[5, 1],
+        &["region", "region"],
+        &["us", "us"],
+        Some("quasidelta"),
+    );
+
+    let otap_out = decode_custom_batch(vec![
+        (ArrowPayloadType::UnivariateMetrics, root),
+        (ArrowPayloadType::NumberDataPoints, dp),
+        (ArrowPayloadType::NumberDpAttrs, attrs),
+    ]);
+    assert_eq!(
+        otap_out.rejected,
+        Vec::new(),
+        "unexpected rejections: {:?}",
+        otap_out.rejected
+    );
+    assert_eq!(otap_out.points.len(), 2);
+
+    let tenant = TenantId::new("acme");
+    let limits = IngestLimits::default();
+    let otlp_out = normalize_metrics(
+        &tenant,
+        gauge_request_with_region(
+            "widgets",
+            [
+                (INGEST_TS_NS, 1.0, "us"),
+                (INGEST_TS_NS + 1_000_000, 2.0, "us"),
+            ],
+        ),
+        &limits,
+        INGEST_TS_NS,
+    );
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
     );
 }
