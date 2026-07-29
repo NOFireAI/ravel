@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{
-    Float64Array, Int64Array, RecordBatch, TimestampNanosecondArray, UInt16Array, UInt32Array,
+    Float64Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray, UInt8Array,
+    UInt16Array, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -33,10 +34,11 @@ use ravel_otap::encode::{
 };
 use ravel_otap::normalize::{
     AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA,
-    AGGREGATION_TEMPORALITY_UNSPECIFIED, normalize_decoded,
+    AGGREGATION_TEMPORALITY_UNSPECIFIED, ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE,
+    normalize_decoded,
 };
 use ravel_otap::proto::experimental::arrow::v1::{ArrowPayloadType, BatchArrowRecords};
-use ravel_otap::stream::{StreamConfig, StreamState};
+use ravel_otap::stream::{DecodedBatch, StreamConfig, StreamState};
 use ravel_otlp::{IngestLimits, NormalizeOutput, Rejection, normalize_metrics};
 use ravel_types::{SeriesId, TenantId};
 
@@ -1462,5 +1464,295 @@ fn number_data_point_null_double_value_falls_back_to_int_value() {
         rejection_multiset(&otlp_out.rejected),
         rejection_multiset(&otap_out.rejected),
         "rejection classes differ"
+    );
+}
+
+// --- Issue #205: DELTA-decode id/parent_id columns (otap-spec.md section
+// 6.4.2). These hand-build every payload `RecordBatch` (rather than going
+// through `MetricsStreamEncoder`, which always tags its own `id`/
+// `parent_id` columns `encoding=plain`) so the encoded column and the
+// decoded value can differ, which is the only way to observe whether
+// decoding actually happened. ---
+
+/// Attach an `encoding` field-metadata declaration (otap-spec.md section
+/// 6.4), or leave it absent (`None`) to exercise the no-declaration-means-
+/// DELTA default.
+fn id_field(name: &str, data_type: DataType, encoding: Option<&str>) -> Field {
+    let field = Field::new(name, data_type, false);
+    match encoding {
+        Some(value) => field.with_metadata(
+            [("encoding".to_string(), value.to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        None => field,
+    }
+}
+
+/// Build a `DecodedBatch` directly from hand-built payloads, bypassing the
+/// encoder entirely.
+fn decode_custom_batch(payloads: Vec<(ArrowPayloadType, RecordBatch)>) -> NormalizeOutput {
+    let decoded = DecodedBatch {
+        batch_id: 0,
+        payloads,
+    };
+    normalize_decoded(
+        &TenantId::new("acme"),
+        &decoded,
+        &IngestLimits::default(),
+        INGEST_TS_NS,
+    )
+}
+
+/// A two-metric `UNIVARIATE_METRICS` batch whose `id` column carries
+/// `encoded` (the still-encoded values); `id_encoding` controls that
+/// column's field-metadata declaration.
+fn root_batch(encoded: [u16; 2], names: [&str; 2], id_encoding: Option<&str>) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("id", DataType::UInt16, id_encoding),
+        Field::new("metric_type", DataType::UInt8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt16Array::from(encoded.to_vec())),
+            Arc::new(UInt8Array::from(vec![METRIC_TYPE_GAUGE, METRIC_TYPE_GAUGE])),
+            Arc::new(StringArray::from(names.to_vec())),
+        ],
+    )
+    .expect("build root batch")
+}
+
+/// A two-row `NUMBER_DATA_POINTS` batch whose `id` and `parent_id` columns
+/// carry `encoded_ids`/`encoded_parents` (the still-encoded values);
+/// `id_encoding`/`parent_encoding` control those columns' field-metadata
+/// declarations.
+fn number_dp_batch(
+    encoded_ids: [u32; 2],
+    encoded_parents: [u16; 2],
+    values: [f64; 2],
+    id_encoding: Option<&str>,
+    parent_encoding: Option<&str>,
+) -> RecordBatch {
+    let schema = Schema::new(vec![
+        id_field("id", DataType::UInt32, id_encoding),
+        id_field("parent_id", DataType::UInt16, parent_encoding),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("double_value", DataType::Float64, false),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(encoded_ids.to_vec())),
+            Arc::new(UInt16Array::from(encoded_parents.to_vec())),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                INGEST_TS_NS,
+                INGEST_TS_NS + 1_000_000,
+            ])),
+            Arc::new(Float64Array::from(values.to_vec())),
+        ],
+    )
+    .expect("build number dp batch")
+}
+
+/// A `NUMBER_DP_ATTRS` batch with one string attribute per row. `parent_ids`
+/// must be the *decoded* `NUMBER_DATA_POINTS.id` values: this table's own
+/// `parent_id` column is quasi-delta per the spec but is not decoded by this
+/// change (see docs/otap-ingest.md) and is always read as a literal value.
+fn number_dp_attrs_batch(parent_ids: [u32; 2], values: [&str; 2]) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("parent_id", DataType::UInt32, false),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("type", DataType::UInt8, false),
+        Field::new("str", DataType::Utf8, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(parent_ids.to_vec())),
+            Arc::new(StringArray::from(vec!["region", "region"])),
+            Arc::new(UInt8Array::from(vec![
+                ANY_VALUE_TYPE_STRING,
+                ANY_VALUE_TYPE_STRING,
+            ])),
+            Arc::new(StringArray::from(values.to_vec())),
+        ],
+    )
+    .expect("build attrs batch")
+}
+
+fn gauge_request_with_region(
+    name: &str,
+    points: [(i64, f64, &str); 2],
+) -> ExportMetricsServiceRequest {
+    gauge_request(
+        name,
+        points
+            .into_iter()
+            .map(|(ts, value, region)| NumberDataPoint {
+                attributes: vec![KeyValue {
+                    key: "region".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(AnyValueVariant::StringValue(region.to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                time_unix_nano: ts as u64,
+                value: Some(NumberValue::AsDouble(value)),
+                ..Default::default()
+            })
+            .collect(),
+    )
+}
+
+/// `NUMBER_DATA_POINTS.id` and `.parent_id` both default to DELTA
+/// (otap-spec.md section 5.3.2). This scenario only produces the expected
+/// two `widgets` points, correctly labeled, if both columns are decoded:
+/// undecoded, the second point's `parent_id` (encoded `0`, decoded `1`)
+/// would misattribute it to `metric_zero`, and the second point's `id`
+/// (encoded `5`, decoded `15`) would fail to join `NUMBER_DP_ATTRS`, losing
+/// its `region` label.
+fn assert_number_dp_id_and_parent_id_scenario_agrees(
+    id_encoding: Option<&str>,
+    parent_encoding: Option<&str>,
+) {
+    let root = root_batch([0, 1], ["metric_zero", "widgets"], Some("plain"));
+    // dp id: encoded [10, 5] -> decoded [10, 15] (DELTA).
+    // dp parent_id: encoded [1, 0] -> decoded [1, 1] (DELTA); both rows
+    // belong to metric id 1, "widgets".
+    let dp = number_dp_batch([10, 5], [1, 0], [1.0, 2.0], id_encoding, parent_encoding);
+    let attrs = number_dp_attrs_batch([10, 15], ["us", "eu"]);
+
+    let otap_out = decode_custom_batch(vec![
+        (ArrowPayloadType::UnivariateMetrics, root),
+        (ArrowPayloadType::NumberDataPoints, dp),
+        (ArrowPayloadType::NumberDpAttrs, attrs),
+    ]);
+    assert_eq!(
+        otap_out.rejected,
+        Vec::new(),
+        "unexpected rejections: {:?}",
+        otap_out.rejected
+    );
+    assert_eq!(otap_out.points.len(), 2);
+
+    let tenant = TenantId::new("acme");
+    let limits = IngestLimits::default();
+    let otlp_out = normalize_metrics(
+        &tenant,
+        gauge_request_with_region(
+            "widgets",
+            [
+                (INGEST_TS_NS, 1.0, "us"),
+                (INGEST_TS_NS + 1_000_000, 2.0, "eu"),
+            ],
+        ),
+        &limits,
+        INGEST_TS_NS,
+    );
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
+    );
+}
+
+#[test]
+fn number_data_points_id_and_parent_id_delta_declared_decodes() {
+    assert_number_dp_id_and_parent_id_scenario_agrees(Some("delta"), Some("delta"));
+}
+
+#[test]
+fn number_data_points_id_and_parent_id_default_encoding_decodes_as_delta() {
+    assert_number_dp_id_and_parent_id_scenario_agrees(None, None);
+}
+
+/// `UNIVARIATE_METRICS.id` defaults to DELTA (otap-spec.md section 5.3.1).
+/// This scenario's single data point only lands on `widgets` (root-encoded
+/// id `2`, decoded `5`) if the root `id` column is decoded; undecoded, its
+/// literal `parent_id` of `5` matches no root row and the point is
+/// classified an unknown metric type instead.
+fn assert_univariate_metrics_id_scenario_agrees(root_id_encoding: Option<&str>) {
+    // root id: encoded [3, 2] -> decoded [3, 5]; "widgets" is metric id 5.
+    let root = root_batch([3, 2], ["metric_zero", "widgets"], root_id_encoding);
+    let dp = number_dp_batch([0, 0], [5, 5], [1.0, 2.0], Some("plain"), Some("plain"));
+
+    let otap_out = decode_custom_batch(vec![
+        (ArrowPayloadType::UnivariateMetrics, root),
+        (ArrowPayloadType::NumberDataPoints, dp),
+    ]);
+    assert_eq!(
+        otap_out.rejected,
+        Vec::new(),
+        "unexpected rejections: {:?}",
+        otap_out.rejected
+    );
+    assert_eq!(otap_out.points.len(), 2);
+
+    let tenant = TenantId::new("acme");
+    let limits = IngestLimits::default();
+    let otlp_out = normalize_metrics(
+        &tenant,
+        gauge_request(
+            "widgets",
+            vec![
+                NumberDataPoint {
+                    time_unix_nano: INGEST_TS_NS as u64,
+                    value: Some(NumberValue::AsDouble(1.0)),
+                    ..Default::default()
+                },
+                NumberDataPoint {
+                    time_unix_nano: (INGEST_TS_NS + 1_000_000) as u64,
+                    value: Some(NumberValue::AsDouble(2.0)),
+                    ..Default::default()
+                },
+            ],
+        ),
+        &limits,
+        INGEST_TS_NS,
+    );
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
+    );
+}
+
+#[test]
+fn univariate_metrics_id_delta_declared_decodes() {
+    assert_univariate_metrics_id_scenario_agrees(Some("delta"));
+}
+
+#[test]
+fn univariate_metrics_id_default_encoding_decodes_as_delta() {
+    assert_univariate_metrics_id_scenario_agrees(None);
+}
+
+/// An `id`/`parent_id` column whose `encoding` field metadata is neither
+/// `"plain"` nor `"delta"` must be rejected as a typed error, not guessed at
+/// as one or the other.
+#[test]
+fn number_data_points_unrecognized_id_encoding_declaration_is_rejected() {
+    let dp_batch = number_dp_batch([0, 0], [0, 0], [1.0, 2.0], Some("lz4"), Some("plain"));
+
+    let otap_out = decode_with_custom_number_dp("widgets", dp_batch);
+    assert_eq!(
+        otap_out.points.len(),
+        0,
+        "no points should decode from a batch with an unrecognized id encoding"
+    );
+    assert_eq!(
+        otap_out.rejected,
+        vec![Rejection::UnsupportedMetricType {
+            metric_type: "unrecognized_id_encoding",
+            count: 2,
+        }]
     );
 }

@@ -118,6 +118,112 @@ const UNKNOWN_OTAP_METRIC_TYPE: &str = "unknown_otap_metric_type";
 /// bespoke "malformed batch" variant (see the crate report for that gap).
 const MALFORMED_NUMBER_DATA_POINTS_BATCH: &str = "malformed_number_data_points_batch";
 
+/// otap-spec.md section 6.4: the two `id`/`parent_id` transport encodings
+/// this pass decodes. Quasi-delta (`*Attrs.parent_id`, `*DpExemplars.parent_id`)
+/// is not decoded yet -- those columns are still read as literal values (see
+/// docs/otap-ingest.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IdEncoding {
+    Plain,
+    Delta,
+}
+
+/// Tag for a whole batch whose `id`/`parent_id` field metadata declares an
+/// `encoding` value this pass does not recognize as a valid encoding for
+/// that column (anything other than `"plain"`/`"delta"`, including
+/// `"quasidelta"` on a column this pass does not decode as quasi-delta).
+/// Rejected outright via the same counted mechanism as
+/// [`MALFORMED_NUMBER_DATA_POINTS_BATCH`], never guessed.
+const UNRECOGNIZED_ID_ENCODING: &str = "unrecognized_id_encoding";
+
+/// Resolve the declared encoding of an `id`/`parent_id` column from its
+/// Arrow field metadata (otap-spec.md section 6.4: key `"encoding"`, values
+/// `"plain"`, `"delta"`, `"quasidelta"`). No declaration defaults to
+/// [`IdEncoding::Delta`], the spec's stated default for these columns. `Err`
+/// means the column is missing (caller already checked for this) or the
+/// declaration is something this call site does not recognize.
+fn id_encoding(rb: &RecordBatch, column: &str) -> Result<IdEncoding, ()> {
+    let field = rb.schema_ref().field_with_name(column).map_err(|_| ())?;
+    match field.metadata().get("encoding").map(String::as_str) {
+        None => Ok(IdEncoding::Delta),
+        Some("plain") => Ok(IdEncoding::Plain),
+        Some("delta") => Ok(IdEncoding::Delta),
+        Some(_) => Err(()),
+    }
+}
+
+/// Decode a delta-encoded `u32` id column (otap-spec.md section 6.4.2):
+/// each decoded value is the running sum of encoded values up to and
+/// including that row. Null values are excluded from the running sum (the
+/// accumulator carries through unchanged); the summation wraps rather than
+/// panics, since a decode path must never panic on adversarial input.
+fn decode_delta_u32(values: &UInt32Array) -> Vec<u32> {
+    let mut acc: u32 = 0;
+    (0..values.len())
+        .map(|i| {
+            if !values.is_null(i) {
+                acc = acc.wrapping_add(values.value(i));
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Decode a delta-encoded `u16` id column; see [`decode_delta_u32`].
+fn decode_delta_u16(values: &UInt16Array) -> Vec<u16> {
+    let mut acc: u16 = 0;
+    (0..values.len())
+        .map(|i| {
+            if !values.is_null(i) {
+                acc = acc.wrapping_add(values.value(i));
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Resolve `column`'s declared encoding and decode it into absolute values,
+/// pushing [`UNRECOGNIZED_ID_ENCODING`] (tagged with `rb`'s row count) and
+/// returning `None` if the declaration is not recognized.
+fn decode_id_column_u32(
+    rb: &RecordBatch,
+    column: &str,
+    values: &UInt32Array,
+    rejected: &mut Vec<Rejection>,
+) -> Option<Vec<u32>> {
+    match id_encoding(rb, column) {
+        Ok(IdEncoding::Plain) => Some(values.values().to_vec()),
+        Ok(IdEncoding::Delta) => Some(decode_delta_u32(values)),
+        Err(()) => {
+            rejected.push(Rejection::UnsupportedMetricType {
+                metric_type: UNRECOGNIZED_ID_ENCODING,
+                count: rb.num_rows(),
+            });
+            None
+        }
+    }
+}
+
+/// `u16` counterpart of [`decode_id_column_u32`].
+fn decode_id_column_u16(
+    rb: &RecordBatch,
+    column: &str,
+    values: &UInt16Array,
+    rejected: &mut Vec<Rejection>,
+) -> Option<Vec<u16>> {
+    match id_encoding(rb, column) {
+        Ok(IdEncoding::Plain) => Some(values.values().to_vec()),
+        Ok(IdEncoding::Delta) => Some(decode_delta_u16(values)),
+        Err(()) => {
+            rejected.push(Rejection::UnsupportedMetricType {
+                metric_type: UNRECOGNIZED_ID_ENCODING,
+                count: rb.num_rows(),
+            });
+            None
+        }
+    }
+}
+
 /// Decode and normalize gauge and sum data points from one decoded OTAP
 /// `BatchArrowRecords` message (`batch.batch_id`'s payloads).
 ///
@@ -161,21 +267,22 @@ pub fn normalize_decoded(
 
     let flat_dp = flatten_dp(&dp_batches, &mut rejected);
     let flat_attrs = flatten_attrs(&attr_batches);
-    let flat_hist_dp = flatten_histogram_dp(&hist_dp_batches);
+    let flat_hist_dp = flatten_histogram_dp(&hist_dp_batches, &mut rejected);
     let flat_hist_attrs = flatten_attrs(&hist_attr_batches);
     let hist_exemplar_counts = count_by_parent_id(&hist_exemplar_batches);
-    let flat_summary_dp = flatten_summary_dp(&summary_dp_batches);
+    let flat_summary_dp = flatten_summary_dp(&summary_dp_batches, &mut rejected);
     let flat_summary_attrs = flatten_attrs(&summary_attr_batches);
 
+    let root_ids = decode_root_ids(&root_batches, &mut rejected);
     let dense_size = dense_size_for(
-        &root_batches,
+        &root_ids,
         flat_dp
             .iter()
             .map(|d| d.parent_id)
             .chain(flat_hist_dp.iter().map(|d| d.parent_id))
             .chain(flat_summary_dp.iter().map(|d| d.parent_id)),
     );
-    let root = build_root_table(&root_batches, dense_size);
+    let root = build_root_table(&root_batches, &root_ids, dense_size);
     let (metric_decision, unknown_number_count) =
         build_metric_decisions(&root, &flat_dp, limits, dense_size, &mut rejected);
     let (hist_decision, unknown_hist_count) =
@@ -518,19 +625,38 @@ enum RawCell {
 type GroupCache =
     HashMap<u32, HashMap<Vec<(String, RawCell)>, Result<(LabelSet, SeriesId), Rejection>>>;
 
-fn dense_size_for(root_batches: &[&RecordBatch], parent_ids: impl Iterator<Item = u16>) -> usize {
+fn dense_size_for(root_ids: &[Option<Vec<u16>>], parent_ids: impl Iterator<Item = u16>) -> usize {
     let mut max_id: u32 = 0;
-    for rb in root_batches {
-        if let Some(ids) = column_as::<UInt16Array>(rb, "id") {
-            for &v in ids.values() {
-                max_id = max_id.max(u32::from(v));
-            }
+    for ids in root_ids.iter().flatten() {
+        for &v in ids {
+            max_id = max_id.max(u32::from(v));
         }
     }
     for parent_id in parent_ids {
         max_id = max_id.max(u32::from(parent_id));
     }
     (max_id as usize + 1).min(MAX_METRIC_IDS)
+}
+
+/// Decode each root batch's `id` column (otap-spec.md section 5.3.1:
+/// UNIVARIATE_METRICS.id, default DELTA) up front, once, so both
+/// [`dense_size_for`] and [`build_root_table`] see decoded ids -- computing
+/// the dense array's size from still-encoded (typically small, delta) values
+/// would undersize it. `None` at an index means that batch's `id` column was
+/// missing (pre-existing, silently skipped, matching [`build_root_table`]'s
+/// prior behavior) or carried an unrecognized encoding declaration (freshly
+/// rejected via [`UNRECOGNIZED_ID_ENCODING`]).
+fn decode_root_ids(
+    root_batches: &[&RecordBatch],
+    rejected: &mut Vec<Rejection>,
+) -> Vec<Option<Vec<u16>>> {
+    root_batches
+        .iter()
+        .map(|rb| {
+            let ids = column_as::<UInt16Array>(rb, "id")?;
+            decode_id_column_u16(rb, "id", ids, rejected)
+        })
+        .collect()
 }
 
 fn column_as<'b, T: 'static>(rb: &'b RecordBatch, name: &str) -> Option<&'b T> {
@@ -576,10 +702,14 @@ fn opt_f64(col: Option<&Float64Array>, i: usize) -> Option<f64> {
     col.filter(|c| !c.is_null(i)).map(|c| c.value(i))
 }
 
-fn build_root_table(root_batches: &[&RecordBatch], dense_size: usize) -> Vec<Option<RootEntry>> {
+fn build_root_table(
+    root_batches: &[&RecordBatch],
+    root_ids: &[Option<Vec<u16>>],
+    dense_size: usize,
+) -> Vec<Option<RootEntry>> {
     let mut entries: Vec<Option<RootEntry>> = (0..dense_size).map(|_| None).collect();
-    for rb in root_batches {
-        let Some(ids) = column_as::<UInt16Array>(rb, "id") else {
+    for (rb, ids) in root_batches.iter().zip(root_ids) {
+        let Some(ids) = ids else {
             continue;
         };
         let Some(types) = column_as::<UInt8Array>(rb, "metric_type") else {
@@ -591,8 +721,7 @@ fn build_root_table(root_batches: &[&RecordBatch], dense_size: usize) -> Vec<Opt
         let temporality_col = column_as::<Int32Array>(rb, "aggregation_temporality");
         let monotonic_col = column_as::<BooleanArray>(rb, "is_monotonic");
 
-        for i in 0..rb.num_rows() {
-            let id = ids.value(i);
+        for (i, &id) in ids.iter().enumerate() {
             let Some(name) = name_at(name_col, i) else {
                 continue;
             };
@@ -645,12 +774,20 @@ fn flatten_dp(dp_batches: &[&RecordBatch], rejected: &mut Vec<Rejection>) -> Vec
             });
             continue;
         }
+        // otap-spec.md section 5.3.2: both `id` and `parent_id` default to
+        // DELTA when the field carries no explicit `encoding` metadata.
+        let Some(decoded_ids) = decode_id_column_u32(rb, "id", ids, rejected) else {
+            continue;
+        };
+        let Some(decoded_parents) = decode_id_column_u16(rb, "parent_id", parents, rejected) else {
+            continue;
+        };
         let flags_col = column_as::<UInt32Array>(rb, "flags");
         for i in 0..rb.num_rows() {
             let value = opt_f64(doubles, i).or_else(|| opt_i64(ints, i).map(|v| v as f64));
             out.push(FlatDp {
-                id: ids.value(i),
-                parent_id: parents.value(i),
+                id: decoded_ids[i],
+                parent_id: decoded_parents[i],
                 ts_ns: times.value(i),
                 value,
                 flags: flags_col.map_or(0, |c| c.value(i)),
@@ -1065,7 +1202,10 @@ fn quantiles_at(list: &ListArray, i: usize) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn flatten_histogram_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatHistogramDp> {
+fn flatten_histogram_dp(
+    dp_batches: &[&RecordBatch],
+    rejected: &mut Vec<Rejection>,
+) -> Vec<FlatHistogramDp> {
     let mut out = Vec::new();
     for rb in dp_batches {
         let Some(ids) = column_as::<UInt32Array>(rb, "id") else {
@@ -1090,10 +1230,18 @@ fn flatten_histogram_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatHistogramDp> {
         let flags_col = column_as::<UInt32Array>(rb, "flags");
         let mins = column_as::<Float64Array>(rb, "min");
         let maxs = column_as::<Float64Array>(rb, "max");
+        // otap-spec.md section 5.3.4: both `id` and `parent_id` default to
+        // DELTA when the field carries no explicit `encoding` metadata.
+        let Some(decoded_ids) = decode_id_column_u32(rb, "id", ids, rejected) else {
+            continue;
+        };
+        let Some(decoded_parents) = decode_id_column_u16(rb, "parent_id", parents, rejected) else {
+            continue;
+        };
         for i in 0..rb.num_rows() {
             out.push(FlatHistogramDp {
-                id: ids.value(i),
-                parent_id: parents.value(i),
+                id: decoded_ids[i],
+                parent_id: decoded_parents[i],
                 ts_ns: times.value(i),
                 count: counts.value(i),
                 sum: opt_f64(sums, i),
@@ -1108,7 +1256,10 @@ fn flatten_histogram_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatHistogramDp> {
     out
 }
 
-fn flatten_summary_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatSummaryDp> {
+fn flatten_summary_dp(
+    dp_batches: &[&RecordBatch],
+    rejected: &mut Vec<Rejection>,
+) -> Vec<FlatSummaryDp> {
     let mut out = Vec::new();
     for rb in dp_batches {
         let Some(ids) = column_as::<UInt32Array>(rb, "id") else {
@@ -1130,10 +1281,18 @@ fn flatten_summary_dp(dp_batches: &[&RecordBatch]) -> Vec<FlatSummaryDp> {
             continue;
         };
         let flags_col = column_as::<UInt32Array>(rb, "flags");
+        // otap-spec.md section 5.3.3: both `id` and `parent_id` default to
+        // DELTA when the field carries no explicit `encoding` metadata.
+        let Some(decoded_ids) = decode_id_column_u32(rb, "id", ids, rejected) else {
+            continue;
+        };
+        let Some(decoded_parents) = decode_id_column_u16(rb, "parent_id", parents, rejected) else {
+            continue;
+        };
         for i in 0..rb.num_rows() {
             out.push(FlatSummaryDp {
-                id: ids.value(i),
-                parent_id: parents.value(i),
+                id: decoded_ids[i],
+                parent_id: decoded_parents[i],
                 ts_ns: times.value(i),
                 count: counts.value(i),
                 sum: sums.value(i),
