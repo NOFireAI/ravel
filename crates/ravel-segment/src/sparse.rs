@@ -153,6 +153,15 @@ fn take_id(bytes: &[u8], pos: &mut usize) -> Result<[u8; 16], SegmentError> {
 /// already crc-verified as a whole (SERIES_IDX is never range-fetched); the
 /// per-window and per-chunk crc32c it carries verify the *other* sections'
 /// range-GETs, not itself.
+///
+/// Beyond field-level truncation/sortedness checks, this also validates the
+/// structural invariants `locate`/`chunk_for` rely on: `sparse_count` and
+/// `chunk_count` against `series_count`/the strides, each entry's
+/// `ids_offset`/`window_len` against its formula, and the chunk directory's
+/// dense `first_index`/`n` chain. A corrupt-but-crc-consistent index (a
+/// tampered count or offset that still passes the section crc32c) fails to
+/// parse here instead of `chunk_for`/`locate` silently treating a present id
+/// as absent.
 pub fn parse_series_idx(bytes: &[u8]) -> Result<SparseIdIndex, SegmentError> {
     let mut pos = 0usize;
     let version = *bytes.get(pos).ok_or(SegmentError::Truncated)?;
@@ -171,13 +180,22 @@ pub fn parse_series_idx(bytes: &[u8]) -> Result<SparseIdIndex, SegmentError> {
     }
     let series_count = take_u32(bytes, &mut pos)?;
     let sparse_count = take_u32(bytes, &mut pos)?;
+    // Entry `p` indexes series `p*stride`, so the entry count is pinned by
+    // series_count/stride (docs/segment-format.md "SERIES_IDX"): one entry
+    // per full stride, plus one more for a nonempty remainder.
+    let expected_sparse_count = series_count.div_ceil(stride);
+    if sparse_count != expected_sparse_count {
+        return Err(SegmentError::BadSparseIndex(
+            "sparse_count does not match series_count/stride",
+        ));
+    }
 
     let mut entries = Vec::with_capacity((sparse_count as usize).min(bytes.len() / 36 + 1));
     let mut prev: Option<[u8; 16]> = None;
-    for _ in 0..sparse_count {
+    for p in 0..sparse_count {
         let id = take_id(bytes, &mut pos)?;
-        if let Some(p) = prev
-            && id <= p
+        if let Some(prev_id) = prev
+            && id <= prev_id
         {
             return Err(SegmentError::SeriesIdsUnsorted);
         }
@@ -185,6 +203,28 @@ pub fn parse_series_idx(bytes: &[u8]) -> Result<SparseIdIndex, SegmentError> {
         let ids_offset = take_u64(bytes, &mut pos)?;
         let window_len = take_u64(bytes, &mut pos)?;
         let window_crc32c = take_u32(bytes, &mut pos)?;
+
+        // Bounded by the sparse_count check above (entry_first < series_count
+        // <= u32::MAX), so this arithmetic cannot overflow u64.
+        let entry_first = u64::from(p) * u64::from(stride);
+        let expected_offset = 4u64 + entry_first * 16;
+        if ids_offset != expected_offset {
+            return Err(SegmentError::BadSparseIndex(
+                "ids_offset does not match its expected formula",
+            ));
+        }
+        let is_last_entry = p + 1 == sparse_count;
+        let expected_id_count = if is_last_entry {
+            u64::from(series_count) - entry_first
+        } else {
+            u64::from(stride)
+        };
+        if window_len != expected_id_count * 16 {
+            return Err(SegmentError::BadSparseIndex(
+                "window_len does not match the id count it should cover",
+            ));
+        }
+
         entries.push(SparseEntry {
             id,
             ids_offset,
@@ -198,14 +238,45 @@ pub fn parse_series_idx(bytes: &[u8]) -> Result<SparseIdIndex, SegmentError> {
         return Err(SegmentError::ZeroStride);
     }
     let chunk_count = take_u32(bytes, &mut pos)?;
+    let expected_chunk_count = series_count.div_ceil(chunk_stride);
+    if chunk_count != expected_chunk_count {
+        return Err(SegmentError::BadSparseIndex(
+            "chunk_count does not match series_count/chunk_stride",
+        ));
+    }
     let mut chunks = Vec::with_capacity((chunk_count as usize).min(bytes.len() / 36 + 1));
-    for _ in 0..chunk_count {
+    for k in 0..chunk_count {
         let frame_offset = take_u64(bytes, &mut pos)?;
         let frame_stored_len = take_u64(bytes, &mut pos)?;
         let frame_uncompressed_len = take_u64(bytes, &mut pos)?;
         let first_index = take_u32(bytes, &mut pos)?;
         let n = take_u32(bytes, &mut pos)?;
         let frame_crc32c = take_u32(bytes, &mut pos)?;
+
+        // Dense chain (docs/segment-format.md): chunk k covers
+        // [k*chunk_stride, k*chunk_stride + n), n == chunk_stride except the
+        // last chunk, which covers the remainder. Validating this here (not
+        // just in decode_catalog_v5) protects the point-lookup path
+        // (`chunk_for`) too: a corrupt-but-crc-consistent directory now
+        // fails to parse instead of `chunk_for` silently answering "absent".
+        let expected_first_index = u64::from(k) * u64::from(chunk_stride);
+        if u64::from(first_index) != expected_first_index {
+            return Err(SegmentError::BadSparseIndex(
+                "chunk first_index does not match the dense stride chain",
+            ));
+        }
+        let is_last_chunk = k + 1 == chunk_count;
+        let expected_n = if is_last_chunk {
+            u64::from(series_count) - expected_first_index
+        } else {
+            u64::from(chunk_stride)
+        };
+        if u64::from(n) != expected_n {
+            return Err(SegmentError::BadSparseIndex(
+                "chunk n does not match chunk_stride (or the final remainder)",
+            ));
+        }
+
         chunks.push(ChunkDirEntry {
             frame_offset,
             frame_stored_len,
@@ -672,7 +743,7 @@ pub fn decode_catalog_v5(
         u64::from(count),
         footer.series_count,
     )?;
-    let _run_total = take_u32_le(&chunk_bytes, &mut hpos)?;
+    let run_total = take_u32_le(&chunk_bytes, &mut hpos)?;
 
     let ts_len = find_section(footer, section_kind::TS_PAGES)
         .map(|s| s.len)
@@ -686,11 +757,11 @@ pub fn decode_catalog_v5(
 
     let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
     let mut entries: Vec<SeriesEntryV4> = Vec::with_capacity(series_ids.len());
-    let mut expected_first: u32 = 0;
+    // The chunk directory's first_index/n dense-chain (0, K, 2K, ...) is
+    // already validated structurally by `parse_series_idx`, so this loop
+    // does not re-check it.
+    let mut run_total_sum: u64 = 0;
     for chunk in index.chunk_directory() {
-        if chunk.first_index != expected_first {
-            return Err(SegmentError::BadChunkFrame);
-        }
         let start =
             usize::try_from(chunk.frame_offset).map_err(|_| SegmentError::SectionOutOfBounds)?;
         let stored_len = usize::try_from(chunk.frame_stored_len)
@@ -718,6 +789,9 @@ pub fn decode_catalog_v5(
         if frame.n != chunk.n as usize {
             return Err(SegmentError::BadChunkFrame);
         }
+        run_total_sum = run_total_sum
+            .checked_add(frame.run_count.iter().map(|&c| u64::from(c)).sum::<u64>())
+            .ok_or(SegmentError::FieldOverflow)?;
 
         // Materialize each series in the frame.
         let mut voff = 0usize;
@@ -774,11 +848,17 @@ pub fn decode_catalog_v5(
                 runs,
             });
         }
-        expected_first = expected_first
-            .checked_add(chunk.n)
-            .ok_or(SegmentError::FieldOverflow)?;
+        if voff != frame.value_ord.len() {
+            return Err(SegmentError::BadBlockLen);
+        }
     }
 
+    if run_total_sum != u64::from(run_total) {
+        return Err(SegmentError::RunCountSumMismatch {
+            run_count_sum: run_total_sum,
+            run_total: u64::from(run_total),
+        });
+    }
     if entries.len() != series_ids.len() {
         return Err(SegmentError::BadChunkFrame);
     }
