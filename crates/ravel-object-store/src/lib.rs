@@ -155,6 +155,12 @@ impl Capabilities {
         }
     }
 
+    /// True when `self` (a backend's reported capabilities) provides every
+    /// flag `required` demands. Call as `backend.satisfies(&mandatory())`:
+    /// `self` is the backend, `required` is the contract. ravel-server's
+    /// startup path uses exactly this to reject a backend that under-reports
+    /// a mandatory flag, so the "startup fails" claim above is enforced, not
+    /// decorative.
     pub fn satisfies(&self, required: &Capabilities) -> bool {
         (!required.consistent_read || self.consistent_read)
             && (!required.consistent_list || self.consistent_list)
