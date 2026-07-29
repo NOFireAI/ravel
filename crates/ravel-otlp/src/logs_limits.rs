@@ -41,7 +41,9 @@ pub struct LogIngestLimits {
     pub max_attributes_per_record: usize,
     /// Bytes in an attribute key.
     pub max_attribute_key_len: usize,
-    /// Bytes in an attribute value, measured on the value's canonical form.
+    /// Payload bytes in an attribute value: its own string or bytes payload,
+    /// plus nested entries for a list or map value (see
+    /// `logs_normalize::attr_value_len`).
     pub max_attribute_value_len: usize,
     /// Bytes in a record body after normalization to a string.
     pub max_body_len: usize,
