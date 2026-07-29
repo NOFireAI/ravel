@@ -16,9 +16,17 @@
 //! `Sum` reject non-cumulative temporality typed
 //! ([`Rejection::UnsupportedTemporality`]); delta-to-cumulative conversion
 //! needs cross-request state, which stateless compute forbids.
-//! `ExponentialHistogram` is never silently dropped: it produces
-//! [`Rejection::UnsupportedMetricType`] carrying the number of data points
-//! skipped, pending ADR-0017.
+//! Cumulative `ExponentialHistogram` (native histogram) data points are
+//! admitted as a native-histogram sample (ADR-0017), materialized as a
+//! [`NormalizedHistogramPoint`] carrying a `ravel_segment::HistogramSample`
+//! rather than exploded into scalar series. Non-cumulative temporality is
+//! rejected typed ([`Rejection::UnsupportedTemporality`]) like the other
+//! aggregating types. `min`/`max` and exemplars have no place in the
+//! segment's native-histogram sample and are dropped informationally. OTLP
+//! carries no custom-bucket boundaries, so `scale == -53` (the custom-buckets
+//! sentinel) is rejected ([`Rejection::NativeHistogramScaleUnsupported`])
+//! rather than stored unbacked; the Remote Write surface admits it, since
+//! that wire format carries the boundaries losslessly.
 //!
 //! Label mapping follows the standard OTel-to-Prometheus convention:
 //! `resource.attributes["service.name"]` (namespaced by
@@ -47,12 +55,14 @@
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::exponential_histogram_data_point::Buckets;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
-    AggregationTemporality, DataPointFlags, HistogramDataPoint, Metric, NumberDataPoint,
-    ResourceMetrics, SummaryDataPoint, metric::Data as MetricData,
+    AggregationTemporality, DataPointFlags, ExponentialHistogramDataPoint, HistogramDataPoint,
+    Metric, NumberDataPoint, ResourceMetrics, SummaryDataPoint, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use ravel_segment::{HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId, TypeError};
 
 use crate::limits::{IngestLimits, Rejection};
@@ -74,7 +84,12 @@ fn has_no_recorded_value(flags: u32) -> bool {
     flags & DataPointFlags::NoRecordedValueMask as u32 != 0
 }
 
-/// One admitted OTLP data point, normalized to Ravel's canonical shape.
+/// One admitted OTLP data point carrying a scalar sample, normalized to
+/// Ravel's canonical shape. Native-histogram points use the sibling
+/// [`NormalizedHistogramPoint`] instead, since scalar and histogram values
+/// have no common storage shape (a scalar is one `f64`, a histogram is a
+/// span-based bucket layout); keeping them as separate types rather than one
+/// enum leaves this struct, and every crate that already builds it, unchanged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedPoint {
     pub series_id: SeriesId,
@@ -85,10 +100,26 @@ pub struct NormalizedPoint {
     pub is_monotonic_sum: bool,
 }
 
-/// Result of normalizing one `ExportMetricsServiceRequest`.
+/// One admitted OTLP native-histogram data point (a cumulative
+/// `ExponentialHistogram` point, ADR-0017). The sibling of
+/// [`NormalizedPoint`] for the histogram value shape; it carries no
+/// `is_monotonic_sum` because a native histogram is never treated as a
+/// monotonic scalar counter (its counter-reset signal lives in the stored
+/// value's `reset_hint`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NormalizedHistogramPoint {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub sample: HistogramSample,
+}
+
+/// Result of normalizing one `ExportMetricsServiceRequest`. Scalar points
+/// and native-histogram points are carried in separate vectors, matching
+/// their separate normalized types; the caller feeds both into ingest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizeOutput {
     pub points: Vec<NormalizedPoint>,
+    pub histogram_points: Vec<NormalizedHistogramPoint>,
     pub rejected: Vec<Rejection>,
 }
 
@@ -108,6 +139,7 @@ pub fn normalize_metrics(
     if total_points > limits.max_data_points_per_request {
         return NormalizeOutput {
             points: Vec::new(),
+            histogram_points: Vec::new(),
             rejected: vec![Rejection::TooManyDataPoints {
                 count: total_points,
                 max: limits.max_data_points_per_request,
@@ -116,13 +148,26 @@ pub fn normalize_metrics(
     }
 
     let mut points = Vec::new();
+    let mut histogram_points = Vec::new();
     let mut rejected = Vec::new();
 
     for rm in &req.resource_metrics {
-        normalize_resource(tenant, rm, limits, ingest_ts_ns, &mut points, &mut rejected);
+        normalize_resource(
+            tenant,
+            rm,
+            limits,
+            ingest_ts_ns,
+            &mut points,
+            &mut histogram_points,
+            &mut rejected,
+        );
     }
 
-    NormalizeOutput { points, rejected }
+    NormalizeOutput {
+        points,
+        histogram_points,
+        rejected,
+    }
 }
 
 fn count_data_points(req: &ExportMetricsServiceRequest) -> usize {
@@ -157,6 +202,7 @@ fn normalize_resource(
     limits: &IngestLimits,
     ingest_ts_ns: i64,
     points: &mut Vec<NormalizedPoint>,
+    histogram_points: &mut Vec<NormalizedHistogramPoint>,
     rejected: &mut Vec<Rejection>,
 ) {
     let resource_point_count = resource_metrics_point_count(rm);
@@ -191,6 +237,7 @@ fn normalize_resource(
                 limits,
                 ingest_ts_ns,
                 points,
+                histogram_points,
                 rejected,
             );
         }
@@ -204,6 +251,7 @@ fn normalize_metric(
     limits: &IngestLimits,
     ingest_ts_ns: i64,
     points: &mut Vec<NormalizedPoint>,
+    histogram_points: &mut Vec<NormalizedHistogramPoint>,
     rejected: &mut Vec<Rejection>,
 ) {
     let point_count = metric_data_point_count(metric);
@@ -305,10 +353,31 @@ fn normalize_metric(
             }
         }
         Some(MetricData::ExponentialHistogram(h)) => {
-            rejected.push(Rejection::UnsupportedMetricType {
-                metric_type: "exponential_histogram",
-                count: h.data_points.len(),
-            });
+            let temporality = AggregationTemporality::try_from(h.aggregation_temporality)
+                .unwrap_or(AggregationTemporality::Unspecified);
+            if temporality != AggregationTemporality::Cumulative {
+                rejected.push(Rejection::UnsupportedTemporality {
+                    count: h.data_points.len(),
+                });
+                return;
+            }
+            let ctx = NativeHistogramContext {
+                tenant,
+                metric_name: &name,
+                resource_labels,
+                limits,
+                ingest_ts_ns,
+            };
+            let mut memo = SeriesIdMemo::new();
+            for dp in &h.data_points {
+                match build_native_histogram_point(&ctx, dp, &mut memo) {
+                    Ok((p, informational)) => {
+                        histogram_points.push(p);
+                        rejected.extend(informational);
+                    }
+                    Err(r) => rejected.push(r),
+                }
+            }
         }
         Some(MetricData::Summary(s)) => {
             let ctx = ExplodeContext {
@@ -350,6 +419,17 @@ struct PointContext<'a> {
     ingest_ts_ns: i64,
     is_sum: bool,
     is_monotonic: bool,
+}
+
+/// Per-metric context shared by every data point of an `ExponentialHistogram`,
+/// mirroring [`PointContext`] but without `is_sum`/`is_monotonic`: a native
+/// histogram is never treated as a monotonic counter series.
+struct NativeHistogramContext<'a> {
+    tenant: &'a TenantId,
+    metric_name: &'a str,
+    resource_labels: &'a [Label],
+    limits: &'a IngestLimits,
+    ingest_ts_ns: i64,
 }
 
 /// Last-seen memo for `SeriesId::compute`, scoped to one `Metric`.
@@ -477,6 +557,163 @@ fn build_point(
         },
         precision_loss,
     ))
+}
+
+/// Build one native-histogram point from an `ExponentialHistogramDataPoint`
+/// (ADR-0017). Rejection is atomic like [`build_point`]; `Ok` additionally
+/// carries informational drops for `min`/`max` and exemplars, since OTLP's
+/// native histogram has no place in the segment's native histogram sample to
+/// store them either.
+fn build_native_histogram_point(
+    ctx: &NativeHistogramContext,
+    dp: &ExponentialHistogramDataPoint,
+    memo: &mut SeriesIdMemo,
+) -> Result<(NormalizedHistogramPoint, Vec<Rejection>), Rejection> {
+    if dp.attributes.len() > ctx.limits.max_attributes_per_point {
+        return Err(Rejection::TooManyAttributes {
+            attribute_count: dp.attributes.len(),
+            max: ctx.limits.max_attributes_per_point,
+        });
+    }
+
+    let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
+    let value = build_histogram_value(dp)?;
+
+    let mut labels = Vec::with_capacity(ctx.resource_labels.len() + dp.attributes.len() + 1);
+    labels.extend_from_slice(ctx.resource_labels);
+    labels.push(Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: ctx.metric_name.to_string(),
+    });
+    push_attribute_labels(&mut labels, &dp.attributes, ctx.limits)?;
+
+    let label_set = LabelSet::new(labels).map_err(|err| match err {
+        TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
+        _ => Rejection::DuplicateLabelName(String::new()),
+    })?;
+
+    let series_id = memo
+        .series_id(ctx.tenant, ctx.metric_name, &label_set)
+        .map_err(|_| Rejection::OversizedSeriesComponent)?;
+
+    let mut informational = Vec::new();
+    if dp.min.is_some() || dp.max.is_some() {
+        informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
+    }
+    if !dp.exemplars.is_empty() {
+        informational.push(Rejection::HistogramExemplarsDropped {
+            count: dp.exemplars.len(),
+        });
+    }
+
+    Ok((
+        NormalizedHistogramPoint {
+            series_id,
+            labels: label_set,
+            sample: HistogramSample {
+                ts_ns: event_ts_ns,
+                value,
+            },
+        },
+        informational,
+    ))
+}
+
+/// Build the storage-side [`HistogramValue`] from an OTLP exponential
+/// histogram data point. OTLP's `Buckets{offset, bucket_counts}` is a single
+/// contiguous run per side (never sparse spans, unlike Prometheus Remote
+/// Write's wire format), so each side maps to at most one [`HistogramSpan`].
+/// OTLP counts are always integer (`fixed64`/`uint64`), so `counts` is
+/// always [`HistogramCounts::Int`]; OTLP has no field to carry custom bucket
+/// boundaries, so `custom_values` is always `None` and `scale == -53` (the
+/// custom-buckets sentinel) is rejected rather than silently mismatched
+/// against an absent boundary list. `reset_hint` is always `Unknown`: OTLP
+/// carries no per-point reset signal, and only cumulative temporality is
+/// admitted (delta rejects earlier, in `normalize_metric`).
+fn build_histogram_value(dp: &ExponentialHistogramDataPoint) -> Result<HistogramValue, Rejection> {
+    if dp.scale <= -53 {
+        return Err(Rejection::NativeHistogramScaleUnsupported { scale: dp.scale });
+    }
+
+    let positive_spans = buckets_to_spans(dp.positive.as_ref());
+    let negative_spans = buckets_to_spans(dp.negative.as_ref());
+    let positive = dp
+        .positive
+        .as_ref()
+        .map(|b| b.bucket_counts.clone())
+        .unwrap_or_default();
+    let negative = dp
+        .negative
+        .as_ref()
+        .map(|b| b.bucket_counts.clone())
+        .unwrap_or_default();
+
+    let counts = HistogramCounts::Int {
+        zero_count: dp.zero_count,
+        count: dp.count,
+        positive,
+        negative,
+    };
+    validate_native_histogram_counts(&counts)?;
+
+    Ok(HistogramValue {
+        scale: dp.scale,
+        zero_threshold: dp.zero_threshold,
+        sum: dp.sum,
+        custom_values: None,
+        positive_spans,
+        negative_spans,
+        counts,
+        reset_hint: ResetHint::Unknown,
+    })
+}
+
+/// Map one OTLP bucket side to at most one contiguous [`HistogramSpan`]. An
+/// absent or empty `Buckets` message means no populated buckets on that
+/// side, encoded as zero spans (never a zero-length span, which the segment
+/// writer rejects).
+fn buckets_to_spans(buckets: Option<&Buckets>) -> Vec<HistogramSpan> {
+    match buckets {
+        Some(b) if !b.bucket_counts.is_empty() => vec![HistogramSpan {
+            offset: b.offset,
+            length: b.bucket_counts.len() as u32,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// `count` must be at least `zero_count` plus the sum of every bucket count
+/// on both sides: the segment format's reader treats a violation as a
+/// corrupted record, so an OTLP-admitted native histogram that fails this
+/// check would be written today and reported unreadable at query time
+/// forever after (data objects are immutable). Rejecting it here instead
+/// keeps nothing ever written that a reader is documented to reject.
+/// Integer arithmetic is overflow-checked; OTLP's counts are always integer,
+/// so the float-kind arm this function's RW1/RW2 counterpart needs does not
+/// apply here.
+fn validate_native_histogram_counts(counts: &HistogramCounts) -> Result<(), Rejection> {
+    match counts {
+        HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => {
+            let bucket_sum = positive
+                .iter()
+                .chain(negative)
+                .try_fold(0u64, |acc, v| acc.checked_add(*v))
+                .ok_or(Rejection::NativeHistogramCountOverflow)?;
+            let total = zero_count
+                .checked_add(bucket_sum)
+                .ok_or(Rejection::NativeHistogramCountOverflow)?;
+            if *count < total {
+                return Err(Rejection::NativeHistogramCountInconsistent);
+            }
+            Ok(())
+        }
+        HistogramCounts::Float { .. } => Ok(()),
+    }
 }
 
 /// Validate and resolve a data point's event timestamp: zero rejects
@@ -893,7 +1130,8 @@ fn is_label_name_continue(c: char) -> bool {
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::metrics::v1::{
-        Exemplar, Gauge, Histogram, ScopeMetrics, Sum, Summary, summary_data_point,
+        Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+        ScopeMetrics, Sum, Summary, summary_data_point,
     };
     use std::collections::HashSet;
 
@@ -1845,34 +2083,134 @@ mod tests {
         );
     }
 
-    // --- unsupported metric types: never silently dropped ---
+    // --- native histograms (ADR-0017) ---
 
-    #[test]
-    fn exponential_histogram_metric_rejected_with_counts() {
-        use opentelemetry_proto::tonic::metrics::v1::{
-            ExponentialHistogram, ExponentialHistogramDataPoint,
-        };
-        let metric = Metric {
-            name: "latency_exp".to_string(),
+    fn exponential_histogram_metric(
+        name: &str,
+        data_points: Vec<ExponentialHistogramDataPoint>,
+        temporality: AggregationTemporality,
+    ) -> Metric {
+        Metric {
+            name: name.to_string(),
             data: Some(MetricData::ExponentialHistogram(ExponentialHistogram {
-                data_points: vec![
-                    ExponentialHistogramDataPoint {
-                        time_unix_nano: 1_000,
-                        ..Default::default()
-                    },
-                    ExponentialHistogramDataPoint {
-                        time_unix_nano: 1_000,
-                        ..Default::default()
-                    },
-                    ExponentialHistogramDataPoint {
-                        time_unix_nano: 1_000,
-                        ..Default::default()
-                    },
-                ],
-                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                data_points,
+                aggregation_temporality: temporality as i32,
             })),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exponential_histogram_metric_admitted_as_native_histogram_points() {
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![
+                ExponentialHistogramDataPoint {
+                    time_unix_nano: 1_000,
+                    ..Default::default()
+                },
+                ExponentialHistogramDataPoint {
+                    time_unix_nano: 1_000,
+                    ..Default::default()
+                },
+                ExponentialHistogramDataPoint {
+                    time_unix_nano: 1_000,
+                    ..Default::default()
+                },
+            ],
+            AggregationTemporality::Cumulative,
+        );
+        let rm = resource_metrics(vec![], vec![metric]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        // Native histograms never land in the scalar `points` vector.
+        assert!(out.points.is_empty());
+        assert_eq!(out.histogram_points.len(), 3);
+        for p in &out.histogram_points {
+            assert_eq!(p.sample.ts_ns, 1_000);
+            assert_eq!(p.sample.value.scale, 0);
+            assert_eq!(p.sample.value.custom_values, None);
+            assert_eq!(p.sample.value.reset_hint, ResetHint::Unknown);
+        }
+    }
+
+    #[test]
+    fn exponential_histogram_captures_scale_and_bucket_shape() {
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_000,
+            count: 8,
+            sum: Some(12.5),
+            scale: 3,
+            zero_count: 1,
+            zero_threshold: 0.001,
+            positive: Some(Buckets {
+                offset: 2,
+                bucket_counts: vec![1, 2, 3],
+            }),
+            negative: Some(Buckets {
+                offset: -1,
+                bucket_counts: vec![1],
+            }),
+            ..Default::default()
         };
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![dp],
+            AggregationTemporality::Cumulative,
+        );
+        let rm = resource_metrics(vec![], vec![metric]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.histogram_points.len(), 1);
+        let sample = &out.histogram_points[0].sample;
+        assert_eq!(sample.value.scale, 3);
+        assert_eq!(sample.value.zero_threshold, 0.001);
+        assert_eq!(sample.value.sum, Some(12.5));
+        assert_eq!(
+            sample.value.positive_spans,
+            vec![HistogramSpan {
+                offset: 2,
+                length: 3
+            }]
+        );
+        assert_eq!(
+            sample.value.negative_spans,
+            vec![HistogramSpan {
+                offset: -1,
+                length: 1
+            }]
+        );
+        assert_eq!(
+            sample.value.counts,
+            HistogramCounts::Int {
+                zero_count: 1,
+                count: 8,
+                positive: vec![1, 2, 3],
+                negative: vec![1],
+            }
+        );
+    }
+
+    #[test]
+    fn exponential_histogram_delta_temporality_rejected() {
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                ..Default::default()
+            }],
+            AggregationTemporality::Delta,
+        );
         let rm = resource_metrics(vec![], vec![metric]);
         let out = normalize_metrics(
             &tenant(),
@@ -1881,13 +2219,140 @@ mod tests {
             1_000,
         );
         assert!(out.points.is_empty());
+        assert!(out.histogram_points.is_empty());
         assert_eq!(
             out.rejected,
-            vec![Rejection::UnsupportedMetricType {
-                metric_type: "exponential_histogram",
-                count: 3,
-            }]
+            vec![Rejection::UnsupportedTemporality { count: 1 }]
         );
+    }
+
+    #[test]
+    fn exponential_histogram_custom_buckets_scale_rejected() {
+        // OTLP has no field for custom bucket boundaries; a scale == -53
+        // (Prometheus native-histogram custom-buckets sentinel) has nothing
+        // to attach it to and is rejected, not silently coerced.
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                scale: -53,
+                ..Default::default()
+            }],
+            AggregationTemporality::Cumulative,
+        );
+        let rm = resource_metrics(vec![], vec![metric]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.histogram_points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::NativeHistogramScaleUnsupported { scale: -53 }]
+        );
+    }
+
+    #[test]
+    fn exponential_histogram_scale_below_minimum_rejected() {
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                scale: -54,
+                ..Default::default()
+            }],
+            AggregationTemporality::Cumulative,
+        );
+        let rm = resource_metrics(vec![], vec![metric]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.histogram_points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::NativeHistogramScaleUnsupported { scale: -54 }]
+        );
+    }
+
+    #[test]
+    fn exponential_histogram_count_below_bucket_sum_rejected() {
+        // count (1) is less than zero_count (0) plus the bucket sum (5): the
+        // segment reader would treat this as corrupted, so it is rejected
+        // typed at admission instead of ever being written.
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_000,
+            count: 1,
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![5],
+            }),
+            ..Default::default()
+        };
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![dp],
+            AggregationTemporality::Cumulative,
+        );
+        let rm = resource_metrics(vec![], vec![metric]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.histogram_points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::NativeHistogramCountInconsistent]
+        );
+    }
+
+    #[test]
+    fn exponential_histogram_min_max_and_exemplars_dropped_informationally() {
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_000,
+            min: Some(0.1),
+            max: Some(9.9),
+            exemplars: vec![
+                Exemplar {
+                    time_unix_nano: 999,
+                    ..Default::default()
+                },
+                Exemplar {
+                    time_unix_nano: 998,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![dp],
+            AggregationTemporality::Cumulative,
+        );
+        let rm = resource_metrics(vec![], vec![metric]);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert_eq!(out.histogram_points.len(), 1);
+        assert_eq!(
+            out.rejected,
+            vec![
+                Rejection::HistogramMinMaxDropped { count: 1 },
+                Rejection::HistogramExemplarsDropped { count: 2 },
+            ]
+        );
+        for r in &out.rejected {
+            assert_eq!(r.rejected_count(), 0);
+        }
     }
 
     // --- delta sums rejected ---
