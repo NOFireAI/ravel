@@ -17,7 +17,12 @@
 //! - `NUMBER_DATA_POINTS`: `id` (UInt32, populated whenever the point has
 //!   attrs, so `NUMBER_DP_ATTRS` has something to reference), `parent_id`
 //!   (UInt16, FK to the root table's `id`), `time_unix_nano`
-//!   (Timestamp(Nanosecond)), `double_value` (Float64).
+//!   (Timestamp(Nanosecond)), `double_value` (Float64), `flags` (UInt32,
+//!   `DataPointFlags` bits, mirroring the histogram/summary tables' own
+//!   `flags` column). This encoder never emits `int_value`: exercising the
+//!   `double_value`-absent/int-only decode path takes a hand-built
+//!   `RecordBatch` in the differential test, since one Arrow IPC schema is
+//!   fixed for a `MetricsStreamEncoder`'s lifetime.
 //! - `NUMBER_DP_ATTRS`: `parent_id` (UInt32, FK to `NUMBER_DATA_POINTS.id`),
 //!   `key` (Utf8), `type` (UInt8, an AnyValue discriminant per otap-spec.md
 //!   section 5.5.1: 1=String, 2=Bool, 3=Int, 4=Double; `AttrValue::Complex`
@@ -98,6 +103,7 @@ pub struct AttrRow {
 pub struct DataPointRow {
     pub time_unix_nano: i64,
     pub value: f64,
+    pub flags: u32,
     pub attrs: Vec<AttrRow>,
 }
 
@@ -221,6 +227,7 @@ fn data_points_schema() -> Schema {
             false,
         ),
         Field::new("double_value", DataType::Float64, false),
+        Field::new("flags", DataType::UInt32, false),
     ])
 }
 
@@ -565,6 +572,7 @@ impl MetricsStreamEncoder {
         let mut dp_parent_ids = Vec::new();
         let mut dp_times = Vec::new();
         let mut dp_values = Vec::new();
+        let mut dp_flags = Vec::new();
         let mut attr_builder = AttrColumnBuilder::default();
 
         for metric in metrics {
@@ -595,6 +603,7 @@ impl MetricsStreamEncoder {
                 dp_parent_ids.push(metric_id);
                 dp_times.push(dp.time_unix_nano);
                 dp_values.push(dp.value);
+                dp_flags.push(dp.flags);
 
                 for attr in &dp.attrs {
                     attr_builder.push(dp_id, attr);
@@ -712,6 +721,7 @@ impl MetricsStreamEncoder {
                 Arc::new(UInt16Array::from(dp_parent_ids)),
                 Arc::new(TimestampNanosecondArray::from(dp_times)),
                 Arc::new(Float64Array::from(dp_values)),
+                Arc::new(UInt32Array::from(dp_flags)),
             ],
         )?;
         let attrs_batch = attr_builder.into_batch()?;

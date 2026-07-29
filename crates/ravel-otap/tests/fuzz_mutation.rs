@@ -78,6 +78,7 @@ fn representative_metrics() -> Vec<MetricRow> {
                 DataPointRow {
                     time_unix_nano: 1_000,
                     value: 0.5,
+                    flags: 0,
                     attrs: vec![AttrRow {
                         key: "host".to_string(),
                         value: AttrValue::Str("a".to_string()),
@@ -86,6 +87,7 @@ fn representative_metrics() -> Vec<MetricRow> {
                 DataPointRow {
                     time_unix_nano: 2_000,
                     value: f64::NAN,
+                    flags: 0,
                     attrs: Vec::new(),
                 },
             ],
@@ -99,6 +101,7 @@ fn representative_metrics() -> Vec<MetricRow> {
             data_points: vec![DataPointRow {
                 time_unix_nano: 3_000,
                 value: 128.0,
+                flags: 0,
                 attrs: Vec::new(),
             }],
         },
