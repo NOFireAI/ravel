@@ -97,6 +97,86 @@ impl Clock for TestClock {
     }
 }
 
+/// Wraps a `MemoryStore` and makes every `put` whose key contains
+/// `key_contains` sleep for `delay` on the injected `Clock` before
+/// delegating to the inner store. Models a backend call that is merely slow
+/// -- it always eventually succeeds, never errors -- so a test can drive
+/// the shard actor's `max_flush_lifetime` deadline past `delay` and assert
+/// the flush is abandoned rather than published (issue #182), without any
+/// real wall-clock wait: the delay only ever elapses if the test itself
+/// advances `clock` that far.
+pub struct SlowStore {
+    inner: MemoryStore,
+    clock: Arc<dyn Clock>,
+    delay: Duration,
+    key_contains: String,
+    hits: AtomicU64,
+}
+
+impl SlowStore {
+    pub fn new(
+        inner: MemoryStore,
+        clock: Arc<dyn Clock>,
+        key_contains: impl Into<String>,
+        delay: Duration,
+    ) -> Self {
+        SlowStore {
+            inner,
+            clock,
+            delay,
+            key_contains: key_contains.into(),
+            hits: AtomicU64::new(0),
+        }
+    }
+
+    /// Number of `put` calls so far whose key matched `key_contains` (and so
+    /// entered the artificial delay), regardless of whether the delay has
+    /// finished yet.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for SlowStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        if key.contains(self.key_contains.as_str()) {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.clock.sleep(self.delay).await;
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
 pub fn tenant(id: &str) -> TenantId {
     TenantId::new(id)
 }
