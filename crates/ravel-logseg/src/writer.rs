@@ -336,6 +336,12 @@ impl RlogWriter {
             block_count: u64::from(total_blocks),
             stream_count: sorted_ids.len() as u64,
             sections,
+            // L0 flush object: explicit compaction-identity sentinels (ADR-0032).
+            // The L1 compactor path sets these to real values; this writer only
+            // ever emits L0 objects.
+            level: 0,
+            input_set_hash: Vec::new(),
+            part_index: 0,
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok(object)
