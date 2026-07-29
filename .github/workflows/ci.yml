@@ -23,7 +23,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
-        uses: taiki-e/install-action@sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -66,7 +66,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
-        uses: taiki-e/install-action@sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -122,7 +122,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
-        uses: taiki-e/install-action@sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -156,7 +156,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
-        uses: taiki-e/install-action@sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -245,7 +245,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
-        uses: taiki-e/install-action@sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -289,7 +289,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
-        uses: taiki-e/install-action@sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
