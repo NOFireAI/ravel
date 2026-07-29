@@ -40,6 +40,8 @@ pub enum WriteError {
     HistogramSpanLengthZero,
     #[error("histogram bucket count vector length does not match its spans' total length")]
     HistogramBucketCountLenMismatch,
+    #[error("histogram count is inconsistent with zero_count and its bucket counts")]
+    HistogramCountInconsistent,
 
     // --- RSEG v4 only (ADR-0018, docs/compaction-retention-plan.md
     // section 4): multi-run verbatim-copy writer. v1/v2/v3 objects never
@@ -100,6 +102,8 @@ pub enum SegmentError {
     BadOrdinal(u64),
     #[error("label dictionary entry is not valid UTF-8")]
     BadUtf8,
+    #[error("label dictionary has the same string at two different ordinals")]
+    DuplicateDictString,
     #[error("stored data is truncated")]
     Truncated,
     #[error("stored data has trailing bytes past the declared structure")]
