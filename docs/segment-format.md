@@ -272,10 +272,16 @@ Entry `p` indexes series `p*stride` and heads the window covering ids
 `[p*stride, (p+1)*stride)` (the last runs to the SERIES_IDS payload end).
 Chunk `k` covers series `[first_index, first_index + n)`; the directory is
 dense, `first_index` running `0, K, 2K, ...`. A reader rejects
-`version != 1` (`UnsupportedSparseIndexVersion`) and a zero stride. SERIES_IDX
-is small, always fetched whole, and covered by its ordinary `Section.crc32c`;
-the per-window and per-chunk crc32c it carries verify the *other* sections'
-range-GETs.
+`version != 1` (`UnsupportedSparseIndexVersion`) and a zero stride. Beyond
+that, `parse_series_idx` fully validates the section's internal structure
+before any lookup runs: `sparse_count`/`chunk_count` must match
+`series_count`/stride, each entry's `ids_offset` and `window_len` must match
+their formulas exactly, and the chunk directory's `first_index`/`n` must form
+the dense `0, K, 2K, ...` chain with no gap or overlap. Any violation is
+`BadSparseIndex`, so a corrupt-but-crc-consistent index fails to parse rather
+than silently answering lookups as absent. SERIES_IDX is small, always
+fetched whole, and covered by its ordinary `Section.crc32c`; the per-window
+and per-chunk crc32c it carries verify the *other* sections' range-GETs.
 
 ### SERIES_META_CHUNKS (kind 9)
 
