@@ -17,20 +17,19 @@
 //! response reports a rejected-point count, and
 //! [`Rejection::rejected_count`] gives the multiplier for a rejection that
 //! covers more than one point (an oversized request, an unsupported metric
-//! type). Not every multi-point rejection uses that mechanism, though. A
-//! resource-scoped rejection materializes one `Rejection` per data point
-//! under the resource (the `repeat_n` in `normalize_resource`), so the
-//! partial-success message repeats the same reason once per point rather
-//! than carrying a single group-scoped rejection with the count.
-//! `rejected_count` exists to make the group-scoped encoding possible, but
-//! the resource path does not yet use it.
+//! type). A resource-scoped rejection (every point under a `ResourceMetrics`
+//! whose resource labels failed to build) uses [`Rejection::Grouped`] for the
+//! same purpose: one `Rejection` value carries the shared reason plus the
+//! point count it covers, instead of `normalize_resource` materializing one
+//! clone per point (issue #209; see also finding a8-F07 in
+//! `docs/reviews/2026-07-27-storage-engine-quality-audit/a8-ingest-otlp.md`,
+//! which flagged the per-point materialization cost). The counting itself
+//! (what `rejected_count` sums to) was already correct before #209 and is
+//! unchanged by it; #209 only changes how that count is represented in
+//! memory.
 //!
 //! Cross-reference (not corrected here): decoding the full body before the
-//! request-size check, and the per-point materialization of resource
-//! rejections, are behavior gaps recorded as finding a8-F07 in
-//! `docs/reviews/2026-07-27-storage-engine-quality-audit/a8-ingest-otlp.md`.
-//! This doc describes the admission model as it is; any correctness change
-//! belongs to a separate ticket.
+//! request-size check is a separate behavior gap, also recorded under a8-F07.
 
 /// Admission limits checked at OTLP ingest, before allocating per-point
 /// label structures.
@@ -226,6 +225,16 @@ pub enum Rejection {
         *value as f64
     )]
     IntegerValuePrecisionLoss { value: i64 },
+
+    /// `reason` applied identically to `count` data points that share one
+    /// scope (currently: every point under a `ResourceMetrics` whose
+    /// resource labels failed to build). Represents the same information as
+    /// `count` clones of `reason` without materializing them (#209).
+    #[error("{reason} (rejecting {count} data points under it)")]
+    Grouped {
+        reason: Box<Rejection>,
+        count: usize,
+    },
 }
 
 impl Rejection {
@@ -239,7 +248,8 @@ impl Rejection {
             | Rejection::MetricNameTooLong { count, .. }
             | Rejection::EmptyMetricName { count }
             | Rejection::UnsupportedMetricType { count, .. }
-            | Rejection::UnsupportedTemporality { count } => *count,
+            | Rejection::UnsupportedTemporality { count }
+            | Rejection::Grouped { count, .. } => *count,
             Rejection::HistogramMinMaxDropped { .. }
             | Rejection::HistogramExemplarsDropped { .. }
             | Rejection::IntegerValuePrecisionLoss { .. } => 0,
@@ -294,5 +304,15 @@ mod tests {
             Rejection::DuplicateLabelName("x".to_string()).rejected_count(),
             1
         );
+    }
+
+    #[test]
+    fn grouped_rejected_count_is_the_carried_count_not_one() {
+        let r = Rejection::Grouped {
+            reason: Box::new(Rejection::ComplexAttributeValue),
+            count: 100_000,
+        };
+        assert_eq!(r.rejected_count(), 100_000);
+        assert!(r.to_string().contains("100000"));
     }
 }
