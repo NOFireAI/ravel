@@ -1426,6 +1426,9 @@ mod v4_tests {
     }
 
     fn sample_histogram_value(seed: i32) -> HistogramValue {
+        let zero_count = 1;
+        let positive = vec![2, (seed.unsigned_abs()) as u64 + 1];
+        let count = zero_count + positive.iter().sum::<u64>();
         HistogramValue {
             scale: 3,
             zero_threshold: 0.001,
@@ -1437,9 +1440,9 @@ mod v4_tests {
             }],
             negative_spans: vec![],
             counts: HistogramCounts::Int {
-                zero_count: 1,
-                count: 4,
-                positive: vec![2, (seed.unsigned_abs()) as u64 + 1],
+                zero_count,
+                count,
+                positive,
                 negative: vec![],
             },
             reset_hint: ResetHint::Unknown,
