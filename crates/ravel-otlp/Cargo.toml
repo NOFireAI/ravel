@@ -8,11 +8,14 @@ rust-version.workspace = true
 [dependencies]
 ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
 opentelemetry-proto = { workspace = true }
 thiserror = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

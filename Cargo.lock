@@ -3897,7 +3897,10 @@ dependencies = [
 name = "ravel-otlp"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "hex",
  "opentelemetry-proto",
+ "ravel-logseg",
  "ravel-segment",
  "ravel-types",
  "thiserror",
