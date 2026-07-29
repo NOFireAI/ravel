@@ -31,6 +31,32 @@ executors.
   workdir is destroyed (this happened; see the 2026-07-27 audit report,
   section 10).
 
+## Merging fleet results
+
+- A real (non-fast-forward-only) merge conflict between a fleet result and
+  current `main` can mean two different things: overlapping edits (resolve
+  textually), or a structural decision landed on `main` while the task was
+  in flight and the task's whole premise is now stale (an ADR, a format
+  version change, a crate rewritten from scratch). Before resolving, read
+  the commit(s) on `main` that conflict — `git log --oneline
+  <merge-base>..origin/main -- <conflicting paths>`, then the full commit
+  body of whatever touched the same files. Forcing a stale-premise branch
+  through reintroduces code or assumptions a deliberate decision already
+  removed.
+- This happened twice on 2026-07-28: ADR-0027 (single-RSEG-version
+  pre-release) landed mid-flight under two long-running tickets built on
+  the multi-version model it deleted. One had a partial file-level
+  collision (some files merged clean, one file conflicted because it had
+  already been rewritten for the new reality); the other's whole
+  dependency chain (a path dev-dependency on a crate independently
+  rewritten from scratch) needed re-targeting, not just conflict
+  resolution.
+- If the underlying logic (not the version/format-specific plumbing) is
+  still valuable once the premise moves, don't discard it and don't force
+  it through: preserve the branch, comment on the relevant issue with a
+  pointer to it as reference material, and let a follow-up port it onto
+  the new reality deliberately.
+
 ## Invariants (violating these is never a valid trade-off)
 
 - Object storage is the source of truth. No durability may depend on local
