@@ -226,7 +226,8 @@ fn measure_sparse(obj: &[u8], footer: &Footer, has_sparse: bool, targets: &[[u8;
         let stored = m.range(obj, chunks_off + cl.frame_offset, cl.frame_stored_len);
         let frame =
             verify_and_decompress_chunk_frame(stored, &cl, ReaderLimits::default()).expect("frame");
-        let runs = decode_chunk_runs(&frame, cl.row_in_chunk, &footer).expect("chunk runs");
+        let runs = decode_chunk_runs(&frame, cl.row_in_chunk, &footer, ReaderLimits::default())
+            .expect("chunk runs");
         fetch_run_pages(&mut m, obj, &footer, &runs[0]);
     }
     m
