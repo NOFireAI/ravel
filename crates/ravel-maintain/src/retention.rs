@@ -46,7 +46,7 @@ use crate::clock::Clock;
 use crate::compact::{CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
-use crate::read::{BucketListing, list_bucket};
+use crate::read::{BucketListing, list_bucket, verify_commit_key};
 use crate::sweep::LeaseCheck;
 
 /// The outcome of one retention pass over a bucket.
@@ -234,35 +234,39 @@ async fn physical_sweep(
     listing: &BucketListing,
     tombstone_key: &str,
 ) -> Result<RetentionOutcome> {
-    // Resolve the derived data-object and part keys BEFORE deleting the
-    // records that name them (records are deleted first).
+    // Resolve the L0 data-object keys BEFORE deleting the commit records that
+    // name them (records are deleted first).
     let mut l0_data_keys: Vec<String> = Vec::new();
     for key in &listing.commit_keys {
         match store.get(key, GetRange::Full).await {
             Ok(got) => {
                 let record = record::decode(&got.data)?;
+                // The record's key must reconstruct to the key we listed it at
+                // (ADR-0010 §7): a corrupted-but-decodable record's own fields,
+                // which reconstruct_data_key trusts, must not name an object
+                // outside the bucket this key implies.
+                verify_commit_key(&record, key)?;
                 l0_data_keys.push(keys::reconstruct_data_key(&record)?);
             }
             Err(StoreError::NotFound) => {}
             Err(e) => return Err(MaintainError::Store(e)),
         }
     }
-    let mut l1_part_keys: Vec<String> = Vec::new();
-    for key in &listing.compaction_record_keys {
-        match store.get(key, GetRange::Full).await {
-            Ok(got) => {
-                let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
-                    MaintainError::Invariant(format!("compaction record decode failed: {e}"))
-                })?;
-                keys::verify_compaction_record_key(&record, key)?;
-                for part in &record.parts {
-                    l1_part_keys.push(keys::reconstruct_l1_part_key(&record, part)?);
-                }
-            }
-            Err(StoreError::NotFound) => {}
-            Err(e) => return Err(MaintainError::Store(e)),
-        }
-    }
+    // Discover L1 parts by a fresh LIST of the bucket's own l1/ prefix (the
+    // same LIST bucket_is_empty_but_tombstone uses), not by reconstructing
+    // keys from compaction records. This makes the L1 delete independent of
+    // whether the compaction record that named those parts still exists, so a
+    // crash between the compaction-record delete and the L1-part delete still
+    // converges: the next pass re-lists whatever l1/ objects are physically
+    // present and deletes them (ADR-0019 decision 4; docs/consistency-model.md
+    // targets "everything in a tombstoned bucket", not "the parts its records
+    // name").
+    let l1_prefix = l1_bucket_prefix(bucket);
+    let l1_part_keys: Vec<String> = list_all(store, &l1_prefix)
+        .await?
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect();
 
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
@@ -345,7 +349,11 @@ fn l1_bucket_prefix(bucket: &Bucket) -> String {
 /// GET, decode, and validate one L0 commit record.
 async fn load_commit_record(store: &dyn ObjectStoreBackend, key: &str) -> Result<CommitRecord> {
     let got = store.get(key, GetRange::Full).await?;
-    Ok(record::decode(&got.data)?)
+    let record = record::decode(&got.data)?;
+    // The record's key must reconstruct to the key we listed it at (ADR-0010
+    // §7): the same identity discipline load_inputs applies to every input.
+    verify_commit_key(&record, key)?;
+    Ok(record)
 }
 
 /// GET, decode, and key-verify one compaction record (ADR-0010 §7).

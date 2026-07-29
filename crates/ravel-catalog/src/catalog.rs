@@ -1604,8 +1604,12 @@ mod tests {
 
         // Retire the bucket and remove the commit record (post physical sweep).
         write_tombstone(&store, 0, skewed_bucket).await;
-        let commit_key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("commit key");
-        store.delete(&commit_key).await.expect("delete commit record");
+        let commit_key =
+            keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("commit key");
+        store
+            .delete(&commit_key)
+            .await
+            .expect("delete commit record");
 
         let snapshot = catalog
             .resolve(
@@ -1657,8 +1661,12 @@ mod tests {
         // mid-sweep state: record gone, tombstone present). The cache still
         // holds the record.
         write_tombstone(&store, 0, bucket_hour).await;
-        let commit_key = keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("commit key");
-        store.delete(&commit_key).await.expect("delete commit record");
+        let commit_key =
+            keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("commit key");
+        store
+            .delete(&commit_key)
+            .await
+            .expect("delete commit record");
 
         // Resolve WITH the token again. The listing pass observes the tombstone
         // and invalidates the bucket's cache; the token path then misses the

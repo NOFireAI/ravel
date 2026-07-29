@@ -419,6 +419,81 @@ async fn partial_sweep_crash_then_converges() {
     run(Sig::Logs).await;
 }
 
+/// A crash during the physical sweep's L1-part delete (the step whose set of
+/// keys the pre-fix code reconstructed from the compaction records it had
+/// already deleted) still converges. The compaction records are deleted before
+/// the L1 delete, so the pre-fix code re-listed an empty compaction-record set
+/// on the next pass, computed no L1 keys, and left the physical `l1/` objects
+/// orphaned forever (SweptPartial on every subsequent pass, tombstone stuck).
+/// The fix discovers L1 keys by a fresh LIST of the bucket's `l1/` prefix, so
+/// the next pass deletes whatever is physically present regardless of the
+/// compaction record's fate and reaches `Swept`.
+#[tokio::test]
+async fn l1_delete_crash_then_converges() {
+    async fn run(sig: Sig) {
+        let inner = MemoryStore::new();
+        // The first L1-part delete (key contains "/l1/") faults once, after the
+        // commit records, compaction records, and L0 data are already deleted.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Delete, ScriptedFault::Timeout)
+                .with_key_contains("/l1/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(inner, plan);
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        let bucket = seed_two(&store, sig).await;
+        let config = cfg();
+
+        // Compact so the bucket holds L0 records, a compaction record, and L1
+        // parts, then tombstone it.
+        let compacted = compact_bucket(&store, &clock, &config, &bucket)
+            .await
+            .expect("compact");
+        assert!(matches!(compacted, CompactionOutcome::Compacted { .. }));
+        let retention = retention_at_floor(&config);
+        let out = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+            .await
+            .expect("tombstone pass");
+        assert_eq!(out, RetentionOutcome::Tombstoned);
+
+        // Past the horizon: the physical sweep deletes records, compaction
+        // records, and L0 data, then the first L1-part delete faults and aborts
+        // the pass. The tombstone (deleted last) survives.
+        clock.set(created + config.protection_horizon_ns + 1);
+        let err =
+            retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket).await;
+        assert!(err.is_err(), "the L1-part delete fault aborts the sweep");
+        assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
+        assert!(
+            has_tombstone(&store, &bucket).await,
+            "tombstone survives the crash, so exclusion still holds"
+        );
+        // The compaction record is already gone, yet the physical l1/ objects
+        // remain: exactly the orphaned-part state the pre-fix code could not
+        // recover from.
+        assert!(
+            !bucket_is_empty(&store, &bucket).await,
+            "L1 parts remain after the faulted pass"
+        );
+
+        // Re-run: the fault is spent. The fix re-LISTs the l1/ prefix directly
+        // (no surviving compaction record needed), deletes the orphaned parts,
+        // verifies the bucket empty, and deletes the tombstone: fully retired.
+        let swept = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+            .await
+            .expect("converging sweep");
+        assert_eq!(swept, RetentionOutcome::Swept);
+        assert!(!has_tombstone(&store, &bucket).await);
+        assert!(
+            bucket_is_empty(&store, &bucket).await,
+            "records and parts gone, l1/ prefix verified empty"
+        );
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+}
+
 // --- Full retention lifecycle over a non-compacted bucket ------------------
 
 /// End to end over a never-compacted bucket: sealed and expired -> tombstoned
