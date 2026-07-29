@@ -15,13 +15,13 @@
 # query for the same reason. Every entry is `mode: unordered` for the same
 # reason as selectors.txt (ADR-0021 decision 3).
 #
-# `ravel-promql` carries no warning annotations yet (see this ticket's final
-# report on the plan doc's section 2.2 claim vs. the actual HTTP envelope):
-# the missing-+Inf and non-monotonic entries below are scenarios Prometheus
-# is expected to attach a warning to, which the differential comparator
-# checks for presence-equality. Until warning plumbing exists, these two
-# entries are expected to fail that specific check even though their
-# computed values are correct.
+# `ravel-promql` now carries warning/info annotations (issue #178): the
+# missing-+Inf and non-monotonic entries below are scenarios Prometheus
+# attaches a warning to, and `ravel-promql` now raises the matching warning
+# through the same evaluator path, so the differential comparator's
+# presence-equality check on both passes rather than being an expected
+# failure. Verified against the real pinned Prometheus binary after #178
+# landed (0 mismatches on this file's entries).
 
 name: instant_histogram_quantile_wellformed_buckets
 query: histogram_quantile(0.9, diff_histogram_bucket{variant="wellformed"})
