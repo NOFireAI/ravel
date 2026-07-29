@@ -25,7 +25,7 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use proptest::prelude::*;
-use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -129,6 +129,7 @@ async fn write_segment(
         writer_epoch: spec.writer_epoch,
         writer_seq: spec.writer_seq,
         created_unix_ns: spec.created_unix_ns,
+        level: SegmentLevel::L0,
     }
 }
 
