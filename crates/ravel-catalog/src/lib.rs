@@ -21,7 +21,7 @@ pub use config::{
 };
 pub use error::CatalogError;
 pub use fold::{FoldReport, Transaction};
-pub use snapshot::{SegmentRef, Snapshot};
+pub use snapshot::{SegmentLevel, SegmentRef, Snapshot};
 pub use snapshot_format::{
     DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, DecodedPostings,
     HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits, SnapshotFormatError,

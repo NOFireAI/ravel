@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::catalog::Catalog;
 use crate::error::CatalogError;
 use crate::fold::head_object_key;
-use crate::snapshot::SegmentRef;
+use crate::snapshot::{SegmentLevel, SegmentRef};
 use crate::snapshot_format::{self, DecodedPart, DecodedPostings, PartLimits, PostingsLimits};
 
 /// A usable snapshot: its watermark and every part HEAD named, already
@@ -445,5 +445,6 @@ fn build_segment_ref_from_entry(
         writer_epoch: entry.writer_epoch,
         writer_seq: entry.writer_seq,
         created_unix_ns: entry.created_unix_ns,
+        level: SegmentLevel::L0,
     })
 }
