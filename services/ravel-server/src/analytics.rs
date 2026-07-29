@@ -85,11 +85,10 @@ use axum::routing::post;
 use ravel_analytics::{
     AnalyticsError, ChangeKind, ChangePointParams, ChangePointResult, SummaryParams, SummaryResult,
 };
-use ravel_catalog::CatalogError;
 use ravel_ingest::Clock;
 use ravel_promql::Value;
-use ravel_query::http::TenantResolver;
-use ravel_query::{FetchError, QueryEngine, QueryError};
+use ravel_query::http::{QueryErrorResponse, TenantResolver};
+use ravel_query::{QueryEngine, QueryError};
 use ravel_types::{CommitToken, LabelSet, Sample, TenantHash};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -104,15 +103,6 @@ const MS_PER_SEC: f64 = 1_000.0;
 /// ADR-0028 decision 4: an analytics call processes at most this many series;
 /// more is a typed error before any op runs, never a silent truncation.
 const MAX_SERIES: usize = 1000;
-
-/// Redaction messages, kept byte-identical to `ravel-query`'s HTTP boundary
-/// (crates/ravel-query/src/http/error.rs) so a storage-layer fault surfaced by
-/// this endpoint is indistinguishable from the same fault surfaced by
-/// `/api/v1/query_range`, and equally free of the object key or tenant hash
-/// its `Display` carries (a7-F02).
-const MSG_CORRUPT: &str = "stored data failed integrity validation";
-const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
-const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; retry";
 
 /// Shared state for the analytics route: the query engine (the same instance
 /// the Prometheus-shaped routes use, so the evaluation is byte-for-byte the
@@ -448,123 +438,20 @@ impl ApiError {
         }
     }
 
-    /// Map a `QueryError` exactly as crates/ravel-query/src/http/error.rs maps
-    /// it, including the a7-F02 redaction of storage-layer faults. This
-    /// duplication is deliberate: that mapping lives in a private module of
-    /// ravel-query and cannot be imported, and the endpoint must keep the same
-    /// status contract as `/api/v1/query_range`.
+    /// Map a `QueryError` through `ravel-query`'s public HTTP mapping, so this
+    /// endpoint keeps the exact status contract of `/api/v1/query_range`,
+    /// including the a7-F02 redaction of storage-layer faults, from one shared
+    /// source rather than a copy that could drift (issue #219).
     fn from_query(err: QueryError) -> Self {
-        if let Some(redacted) = redacted_storage_message(&err) {
-            tracing::warn!(
-                error = %err,
-                client_message = redacted,
-                "storage-layer analytics error redacted from client response",
-            );
-            return if redacted == MSG_CORRUPT {
-                ApiError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    error_type: "internal",
-                    message: redacted.to_string(),
-                }
-            } else {
-                ApiError {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    error_type: "unavailable",
-                    message: redacted.to_string(),
-                }
-            };
-        }
-        match &err {
-            QueryError::Parse(_)
-            | QueryError::NonPositiveStep { .. }
-            | QueryError::InvalidRange { .. }
-            | QueryError::TimeOverflow => ApiError::bad_request(err.to_string()),
-            QueryError::Unsupported { .. }
-            | QueryError::TooManySegments { .. }
-            | QueryError::TooManySeries { .. }
-            | QueryError::TooManySamples { .. } => ApiError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                error_type: "execution",
-                message: err.to_string(),
-            },
-            QueryError::DeadlineExceeded { .. } => ApiError {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                error_type: "timeout",
-                message: err.to_string(),
-            },
-            QueryError::Eval(inner) => from_eval_error(inner, &err),
-            // Redacted above by `redacted_storage_message`; a catch-all keeps
-            // the match total over the `#[non_exhaustive]` enum and defaults to
-            // the safe transient message rather than echoing an unknown error.
-            _ => {
-                tracing::warn!(
-                    error = %err,
-                    client_message = MSG_UNAVAILABLE,
-                    "analytics error redacted from client response",
-                );
-                ApiError {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    error_type: "unavailable",
-                    message: MSG_UNAVAILABLE.to_string(),
-                }
-            }
-        }
-    }
-}
-
-/// The redacted, class-specific message for a storage-layer fault, or `None`
-/// for errors whose `Display` is already safe to show the caller. Mirrors
-/// crates/ravel-query/src/http/error.rs so the two boundaries stay in lockstep.
-fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
-    match err {
-        QueryError::Fetch(fetch) => Some(match fetch {
-            FetchError::Corrupt { .. } => MSG_CORRUPT,
-            FetchError::Store { .. } | FetchError::EtagChanged { .. } => MSG_UNAVAILABLE,
-        }),
-        QueryError::Catalog(catalog) => Some(match catalog {
-            CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
-            CatalogError::Reconstruction { .. }
-            | CatalogError::FieldMismatch { .. }
-            | CatalogError::Record(_)
-            | CatalogError::Key(_) => MSG_CORRUPT,
-            _ => MSG_UNAVAILABLE,
-        }),
-        QueryError::NonMonotonicSamples { .. } => Some(MSG_CORRUPT),
-        QueryError::SnapshotInvalidated => Some(MSG_UNAVAILABLE),
-        _ => None,
-    }
-}
-
-fn from_eval_error(inner: &ravel_promql::Error, outer: &QueryError) -> ApiError {
-    use ravel_promql::Error as E;
-    match inner {
-        E::Parse(_)
-        | E::TimeOverflow
-        | E::NonPositiveStep { .. }
-        | E::InvalidRange { .. }
-        | E::WrongType { .. } => ApiError::bad_request(outer.to_string()),
-        E::Unsupported { .. }
-        | E::TooManyPoints { .. }
-        | E::AmbiguousMatch { .. }
-        | E::InvalidRegex { .. }
-        | E::InvalidLabelName { .. } => ApiError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            error_type: "execution",
-            message: outer.to_string(),
-        },
-        // Source can wrap raw backend text; redact it, and fall through the
-        // same way for any future variant of the `#[non_exhaustive]` enum.
-        _ => {
-            tracing::warn!(
-                error = %outer,
-                client_message = MSG_UNAVAILABLE,
-                "analytics eval error redacted from client response",
-            );
-            ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                error_type: "unavailable",
-                message: MSG_UNAVAILABLE.to_string(),
-            }
+        let QueryErrorResponse {
+            status,
+            error_type,
+            message,
+        } = QueryErrorResponse::from_query_error(err);
+        ApiError {
+            status,
+            error_type,
+            message,
         }
     }
 }
@@ -827,13 +714,15 @@ mod tests {
             StatusCode::GATEWAY_TIMEOUT
         );
 
-        // Storage faults are redacted, never echoed.
+        // Storage faults are redacted, never echoed. The redacted messages are
+        // single-sourced from ravel-query (issue #219), so assert against those
+        // public constants rather than a local copy.
         let corrupt = ApiError::from_query(QueryError::NonMonotonicSamples { prev: 2, next: 1 });
         assert_eq!(corrupt.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(corrupt.message, MSG_CORRUPT);
+        assert_eq!(corrupt.message, ravel_query::http::MSG_CORRUPT);
 
         let unavailable = ApiError::from_query(QueryError::SnapshotInvalidated);
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(unavailable.message, MSG_UNAVAILABLE);
+        assert_eq!(unavailable.message, ravel_query::http::MSG_UNAVAILABLE);
     }
 }
