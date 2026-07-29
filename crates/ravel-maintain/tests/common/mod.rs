@@ -347,6 +347,148 @@ fn slice(bytes: &[u8], range: (u64, u64)) -> &[u8] {
     &bytes[range.0 as usize..(range.0 + range.1) as usize]
 }
 
+// --- RLOG (logs) fixtures --------------------------------------------------
+//
+// The sweeper is signal-generic, so its crash-matrix suite runs once over an
+// RSEG (metrics) fixture and once over an RLOG (logs) fixture. These helpers
+// seed real, compactable L0 `.rlog` objects exactly as the ingest log shard
+// would, so `compact_bucket` produces a genuine compaction record and L1
+// parts for the logs bucket (mirroring `rlog.rs`'s own test seeding).
+
+/// The logs bucket for the shared `SHARD`/`HOUR` (Signal::Logs).
+pub fn logs_bucket() -> Bucket {
+    Bucket::new(tenant_hash(), Signal::Logs, SHARD, HOUR)
+}
+
+/// Synthetic log stream `n`: its id and canonical resource+scope blob, the id
+/// being the true hash of the blob (real stream identity, never a placeholder).
+fn log_stream_ident(n: u32) -> (ravel_types::logstream::LogStreamId, Vec<u8>) {
+    use ravel_types::logstream::{AttrValue, log_stream_id};
+    let res = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(format!("svc{n}")),
+    )];
+    let id = log_stream_id(&res, "scope", "1", &[]);
+    let blob = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]);
+    (id, blob)
+}
+
+fn log_record(stream_n: u32, ts: i64, body: &str) -> ravel_logseg::LogRecord {
+    let (stream_id, stream_attrs) = log_stream_ident(stream_n);
+    ravel_logseg::LogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// Seed one L0 `.rlog` input (data object + commit record) for the logs
+/// bucket, exactly as the ingest log shard would. Returns the commit key.
+pub async fn seed_rlog_input(
+    store: &dyn ObjectStoreBackend,
+    writer_id: Uuid,
+    epoch: u64,
+    seq: u64,
+    records: &[ravel_logseg::LogRecord],
+) -> String {
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogConfig, RlogWriter};
+    let th = tenant_hash();
+    let identity = ObjectIdentity {
+        tenant_hash: th.0,
+        shard: SHARD,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: epoch,
+        writer_seq: seq,
+    };
+    let mut w = RlogWriter::new(RlogConfig::default(), identity);
+    for r in records {
+        w.push(r.clone()).expect("push log record");
+    }
+    let bytes = Bytes::from(w.finish().expect("finish rlog L0"));
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+    let data_key = keys::data_key(
+        &th,
+        Signal::Logs,
+        SHARD,
+        writer_id,
+        epoch,
+        seq,
+        &content_hash,
+    )
+    .expect("data key");
+    store
+        .put(&data_key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("put rlog data");
+
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    let mut streams = std::collections::BTreeSet::new();
+    for r in records {
+        min_ts = min_ts.min(r.ts_ns);
+        max_ts = max_ts.max(r.ts_ns);
+        streams.insert(r.stream_id);
+    }
+    let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+    let rec = record::build(NewCommitRecord {
+        tenant_hash: th,
+        signal: Signal::Logs,
+        shard: SHARD,
+        writer_id,
+        writer_epoch: epoch,
+        writer_seq: seq,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: streams.len() as u64,
+        min_event_ts_ns: min_ts,
+        max_event_ts_ns: max_ts,
+        min_ingest_ts_ns: created,
+        max_ingest_ts_ns: created,
+        segment_format_version: 2,
+        created_unix_ns: created,
+        ingest_hour_bucket: HOUR,
+    })
+    .expect("build logs commit record");
+    let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+    store
+        .put(&commit_key, record::encode(&rec), PutOptions::default())
+        .await
+        .expect("put logs commit record");
+    commit_key
+}
+
+/// Seed two compactable L0 `.rlog` inputs into the logs bucket, the RLOG
+/// analogue of [`seed`]/[`two_inputs`] for metrics. Returns the logs bucket.
+pub async fn seed_rlog_two_inputs(store: &dyn ObjectStoreBackend) -> Bucket {
+    seed_rlog_input(
+        store,
+        Uuid::from_u128(1),
+        10,
+        1,
+        &[log_record(0, 10, "alpha"), log_record(1, 20, "bravo")],
+    )
+    .await;
+    seed_rlog_input(
+        store,
+        Uuid::from_u128(2),
+        10,
+        2,
+        &[log_record(0, 15, "charlie"), log_record(2, 5, "delta")],
+    )
+    .await;
+    logs_bucket()
+}
+
 /// Convenience: full-object GET as `Bytes`.
 pub async fn get_full(store: &dyn ObjectStoreBackend, key: &str) -> Bytes {
     use ravel_object_store::GetRange;

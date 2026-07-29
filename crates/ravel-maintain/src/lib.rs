@@ -42,6 +42,7 @@ pub mod publish;
 pub mod read;
 pub mod rlog;
 pub mod scan;
+pub mod sweep;
 
 pub use bucket::Bucket;
 pub use clock::{Clock, FixedClock};
@@ -52,3 +53,7 @@ pub use error::{MaintainError, Result};
 pub use publish::PublishOutcome;
 pub use rlog::RlogCodec;
 pub use scan::{ScanReport, scan_and_compact};
+pub use sweep::{
+    LeaseCheck, NoLeases, SweepReport, sweep_orphans, sweep_shard, sweep_superseded,
+    sweep_unreferenced_parts,
+};
