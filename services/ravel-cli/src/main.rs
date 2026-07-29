@@ -2,8 +2,23 @@
 
 use clap::{Parser, Subcommand};
 use ravel_cli::{catalog, now_ns, store};
+use ravel_logseg::block::NumStat;
+use ravel_logseg::field_dir::FieldDir;
+use ravel_logseg::footer::{
+    self, COMP_NONE, COMP_ZSTD, DEFAULT_MAX_SECTION_UNCOMP, SectionDesc, kind,
+};
+use ravel_logseg::record::FieldType;
+use ravel_logseg::skip_index::SkipIndex;
+use ravel_logseg::stream_dir::StreamDir;
 use ravel_proto::segment::v1::Footer;
 use ravel_types::{Signal, TenantId, TimeRange};
+
+// Decode caps for the whole-read RLOG sections, matching `RlogReader`'s own
+// limits (crates/ravel-logseg/src/reader.rs). The inspector reads STREAM_DIR,
+// FIELD_DIR, and SKIP_IDX; a decode past these caps is `Corrupted`.
+const RLOG_MAX_STREAMS: u64 = 1 << 24;
+const RLOG_MAX_FIELDS: u64 = 1 << 20;
+const RLOG_MAX_BLOCKS: u64 = 1 << 24;
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
@@ -37,6 +52,11 @@ enum Command {
         #[command(subcommand)]
         command: SegmentCommand,
     },
+    /// Inspect an RLOG log segment (footer, sections, skip index, directories).
+    Rlog {
+        #[command(subcommand)]
+        command: RlogCommand,
+    },
     /// Fetch and decode a commit record.
     Commit {
         #[command(subcommand)]
@@ -51,6 +71,14 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SegmentCommand {
+    Inspect {
+        /// Local file path or object store key.
+        path: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RlogCommand {
     Inspect {
         /// Local file path or object store key.
         path: String,
@@ -105,6 +133,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let bytes = store::read_bytes(&cli.store, &path).await?;
             segment_inspect(&bytes)
+        }
+        Command::Rlog {
+            command: RlogCommand::Inspect { path },
+        } => {
+            let bytes = store::read_bytes(&cli.store, &path).await?;
+            rlog_inspect(&bytes)
         }
         Command::Commit {
             command: CommitCommand::Decode { key },
@@ -415,6 +449,200 @@ fn segment_inspect_v5(
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Human-readable name for a known RLOG section kind (docs/log-segment-format.md).
+fn rlog_section_kind_name(kind: u32) -> &'static str {
+    match kind {
+        kind::STREAM_DIR => "STREAM_DIR",
+        kind::FIELD_DIR => "FIELD_DIR",
+        kind::BLOCKS => "BLOCKS",
+        kind::SKIP_IDX => "SKIP_IDX",
+        kind::BLOOM => "BLOOM",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Human-readable name for a section `comp` tag (0=none, 2=zstd).
+fn rlog_comp_name(comp: u8) -> &'static str {
+    match comp {
+        COMP_NONE => "none",
+        COMP_ZSTD => "zstd",
+        _ => "unknown",
+    }
+}
+
+/// Human-readable name for a field/stat [`FieldType`] (docs/log-segment-format.md
+/// FIELD_DIR type byte: 1=str 2=i64 3=f64 4=bool 5=bytes).
+fn rlog_field_type_name(ty: FieldType) -> &'static str {
+    match ty {
+        FieldType::Str => "str",
+        FieldType::I64 => "i64",
+        FieldType::F64 => "f64",
+        FieldType::Bool => "bool",
+        FieldType::Bytes => "bytes",
+    }
+}
+
+/// Reads, crc-verifies, and decompresses one whole-read RLOG section
+/// (STREAM_DIR, FIELD_DIR, SKIP_IDX) from its footer descriptor. This mirrors
+/// `ravel_logseg`'s internal `read_section` (crates/ravel-logseg/src/reader.rs),
+/// which the crate does not expose publicly, so the inspector reconstructs the
+/// section-access path from the public `SectionDesc`. A crc mismatch, an
+/// over-cap `uncompressed_len`, or a length disagreement is a loud error, the
+/// same `Corrupted` discipline the reader applies.
+fn rlog_read_section(bytes: &[u8], desc: &SectionDesc) -> anyhow::Result<Vec<u8>> {
+    let start = usize::try_from(desc.offset)?;
+    let len = usize::try_from(desc.len)?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("section range overflows"))?;
+    let stored = bytes
+        .get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("section is out of bounds"))?;
+    if crc32c::crc32c(stored) != desc.crc32c {
+        return Err(anyhow::anyhow!(
+            "section crc32c mismatch (kind {})",
+            desc.kind
+        ));
+    }
+    if desc.uncomp_len > DEFAULT_MAX_SECTION_UNCOMP {
+        return Err(anyhow::anyhow!("section uncompressed_len over cap"));
+    }
+    match desc.comp {
+        COMP_ZSTD => {
+            let uncomp = usize::try_from(desc.uncomp_len)?;
+            let raw = zstd::bulk::decompress(stored, uncomp)
+                .map_err(|err| anyhow::anyhow!("section zstd decompress: {err}"))?;
+            if raw.len() as u64 != desc.uncomp_len {
+                return Err(anyhow::anyhow!("section decompressed length mismatch"));
+            }
+            Ok(raw)
+        }
+        COMP_NONE => {
+            if stored.len() as u64 != desc.uncomp_len {
+                return Err(anyhow::anyhow!("raw section length != uncompressed_len"));
+            }
+            Ok(stored.to_vec())
+        }
+        other => Err(anyhow::anyhow!("unknown comp tag {other}")),
+    }
+}
+
+/// Returns the descriptor for a mandatory section kind, or a typed error.
+fn rlog_section(footer: &footer::LogFooter, k: u32) -> anyhow::Result<&SectionDesc> {
+    footer
+        .section(k)
+        .ok_or_else(|| anyhow::anyhow!("missing section kind {k}"))
+}
+
+/// Prints the numeric stats attached to a skip-index entry, one per line.
+fn rlog_print_stats(stats: &[NumStat]) {
+    for st in stats {
+        println!(
+            "    stat column_id={} type={} min_bits={} max_bits={} null_count={} has_nan={}",
+            st.column_id,
+            rlog_field_type_name(st.ty),
+            st.min_bits,
+            st.max_bits,
+            st.null_count,
+            st.has_nan,
+        );
+    }
+}
+
+/// Inspects a whole RLOG object (docs/log-segment-format.md): footer identity
+/// and summary, the section table, the level-0 skip index (one line per block
+/// plus its numeric column stats), the stream directory, and the field
+/// directory. Every decode is the reader's own path, so a corrupt SKIP_IDX or a
+/// section crc mismatch surfaces as a typed error with a non-zero exit, never a
+/// panic.
+fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
+    let footer = footer::open(bytes)
+        .map_err(|err| anyhow::anyhow!("failed to parse rlog segment: {err}"))?;
+
+    println!("total_size: {}", bytes.len());
+    println!("version: {}", footer::VERSION);
+    println!("signal: {}", footer::SIGNAL_LOGS);
+    println!("tenant_hash: {}", hex::encode(footer.tenant_hash));
+    println!("shard: {}", footer.shard);
+    println!("writer_id: {}", hex::encode(footer.writer_id));
+    println!("writer_epoch: {}", footer.writer_epoch);
+    println!("writer_seq: {}", footer.writer_seq);
+    println!("min_ts_ns: {}", footer.min_ts_ns);
+    println!("max_ts_ns: {}", footer.max_ts_ns);
+    println!("min_observed_ts_ns: {}", footer.min_observed_ts_ns);
+    println!("max_observed_ts_ns: {}", footer.max_observed_ts_ns);
+    println!("record_count: {}", footer.record_count);
+    println!("block_count: {}", footer.block_count);
+    println!("stream_count: {}", footer.stream_count);
+    println!("sections:");
+    for section in &footer.sections {
+        println!(
+            "  kind={} name={} offset={} len={} comp={} uncompressed_len={}",
+            section.kind,
+            rlog_section_kind_name(section.kind),
+            section.offset,
+            section.len,
+            rlog_comp_name(section.comp),
+            section.uncomp_len,
+        );
+    }
+
+    // Skip index, level 0: the block framing and per-block stats.
+    let skip_raw = rlog_read_section(bytes, rlog_section(&footer, kind::SKIP_IDX)?)?;
+    let skip = SkipIndex::decode(&skip_raw, RLOG_MAX_BLOCKS)
+        .map_err(|err| anyhow::anyhow!("failed to decode skip index: {err}"))?;
+    println!("skip_index level 0 ({} block(s)):", skip.l0.len());
+    for (i, entry) in skip.l0.iter().enumerate() {
+        println!(
+            "  block[{i}] offset={} len={} crc32c={:08x} record_count={} \
+             ts_range=[{}, {}] stream_ref_range=[{}, {}]",
+            entry.block_offset,
+            entry.block_len,
+            entry.block_crc32c,
+            entry.record_count,
+            entry.min_ts,
+            entry.max_ts,
+            entry.min_stream_ref,
+            entry.max_stream_ref,
+        );
+        rlog_print_stats(&entry.stats);
+    }
+
+    // Stream directory: stream_id -> ordinal stream_ref and block range.
+    let stream_raw = rlog_read_section(bytes, rlog_section(&footer, kind::STREAM_DIR)?)?;
+    let stream_dir = StreamDir::decode(&stream_raw, RLOG_MAX_STREAMS)
+        .map_err(|err| anyhow::anyhow!("failed to decode stream directory: {err}"))?;
+    println!("stream_dir ({} entry(ies)):", stream_dir.len());
+    for (stream_ref, entry) in stream_dir.entries().iter().enumerate() {
+        println!(
+            "  stream_ref={} stream_id={} blob_len={} blocks=[{}, {}]",
+            stream_ref,
+            hex::encode(entry.stream_id.0),
+            entry.blob.len(),
+            entry.first_blk,
+            entry.last_blk,
+        );
+    }
+
+    // Field directory: dynamic attribute columns.
+    let field_raw = rlog_read_section(bytes, rlog_section(&footer, kind::FIELD_DIR)?)?;
+    let field_dir = FieldDir::decode(&field_raw, RLOG_MAX_FIELDS)
+        .map_err(|err| anyhow::anyhow!("failed to decode field directory: {err}"))?;
+    println!("field_dir ({} entry(ies)):", field_dir.len());
+    for entry in field_dir.entries() {
+        println!(
+            "  column_id={} name={} type={} present_blocks={} null_count={}",
+            entry.column_id,
+            entry.name,
+            rlog_field_type_name(entry.ty),
+            entry.present_blocks,
+            entry.null_count,
+        );
     }
 
     Ok(())

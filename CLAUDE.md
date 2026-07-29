@@ -91,6 +91,7 @@ task scope.
 | ravel-types | docs/adrs/0005, 0010 |
 | ravel-object-store | docs/object-store-contract.md |
 | ravel-segment | docs/segment-format.md |
+| ravel-logseg | docs/log-segment-format.md |
 | ravel-commit, ravel-catalog | docs/catalog-and-mvcc.md |
 | ravel-ingest | docs/ingest.md, docs/consistency-model.md |
 | ravel-otlp | docs/adrs/0005 (mapping note), crate module docs |

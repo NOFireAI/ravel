@@ -158,6 +158,106 @@ Field by field:
   segment is internally consistent.
 
 
+## `rlog inspect`: what's inside one log segment
+
+Log data lives in RLOG v1 objects (`.rlog`), the columnar log segment format
+(docs/log-segment-format.md, ADR-0029). RLOG is a sibling of RSEG: same
+16-byte trailer, protobuf footer, and crc32c discipline, but its own sections
+and none of the bytes. As of log storage phase 1 the format crate
+(`ravel-logseg`) ships on its own; ingest, query, and lifecycle are later
+phases, so today an RLOG object is produced by the writer directly (in tests
+and tooling) rather than by the ingest path. The command:
+
+```sh
+cargo run -p ravel-cli -- rlog inspect "t/abab.../l/l0/0000/....rlog"
+```
+
+```
+total_size: 695
+version: 1
+signal: 2
+tenant_hash: abababababababababababababababab
+shard: 3
+writer_id: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+writer_epoch: 7
+writer_seq: 42
+min_ts_ns: 100
+max_ts_ns: 250
+min_observed_ts_ns: 105
+max_observed_ts_ns: 255
+record_count: 4
+block_count: 2
+stream_count: 2
+sections:
+  kind=1 name=STREAM_DIR offset=0 len=27 comp=zstd uncompressed_len=42
+  kind=2 name=FIELD_DIR offset=27 len=30 comp=zstd uncompressed_len=21
+  kind=3 name=BLOCKS offset=57 len=214 comp=none uncompressed_len=214
+  kind=4 name=SKIP_IDX offset=271 len=75 comp=zstd uncompressed_len=104
+  kind=5 name=BLOOM offset=346 len=164 comp=none uncompressed_len=164
+skip_index level 0 (2 block(s)):
+  block[0] offset=0 len=105 crc32c=e97c8ea6 record_count=2 ts_range=[100, 200] stream_ref_range=[0, 0]
+    stat column_id=10 type=i64 min_bits=200 max_bits=504 null_count=0 has_nan=false
+  block[1] offset=105 len=109 crc32c=c009cac7 record_count=2 ts_range=[150, 250] stream_ref_range=[1, 1]
+    stat column_id=10 type=i64 min_bits=200 max_bits=401 null_count=0 has_nan=false
+stream_dir (2 entry(ies)):
+  stream_ref=0 stream_id=01000000000000000000000000000000 blob_len=0 blocks=[0, 0]
+  stream_ref=1 stream_id=02000000000000000000000000000000 blob_len=0 blocks=[1, 1]
+field_dir (2 entry(ies)):
+  column_id=10 name=code type=i64 present_blocks=2 null_count=0
+  column_id=11 name=svc type=str present_blocks=2 null_count=0
+```
+
+Field by field:
+
+- `total_size`, `version`, `signal`: byte length of the object, the trailer
+  format version (always `1` for RLOG v1; a non-1 version is rejected with a
+  typed error), and the signal byte (`2` = logs). Like RSEG, the object is
+  footer-first-readable: the 16-byte trailer at the end gives the footer's
+  length and crc, so a reader validates the footer in one suffix GET before
+  fetching anything else.
+- `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
+  identity components, which must match the commit record the reader resolved
+  the object from. `writer_id` and `tenant_hash` are printed as hex.
+- `min/max_ts_ns`: the span of record event timestamps.
+  `min/max_observed_ts_ns`: the span of observed (ingest-side) timestamps.
+  These four plus the counts are the skip index's level 2, the whole-object
+  summary in the footer.
+- `record_count`, `block_count`, `stream_count`: totals the footer claims.
+- `sections`: the five mandatory sections and their byte ranges. `kind=1`
+  `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
+  `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
+  columnar row blocks), `kind=4` `SKIP_IDX` (the multi-level min/max index),
+  `kind=5` `BLOOM` (per-block token blooms). STREAM_DIR, FIELD_DIR, and
+  SKIP_IDX are whole-section zstd (`comp=zstd`); BLOCKS and BLOOM are
+  containers read entry by entry, so they are `comp=none`. `comp` is printed
+  by name (`none`/`zstd`).
+- `skip_index level 0`: one line per row block -- its byte `offset` (into
+  BLOCKS) and `len`, the `crc32c` the reader verifies before decoding the
+  block, `record_count`, and the block's `ts_range` and `stream_ref_range`
+  (both inclusive), which are what the skip index prunes on. Under each block
+  line is one `stat` line per numeric column present in the block:
+  `column_id`, `type` (`i64`/`f64`/`bool`/`bytes`), `min_bits`/`max_bits` (the
+  bit pattern the min/max are stored as -- two's complement for i64, `to_bits`
+  for f64, so f64 comparison is bit-exact), `null_count`, and `has_nan`. In
+  the example both blocks carry column 10 (`code`), an i64 attribute; the
+  string column `svc` is not numeric and so has no stat.
+- `stream_dir`: one line per stream, in the object's sorted stream_id order.
+  The line number is the `stream_ref` used everywhere else (the entry's
+  0-based ordinal); `stream_id` is the 16-byte identity in hex; `blob_len` is
+  the length of the canonical resource+scope attribute blob; `blocks` is the
+  half-open-printed inclusive block range holding that stream's records.
+- `field_dir`: one line per dynamic attribute column -- `column_id` (dynamic
+  columns start at 10; fixed columns 0..=9 are implicit and never listed),
+  `name`, `type`, `present_blocks` (blocks with at least one value), and the
+  object-wide `null_count`. A key seen with two value types appears as two
+  entries (per-type splitting).
+
+A corrupt object never half-prints: the footer open protocol and every
+section decode return a typed `Corrupted` error with a non-zero exit. A
+corrupt SKIP_IDX in particular is loud rather than a degrade, because its
+level-0 entries are the only source of block byte ranges and per-block
+checksums.
+
 ## `commit decode`: what a commit record says
 
 ```sh

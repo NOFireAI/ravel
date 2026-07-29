@@ -3741,10 +3741,12 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "crc32c",
  "hex",
  "prost",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-logseg",
  "ravel-object-store",
  "ravel-proto",
  "ravel-segment",
@@ -3752,6 +3754,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
