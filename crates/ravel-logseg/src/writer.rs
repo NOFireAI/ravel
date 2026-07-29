@@ -87,9 +87,48 @@ impl RlogWriter {
         Ok(())
     }
 
-    /// Produces the whole object. Empty input is rejected: the flush layer never
-    /// writes empty objects (matches RSEG's zero-sample rule).
+    /// Produces the whole object as an L0 flush object: the compaction-identity
+    /// fields are stamped at their L0 sentinels (`level = 0`, empty
+    /// `input_set_hash`, `part_index = 0`). Empty input is rejected: the flush
+    /// layer never writes empty objects (matches RSEG's zero-sample rule).
     pub fn finish(self) -> Result<Vec<u8>, LogSegError> {
+        self.build_object(0, Vec::new(), 0)
+    }
+
+    /// Produces the whole object as an L1 compacted part, stamping the caller's
+    /// compaction identity (`level`, `input_set_hash`, `part_index`) into the
+    /// footer instead of the L0 sentinels (ADR-0032). Every other byte is
+    /// produced by the exact same pipeline as [`RlogWriter::finish`]: the two
+    /// share [`RlogWriter::build_object`], so the STREAM_DIR / FIELD_DIR /
+    /// BLOCKS / SKIP_IDX / BLOOM encoding (including the dynamic-column cap and
+    /// `attrs_raw` overflow rule) cannot drift between an L0 write and an L1
+    /// merge. The compactor (`ravel-maintain`, issue #231) is the only caller.
+    ///
+    /// `input_set_hash` is the compaction's canonical input-set hash (the same
+    /// bytes the [`ravel_proto::logseg::v1::LogFooter`] and the
+    /// `CompactionRecord` carry); `level` is 1 for an L1 part and `part_index`
+    /// is the part's ordinal within one compaction output. Empty input is
+    /// rejected exactly as [`RlogWriter::finish`] rejects it.
+    pub fn finish_compacted(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+    ) -> Result<Vec<u8>, LogSegError> {
+        self.build_object(level, input_set_hash, part_index)
+    }
+
+    /// The shared object-building pipeline behind [`RlogWriter::finish`] and
+    /// [`RlogWriter::finish_compacted`]. The only inputs that vary between the
+    /// two are the footer's compaction-identity fields; every section is built
+    /// identically, so identical records plus identical identity yield
+    /// byte-identical output regardless of which entry point was used.
+    fn build_object(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+    ) -> Result<Vec<u8>, LogSegError> {
         if self.records.is_empty() {
             return Err(LogSegError::LimitExceeded("empty object".into()));
         }
@@ -336,12 +375,13 @@ impl RlogWriter {
             block_count: u64::from(total_blocks),
             stream_count: sorted_ids.len() as u64,
             sections,
-            // L0 flush object: explicit compaction-identity sentinels (ADR-0032).
-            // The L1 compactor path sets these to real values; this writer only
-            // ever emits L0 objects.
-            level: 0,
-            input_set_hash: Vec::new(),
-            part_index: 0,
+            // Compaction identity (ADR-0032). `finish` passes the L0 sentinels
+            // (level 0, empty hash, part 0); `finish_compacted` passes the
+            // compactor's real values. Stamped verbatim, checked nowhere here:
+            // the footer round-trips whatever the caller set.
+            level,
+            input_set_hash,
+            part_index,
         };
         write_footer_and_trailer(&mut object, &footer);
         Ok(object)
@@ -570,6 +610,58 @@ mod tests {
         assert_eq!(footer.stream_count, 5);
         assert_eq!(footer.record_count, 10_000);
         assert_eq!(footer.block_count, 10);
+    }
+
+    #[test]
+    fn finish_compacted_stamps_identity_and_shares_body_with_finish() {
+        // Two writers over identical records: one L0 via finish(), one L1 via
+        // finish_compacted(). Every section byte is identical; only the footer's
+        // compaction-identity fields differ. This is the guarantee that lets the
+        // compactor reuse the writer without the L0 and L1 encoders drifting.
+        let build = |records: &[LogRecord]| {
+            let mut w = RlogWriter::new(RlogConfig::default(), identity());
+            for r in records {
+                w.push(r.clone()).expect("push");
+            }
+            w
+        };
+        let records: Vec<LogRecord> = (0..50i64)
+            .map(|i| {
+                let mut r = base_record((i % 3) as u8, i);
+                r.attrs.push(("k".into(), AttrValue::I64(i)));
+                r
+            })
+            .collect();
+
+        let l0 = build(&records).finish().expect("finish");
+        let hash = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let l1 = build(&records)
+            .finish_compacted(1, hash.clone(), 3)
+            .expect("finish_compacted");
+
+        let f0 = open(&l0).expect("open l0");
+        let f1 = open(&l1).expect("open l1");
+        // L0 sentinels unchanged.
+        assert_eq!(f0.level, 0);
+        assert!(f0.input_set_hash.is_empty());
+        assert_eq!(f0.part_index, 0);
+        // L1 identity stamped.
+        assert_eq!(f1.level, 1);
+        assert_eq!(f1.input_set_hash, hash);
+        assert_eq!(f1.part_index, 3);
+        // Every section is byte-identical between the two objects: the sections
+        // live before the footer, so equal section tables plus equal section
+        // bytes prove the body did not change.
+        assert_eq!(f0.sections, f1.sections, "section tables identical");
+        for s in &f0.sections {
+            let range = |o: u64, l: u64| (o as usize)..((o + l) as usize);
+            assert_eq!(
+                &l0[range(s.offset, s.len)],
+                &l1[range(s.offset, s.len)],
+                "section kind {} bytes identical",
+                s.kind
+            );
+        }
     }
 
     #[test]

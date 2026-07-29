@@ -83,13 +83,17 @@ are permitted.
 - unknown section kinds MUST be skipped by readers (forward
   compatibility).
 
-An **L0 flush object** (one object per writer flush, the only kind any
-writer emits today) stamps the compaction-identity fields at their
-sentinels explicitly: `level = 0`, `input_set_hash` empty, `part_index =
-0`. The L1 compactor path sets them to real values. These three fields
-live inside the protobuf-encoded `LogFooter` and are therefore already
-covered end to end by `footer_crc32c` (verified before the footer is
-decoded); they need no separate checksum.
+An **L0 flush object** (one object per writer flush, emitted by the
+ingest log shard via `RlogWriter::finish`) stamps the compaction-identity
+fields at their sentinels explicitly: `level = 0`, `input_set_hash`
+empty, `part_index = 0`. An **L1 compacted part** is emitted by the
+compactor (`ravel-maintain`) via `RlogWriter::finish_compacted`, which
+runs the identical section-building pipeline as `finish` and stamps
+`level = 1`, the compaction's `input_set_hash`, and the part's
+`part_index` (see "Compaction (L0 → L1)" below). These three fields live
+inside the protobuf-encoded `LogFooter` and are therefore already covered
+end to end by `footer_crc32c` (verified before the footer is decoded);
+they need no separate checksum.
 
 Validation (all violations `Corrupted`, never panics):
 
@@ -447,6 +451,48 @@ construction, which is what makes bloom-based skipping sound (ADR-0013).
 Readers reject a truncated entry, an `m_bits` that is not a power of two
 or is below 512, a `k` of 0, a `bits` length that is not `m_bits / 8`,
 and an entry index outside `[0, count)`.
+
+## Compaction (L0 → L1)
+
+Compaction (ADR-0032, issue #231) rewrites many small L0 `.rlog` flush
+objects for one sealed `(tenant, shard, ingest-hour)` bucket into a
+handful of large L1 parts, the log analogue of RSEG's L0→L1 compaction
+(ADR-0018). It lives in `ravel-maintain` behind a per-signal codec seam;
+the transaction machinery (seal detection, `CreateIfAbsent` publish,
+convergence, abandonment, the advisory cursor) is shared with RSEG and
+signal-generic. An L1 part is byte-for-byte a normal RLOG object with
+`level = 1`; readers need no special path.
+
+The merge is defined entirely in terms of this format:
+
+- **Global `stream_ref` remap.** The inputs' sorted `STREAM_DIR`s are
+  merged into one sorted stream set; every input's local `stream_ref`
+  values are renumbered into it. Because `stream_id` is the canonical
+  hash of a stream's resource+scope blob, two inputs may list the same
+  `stream_id` only with byte-identical blobs; a disagreement is an
+  upstream identity violation or a hash collision and is a hard,
+  typed error (the cross-object form of the single-writer
+  `InconsistentStreamAttrs` check), never a silent pick.
+- **Re-sort and re-block.** The merged records are re-sorted by
+  `(stream_ref ascending, ts ascending)` and re-chunked at the same 8192
+  record block target. There is no record-level dedup: distinct
+  submissions of identical content are distinct records (the write path
+  makes retry duplicates structurally impossible), so the L1 object holds
+  the union of all inputs' records.
+- **Rebuilt directories and indexes.** `FIELD_DIR` is rebuilt from the
+  merged column set under the same 1000-dynamic-column cap, with overflow
+  keys folded into `attrs_raw` exactly as a single-object write does — the
+  union of columns across inputs can exceed the cap even when no single
+  input does. `SKIP_IDX` and every per-block `BLOOM` are rebuilt from the
+  merged, re-blocked contents (each bloom sized by its own block's
+  distinct-token count); an input's `SKIP_IDX`/`BLOOM` bytes are never
+  reused or concatenated, since the merged block boundaries differ from
+  any input's.
+
+Because these are exactly the steps `RlogWriter` already performs for an
+L0 write, the compactor performs them by decoding each input back to
+records and feeding the merged records through the same writer via
+`finish_compacted`; the L0 and L1 encoders are one implementation.
 
 ## Tokenizer
 

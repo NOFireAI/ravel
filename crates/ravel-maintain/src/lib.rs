@@ -34,17 +34,21 @@
 pub mod bucket;
 pub mod build;
 pub mod clock;
+pub mod codec;
 pub mod compact;
 pub mod config;
 pub mod error;
 pub mod publish;
 pub mod read;
+pub mod rlog;
 pub mod scan;
 
 pub use bucket::Bucket;
 pub use clock::{Clock, FixedClock};
+pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{CompactionOutcome, compact_bucket};
 pub use config::CompactorConfig;
 pub use error::{MaintainError, Result};
 pub use publish::PublishOutcome;
+pub use rlog::RlogCodec;
 pub use scan::{ScanReport, scan_and_compact};
