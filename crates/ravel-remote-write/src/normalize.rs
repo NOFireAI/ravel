@@ -93,16 +93,20 @@ pub fn normalize_resolved(
     limits: &IngestLimits,
     ingest_ts_ns: i64,
 ) -> RwNormalizeOutput {
-    let total_samples: usize = resolved.series.iter().map(|s| s.samples.len()).sum();
-    if total_samples > limits.max_data_points_per_request {
+    let total_points: usize = resolved
+        .series
+        .iter()
+        .map(|s| s.samples.len() + s.histogram_count)
+        .sum();
+    if total_points > limits.max_data_points_per_request {
         return RwNormalizeOutput {
             points: Vec::new(),
             rejected: vec![RwRejection::Otlp {
                 reason: Rejection::TooManyDataPoints {
-                    count: total_samples,
+                    count: total_points,
                     max: limits.max_data_points_per_request,
                 },
-                count: total_samples,
+                count: total_points,
             }],
             histograms_dropped: 0,
             exemplars_dropped: 0,
@@ -814,6 +818,29 @@ mod tests {
             vec![sample(1_000, 1.0), sample(2_000, 2.0), sample(3_000, 3.0)],
         )]);
         let out = normalize_resolved(&tenant(), req, &limits, 1_000_000);
+        assert!(out.points.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![RwRejection::Otlp {
+                reason: Rejection::TooManyDataPoints { count: 3, max: 2 },
+                count: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn histogram_only_request_counts_toward_the_request_level_cap() {
+        // No scalar samples at all: the request-level total must still
+        // count native histogram entries (matching the per-series formula
+        // in `normalize_series`), or a histogram-heavy request slips past
+        // the cap while `samples.len()` alone stays at 0.
+        let limits = IngestLimits {
+            max_data_points_per_request: 2,
+            ..IngestLimits::default()
+        };
+        let mut s = series(vec![label("__name__", "h")], vec![]);
+        s.histogram_count = 3;
+        let out = normalize_resolved(&tenant(), request(vec![s]), &limits, 1_000_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
