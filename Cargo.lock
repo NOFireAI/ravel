@@ -3989,6 +3989,7 @@ dependencies = [
  "prost-build",
  "protox",
  "ravel-otlp",
+ "ravel-segment",
  "ravel-types",
  "snap",
  "thiserror",
