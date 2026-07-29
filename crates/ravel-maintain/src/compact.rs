@@ -5,14 +5,17 @@
 //! `CreateIfAbsent` (plan §3.6).
 
 use ravel_object_store::ObjectStoreBackend;
+use ravel_types::Signal;
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
+use crate::codec::{RsegCodec, SegmentCodec};
 use crate::config::CompactorConfig;
-use crate::error::Result;
+use crate::error::{MaintainError, Result};
 use crate::publish::{PublishOutcome, publish_record};
-use crate::read::{input_set_hash, list_bucket, load_input_catalog, load_inputs};
-use crate::{build, read};
+use crate::read;
+use crate::read::{input_set_hash, list_bucket, load_inputs};
+use crate::rlog::RlogCodec;
 
 /// The result of a `compact_bucket` call. Every variant except
 /// [`CompactionOutcome::Compacted`] means the bucket was left untouched, with
@@ -65,17 +68,51 @@ pub async fn compact_bucket(
         });
     }
 
-    let inputs = load_inputs(store, bucket, &listing.commit_keys).await?;
+    // Everything up to here is signal-generic (seal, tombstone, already-done,
+    // and input-count gates on the bucket listing). The plan-build step is the
+    // only signal-specific part: dispatch it to the codec for this bucket's
+    // signal and run the identical shared pipeline (canonical ordering,
+    // input_set_hash, publish) around it (ADR-0032).
+    match bucket.signal {
+        Signal::Metrics => {
+            run_pipeline::<RsegCodec>(store, clock, config, bucket, &listing.commit_keys, start_ns)
+                .await
+        }
+        Signal::Logs => {
+            run_pipeline::<RlogCodec>(store, clock, config, bucket, &listing.commit_keys, start_ns)
+                .await
+        }
+        other => Err(MaintainError::Invariant(format!(
+            "compaction is not implemented for signal {other:?}"
+        ))),
+    }
+}
+
+/// The signal-generic plan-build-publish pipeline, parameterized over the
+/// per-signal [`SegmentCodec`]. Loads and canonically orders the inputs,
+/// derives the `input_set_hash`, decodes each input's catalog metadata through
+/// the codec, streams the merge into size-capped parts through the codec, and
+/// publishes the record. Only the two `C::` calls know the on-object format;
+/// everything else is identical for every signal.
+async fn run_pipeline<C: SegmentCodec>(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    commit_keys: &[String],
+    start_ns: i64,
+) -> Result<CompactionOutcome> {
+    let inputs = load_inputs(store, bucket, commit_keys).await?;
     let hash = input_set_hash(&inputs);
 
     // Catalogs aligned one-to-one with `inputs` (canonical order): the merge
-    // relies on that alignment for deterministic run tie-breaking.
+    // relies on that alignment for deterministic tie-breaking.
     let mut catalogs = Vec::with_capacity(inputs.len());
     for input in &inputs {
-        catalogs.push(load_input_catalog(store, config, input).await?);
+        catalogs.push(C::load_input_catalog(store, config, input).await?);
     }
 
-    let parts = build::build_parts(store, config, bucket, &inputs, &catalogs, &hash).await?;
+    let parts = C::build_parts(store, config, bucket, &inputs, &catalogs, &hash).await?;
 
     let publish = publish_record(
         store, config, clock, bucket, &inputs, &hash, &parts, start_ns,

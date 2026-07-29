@@ -4,6 +4,7 @@
 
 use ravel_commit::keys::{KeyError, ReconstructionError};
 use ravel_commit::record::RecordError;
+use ravel_logseg::LogSegError;
 use ravel_object_store::StoreError;
 use ravel_segment::SegmentError;
 
@@ -24,8 +25,18 @@ pub enum MaintainError {
     Record(#[from] RecordError),
     #[error(transparent)]
     Segment(#[from] SegmentError),
+    #[error(transparent)]
+    LogSeg(#[from] LogSegError),
     #[error("segment write error: {0}")]
     Write(String),
+    #[error(
+        "two inputs claim log stream {stream_id} with different resource+scope attribute blobs ({a_len} and {b_len} bytes): stream identity is violated upstream or a stream-id hash collided (fatal invariant breach)"
+    )]
+    StreamAttrsConflict {
+        stream_id: String,
+        a_len: usize,
+        b_len: usize,
+    },
     #[error("unknown object shape in bucket listing: {0:?}")]
     UnknownBucketEntry(String),
     #[error("decoded record signal {actual} does not match the queried signal {expected}")]
