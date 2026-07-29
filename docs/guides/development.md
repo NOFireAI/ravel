@@ -36,11 +36,13 @@ jobs do not each recompile the overlapping crates from scratch.
 
 - `Swatinem/rust-cache@v2` restores the dependency registry and build cache
   keyed on `Cargo.lock`.
-- `sccache` (installed via `taiki-e/install-action@sccache`) wraps `rustc`
+- `sccache` (installed via `mozilla-actions/sccache-action`) wraps `rustc`
   with `RUSTC_WRAPPER=sccache` and stores compiled objects in the GitHub
-  Actions cache backend (`SCCACHE_GHA_ENABLED=true`). Objects compiled by
-  one job are reused by the others; no repo secret or setting beyond those
-  two environment variables is required.
+  Actions cache backend (`SCCACHE_GHA_ENABLED=true`). That action also
+  exports the GHA cache auth tokens (`ACTIONS_RESULTS_URL` /
+  `ACTIONS_RUNTIME_TOKEN`) the backend needs, which a plain binary installer
+  does not. Objects compiled by one job are reused by the others; no repo
+  secret or setting beyond those two environment variables is required.
 - Tests run under `cargo nextest run` (installed via
   `taiki-e/install-action@nextest`) instead of `cargo test`, for faster
   parallel execution and clearer output.
