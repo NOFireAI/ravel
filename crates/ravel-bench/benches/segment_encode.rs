@@ -9,9 +9,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};
+use ravel_bench::generator::{
+    CardinalityProfile, WorkloadConfig, generate_histograms, generate_raw,
+};
 use ravel_bench::segment_support::{bench_bounds, bench_identity};
-use ravel_segment::{SegmentWriter, SeriesInput};
+use ravel_segment::{SegmentWriter, SeriesInput, SeriesInputV3};
 
 const TOTAL_SAMPLES: usize = 200_000;
 
@@ -120,9 +122,55 @@ fn bench_segment_encode_axis_sweep(c: &mut Criterion) {
     group.finish();
 }
 
+fn clone_hist_inputs(inputs: &[SeriesInputV3]) -> Vec<SeriesInputV3> {
+    inputs
+        .iter()
+        .map(|s| SeriesInputV3 {
+            series_id: s.series_id,
+            labels: s.labels.clone(),
+            values: s.values.clone(),
+        })
+        .collect()
+}
+
+/// RSEG v3 native-histogram encode throughput for the representative shape
+/// from docs/rseg-v3-plan.md section 8 (30 populated buckets/side, 4 spans,
+/// integer counts, has_sum, one sample per series). New group with ids
+/// `{series_count}_series_histogram`, distinct from the frozen scalar
+/// `segment_encode` ids. Same untimed clone-in-setup pattern as
+/// `bench_segment_encode` (a12-F01): `write_histograms` consumes its input,
+/// so each iteration gets a fresh copy from the untimed setup closure and
+/// only the write is timed. Throughput is one element per histogram sample
+/// (one per series in this shape).
+fn bench_segment_encode_histogram(c: &mut Criterion) {
+    let mut group = c.benchmark_group("segment_encode_histogram");
+    for &series_count in &[100usize, 10_000] {
+        let config = WorkloadConfig {
+            series_count,
+            cardinality: CardinalityProfile::many_small(series_count),
+            ..Default::default()
+        };
+        let inputs = generate_histograms(&config).expect("generate histogram workload");
+        // One histogram sample per series in the section 8 shape.
+        group.throughput(Throughput::Elements(inputs.len() as u64));
+        group.bench_function(format!("{series_count}_series_histogram"), |b| {
+            b.iter_batched(
+                || clone_hist_inputs(&inputs),
+                |series| {
+                    SegmentWriter::write_histograms(series, bench_identity(), bench_bounds())
+                        .expect("encode")
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_segment_encode,
-    bench_segment_encode_axis_sweep
+    bench_segment_encode_axis_sweep,
+    bench_segment_encode_histogram
 );
 criterion_main!(benches);
