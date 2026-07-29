@@ -1657,6 +1657,75 @@ mod tests {
     }
 
     #[test]
+    fn range_function_over_subquery_is_an_instant_vector_inside_an_outer_subquery() {
+        // Regression for issue #224 mismatch #1: the exact nesting shape
+        // `max_over_time(rate(<selector>[2m])[5m:1m])[10m:2m]`. The inner
+        // expression of the outer subquery is itself a range-vector-consuming
+        // function (`max_over_time`) wrapped around a subquery whose own inner
+        // body is another range function over a matrix selector (`rate(..[2m])`).
+        // Each outer grid step must resolve that inner expression to an
+        // *instant vector* (not a range vector), and the whole outer subquery
+        // must therefore resolve to a matrix. This exercises the deeper nesting
+        // the pre-existing `nested_subquery_recurses_through_an_intervening_
+        // function` test does not: there the innermost body is a bare selector,
+        // here it is a `rate` over a matrix selector.
+        //
+        // A regularly-sampled monotonic counter every 30s: `rate` over any 2m
+        // window is a constant 1 unit / 30s = 1/30 per second, so
+        // `max_over_time` of that subquery grid is 1/30 at every step.
+        let mut samples = Vec::new();
+        let mut value = 0.0;
+        let mut t_ms = 0i64;
+        while t_ms <= minutes(20) {
+            samples.push((ms_to_ns(t_ms).expect("no overflow"), value));
+            value += 1.0;
+            t_ms += 30_000;
+        }
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "diff_counter_total"), ("shape", "reset")],
+                &samples,
+            )
+            .expect("valid series");
+
+        // The inner expression alone (an over-time function wrapping a
+        // subquery) resolves to an instant vector, the per-step value type the
+        // outer subquery consumes.
+        let inner = Evaluator::new()
+            .eval_instant(
+                &source,
+                r#"max_over_time(rate(diff_counter_total{shape="reset"}[2m])[5m:1m])"#,
+                minutes(18),
+            )
+            .expect("inner range-function-over-subquery evaluates");
+        let Value::Vector(vector) = inner else {
+            panic!("inner expression must be an instant vector, got {inner:?}");
+        };
+        assert_eq!(vector.len(), 1);
+        assert!((vector[0].value - 1.0 / 30.0).abs() < 1e-9);
+
+        // Wrapping that instant vector in the outer `[10m:2m]` subquery must
+        // succeed and resolve to a matrix (Prometheus returns `resultType:
+        // matrix` for this instant query), not raise a range-vector type error.
+        let outer = Evaluator::new()
+            .eval_instant(
+                &source,
+                r#"max_over_time(rate(diff_counter_total{shape="reset"}[2m])[5m:1m])[10m:2m]"#,
+                minutes(18),
+            )
+            .expect("outer subquery over the range function evaluates");
+        let Value::Matrix(matrix) = outer else {
+            panic!("outer subquery must resolve to a matrix, got {outer:?}");
+        };
+        assert_eq!(matrix.len(), 1);
+        let (_, samples) = &matrix[0];
+        // Outer grid: end 18m, range 10m, step 2m -> epoch-aligned points at
+        // 8m, 10m, 12m, 14m, 16m, 18m.
+        assert_eq!(samples.len(), 6);
+        assert!(samples.iter().all(|s| (s.value - 1.0 / 30.0).abs() < 1e-9));
+    }
+
+    #[test]
     fn subquery_offset_and_at_shift_the_grids_own_end() {
         // `up[2m:1m] offset 1m` at t=0 ends its grid at -1m (the grid start
         // is then epoch-aligned from that shifted end), not at t=0 itself.
