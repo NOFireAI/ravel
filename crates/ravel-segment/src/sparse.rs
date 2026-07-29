@@ -37,10 +37,10 @@ use crate::format::{
     section_kind,
 };
 use crate::reader::{
-    DictResolver, RunEntry, SeriesEntry, SeriesEntryV4, ValueKind, check_series_counts_v2,
-    decode_section_bytes, find_section, index_label_dict, parse_schema_list_v2,
-    parse_schema_ref_block_v2, parse_series_ids_v2, parse_value_ord_block_all_v2, take_block,
-    take_u32_le,
+    DictResolver, RUN_LIVE_BYTES_CHUNK, RunEntry, SeriesEntry, SeriesEntryV4, ValueKind,
+    check_run_total_live_budget, check_series_counts_v2, decode_section_bytes, find_section,
+    index_label_dict, parse_schema_list_v2, parse_schema_ref_block_v2, parse_series_ids_v2,
+    parse_value_ord_block_all_v2, take_block, take_u32_le,
 };
 use crate::varint::{read_uvarint, write_uvarint};
 use crate::writer::WrittenSegment;
@@ -432,10 +432,12 @@ fn decode_chunk_frame(
     ts_section_len: u64,
     val_section_len: u64,
     hist_section_len: u64,
+    limits: ReaderLimits,
 ) -> Result<ChunkFrame, SegmentError> {
     let mut pos = 0usize;
     let n = take_u32(frame_raw, &mut pos)? as usize;
     let frame_run_total = take_u32(frame_raw, &mut pos)? as usize;
+    check_run_total_live_budget(frame_run_total as u64, RUN_LIVE_BYTES_CHUNK, limits)?;
     let ts_base = read_uvarint(frame_raw, &mut pos)?;
     let val_base = read_uvarint(frame_raw, &mut pos)?;
     let hist_base = read_uvarint(frame_raw, &mut pos)?;
@@ -581,11 +583,15 @@ fn value_ord_block_to_flat(block: &[u8]) -> Result<Vec<u64>, SegmentError> {
 
 /// Decodes just the runs of the series at `row_in_chunk` from a decompressed
 /// meta-chunk frame (the selective point path). Skips label materialization
-/// entirely: a by-id fetch already knows the series it wants.
+/// entirely: a by-id fetch already knows the series it wants. `limits` bounds
+/// `frame_run_total`'s live-decode footprint exactly as it does in
+/// [`decode_catalog_v5`]'s whole-frame path; pass the same limits used to
+/// decompress `frame_raw` (`verify_and_decompress_chunk_frame`).
 pub fn decode_chunk_runs(
     frame_raw: &[u8],
     row_in_chunk: u64,
     footer: &Footer,
+    limits: ReaderLimits,
 ) -> Result<Vec<RunEntry>, SegmentError> {
     let ts_len = find_section(footer, section_kind::TS_PAGES)
         .map(|s| s.len)
@@ -596,7 +602,7 @@ pub fn decode_chunk_runs(
     let hist_len = find_section(footer, section_kind::HIST_PAGES)
         .map(|s| s.len)
         .unwrap_or(0);
-    let frame = decode_chunk_frame(frame_raw, footer, ts_len, val_len, hist_len)?;
+    let frame = decode_chunk_frame(frame_raw, footer, ts_len, val_len, hist_len, limits)?;
     let row = usize::try_from(row_in_chunk).map_err(|_| SegmentError::SectionOutOfBounds)?;
     if row >= frame.n {
         return Err(SegmentError::SectionOutOfBounds);
@@ -714,7 +720,7 @@ pub fn decode_catalog_v5(
         }
         let frame_raw = zstd::bulk::decompress(stored, cap)
             .map_err(|e| SegmentError::Decompress(e.to_string()))?;
-        let frame = decode_chunk_frame(&frame_raw, footer, ts_len, val_len, hist_len)?;
+        let frame = decode_chunk_frame(&frame_raw, footer, ts_len, val_len, hist_len, limits)?;
         if frame.n != chunk.n as usize {
             return Err(SegmentError::BadChunkFrame);
         }
