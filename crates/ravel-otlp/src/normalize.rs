@@ -244,6 +244,7 @@ fn normalize_resource(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_metric(
     tenant: &TenantId,
     metric: &Metric,
