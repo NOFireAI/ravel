@@ -10,13 +10,14 @@ mod config;
 mod error;
 mod log_error;
 mod log_metrics;
+mod log_shard;
 mod metrics;
 mod router;
 mod shard;
 mod value;
 
 pub use clock::{Clock, SystemClock};
-pub use config::{IngestConfig, SEGMENT_FORMAT_VERSION};
+pub use config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION};
 pub use error::WriteError;
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};

@@ -104,11 +104,6 @@ pub struct LogIngestMetricsSnapshot {
     pub shard_deaths: u64,
 }
 
-// Every `record_*` method below is written by the log shard actor and the log
-// router, which land in the next part of this phase. They are exercised by
-// this module's tests today, so `dead_code` would fire on a non-test build
-// until those callers exist.
-#[allow(dead_code)]
 impl LogIngestMetrics {
     pub(crate) fn record_flush(&self, trigger: FlushTrigger) {
         let counter = match trigger {
@@ -154,6 +149,9 @@ impl LogIngestMetrics {
         self.stream_id_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    // The log router (next task in this phase) is this counter's only real
+    // caller; until it lands, only this module's tests exercise it.
+    #[allow(dead_code)]
     pub(crate) fn record_shard_death(&self) {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }

@@ -10,6 +10,13 @@ use std::time::Duration;
 /// a routine edit.
 pub const SEGMENT_FORMAT_VERSION: u16 = 5;
 
+/// RLOG trailer version every log flush emits. Mirrors `ravel_logseg`'s own
+/// object trailer version (`docs/log-segment-format.md`, ADR-0029); like
+/// [`SEGMENT_FORMAT_VERSION`] it is not a configurable knob, and is stamped
+/// verbatim into the commit record's `segment_format_version`. Changing it is
+/// a format-level ADR, not a routine edit.
+pub const LOG_SEGMENT_FORMAT_VERSION: u16 = 1;
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -73,5 +80,10 @@ mod tests {
     #[test]
     fn segment_format_version_is_v5() {
         assert_eq!(SEGMENT_FORMAT_VERSION, 5);
+    }
+
+    #[test]
+    fn log_segment_format_version_is_v1() {
+        assert_eq!(LOG_SEGMENT_FORMAT_VERSION, 1);
     }
 }
