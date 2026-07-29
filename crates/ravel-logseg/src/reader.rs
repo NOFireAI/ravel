@@ -450,7 +450,19 @@ fn section(footer: &LogFooter, k: u32) -> Result<&SectionDesc, LogSegError> {
 }
 
 /// Reads and decompresses a whole-read section, verifying its crc first.
-fn read_section(
+///
+/// This is the section-access path for the whole-read sections STREAM_DIR,
+/// FIELD_DIR, and SKIP_IDX (docs/log-segment-format.md): slice the section's
+/// stored bytes from `desc`, verify `crc32c` against `desc.crc32c`, reject an
+/// `uncomp_len` over `cfg.max_uncomp_section`, then zstd-decompress or pass the
+/// raw bytes through, checking the result is exactly `desc.uncomp_len` long.
+/// BLOCKS and BLOOM are not whole-read sections and have their own per-block or
+/// per-entry access paths; do not route them through here.
+///
+/// Exposed so tools (the `ravel-cli` inspector) can reconstruct a section from
+/// its public [`SectionDesc`] without reimplementing the crc-and-decompress
+/// discipline. [`RlogReader::new`] is the only in-crate caller.
+pub fn read_section(
     bytes: &[u8],
     desc: &SectionDesc,
     cfg: &RlogConfig,
@@ -760,6 +772,36 @@ mod tests {
             w.push(r).expect("push");
         }
         w.finish().expect("finish")
+    }
+
+    #[test]
+    fn read_section_standalone_valid_and_crc_mismatch() {
+        use crate::footer::{COMP_NONE, SectionDesc, kind};
+
+        // A hand-built raw (uncompressed) section: stored bytes are the section
+        // payload verbatim, uncomp_len equals its length, crc32c covers it.
+        let payload = b"hand-built section bytes".to_vec();
+        let cfg = RlogConfig::default();
+        let good = SectionDesc {
+            kind: kind::STREAM_DIR,
+            offset: 0,
+            len: payload.len() as u64,
+            crc32c: crc32c::crc32c(&payload),
+            comp: COMP_NONE,
+            uncomp_len: payload.len() as u64,
+        };
+        // Usable without an RlogReader: it takes bytes + a descriptor directly.
+        let got = read_section(&payload, &good, &cfg).expect("valid section reads");
+        assert_eq!(got, payload);
+
+        // A crc that does not match the stored bytes is a loud Corrupted error,
+        // before any decompression or grammar parse.
+        let bad = SectionDesc {
+            crc32c: good.crc32c ^ 0xFFFF_FFFF,
+            ..good
+        };
+        let err = read_section(&payload, &bad, &cfg).expect_err("crc mismatch rejected");
+        assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
     }
 
     #[test]

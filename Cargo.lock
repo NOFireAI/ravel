@@ -3741,7 +3741,6 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
- "crc32c",
  "hex",
  "prost",
  "ravel-catalog",
@@ -3754,7 +3753,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
- "zstd",
 ]
 
 [[package]]
