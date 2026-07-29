@@ -3966,6 +3966,7 @@ dependencies = [
  "proptest",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-maintain",
  "ravel-object-store",
  "ravel-promql",
  "ravel-segment",
