@@ -54,4 +54,11 @@ message LogFooter {
   uint64 stream_count = 12;
 
   repeated Section sections = 13;
+
+  // Compaction identity (ADR-0032), added in RLOG trailer v2. An L0 flush
+  // object carries the defaults: level=0, input_set_hash empty, part_index=0.
+  // Field numbers 14-16 are frozen; never renumber or reuse 1-13.
+  uint32 level = 14;          // 0 = L0 flush object, 1 = L1 compacted part
+  bytes input_set_hash = 15;  // over the sorted input list, empty on L0
+  uint32 part_index = 16;     // part ordinal within one compaction output
 }

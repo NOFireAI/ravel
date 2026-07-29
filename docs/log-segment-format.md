@@ -1,6 +1,9 @@
-# RLOG v1: Ravel Log Segment Format
+# RLOG: Ravel Log Segment Format
 
-Persistent contract (ADR-0029). Any change bumps the trailer version.
+Persistent contract (ADR-0029). Any change bumps the trailer version. The
+current trailer version is 2 (ADR-0032 added the footer's compaction-identity
+fields; version 1 was the format-only initial release and no reader accepts it
+any longer).
 Parsers treat every offset, length, count, and tag read from stored bytes
 as untrusted input: bounds-check everything, overflow-check every
 accumulation, fuzz all decoders. No `unsafe`. Every violation is a typed
@@ -27,7 +30,7 @@ encodings.
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 1)                       |
+|   version:      u16   (= 2)                       |
 |   signal:       u8    (2 = logs)                  |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RLG1"                   |
@@ -69,8 +72,24 @@ are permitted.
   `block_count`, `stream_count`.
 - `sections`: repeated `Section { kind, offset, len, crc32c, comp
   (0=none, 2=zstd), uncompressed_len }`.
+- compaction identity (ADR-0032, field numbers 14-16, added in trailer
+  version 2): `level` (uint32, 0 = L0 flush object, 1 = L1 compacted
+  part), `input_set_hash` (bytes, over the sorted input list, same
+  canonical convention as RSEG), `part_index` (uint32, part ordinal
+  within one compaction output). RLOG carries no
+  `base_created_unix_ns`-equivalent: unlike RSEG it has no cross-writer
+  record dedup that needs a recovered per-run creation time (retry
+  duplicates are structurally impossible at the RLOG write path).
 - unknown section kinds MUST be skipped by readers (forward
   compatibility).
+
+An **L0 flush object** (one object per writer flush, the only kind any
+writer emits today) stamps the compaction-identity fields at their
+sentinels explicitly: `level = 0`, `input_set_hash` empty, `part_index =
+0`. The L1 compactor path sets them to real values. These three fields
+live inside the protobuf-encoded `LogFooter` and are therefore already
+covered end to end by `footer_crc32c` (verified before the footer is
+decoded); they need no separate checksum.
 
 Validation (all violations `Corrupted`, never panics):
 
