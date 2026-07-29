@@ -93,6 +93,33 @@ and test gates on every push. Where cargo-nextest is installed, `cargo
 nextest run` is an accepted equivalent of `cargo test` (CI's check job
 runs it with the `ci` profile); doctests still need `cargo test --doc`.
 
+## Scripts
+
+Use these instead of retyping the same shell each time; they exist
+because the ad-hoc version of each has broken in practice (a stale SSE
+connection, a pushed-but-broken main).
+
+- `scripts/gates.sh [-p CRATE ...]` — the Gates list above. No args runs
+  the full workspace gate; `-p CRATE` (repeatable) scopes clippy/test/doc
+  to specific crates for fast iteration.
+- `scripts/fleet-watch.sh <watch-url> [poll-interval-seconds]` — waits on
+  a `fleet_dispatch`/`fleet_status` task by polling its watch endpoint in
+  a loop. The SSE stream it wraps drops the connection almost immediately
+  in this environment, so a single long-lived `curl -N` never sees the
+  terminal event; this retries instead. Prints the terminal event and
+  exits 0 once one arrives.
+- `scripts/fleet-result-inspect.sh <task-id>` — fetches a dispatched
+  task's result branch and prints its commits and diff scope vs `main`,
+  for review before merging. Never trust an executor's own "gates green"
+  claim; look at what actually landed.
+- `scripts/fleet-result-merge.sh <task-id> <message-file> [-p CRATE ...]`
+  — merges the reviewed result branch (`--no-ff`), runs `gates.sh`, and
+  only pushes `main` and deletes the task's remote refs if gates pass.
+  Write the merge commit message to `<message-file>` first (trailers
+  included); this script does not construct one for you. Run
+  `fleet-result-inspect.sh` first — this script does not pause for
+  review, it assumes you already decided the scope is correct.
+
 ## Commits
 
 Conventional Commits: imperative header <=72 chars (feat/fix/docs/test/
