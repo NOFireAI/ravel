@@ -54,11 +54,17 @@ arrow-flight = { workspace = true, optional = true }
 #    snapshot-pinning ticket carries.
 #  - `tracing` records the full, unredacted error at the Flight error
 #    boundary, the same discipline the HTTP endpoint follows.
+#  - `blake3` keys the ticket's integrity MAC (issue #185); already a
+#    workspace pin, used the same way `content_hash` fields are hashed
+#    elsewhere in the workspace, just keyed here instead of unkeyed.
+#  - `rand` generates the ticket's in-process MAC key once at construction.
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -86,6 +92,8 @@ flight-sql = [
     "dep:bytes",
     "dep:uuid",
     "dep:tracing",
+    "dep:blake3",
+    "dep:rand",
 ]
 
 [dev-dependencies]

@@ -70,7 +70,9 @@ pub use flight::{
     DEFAULT_GC_PROTECTION_HORIZON, FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService,
 };
 #[cfg(feature = "flight-sql")]
-pub use flight_ticket::{FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin};
+pub use flight_ticket::{
+    FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, TICKET_KEY_LEN, TicketKey,
+};
 pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
