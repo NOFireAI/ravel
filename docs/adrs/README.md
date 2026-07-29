@@ -33,3 +33,5 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0027](0027-single-rseg-version-pre-release.md) | Single supported RSEG version until first release; v1-v4 support removed | Accepted |
 | [0028](0028-analytics-stage.md) | Post-evaluation analytics stage: change point detection and robust statistics in a new ravel-analytics crate | Accepted |
 | [0029](0029-rlog-v1-log-segment.md) | RLOG v1: columnar log segment format, a sibling to RSEG | Accepted |
+| [0030](0030-promql-subquery-point-cap-divergence.md) | PromQL subquery point-cap divergence from Prometheus: Ravel's documented cap rejects two cases Prometheus succeeds on, by design | Accepted |
+| [0031](0031-empty-label-identity.md) | Empty-valued labels absent from series identity everywhere; empty-named labels always rejected | Proposed |
