@@ -10,6 +10,7 @@ ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
 ravel-commit = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
@@ -23,6 +24,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 ravel-segment = { workspace = true }
 tokio = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
