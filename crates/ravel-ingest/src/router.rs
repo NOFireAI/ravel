@@ -129,11 +129,10 @@ impl IngestRouter {
 
     /// Like [`Self::write`], but for points that already carry their value
     /// shape (scalar or histogram) rather than OTLP's `NormalizedPoint`
-    /// (docs/rseg-v3-plan.md section 7). Native histograms are rejected at
-    /// wire admission (docs/rseg-v3-plan.md's phase C8); this is the entry
-    /// point that proves the shard buffer and segment-write plumbing for
-    /// histogram values end to end ahead of that, via directly-constructed
-    /// [`IngestPoint`]s rather than OTLP/remote-write decode.
+    /// (docs/rseg-v3-plan.md section 7). Both entry points reach the same
+    /// shard buffer and the same RSEG v5 writer; this one is for callers
+    /// that construct [`IngestPoint`]s directly, chiefly the wire surfaces
+    /// mixing scalar and native-histogram points from one request.
     pub async fn write_values(
         &self,
         tenant: TenantId,
