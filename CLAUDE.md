@@ -119,6 +119,13 @@ connection, a pushed-but-broken main).
   included); this script does not construct one for you. Run
   `fleet-result-inspect.sh` first — this script does not pause for
   review, it assumes you already decided the scope is correct.
+- `scripts/verify-dispatch-gates.sh <ref> <scratchpad-dir>` — the tier-1
+  gate check behind the `verify-dispatch` skill: an isolated worktree
+  outside the repo, a cold `CARGO_TARGET_DIR`, and the full workspace
+  gate list, regardless of which crate the branch touched. Run this (via
+  the `verify-dispatch` skill, which adds narrow adversarial checks on
+  top) before merging any fleet result — a crate-scoped or warm-cache
+  gate run has let a broken branch through before.
 
 ## Commits
 
