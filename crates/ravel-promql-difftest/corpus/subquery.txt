@@ -42,6 +42,17 @@ kind: instant
 time: +600s
 mode: unordered
 
+# ADR-0025 allowlist (arithmetic residue, same class as rate.txt's
+# rate/deriv/predict_linear entries): avg_over_time sums the subquery
+# grid's values then divides by the count, using only IEEE 754 +/- and /,
+# so any gap is arithmetic residue, not a transcendental libm difference.
+# Measured up to 5 ULPs across this range's grid points (issue #224
+# mismatch #2); the representative pair there, -4.242539167465618 vs
+# -4.242539167465619, is 1 ULP by f64::to_bits, and only that one grid
+# point is observable from the issue text.
+# tolerance: 8 is the next power of two above the 5-ULP worst case;
+# tighten it if a live run shows a smaller observed max (ADR-0025
+# Consequences: a tightenable tolerance is a signal worth checking).
 name: range_subquery_over_a_stepped_grid
 query: avg_over_time(diff_gauge_walk[3m:1m])
 kind: range
@@ -49,6 +60,7 @@ start: +300s
 end: +900s
 step: 60s
 mode: unordered
+tolerance: 8
 
 name: instant_subquery_offset_shifts_the_grids_own_end
 query: avg_over_time(diff_gauge_walk[3m:1m] offset 2m)
@@ -56,21 +68,49 @@ kind: instant
 time: +900s
 mode: unordered
 
+# ADR-0025 allowlist (arithmetic residue, same class as rate.txt's
+# rate/deriv/predict_linear entries): avg_over_time sums then divides,
+# IEEE 754 arithmetic only, so this is residue rather than a libm
+# difference. Measured 1 ULP: the exact values in issue #224 mismatch #3
+# (-3.4712031303800788 vs -3.4712031303800783) are adjacent doubles by
+# f64::to_bits. This is a single, fully observed value (one instant
+# result), not a sampled worst case, so the measurement is exact.
+# tolerance: 2 is 1 ULP of headroom, matching rate.txt's 1-ULP entries.
 name: instant_subquery_at_modifier_pins_the_grids_own_end
 query: avg_over_time(diff_gauge_walk[3m:1m] @ 1700000600.000)
 kind: instant
 time: +0s
 mode: unordered
+tolerance: 2
 
 # Cap-exceeded entries: Ravel enforces a resolution cap (11_000 points,
-# docs/query-engine.md "Budgets") independently at every subquery
-# evaluation node, before that node's grid is built. Both entries below
-# ask for a single node's grid alone to exceed it, one directly and one
-# through one level of nesting. `mode: error` here only compares the
-# `errorType` class, per comparator.rs; whether the pinned Prometheus
-# binary raises the same class for an equivalently oversized subquery
-# grid has not been verified against a live binary (this sandbox has no
-# network egress to it) and is flagged in the P10 completion report.
+# docs/query-engine.md "Budgets", issue #77) independently at every
+# subquery evaluation node, before that node's grid is built. Both
+# entries below ask for a single node's grid alone to exceed it, one
+# directly and one through one level of nesting.
+#
+# Verified against the pinned Prometheus v3.13.1 binary (issue #224
+# mismatches #4 and #5): Prometheus SUCCEEDS on both, Ravel errors by
+# design. This is intentional, documented divergence, not a bug and not
+# a missing prometheus_process.rs flag. Prometheus has no per-subquery-
+# node step-count cap, and neither of its query resource limits fires
+# here: --query.max-samples is a yielded-sample memory budget (these
+# sparse 30s-sampled series yield far too few samples to trip it), and
+# query_range's outer 11_000-step check never runs because both entries
+# are instant queries. Ravel additionally classifies its cap rejection
+# as a 422 "execution" budget error (TooManyPoints -> Unsupported), not
+# the 400 "bad_data" class Prometheus uses for its own outer resolution
+# limit, so the two engines diverge on error class as well as on whether
+# they error at all. See
+# docs/adrs/0030-promql-subquery-point-cap-divergence.md for the full
+# investigation and decision.
+#
+# These stay `mode: error`: it encodes Ravel's own expected behavior,
+# and the per-node cap itself stays covered by ravel-promql's eval.rs
+# unit tests. The comparator (comparator.rs) has no mode for "Ravel
+# errors by design, Prometheus succeeds"; ADR-0030 records that gap and
+# the harness follow-up needed to turn these green rather than
+# known-divergent, which is outside this corpus-only change.
 
 name: error_subquery_grid_exceeds_the_point_cap
 query: max_over_time(diff_gauge_walk[100d:1s])
