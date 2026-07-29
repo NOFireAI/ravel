@@ -5,6 +5,10 @@
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use ravel_otlp::NormalizedPoint;
+use ravel_segment::{
+    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint, SeriesInputV3,
+    SeriesValues,
+};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId, TypeError};
 
 /// Gauge or cumulative counter, matching docs/benchmarking.md's workload list.
@@ -198,6 +202,114 @@ pub fn generate_batches(config: &WorkloadConfig) -> Result<Vec<Vec<NormalizedPoi
         batches.push(rest.drain(..take).collect());
     }
     Ok(batches)
+}
+
+/// Populated buckets per side in the representative native-histogram shape
+/// (docs/rseg-v3-plan.md section 8): 30 per side, 60 total, a mid-range
+/// latency-style population.
+pub const HIST_BUCKETS_PER_SIDE: usize = 30;
+/// Contiguous populated runs (spans) per side in the representative shape:
+/// 4, a typical latency distribution's few clustered runs rather than one
+/// bucket per span.
+pub const HIST_SPANS_PER_SIDE: usize = 4;
+
+/// The representative shape's per-side span lengths, summing to
+/// [`HIST_BUCKETS_PER_SIDE`] across [`HIST_SPANS_PER_SIDE`] runs.
+const HIST_SPAN_LENGTHS: [u32; HIST_SPANS_PER_SIDE] = [8, 8, 7, 7];
+/// Per-side span offsets, each relative to the previous run's end
+/// (docs/rseg-v3-plan.md section 3.5): the first run starts at index 0, each
+/// later run sits a small gap past the previous run, so the buckets cluster
+/// instead of running fully contiguous.
+const HIST_SPAN_GAPS: [i32; HIST_SPANS_PER_SIDE] = [0, 2, 2, 2];
+
+/// One side (positive or negative) of the representative histogram: its four
+/// clustered spans and the 30 integer bucket counts they cover. Counts are
+/// drawn from `rng`, so the shape is fixed but the values vary by seed like
+/// the scalar generator's samples do.
+fn representative_hist_side(rng: &mut StdRng) -> (Vec<HistogramSpan>, Vec<u64>) {
+    let spans: Vec<HistogramSpan> = HIST_SPAN_LENGTHS
+        .iter()
+        .zip(HIST_SPAN_GAPS)
+        .map(|(&length, offset)| HistogramSpan { offset, length })
+        .collect();
+    let bucket_count: usize = HIST_SPAN_LENGTHS.iter().map(|&l| l as usize).sum();
+    // Small per-bucket counts (1..=127, a single varint byte each), matching
+    // section 8's "30 bucket counts * ~1" byte assumption so the measured
+    // HIST_PAGES bytes/record supersedes the same shape rather than a
+    // denser-valued one.
+    let counts: Vec<u64> = (0..bucket_count)
+        .map(|_| rng.random_range(1..128))
+        .collect();
+    (spans, counts)
+}
+
+/// One native-histogram value matching the representative shape from
+/// docs/rseg-v3-plan.md section 8: integer counts (no custom boundaries),
+/// [`HIST_BUCKETS_PER_SIDE`] populated buckets per side clustered into
+/// [`HIST_SPANS_PER_SIDE`] spans, `has_sum` set, at OTel/Prometheus default
+/// scale.
+fn representative_histogram_value(rng: &mut StdRng) -> HistogramValue {
+    let (positive_spans, positive) = representative_hist_side(rng);
+    let (negative_spans, negative) = representative_hist_side(rng);
+    let zero_count = rng.random_range(0..5u64);
+    // `count` is the histogram's total population; the writer enforces
+    // `count >= zero_count` and `count >= sum(bucket_counts)`, so make it the
+    // exact total.
+    let count = zero_count + positive.iter().sum::<u64>() + negative.iter().sum::<u64>();
+    HistogramValue {
+        scale: 3,
+        zero_threshold: 0.001,
+        sum: Some(rng.random_range(0.0..1_000_000.0)),
+        custom_values: None,
+        positive_spans,
+        negative_spans,
+        counts: HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative,
+        },
+        reset_hint: ResetHint::Unknown,
+    }
+}
+
+/// Native-histogram workload at the segment-writer level: one
+/// [`SeriesInputV3`] per series carrying exactly one [`HistogramSample`] of
+/// the representative shape (docs/rseg-v3-plan.md section 8). Reuses
+/// `config`'s tenant, seed, cardinality, and `series_count` so it lines up
+/// with the scalar `many_small` workload for comparability; unlike the scalar
+/// generators it always emits one sample per series (section 8's stated
+/// assumption, matching many_small's convention used throughout
+/// docs/rseg-v2-plan.md's own arithmetic) and ignores `samples_per_series`.
+///
+/// Operates directly on the RSEG v3 writer input, not through the
+/// OTLP/`NormalizedPoint` ingest pipeline: `NormalizedPoint` has no
+/// native-histogram sample type yet (issue #218), so this shape is only
+/// reachable at the `SegmentWriter::write_histograms` level.
+pub fn generate_histograms(config: &WorkloadConfig) -> Result<Vec<SeriesInputV3>, TypeError> {
+    let tenant = TenantId::new(config.tenant.clone());
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let profile = config.cardinality;
+    let mut out = Vec::with_capacity(config.series_count);
+    for i in 0..config.series_count {
+        let base_idx = i % profile.distinct_sets.max(1);
+        let mut base_labels = base_label_set(base_idx, profile.labels_per_set);
+        base_labels.push(Label {
+            name: "series_idx".to_string(),
+            value: i.to_string(),
+        });
+        let labels = LabelSet::new(base_labels)?;
+        let series_id = SeriesId::compute(&tenant, "bench_histogram", &labels)?;
+        out.push(SeriesInputV3 {
+            series_id,
+            labels,
+            values: SeriesValues::Histogram(vec![HistogramSample {
+                ts_ns: config.start_ts_ns,
+                value: representative_histogram_value(&mut rng),
+            }]),
+        });
+    }
+    Ok(out)
 }
 
 fn base_label_set(base_idx: usize, labels_per_set: usize) -> Vec<Label> {
@@ -452,6 +564,71 @@ mod tests {
                     "each series carries exactly {labels} labels"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn histogram_shape_is_well_formed() {
+        let config = WorkloadConfig {
+            series_count: 8,
+            cardinality: CardinalityProfile::many_small(8),
+            ..Default::default()
+        };
+        let series = generate_histograms(&config).expect("generate");
+        assert_eq!(series.len(), 8);
+        for s in &series {
+            let SeriesValues::Histogram(samples) = &s.values else {
+                panic!("expected histogram values");
+            };
+            // Section 8's shape: exactly one sample per series.
+            assert_eq!(samples.len(), 1);
+            let v = &samples[0].value;
+            assert_eq!(v.positive_spans.len(), HIST_SPANS_PER_SIDE);
+            assert_eq!(v.negative_spans.len(), HIST_SPANS_PER_SIDE);
+            // No zero-length spans: the writer rejects them as
+            // WriteError::HistogramSpanLengthZero.
+            for span in v.positive_spans.iter().chain(&v.negative_spans) {
+                assert!(span.length > 0, "span length must be > 0");
+            }
+            // Populated buckets per side equal the sum of span lengths.
+            let pos_len: u32 = v.positive_spans.iter().map(|sp| sp.length).sum();
+            let neg_len: u32 = v.negative_spans.iter().map(|sp| sp.length).sum();
+            assert_eq!(pos_len as usize, HIST_BUCKETS_PER_SIDE);
+            assert_eq!(neg_len as usize, HIST_BUCKETS_PER_SIDE);
+            let HistogramCounts::Int {
+                zero_count,
+                count,
+                positive,
+                negative,
+            } = &v.counts
+            else {
+                panic!("expected integer counts");
+            };
+            // Bucket-count vectors must match sum(span.length) per side, the
+            // writer's structural invariant.
+            assert_eq!(positive.len(), HIST_BUCKETS_PER_SIDE);
+            assert_eq!(negative.len(), HIST_BUCKETS_PER_SIDE);
+            // Consistency the writer also enforces at encode time.
+            assert!(*count >= *zero_count);
+            let bucket_total: u64 = positive.iter().chain(negative).sum();
+            assert!(*count >= bucket_total);
+            assert!(v.sum.is_some(), "representative shape sets has_sum");
+            assert!(v.custom_values.is_none(), "integer histogram, no custom");
+        }
+    }
+
+    #[test]
+    fn histogram_shape_deterministic_by_seed() {
+        let config = WorkloadConfig {
+            series_count: 4,
+            ..Default::default()
+        };
+        let a = generate_histograms(&config).expect("generate");
+        let b = generate_histograms(&config).expect("generate");
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.values, y.values);
         }
     }
 
