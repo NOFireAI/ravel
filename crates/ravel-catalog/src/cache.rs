@@ -68,6 +68,18 @@ impl RecordCache {
             .or_default()
             .insert(key, record, capacity);
     }
+
+    /// Drop every cached record for `tenant` whose key starts with `prefix`.
+    /// The tombstone-observation invalidation trigger ADR-0010 §10 promises:
+    /// when a resolver lists a bucket's retention tombstone, the bucket's
+    /// cached commit records are dropped so a later token-fallback GET cannot
+    /// serve a record the sweep is about to physically remove.
+    pub(crate) fn invalidate_prefix(&self, tenant: &TenantHash, prefix: &str) {
+        if let Some(cache) = self.tenants.lock().get_mut(tenant) {
+            cache.entries.retain(|k, _| !k.starts_with(prefix));
+            cache.order.retain(|k| !k.starts_with(prefix));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -95,11 +107,14 @@ impl CompactionTenantCache {
 /// Decoded compaction-record cache, partitioned by tenant and keyed by full
 /// object key, exactly like [`RecordCache`] (docs/catalog-and-mvcc.md step
 /// 2: compaction records are cached the same way commit records are).
-/// Compaction records are immutable once published, so entries never need
-/// invalidating within Phase 1, only capacity-cap eviction; the promised
-/// tombstone-observation invalidation (ADR-0010 §10) is retention's job
-/// (P7) and does not affect resolution correctness, since a tombstoned
-/// bucket contributes nothing regardless of what is cached.
+/// Compaction records are immutable once published, so entries are only ever
+/// capacity-cap evicted, except for one trigger: when a resolver observes a
+/// bucket's retention tombstone it drops that bucket's cached compaction
+/// records via [`CompactionRecordCache::invalidate_prefix`] (ADR-0010 §10,
+/// the same tombstone-observation invalidation as [`RecordCache`]). Exclusion
+/// itself already happens at resolution before the cache matters, so this is a
+/// hygiene trigger, not a correctness dependency; it keeps a later
+/// token-fallback GET from serving a record the sweep is about to remove.
 #[derive(Default)]
 pub(crate) struct CompactionRecordCache {
     tenants: Mutex<HashMap<TenantHash, CompactionTenantCache>>,
@@ -125,6 +140,15 @@ impl CompactionRecordCache {
             .entry(tenant)
             .or_default()
             .insert(key, record, capacity);
+    }
+
+    /// Drop every cached compaction record for `tenant` whose key starts with
+    /// `prefix` (ADR-0010 §10 tombstone-observation invalidation).
+    pub(crate) fn invalidate_prefix(&self, tenant: &TenantHash, prefix: &str) {
+        if let Some(cache) = self.tenants.lock().get_mut(tenant) {
+            cache.entries.retain(|k, _| !k.starts_with(prefix));
+            cache.order.retain(|k| !k.starts_with(prefix));
+        }
     }
 }
 
