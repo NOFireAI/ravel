@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
-use ravel_ingest::{IngestRouter, WriteError, WriteMode};
+use ravel_ingest::{IngestPoint, IngestRouter, WriteError, WriteMode};
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
 use ravel_remote_write::{Rw1DecodeError, Rw2DecodeError, RwNormalizeOutput, normalize_resolved};
@@ -229,16 +229,31 @@ async fn remote_write(
     let points_dropped = compute_points_dropped(&normalized);
     let metadata_dropped = normalized.metadata_dropped as u64;
     let created_timestamps_dropped = normalized.created_timestamps_dropped as u64;
-    let points_accepted = normalized.points.len() as u64;
+    // The RW2 stats headers count the two admitted point kinds separately
+    // (docs/ingest-breadth-plan.md section 2.1): a native histogram is one
+    // written histogram, not one written sample. Scalar samples and native
+    // histograms arrive in their own vectors from the normalizer, so each
+    // header reads its own count directly, and both kinds feed the same
+    // ingest write. Histograms became writable with RSEG v5
+    // (docs/rseg-v3-plan.md phase C8), so this is where the histograms-written
+    // header stops being a constant zero.
+    let samples_written = normalized.points.len() as u64;
+    let histograms_written = normalized.histograms_written as u64;
+    let points_accepted = samples_written + histograms_written;
+
+    let mut ingest_points: Vec<IngestPoint> =
+        Vec::with_capacity(normalized.points.len() + normalized.histogram_points.len());
+    ingest_points.extend(normalized.points.into_iter().map(IngestPoint::from));
+    ingest_points.extend(
+        normalized
+            .histogram_points
+            .into_iter()
+            .map(IngestPoint::from),
+    );
 
     let receipt = match state
         .router
-        .write(
-            tenant,
-            normalized.points,
-            WriteMode::Strict,
-            state.ack_deadline,
-        )
+        .write_values(tenant, ingest_points, WriteMode::Strict, state.ack_deadline)
         .await
     {
         Ok(receipt) => receipt,
@@ -272,10 +287,14 @@ async fn remote_write(
 
     if version == RemoteWriteVersion::V2 {
         let headers_mut = response.headers_mut();
-        if let Ok(value) = HeaderValue::from_str(&points_accepted.to_string()) {
+        if let Ok(value) = HeaderValue::from_str(&samples_written.to_string()) {
             headers_mut.insert(SAMPLES_WRITTEN_HEADER, value);
         }
-        headers_mut.insert(HISTOGRAMS_WRITTEN_HEADER, HeaderValue::from_static("0"));
+        if let Ok(value) = HeaderValue::from_str(&histograms_written.to_string()) {
+            headers_mut.insert(HISTOGRAMS_WRITTEN_HEADER, value);
+        }
+        // Still a constant zero: exemplars are accepted and dropped, with no
+        // storage of their own (ADR-0017 defers it).
         headers_mut.insert(EXEMPLARS_WRITTEN_HEADER, HeaderValue::from_static("0"));
     }
 
@@ -293,22 +312,26 @@ mod tests {
     fn points_dropped_does_not_double_count_native_histograms() {
         let normalized = RwNormalizeOutput {
             points: Vec::new(),
+            histogram_points: Vec::new(),
             rejected: vec![
-                RwRejection::NativeHistogramUnsupported { count: 3 },
+                RwRejection::NativeHistogramSpanLengthZero,
+                RwRejection::NativeHistogramSpanLengthZero,
+                RwRejection::NativeHistogramSpanLengthZero,
                 RwRejection::Otlp {
                     reason: Rejection::EmptyMetricName { count: 2 },
                     count: 2,
                 },
             ],
+            histograms_written: 0,
             histograms_dropped: 3,
             exemplars_dropped: 1,
             metadata_dropped: 5,
             created_timestamps_dropped: 7,
         };
 
-        // 3 (histogram rejection) + 2 (otlp rejection) + 1 (exemplar), not
-        // +3 again for histograms_dropped and not +5/+7 for metadata/created
-        // timestamps, which are not data points.
+        // 3 (one point per histogram rejection) + 2 (otlp rejection) + 1
+        // (exemplar), not +3 again for histograms_dropped and not +5/+7 for
+        // metadata/created timestamps, which are not data points.
         assert_eq!(compute_points_dropped(&normalized), 6);
     }
 
@@ -316,7 +339,9 @@ mod tests {
     fn points_dropped_ignores_metadata_and_created_timestamps() {
         let normalized = RwNormalizeOutput {
             points: Vec::new(),
+            histogram_points: Vec::new(),
             rejected: Vec::new(),
+            histograms_written: 0,
             histograms_dropped: 0,
             exemplars_dropped: 0,
             metadata_dropped: 4,

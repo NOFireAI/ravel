@@ -190,6 +190,19 @@ pub enum Rejection {
     #[error("histogram bucket_counts overflow u64 during cumulative accumulation")]
     HistogramCountOverflow,
 
+    #[error(
+        "exponential histogram scale {scale} is unsupported: scale below -53 is invalid, and OTLP has no custom-bucket-boundary field to back the -53 custom-buckets sentinel"
+    )]
+    NativeHistogramScaleUnsupported { scale: i32 },
+
+    #[error(
+        "exponential histogram count is smaller than its zero_count plus bucket counts, which the segment format's reader would reject as corrupted"
+    )]
+    NativeHistogramCountInconsistent,
+
+    #[error("exponential histogram zero_count plus bucket counts overflow u64")]
+    NativeHistogramCountOverflow,
+
     #[error("summary quantile value is NaN or infinite")]
     NonFiniteQuantile,
 

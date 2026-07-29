@@ -9,8 +9,13 @@
 use prost::Message;
 use ravel_types::Label;
 
-use crate::proto::prometheus::{TimeSeries as ProtoTimeSeries, WriteRequest};
-use crate::resolved::{ResolvedRequest, ResolvedSample, ResolvedSeries};
+use crate::proto::prometheus::histogram::{Count, ZeroCount};
+use crate::proto::prometheus::{
+    BucketSpan, Histogram as ProtoHistogram, TimeSeries as ProtoTimeSeries, WriteRequest,
+};
+use crate::resolved::{
+    ResolvedCount, ResolvedHistogram, ResolvedRequest, ResolvedSample, ResolvedSeries, ResolvedSpan,
+};
 use crate::snappy::{self, SnappyError};
 
 #[derive(Debug, thiserror::Error)]
@@ -61,8 +66,49 @@ fn resolve_series(series: ProtoTimeSeries) -> ResolvedSeries {
                 value: s.value,
             })
             .collect(),
-        histogram_count: series.histograms.len(),
+        histograms: series
+            .histograms
+            .into_iter()
+            .map(resolve_histogram)
+            .collect(),
         exemplar_count: series.exemplars.len(),
+    }
+}
+
+/// Field-for-field mapping of one wire `prometheus.Histogram` into the
+/// version-blind [`ResolvedHistogram`]. Nothing is validated or reshaped
+/// here (bucket deltas stay deltas, an unset `count` oneof stays absent):
+/// [`crate::normalize`] owns every admission decision, so RW1 and RW2 cannot
+/// drift on what they accept. Its RW2 twin is `rw2::resolve_histogram`.
+fn resolve_histogram(h: ProtoHistogram) -> ResolvedHistogram {
+    ResolvedHistogram {
+        ts_ms: h.timestamp,
+        schema: h.schema,
+        zero_threshold: h.zero_threshold,
+        sum: h.sum,
+        count: h.count.map(|c| match c {
+            Count::CountInt(v) => ResolvedCount::Int(v),
+            Count::CountFloat(v) => ResolvedCount::Float(v),
+        }),
+        zero_count: h.zero_count.map(|z| match z {
+            ZeroCount::ZeroCountInt(v) => ResolvedCount::Int(v),
+            ZeroCount::ZeroCountFloat(v) => ResolvedCount::Float(v),
+        }),
+        positive_spans: h.positive_spans.iter().map(resolve_span).collect(),
+        negative_spans: h.negative_spans.iter().map(resolve_span).collect(),
+        positive_deltas: h.positive_deltas,
+        negative_deltas: h.negative_deltas,
+        positive_counts: h.positive_counts,
+        negative_counts: h.negative_counts,
+        reset_hint: h.reset_hint,
+        custom_values: h.custom_values,
+    }
+}
+
+fn resolve_span(span: &BucketSpan) -> ResolvedSpan {
+    ResolvedSpan {
+        offset: span.offset,
+        length: span.length,
     }
 }
 
@@ -112,13 +158,16 @@ mod tests {
         assert_eq!(series.samples.len(), 1);
         assert_eq!(series.samples[0].ts_ms, 1_700_000_000_000);
         assert_eq!(series.samples[0].value, 1.0);
-        assert_eq!(series.histogram_count, 0);
+        assert!(series.histograms.is_empty());
         assert_eq!(series.exemplar_count, 0);
     }
 
+    /// Native histograms are materialized (they have durable storage since
+    /// RSEG v5); exemplars stay a tally, since ADR-0017 defers exemplar
+    /// storage.
     #[test]
-    fn tallies_histograms_and_exemplars_without_materializing_them() {
-        use crate::proto::prometheus::{Exemplar as ProtoExemplar, Histogram as ProtoHistogram};
+    fn materializes_histograms_and_tallies_exemplars() {
+        use crate::proto::prometheus::Exemplar as ProtoExemplar;
         let req = write_request(vec![ProtoTimeSeries {
             labels: vec![proto_label("__name__", "latency")],
             samples: vec![],
@@ -132,8 +181,92 @@ mod tests {
         let body = compress(&req.encode_to_vec());
 
         let resolved = decode_write_request(&body, 1_000_000).expect("decode");
-        assert_eq!(resolved.series[0].histogram_count, 2);
+        assert_eq!(resolved.series[0].histograms.len(), 2);
         assert_eq!(resolved.series[0].exemplar_count, 1);
+    }
+
+    /// Every histogram field reaches [`ResolvedHistogram`] unreshaped: the
+    /// oneofs keep their kind, integer bucket sides stay deltas, and nothing
+    /// is validated at this layer.
+    #[test]
+    fn resolves_every_histogram_field_verbatim() {
+        use crate::proto::prometheus::histogram::ResetHint;
+        let req = write_request(vec![ProtoTimeSeries {
+            labels: vec![proto_label("__name__", "latency")],
+            samples: vec![],
+            exemplars: vec![],
+            histograms: vec![ProtoHistogram {
+                count: Some(Count::CountInt(14)),
+                zero_count: Some(ZeroCount::ZeroCountInt(1)),
+                sum: 42.5,
+                schema: 2,
+                zero_threshold: 1e-9,
+                positive_spans: vec![BucketSpan {
+                    offset: -2,
+                    length: 3,
+                }],
+                positive_deltas: vec![2, 3, 1],
+                negative_spans: vec![],
+                negative_deltas: vec![],
+                positive_counts: vec![],
+                negative_counts: vec![],
+                reset_hint: ResetHint::Yes as i32,
+                timestamp: 1_700_000_000_000,
+                custom_values: vec![],
+            }],
+        }]);
+        let body = compress(&req.encode_to_vec());
+
+        let resolved = decode_write_request(&body, 1_000_000).expect("decode");
+        let h = &resolved.series[0].histograms[0];
+        assert_eq!(h.ts_ms, 1_700_000_000_000);
+        assert_eq!(h.schema, 2);
+        assert_eq!(h.zero_threshold.to_bits(), 1e-9f64.to_bits());
+        assert_eq!(h.sum.to_bits(), 42.5f64.to_bits());
+        assert_eq!(h.count, Some(ResolvedCount::Int(14)));
+        assert_eq!(h.zero_count, Some(ResolvedCount::Int(1)));
+        assert_eq!(
+            h.positive_spans,
+            vec![ResolvedSpan {
+                offset: -2,
+                length: 3
+            }]
+        );
+        assert_eq!(h.positive_deltas, vec![2, 3, 1]);
+        assert!(h.negative_spans.is_empty());
+        assert!(h.positive_counts.is_empty());
+        assert_eq!(h.reset_hint, ResetHint::Yes as i32);
+        assert!(h.custom_values.is_empty());
+    }
+
+    /// A float histogram's oneofs resolve to the float variant, which is
+    /// what tells the normalizer to read `positive_counts` instead of
+    /// `positive_deltas`.
+    #[test]
+    fn resolves_float_histogram_oneofs_as_float() {
+        let req = write_request(vec![ProtoTimeSeries {
+            labels: vec![proto_label("__name__", "latency")],
+            samples: vec![],
+            exemplars: vec![],
+            histograms: vec![ProtoHistogram {
+                count: Some(Count::CountFloat(14.5)),
+                zero_count: Some(ZeroCount::ZeroCountFloat(1.5)),
+                positive_spans: vec![BucketSpan {
+                    offset: 0,
+                    length: 2,
+                }],
+                positive_counts: vec![3.0, 4.0],
+                ..ProtoHistogram::default()
+            }],
+        }]);
+        let body = compress(&req.encode_to_vec());
+
+        let resolved = decode_write_request(&body, 1_000_000).expect("decode");
+        let h = &resolved.series[0].histograms[0];
+        assert_eq!(h.count, Some(ResolvedCount::Float(14.5)));
+        assert_eq!(h.zero_count, Some(ResolvedCount::Float(1.5)));
+        assert_eq!(h.positive_counts, vec![3.0, 4.0]);
+        assert!(h.positive_deltas.is_empty());
     }
 
     #[test]
