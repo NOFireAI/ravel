@@ -12,13 +12,48 @@ use crate::http::error::ApiError;
 #[serde(tag = "status")]
 pub enum ApiResponse<T> {
     #[serde(rename = "success")]
-    Success { data: T },
+    Success {
+        data: T,
+        /// Prometheus' top-level `warnings` array: non-fatal diagnostics that
+        /// very likely indicate a result the caller did not intend. Omitted
+        /// when empty (Prometheus' own `omitempty`), which most responses
+        /// are; the labels/series/label-values endpoints always pass empty.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+        /// Prometheus' top-level `infos` array: non-fatal diagnostics worth
+        /// surfacing but usually benign. Kept separate from `warnings` (the
+        /// two are distinct fields in Prometheus and in [`ravel_promql`]'s
+        /// `Annotations`). Omitted when empty.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        infos: Vec<String>,
+    },
     #[serde(rename = "error")]
     Error {
         #[serde(rename = "errorType")]
         error_type: &'static str,
         error: String,
     },
+}
+
+impl<T> ApiResponse<T> {
+    /// A success envelope with no annotations, for endpoints that never
+    /// produce warnings or infos (labels, series, label-values).
+    pub fn success(data: T) -> Self {
+        ApiResponse::Success {
+            data,
+            warnings: Vec::new(),
+            infos: Vec::new(),
+        }
+    }
+
+    /// A success envelope carrying the query's evaluation annotations.
+    pub fn success_with_annotations(data: T, warnings: Vec<String>, infos: Vec<String>) -> Self {
+        ApiResponse::Success {
+            data,
+            warnings,
+            infos,
+        }
+    }
 }
 
 /// Segment counters for the query that produced a response
@@ -392,6 +427,38 @@ mod tests {
     fn fractional_timestamp_still_renders_its_fractional_part() {
         let json = serde_json::to_string(&Timestamp(1_700_000_150.5)).expect("serializes");
         assert_eq!(json, "1700000150.5");
+    }
+
+    #[test]
+    fn success_envelope_carries_warnings_and_infos() {
+        // Both annotation channels render as top-level arrays, matching
+        // Prometheus' `warnings`/`infos` fields (issue #178).
+        let resp = ApiResponse::success_with_annotations(
+            "data-goes-here",
+            vec!["quantile value should be between 0 and 1, got 1.5".to_string()],
+            vec!["needed to be fixed for monotonicity".to_string()],
+        );
+        let json = serde_json::to_value(&resp).expect("serializes");
+        assert_eq!(json["status"], "success");
+        assert_eq!(
+            json["warnings"],
+            serde_json::json!(["quantile value should be between 0 and 1, got 1.5"])
+        );
+        assert_eq!(
+            json["infos"],
+            serde_json::json!(["needed to be fixed for monotonicity"])
+        );
+    }
+
+    #[test]
+    fn success_envelope_omits_empty_annotation_arrays() {
+        // Prometheus' `omitempty`: a query with no annotations carries
+        // neither field, so the comparator's presence check reads them as
+        // absent rather than present-but-empty.
+        let resp = ApiResponse::success("data-goes-here");
+        let json = serde_json::to_value(&resp).expect("serializes");
+        assert!(json.get("warnings").is_none(), "empty warnings omitted");
+        assert!(json.get("infos").is_none(), "empty infos omitted");
     }
 
     #[test]
