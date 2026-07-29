@@ -87,7 +87,13 @@ Validation (all violations are Corrupted, never panics):
 - Every section `[offset, offset+len)` must lie within
   `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
 - `uncompressed_len` is capped by config (default 1 GiB per section,
-  64 MiB per page) and the decompressed size must equal it exactly.
+  64 MiB per page) and the decompressed size must equal it exactly. The same
+  section cap also bounds the live-decoded byte cost of a SERIES_META (or
+  SERIES_META_CHUNKS frame) run-major column set: `run_total` (or
+  `frame_run_total`) is rejected before any run-major column is allocated if
+  its known per-run live-byte cost would exceed the cap, since a small
+  compressed section can otherwise declare a `run_total` whose decoded
+  columns occupy far more live heap than its input byte count implies.
 - SERIES_IDS `count`, the catalog body's `count`, and FooterProto
   `series_count` must all be equal.
 - Identity fields (tenant_hash, shard, writer_id, epoch, seq) MUST match the

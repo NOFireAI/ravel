@@ -206,6 +206,14 @@ pub enum SegmentError {
     RunCountSumMismatch { run_count_sum: u64, run_total: u64 },
     #[error("SERIES_META run provenance/bounds arithmetic overflowed i64")]
     ProvenanceBoundsOverflow,
+    #[error(
+        "SERIES_META run_total {run_total} would decode to {live_bytes} live bytes, exceeding the {cap}-byte section budget"
+    )]
+    RunTotalLiveBudgetExceeded {
+        run_total: u64,
+        live_bytes: u64,
+        cap: u64,
+    },
 
     // --- RSEG v5 only (ADR-0026, docs/segment-format.md "RSEG v5
     // amendment"): SERIES_IDX + chunked SERIES_META decode. v1-v4 objects
