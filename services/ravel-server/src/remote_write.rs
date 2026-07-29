@@ -19,7 +19,7 @@ use bytes::Bytes;
 use ravel_ingest::{IngestRouter, WriteError, WriteMode};
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
-use ravel_remote_write::{Rw1DecodeError, Rw2DecodeError, normalize_resolved};
+use ravel_remote_write::{Rw1DecodeError, Rw2DecodeError, RwNormalizeOutput, normalize_resolved};
 use ravel_types::TenantId;
 
 const SAMPLES_WRITTEN_HEADER: &str = "x-prometheus-remote-write-samples-written";
@@ -53,6 +53,8 @@ pub struct RemoteWriteMetrics {
     requests_rejected: AtomicU64,
     points_accepted: AtomicU64,
     points_dropped: AtomicU64,
+    metadata_dropped: AtomicU64,
+    created_timestamps_dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,14 @@ pub struct RemoteWriteMetricsSnapshot {
     pub requests_rejected: u64,
     pub points_accepted: u64,
     pub points_dropped: u64,
+    /// Metric metadata entries accepted-and-dropped (no metadata store yet,
+    /// ADR-0015). Not a data point; kept separate from `points_dropped`
+    /// rather than folded into it.
+    pub metadata_dropped: u64,
+    /// Created/start timestamps accepted-and-dropped (no storage for them
+    /// yet, ADR-0017). Not a data point; kept separate from `points_dropped`
+    /// rather than folded into it.
+    pub created_timestamps_dropped: u64,
 }
 
 impl RemoteWriteMetrics {
@@ -68,12 +78,22 @@ impl RemoteWriteMetrics {
         self.requests_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_request_accepted(&self, points_accepted: u64, points_dropped: u64) {
+    fn record_request_accepted(
+        &self,
+        points_accepted: u64,
+        points_dropped: u64,
+        metadata_dropped: u64,
+        created_timestamps_dropped: u64,
+    ) {
         self.requests_accepted.fetch_add(1, Ordering::Relaxed);
         self.points_accepted
             .fetch_add(points_accepted, Ordering::Relaxed);
         self.points_dropped
             .fetch_add(points_dropped, Ordering::Relaxed);
+        self.metadata_dropped
+            .fetch_add(metadata_dropped, Ordering::Relaxed);
+        self.created_timestamps_dropped
+            .fetch_add(created_timestamps_dropped, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> RemoteWriteMetricsSnapshot {
@@ -82,6 +102,8 @@ impl RemoteWriteMetrics {
             requests_rejected: self.requests_rejected.load(Ordering::Relaxed),
             points_accepted: self.points_accepted.load(Ordering::Relaxed),
             points_dropped: self.points_dropped.load(Ordering::Relaxed),
+            metadata_dropped: self.metadata_dropped.load(Ordering::Relaxed),
+            created_timestamps_dropped: self.created_timestamps_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -98,6 +120,20 @@ pub fn router(state: Arc<RemoteWriteState>) -> Router {
     Router::new()
         .route("/api/v1/write", post(remote_write))
         .with_state(state)
+}
+
+/// Data points dropped for the Remote Write "points accepted/dropped"
+/// counters: the rejected-count sum already includes native histogram
+/// rejections (`RwRejection::NativeHistogramUnsupported`), so it must not be
+/// added again. Metadata entries and created/start timestamps are not data
+/// points and are reported through their own counters instead.
+fn compute_points_dropped(normalized: &RwNormalizeOutput) -> u64 {
+    normalized
+        .rejected
+        .iter()
+        .map(|r| r.rejected_count() as u64)
+        .sum::<u64>()
+        + normalized.exemplars_dropped as u64
 }
 
 fn now_ns() -> i64 {
@@ -190,15 +226,9 @@ async fn remote_write(
     // Strict mode only: a Remote Write 2xx must mean durable, so the
     // buffered-mode header override is never consulted on this surface.
     let normalized = normalize_resolved(&tenant, resolved, &state.limits, now_ns());
-    let points_dropped: u64 = normalized
-        .rejected
-        .iter()
-        .map(|r| r.rejected_count() as u64)
-        .sum::<u64>()
-        + normalized.histograms_dropped as u64
-        + normalized.exemplars_dropped as u64
-        + normalized.metadata_dropped as u64
-        + normalized.created_timestamps_dropped as u64;
+    let points_dropped = compute_points_dropped(&normalized);
+    let metadata_dropped = normalized.metadata_dropped as u64;
+    let created_timestamps_dropped = normalized.created_timestamps_dropped as u64;
     let points_accepted = normalized.points.len() as u64;
 
     let receipt = match state
@@ -218,9 +248,12 @@ async fn remote_write(
         }
     };
 
-    state
-        .metrics
-        .record_request_accepted(points_accepted, points_dropped);
+    state.metrics.record_request_accepted(
+        points_accepted,
+        points_dropped,
+        metadata_dropped,
+        created_timestamps_dropped,
+    );
 
     let mut response = StatusCode::NO_CONTENT.into_response();
     if !receipt.tokens.is_empty() {
@@ -247,4 +280,49 @@ async fn remote_write(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use ravel_otlp::Rejection;
+    use ravel_remote_write::RwRejection;
+
+    use super::*;
+
+    #[test]
+    fn points_dropped_does_not_double_count_native_histograms() {
+        let normalized = RwNormalizeOutput {
+            points: Vec::new(),
+            rejected: vec![
+                RwRejection::NativeHistogramUnsupported { count: 3 },
+                RwRejection::Otlp {
+                    reason: Rejection::EmptyMetricName { count: 2 },
+                    count: 2,
+                },
+            ],
+            histograms_dropped: 3,
+            exemplars_dropped: 1,
+            metadata_dropped: 5,
+            created_timestamps_dropped: 7,
+        };
+
+        // 3 (histogram rejection) + 2 (otlp rejection) + 1 (exemplar), not
+        // +3 again for histograms_dropped and not +5/+7 for metadata/created
+        // timestamps, which are not data points.
+        assert_eq!(compute_points_dropped(&normalized), 6);
+    }
+
+    #[test]
+    fn points_dropped_ignores_metadata_and_created_timestamps() {
+        let normalized = RwNormalizeOutput {
+            points: Vec::new(),
+            rejected: Vec::new(),
+            histograms_dropped: 0,
+            exemplars_dropped: 0,
+            metadata_dropped: 4,
+            created_timestamps_dropped: 9,
+        };
+
+        assert_eq!(compute_points_dropped(&normalized), 0);
+    }
 }
