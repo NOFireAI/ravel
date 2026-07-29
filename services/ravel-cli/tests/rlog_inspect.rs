@@ -54,6 +54,12 @@ fn sid(n: u8) -> LogStreamId {
 fn rec(stream: u8, ts: i64, severity: u8, body: &str, svc: &str, code: i64) -> LogRecord {
     LogRecord {
         stream_id: sid(stream),
+        stream_attrs: ravel_logseg::stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str(format!("s{stream}")))],
+            "scope",
+            "1",
+            &[],
+        ),
         ts_ns: ts,
         observed_ts_ns: ts + 5,
         severity_num: severity,

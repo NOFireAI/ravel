@@ -30,7 +30,7 @@ pub mod writer;
 
 pub use error::LogSegError;
 pub use reader::{RlogReader, ScanStats, read_section};
-pub use record::{FieldSel, LogRecord, Predicate};
+pub use record::{FieldSel, LogRecord, Predicate, stream_attrs_bytes};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
 
 // Re-exported for callers building records; these are the ravel-types identity
