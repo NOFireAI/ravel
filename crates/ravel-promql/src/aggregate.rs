@@ -78,7 +78,9 @@ use promql_parser::parser::token::{
 use promql_parser::parser::{AggregateExpr, LabelModifier};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL};
 
-use crate::eval::{Error, Evaluator, InstantSample, InstantVector, QueryWindow, Value};
+use crate::eval::{
+    Error, Evaluator, InstantSample, InstantVector, QueryWindow, Value, invalid_quantile_warning,
+};
 use crate::functions::label::is_valid_label_name;
 use crate::functions::over_time::{kahan_sum_inc, quantile};
 use crate::histogram::{FloatHistogram, avg_histograms, sum_histograms};
@@ -124,6 +126,7 @@ pub(crate) fn eval_aggregate(
                 agg.modifier.as_ref(),
                 input,
                 eval_ts_ns,
+                ctx,
             )))
         }
         T_SUM | T_AVG | T_MIN | T_MAX | T_COUNT | T_GROUP | T_STDDEV | T_STDVAR => {
@@ -389,7 +392,16 @@ fn eval_quantile(
     modifier: Option<&LabelModifier>,
     input: InstantVector,
     eval_ts_ns: i64,
+    ctx: &QueryWindow,
 ) -> InstantVector {
+    // A `q` outside [0, 1] does not error; `quantile` clamps it to +/-Inf
+    // (and a NaN `q` yields NaN). Prometheus flags any of those with a
+    // warning annotation, and now so does Ravel (issue #178). `!contains`
+    // covers NaN too (NaN is in no range), matching Prometheus, which warns
+    // on `math.IsNaN(q) || q < 0 || q > 1`.
+    if !(0.0..=1.0).contains(&q) {
+        ctx.warn(invalid_quantile_warning(q));
+    }
     group_by(modifier, input, |s| s.value)
         .into_iter()
         .map(|(labels, values)| InstantSample {

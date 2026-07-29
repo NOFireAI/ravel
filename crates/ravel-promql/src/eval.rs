@@ -48,7 +48,7 @@
 //! future phase to consume; `instant`/`range` unwrap the `Vector`/`Matrix`
 //! case and turn anything else into [`Error::WrongType`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
@@ -175,6 +175,98 @@ impl Value {
     }
 }
 
+/// Non-fatal diagnostics an otherwise-successful query evaluation
+/// accumulates, mirroring the two separate fields real Prometheus attaches
+/// to a query response envelope (`promql/parser` `Annotations`, rendered as
+/// the top-level `warnings` and `infos` arrays).
+///
+/// `warnings` and `infos` are kept **distinct**, exactly as Prometheus keeps
+/// them: a warning flags a result that is very likely not what the user
+/// wanted (a quantile argument outside `[0, 1]` clamped to an infinity, a
+/// classic histogram without enough well-formed buckets), while an info
+/// flags a result that is probably fine but worth knowing about (a classic
+/// histogram whose buckets had to be nudged back into monotonic order, a
+/// `rate()` over a metric whose name suggests it is not a counter). Collapsing
+/// the two would lose that severity distinction, so they never share a
+/// channel here either.
+///
+/// Each channel de-duplicates by exact message text: an annotation raised at
+/// every step of a range query, or once per matched series, is reported once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Annotations {
+    warnings: Vec<String>,
+    infos: Vec<String>,
+}
+
+impl Annotations {
+    /// The accumulated warning messages, in first-seen order.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// The accumulated info messages, in first-seen order.
+    pub fn infos(&self) -> &[String] {
+        &self.infos
+    }
+
+    /// True when neither channel carries anything.
+    pub fn is_empty(&self) -> bool {
+        self.warnings.is_empty() && self.infos.is_empty()
+    }
+
+    /// Consume into the two owned channel vectors, for a caller wiring them
+    /// into a response envelope.
+    pub fn into_parts(self) -> (Vec<String>, Vec<String>) {
+        (self.warnings, self.infos)
+    }
+
+    /// Record a warning, ignoring an exact-text duplicate already present.
+    pub(crate) fn add_warning(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if !self.warnings.contains(&message) {
+            self.warnings.push(message);
+        }
+    }
+
+    /// Record an info, ignoring an exact-text duplicate already present.
+    pub(crate) fn add_info(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if !self.infos.contains(&message) {
+            self.infos.push(message);
+        }
+    }
+}
+
+/// Prometheus' `InvalidQuantileWarning` message: a quantile argument (`phi`
+/// for `histogram_quantile`, `q` for the `quantile` aggregator and
+/// `quantile_over_time`) fell outside `[0, 1]` and was clamped to an
+/// infinity. A warning, not an info: the clamped result is almost never what
+/// the caller intended.
+pub(crate) fn invalid_quantile_warning(q: f64) -> String {
+    format!("quantile value should be between 0 and 1, got {q}")
+}
+
+/// Prometheus' bad-bucket warning for a classic histogram whose bucket set
+/// is not usable: fewer than two buckets, or no `+Inf` bucket, so no
+/// quantile/fraction can be computed and the group evaluates to `NaN`. A
+/// warning: the `NaN` result signals a malformed input, not a benign one.
+pub(crate) fn classic_histogram_bad_buckets_warning() -> String {
+    "input to histogram function was not a valid classic histogram: it needs \
+     at least two buckets, the highest being a +Inf bucket"
+        .to_string()
+}
+
+/// Prometheus' `HistogramQuantileForcedMonotonicityInfo` message: a classic
+/// histogram's cumulative bucket counts were not monotonic and had to be
+/// clamped to a running maximum before interpolation. An info, not a
+/// warning: the fixed-up result is usually close to correct, the source data
+/// was merely slightly inconsistent.
+pub(crate) fn forced_monotonicity_info() -> String {
+    "input to histogram function needed to be fixed for monotonicity of \
+     bucket counts (see https://prometheus.io/docs/practices/histograms/)"
+        .to_string()
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -285,9 +377,44 @@ pub(crate) struct QueryWindow {
     /// would otherwise always run to completion before the timeout could
     /// fire. `None` (the default, [`Evaluator::new`]) never cancels.
     deadline: Option<Instant>,
+    /// Non-fatal diagnostics accumulated across the whole evaluation
+    /// (`quantile` out-of-range clamps, classic-histogram bucket problems,
+    /// forced monotonicity). Threaded through every `eval_*` call via this
+    /// shared context rather than woven into each `Value`, so no per-node
+    /// return type changes; [`Evaluator::eval_instant_annotated`]/
+    /// [`Evaluator::eval_range_annotated`] hand it back to the caller once
+    /// evaluation finishes. `RefCell` because evaluation borrows `ctx`
+    /// immutably everywhere and this is the one interior-mutable sink, like
+    /// `budget` above.
+    annotations: RefCell<Annotations>,
 }
 
 impl QueryWindow {
+    /// Test-only bare context: instant window at time zero, effectively
+    /// unbounded budget, no deadline, empty annotation sink. For unit tests
+    /// that call an internal `eval_*`/annotation helper directly instead of
+    /// going through [`Evaluator::eval_instant`]/[`Evaluator::eval_range`].
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        QueryWindow {
+            start_ns: 0,
+            end_ns: 0,
+            budget: Cell::new(u64::MAX),
+            deadline: None,
+            annotations: RefCell::new(Annotations::default()),
+        }
+    }
+
+    /// Record an evaluation warning (see [`Annotations`]).
+    pub(crate) fn warn(&self, message: impl Into<String>) {
+        self.annotations.borrow_mut().add_warning(message);
+    }
+
+    /// Record an evaluation info (see [`Annotations`]).
+    pub(crate) fn info(&self, message: impl Into<String>) {
+        self.annotations.borrow_mut().add_info(message);
+    }
+
     /// Charge `points` (one subquery-grid evaluation's own size) against the
     /// shared cross-level budget. `max` is the configured ceiling
     /// ([`Evaluator::max_total_eval_points`]), reported back in the error so
@@ -415,6 +542,20 @@ impl Evaluator {
         query: &str,
         t_ms: i64,
     ) -> Result<Value, Error> {
+        Ok(self.eval_instant_annotated(source, query, t_ms)?.0)
+    }
+
+    /// Like [`Self::eval_instant`], but also returns the [`Annotations`]
+    /// (warnings and infos) evaluation accumulated. `eval_instant` is the
+    /// thin wrapper that discards them; a caller rendering a Prometheus
+    /// response envelope (`ravel-query`) uses this to surface both the
+    /// separate `warnings` and `infos` fields real Prometheus emits.
+    pub fn eval_instant_annotated(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        t_ms: i64,
+    ) -> Result<(Value, Annotations), Error> {
         let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
         let t_ns = ms_to_ns(t_ms)?;
         let ctx = QueryWindow {
@@ -422,8 +563,10 @@ impl Evaluator {
             end_ns: t_ns,
             budget: Cell::new(self.max_total_eval_points),
             deadline: self.deadline,
+            annotations: RefCell::new(Annotations::default()),
         };
-        self.eval_expr(source, &expr, t_ns, &ctx)
+        let value = self.eval_expr(source, &expr, t_ns, &ctx)?;
+        Ok((value, ctx.annotations.into_inner()))
     }
 
     /// Evaluate `query` as an instant vector at `t_ms`.
@@ -464,6 +607,23 @@ impl Evaluator {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<Value, Error> {
+        Ok(self
+            .eval_range_annotated(source, query, start_ms, end_ms, step_ms)?
+            .0)
+    }
+
+    /// Like [`Self::eval_range`], but also returns the [`Annotations`]
+    /// (warnings and infos) evaluation accumulated over the whole grid
+    /// (de-duplicated by message text, so a per-step annotation is reported
+    /// once). `eval_range` is the thin wrapper that discards them.
+    pub fn eval_range_annotated(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> Result<(Value, Annotations), Error> {
         if step_ms <= 0 {
             return Err(Error::NonPositiveStep { step_ms });
         }
@@ -493,6 +653,7 @@ impl Evaluator {
             end_ns,
             budget: Cell::new(self.max_total_eval_points),
             deadline: self.deadline,
+            annotations: RefCell::new(Annotations::default()),
         };
 
         // P1's supported grammar (paren, unary minus, literals, one
@@ -505,14 +666,14 @@ impl Evaluator {
         // multiple sub-evaluations) is the point at which per-selector
         // cursoring (ADR-0021 §1) becomes necessary; it is not needed yet.
         let (core, negate) = resolve_range_core(&expr)?;
-        match core {
-            RangeCore::Scalar(v) => Ok(Value::Scalar(if negate { -v } else { v })),
-            RangeCore::Str(s) => Ok(Value::String(s.to_string())),
+        let value = match core {
+            RangeCore::Scalar(v) => Value::Scalar(if negate { -v } else { v }),
+            RangeCore::Str(s) => Value::String(s.to_string()),
             RangeCore::Selector(vs) => {
                 let matrix = self.eval_range_selector(
                     source, vs, start_ns, end_ns, step_ns, points, &ctx, negate,
                 )?;
-                Ok(Value::Matrix(matrix))
+                Value::Matrix(matrix)
             }
             RangeCore::Call(call) => {
                 let matrix = crate::functions::eval_range_call(
@@ -523,7 +684,7 @@ impl Evaluator {
                 } else {
                     matrix
                 };
-                Ok(Value::Matrix(matrix))
+                Value::Matrix(matrix)
             }
             RangeCore::Generic(e) => {
                 let matrix =
@@ -531,9 +692,10 @@ impl Evaluator {
                         ctx.check_deadline()?;
                         self.eval_expr(source, e, t, &ctx)
                     })?;
-                Ok(Value::Matrix(matrix))
+                Value::Matrix(matrix)
             }
-        }
+        };
+        Ok((value, ctx.annotations.into_inner()))
     }
 
     /// Evaluate `query` as a range matrix over `start_ms..=end_ms` stepping
@@ -1376,6 +1538,120 @@ mod tests {
 
     fn minutes(m: i64) -> i64 {
         m * 60_000
+    }
+
+    // --- Warning/info annotations (issue #178) ---
+
+    #[test]
+    fn quantile_out_of_range_surfaces_a_warning() {
+        // quantile(1.5, ...) clamps to +Inf; the value is correct but the
+        // out-of-range argument earns a warning, and no info.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "m"), ("i", "1")], &[(0, 1.0)])
+            .expect("valid series")
+            .with_series(&[("__name__", "m"), ("i", "2")], &[(0, 2.0)])
+            .expect("valid series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "quantile(1.5, m)", 0)
+            .expect("evaluates");
+        match value {
+            Value::Vector(v) => assert_eq!(v[0].value, f64::INFINITY),
+            other => panic!("expected vector, got {}", other.type_name()),
+        }
+        assert_eq!(annotations.warnings().len(), 1, "one warning");
+        assert!(
+            annotations.warnings()[0].contains("quantile value should be between 0 and 1"),
+            "warning names the out-of-range quantile: {:?}",
+            annotations.warnings()
+        );
+        assert!(annotations.infos().is_empty(), "no info for this case");
+    }
+
+    #[test]
+    fn quantile_in_range_surfaces_no_annotations() {
+        let source = TestSource::new()
+            .with_series(&[("__name__", "m"), ("i", "1")], &[(0, 1.0)])
+            .expect("valid series")
+            .with_series(&[("__name__", "m"), ("i", "2")], &[(0, 2.0)])
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "quantile(0.5, m)", 0)
+            .expect("evaluates");
+        assert!(
+            annotations.is_empty(),
+            "a well-formed quantile query is annotation-free: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn histogram_quantile_missing_inf_bucket_surfaces_a_warning() {
+        // A classic histogram whose buckets have no +Inf is not usable: the
+        // group is NaN and a bucket-count warning surfaces.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "http_bucket"), ("le", "0.1")], &[(0, 10.0)])
+            .expect("valid series")
+            .with_series(&[("__name__", "http_bucket"), ("le", "0.5")], &[(0, 20.0)])
+            .expect("valid series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "histogram_quantile(0.9, http_bucket)", 0)
+            .expect("evaluates");
+        match value {
+            Value::Vector(v) => assert!(v[0].value.is_nan(), "malformed histogram is NaN"),
+            other => panic!("expected vector, got {}", other.type_name()),
+        }
+        assert_eq!(annotations.warnings().len(), 1, "one bucket-count warning");
+        assert!(
+            annotations.warnings()[0].contains("classic histogram"),
+            "warning names the malformed classic histogram: {:?}",
+            annotations.warnings()
+        );
+    }
+
+    #[test]
+    fn histogram_quantile_non_monotonic_buckets_surface_an_info() {
+        // Cumulative counts dip (0.5 bucket below the 0.1 bucket): the fixup
+        // is an info, not a warning, and the result is still produced.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "hb"), ("le", "0.1")], &[(0, 10.0)])
+            .expect("valid series")
+            .with_series(&[("__name__", "hb"), ("le", "0.5")], &[(0, 5.0)])
+            .expect("valid series")
+            .with_series(&[("__name__", "hb"), ("le", "+Inf")], &[(0, 20.0)])
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "histogram_quantile(0.5, hb)", 0)
+            .expect("evaluates");
+        assert!(
+            annotations.warnings().is_empty(),
+            "a monotonicity fixup is not a warning: {:?}",
+            annotations.warnings()
+        );
+        assert_eq!(annotations.infos().len(), 1, "one forced-monotonicity info");
+        assert!(
+            annotations.infos()[0].contains("monotonicity"),
+            "info names the monotonicity fixup: {:?}",
+            annotations.infos()
+        );
+    }
+
+    #[test]
+    fn range_query_deduplicates_a_per_step_warning() {
+        // A range query re-evaluates the quantile at every grid step, but the
+        // identical out-of-range warning is reported once, not per step.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "m"), ("i", "1")], &[(0, 1.0)])
+            .expect("valid series")
+            .with_series(&[("__name__", "m"), ("i", "2")], &[(0, 2.0)])
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_range_annotated(&source, "quantile(1.5, m)", 0, minutes(5), minutes(1))
+            .expect("evaluates");
+        assert_eq!(
+            annotations.warnings().len(),
+            1,
+            "the per-step warning is de-duplicated to one: {:?}",
+            annotations.warnings()
+        );
     }
 
     #[test]
@@ -2273,6 +2549,7 @@ mod tests {
             end_ns: sel_ts_ns,
             budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
             deadline: None,
+            annotations: RefCell::new(Annotations::default()),
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
@@ -2306,6 +2583,7 @@ mod tests {
             end_ns: sel_ts_ns,
             budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
             deadline: None,
+            annotations: RefCell::new(Annotations::default()),
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)

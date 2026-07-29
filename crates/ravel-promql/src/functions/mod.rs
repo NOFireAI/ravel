@@ -65,11 +65,14 @@ pub(crate) enum FunctionKind {
     /// `f(phi, v instant-vector) -> instant-vector`: many-to-fewer,
     /// grouping `v` by its own labels rather than reducing one series'
     /// matrix window, so it does not fit either `RangeVector` shape above
-    /// (P9, `histogram_quantile`).
-    HistogramQuantile(fn(f64, InstantVector) -> Vec<(LabelSet, f64)>),
+    /// (P9, `histogram_quantile`). Takes `&QueryWindow` so it can raise
+    /// warning/info annotations (out-of-range `phi`, malformed buckets,
+    /// forced monotonicity; issue #178).
+    HistogramQuantile(HistogramQuantileFn),
     /// `f(lower, upper, v instant-vector) -> instant-vector`, the two-scalar
-    /// counterpart of `HistogramQuantile` (P9, `histogram_fraction`).
-    HistogramFraction(fn(f64, f64, InstantVector) -> Vec<(LabelSet, f64)>),
+    /// counterpart of `HistogramQuantile` (P9, `histogram_fraction`). Takes
+    /// `&QueryWindow` for the same annotation reason.
+    HistogramFraction(HistogramFractionFn),
     /// `f(q, v range-vector) -> instant-vector`: the scalar comes first
     /// (`quantile_over_time(q, v)`), the mirror image of
     /// `RangeVectorScalar`'s argument order (`predict_linear(v, t)`). P5's
@@ -97,6 +100,16 @@ pub(crate) enum FunctionKind {
     /// arguments however its shape requires (P6).
     Instant(InstantFn),
 }
+
+/// An [`FunctionKind::HistogramQuantile`] function pointer, aliased to keep
+/// the enum variant under clippy's `type_complexity` threshold now that it
+/// also takes a `&QueryWindow` for annotations.
+pub(crate) type HistogramQuantileFn = fn(f64, InstantVector, &QueryWindow) -> Vec<(LabelSet, f64)>;
+
+/// An [`FunctionKind::HistogramFraction`] function pointer, aliased for the
+/// same reason as [`HistogramQuantileFn`].
+pub(crate) type HistogramFractionFn =
+    fn(f64, f64, InstantVector, &QueryWindow) -> Vec<(LabelSet, f64)>;
 
 /// An [`FunctionKind::Instant`] function: given the evaluator and full call
 /// context, evaluates its own arguments and produces a [`Value`] however its
@@ -207,14 +220,17 @@ pub(crate) fn eval_call(
         FunctionKind::HistogramQuantile(f) => {
             let phi = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
             let vector = vector_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
-            Ok(Value::Vector(to_instant_vector(f(phi, vector), eval_ts_ns)))
+            Ok(Value::Vector(to_instant_vector(
+                f(phi, vector, ctx),
+                eval_ts_ns,
+            )))
         }
         FunctionKind::HistogramFraction(f) => {
             let lower = scalar_arg(evaluator, source, &call.args.args[0], eval_ts_ns, ctx)?;
             let upper = scalar_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
             let vector = vector_arg(evaluator, source, &call.args.args[2], eval_ts_ns, ctx)?;
             Ok(Value::Vector(to_instant_vector(
-                f(lower, upper, vector),
+                f(lower, upper, vector, ctx),
                 eval_ts_ns,
             )))
         }

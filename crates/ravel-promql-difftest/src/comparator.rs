@@ -8,7 +8,10 @@
 //! comparator agnostic to that internal bit pattern); `-0.0` is otherwise
 //! bit-significant. Result vectors compare label-set-sorted unless the
 //! corpus entry is marked order-sensitive. Errors compare by `errorType`
-//! class string equality. Warnings compare by presence only.
+//! class string equality. The two annotation channels `warnings` and
+//! `infos` each compare by presence only, but independently: they are
+//! distinct Prometheus fields (issue #178), so a query where one engine
+//! emits an info and the other a warning (or nothing) is a mismatch.
 //!
 //! A corpus entry may opt into a bounded ULP tolerance (ADR-0025's
 //! allowlist: a named, measured, per-entry exception, not a global fuzzy
@@ -165,7 +168,15 @@ fn sort_by_label_key(results: &[Json]) -> Vec<Json> {
 }
 
 fn has_warnings(body: &Json) -> bool {
-    body.get("warnings")
+    has_nonempty_array(body, "warnings")
+}
+
+fn has_infos(body: &Json) -> bool {
+    has_nonempty_array(body, "infos")
+}
+
+fn has_nonempty_array(body: &Json, field: &str) -> bool {
+    body.get(field)
         .and_then(|w| w.as_array())
         .is_some_and(|arr| !arr.is_empty())
 }
@@ -259,6 +270,19 @@ fn compare_success(
             "warning presence mismatch: prometheus={} ravel={}",
             has_warnings(prometheus),
             has_warnings(ravel)
+        ));
+    }
+
+    // `infos` is a distinct Prometheus field from `warnings` (issue #178):
+    // an out-of-range `quantile` clamp warns, a forced-monotonicity fixup
+    // informs. Before Ravel had any annotation channel the comparator could
+    // only skip `infos`; now it checks its presence too, so a query where
+    // one engine emits an info and the other does not is caught.
+    if has_infos(prometheus) != has_infos(ravel) {
+        return Verdict::Mismatch(format!(
+            "info presence mismatch: prometheus={} ravel={}",
+            has_infos(prometheus),
+            has_infos(ravel)
         ));
     }
 
@@ -643,6 +667,68 @@ mod tests {
         let ravel = json!({
             "status": "success",
             "data": {"resultType": "vector", "result": []}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn info_presence_mismatch_is_caught_independently_of_warnings() {
+        // Both sides agree on the (empty) warnings channel and on the result,
+        // but only Prometheus carries an `infos` entry. Before issue #178 the
+        // comparator skipped `infos` entirely and this pair compared equal;
+        // now the info-presence check must catch it, proving `infos` is
+        // compared and is a channel distinct from `warnings`.
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+            "infos": ["input to histogram_quantile needed to be fixed for monotonicity"]
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []}
+        });
+        assert!(matches!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn matching_infos_on_both_sides_still_match() {
+        // Presence, not content: both sides carry some info, so they agree.
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+            "infos": ["prometheus wording for the info"]
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+            "infos": ["ravel wording for the info"]
+        });
+        assert_eq!(
+            compare(ComparisonMode::Unordered, None, &prom, &ravel),
+            Verdict::Match
+        );
+    }
+
+    #[test]
+    fn a_warning_on_one_side_and_an_info_on_the_other_is_a_mismatch() {
+        // The two channels are severity-distinct: an engine emitting a
+        // warning where the other emits only an info is a real divergence,
+        // caught because the warnings channel disagrees.
+        let prom = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+            "warnings": ["quantile value should be between 0 and 1"]
+        });
+        let ravel = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+            "infos": ["some info instead"]
         });
         assert!(matches!(
             compare(ComparisonMode::Unordered, None, &prom, &ravel),

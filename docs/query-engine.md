@@ -38,7 +38,12 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      result)
   -> ravel-promql Evaluator -> Value (scalar / string / instant vector /
      range matrix)
-  -> Prometheus JSON envelope {status, data:{resultType, result}, warnings}
+  -> Prometheus JSON envelope {status, data:{resultType, result},
+     warnings, infos}
+     (warnings/infos are the evaluator's Annotations: two distinct
+     Prometheus fields, both omitted when empty. A quantile argument outside
+     [0,1] and a malformed classic histogram are warnings; a forced
+     histogram monotonicity fixup is an info. Issue #178.)
 ```
 
 `padded_range`: the union, over every selector `plan_selectors` reports, of
