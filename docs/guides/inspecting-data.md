@@ -160,13 +160,14 @@ Field by field:
 
 ## `rlog inspect`: what's inside one log segment
 
-Log data lives in RLOG v1 objects (`.rlog`), the columnar log segment format
-(docs/log-segment-format.md, ADR-0029). RLOG is a sibling of RSEG: same
-16-byte trailer, protobuf footer, and crc32c discipline, but its own sections
-and none of the bytes. As of log storage phase 1 the format crate
-(`ravel-logseg`) ships on its own; ingest, query, and lifecycle are later
-phases, so today an RLOG object is produced by the writer directly (in tests
-and tooling) rather than by the ingest path. The command:
+Log data lives in RLOG objects (`.rlog`), the columnar log segment format
+(docs/log-segment-format.md, ADR-0029; trailer version 2, ADR-0032). RLOG is
+a sibling of RSEG: same 16-byte trailer, protobuf footer, and crc32c
+discipline, but its own sections and none of the bytes. As of log storage
+phase 1 the format crate (`ravel-logseg`) ships on its own; ingest, query,
+and lifecycle are later phases, so today an RLOG object is produced by the
+writer directly (in tests and tooling) rather than by the ingest path. The
+command:
 
 ```sh
 cargo run -p ravel-cli -- rlog inspect "t/abab.../l/l0/0000/....rlog"
@@ -174,7 +175,7 @@ cargo run -p ravel-cli -- rlog inspect "t/abab.../l/l0/0000/....rlog"
 
 ```
 total_size: 732
-version: 1
+version: 2
 signal: 2
 tenant_hash: abababababababababababababababab
 shard: 3
@@ -188,6 +189,9 @@ max_observed_ts_ns: 255
 record_count: 4
 block_count: 2
 stream_count: 2
+level: 0
+input_set_hash: 
+part_index: 0
 sections:
   kind=1 name=STREAM_DIR offset=0 len=64 comp=zstd uncompressed_len=96
   kind=2 name=FIELD_DIR offset=64 len=30 comp=zstd uncompressed_len=21
@@ -210,9 +214,10 @@ field_dir (2 entry(ies)):
 Field by field:
 
 - `total_size`, `version`, `signal`: byte length of the object, the trailer
-  format version (always `1` for RLOG v1; a non-1 version is rejected with a
-  typed error), and the signal byte (`2` = logs). Like RSEG, the object is
-  footer-first-readable: the 16-byte trailer at the end gives the footer's
+  format version (currently `2`; any other version is rejected with a typed
+  error, no dual-reader path), and the signal byte (`2` = logs). Like RSEG,
+  the object is footer-first-readable: the 16-byte trailer at the end gives
+  the footer's
   length and crc, so a reader validates the footer in one suffix GET before
   fetching anything else.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
@@ -223,6 +228,10 @@ Field by field:
   These four plus the counts are the skip index's level 2, the whole-object
   summary in the footer.
 - `record_count`, `block_count`, `stream_count`: totals the footer claims.
+- `level`, `input_set_hash`, `part_index`: compaction provenance (ADR-0032),
+  the same convention RSEG uses. An L0 flush object (every object shown in
+  this guide) stamps the sentinels `level=0`, `input_set_hash` empty,
+  `part_index=0`; a future L1 compacted object carries real values.
 - `sections`: the five mandatory sections and their byte ranges. `kind=1`
   `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
   `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
