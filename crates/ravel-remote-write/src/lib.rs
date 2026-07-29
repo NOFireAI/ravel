@@ -25,7 +25,9 @@ pub mod rw2;
 pub mod snappy;
 
 pub use normalize::{RwNormalizeOutput, RwRejection, normalize_resolved};
-pub use resolved::{ResolvedRequest, ResolvedSample, ResolvedSeries};
+pub use resolved::{
+    ResolvedCount, ResolvedHistogram, ResolvedRequest, ResolvedSample, ResolvedSeries, ResolvedSpan,
+};
 pub use rw1::{Rw1DecodeError, decode_write_request};
 pub use rw2::{Rw2DecodeError, decode_request};
 pub use snappy::SnappyError;

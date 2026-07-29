@@ -15,8 +15,10 @@ use ravel_remote_write::proto::prometheus::{
     Label as ProtoLabelV1, Sample as ProtoSampleV1, TimeSeries as ProtoTimeSeriesV1,
     WriteRequest as ProtoWriteRequestV1,
 };
+use ravel_remote_write::proto::write_v2::histogram::{Count, ZeroCount};
 use ravel_remote_write::proto::write_v2::{
-    Request as ProtoRequestV2, Sample as ProtoSampleV2, TimeSeries as ProtoTimeSeriesV2,
+    BucketSpan, Histogram as ProtoHistogramV2, Request as ProtoRequestV2, Sample as ProtoSampleV2,
+    TimeSeries as ProtoTimeSeriesV2,
 };
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
@@ -80,6 +82,49 @@ fn rw2_body(metric: &str, job: &str, value: f64, ts_ms: i64) -> Vec<u8> {
                 start_timestamp: 0,
             }],
             histograms: vec![],
+            exemplars: vec![],
+            metadata: None,
+        }],
+    };
+    compress(&req.encode_to_vec())
+}
+
+/// An RW2 body carrying one well-formed integer native histogram (no scalar
+/// samples): one positive span of three buckets whose deltas accumulate to
+/// 2, 5, 6, plus a zero bucket, all covered by `count`.
+fn rw2_histogram_body(metric: &str, job: &str, ts_ms: i64) -> Vec<u8> {
+    let symbols = vec![
+        String::new(),
+        "__name__".to_string(),
+        metric.to_string(),
+        "job".to_string(),
+        job.to_string(),
+    ];
+    let req = ProtoRequestV2 {
+        symbols,
+        timeseries: vec![ProtoTimeSeriesV2 {
+            labels_refs: vec![1, 2, 3, 4],
+            samples: vec![],
+            histograms: vec![ProtoHistogramV2 {
+                count: Some(Count::CountInt(14)),
+                zero_count: Some(ZeroCount::ZeroCountInt(1)),
+                sum: 42.5,
+                schema: 2,
+                zero_threshold: 1e-9,
+                positive_spans: vec![BucketSpan {
+                    offset: 0,
+                    length: 3,
+                }],
+                positive_deltas: vec![2, 3, 1],
+                negative_spans: vec![],
+                negative_deltas: vec![],
+                positive_counts: vec![],
+                negative_counts: vec![],
+                reset_hint: 0,
+                timestamp: ts_ms,
+                start_timestamp: 0,
+                custom_values: vec![],
+            }],
             exemplars: vec![],
             metadata: None,
         }],
@@ -224,6 +269,53 @@ async fn rw2_write_then_query_round_trips_sample_with_stats_headers() {
     );
 
     query_one(&base, &client, "rw2_metric", &commit_token).await;
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A native histogram admitted over RW2 is reported as one written
+/// histogram and zero written samples, the split fixed for phase C8: before
+/// it, the histograms-written header was a hardcoded zero and an admitted
+/// histogram would have inflated samples-written.
+#[tokio::test]
+async fn rw2_native_histogram_reports_histograms_written_not_samples() {
+    let running = start_test_server().await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = rw2_histogram_body("rw2_hist", "demo", now_ms());
+    let response = client
+        .post(format!("{base}/api/v1/write"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header(
+            "content-type",
+            "application/x-protobuf;proto=io.prometheus.write.v2.Request",
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("write request succeeds");
+
+    assert_eq!(response.status(), 204, "RW2 histogram write should succeed");
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} header present"))
+            .to_str()
+            .expect("ascii")
+            .to_string()
+    };
+    assert_eq!(
+        header("x-prometheus-remote-write-histograms-written"),
+        "1",
+        "one native histogram was admitted and written"
+    );
+    assert_eq!(
+        header("x-prometheus-remote-write-samples-written"),
+        "0",
+        "a native histogram is not counted as a written scalar sample"
+    );
 
     running.shutdown().await.expect("graceful shutdown");
 }

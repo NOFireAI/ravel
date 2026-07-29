@@ -10,7 +10,13 @@ rust-version = "1.97"
 repository = "https://github.com/NOFireAI/ravel"
 
 [workspace.lints.rust]
-unsafe_code = "deny"
+# forbid, not deny: deny can be silently overridden by a scoped
+# #[allow(unsafe_code)], which is exactly how a generated test or a fleet
+# executor's change could smuggle unsafe past `cargo clippy -D warnings`
+# without anyone noticing the override. forbid rejects the allow attempt
+# itself as a compile error, closing the class at the compiler instead of
+# relying on a reviewer to catch it.
+unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
