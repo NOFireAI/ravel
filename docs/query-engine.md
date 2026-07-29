@@ -82,7 +82,13 @@ and passes through bit-exactly (issue #75).
   as a `matrix` with one synthetic empty-labeled series repeating that
   value at every evaluated grid step (`ravel-promql`'s `eval_range`
   resolves it once; materializing the repetition is this HTTP layer's
-  job, not the evaluator's).
+  job, not the evaluator's). `/api/v1/query` (instant) can also return
+  `matrix`, not just `vector`/`scalar`/`string`: when the top-level
+  expression is itself a range vector (for example a bare subquery, or a
+  range function nested inside an outer subquery), Prometheus renders
+  `resultType: matrix`, and Ravel matches that. Such a matrix already
+  carries its own per-series timestamps from the evaluator, so no grid
+  repetition is synthesized.
 
 ## Budgets (Phase 1: static config)
 
