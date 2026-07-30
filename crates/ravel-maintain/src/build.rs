@@ -121,7 +121,9 @@ pub async fn build_parts(
                 part_index,
                 std::mem::take(&mut batch),
             )?;
-            put_part(store, &part).await?;
+            if !config.dry_run {
+                put_part(store, &part).await?;
+            }
             parts.push(part);
             part_index += 1;
             batch_bytes = 0;
@@ -138,7 +140,9 @@ pub async fn build_parts(
             part_index,
             batch,
         )?;
-        put_part(store, &part).await?;
+        if !config.dry_run {
+            put_part(store, &part).await?;
+        }
         parts.push(part);
     }
 
