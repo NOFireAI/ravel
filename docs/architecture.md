@@ -44,6 +44,8 @@ ravel-types
   <- ravel-ingest       (segment, commit, object-store, otlp)
   <- ravel-promql       (types)
   <- ravel-query        (catalog, segment, promql)
+  <- ravel-maintain     (commit, object-store, segment, logseg; the L0->L1
+                          compactor, GC sweeper, and age-based retention)
   <- ravel-analytics    (types only; pure post-evaluation compute stage)
   <- ravel-sql          (query, catalog, types; arrow + datafusion, in
                           progress -- see below)
@@ -53,7 +55,12 @@ ravel-test-util (types, object-store) used by all dev-deps
 
 Phase 1 runs every service as modes of one binary (`ravel-server --mode
 all|gateway|query`). Crate boundaries keep the split honest so later phases
-can deploy them separately.
+can deploy them separately. A fourth mode, `--mode maintain`, runs no
+ingest or query surface: it is a disposable background worker that drives
+`ravel-maintain`'s compaction, age-based retention, and GC sweeper per
+tenant over every shard (docs/compaction-retention-plan.md P8). It requires
+a `multipart`-capable object store (compaction is the only writer of
+multipart objects) and still binds `--listen-http` for liveness only.
 
 Remote Write (ADR-0015) reuses this same gateway/router/shard pipeline: RW1
 and RW2 payloads decode and normalize to the same `NormalizedPoint` shape

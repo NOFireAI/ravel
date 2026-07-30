@@ -6,7 +6,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--mode <all\|gateway\|query>` | | `all` | Which roles this process runs. `all` and `gateway` serve OTLP ingest; `all` and `query` serve `/api/v1/*`. |
+| `--mode <all\|gateway\|query\|maintain>` | | `all` | Which roles this process runs. `all` and `gateway` serve OTLP ingest; `all` and `query` serve `/api/v1/*`. `maintain` serves neither: it runs only the background maintenance loop (compaction, retention, sweep) and still binds `--listen-http` for liveness. It requires a backend that reports the `multipart` capability. |
 | `--listen-http <addr>` | | `127.0.0.1:4318` | HTTP listener for OTLP ingest (`POST /v1/metrics`) and the query API. |
 | `--listen-grpc <addr>` | | `127.0.0.1:4317` | gRPC listener for the OTLP `MetricsService`. Only bound when the process runs ingest (`all`/`gateway`). |
 | `--store <memory\|s3>` | | `memory` | Object store backend. `memory` is in-process only, for tests and local experiments; nothing survives process exit. |
@@ -20,6 +20,9 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--s3-secret-key <secret>` | `RAVEL_S3_SECRET_KEY` | none | Required when `--store s3`. |
 | `--disable-fold` | | off | Disables the per-(tenant, signal) background catalog fold task (docs/metric-index-plan.md section 4). Folding only lowers query resolve cost; disabling it never changes query results. |
 | `--fold-interval-secs <n>` | | `300` | How often each tenant's fold task wakes up to check for newly sealed hours. |
+| `--maintain-interval-secs <n>` | | `300` | Only used in `--mode maintain`. How often each tenant's maintenance task wakes to run retention, compaction, and the sweeper over every shard of both signals. |
+| `--retention-default <duration>` | | none | Only used in `--mode maintain`. Default age-based retention window applied to every tenant with no explicit override, as a humantime duration (`30d`, `720h`). Omitted means no default retention: nothing is age-deleted unless a per-tenant window is set. Validated at startup against the ADR-0019 floor; a window below the floor fails startup rather than being clamped. |
+| `--retention-tenant TENANT=DURATION` | | none, repeatable | Only used in `--mode maintain`. Per-tenant retention window, overriding `--retention-default` for that tenant. Parsed with `humantime::parse_duration`. Same below-floor validation. |
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (via
 flag or env) fails at startup with an explicit error naming the missing
@@ -44,6 +47,12 @@ above).
 |---|---|---|
 | `ravel-cli segment inspect <path>` | local file path or object store key | Parses one RSEG segment: trailer, footer fields, section list, decoded series count. |
 | `ravel-cli commit decode <key>` | local file path or object store key | Decodes one commit record: identity, referenced data object key/size/hash, sample/series counts, timestamps. |
+| `ravel-cli commit decode-compaction <key>` | local file path or object store key | Decodes one `CompactionRecord`: identity, `input_set_hash`, each input identity, and each part's summary (`part_index`, series-id range, content hash, sizes, level, `segment_format_version`). |
+| `ravel-cli commit decode-tombstone <key>` | local file path or object store key | Decodes one `RetentionTombstone`: identity, `retired_at_ns`, `retention_window_ns`, observed record count. |
+| `ravel-cli maintain compact-bucket --tenant <n> --signal <metrics\|logs> --shard <n> --hour <n> [--dry-run]` | | Runs one compaction pass over a single sealed bucket and prints the outcome. `--dry-run` computes the same plan (part count, publish outcome) but writes no L1 parts or record. |
+| `ravel-cli maintain sweep --tenant <n> --signal <metrics\|logs> --shard <n> [--dry-run]` | | Runs one sweep pass (orphan GC, superseded inputs, unreferenced parts) over a shard and prints the four delete counts. `--dry-run` reports the eligible set but deletes nothing. |
+| `ravel-cli maintain status --tenant <n> --signal <metrics\|logs> --shard <n> --hour <n>` | | Reports a bucket's state (sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 parts present, unreferenced-part count). Read-only, so no `--dry-run`. |
+| `ravel-cli maintain audit-versions --tenant <n> [--shards <n>]` | `--shards` default `4` | Audits live on-object format versions across both signals. Flags any RSEG object at a version other than the one supported version (ADR-0027) and reports the RLOG population by trailer version (1 vs 2, ADR-0032). Exits nonzero on any anomaly. |
 | `ravel-cli catalog list --tenant <name> [--hours <n>] [--shards <n>]` | `--hours` default `1`, `--shards` default `4` | Lists commit records the catalog resolves for that tenant over the last `hours` hours. `--shards` must match the shard count the data was written with. |
 | `ravel-cli catalog fold --tenant <name> [--shards <n>]` | `--shards` default `4` | One-shot catalog fold: seals every eligible hour into a new snapshot part and CAS-advances HEAD. Prints the fold report (watermark before/after, buckets folded, entry count, request counts). Same operation the background fold task runs on a timer. |
 | `ravel-cli catalog inspect --tenant <name>` | | Decodes and prints HEAD and every referenced snapshot part: watermark, part keys, hashes, entry counts. Reports rather than errors when no HEAD exists yet. |
@@ -168,30 +177,84 @@ special shutdown sequence required for correctness:
 
 ## Garbage collection and retention
 
-What's implemented today: nothing deletes data. Segments and commit
-records, once written, stay forever.
+Ravel deletes data through two independent triggers, both driven by the
+background maintenance loop (`ravel-server --mode maintain`) or one-shot
+from `ravel-cli maintain`. Objects are immutable throughout: deletion
+removes whole objects, nothing is ever modified in place
+([docs/consistency-model.md](../consistency-model.md#deletion-and-gc),
+docs/compaction-retention-plan.md, ADR-0018/ADR-0019). All of it is
+signal-generic: metrics (RSEG) and logs (RLOG) go through the same code.
 
-What's designed but not built
-([docs/consistency-model.md](../consistency-model.md#deletion-and-gc)):
+### What runs
 
-- **Orphan GC**: a data object written but never committed (the process
-  crashed between the data PUT and the commit PUT) is invisible to queries
-  but still occupies space. The design calls for a sweep that considers
-  only objects older than `grace` (default 24h) plus `max_flush_lifetime`
-  (default 1h), re-verifies the commit record is still absent immediately
-  before deleting (relying on the object store's listing being strongly
-  consistent), and only then deletes. No such sweep exists in the codebase
-  yet; orphans accumulate.
-- **Tombstone-based deletion**: a durable tombstone transaction, then
-  logical exclusion from new snapshots, then physical removal once nothing
-  live references the object and its protection horizon has passed. Not
-  implemented.
-- **Compaction, rollups, retention windows**: none of these exist. Every
-  ingested L0 segment is retained at full resolution indefinitely.
+- **Compaction (L0 → L1)**: once an ingest-hour bucket is sealed (its end
+  plus `max_flush_lifetime` + `clock_skew_allowance`, so no further commit
+  can appear), the compactor rewrites its many small L0 segments into a
+  handful of large L1 parts and publishes one `CompactionRecord` naming
+  the L0 inputs it superseded. It copies pages verbatim, never decoding a
+  sample, so a query over the L1 output is bit-identical to a query over
+  the L0 inputs. This is the primary win: object count per hour drops from
+  thousands to a handful.
+- **Age-based retention** (ADR-0019): a sealed bucket whose newest event
+  is older than the tenant's retention window `R` is *tombstoned* (a
+  durable `RetentionTombstone`), which immediately excludes the whole
+  bucket from new query snapshots. Retention is off by default; configure
+  it with `--retention-default` / `--retention-tenant`. `R` is validated
+  at startup against a floor (`max_ingest_lag + max_flush_lifetime +
+  clock_skew_allowance` + one bucket span) so a bucket can never be
+  tombstoned before it is sealed; a window below the floor fails startup.
+  Retention runs before compaction, so an expired bucket is tombstoned,
+  never compacted first.
 
-Operationally, this means: today, running Ravel against a bucket for a
-long time only ever grows that bucket. Plan storage capacity accordingly
-until compaction and retention ship.
+### The three sweep rules (physical deletion)
+
+The sweeper is the only component that issues `delete`. All three rules
+re-verify their precondition against a fresh strongly consistent listing
+immediately before each delete, and every delete is idempotent:
+
+1. **Orphan GC**: an `l0/` data object with no commit record, older than
+   `grace + max_flush_lifetime`. The writer interlock guarantees such an
+   object can never gain a commit record later, so deleting it cannot
+   orphan a future reader.
+2. **Superseded-input sweep**: the L0 commit records and data objects a
+   `CompactionRecord` names, once `now ≥ record.created_unix_ns +
+   protection_horizon`. Records are deleted before data objects, so a
+   crash mid-sweep never leaves a commit record pointing at a deleted
+   object.
+3. **Unreferenced-part cleanup**: an `l1/` object referenced by no
+   compaction record in its bucket, once a compaction record exists for
+   that bucket and the object is older than `grace +
+   max_compaction_lifetime`.
+
+Retention's own physical sweep deletes everything in a tombstoned bucket
+(L0 records, compaction records, L0 data, L1 parts, then the tombstone
+last) once `now ≥ retired_at_ns + protection_horizon`, and only after a
+verifying listing shows the bucket empty but for its tombstone.
+
+### Timing
+
+- `grace` (default 24h): floor for the orphan and unreferenced-part age
+  gates.
+- `protection_horizon` (default `max_query_duration + grace`, 25h): the
+  gap between a deletion anchor (a compaction record's `created_unix_ns`,
+  a tombstone's `retired_at_ns`) and physical deletion, so a query
+  resolved just before the anchor still has time to read the inputs it
+  pinned.
+
+These are compaction-config defaults, not yet exposed as CLI flags; the
+maintenance loop uses the defaults.
+
+### Running it
+
+- **Continuously**: `ravel-server --mode maintain` runs the loop per
+  tenant over both signals and every shard on `--maintain-interval-secs`.
+  It requires a `multipart`-capable backend and serves no ingest or query
+  routes.
+- **One-shot / inspection**: `ravel-cli maintain compact-bucket`,
+  `maintain sweep`, `maintain status`, and `maintain audit-versions` (see
+  the CLI table above). `compact-bucket` and `sweep` take `--dry-run` to
+  report exactly what a real run would write or delete without mutating
+  anything.
 
 ## Known limitations
 
