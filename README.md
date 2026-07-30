@@ -278,6 +278,9 @@ built this way.
 - [docs/guides/](docs/guides/): getting started, ingest, query, operations,
   inspecting data
 - [docs/adrs/](docs/adrs/): one decision record per architectural choice
+- [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
+  conformance table and score — every construct classified supported,
+  intentionally rejected, or unclassified (ADR-0035)
 - [BENCHMARKS.md](BENCHMARKS.md): measured numbers, with the exact commands
   and environment that produced them
 

@@ -334,3 +334,7 @@ gain.
   (`min`/`max`/`avg` in `crates/ravel-sql/src/session.rs`): one more
   function registered into the per-query `SessionContext`, no new
   isolation mechanism.
+- The `samples`/`logs` table dispatch decided here, and the cross-signal
+  rejection, are enumerated and scored in the SQL conformance table
+  ([docs/sql-conformance.md](../sql-conformance.md), ADR-0035) alongside the
+  aggregate allowlist and the read-only write rejections.
