@@ -40,6 +40,7 @@
 
 mod avg;
 mod config;
+pub mod conformance;
 mod dedup;
 mod error;
 mod executor;
