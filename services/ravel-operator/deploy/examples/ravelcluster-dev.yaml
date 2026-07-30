@@ -1,0 +1,31 @@
+# A minimal RavelCluster for local/dev use (ADR-0034 decision 6). Points at an
+# S3-compatible endpoint (MinIO/floci) and references two Secrets the platform
+# owner creates: one with keys accessKeyId/secretAccessKey, one whose keys are
+# tenant names and whose values are bearer tokens.
+apiVersion: ravel.nofire.ai/v1alpha1
+kind: RavelCluster
+metadata:
+  name: dev
+  namespace: ravel-system
+spec:
+  image: ravel-server:latest
+  imagePullPolicy: IfNotPresent
+  shards: 4
+  storage:
+    s3:
+      bucket: ravel
+      region: us-east-1
+      endpoint: http://minio.ravel-system.svc:9000
+      credentialsSecretRef:
+        name: ravel-s3-credentials
+  tenantTokensSecretRef:
+    name: ravel-tenant-tokens
+  gateway:
+    replicas: 1
+  query:
+    replicas: 1
+  maintain:
+    enabled: true
+    intervalSecs: 300
+  retention:
+    default: 30d
