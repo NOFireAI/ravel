@@ -1,11 +1,17 @@
-//! Streaming k-way catalog merge and verbatim-page copy into RSEG v5 parts
+//! Whole-bucket catalog group-by and verbatim-page copy into RSEG v5 parts
 //! (docs/compaction-retention-plan.md §3.3 steps 3-4, with the ADR-0026/0027
-//! v5 writer substitution). Series are emitted in global id order; every run
-//! of a series is gathered from every input that carries it, its TS and
-//! VAL-or-HIST pages are fetched by range and copied verbatim (never
-//! decoded), and parts are split on series boundaries once accumulated page
-//! bytes reach `max_l1_part_bytes`, so a series' runs never straddle a part
-//! and part id-ranges are disjoint.
+//! v5 writer substitution). Every input catalog's series is grouped into one
+//! `BTreeMap` keyed by series id (all inputs' per-series metadata resident at
+//! once), then iterated in id order; this is a group-by-then-iterate, not a
+//! bounded-window k-way merge. Only the page bytes stream: every run of a
+//! series is gathered from every input that carries it, its TS and VAL-or-HIST
+//! pages are fetched by range and copied verbatim (never decoded), and parts
+//! are split on series boundaries once accumulated page bytes reach
+//! `max_l1_part_bytes`, so a series' runs never straddle a part and part
+//! id-ranges are disjoint. Each finished part is a whole object written with a
+//! single `CreateIfAbsent` PUT (no multipart; issue #243), and its encoded
+//! bytes are retained in the returned `Vec` until publish so the
+//! convergence-repair path can re-PUT a part a racing winner is missing.
 
 use std::collections::BTreeMap;
 

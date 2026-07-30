@@ -50,7 +50,10 @@ tonic OTAP stream
 ```
 
 New crate `ravel-otap` (protocol decode + normalizer). Gateway wiring in
-`ravel-server` behind cargo feature `otap` and flag `--otap`.
+`ravel-server` behind cargo feature `otap` and flag `--otap` is planned,
+not present: as shipped, `services/` has no `ravel-otap` dependency and the
+server ingest router exposes no OTAP surface. The decode/normalizer crate
+stands alone; wiring it into the server is tracked in issue #12.
 
 Dependency decisions:
 - Vendored OTAP `.proto` files (Apache-2.0) compiled with protox, same as
