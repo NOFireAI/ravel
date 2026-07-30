@@ -20,10 +20,10 @@ conditional-write primitives are the only consensus we get.
 
 ## Decision
 
-Option 3. Sequence: serialize L0 → blake3 content hash → PUT data object
-(unique key, overwrite mode is safe because the key embeds writer identity,
-sequence, and content hash) → verify → PUT commit record with
-`create-if-absent` → ack with commit token.
+Option 3. Sequence: serialize L0 → blake3 content hash → PUT data object with
+`create-if-absent` (the key embeds writer identity, sequence, and content
+hash, so a retried PUT that finds the object already present is idempotent
+success) → PUT commit record with `create-if-absent` → ack with commit token.
 
 Commit record key: `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/
 <writer_id>.<epoch>.<seq>.cmt`. Retrying the same logical commit hits the same
@@ -31,10 +31,26 @@ key; on `AlreadyExists` the writer GETs the record, verifies content hash
 equality, and treats it as success (idempotent) or a fatal split-brain error
 (mismatch).
 
-Commit token = `v1:<shard>:<writer_id>:<epoch>:<seq>` (opaque to clients).
+Commit token (opaque to clients): the token format shipped as v2, not the
+v1 shape this ADR originally recorded; see "Superseded details" below.
 
 Orphan rule: data objects without a commit record are invisible and GC-eligible
 after a grace period (default 24 h) keyed on object creation time.
+
+## Superseded details
+
+This ADR's decision (two objects, commit-record existence as the sole
+visibility truth, create-if-absent idempotency) stands. Two specifics it
+originally stated are superseded by ADR-0010; that ADR is authoritative:
+
+- The data PUT is `create-if-absent` with no separate verify step (the
+  content-addressed key makes a present object identical by construction);
+  the "→ verify →" step in the original sequence never shipped
+  (crates/ravel-commit/src/publish.rs).
+- The commit token is v2, `v2:<shard>:<writer_id>:<epoch>:<seq>:
+  <ingest_hour_bucket>` base64url-encoded, carrying the ingest_hour_bucket
+  the v1 shape lacked (ADR-0010 §2). Use ADR-0010 for the current token
+  format and full commit sequence.
 
 ## Consequences
 

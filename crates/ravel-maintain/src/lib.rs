@@ -18,8 +18,12 @@
 //!    yielding a stable [`read::input_set_hash`];
 //! 3. [`read::load_input_catalog`] decodes each input's catalog to per-run
 //!    absolute page ranges (only metadata retained);
-//! 4. [`build::build_parts`] streams a k-way merge in series-id order,
-//!    fetching and copying verbatim pages into size-capped v5 parts;
+//! 4. [`build::build_parts`] groups every input catalog's series into one
+//!    whole-bucket `BTreeMap` keyed by series id, then iterates it in id
+//!    order, fetching and copying verbatim pages into size-capped v5 parts
+//!    (a group-by-then-iterate; only the page bytes stream, and every
+//!    completed part's bytes are retained until publish for convergence
+//!    repair);
 //! 5. [`publish::publish_record`] publishes the [`CompactionRecord`] with
 //!    `CreateIfAbsent`, converging on any racing winner (plan §3.4).
 //!

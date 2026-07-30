@@ -129,8 +129,15 @@ docs/compaction-retention-plan.md §7.
    fuzz and property coverage over all four versions, inspector support.
 3. **Output partitioning.** 1..N part objects per bucket, split by
    disjoint series-id ranges when a size cap (`max_l1_part_bytes`) would
-   be exceeded, built via multipart upload. The multipart capability
-   becomes mandatory, as the object-store contract already anticipates.
+   be exceeded. As shipped, each part is assembled whole in memory and
+   written with a single `CreateIfAbsent` PUT (crates/ravel-maintain/
+   src/build.rs `put_part`); no multipart method exists on the
+   object-store trait, so streaming/multipart assembly of large parts is
+   deferred to issue #243. The maintain-mode capability gate does add
+   `multipart` to its required set (crates/ravel-object-store/src/lib.rs),
+   but no shipped backend reports that capability (MemoryStore and S3 both
+   report `multipart: false`), so the gate as written is a future
+   requirement, not a satisfied one; tracked in issue #243.
 4. **Publication.** New protobuf message `CompactionRecord` (additive,
    proto/ravel/commit.proto): identity fields, ingest_hour_bucket,
    level = 1, the full input identity list [(writer_id, epoch, seq)],
@@ -195,6 +202,15 @@ docs/compaction-retention-plan.md §7.
    precedent) only bounds rescans. Losing the cursor costs a rescan,
    never correctness. No leader election, no locks: concurrent
    maintainers converge through CreateIfAbsent.
+
+   As shipped, the advisory cursor is unused by the running worker.
+   `scan_and_compact` (its only consumer) has no non-test caller; the
+   `--mode maintain` service deliberately full-scans every sealed bucket
+   each pass via `scan_and_maintain`, which does not touch the cursor,
+   because retention must re-evaluate every bucket on every pass rather
+   than skip past a monotonic cursor (crates/ravel-maintain/src/scan.rs
+   retention rationale). The cursor and its CAS plumbing remain for the
+   compaction-only driver.
 8. **v1 retirement is in scope.** Compaction output is always v4, so
    every compacted bucket removes v1 (and v2, and v3) objects from the
    population once the sweep completes, and retention (ADR-0019) bounds
