@@ -19,34 +19,37 @@
 //! truthful for the stream this stage produces; nothing declares a global
 //! cross-partition order (that is a merge's job, not the leaf's).
 //!
-//! # Mandatory stream-attribute re-verification (issue #239 correctness gate)
+//! # Correctness: the merged `attrs` column plus DataFusion's residual
 //!
-//! [`LogSegmentFetcher::matching_streams`] — used internally by `fetch` to
-//! resolve a `attrs['k'] = 'v'` predicate into a `Predicate::StreamIn` — is
-//! **documented to over-approximate**: it is a byte-containment search over each
-//! stream's canonical resource+scope blob, so it also matches a `(key, value)`
-//! pair that appears only *nested* inside a `Map`/`List` attribute value, not as
-//! a genuine top-level resource or scope attribute. Its own doc comment
-//! requires the caller to re-apply the equality on returned records. This stage
-//! does exactly that: for every record `fetch` returns whose query carried a
-//! stream-attribute equality, it re-checks the equality against the record's
-//! actual top-level resource/scope attributes ([`ravel_logseg::LogRecord::stream_attrs`],
-//! the canonical hash-preimage blob) before emitting the row, dropping the
-//! fetcher's false positives. The check walks the blob's top-level entries
-//! only, so a nested pair never satisfies it. This makes the scan's output
-//! exact for stream-attribute predicates independently of DataFusion's residual.
+//! This scan pushes only two predicate kinds into [`LogSegmentFetcher::fetch`]:
+//! the ts range (a segment-level and reader-level prune, exact) and content
+//! predicates (`has_word`, whose SQL semantics equal the reader's exact filter,
+//! [`crate::logs_pushdown`]). It does **not** push stream-attribute equalities,
+//! and it performs no per-record re-verification: it emits every record the
+//! fetcher returns. Attribute filtering is entirely DataFusion's job.
 //!
-//! The residual still runs (pushdown is always `Inexact`), so it must *agree*
-//! with this check rather than fight it: [`build_batch`] therefore populates the
-//! `attrs` map column from each record's resource + scope attributes merged with
-//! its dynamic per-record attributes (record wins on a key collision; ADR-0033
-//! amendment, issue #239), not from the per-record attributes alone. Before that
-//! fix the column carried only dynamic attributes, so a residual re-check of
-//! `attrs['service.name'] = 'api'` against it dropped every record whose
-//! `service.name` was a genuine resource attribute -- the normal OTLP shape --
-//! even though this scan had already verified the stream matched. Merging makes
-//! the data the residual checks and the data this stream-identity check verifies
-//! the same data, so the two agree.
+//! The reason is the ADR-0033 merge. `attrs` is the resource + scope + record
+//! attributes merged into one map with the record winning on a key collision, so
+//! a record's `attrs['k']` value can differ from its stream-identifying
+//! resource/scope attributes. Any prune keyed on stream-level attributes — the
+//! fetcher's STREAM_DIR match resolved into a `Predicate::StreamIn`, or a
+//! scan-level re-check of `stream_attrs` — is therefore **not** a sound
+//! over-approximation of `attrs['k'] = 'v'`: it drops a record whose match lives
+//! only in its per-record dynamic attributes (resource `service.name = worker`,
+//! record attribute `service.name = api`, query `= 'api'`), which the merged map
+//! resolves to `api` and must keep. Pushing such a predicate as a fetch prune is
+//! a data-loss bug; so this scan does not, and stream-attribute equalities are
+//! not extracted into the fetch at all ([`crate::logs_pushdown`]).
+//!
+//! Correctness comes solely from the merged `attrs` column plus the residual.
+//! Pushdown is always `Inexact`, so DataFusion re-applies the *original*
+//! predicate against the emitted batch. [`build_batch`] populates the `attrs`
+//! column from the fully merged view (ADR-0033 amendment, issue #239), so the
+//! residual evaluates `attrs['k'] = 'v'` against exactly the data a row's SQL
+//! semantics demand: a resource-only match survives (the residual sees it in the
+//! merged column), and a record-attribute override survives (the merge resolves
+//! the key to the record's value, which wins). The merged column and the
+//! residual are the whole correctness story.
 
 use std::fmt;
 use std::future::Future;
@@ -74,7 +77,7 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{LogRecord, Predicate};
-use ravel_query::{LogQuery, LogSegmentFetcher, StreamAttrEquals};
+use ravel_query::{LogQuery, LogSegmentFetcher};
 use ravel_types::logstream::{AttrValue, canonical_attr_bytes};
 
 use crate::error::SqlError;
@@ -83,9 +86,9 @@ use crate::logs_schema::{SPAN_ID_WIDTH, TRACE_ID_WIDTH, logs_schema};
 /// Rows accumulated into one output batch before it is emitted.
 const BATCH_ROWS: usize = 8192;
 
-/// Depth cap when walking a record's canonical resource/scope blob for
-/// stream-attribute re-verification (mirrors the reader's `MAX_ATTR_DEPTH`),
-/// so hostile nesting cannot exhaust the stack.
+/// Depth cap when walking a record's canonical resource/scope blob for the
+/// merged-`attrs` decode (mirrors the reader's `MAX_ATTR_DEPTH`), so hostile
+/// nesting cannot exhaust the stack.
 const MAX_ATTR_DEPTH: u32 = 32;
 
 /// Entry-count cap per attribute set when walking the blob, matching the
@@ -102,9 +105,6 @@ pub struct LogsScanExec {
     /// Inclusive ts bounds for the fetch's [`LogQuery`].
     ts_min: i64,
     ts_max: i64,
-    /// Stream-attribute equalities pushed into the fetch and re-verified per
-    /// record (see the module doc).
-    stream_attrs: Arc<Vec<StreamAttrEquals>>,
     /// Content predicates (`has_word`) handed to `RlogReader::scan`, applied
     /// exactly there.
     content: Arc<Vec<Predicate>>,
@@ -115,14 +115,16 @@ pub struct LogsScanExec {
 impl LogsScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given ts
-    /// bounds, stream-attribute equalities, and content predicates.
+    /// bounds and content predicates. Stream-attribute equalities are
+    /// deliberately not accepted: they are not pushed into the fetch, because a
+    /// stream-level prune is unsound against the merged `attrs` column (see the
+    /// module doc). DataFusion's residual filters attributes.
     pub fn new(
         fetcher: LogSegmentFetcher,
         segments: &[SegmentRef],
         target_partitions: usize,
         ts_min: i64,
         ts_max: i64,
-        stream_attrs: Arc<Vec<StreamAttrEquals>>,
         content: Arc<Vec<Predicate>>,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -137,7 +139,6 @@ impl LogsScanExec {
             partitions,
             ts_min,
             ts_max,
-            stream_attrs,
             content,
             schema,
             properties,
@@ -176,9 +177,8 @@ impl DisplayAs for LogsScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "LogsScanExec: partitions={}, stream_attrs={}, content={}",
+            "LogsScanExec: partitions={}, content={}",
             self.partitions.len(),
-            self.stream_attrs.len(),
             self.content.len()
         )
     }
@@ -211,7 +211,6 @@ impl ExecutionPlan for LogsScanExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let segs = self.partitions.get(partition).cloned().unwrap_or_default();
         let fetcher = self.fetcher.clone();
-        let stream_attrs = Arc::clone(&self.stream_attrs);
         let content = Arc::clone(&self.content);
         let schema = Arc::clone(&self.schema);
 
@@ -223,7 +222,6 @@ impl ExecutionPlan for LogsScanExec {
             segs,
             self.ts_min,
             self.ts_max,
-            stream_attrs,
             content,
         ));
         Ok(Box::pin(LogScanStream {
@@ -234,21 +232,18 @@ impl ExecutionPlan for LogsScanExec {
     }
 }
 
-/// Fetch every segment in this partition, re-verify stream-attribute equalities
-/// against each returned record's genuine resource/scope attributes, and return
-/// the surviving records sorted by `ts` ascending.
+/// Fetch every segment in this partition and return its records sorted by `ts`
+/// ascending. Only the ts range and content predicates prune the fetch;
+/// attribute filtering is DataFusion's residual over [`build_batch`]'s merged
+/// `attrs` column (see the module doc). Every fetched record is emitted.
 async fn prepare_partition(
     fetcher: LogSegmentFetcher,
     segs: Vec<SegmentRef>,
     ts_min: i64,
     ts_max: i64,
-    stream_attrs: Arc<Vec<StreamAttrEquals>>,
     content: Arc<Vec<Predicate>>,
 ) -> DFResult<Vec<LogRecord>> {
     let mut query = LogQuery::new(ts_min, ts_max);
-    for sa in stream_attrs.iter() {
-        query = query.with_stream_attr(sa.clone());
-    }
     for c in content.iter() {
         query = query.with_content(c.clone());
     }
@@ -258,14 +253,10 @@ async fn prepare_partition(
         let Some(output) = fetcher.fetch(seg, &query).await.map_err(SqlError::from)? else {
             continue;
         };
-        for rec in output.records {
-            // Mandatory re-verification: drop the fetcher's stream-attribute
-            // over-approximation false positives (see the module doc). With no
-            // stream-attribute predicate this is a no-op keeping every record.
-            if record_satisfies_stream_attrs(&rec.stream_attrs, &stream_attrs)? {
-                out.push(rec);
-            }
-        }
+        // Emit every fetched record: stream-attribute equalities are not pushed
+        // (a stream-level prune is unsound against the merged `attrs` column),
+        // so nothing here narrows below what DataFusion's residual keeps.
+        out.extend(output.records);
     }
     // Stable sort so records with equal ts keep the reader's emission order.
     out.sort_by_key(|r| r.ts_ns);
@@ -382,11 +373,10 @@ fn build_batch(records: &[LogRecord], schema: SchemaRef) -> DFResult<RecordBatch
     // `attrs` map: each record's stream-identity (resource + scope) attributes
     // merged with its dynamic per-record attributes, values rendered to text.
     // DataFusion's mandatory `Inexact` residual re-applies `attrs['k'] = 'v'`
-    // against this column, so it must carry the same resource/scope data the
-    // scan's stream-identity re-verification checks against `stream_attrs`;
-    // populating it from `r.attrs` alone silently dropped every record whose
-    // matched attribute was a genuine resource attribute (ADR-0033 amendment,
-    // issue #239). See `merged_attrs`.
+    // against this column, and that residual is the sole exactness mechanism, so
+    // the column must carry the fully merged view. Populating it from `r.attrs`
+    // alone silently dropped every record whose matched attribute was a genuine
+    // resource attribute (ADR-0033 amendment, issue #239). See `merged_attrs`.
     let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
     for r in records {
         for (k, v) in merged_attrs(r)? {
@@ -466,9 +456,8 @@ fn merged_attrs(r: &LogRecord) -> DFResult<Vec<(String, AttrValue)>> {
 /// the canonical `resource ++ scope-name ++ scope-version ++ scope-attrs`
 /// bytes) into `(key, value)` pairs, in blob order (resource set first, then the
 /// scope attribute set). The scope name and version are length-prefixed
-/// *positional* fields, not key-value entries, so they are skipped exactly as
-/// [`blob_has_top_level_attr`] skips them and never become synthetic
-/// `scope.name`/`scope.version` keys.
+/// *positional* fields, not key-value entries, so they are skipped over and
+/// never become synthetic `scope.name`/`scope.version` keys.
 ///
 /// A top-level entry whose value is a nested `Map` or `List` is walked past
 /// (consumed, so decoding stays in frame) but **omitted** from the returned
@@ -496,8 +485,8 @@ fn decode_stream_attrs(blob: &[u8]) -> DFResult<Vec<(String, AttrValue)>> {
 /// push every top-level scalar entry as a decoded `(key, value)` pair onto
 /// `out`. A nested `Map`/`List` value is consumed but not pushed (see
 /// [`decode_stream_attrs`]). Byte-walks the same frozen grammar as
-/// [`walk_attr_set`]; kept a separate function so that verified matcher's
-/// behavior stays untouched.
+/// [`walk_attr_set`]; kept a separate function so that walker's behavior stays
+/// untouched.
 fn decode_attr_set(
     buf: &[u8],
     pos: &mut usize,
@@ -591,49 +580,15 @@ fn unzigzag(n: u64) -> i64 {
     ((n >> 1) as i64) ^ -((n & 1) as i64)
 }
 
-// --- Stream-attribute re-verification over the canonical resource/scope blob ---
-
-/// True iff `blob` (a record's [`ravel_logseg::LogRecord::stream_attrs`], the
-/// canonical `resource ++ scope-name ++ scope-version ++ scope-attrs` bytes)
-/// genuinely carries every filter's `(key, value)` as a **top-level** resource
-/// or scope attribute. A pair nested inside a `Map`/`List` value never
-/// satisfies it, which is exactly what distinguishes a real match from the
-/// fetcher's byte-containment over-approximation. Empty `filters` is true.
-fn record_satisfies_stream_attrs(blob: &[u8], filters: &[StreamAttrEquals]) -> DFResult<bool> {
-    for f in filters {
-        if !blob_has_top_level_attr(blob, f)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn blob_has_top_level_attr(blob: &[u8], filter: &StreamAttrEquals) -> DFResult<bool> {
-    let needle = value_needle(&filter.value);
-    let key = filter.key.as_bytes();
-    let mut pos = 0usize;
-    // Resource attribute set.
-    if walk_attr_set(blob, &mut pos, key, &needle, 0)? {
-        return Ok(true);
-    }
-    // Scope name and scope version, each a length-prefixed string.
-    skip_len_prefixed(blob, &mut pos)?;
-    skip_len_prefixed(blob, &mut pos)?;
-    // Scope attribute set.
-    walk_attr_set(blob, &mut pos, key, &needle, 0)
-}
-
-/// The canonical value bytes of `v` as they appear for a single attribute entry
-/// (i.e. `encode_value(v)`): `canonical_attr_bytes([("", v)])` with its leading
-/// one-entry count byte (`0x01`) and empty-key length byte (`0x00`) stripped.
-fn value_needle(v: &AttrValue) -> Vec<u8> {
-    let full = canonical_attr_bytes(std::slice::from_ref(&(String::new(), v.clone())));
-    full.get(2..).map(<[u8]>::to_vec).unwrap_or_default()
-}
+// --- Byte-walkers shared by the merged-attrs decode ---
 
 /// Walk one canonical attribute set from `pos`, advancing `pos` to its end, and
 /// return whether any **top-level** entry's key and encoded value equal
 /// `(key, needle)`. Nested `Map`/`List` values are consumed but never matched.
+///
+/// [`decode_value`]'s `Map` case calls this with an empty `key`/`needle` purely
+/// to skip past a nested set (ignoring the returned bool); the matching logic is
+/// retained unchanged so that skip stays byte-exact.
 fn walk_attr_set(
     buf: &[u8],
     pos: &mut usize,
@@ -769,57 +724,6 @@ mod tests {
 
     fn s(v: &str) -> AttrValue {
         AttrValue::Str(v.into())
-    }
-
-    #[test]
-    fn top_level_resource_attr_matches() {
-        let blob = stream_attrs_bytes(
-            &[("service.name".into(), s("api")), ("host".into(), s("h1"))],
-            "scope",
-            "1.0",
-            &[],
-        );
-        assert!(
-            blob_has_top_level_attr(&blob, &StreamAttrEquals::new("service.name", s("api")))
-                .unwrap()
-        );
-        // Wrong value does not match.
-        assert!(
-            !blob_has_top_level_attr(&blob, &StreamAttrEquals::new("service.name", s("worker")))
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn top_level_scope_attr_matches() {
-        let blob = stream_attrs_bytes(&[], "scope", "1.0", &[("lib".into(), s("otel"))]);
-        assert!(blob_has_top_level_attr(&blob, &StreamAttrEquals::new("lib", s("otel"))).unwrap());
-    }
-
-    #[test]
-    fn nested_map_value_is_not_a_top_level_match() {
-        // The pair only appears nested inside a `k8s.labels` map value; the
-        // fetcher's byte containment would match it, this must not.
-        let blob = stream_attrs_bytes(
-            &[(
-                "k8s.labels".into(),
-                AttrValue::Map(vec![("service.name".into(), s("api"))]),
-            )],
-            "scope",
-            "1.0",
-            &[],
-        );
-        assert!(
-            !blob_has_top_level_attr(&blob, &StreamAttrEquals::new("service.name", s("api")))
-                .unwrap(),
-            "nested-map pair must not count as a genuine top-level attribute"
-        );
-    }
-
-    #[test]
-    fn empty_filter_set_is_satisfied() {
-        let blob = stream_attrs_bytes(&[("a".into(), s("b"))], "s", "1", &[]);
-        assert!(record_satisfies_stream_attrs(&blob, &[]).unwrap());
     }
 
     // --- decoder / merge (issue #239 fix) ---

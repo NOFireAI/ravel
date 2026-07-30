@@ -11,11 +11,10 @@
 //!
 //! `supports_filters_pushdown` returns `Inexact` for every filter, exactly like
 //! the metrics provider: DataFusion always re-applies the originals above the
-//! scan, so pruning may only widen. Stream-attribute equalities are the one
-//! predicate whose exactness the scan itself guarantees (post-fetch
-//! re-verification, crate::logs_scan), because DataFusion's residual re-applies
-//! `attrs['k']='v'` against the dynamic-attrs column and could not re-check a
-//! resource/scope attribute there.
+//! scan, so pruning may only widen. Attribute predicates (`attrs['k']='v'`) are
+//! not pushed at all — a stream-level prune is unsound against the merged `attrs`
+//! column (crate::logs_pushdown, crate::logs_scan) — so they are evaluated
+//! entirely by DataFusion's residual over the merged column.
 
 use std::fmt;
 use std::sync::Arc;
@@ -70,18 +69,6 @@ impl LogsTableProvider {
         self.build_scan(target_partitions, &LogsPushdown::default())
     }
 
-    /// Build the scan for an explicit, already-extracted pushdown. Exposed so
-    /// tests can inject a stream-attribute predicate directly (the
-    /// re-verification case) without constructing the SQL `attrs['k']`
-    /// expression.
-    pub fn plan_pushdown(
-        &self,
-        target_partitions: usize,
-        pushdown: &LogsPushdown,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, pushdown)
-    }
-
     /// Build the scan for a set of filters, extracting the pushdown from them.
     /// Exposed so tests exercise the whole `extract_logs` -> prune -> scan path.
     pub fn plan_filters(
@@ -111,7 +98,6 @@ impl LogsTableProvider {
             target_partitions,
             pushdown.ts_min(),
             pushdown.ts_max(),
-            Arc::new(pushdown.stream_attrs.clone()),
             Arc::new(pushdown.content.clone()),
         )?;
         Ok(Arc::new(scan))

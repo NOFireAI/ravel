@@ -13,25 +13,6 @@
 //!   a literal timestamp (`>=`, `>`, `<`, `<=`, `=`), and `BETWEEN`. Feeds
 //!   segment-level pruning and the fetch's [`LogQuery`] ts bounds, identical to
 //!   the metrics `ts_lo`/`ts_hi` shape.
-//! - **stream-attribute equality** `get_field(attrs, 'k') = 'v'`: recognized
-//!   with a Utf8 literal, it becomes a [`StreamAttrEquals`] resolved per-object
-//!   against STREAM_DIR (ADR-0033). This filter over-approximates at fetch time;
-//!   the same predicate is therefore carried in [`LogsPushdown::stream_attrs`]
-//!   for the mandatory post-fetch re-verification the scan performs
-//!   (crate::logs_scan) — it is not only a fetch hint.
-//!
-//!   Note on the `attrs['k']` subscript *syntax*: it does **not** plan on this
-//!   crate's DataFusion build today. `attrs['k']` would have to lower to a
-//!   `get_field(attrs, 'k')` scalar call through a nested-expression
-//!   `ExprPlanner`, but this crate depends on `datafusion` with
-//!   `features = ["sql"]` only and registers no such planner, so the subscript
-//!   fails *query planning* with a hard error (planning stops loudly; it is
-//!   never silently mis-evaluated), independent of this extractor and of the
-//!   `attrs` column's contents. The extractor recognizes the lowered
-//!   `get_field(attrs, 'k')` shape so that once the subscript planning is wired
-//!   the pushdown works unchanged; wiring it (registering the planner in the
-//!   query session/endpoint) is an explicit gate item for issue #240, per the
-//!   ADR-0033 amendment.
 //! - **word/phrase search** `has_word(col, 'literal')` and the plain
 //!   `col LIKE '%word%'` substring shape: see below. Only `has_word` is pushed;
 //!   `LIKE` is deliberately not, for soundness.
@@ -50,18 +31,35 @@
 //! recognized (for a future exact-substring predicate) but contributes no
 //! pushed predicate today; `has_word`, whose SQL semantics are defined to equal
 //! `HasWord` exactly (crate::logs_udf), is the sound text-pruning path.
+//!
+//! # Why stream-attribute equalities are not pushed
+//!
+//! `attrs['k'] = 'v'` (lowered to `get_field(attrs, 'k') = 'v'`) is **not**
+//! extracted. It is tempting to resolve it against STREAM_DIR into a
+//! `Predicate::StreamIn` prune (ADR-0033 first described exactly this), but that
+//! is unsound under the ADR-0033 amendment's merged `attrs` column. `attrs`
+//! merges resource + scope + record attributes with the record winning on a key
+//! collision, so a record's `attrs['k']` can differ from its stream-identifying
+//! resource/scope attributes. A `StreamIn` built from stream-level attributes
+//! therefore drops a record whose match lives only in its per-record dynamic
+//! attributes (resource `service.name = worker`, record attribute
+//! `service.name = api`, query `= 'api'`) — a genuine narrowing, not a widen, so
+//! it fails the pruning-soundness invariant and no residual can recover the lost
+//! rows. Because there is no sound stream-level prune for this predicate, it is
+//! not pushed at all: it is evaluated entirely by DataFusion's `Inexact`
+//! residual against the merged `attrs` column ([`crate::logs_scan`]). Making it a
+//! sound prune would need a record-attribute-aware index, an ADR-0033 follow-up.
+//!
+//! (Separately, the `attrs['k']` subscript *syntax* does not plan on this crate's
+//! DataFusion build — `features = ["sql"]` registers no nested-expression
+//! `ExprPlanner`, so the subscript fails query planning loudly rather than being
+//! silently mis-evaluated; wiring it is a gate item for issue #240.)
 
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 use ravel_logseg::{FieldSel, Predicate};
-use ravel_query::StreamAttrEquals;
-use ravel_types::logstream::AttrValue;
 
 use crate::logs_udf::HAS_WORD_UDF;
-
-/// The name DataFusion gives the map/struct field-access function that
-/// `attrs['k']` lowers to.
-const GET_FIELD_UDF: &str = "get_field";
 
 /// Everything the extractor pulled out of a `logs` filter set, all widen-only.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -70,11 +68,6 @@ pub struct LogsPushdown {
     pub ts_lo: Option<i64>,
     /// Inclusive upper bound on `ts` in nanoseconds, if provably required.
     pub ts_hi: Option<i64>,
-    /// Stream-attribute equalities. Fed to the fetch as [`StreamAttrEquals`]
-    /// (an over-approximating STREAM_DIR filter) *and* carried forward for the
-    /// scan's mandatory post-fetch re-verification against each record's genuine
-    /// resource/scope attributes (crate::logs_scan).
-    pub stream_attrs: Vec<StreamAttrEquals>,
     /// Content predicates handed straight to `RlogReader::scan`. Only shapes
     /// whose SQL semantics equal the reader's exact filter are pushed (today:
     /// `has_word`).
@@ -142,16 +135,11 @@ fn handle_leaf(expr: &Expr, out: &mut LogsPushdown) {
 }
 
 fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown) {
-    // ts vs literal timestamp comparison (either operand order).
+    // ts vs literal timestamp comparison (either operand order). Stream-attribute
+    // equalities (`get_field(attrs, 'k') = 'v'`) are deliberately not extracted;
+    // see the module doc ("Why stream-attribute equalities are not pushed").
     if let Some((op, ts_ns)) = ts_comparison(be) {
         apply_ts_bound(out, op, ts_ns);
-        return;
-    }
-    // attrs['k'] = 'v'  ->  a stream-attribute equality.
-    if be.op == Operator::Eq
-        && let Some(sa) = stream_attr_equality(be)
-    {
-        out.stream_attrs.push(sa);
     }
 }
 
@@ -244,45 +232,6 @@ fn flip_op(op: Operator) -> Option<Operator> {
     })
 }
 
-// --- stream-attribute equality extraction ---
-
-/// `get_field(attrs, 'k') = 'v'` (either operand order) -> a stream-attribute
-/// equality with a Utf8 value. Only string-literal values are recognized; a
-/// non-string RHS contributes nothing (widen).
-fn stream_attr_equality(be: &BinaryExpr) -> Option<StreamAttrEquals> {
-    let (field_side, lit_side) = if is_attrs_get_field(&be.left) {
-        (&be.left, &be.right)
-    } else if is_attrs_get_field(&be.right) {
-        (&be.right, &be.left)
-    } else {
-        return None;
-    };
-    let key = attrs_get_field_key(field_side)?;
-    let value = lit_utf8(lit_side)?;
-    Some(StreamAttrEquals::new(key, AttrValue::Str(value)))
-}
-
-fn is_attrs_get_field(e: &Expr) -> bool {
-    attrs_get_field_key(e).is_some()
-}
-
-/// The `'k'` argument of a `get_field(attrs, 'k')` call, requiring the first
-/// argument to be the bare `attrs` column so a wrapped/aliased first arg does
-/// not accidentally match.
-fn attrs_get_field_key(e: &Expr) -> Option<String> {
-    let Expr::ScalarFunction(sf) = e else {
-        return None;
-    };
-    if sf.func.name() != GET_FIELD_UDF || sf.args.len() != 2 || !is_attrs_col(&sf.args[0]) {
-        return None;
-    }
-    lit_utf8(&sf.args[1])
-}
-
-fn is_attrs_col(e: &Expr) -> bool {
-    matches!(e, Expr::Column(c) if c.name == "attrs")
-}
-
 // --- content predicate extraction ---
 
 /// `has_word(col, 'literal')` -> a [`Predicate::HasWord`] over the recognized
@@ -318,12 +267,7 @@ fn lit_utf8(e: &Expr) -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use std::sync::Arc;
-
-    use datafusion::arrow::datatypes::DataType;
-    use datafusion::logical_expr::{
-        BinaryExpr, ColumnarValue, ScalarUDF, Volatility, and, create_udf, or,
-    };
+    use datafusion::logical_expr::{BinaryExpr, and, or};
     use datafusion::prelude::{col, lit};
 
     use super::*;
@@ -331,23 +275,6 @@ mod tests {
 
     fn ts_lit(v: i64) -> Expr {
         lit(ScalarValue::TimestampNanosecond(Some(v), None))
-    }
-
-    /// A stand-in `get_field` UDF: `extract_logs` recognizes it by name and
-    /// argument shape only, so a same-named local UDF produces the identical
-    /// `attrs['k']` predicate DataFusion's real subscript lowering would.
-    fn get_field_udf() -> ScalarUDF {
-        create_udf(
-            GET_FIELD_UDF,
-            vec![DataType::Utf8, DataType::Utf8],
-            DataType::Utf8,
-            Volatility::Immutable,
-            Arc::new(|_: &[ColumnarValue]| unreachable!("not evaluated in pushdown tests")),
-        )
-    }
-
-    fn attrs_get(key: &str) -> Expr {
-        get_field_udf().call(vec![col("attrs"), lit(key)])
     }
 
     #[test]
@@ -376,22 +303,6 @@ mod tests {
         let mixed = or(range, col("severity_num").gt(lit(5)));
         let p = extract_logs(&[mixed]);
         assert_eq!((p.ts_lo, p.ts_hi), (None, None));
-    }
-
-    #[test]
-    fn attrs_subscript_equality_becomes_stream_attr() {
-        // attrs['service.name'] = 'api'
-        let e = attrs_get("service.name").eq(lit("api"));
-        let p = extract_logs(&[e]);
-        assert_eq!(p.stream_attrs.len(), 1);
-        assert_eq!(
-            p.stream_attrs[0],
-            StreamAttrEquals::new("service.name", AttrValue::Str("api".into()))
-        );
-        // literal-on-left operand order also recognized
-        let e = lit("api").eq(attrs_get("service.name"));
-        let p = extract_logs(&[e]);
-        assert_eq!(p.stream_attrs.len(), 1);
     }
 
     #[test]
@@ -424,7 +335,6 @@ mod tests {
         });
         let p = extract_logs(&[like]);
         assert!(p.content.is_empty());
-        assert!(p.stream_attrs.is_empty());
     }
 
     #[test]

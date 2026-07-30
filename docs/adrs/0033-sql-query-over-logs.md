@@ -158,6 +158,41 @@ now comes from the residual re-applying the predicate against the fully
 merged `attrs` column, not from any pre-DataFusion filtering step being
 exact on its own.
 
+**Amendment (issue #241): a stream-attribute predicate is not pushed as a
+fetch prune at all.** The paragraph above is inconsistent with the merged-
+`attrs` amendment two paragraphs up, and the inconsistency was a live data-
+loss bug. It calls the per-object `StreamIn` match "pruning only," i.e. a
+sound over-approximation that never drops a true result. Under the merged
+`attrs` column with record-wins precedence, it is not: a `StreamIn` built
+by matching a `(key, value)` against each stream's resource/scope
+`stream_attrs` blob drops a record whose match for `attrs['k'] = 'v'` lives
+only in its *per-record* dynamic attributes (resource `service.name =
+worker`, record attribute `service.name = api`, query `= 'api'`). The
+merged column resolves that key to the record's value and must keep the
+row, but the record is never fetched, because its stream is absent from the
+`StreamIn` set. That is a narrowing, not a widening — it violates the
+pruning-soundness invariant, and no residual can recover a row the scan
+never emitted. The same flaw applies to a scan-level re-check of
+`stream_attrs`, which was the mirror-image bug (it dropped the record-
+override case) originally masked by the record-only `attrs` column.
+
+Because there is no *sound* stream-level prune for a merged-column
+attribute predicate, `ravel-sql` no longer extracts `attrs['k'] = 'v'` into
+a fetch prune at all (`crates/ravel-sql/src/logs_pushdown.rs`), and the
+scan performs no per-record re-verification
+(`crates/ravel-sql/src/logs_scan.rs`): it emits every fetched record and
+lets DataFusion's mandatory `Inexact` residual evaluate the equality
+against the merged `attrs` column — which is exactly what "correctness
+comes from the residual, not any pre-DataFusion step being exact on its
+own" already required. The fetch still prunes on the ts range (exact) and
+content predicates (`has_word`, whose SQL semantics equal the reader's
+exact filter). `LogSegmentFetcher::matching_streams` in `ravel-query` is
+unchanged and remains available; `ravel-sql` simply no longer calls it,
+because a stream-level match cannot soundly prune a merged-column
+predicate. Restoring a sound stream-attribute prune would require a
+record-attribute-aware index and is a deliberate follow-up (see Rejected
+Alternative A), not a placeholder to re-enable in place.
+
 **`attrs['k']` subscript lowering is a known gap, not fixed by this
 ADR.** `ravel-sql`'s DataFusion dependency is configured with
 `features = ["sql"]` only — no nested-expression `ExprPlanner`
