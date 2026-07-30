@@ -40,15 +40,22 @@ pub mod config;
 pub mod error;
 pub mod publish;
 pub mod read;
+pub mod retention;
 pub mod rlog;
 pub mod scan;
+pub mod sweep;
 
 pub use bucket::Bucket;
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{CompactionOutcome, compact_bucket};
-pub use config::CompactorConfig;
+pub use config::{CompactorConfig, RetentionConfig, RetentionConfigError, RetentionPolicy};
 pub use error::{MaintainError, Result};
 pub use publish::PublishOutcome;
+pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rlog::RlogCodec;
 pub use scan::{ScanReport, scan_and_compact};
+pub use sweep::{
+    LeaseCheck, NoLeases, SweepReport, sweep_orphans, sweep_shard, sweep_superseded,
+    sweep_unreferenced_parts,
+};
