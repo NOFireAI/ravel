@@ -44,7 +44,8 @@ COPY . .
 # developer's machine actually provide, not just the box this was measured on.
 ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release --locked -p ravel-server --features sql \
-    && cargo build --release --locked -p ravel-cli
+    && cargo build --release --locked -p ravel-cli \
+    && cargo build --release --locked -p ravel-operator
 
 # ---- Runtime: server image --------------------------------------------------
 # distroless/cc: glibc (no untested musl), ships ca-certificates for
@@ -67,3 +68,21 @@ EXPOSE 4318 4317
 # `docker run <image> --help` is the runtime smoke test; a bare `docker run`
 # is a real (if minimally configured) server process, not a no-op.
 ENTRYPOINT ["/usr/local/bin/ravel-server"]
+
+# ---- Runtime: operator image ------------------------------------------------
+# The Kubernetes operator (ADR-0034 decision 5): same distroless/cc:nonroot
+# base and the same CARGO_BUILD_JOBS=2 builder stage as the server image, so it
+# inherits the OOM fix (issue #251) without a second build configuration.
+# `--target operator` builds only this image.
+FROM gcr.io/distroless/cc-debian12:nonroot AS operator
+
+COPY --from=builder /app/target/release/ravel-operator /usr/local/bin/ravel-operator
+
+# No ports: the operator makes outbound calls to the Kubernetes API server and
+# serves nothing itself.
+
+# The operator takes its configuration from the ambient Kubernetes environment
+# (in-cluster service account or kubeconfig). `--print-crd` emits the
+# CustomResourceDefinition and exits, which is how deploy/crd.yaml is
+# regenerated.
+ENTRYPOINT ["/usr/local/bin/ravel-operator"]

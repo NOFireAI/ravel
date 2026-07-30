@@ -105,6 +105,19 @@ humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# kubernetes operator (services/ravel-operator, ADR-0034). These four are the
+# only new external dependencies the operator introduces. kube pulls in the
+# client, the CustomResource derive, and the rustls TLS stack; kube-runtime is
+# the controller/watcher runtime; k8s-openapi carries the generated Kubernetes
+# API types (v1_34 is a current, stable Kubernetes release); schemars derives
+# the CRD's OpenAPI v3 schema from the Rust spec structs. The operator renders
+# Kubernetes objects from the CRD only, so it depends on none of the ravel-*
+# crates or object_store.
+kube = { version = "4.2", default-features = false, features = ["client", "derive", "rustls-tls", "ring"] }
+kube-runtime = { version = "4.2" }
+k8s-openapi = { version = "0.28", features = ["v1_34"] }
+schemars = { version = "1.2", features = ["derive"] }
+
 # build
 prost-build = "0.14"
 tonic-prost-build = "0.14"
