@@ -28,6 +28,7 @@ use datafusion::arrow::compute::concat_batches;
 use futures::TryStreamExt;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
+use ravel_query::LogSegmentFetcher;
 use ravel_sql::{
     FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SqlConfig, SqlExecutor,
 };
@@ -134,6 +135,7 @@ impl Harness {
         let executor = Arc::new(SqlExecutor::new(
             Arc::clone(&fixture.catalog),
             fixture.fetcher.clone(),
+            LogSegmentFetcher::new(Arc::clone(&fixture.store)),
             SqlConfig::default(),
             1 << 30,
         ));

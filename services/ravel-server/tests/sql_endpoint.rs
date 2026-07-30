@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -24,14 +25,17 @@ use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::SegmentFetcher;
 use ravel_query::http::StaticBearerTokenResolver;
+use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::sql::{ARROW_STREAM_MEDIA_TYPE, SqlState, router};
 use ravel_sql::{SqlConfig, SqlExecutor};
+use ravel_types::logstream::log_stream_id;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -135,12 +139,104 @@ async fn publish_segment(
         .expect("publish");
 }
 
+/// One log record on the single-`service.name` stream `service`. Mirrors the
+/// fixture builder in `crates/ravel-sql/tests/logs_provider.rs`, but this test
+/// drives it through the real HTTP endpoint rather than the provider directly.
+fn log_record(service: &str, ts: i64, body: &str) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(service.to_string()),
+    )];
+    LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// Publish one real RLOG object plus its `Signal::Logs` commit record for
+/// `tenant`, exactly as `ravel-ingest`'s log shard actor does: distinct-stream
+/// count as `series_count`, record count as `sample_count`, event-time bounds
+/// from the records, and a blake3 content hash over the object bytes. The
+/// object lands at the reconstructed data key, so `Catalog::resolve` finds it.
+async fn publish_log_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+    records: &[LogRecord],
+) {
+    let tenant_hash = tenant.hash();
+
+    let mut min_event_ts_ns = i64::MAX;
+    let mut max_event_ts_ns = i64::MIN;
+    let mut streams = std::collections::HashSet::new();
+    for rec in records {
+        min_event_ts_ns = min_event_ts_ns.min(rec.ts_ns);
+        max_event_ts_ns = max_event_ts_ns.max(rec.ts_ns);
+        streams.insert(rec.stream_id);
+    }
+
+    let writer_id = Uuid::from_u128(9_000 + index as u128);
+    let identity = ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for rec in records {
+        writer.push(rec.clone()).expect("push log record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: streams.len() as u64,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: min_event_ts_ns,
+        max_ingest_ts_ns: max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10 + index as i64,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid log commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put log data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish log commit");
+}
+
 fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantId>) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
         catalog,
-        SegmentFetcher::new(store),
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store),
         SqlConfig::default(),
         1 << 30,
     );
@@ -578,4 +674,216 @@ async fn min_commit_token_is_accepted_and_read_your_write_resolves() {
             .contains("min_commit_token"),
         "{value}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The `logs` table over HTTP (ADR-0033, issue #240)
+// ---------------------------------------------------------------------------
+
+/// The epic's acceptance test for the endpoint wiring: a real `POST
+/// /api/v1/sql` against `FROM logs` returns the expected rows. Unlike the
+/// provider-level test in `crates/ravel-sql/tests/logs_provider.rs`, this
+/// resolves a `Signal::Logs` snapshot through the real `Catalog` and drives the
+/// query through the HTTP layer, proving the endpoint routes to the `logs`
+/// table purely from the query's `FROM` clause (ADR-0033 decision D: no
+/// protocol change, no second endpoint).
+#[tokio::test]
+async fn sql_query_against_logs_table_returns_rows() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+
+    // Two streams, several records, one carrying the word "timeout".
+    let records = vec![
+        log_record("api", 100, "hello world"),
+        log_record("api", 150, "connection timeout"),
+        log_record("worker", 200, "shutdown ok"),
+    ];
+    publish_log_segment(store.as_ref(), &tenant, 0, &records).await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    // A plain ts-range scan returns every record in range, body included. The
+    // `ts` column is `Timestamp(ns)`, so the bounds are TIMESTAMP literals (a
+    // bare integer does not coerce), 100 ns and 200 ns past the epoch.
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts, body FROM logs \
+         WHERE ts >= TIMESTAMP '1970-01-01 00:00:00.000000100' \
+           AND ts <= TIMESTAMP '1970-01-01 00:00:00.000000200' \
+         ORDER BY ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 3, "{value}");
+    assert_eq!(rows[0][0], serde_json::json!(100));
+    assert_eq!(rows[0][1], serde_json::json!("hello world"));
+    assert_eq!(rows[1][1], serde_json::json!("connection timeout"));
+    assert_eq!(rows[2][1], serde_json::json!("shutdown ok"));
+
+    // A `has_word` content predicate pushes down and returns only the match,
+    // proving the `has_word` UDF is registered in the logs session and the
+    // bloom-accelerated scan runs end to end over HTTP.
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts FROM logs WHERE has_word(body, 'timeout') ORDER BY ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the 'connection timeout' record: {value}"
+    );
+    assert_eq!(rows[0][0], serde_json::json!(150));
+}
+
+/// A `samples`-only query must not trigger a `Signal::Logs` catalog resolve
+/// (ADR-0033: resolve the logs snapshot only when the query references `logs`).
+/// Proven by counting the LIST calls against the logs commit keyspace
+/// (`.../l/c/...`) through a spying `ObjectStoreBackend`: a metrics query adds
+/// zero such LISTs, while a logs query adds several.
+///
+/// `FaultStore` counts only faults it *injects*, not passthrough calls, so it
+/// cannot answer "did this request list the logs keyspace at all"; a small
+/// counting proxy is the honest tool here (the same conclusion the counting
+/// store in `crates/ravel-sql/tests/util` reached).
+#[tokio::test]
+async fn a_samples_only_query_does_not_resolve_the_logs_signal() {
+    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let spy = LogsCommitListSpy::new(inner);
+    let backend: Arc<dyn ObjectStoreBackend> = spy.clone();
+    let tenant = TenantId::new("acme".to_string());
+
+    // Both signals have data, so either query can succeed on its own merits.
+    publish_segment(backend.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    publish_log_segment(
+        backend.as_ref(),
+        &tenant,
+        0,
+        &[
+            log_record("api", 100, "hello"),
+            log_record("api", 200, "world"),
+        ],
+    )
+    .await;
+
+    let app = build_router(Arc::clone(&backend), tokens(&[("acme-token", "acme")]));
+
+    // Ignore whatever publishing did; measure only what the queries cause.
+    spy.reset();
+    let before = spy.logs_commit_lists();
+    assert_eq!(before, 0, "counter reset before the queries");
+
+    // A metrics-only query resolves Signal::Metrics and must never list the
+    // logs commit keyspace.
+    let (status, value) = post_json(&app, "acme-token", "SELECT count(value) FROM samples").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let after_samples = spy.logs_commit_lists();
+    assert_eq!(
+        after_samples, before,
+        "a samples-only query must trigger no Signal::Logs LISTs \
+         (before={before}, after={after_samples})"
+    );
+
+    // A logs query, by contrast, does list the logs commit keyspace: this is
+    // the "after" that makes the zero above meaningful rather than vacuous.
+    let (status, value) = post_json(&app, "acme-token", "SELECT ts FROM logs").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let after_logs = spy.logs_commit_lists();
+    assert!(
+        after_logs > after_samples,
+        "a logs query must resolve Signal::Logs and list its commit keyspace \
+         (after_samples={after_samples}, after_logs={after_logs})"
+    );
+}
+
+/// A pass-through `ObjectStoreBackend` that counts LIST calls whose prefix
+/// addresses the logs commit keyspace (`t/<hash>/l/c/...`, the unit
+/// `Catalog::resolve(_, Signal::Logs, _)` lists). Every other operation is a
+/// plain delegate. This observes real calls, which `FaultStore`'s
+/// injected-fault counters cannot.
+struct LogsCommitListSpy {
+    inner: Arc<dyn ObjectStoreBackend>,
+    logs_commit_lists: AtomicU64,
+}
+
+impl LogsCommitListSpy {
+    fn new(inner: Arc<dyn ObjectStoreBackend>) -> Arc<Self> {
+        Arc::new(LogsCommitListSpy {
+            inner,
+            logs_commit_lists: AtomicU64::new(0),
+        })
+    }
+
+    fn logs_commit_lists(&self) -> u64 {
+        self.logs_commit_lists.load(Ordering::Acquire)
+    }
+
+    fn reset(&self) {
+        self.logs_commit_lists.store(0, Ordering::Release);
+    }
+
+    /// The `l` signal segment in the commit-key layout
+    /// (`t/<hash>/l/c/<shard>/<hour>/`, ravel-commit `keys`). Metrics is `/m/c/`.
+    fn note(&self, prefix: &str) {
+        if prefix.contains("/l/c/") {
+            self.logs_commit_lists.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for LogsCommitListSpy {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: ravel_object_store::GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.note(prefix);
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.note(prefix);
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
 }

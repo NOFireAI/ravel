@@ -72,6 +72,7 @@ use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SetExpr, Statement,
     TableFactor, Visit, Visitor,
 };
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 /// Every aggregate UDAF name (primary spelling and alias) the default
@@ -216,6 +217,58 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
     reject_writes_in_query(query)?;
     reject_excluded_aggregates(query)?;
     Ok(())
+}
+
+/// The base table names `sql` references, lowercased and unqualified (the
+/// last identifier of any multi-part name). Parsing reuses the same
+/// `DFParser` front end as [`validate`], so the extraction is as robust
+/// against comments, string literals, and quoting as the planner itself --
+/// never a raw-text scan of the statement.
+///
+/// The executor uses this to pick which signal a query needs before planning
+/// (ADR-0033: `samples` -> `Signal::Metrics`, `logs` -> `Signal::Logs`),
+/// resolving a `Signal::Logs` snapshot only when `logs` is referenced and
+/// rejecting a query that references both. The walk descends the whole query
+/// tree (CTEs, set operations, subqueries, derived tables), so a `logs`
+/// reference nested anywhere is seen; CTE aliases and other non-signal names
+/// come back too but are simply not `samples`/`logs`, so they never affect the
+/// decision.
+pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, ValidationError> {
+    let statements = DFParser::parse_sql(sql)
+        .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))?;
+    let mut tables = BTreeSet::new();
+    for statement in &statements {
+        if let DFStatement::Statement(inner) = statement
+            && let Statement::Query(query) = inner.as_ref()
+        {
+            let _ = query.visit(&mut TableNameCollector {
+                tables: &mut tables,
+            });
+        }
+    }
+    Ok(tables)
+}
+
+/// Collects every table-factor name in a query tree, lowercased and reduced to
+/// its bare (unqualified) identifier. Never breaks: it visits the whole tree.
+struct TableNameCollector<'a> {
+    tables: &'a mut BTreeSet<String>,
+}
+
+impl Visitor for TableNameCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table { name, .. } = factor {
+            // `ObjectName`'s `Display` joins parts with '.'; take the last
+            // segment and strip any identifier quoting so `public."samples"`
+            // and `samples` both reduce to `samples`.
+            let full = name.to_string();
+            let bare = full.rsplit('.').next().unwrap_or(&full).trim_matches('"');
+            self.tables.insert(bare.to_ascii_lowercase());
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// sqlparser prefixes its errors with "sql parser error: "; the endpoint
@@ -669,5 +722,47 @@ mod tests {
             validate("SELECT ((( FROM samples"),
             Err(ValidationError::Parse(_))
         ));
+    }
+
+    fn tables(sql: &str) -> BTreeSet<String> {
+        referenced_base_tables(sql).expect("parses")
+    }
+
+    #[test]
+    fn referenced_tables_are_extracted_via_the_parser_not_raw_text() {
+        // A plain FROM.
+        assert!(tables("SELECT ts FROM logs").contains("logs"));
+        assert!(!tables("SELECT ts FROM logs").contains("samples"));
+
+        // A string literal that mentions the other table must NOT count: the
+        // whole point of parsing rather than substring-matching.
+        let only_samples = tables("SELECT body FROM samples WHERE body = 'from logs table'");
+        assert!(only_samples.contains("samples"));
+        assert!(
+            !only_samples.contains("logs"),
+            "a string literal is not a table reference: {only_samples:?}"
+        );
+
+        // A comment mentioning the other table must not count either.
+        let commented = tables("SELECT ts FROM logs -- not from samples\n");
+        assert!(commented.contains("logs") && !commented.contains("samples"));
+
+        // Quoting and schema qualification reduce to the bare lowercased name.
+        assert!(tables("SELECT ts FROM \"logs\"").contains("logs"));
+    }
+
+    #[test]
+    fn referenced_tables_see_nested_and_both_table_references() {
+        // A subquery reference is found.
+        let nested = tables("SELECT ts FROM (SELECT ts FROM logs) t");
+        assert!(nested.contains("logs"));
+
+        // A query touching both tables surfaces both names (the executor turns
+        // this into a rejection; here we only prove the extractor sees both).
+        let both = tables("SELECT * FROM samples JOIN logs ON samples.ts = logs.ts");
+        assert!(both.contains("samples") && both.contains("logs"));
+
+        // A constant query references neither.
+        assert!(tables("SELECT 1").is_empty());
     }
 }

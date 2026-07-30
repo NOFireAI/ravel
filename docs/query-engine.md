@@ -168,6 +168,61 @@ output size: every matched series in every matched segment is still fully
 fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
 scales with the query's matched input, not with `max_samples`.
 
+## SQL over logs (the `logs` table, ADR-0033)
+
+`POST /api/v1/sql` serves two tables from one endpoint: `samples`
+(`Signal::Metrics`) and `logs` (`Signal::Logs`). There is no separate logs
+endpoint and no protocol change; DataFusion picks the table from the query's
+`FROM` clause. `SqlExecutor` inspects the referenced table names (through the
+same parser the read-only gate uses, never a raw-text scan) and resolves a
+snapshot for exactly one signal: `Signal::Logs` when the query references
+`logs`, `Signal::Metrics` otherwise. A query naming both tables is rejected
+before any catalog listing (HTTP 400): v1 admits one signal per query, and no
+query needs to scan or join metrics and logs together.
+
+Schema (fixed columns plus one map):
+
+- `ts`, `observed_ts` — `Timestamp(ns)`.
+- `severity_num` — `UInt8`; `severity_text`, `body` — `Utf8`.
+- `trace_id` — `FixedSizeBinary(16)`, `span_id` — `FixedSizeBinary(8)`, both
+  nullable; `flags` — `UInt32`.
+- `attrs` — `Map(Utf8, Utf8)` carrying each record's resource, scope, and
+  per-record dynamic attributes merged into one map. On a key collision the
+  per-record value wins over the resource/scope value. Positional scope name
+  and version are excluded (no synthetic `scope.name`/`scope.version` keys).
+
+Supported predicates (all pushdown is widen-only; DataFusion always re-applies
+the original predicate above the scan, so pruning can only ever widen the fetch,
+never drop a true result):
+
+- `ts` range comparisons — exact segment-level pruning from the catalog
+  summary, the same shape as the metrics table's `ts` bounds.
+- `has_word(body, 'literal')` — a word/phrase content search whose SQL
+  semantics equal the RLOG reader's exact token filter, so it both pushes down
+  (bloom-accelerated pruning inside the scan) and needs no residual correction.
+  A plain `LIKE '%word%'` pattern's literal is recognized but is **not** pushed
+  as a prune, because token matching is not a superset of SQL substring `LIKE`.
+
+Two known gaps, both inherited from ADR-0033 and deliberate, not oversights:
+
+1. **`attrs['k']` subscript planning is not wired.** This crate's DataFusion is
+   built with `features = ["sql"]` only, so no nested-expression `ExprPlanner`
+   (`GetFieldAccess`/`NamedStructField`) is registered and the `attrs['k']`
+   subscript **fails query planning** with a loud `GetFieldAccess not supported`
+   error rather than returning a wrong answer. Filtering by an attribute value
+   over SQL therefore is not usable end to end yet; `has_word` and `LIKE` do not
+   depend on this and work today.
+2. **A stream-attribute equality has no fetch-time prune.** Because `attrs`
+   merges resource, scope, and per-record attributes with record-wins
+   precedence, no stream-level (STREAM_DIR) match can soundly prune it: a
+   stream-level `StreamIn` would drop a record whose match lives only in its
+   per-record attributes, which no residual can recover. So `attrs['k'] = 'v'`
+   is not extracted into a fetch prune at all; it is evaluated **entirely by
+   DataFusion's residual** over the merged `attrs` column. The fetch still
+   prunes exactly on the `ts` range and on content (`has_word`). Restoring a
+   sound stream-attribute prune needs a record-attribute-aware index and is a
+   deliberate follow-up (ADR-0033 Rejected Alternative A).
+
 ## Caching note
 
 Phase 1 caches only decoded commit records (immutable) and parsed footers
