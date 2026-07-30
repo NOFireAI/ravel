@@ -3,9 +3,18 @@
 //!
 //! [`build_session`] constructs a complete, throwaway DataFusion session for
 //! exactly one query: its own `SessionConfig`, its own `RuntimeEnv`, its own
-//! memory pool, and one registered table -- the requesting tenant's
-//! `samples` provider over that query's already-resolved `Snapshot`. Nothing
-//! is cached, pooled, or reused across queries or tenants.
+//! memory pool, and exactly one registered table -- either the requesting
+//! tenant's `samples` provider over a `Signal::Metrics` snapshot or its `logs`
+//! provider over a `Signal::Logs` snapshot (ADR-0033 decision C: no v1 query
+//! spans both signals, so the session registers one, chosen by
+//! [`SessionTable`]). Nothing is cached, pooled, or reused across queries or
+//! tenants.
+//!
+//! The session widens no further than the one table the query needs (ADR-0033,
+//! "one SQL endpoint, two tables"): a `samples` query registers `samples` and
+//! the metric scalar UDFs; a `logs` query registers `logs` and `has_word`. The
+//! aggregate allowlist below is enforced for both, because `count(*)` and the
+//! numeric aggregates are reachable from either table.
 //!
 //! This is the tenant-isolation mechanism, not a performance shortcut
 //! (review F17: framing it as "context construction is cheap enough" invites
@@ -64,12 +73,28 @@ use url::Url;
 
 use crate::avg::sequential_avg_udaf;
 use crate::config::SqlConfig;
+use crate::logs_provider::LogsTableProvider;
+use crate::logs_udf::has_word_udf;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::provider::RavelTableProvider;
 use crate::udf::{label_match_udf, label_udf};
 
-/// The single table name every SQL query addresses.
+/// The metrics table name (`Signal::Metrics`).
 pub const SAMPLES_TABLE: &str = "samples";
+
+/// The logs table name (`Signal::Logs`, ADR-0033).
+pub const LOGS_TABLE: &str = "logs";
+
+/// The single table a query's session registers. ADR-0033 decision C admits
+/// exactly one signal per query in v1, so the executor resolves one snapshot
+/// and hands [`build_session`] one provider; the enum keeps the two provider
+/// types (metrics vs logs) apart without a `dyn TableProvider` erasure.
+pub enum SessionTable {
+    /// The `samples` table over a resolved `Signal::Metrics` snapshot.
+    Metrics(Arc<RavelTableProvider>),
+    /// The `logs` table over a resolved `Signal::Logs` snapshot.
+    Logs(Arc<LogsTableProvider>),
+}
 
 /// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
 /// enumerates the aggregate UDAFs the default session registers and
@@ -129,8 +154,18 @@ pub fn session_config(config: &SqlConfig) -> SessionConfig {
         .with_repartition_file_scans(false)
 }
 
-/// Build a fresh, single-tenant `SessionContext` around `provider` with
-/// `pool` installed as the query's memory pool.
+/// Build a fresh, single-tenant `SessionContext` around `table` with `pool`
+/// installed as the query's memory pool.
+///
+/// `table` selects which single table the session exposes (ADR-0033 decision
+/// C: one signal per query). The aggregate allowlist, the total-order/
+/// sequential-fold UDAF replacements, and the `range`/`generate_series`
+/// deregistration run for both, because those are the hard registration
+/// boundaries behind the parse gate and must not depend on which table is
+/// registered. The table-specific scalar UDFs are registered per table: the
+/// metric `label`/`label_match` UDFs only alongside `samples`, and `has_word`
+/// only alongside `logs`, so the session exposes exactly the surface the one
+/// query needs and no more.
 ///
 /// The caller owns `pool` (typically a `TenantDelegatingPool` from
 /// [`SqlConfig::query_pool`](crate::SqlConfig::query_pool)) so it can read
@@ -138,7 +173,7 @@ pub fn session_config(config: &SqlConfig) -> SessionConfig {
 pub fn build_session(
     config: &SqlConfig,
     pool: Arc<dyn MemoryPool>,
-    provider: Arc<RavelTableProvider>,
+    table: SessionTable,
 ) -> DFResult<SessionContext> {
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
@@ -147,8 +182,6 @@ pub fn build_session(
 
     let ctx = SessionContext::new_with_config_rt(session_config(config), runtime);
 
-    ctx.register_udf(label_udf());
-    ctx.register_udf(label_match_udf());
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
     // boundary behind the parse gate. Enumerate every aggregate UDAF the
     // default session registered and deregister every name outside the admitted
@@ -189,7 +222,21 @@ pub fn build_session(
     ctx.deregister_udtf("range");
     ctx.deregister_udtf("generate_series");
 
-    ctx.register_table(SAMPLES_TABLE, provider)?;
+    // Register exactly the one table this query needs, plus that table's own
+    // scalar UDFs. A metrics query never sees `has_word` and a logs query
+    // never sees the `label`/`label_match` UDFs, matching the security
+    // invariant's stance that the session exposes only what one query needs.
+    match table {
+        SessionTable::Metrics(provider) => {
+            ctx.register_udf(label_udf());
+            ctx.register_udf(label_match_udf());
+            ctx.register_table(SAMPLES_TABLE, provider)?;
+        }
+        SessionTable::Logs(provider) => {
+            ctx.register_udf(has_word_udf());
+            ctx.register_table(LOGS_TABLE, provider)?;
+        }
+    }
     Ok(ctx)
 }
 

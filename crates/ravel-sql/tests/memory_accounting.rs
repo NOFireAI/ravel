@@ -27,7 +27,9 @@ use std::sync::Arc;
 use datafusion::execution::memory_pool::MemoryPool;
 use futures::StreamExt;
 use ravel_query::SegmentFetcher;
-use ravel_sql::{RavelTableProvider, SqlConfig, TenantMemoryAccountant, build_session};
+use ravel_sql::{
+    RavelTableProvider, SessionTable, SqlConfig, TenantMemoryAccountant, build_session,
+};
 use ravel_types::TenantId;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
@@ -62,7 +64,12 @@ async fn drain(
         SegmentFetcher::new(Arc::clone(&fixture.store)),
         SqlConfig::default(),
     ));
-    let ctx = build_session(&SqlConfig::default(), Arc::clone(&pool), provider).expect("session");
+    let ctx = build_session(
+        &SqlConfig::default(),
+        Arc::clone(&pool),
+        SessionTable::Metrics(provider),
+    )
+    .expect("session");
 
     let mut stream = ctx
         .sql(sql)
@@ -248,7 +255,8 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         SegmentFetcher::new(Arc::clone(&fixture.store)),
         config,
     ));
-    let ctx = build_session(&config, Arc::clone(&pool), provider).expect("session");
+    let ctx = build_session(&config, Arc::clone(&pool), SessionTable::Metrics(provider))
+        .expect("session");
     let mut stream = ctx
         .sql("SELECT ts, value FROM samples")
         .await
