@@ -210,6 +210,7 @@ impl SegmentCodec for RlogCodec {
                     input_set_hash,
                     part_index,
                     std::mem::take(&mut batch),
+                    config.dry_run,
                 )
                 .await?;
                 parts.push(part);
@@ -218,8 +219,16 @@ impl SegmentCodec for RlogCodec {
             }
         }
         if !batch.is_empty() {
-            let part =
-                flush_part(store, bucket, &identity, input_set_hash, part_index, batch).await?;
+            let part = flush_part(
+                store,
+                bucket,
+                &identity,
+                input_set_hash,
+                part_index,
+                batch,
+                config.dry_run,
+            )
+            .await?;
             parts.push(part);
         }
 
@@ -248,6 +257,7 @@ fn gather_stream(readers: &[RlogReader<'_>], stream_id: &LogStreamId) -> Result<
 /// `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
 /// `CreateIfAbsent`. The part's summary stats are read back from the produced
 /// object's own footer, so they describe exactly what was written.
+#[allow(clippy::too_many_arguments)]
 async fn flush_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -255,6 +265,7 @@ async fn flush_part(
     input_set_hash: &[u8; 32],
     part_index: u32,
     batch: Vec<LogRecord>,
+    dry_run: bool,
 ) -> Result<BuiltPart> {
     let (first_stream_id, last_stream_id) = stream_id_bounds(&batch);
 
@@ -301,7 +312,9 @@ async fn flush_part(
         bytes: object,
         part,
     };
-    put_part(store, &built).await?;
+    if !dry_run {
+        put_part(store, &built).await?;
+    }
     Ok(built)
 }
 

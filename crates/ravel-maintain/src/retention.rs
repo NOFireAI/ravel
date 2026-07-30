@@ -104,7 +104,15 @@ pub async fn retention_sweep_bucket(
                 .retired_at_ns
                 .saturating_add(config.protection_horizon_ns)
         {
-            return physical_sweep(store, lease, bucket, &listing, tombstone_key).await;
+            return physical_sweep(
+                store,
+                lease,
+                bucket,
+                &listing,
+                tombstone_key,
+                config.dry_run,
+            )
+            .await;
         }
         return Ok(RetentionOutcome::Tombstoned);
     }
@@ -124,7 +132,7 @@ pub async fn retention_sweep_bucket(
         return Ok(RetentionOutcome::NotExpired);
     }
 
-    write_tombstone(store, bucket, now, window_ns, &listing).await?;
+    write_tombstone(store, bucket, now, window_ns, &listing, config.dry_run).await?;
     Ok(RetentionOutcome::Tombstoned)
 }
 
@@ -199,6 +207,7 @@ async fn write_tombstone(
     retired_at_ns: i64,
     window_ns: i64,
     listing: &BucketListing,
+    dry_run: bool,
 ) -> Result<()> {
     let record_count = (listing.commit_keys.len() + listing.compaction_record_keys.len()) as u64;
     let tombstone = RetentionTombstone {
@@ -216,6 +225,11 @@ async fn write_tombstone(
     let payload = tombstone.encode_to_vec();
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&payload));
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
+    // Dry-run: the tombstone and its key are assembled identically, but the
+    // durable PUT that would tombstone the bucket is skipped (plan §8).
+    if dry_run {
+        return Ok(());
+    }
     match store.put(&key, payload.into(), opts).await {
         Ok(_) | Err(StoreError::AlreadyExists) => Ok(()),
         Err(e) => Err(MaintainError::Store(e)),
@@ -233,6 +247,7 @@ async fn physical_sweep(
     bucket: &Bucket,
     listing: &BucketListing,
     tombstone_key: &str,
+    dry_run: bool,
 ) -> Result<RetentionOutcome> {
     // Resolve the L0 data-object keys BEFORE deleting the commit records that
     // name them (records are deleted first).
@@ -270,18 +285,26 @@ async fn physical_sweep(
 
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
-    delete_all(store, lease, &listing.commit_keys).await?;
-    delete_all(store, lease, &listing.compaction_record_keys).await?;
-    delete_all(store, lease, &l0_data_keys).await?;
-    delete_all(store, lease, &l1_part_keys).await?;
+    delete_all(store, lease, &listing.commit_keys, dry_run).await?;
+    delete_all(store, lease, &listing.compaction_record_keys, dry_run).await?;
+    delete_all(store, lease, &l0_data_keys, dry_run).await?;
+    delete_all(store, lease, &l1_part_keys, dry_run).await?;
 
     // Verify the bucket is empty before deleting the tombstone: the commit
     // prefix must contain only the tombstone, and the l1/ prefix must be empty.
+    // Under dry-run every delete above was skipped, so the bucket still holds
+    // its objects and this check reports SweptPartial: the honest dry-run
+    // answer is "the horizon has elapsed and a real run would sweep now", not
+    // "the bucket is empty". No CLI path dry-runs retention (the service
+    // always runs with dry_run == false); this guard exists so config.dry_run
+    // is honored everywhere it is threaded.
     if !bucket_is_empty_but_tombstone(store, bucket).await? {
         return Ok(RetentionOutcome::SweptPartial);
     }
     if !lease.is_protected(tombstone_key) {
-        store.delete(tombstone_key).await?;
+        if !dry_run {
+            store.delete(tombstone_key).await?;
+        }
     } else {
         return Ok(RetentionOutcome::SweptPartial);
     }
@@ -295,12 +318,15 @@ async fn delete_all(
     store: &dyn ObjectStoreBackend,
     lease: &dyn LeaseCheck,
     keys: &[String],
+    dry_run: bool,
 ) -> Result<()> {
     for key in keys {
         if lease.is_protected(key) {
             continue;
         }
-        store.delete(key).await?;
+        if !dry_run {
+            store.delete(key).await?;
+        }
     }
     Ok(())
 }

@@ -84,6 +84,18 @@ pub struct CompactorConfig {
     /// query resolved just before the anchor still has time to read the
     /// inputs it pinned. Default [`DEFAULT_PROTECTION_HORIZON_NS`] (25 h).
     pub protection_horizon_ns: i64,
+    /// Dry-run switch (plan §8, P8). When `true`, every maintenance path
+    /// computes exactly the same eligible set and decision it would in a real
+    /// run -- all reads (LIST/GET/HEAD, re-verify listings, k-way merges,
+    /// part planning) happen identically -- but each `store.put`/`store.delete`
+    /// that would mutate or delete an object is skipped while the surrounding
+    /// counters still advance, so a report reflects what a real run *would*
+    /// have written or deleted. This is carried in the config (already threaded
+    /// through every compaction/sweep/retention function) rather than added as
+    /// a separate parameter to each so existing call sites, which all build the
+    /// config via `..CompactorConfig::default()`, stay byte-for-byte unchanged
+    /// with `dry_run == false`. Default `false`.
+    pub dry_run: bool,
 }
 
 impl Default for CompactorConfig {
@@ -98,6 +110,7 @@ impl Default for CompactorConfig {
             compactor_writer_id: Uuid::nil(),
             grace_ns: DEFAULT_GRACE_NS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
+            dry_run: false,
         }
     }
 }
