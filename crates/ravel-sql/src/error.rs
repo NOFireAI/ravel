@@ -33,7 +33,7 @@
 
 use datafusion::error::DataFusionError;
 use ravel_catalog::CatalogError;
-use ravel_query::FetchError;
+use ravel_query::{FetchError, LogFetchError};
 
 use crate::validate::ValidationError;
 
@@ -93,6 +93,24 @@ pub enum SqlError {
     /// A segment fetch or decode failed mid-scan.
     #[error("segment fetch failed: {0}")]
     Fetch(#[from] FetchError),
+
+    /// An RLOG log-segment fetch or decode failed mid-scan (the `logs` table's
+    /// sibling of [`SqlError::Fetch`], issue #239). Its `Display` embeds the
+    /// object key, so it redacts the same way [`SqlError::Fetch`] does.
+    #[error("log segment fetch failed: {0}")]
+    LogFetch(#[from] LogFetchError),
+
+    /// A record's canonical `stream_attrs` blob failed to decode during the
+    /// scan's stream-attribute re-verification or `attrs`-column build
+    /// (crate::logs_scan). This is the same data-integrity fault as the
+    /// fetcher's own [`LogFetchError::Corrupt`] path -- a stored blob that
+    /// failed integrity -- just detected one layer up, so it surfaces with the
+    /// identical client class ([`ErrorClass::Unavailable`]) and message
+    /// ([`MSG_CORRUPT`]) rather than collapsing into a generic internal error.
+    /// The detail string carries no object key or tenant data and is logged
+    /// server-side only.
+    #[error("corrupt stream_attrs blob: {0}")]
+    CorruptStreamAttrs(String),
 
     /// A pinned segment vanished and the re-resolve-and-retry contract was
     /// exhausted (docs/consistency-model.md; plan section 2 retry contract,
@@ -160,9 +178,11 @@ impl SqlError {
     pub fn class(&self) -> ErrorClass {
         match self {
             SqlError::Validation(_) => ErrorClass::BadRequest,
-            SqlError::Catalog(_) | SqlError::Fetch(_) | SqlError::SnapshotInvalidated => {
-                ErrorClass::Unavailable
-            }
+            SqlError::Catalog(_)
+            | SqlError::Fetch(_)
+            | SqlError::LogFetch(_)
+            | SqlError::CorruptStreamAttrs(_)
+            | SqlError::SnapshotInvalidated => ErrorClass::Unavailable,
             SqlError::DeadlineExceeded { .. } => ErrorClass::Timeout,
             SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
@@ -192,6 +212,11 @@ impl SqlError {
                     MSG_UNAVAILABLE.to_string()
                 }
             },
+            SqlError::LogFetch(fetch) => match fetch {
+                LogFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                LogFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+            },
+            SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),
             SqlError::DeadlineExceeded { .. }
             | SqlError::TooManySamples { .. }
@@ -212,6 +237,9 @@ impl SqlError {
         matches!(
             self,
             SqlError::Fetch(FetchError::Store {
+                source: ravel_object_store::StoreError::NotFound,
+                ..
+            }) | SqlError::LogFetch(LogFetchError::Store {
                 source: ravel_object_store::StoreError::NotFound,
                 ..
             })
@@ -345,6 +373,26 @@ mod tests {
         assert_redacted(&exec.client_message());
         // plan and execution stay distinguishable to the caller.
         assert_ne!(MSG_PLAN, MSG_EXECUTION);
+    }
+
+    #[test]
+    fn corrupt_stream_attrs_shares_the_fetcher_corruption_class_and_message() {
+        // A malformed stream_attrs blob detected during re-verification must
+        // surface as the same client class/message as the fetcher's own
+        // LogFetchError::Corrupt path -- one corruption class, not two.
+        let reverify = SqlError::CorruptStreamAttrs("stream_attrs truncated".to_string());
+        assert_eq!(reverify.client_message(), MSG_CORRUPT);
+        assert_eq!(reverify.class(), ErrorClass::Unavailable);
+
+        let fetcher = SqlError::LogFetch(LogFetchError::Corrupt {
+            key: LEAKY_KEY.to_string(),
+            source: ravel_logseg::LogSegError::Corrupted("bad footer".into()),
+        });
+        assert_eq!(reverify.client_message(), fetcher.client_message());
+        assert_eq!(reverify.class(), fetcher.class());
+        // The detail string stays available server-side and leaks nothing.
+        assert!(reverify.to_string().contains("stream_attrs truncated"));
+        assert_redacted(&reverify.client_message());
     }
 
     #[test]
