@@ -230,33 +230,68 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
 /// resolving a `Signal::Logs` snapshot only when `logs` is referenced and
 /// rejecting a query that references both. The walk descends the whole query
 /// tree (CTEs, set operations, subqueries, derived tables), so a `logs`
-/// reference nested anywhere is seen; CTE aliases and other non-signal names
-/// come back too but are simply not `samples`/`logs`, so they never affect the
-/// decision.
+/// reference nested anywhere is seen.
+///
+/// A `WITH <name> AS (...)` common table expression declares a query-local
+/// name that is *not* a base table: `WITH logs AS (SELECT value FROM samples)
+/// SELECT count(*) FROM logs` never reads the real `logs` RLOG table, and must
+/// resolve to metrics only. So the collected set has every CTE-declared name
+/// subtracted from it. This uses the cheap, conservative whole-tree
+/// approximation ADR-0033's amendment sanctions: collect every CTE alias
+/// declared anywhere in the tree and subtract them all, rather than doing
+/// per-scope shadow resolution. sqlparser's AST exposes no ready per-scope
+/// resolver, and this crate's other pruning/extraction logic is already
+/// widen-only (it never narrows incorrectly); a base table genuinely named
+/// the same as a sibling-scope CTE is not a shape SQL v1 produces, and the
+/// only cost of the approximation is failing to treat such a collision as a
+/// real reference -- consistent with the rest of ravel-sql, never a
+/// correctness hazard for the both-tables rejection, which still fires for
+/// any query that reads both real tables (no CTE shadows a name it also
+/// reads as a base table without the query being nonsensical).
 pub(crate) fn referenced_base_tables(sql: &str) -> Result<BTreeSet<String>, ValidationError> {
     let statements = DFParser::parse_sql(sql)
         .map_err(|e| ValidationError::Parse(strip_prefix(&e.to_string())))?;
     let mut tables = BTreeSet::new();
+    let mut ctes = BTreeSet::new();
     for statement in &statements {
         if let DFStatement::Statement(inner) = statement
             && let Statement::Query(query) = inner.as_ref()
         {
             let _ = query.visit(&mut TableNameCollector {
                 tables: &mut tables,
+                ctes: &mut ctes,
             });
         }
     }
+    // A CTE-declared name is query-local, never a base-table reference.
+    tables.retain(|table| !ctes.contains(table));
     Ok(tables)
 }
 
-/// Collects every table-factor name in a query tree, lowercased and reduced to
-/// its bare (unqualified) identifier. Never breaks: it visits the whole tree.
+/// Collects every table-factor name in a query tree, plus every CTE alias the
+/// tree declares, both lowercased and reduced to their bare (unqualified)
+/// identifier. Never breaks: it visits the whole tree. The caller subtracts
+/// the CTE names from the table names so a CTE named `logs`/`samples` is not
+/// mistaken for the real table of that name.
 struct TableNameCollector<'a> {
     tables: &'a mut BTreeSet<String>,
+    ctes: &'a mut BTreeSet<String>,
 }
 
 impl Visitor for TableNameCollector<'_> {
     type Break = ();
+
+    /// Record every CTE name this query's `WITH` clause declares. A
+    /// `TableFactor::Table` reference to one of these names is resolved by
+    /// the CTE, not by a base table, so the caller excludes them.
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.ctes.insert(cte.alias.name.value.to_ascii_lowercase());
+            }
+        }
+        ControlFlow::Continue(())
+    }
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
         if let TableFactor::Table { name, .. } = factor {
@@ -764,5 +799,53 @@ mod tests {
 
         // A constant query references neither.
         assert!(tables("SELECT 1").is_empty());
+    }
+
+    /// A CTE whose declared name collides with a real table name is not a
+    /// reference to that real table: `WITH logs AS (...) ... FROM logs` reads
+    /// only whatever the CTE body reads. Regression for the ADR-0033 wiring,
+    /// which collected every `TableFactor::Table` name indiscriminately and so
+    /// rejected this legal metrics-only query as cross-signal.
+    #[test]
+    fn a_cte_named_like_a_table_is_not_that_base_table() {
+        // A CTE named `logs` reading only `samples` resolves to samples alone.
+        let via_cte = tables("WITH logs AS (SELECT value FROM samples) SELECT count(*) FROM logs");
+        assert!(
+            via_cte.contains("samples"),
+            "the CTE body's real base table is still seen: {via_cte:?}"
+        );
+        assert!(
+            !via_cte.contains("logs"),
+            "a CTE named `logs` is not the real logs table: {via_cte:?}"
+        );
+
+        // Symmetric case: a CTE named `samples` reading only `logs`.
+        let via_cte =
+            tables("WITH samples AS (SELECT body FROM logs) SELECT count(*) FROM samples");
+        assert!(
+            via_cte.contains("logs"),
+            "the CTE body's real base table is still seen: {via_cte:?}"
+        );
+        assert!(
+            !via_cte.contains("samples"),
+            "a CTE named `samples` is not the real samples table: {via_cte:?}"
+        );
+    }
+
+    /// The CTE exclusion is whole-tree: a CTE declared in a subquery shadows
+    /// its name for the whole extraction too, and a real base table still
+    /// surfaces when the same query reads one.
+    #[test]
+    fn cte_exclusion_does_not_hide_a_genuine_both_table_reference() {
+        // A CTE named `logs` alongside a genuine `logs` base-table read in a
+        // different arm still surfaces `logs`: the base reference is real.
+        let both = tables(
+            "WITH t AS (SELECT value FROM samples) \
+             SELECT * FROM t JOIN logs ON t.ts = logs.ts",
+        );
+        assert!(
+            both.contains("samples") && both.contains("logs"),
+            "a genuine base reference must survive CTE collection: {both:?}"
+        );
     }
 }

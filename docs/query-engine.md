@@ -172,13 +172,18 @@ scales with the query's matched input, not with `max_samples`.
 
 `POST /api/v1/sql` serves two tables from one endpoint: `samples`
 (`Signal::Metrics`) and `logs` (`Signal::Logs`). There is no separate logs
-endpoint and no protocol change; DataFusion picks the table from the query's
-`FROM` clause. `SqlExecutor` inspects the referenced table names (through the
-same parser the read-only gate uses, never a raw-text scan) and resolves a
-snapshot for exactly one signal: `Signal::Logs` when the query references
-`logs`, `Signal::Metrics` otherwise. A query naming both tables is rejected
-before any catalog listing (HTTP 400): v1 admits one signal per query, and no
-query needs to scan or join metrics and logs together.
+endpoint and no protocol change. DataFusion does not choose between two
+registered tables: `SqlExecutor` decides which single table a query targets by
+parsing its `FROM` clause *before* planning (through the same parser the
+read-only gate uses, never a raw-text scan), resolves a snapshot for that one
+signal, and registers exactly that one table in the per-query `SessionContext`
+-- `Signal::Logs` when the query references `logs`, `Signal::Metrics`
+otherwise. A `WITH <name> AS (...)` CTE that happens to be named `logs` or
+`samples` is a query-local name, not a base-table reference, and does not
+change the target (`WITH logs AS (SELECT value FROM samples) SELECT count(*)
+FROM logs` is a metrics-only query). A query naming both real tables is
+rejected before any catalog listing (HTTP 400): v1 admits one signal per
+query, and no query needs to scan or join metrics and logs together.
 
 Schema (fixed columns plus one map):
 

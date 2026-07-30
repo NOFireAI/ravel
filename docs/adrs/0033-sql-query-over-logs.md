@@ -210,12 +210,37 @@ supported map-access syntax and have the planner reject the subscript
 form with a clear error. `has_word(col, 'literal')` and `LIKE` do not
 depend on this — both plan and push down today without it.
 
-**One SQL endpoint, two tables.** No new HTTP endpoint. `SqlExecutor`'s
-per-query `SessionContext` (`crates/ravel-sql/src/session.rs`) registers
-`logs` alongside `samples`, resolving `Signal::Logs`'s snapshot only
-when the query text references the `logs` table (avoid an unconditional
-second catalog resolve on every metrics-only query). `POST /api/v1/sql`
-is unchanged; DataFusion picks the table from the query's `FROM` clause.
+**One SQL endpoint, two tables, exactly one registered per session.** No new
+HTTP endpoint. `POST /api/v1/sql` is unchanged.
+
+*Amendment (issue #240): one table is registered per session, chosen before
+planning.* This ADR's first draft said the per-query `SessionContext`
+"registers `logs` alongside `samples`" and that "DataFusion picks the table
+from the query's `FROM` clause." The wiring did not do that, and it should not:
+registering both tables would force a `Signal::Logs` catalog resolve (or a
+placeholder empty registration) on every metrics-only query, the exact
+unconditional second resolve this paragraph set out to avoid. Instead
+`SqlExecutor` (`crates/ravel-sql/src/executor.rs`) parses the query's `FROM`
+clause *before* planning -- through the same `DFParser` front end the read-only
+gate uses (`referenced_base_tables`, `crates/ravel-sql/src/validate.rs`), never
+a raw-text scan -- resolves a snapshot for exactly one signal, and registers
+exactly one table (`SessionTable::Metrics` or `SessionTable::Logs`,
+`crates/ravel-sql/src/session.rs`) in that query's `SessionContext`. DataFusion
+never chooses between two registered tables; only the targeted one exists in the
+session. The mapping: references `logs` (and not `samples`) -> `Signal::Logs`;
+references `samples`, or references neither -> `Signal::Metrics`; references
+both real tables -> rejected (`SqlError::CrossSignalQuery`, HTTP 400) before any
+catalog listing, since v1 admits one signal per query.
+
+A `WITH <name> AS (...)` common table expression declares a query-local name,
+not a base-table reference: `WITH logs AS (SELECT value FROM samples) SELECT
+count(*) FROM logs` never reads the real `logs` RLOG table and resolves to
+`Signal::Metrics`. `referenced_base_tables` collects each query's declared CTE
+names (whole-tree, a conservative widen-only approximation consistent with the
+rest of ravel-sql's pruning) and subtracts them from the base-table set, so a
+CTE named `logs` or `samples` is not mistaken for the real table of that name.
+The both-tables rejection still fires for any query that genuinely reads both
+real tables.
 
 **Correctness gate: exact equality, not bit-pattern, and scan-oracle
 only for v1.** Mirror the *structure* of the existing two-layer
