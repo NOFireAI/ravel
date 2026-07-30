@@ -10,13 +10,13 @@
 //!   positives and no false negatives. This is the pruning-soundness property:
 //!   segment/ts pruning and content pushdown may only ever widen, and the
 //!   scan's output still matches an independent record-by-record oracle.
-//! - `scan_reverifies_stream_attr_over_approximation`: the scan re-applies a
-//!   stream-attribute equality against each record's genuine top-level
-//!   resource/scope attributes, excluding a record whose stream only matches
-//!   because the fetcher's byte-containment prefilter cannot tell a nested
-//!   `Map` value from a real top-level attribute (issue #238's documented
-//!   over-approximation). A control fetch proves the fetcher really does return
-//!   the false positive, so the scan's exclusion is doing real work.
+//! - `stream_attr_equality_is_resolved_by_the_residual`: `attrs['k']='v'` is not
+//!   pushed as a fetch prune (a stream-level prune is unsound against the merged
+//!   `attrs` column, ADR-0033 amendment); it is evaluated by DataFusion's
+//!   residual over the merged column. The test pins both directions that a
+//!   stream-level prune would get wrong: a record matching only via a nested
+//!   `Map` value is excluded, and a record matching only via a per-record
+//!   attribute that overrides its resource attribute is kept.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -42,8 +42,8 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{EngineConfig, LogQuery, LogSegmentFetcher, StreamAttrEquals};
-use ravel_sql::{LogsPushdown, LogsTableProvider, has_word_udf};
+use ravel_query::{EngineConfig, LogSegmentFetcher};
+use ravel_sql::{LogsTableProvider, has_word_udf};
 use uuid::Uuid;
 
 fn identity() -> ObjectIdentity {
@@ -71,8 +71,21 @@ fn record(name: &str, ts: i64, body: &str) -> LogRecord {
     record_with_resource(&resource, ts, body)
 }
 
-/// A record on the stream identified by an arbitrary resource attribute set.
+/// A record on the stream identified by an arbitrary resource attribute set,
+/// with no per-record attributes.
 fn record_with_resource(resource: &[(String, AttrValue)], ts: i64, body: &str) -> LogRecord {
+    record_with_resource_and_attrs(resource, ts, body, &[])
+}
+
+/// A record on the stream identified by `resource`, carrying per-record dynamic
+/// `attrs` (which win over resource/scope attributes on a key collision in the
+/// merged `attrs` column).
+fn record_with_resource_and_attrs(
+    resource: &[(String, AttrValue)],
+    ts: i64,
+    body: &str,
+    attrs: &[(String, AttrValue)],
+) -> LogRecord {
     LogRecord {
         stream_id: ravel_types::logstream::log_stream_id(resource, "scope", "1.0", &[]),
         stream_attrs: stream_attrs_bytes(resource, "scope", "1.0", &[]),
@@ -84,7 +97,7 @@ fn record_with_resource(resource: &[(String, AttrValue)], ts: i64, body: &str) -
         trace_id: None,
         span_id: None,
         flags: 0,
-        attrs: Vec::new(),
+        attrs: attrs.to_vec(),
     }
 }
 
@@ -261,22 +274,30 @@ async fn scan_prunes_by_ts_and_word_returns_exact_rows() {
     assert_eq!(got, want, "scan output must equal the oracle exactly");
 }
 
-/// The mandatory stream-attribute re-verification test (issue #239): the
-/// scan excludes a record whose stream only matches `service.name = 'api'`
-/// because the pair is nested inside a `Map` value, not a genuine top-level
-/// resource attribute. The fetcher over-approximates and returns it; the scan
-/// must not.
+/// `attrs['service.name'] = 'api'` is resolved entirely by DataFusion's residual
+/// over the merged `attrs` column, not by any stream-level fetch prune (ADR-0033
+/// amendment). This pins both directions a stream-level prune gets wrong:
+///
+/// - ts=2's stream matches `service.name = 'api'` only via a value nested inside
+///   a `Map` attribute, not a genuine top-level attribute. The merged column
+///   omits nested values, so the residual excludes it. (The fetcher's
+///   byte-containment STREAM_DIR match would have treated it as a positive.)
+/// - ts=3's stream carries a genuine top-level `service.name = 'worker'`, but the
+///   record overrides it with a per-record `service.name = 'api'`. The merge
+///   resolves the key to the record's value (record wins), so the residual keeps
+///   it. A `Predicate::StreamIn` built from stream-level attributes would have
+///   dropped it before DataFusion ever ran — the data-loss bug this fix closes.
 #[tokio::test]
-async fn scan_reverifies_stream_attr_over_approximation() {
+async fn stream_attr_equality_is_resolved_by_the_residual() {
     let store = MemoryStore::new();
 
-    // Stream (plain): a genuine top-level `service.name = "api"`.
+    // ts=1: genuine top-level `service.name = "api"` -> kept.
     let plain = vec![(
         "service.name".to_string(),
         AttrValue::Str("api".to_string()),
     )];
-    // Stream (nested): no top-level `service.name`; the pair only appears nested
-    // inside a `k8s.labels` map attribute value. A distinct stream.
+    // ts=2: no top-level `service.name`; the pair only appears nested inside a
+    // `k8s.labels` map value. Merged column omits nested values -> excluded.
     let nested = vec![(
         "k8s.labels".to_string(),
         AttrValue::Map(vec![(
@@ -284,56 +305,63 @@ async fn scan_reverifies_stream_attr_over_approximation() {
             AttrValue::Str("api".to_string()),
         )]),
     )];
+    // ts=3: resource `service.name = "worker"`, overridden by a per-record
+    // `service.name = "api"` (record wins in the merge) -> kept.
+    let overridden_resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("worker".to_string()),
+    )];
 
     let records = vec![
-        record_with_resource(&plain, 1, "hello from plain"),
-        record_with_resource(&nested, 2, "hello from nested"),
+        record_with_resource(&plain, 1, "plain"),
+        record_with_resource(&nested, 2, "nested"),
+        record_with_resource_and_attrs(
+            &overridden_resource,
+            3,
+            "override",
+            &[(
+                "service.name".to_string(),
+                AttrValue::Str("api".to_string()),
+            )],
+        ),
     ];
-    let seg = write_object(&store, "logs/nested.rlog", &records).await;
+    let seg = write_object(&store, "logs/attrs.rlog", &records).await;
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
     let fetcher = LogSegmentFetcher::new(Arc::clone(&store));
 
-    // Control: the fetcher itself, given the same stream-attribute equality,
-    // returns BOTH records — the nested-map stream is a false positive. This
-    // proves the scan's exclusion below is doing real work.
-    let query = LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(StreamAttrEquals::new(
-        "service.name",
-        AttrValue::Str("api".into()),
-    ));
-    let control = fetcher
-        .fetch(&seg, &query)
-        .await
-        .expect("fetch")
-        .expect("in range");
-    let control_ts: BTreeSet<i64> = control.records.iter().map(|r| r.ts_ns).collect();
-    assert_eq!(
-        control_ts,
-        BTreeSet::from([1, 2]),
-        "the fetcher over-approximates and returns the nested-map false positive"
-    );
-
-    // The scan re-verifies and keeps only the genuine top-level match (ts=1).
     let snapshot = Snapshot {
         segments: vec![seg],
         segments_pruned: 0,
     };
     let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
-    let pushdown = LogsPushdown {
-        stream_attrs: vec![StreamAttrEquals::new(
-            "service.name",
-            AttrValue::Str("api".into()),
-        )],
-        ..LogsPushdown::default()
-    };
-    let plan = provider.plan_pushdown(2, &pushdown).expect("build plan");
+
+    // A full SessionContext query so DataFusion's residual FilterExec actually
+    // runs the `attrs['service.name'] = 'api'` equality (via the `get_field` UDF)
+    // over the merged column, which is the sole correctness mechanism here.
+    let ctx = SessionContext::new();
+    let get_field = ScalarUDF::from(GetField::new());
+    ctx.register_udf(get_field.clone());
+    ctx.register_table("logs", Arc::new(provider))
+        .expect("register table");
+    let df = ctx
+        .table("logs")
+        .await
+        .expect("table")
+        .filter(
+            get_field
+                .call(vec![col("attrs"), lit("service.name")])
+                .eq(lit("api")),
+        )
+        .expect("filter");
+    let plan = df.create_physical_plan().await.expect("physical plan");
     let batches = collect_plan(plan).await;
     let got = batches_to_rows(&batches);
 
     assert_eq!(
         got,
-        BTreeSet::from([(1, "hello from plain".to_string())]),
-        "scan must exclude the nested-map false positive (ts=2) and keep only \
-         the genuine top-level attribute record (ts=1)"
+        BTreeSet::from([(1, "plain".to_string()), (3, "override".to_string())]),
+        "residual must keep the top-level match (ts=1) and the record-override \
+         match (ts=3), and exclude the nested-map non-match (ts=2)"
     );
 }
 
@@ -439,15 +467,16 @@ impl ScalarUDFImpl for GetField {
 
 /// Regression test for the issue #239 data-loss bug: DataFusion's mandatory
 /// `Inexact` residual re-applies `attrs['service.name'] = 'api'` against the
-/// `attrs` column, so that column must carry the same resource/scope data the
-/// scan's stream-identity check verifies. If `attrs` holds only per-record
-/// dynamic attributes, a record whose `service.name` is a genuine *resource*
-/// attribute (the normal OTLP shape) is silently dropped by the residual even
-/// though the scan verified its stream matches.
+/// `attrs` column, so that column must carry resource/scope data merged with the
+/// record's own attributes. If `attrs` holds only per-record dynamic attributes,
+/// a record whose `service.name` is a genuine *resource* attribute (the normal
+/// OTLP shape) is silently dropped by the residual — the bug the merged column
+/// closed. The residual is the sole correctness mechanism (no fetch prune or
+/// scan re-check narrows the attribute set; ADR-0033 amendment, issue #241).
 ///
 /// This drives a REAL `TableProvider::scan` inside a `SessionContext` (unlike
-/// the two tests above, which execute the scan leaf directly and so never run
-/// the residual `FilterExec` that exposes this bug).
+/// `scan_prunes_by_ts_and_word_returns_exact_rows`, which executes the scan leaf
+/// directly and so never runs the residual `FilterExec` that exposes this bug).
 ///
 /// Records:
 /// - ts=1: `service.name = "api"` ONLY as a resource attribute, no dynamic

@@ -500,17 +500,16 @@ impl QuerySpec {
             return false;
         }
         if let Some((k, v)) = &self.stream_attr {
-            // The scan drops records whose stream does not carry the pair as a
-            // genuine top-level resource/scope attribute (re-verification), then
-            // DataFusion's residual re-applies the equality against the merged
-            // `attrs` column. The surviving set is the conjunction of the two:
-            // the top-level blob must carry (k, v) AND the merged map (record
-            // wins) must resolve k to v.
-            let blob = ref_decode_stream_attrs(&rec.stream_attrs);
-            let top_level_has = blob.get(k).map(String::as_str) == Some(v.as_str());
+            // The scan emits every fetched record unconditionally; DataFusion's
+            // `Inexact` residual re-applies the equality against the merged
+            // `attrs` column (resource + scope + record attributes, record wins
+            // on collision). That merged view alone decides the match -- the
+            // table's true SQL semantics per the ADR-0033 amendment, not the raw
+            // `stream_attrs` blob. A record matches iff its merged map resolves
+            // k to v, whether the match comes from a resource/scope attribute or
+            // from a per-record dynamic attribute.
             let merged = ref_merged_attrs(rec);
-            let merged_has = merged.get(k).map(String::as_str) == Some(v.as_str());
-            if !(top_level_has && merged_has) {
+            if merged.get(k).map(String::as_str) != Some(v.as_str()) {
                 return false;
             }
         }
