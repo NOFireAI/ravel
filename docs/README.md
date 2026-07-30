@@ -36,7 +36,11 @@ code, not just using it.
 - [ingest.md](ingest.md): the ingest pipeline's internal structure (gateway,
   shard actors, flush) and sizing defaults.
 - [query-engine.md](query-engine.md): the query engine's internal structure
-  (snapshot resolution, segment fetch, pruning, evaluation) and budgets.
+  (snapshot resolution, segment fetch, pruning, evaluation) and budgets;
+  includes the generated PromQL conformance table (ADR-0035).
+- [sql-conformance.md](sql-conformance.md): the generated SQL conformance
+  table (ADR-0035) — every construct in Ravel's claimed SQL surface,
+  classified as supported, intentionally rejected, or unclassified.
 - [analytics.md](analytics.md): the post-evaluation analytics stage (ADR-0028):
   `ravel-analytics`' pure per-series change point detection and robust summary
   statistics, their parameters, error taxonomy, and evidence gate.
