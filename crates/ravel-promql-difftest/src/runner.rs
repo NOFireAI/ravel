@@ -32,6 +32,14 @@ pub struct Failure {
     pub ravel_body: Json,
 }
 
+/// Pass/fail totals for one corpus run.
+///
+/// The per-construct breakdown ADR-0035 asks for is
+/// [`crate::scoring::ConformanceReport`], a sibling type rather than a field
+/// here: it is derived from the same run (feed this report to
+/// [`ConformanceReport::apply_run_report`](crate::scoring::ConformanceReport::apply_run_report))
+/// but is also buildable without a pinned Prometheus binary, so `runner.rs`
+/// stays a plain corpus-vs-Prometheus differ.
 #[derive(Debug, Default)]
 pub struct RunReport {
     pub total: usize,
@@ -122,7 +130,11 @@ pub async fn run_corpus(
     }
 }
 
-async fn ravel_instant_query(
+/// Instant-queries the in-process Ravel router. `pub(crate)` so
+/// [`crate::scoring::run_ravel_only`] drives the identical request shape
+/// (URI, encoding, auth header) the differential run uses, rather than a
+/// second near-copy that could drift from it.
+pub(crate) async fn ravel_instant_query(
     app: &Router,
     token: &str,
     query: &str,
@@ -136,7 +148,9 @@ async fn ravel_instant_query(
     ravel_get(app, token, &uri).await
 }
 
-async fn ravel_range_query(
+/// Range-queries the in-process Ravel router. `pub(crate)` for the same
+/// reason as [`ravel_instant_query`].
+pub(crate) async fn ravel_range_query(
     app: &Router,
     token: &str,
     query: &str,
