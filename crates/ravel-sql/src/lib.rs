@@ -91,7 +91,10 @@ pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
 pub use schema::{internal_schema, public_schema};
-pub use session::{EmptyObjectStoreRegistry, SAMPLES_TABLE, build_session, session_config};
+pub use session::{
+    EmptyObjectStoreRegistry, LOGS_TABLE, SAMPLES_TABLE, SessionTable, build_session,
+    session_config,
+};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{ValidationError, validate};
 

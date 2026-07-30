@@ -186,6 +186,54 @@ truncation ([crates/ravel-query/src/config.rs](../../crates/ravel-query/src/conf
 seconds) lowers the deadline per request; it cannot raise it above the
 server's configured default.
 
+## SQL over the `logs` table
+
+`POST /api/v1/sql` (see README "SQL") serves two tables from one endpoint:
+`samples` (metrics) and `logs`. The server parses the query's `FROM` clause
+before planning and registers only that one table for the query; a single
+query may reference one or the other, never both (a query naming both is
+rejected with HTTP 400). The request body, auth, window
+(`start`/`end`), and `min_commit_token` handling are identical to the `samples`
+case.
+
+The `logs` table columns are `ts`, `observed_ts` (both `Timestamp(ns)`),
+`severity_num`, `severity_text`, `body`, `trace_id`, `span_id`, `flags`, and an
+`attrs` `Map(Utf8, Utf8)` merging each record's resource, scope, and per-record
+attributes (see docs/query-engine.md for the full schema and semantics).
+
+A `ts` range scan. `ts` is a timestamp, so the bounds are `TIMESTAMP` literals,
+not bare integers:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "query": "SELECT ts, severity_text, body FROM logs WHERE ts >= TIMESTAMP '\''2026-07-30 00:00:00'\'' ORDER BY ts LIMIT 100",
+        "start": 1785369600.0,
+        "end": 1785373200.0
+      }'
+```
+
+A word/phrase content search with `has_word(body, 'literal')`, which pushes
+down to the RLOG bloom-accelerated scan and matches whole tokens (so `timeout`
+matches `connection timeout` but not `timed out`):
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT ts, body FROM logs WHERE has_word(body, '\''timeout'\'') ORDER BY ts"}'
+```
+
+Filtering by an attribute value (the `attrs['service.name'] = 'api'` shape) is
+**not yet available over SQL**: this build registers no nested-expression
+planner, so the `attrs['k']` subscript fails query planning with a loud error
+rather than returning a wrong answer (a documented ADR-0033 gap). Until it is
+wired, use `has_word` over `body` for content search; only the `attrs['k']`
+subscript form is affected, and other predicates (`ts`, `has_word`) are
+unaffected.
+
 ## HTTP status codes
 
 | Status | `errorType` | When |

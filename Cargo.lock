@@ -4034,6 +4034,7 @@ dependencies = [
  "arrow-flight",
  "async-trait",
  "axum",
+ "blake3",
  "bytes",
  "clap",
  "futures",

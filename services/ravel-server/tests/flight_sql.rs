@@ -39,8 +39,8 @@ use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::SegmentFetcher;
 use ravel_query::http::StaticBearerTokenResolver;
+use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::sql::SqlState;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
@@ -154,7 +154,8 @@ fn sql_state(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantI
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
         catalog,
-        SegmentFetcher::new(store),
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store),
         SqlConfig::default(),
         1 << 30,
     );
