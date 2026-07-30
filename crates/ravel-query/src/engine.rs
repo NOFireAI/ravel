@@ -12,9 +12,9 @@ use promql_parser::parser::{Expr, Offset};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
-    Annotations, Evaluator, LabelMatcher, MatchOp, PlanAnchor, SelectorPlan, SeriesData,
-    SeriesSource, SourceError, Value, from_ast_matchers, has_or_group, matches_series, ms_to_ns,
-    plan_selectors,
+    Annotations, Evaluator, FloatHistogram, HistogramSeriesData, LabelMatcher, MatchOp, PlanAnchor,
+    SelectorPlan, SeriesData, SeriesSource, SourceError, Span, Value, from_ast_matchers,
+    has_or_group, matches_series, ms_to_ns, plan_selectors,
 };
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
@@ -22,7 +22,7 @@ use ravel_types::{
 
 use crate::config::EngineConfig;
 use crate::error::QueryError;
-use crate::fetcher::{FetchError, FetchedSeriesSoa, SegmentFetcher};
+use crate::fetcher::{FetchError, FetchedHistogramSeries, FetchedSeriesSoa, SegmentFetcher};
 
 /// Which evaluation shape a prefetch is being computed for: an instant
 /// query has one lookup instant, a range query spans a step grid whose
@@ -395,7 +395,13 @@ impl QueryEngine {
         now_ns: i64,
     ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
-            return Ok((MergedSource { series: Vec::new() }, QueryStats::default()));
+            return Ok((
+                MergedSource {
+                    series: Vec::new(),
+                    histogram_series: Vec::new(),
+                },
+                QueryStats::default(),
+            ));
         }
 
         let windows: Vec<TimeRange> = plans
@@ -420,14 +426,25 @@ impl QueryEngine {
             // blanket impl ("implementation of FnOnce is not general
             // enough") at the router call site in `http/mod.rs`. Cloning
             // each `SelectorPlan` into the future sidesteps that entirely.
-            let results: Vec<Result<Vec<SeriesData>, QueryError>> = stream::iter(plans.to_vec())
+            type PerPlan = (Vec<SeriesData>, Vec<HistogramSeriesData>);
+            let results: Vec<Result<PerPlan, QueryError>> = stream::iter(plans.to_vec())
                 .map(|plan| {
                     let snapshot = &snapshot;
                     async move {
-                        let fetched = self
+                        // A selector's segments carry scalar and/or
+                        // native-histogram series; fetch and merge both kinds
+                        // (a series is one kind for its whole life, so the two
+                        // sets never overlap) and hand both to the source.
+                        let scalar_fetched = self
                             .fetch_all_samples_soa(tenant_hash, snapshot, &plan.matchers)
                             .await?;
-                        merge_soa_runs(fetched, max_series, max_samples)
+                        let scalar = merge_soa_runs(scalar_fetched, max_series, max_samples)?;
+                        let hist_fetched = self
+                            .fetch_all_histograms(tenant_hash, snapshot, &plan.matchers)
+                            .await?;
+                        let histograms =
+                            merge_histogram_soa_runs(hist_fetched, max_series, max_samples)?;
+                        Ok::<PerPlan, QueryError>((scalar, histograms))
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -435,13 +452,21 @@ impl QueryEngine {
                 .await;
 
             let mut combined: HashMap<LabelSet, SeriesData> = HashMap::new();
+            let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
             for r in results {
-                for series in r? {
+                let (scalar, histograms) = r?;
+                for series in scalar {
                     combined.entry(series.labels.clone()).or_insert(series);
+                }
+                for series in histograms {
+                    combined_histograms
+                        .entry(series.labels.clone())
+                        .or_insert(series);
                 }
             }
             Ok(MergedSource {
                 series: combined.into_values().collect(),
+                histogram_series: combined_histograms.into_values().collect(),
             })
         };
 
@@ -553,6 +578,40 @@ impl QueryEngine {
                             .fetch_soa(tenant_hash, &seg_ref, matchers.as_slice())
                             .await
                             .map(|(runs, _stats)| runs)
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Histogram counterpart to [`fetch_all_samples_soa`](Self::fetch_all_samples_soa)
+    /// (#218): fetches every matched native-histogram series from each snapshot
+    /// segment as per-segment SoA runs (`fetch_histograms`), one
+    /// `Vec<FetchedHistogramSeries>` per segment, for
+    /// [`merge_histogram_soa_runs`].
+    async fn fetch_all_histograms(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: &Snapshot,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<Vec<FetchedHistogramSeries>>, QueryError> {
+        let concurrency = self.config.fetch_concurrency.max(1);
+        let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
+        let results: Vec<Result<Vec<FetchedHistogramSeries>, FetchError>> =
+            stream::iter(snapshot.segments.iter().cloned())
+                .map(|seg_ref| {
+                    let fetcher = self.fetcher.clone();
+                    let matchers = Arc::clone(&matchers);
+                    async move {
+                        fetcher
+                            .fetch_histograms(tenant_hash, &seg_ref, matchers.as_slice())
+                            .await
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -965,21 +1024,20 @@ fn merge_series_runs(
 // --- Native-histogram dedup total order (docs/rseg-v3-plan.md section 7) ---
 //
 // Generalizes `is_greater`/`merge_series_runs` to histogram structural
-// comparison by bit pattern. `ravel-promql`'s `SeriesData`/`SeriesSource`
-// remain scalar-only, and wiring this into a live query path additionally
-// needs `fetcher.rs` to decode RSEG v3/HIST_PAGES, both out of this
-// ticket's "Work in" scope (crates/ravel-segment, crates/ravel-ingest,
-// crates/ravel-query only) -- so nothing here is called by
-// `merge_soa_runs`/`MergedSource` yet. The extension is proven directly by
-// the tests below, constructing `HistogramValue`s by hand rather than via
-// OTLP/RW decode, mirroring how phase C7's ingest plumbing is proven.
+// comparison by bit pattern. Wired into the live query path (#218):
+// `merge_histogram_soa_runs` groups the per-segment histogram runs
+// `SegmentFetcher::fetch_histograms` decodes and drains them through
+// `merge_histogram_series_runs` below, and `MergedSource::query_histograms`
+// serves the converted result to the evaluator's native-histogram path. The
+// tests below additionally prove the merge order directly, constructing
+// `HistogramValue`s by hand rather than via OTLP/RW decode, mirroring how
+// phase C7's ingest plumbing is proven.
 
 /// Bit-pattern total order over one [`HistogramValue`]'s full structure:
 /// every float field compared by its raw bit pattern (never `==`/`PartialOrd`
 /// on `f64` itself), so NaN payloads and -0.0 are significant, matching
 /// `f64::to_bits()`'s role in the scalar tiebreak ([`is_greater`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 struct HistogramSortKey {
     scale: i32,
     zero_threshold_bits: u64,
@@ -997,7 +1055,6 @@ struct HistogramSortKey {
 /// outrank the other, so any fixed order is correct as long as it never
 /// changes (it decides duplicate-sample winners).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 enum CountsSortKey {
     Int {
         zero_count: u64,
@@ -1016,7 +1073,6 @@ enum CountsSortKey {
 /// Stable, deterministic rank for [`ravel_segment::ResetHint`] (which has no
 /// `Ord` of its own): only used to make [`HistogramSortKey`] total, not tied
 /// to the format's wire encoding.
-#[allow(dead_code)]
 fn reset_hint_rank(hint: ravel_segment::ResetHint) -> u8 {
     use ravel_segment::ResetHint;
     match hint {
@@ -1027,12 +1083,10 @@ fn reset_hint_rank(hint: ravel_segment::ResetHint) -> u8 {
     }
 }
 
-#[allow(dead_code)]
 fn spans_sort_key(spans: &[ravel_segment::HistogramSpan]) -> Vec<(i32, u32)> {
     spans.iter().map(|s| (s.offset, s.length)).collect()
 }
 
-#[allow(dead_code)]
 fn histogram_sort_key(v: &ravel_segment::HistogramValue) -> HistogramSortKey {
     use ravel_segment::HistogramCounts;
 
@@ -1077,7 +1131,6 @@ fn histogram_sort_key(v: &ravel_segment::HistogramValue) -> HistogramSortKey {
 
 /// Histogram counterpart to [`Candidate`]: same provenance priority, paired
 /// with a full [`HistogramValue`] instead of a plain `f64`.
-#[allow(dead_code)]
 struct HistogramCandidate {
     value: ravel_segment::HistogramValue,
     priority: (i64, u64, u64, u32),
@@ -1086,7 +1139,6 @@ struct HistogramCandidate {
 /// Histogram counterpart to [`is_greater`]: same priority-prefix-first
 /// total order, tie-broken by [`histogram_sort_key`] instead of a plain
 /// `value.to_bits()`.
-#[allow(dead_code)]
 fn histogram_is_greater(a: &HistogramCandidate, b: &HistogramCandidate) -> bool {
     (a.priority, histogram_sort_key(&a.value)) > (b.priority, histogram_sort_key(&b.value))
 }
@@ -1094,7 +1146,6 @@ fn histogram_is_greater(a: &HistogramCandidate, b: &HistogramCandidate) -> bool 
 /// Histogram counterpart to [`SeriesRun`]: one decoded per-segment run of a
 /// single histogram-kind series, kept in on-disk order.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct HistogramSeriesRun {
     timestamps: Vec<i64>,
     values: Vec<ravel_segment::HistogramValue>,
@@ -1105,7 +1156,6 @@ struct HistogramSeriesRun {
 /// shape (min-heap by ts, drain same-ts heads, [`histogram_is_greater`]
 /// picks the winner), substituting [`HistogramCandidate`] for [`Candidate`]
 /// and yielding [`ravel_segment::HistogramSample`]s.
-#[allow(dead_code)]
 fn merge_histogram_series_runs(
     runs: &[HistogramSeriesRun],
     budget: &mut YieldBudget,
@@ -1162,12 +1212,136 @@ fn merge_histogram_series_runs(
     Ok(())
 }
 
+/// Converts one storage-model [`ravel_segment::HistogramValue`] to the
+/// evaluator's float working model [`FloatHistogram`] (#218). Integer counts
+/// are widened to `f64` exactly as Prometheus converts an integer histogram to
+/// its `FloatHistogram` before evaluation (`ravel_promql::source::HistogramSample`
+/// doc); span layouts and float fields carry over verbatim. A sample with no
+/// stored `sum` maps to `NaN` (the honest "sum unknown" float value); every
+/// native histogram Ravel ingests today carries a sum, so this is the
+/// unreachable-in-practice edge, not the norm.
+fn histogram_value_to_float(v: &ravel_segment::HistogramValue) -> FloatHistogram {
+    use ravel_segment::HistogramCounts;
+
+    let spans = |src: &[ravel_segment::HistogramSpan]| -> Vec<Span> {
+        src.iter()
+            .map(|s| Span {
+                offset: s.offset,
+                length: s.length,
+            })
+            .collect()
+    };
+
+    let (zero_count, count, positive_buckets, negative_buckets) = match &v.counts {
+        HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => (
+            *zero_count as f64,
+            *count as f64,
+            positive.iter().map(|&c| c as f64).collect(),
+            negative.iter().map(|&c| c as f64).collect(),
+        ),
+        HistogramCounts::Float {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => (*zero_count, *count, positive.clone(), negative.clone()),
+    };
+
+    FloatHistogram {
+        counter_reset_hint: reset_hint_to_float(v.reset_hint),
+        scale: v.scale,
+        zero_threshold: v.zero_threshold,
+        zero_count,
+        count,
+        sum: v.sum.unwrap_or(f64::NAN),
+        positive_spans: spans(&v.positive_spans),
+        negative_spans: spans(&v.negative_spans),
+        positive_buckets,
+        negative_buckets,
+        custom_values: v.custom_values.clone().unwrap_or_default(),
+    }
+}
+
+/// Maps [`ravel_segment::ResetHint`] to the evaluator's own
+/// [`ravel_promql::ResetHint`] (identical four states, distinct types across
+/// the crate boundary).
+fn reset_hint_to_float(hint: ravel_segment::ResetHint) -> ravel_promql::ResetHint {
+    use ravel_promql::ResetHint as F;
+    use ravel_segment::ResetHint as S;
+    match hint {
+        S::Unknown => F::Unknown,
+        S::Yes => F::Yes,
+        S::No => F::No,
+        S::Gauge => F::Gauge,
+    }
+}
+
+/// Histogram counterpart to [`merge_soa_runs`] (#218): groups the per-segment
+/// histogram runs by series id, lazily k-way merges each series' runs through
+/// [`merge_histogram_series_runs`] (same ascending-ts, per-timestamp-dedup,
+/// full-total-order winner selection as the scalar merge), then converts each
+/// merged storage-model sample to the evaluator's float model for the built
+/// [`HistogramSeriesData`]. `max_series`/`max_samples` are enforced exactly as
+/// on the scalar path.
+fn merge_histogram_soa_runs(
+    fetched: Vec<Vec<FetchedHistogramSeries>>,
+    max_series: usize,
+    max_samples: usize,
+) -> Result<Vec<HistogramSeriesData>, QueryError> {
+    let mut by_series: HashMap<SeriesId, (LabelSet, Vec<HistogramSeriesRun>)> = HashMap::new();
+    for segment_series in fetched {
+        for fs in segment_series {
+            let entry = by_series
+                .entry(fs.series_id)
+                .or_insert_with(|| (fs.labels.clone(), Vec::new()));
+            entry.1.push(HistogramSeriesRun {
+                timestamps: fs.timestamps,
+                values: fs.values,
+                prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
+            });
+        }
+    }
+
+    if by_series.len() > max_series {
+        return Err(QueryError::TooManySeries {
+            count: by_series.len(),
+            max: max_series,
+        });
+    }
+
+    let mut budget = YieldBudget {
+        yielded: 0,
+        max: max_samples,
+    };
+    let mut out = Vec::with_capacity(by_series.len());
+    for (labels, runs) in by_series.into_values() {
+        let mut merged = Vec::new();
+        merge_histogram_series_runs(&runs, &mut budget, &mut merged)?;
+        let samples = merged
+            .into_iter()
+            .map(|s| ravel_promql::HistogramSample {
+                ts_ns: s.ts_ns,
+                value: histogram_value_to_float(&s.value),
+            })
+            .collect();
+        out.push(HistogramSeriesData { labels, samples });
+    }
+    Ok(out)
+}
+
 /// A `SeriesSource` backed by the per-series output of the lazy k-way merge
-/// ([`merge_soa_runs`]), not a materialized per-timestamp window
+/// ([`merge_soa_runs`] for scalar series, [`merge_histogram_soa_runs`] for
+/// native-histogram series), not a materialized per-timestamp window
 /// (docs/query-engine.md / `ravel_promql::source` module doc: by the time
 /// the evaluator runs, everything is plain, synchronous, in-memory data).
 struct MergedSource {
     series: Vec<SeriesData>,
+    histogram_series: Vec<HistogramSeriesData>,
 }
 
 impl SeriesSource for MergedSource {
@@ -1187,6 +1361,31 @@ impl SeriesSource for MergedSource {
                     .iter()
                     .filter(|sm| sm.ts_ns >= window.start_ns && sm.ts_ns <= window.end_ns)
                     .copied()
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Native-histogram counterpart to [`query`](Self::query) (#218): the same
+    /// matcher-filter-then-window-clip over the already-merged histogram
+    /// series. A series is scalar or histogram in storage, never both, so this
+    /// and `query` partition the merged source with no overlap.
+    fn query_histograms(
+        &self,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+    ) -> Result<Vec<HistogramSeriesData>, SourceError> {
+        Ok(self
+            .histogram_series
+            .iter()
+            .filter(|s| matches_series(matchers, &s.labels))
+            .map(|s| HistogramSeriesData {
+                labels: s.labels.clone(),
+                samples: s
+                    .samples
+                    .iter()
+                    .filter(|sm| sm.ts_ns >= window.start_ns && sm.ts_ns <= window.end_ns)
+                    .cloned()
                     .collect(),
             })
             .collect())
@@ -1930,6 +2129,158 @@ mod histogram_merge_tests {
                 want.into_iter().map(|(ts, (_, key))| (ts, key)).collect();
             prop_assert_eq!(got, want_keys);
         }
+    }
+}
+
+/// Exercises `merge_histogram_soa_runs` + `MergedSource::query_histograms`
+/// (#218): the fetch-side merge-and-convert path that feeds the evaluator's
+/// native-histogram source, the histogram counterpart of the scalar
+/// `prefetch`/`MergedSource::query` path. Builds `FetchedHistogramSeries` by
+/// hand (as `merge_tests` builds `FetchedSeriesSoa`), so it is independent of
+/// the object-store fetch proven in `fetcher::tests`.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod histogram_source_tests {
+    use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
+    use ravel_types::{Label, LabelSet};
+
+    use super::*;
+    use crate::fetcher::FetchedHistogramSeries;
+
+    fn labels(series: u8) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: format!("metric_{series}"),
+        }])
+        .expect("valid labels")
+    }
+
+    /// A single-bucket int histogram distinguished only by `sum`.
+    fn hv(sum: f64) -> HistogramValue {
+        HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: Some(sum),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
+    fn fhs(
+        series: u8,
+        ts: &[i64],
+        vals: Vec<HistogramValue>,
+        created: i64,
+        epoch: u64,
+        seq: u64,
+    ) -> FetchedHistogramSeries {
+        assert_eq!(ts.len(), vals.len());
+        FetchedHistogramSeries {
+            series_id: SeriesId([series; 16]),
+            labels: labels(series),
+            timestamps: ts.to_vec(),
+            values: vals,
+            created_unix_ns: created,
+            writer_epoch: epoch,
+            writer_seq: seq,
+        }
+    }
+
+    fn source(segments: Vec<Vec<FetchedHistogramSeries>>) -> MergedSource {
+        let histogram_series =
+            merge_histogram_soa_runs(segments, 10_000, usize::MAX).expect("merge");
+        MergedSource {
+            series: Vec::new(),
+            histogram_series,
+        }
+    }
+
+    #[test]
+    fn duplicate_sample_across_segments_resolves_by_provenance() {
+        // Two segments, same series, same ts: the greater created_unix_ns wins,
+        // exactly as the scalar merge resolves a duplicate.
+        let older = fhs(1, &[5], vec![hv(1.0)], 10, 0, 0);
+        let newer = fhs(1, &[5], vec![hv(2.0)], 20, 0, 0);
+
+        let src = source(vec![vec![older.clone()], vec![newer.clone()]]);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let got = src.query_histograms(&[], window).expect("query_histograms");
+        assert_eq!(got.len(), 1, "one merged series");
+        assert_eq!(got[0].samples.len(), 1, "one deduped sample");
+        assert_eq!(got[0].samples[0].value.sum, 2.0, "newer created wins");
+
+        // Order-independent: swapping the two segments yields the same winner.
+        let src = source(vec![vec![newer], vec![older]]);
+        let got = src.query_histograms(&[], window).expect("query_histograms");
+        assert_eq!(got[0].samples[0].value.sum, 2.0);
+    }
+
+    #[test]
+    fn k_way_merge_and_window_clip_and_matcher_filter() {
+        // Series 1 interleaved across two segments; series 2 disjoint. The
+        // merge yields ascending deduped ts per series; query_histograms then
+        // clips to the window and filters by matcher.
+        let a = fhs(1, &[1, 5], vec![hv(1.0), hv(5.0)], 0, 0, 0);
+        let b = fhs(1, &[3], vec![hv(3.0)], 0, 0, 0);
+        let c = fhs(2, &[2, 4], vec![hv(20.0), hv(40.0)], 0, 0, 0);
+        let src = source(vec![vec![a, c], vec![b]]);
+
+        // Full window, series 1 only: ts 1,3,5 in order.
+        let full = TimeRange {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let s1 = src
+            .query_histograms(&[LabelMatcher::equal(METRIC_NAME_LABEL, "metric_1")], full)
+            .expect("query");
+        assert_eq!(s1.len(), 1, "matcher isolates series 1");
+        let ts1: Vec<i64> = s1[0].samples.iter().map(|s| s.ts_ns).collect();
+        assert_eq!(ts1, vec![1, 3, 5]);
+
+        // Clipped window drops out-of-range samples (inclusive both ends).
+        let clipped = TimeRange {
+            start_ns: 2,
+            end_ns: 4,
+        };
+        let s2 = src
+            .query_histograms(
+                &[LabelMatcher::equal(METRIC_NAME_LABEL, "metric_2")],
+                clipped,
+            )
+            .expect("query");
+        let ts2: Vec<i64> = s2[0].samples.iter().map(|s| s.ts_ns).collect();
+        assert_eq!(ts2, vec![2, 4]);
+    }
+
+    #[test]
+    fn int_counts_convert_to_float_model() {
+        // The converted sample carries the float working model: int counts
+        // widened to f64, spans preserved, sum carried through.
+        let src = source(vec![vec![fhs(1, &[7], vec![hv(9.5)], 0, 0, 0)]]);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let got = src.query_histograms(&[], window).expect("query");
+        let h = &got[0].samples[0].value;
+        assert_eq!(h.count, 1.0);
+        assert_eq!(h.sum, 9.5);
+        assert_eq!(h.positive_buckets, vec![1.0]);
+        assert_eq!(h.positive_spans.len(), 1);
     }
 }
 

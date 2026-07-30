@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use ravel_promql::{Value, ms_to_ns};
+use ravel_promql::{FloatHistogram, Value, ms_to_ns};
 use ravel_types::{LabelSet, SeriesId};
 use serde::{Serialize, Serializer};
 
@@ -109,10 +109,18 @@ pub enum QueryData {
     String((Timestamp, String)),
 }
 
+/// One instant-vector element. Prometheus renders a float sample under a
+/// `value` field and a native-histogram sample under a `histogram` field;
+/// exactly one is present per element (a series is scalar or histogram in
+/// storage, never both), so both are `Option` with `omitempty`, matching
+/// Prometheus' `web/api/v1` sample shape (#218).
 #[derive(Debug, Serialize)]
 pub struct VectorResult {
     pub metric: HashMap<String, String>,
-    pub value: (Timestamp, String),
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<(Timestamp, String)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub histogram: Option<(Timestamp, HistogramJson)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +128,27 @@ pub struct MatrixResult {
     pub metric: HashMap<String, String>,
     pub values: Vec<(Timestamp, String)>,
 }
+
+/// Prometheus' `model.SampleHistogram` JSON shape for a native (exponential)
+/// histogram value (#218): `count` and `sum` as strings (same
+/// full-precision string encoding as a float sample value), and `buckets` an
+/// array of `[boundaries, lower, upper, count]` tuples in cumulative ascending
+/// order. Field names match Prometheus so the differential comparator (a
+/// follow-up task) can compare against real Prometheus output.
+#[derive(Debug, Serialize)]
+pub struct HistogramJson {
+    pub count: String,
+    pub sum: String,
+    pub buckets: Vec<HistogramBucketJson>,
+}
+
+/// One native-histogram bucket, rendered exactly as Prometheus renders it: a
+/// 4-element JSON array `[boundaries, lower, upper, count]`. `boundaries`
+/// encodes interval openness (Prometheus' convention): 0 left-open/right-closed
+/// `(lower, upper]`, 1 left-closed/right-open `[lower, upper)`, 2 open both,
+/// 3 closed both.
+#[derive(Debug, Serialize)]
+pub struct HistogramBucketJson(pub i32, pub String, pub String, pub String);
 
 /// A query result timestamp, rendered in JSON as Prometheus' Go encoder
 /// renders it: a whole-second value is a bare integer (`1700000150`), not
@@ -170,6 +199,70 @@ fn ts_ns_to_seconds(ts_ns: i64) -> Timestamp {
     Timestamp((ts_ns as f64) / 1_000_000_000.0)
 }
 
+/// Render one instant-vector element (#218): a native-histogram element
+/// (`histogram: Some`) becomes Prometheus' `histogram` field, a float element
+/// its `value` field. The evaluator leaves `value` at `0.0` on a histogram
+/// element, so the two are never both meaningful.
+fn vector_result(s: ravel_promql::InstantSample) -> VectorResult {
+    let metric = labels_to_map(&s.labels);
+    let ts = ts_ns_to_seconds(s.ts_ns);
+    match s.histogram {
+        Some(h) => VectorResult {
+            metric,
+            value: None,
+            histogram: Some((ts, histogram_to_json(&h))),
+        },
+        None => VectorResult {
+            metric,
+            value: Some((ts, format_value(s.value))),
+            histogram: None,
+        },
+    }
+}
+
+/// Convert a [`FloatHistogram`] to Prometheus' `model.SampleHistogram` JSON
+/// shape (#218): `count`/`sum` as strings, and every populated bucket in
+/// cumulative ascending order (the order `FloatHistogram::all_buckets` yields,
+/// itself matching Prometheus' `AllFloatBucketIterator`). Zero-count buckets
+/// are skipped, exactly as Prometheus' marshaler skips them.
+fn histogram_to_json(h: &FloatHistogram) -> HistogramJson {
+    let buckets = h
+        .all_buckets()
+        .into_iter()
+        .filter(|b| b.count != 0.0)
+        .map(|b| {
+            HistogramBucketJson(
+                bucket_boundaries(b.lower, b.upper),
+                format_value(b.lower),
+                format_value(b.upper),
+                format_value(b.count),
+            )
+        })
+        .collect();
+    HistogramJson {
+        count: format_value(h.count),
+        sum: format_value(h.sum),
+        buckets,
+    }
+}
+
+/// Prometheus' interval-openness code for a bucket, computed exactly as
+/// Prometheus does (`histogram.Bucket`: `LowerInclusive = lower < 0`,
+/// `UpperInclusive = upper > 0`): 0 left-open/right-closed, 1
+/// left-closed/right-open, 2 open both, 3 closed both. Positive buckets are
+/// `(lower, upper]` (0), negative buckets `[lower, upper)` (1), the zero bucket
+/// `[lower, upper]` (3).
+fn bucket_boundaries(lower: f64, upper: f64) -> i32 {
+    let lower_inclusive = lower < 0.0;
+    let upper_inclusive = upper > 0.0;
+    match (lower_inclusive, upper_inclusive) {
+        (true, true) => 3,
+        (true, false) => 1,
+        (false, true) => 0,
+        (false, false) => 2,
+    }
+}
+
 /// Render an [`Evaluator::eval_instant`] result as a Prometheus-shaped
 /// `/api/v1/query` payload. A top-level range vector is a valid instant
 /// result: Prometheus renders `resultType: matrix` for an instant query
@@ -182,13 +275,7 @@ fn ts_ns_to_seconds(ts_ns: i64) -> Timestamp {
 pub fn instant_value_to_json(value: Value, time_ms: i64) -> Result<QueryData, ApiError> {
     match value {
         Value::Vector(vector) => Ok(QueryData::Vector(
-            vector
-                .into_iter()
-                .map(|s| VectorResult {
-                    metric: labels_to_map(&s.labels),
-                    value: (ts_ns_to_seconds(s.ts_ns), format_value(s.value)),
-                })
-                .collect(),
+            vector.into_iter().map(vector_result).collect(),
         )),
         Value::Scalar(v) => Ok(QueryData::Scalar((
             ms_to_seconds(time_ms)?,
@@ -459,6 +546,101 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("serializes");
         assert!(json.get("warnings").is_none(), "empty warnings omitted");
         assert!(json.get("infos").is_none(), "empty infos omitted");
+    }
+
+    #[test]
+    fn instant_vector_renders_native_histogram_element() {
+        // A native-histogram vector element renders under Prometheus'
+        // `histogram` field (not `value`), with count/sum as strings and each
+        // populated bucket a [boundaries, lower, upper, count] array in
+        // cumulative ascending order (#218). This value has a negative bucket
+        // (-2,-1] (boundaries 1), a zero bucket (-0.5,0.5] (boundaries 3), and
+        // a positive bucket (1,2] (boundaries 0).
+        use ravel_promql::{FloatHistogram, InstantSample, ResetHint, Span};
+        use ravel_types::{Label, LabelSet};
+
+        let h = FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.5,
+            zero_count: 4.0,
+            count: 9.0,
+            sum: 4.5,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            positive_buckets: vec![2.0],
+            negative_buckets: vec![3.0],
+            custom_values: Vec::new(),
+        };
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "req_latency".to_string(),
+        }])
+        .expect("valid labels");
+        let sample = InstantSample {
+            labels,
+            ts_ns: 1_700_000_000_000_000_000,
+            orig_sample_ts_ns: 1_700_000_000_000_000_000,
+            value: 0.0,
+            histogram: Some(h),
+        };
+
+        let data = instant_value_to_json(Value::Vector(vec![sample]), 1_700_000_000_000)
+            .expect("histogram vector renders");
+        let json = serde_json::to_value(&data).expect("serializes");
+        assert_eq!(json["resultType"], "vector");
+        let elem = &json["result"][0];
+        assert_eq!(elem["metric"]["__name__"], "req_latency");
+        // Float `value` field is absent on a histogram element.
+        assert!(elem.get("value").is_none(), "no value field on a histogram");
+        let hist = &elem["histogram"];
+        assert_eq!(hist[0], 1_700_000_000, "histogram carries the timestamp");
+        assert_eq!(hist[1]["count"], "9");
+        assert_eq!(hist[1]["sum"], "4.5");
+        assert_eq!(
+            hist[1]["buckets"],
+            serde_json::json!([
+                [1, "-2", "-1", "3"],
+                [3, "-0.5", "0.5", "4"],
+                [0, "1", "2", "2"],
+            ])
+        );
+    }
+
+    #[test]
+    fn instant_vector_renders_float_element_under_value_field() {
+        // A plain float vector element keeps the `value` field and carries no
+        // `histogram` field, so the two element shapes stay disjoint.
+        use ravel_promql::InstantSample;
+        use ravel_types::{Label, LabelSet};
+
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "up".to_string(),
+        }])
+        .expect("valid labels");
+        let sample = InstantSample {
+            labels,
+            ts_ns: 1_700_000_000_000_000_000,
+            orig_sample_ts_ns: 1_700_000_000_000_000_000,
+            value: 1.0,
+            histogram: None,
+        };
+        let data = instant_value_to_json(Value::Vector(vec![sample]), 1_700_000_000_000)
+            .expect("float vector renders");
+        let json = serde_json::to_value(&data).expect("serializes");
+        let elem = &json["result"][0];
+        assert_eq!(elem["value"], serde_json::json!([1_700_000_000, "1"]));
+        assert!(
+            elem.get("histogram").is_none(),
+            "no histogram field on a float element"
+        );
     }
 
     #[test]

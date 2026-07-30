@@ -7,9 +7,9 @@ use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_object_store::{Etag, GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
-    ExpectedIdentity, Footer, FooterOutcome, ReaderLimits, RunEntry, SeriesEntry, SeriesEntryV4,
-    ValPageKind, ValueKind, check_identity, decode_catalog_v4, decode_catalog_v5,
-    decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
+    ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry, SeriesEntry,
+    SeriesEntryV4, ValPageKind, ValueKind, check_identity, decode_catalog_v4, decode_catalog_v5,
+    decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 
@@ -82,6 +82,24 @@ pub struct FetchedSeriesSoa {
     pub labels: LabelSet,
     pub timestamps: Vec<i64>,
     pub values: Vec<f64>,
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+}
+
+/// Histogram counterpart to `FetchedSeriesSoa` (#218): the decoded
+/// native-histogram samples of one matched histogram-kind series, as parallel
+/// timestamp/value vecs, with the same provenance fields and per-segment
+/// on-disk order (index into `timestamps`/`values` is the in-page-index
+/// tiebreak) the scalar SoA carries. `values` holds `ravel_segment`'s storage
+/// histogram model; the read path converts each to the evaluator's float model
+/// downstream (docs/query-engine.md, `merge_histogram_soa_runs`).
+#[derive(Debug, Clone)]
+pub struct FetchedHistogramSeries {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<HistogramValue>,
     pub created_unix_ns: i64,
     pub writer_epoch: u64,
     pub writer_seq: u64,
@@ -399,6 +417,35 @@ impl SegmentFetcher {
         Ok(planned)
     }
 
+    /// Histogram counterpart to [`fetch_scalar_pages`](Self::fetch_scalar_pages)
+    /// (#218): coalesced TS/HIST page ranges for the histogram runs of
+    /// `histogram`, fetched into `regions`. `plan_ranges_v4` fills each
+    /// histogram run's `hist_range` (and leaves `val_range` a `(0, 0)`
+    /// sentinel), so this fetches the TS and HIST byte ranges the histogram
+    /// decode path reads.
+    async fn fetch_histogram_pages(
+        &self,
+        key: &str,
+        footer: &Footer,
+        histogram: &[&SeriesEntryV4],
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+    ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
+        let planned = plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
+        let page_ranges: Vec<(u64, u64)> = planned
+            .iter()
+            .flat_map(|p| {
+                [
+                    (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                    (p.hist_range.0, p.hist_range.0 + p.hist_range.1),
+                ]
+            })
+            .collect();
+        self.ensure_ranges(key, suffix_etag, &page_ranges, regions)
+            .await?;
+        Ok(planned)
+    }
+
     /// Decodes one scalar run's TS/VAL pages into `timestamps`/`values`
     /// (appending), returning the VAL page kind for stats. Shared by the L0
     /// and L1 sample paths; reuses the caller's decompression `scratch`.
@@ -434,6 +481,38 @@ impl SegmentFetcher {
         Ok(kind)
     }
 
+    /// Histogram counterpart to [`decode_run`](Self::decode_run) (#218):
+    /// decodes one histogram run's TS/HIST pages into `timestamps`/`values`
+    /// (appending). `decode_run_histogram_pages` yields combined
+    /// [`ravel_segment::HistogramSample`]s (ts + value), which this splits into
+    /// the parallel vecs the SoA shape carries, preserving on-disk order.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_histogram_run(
+        &self,
+        key: &str,
+        series_id: &SeriesId,
+        run: &RunEntry,
+        plan: &ravel_segment::PlannedRunRange,
+        regions: &FetchedRegions,
+        timestamps: &mut Vec<i64>,
+        values: &mut Vec<HistogramValue>,
+    ) -> Result<(), FetchError> {
+        let ts_bytes = regions
+            .slice(plan.ts_range.0, plan.ts_range.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let hist_bytes = regions
+            .slice(plan.hist_range.0, plan.hist_range.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let samples =
+            decode_run_histogram_pages(series_id, run, &ts_bytes, &hist_bytes, self.limits)
+                .map_err(|source| corrupt(key, source))?;
+        for sample in samples {
+            timestamps.push(sample.ts_ns);
+            values.push(sample.value);
+        }
+        Ok(())
+    }
+
     /// Core of `fetch`/`fetch_soa`: decodes every matched scalar series into
     /// one [`RunDecode`] per emitted unit, with resolved provenance keyed on
     /// the segment level (docs/compaction-retention-plan.md §3.5):
@@ -449,8 +528,9 @@ impl SegmentFetcher {
     ///   tuples, in the same dedup total order, as a query over the L0 inputs
     ///   it was built from.
     ///
-    /// Histogram-valued series are skipped: no histogram fetch path exists yet
-    /// and a scalar SoA cannot hold them.
+    /// Histogram-valued series are skipped here: a scalar SoA cannot hold
+    /// them. They are fetched by the mirror-image
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead (#218).
     async fn fetch_runs(
         &self,
         tenant_hash: TenantHash,
@@ -561,6 +641,112 @@ impl SegmentFetcher {
         Ok((out, stats))
     }
 
+    /// Histogram counterpart to [`fetch_runs`](Self::fetch_runs) (#218):
+    /// decodes every matched histogram-kind series into one
+    /// [`RunHistogramDecode`] per emitted unit, with the same per-level
+    /// provenance resolution as the scalar path (L0: one unit per series, runs
+    /// concatenated, segment provenance; L1: one unit per (series, run), each
+    /// run's own provenance). These are the histogram-kind entries the scalar
+    /// path's `ValueKind::Scalar` filter drops.
+    async fn fetch_histogram_runs(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<RunHistogramDecode>, FetchError> {
+        let key = &seg_ref.data_object_key;
+        let (footer, total_size, suffix_etag, mut regions) =
+            self.open_segment(tenant_hash, seg_ref).await?;
+        let selected = self
+            .decode_selected(
+                key,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+            )
+            .await?;
+        let histogram: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Histogram)
+            .collect();
+        if histogram.is_empty() {
+            return Ok(Vec::new());
+        }
+        let planned = self
+            .fetch_histogram_pages(key, &footer, &histogram, &suffix_etag, &mut regions)
+            .await?;
+
+        let mut out = Vec::with_capacity(histogram.len());
+        for entry in &histogram {
+            match &seg_ref.level {
+                SegmentLevel::L0 => {
+                    // One unit per series: concatenate every run's samples in
+                    // on-disk order, segment-level provenance.
+                    let mut timestamps = Vec::new();
+                    let mut values = Vec::new();
+                    for (run_index, run) in entry.runs.iter().enumerate() {
+                        let plan = find_run_plan(&planned, &entry.entry.series_id, run_index)
+                            .ok_or_else(|| {
+                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                            })?;
+                        self.decode_histogram_run(
+                            key,
+                            &entry.entry.series_id,
+                            run,
+                            plan,
+                            &regions,
+                            &mut timestamps,
+                            &mut values,
+                        )?;
+                    }
+                    out.push(RunHistogramDecode {
+                        series_id: entry.entry.series_id,
+                        labels: entry.entry.labels.clone(),
+                        timestamps,
+                        values,
+                        created_unix_ns: seg_ref.created_unix_ns,
+                        writer_epoch: seg_ref.writer_epoch,
+                        writer_seq: seg_ref.writer_seq,
+                    });
+                }
+                SegmentLevel::L1 { .. } => {
+                    // One unit per (series, run): each run keeps its own
+                    // provenance so cross-input duplicate samples resolve under
+                    // the same total order as the pre-compaction L0s.
+                    for (run_index, run) in entry.runs.iter().enumerate() {
+                        let plan = find_run_plan(&planned, &entry.entry.series_id, run_index)
+                            .ok_or_else(|| {
+                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                            })?;
+                        let mut timestamps = Vec::new();
+                        let mut values = Vec::new();
+                        self.decode_histogram_run(
+                            key,
+                            &entry.entry.series_id,
+                            run,
+                            plan,
+                            &regions,
+                            &mut timestamps,
+                            &mut values,
+                        )?;
+                        out.push(RunHistogramDecode {
+                            series_id: entry.entry.series_id,
+                            labels: entry.entry.labels.clone(),
+                            timestamps,
+                            values,
+                            created_unix_ns: run.created_unix_ns,
+                            writer_epoch: run.writer_epoch,
+                            writer_seq: run.writer_seq,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Returns the series (labels only, no samples) in this segment matching
     /// `matchers`. Used by the labels/label-values/series HTTP endpoints,
     /// which never need page data. Returns the folded per-series
@@ -623,6 +809,28 @@ impl SegmentFetcher {
             .await?;
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
     }
+
+    /// Histogram counterpart to [`fetch_soa`](Self::fetch_soa) (#218): fetches
+    /// and decodes the native-histogram samples of every histogram-kind series
+    /// in this segment matching `matchers`, as SoA
+    /// [`FetchedHistogramSeries`]. Scalar-kind series carry no histogram
+    /// samples and are skipped (the mirror image of `fetch_soa` skipping
+    /// histogram-kind series). Same per-level emission shape and provenance as
+    /// `fetch_soa` (see [`fetch_histogram_runs`](Self::fetch_histogram_runs)).
+    pub async fn fetch_histograms(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<FetchedHistogramSeries>, FetchError> {
+        let runs = self
+            .fetch_histogram_runs(tenant_hash, seg_ref, matchers)
+            .await?;
+        Ok(runs
+            .into_iter()
+            .map(RunHistogramDecode::into_fetched)
+            .collect())
+    }
 }
 
 /// One decoded, provenance-resolved emission unit, convertible to either the
@@ -662,6 +870,33 @@ impl RunDecode {
             series_id: self.series_id,
             labels: self.labels,
             samples,
+            created_unix_ns: self.created_unix_ns,
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+        }
+    }
+}
+
+/// Histogram counterpart to [`RunDecode`] (#218): one decoded,
+/// provenance-resolved histogram emission unit. For L0 this is one series
+/// (runs concatenated); for L1 this is one (series, run).
+struct RunHistogramDecode {
+    series_id: SeriesId,
+    labels: LabelSet,
+    timestamps: Vec<i64>,
+    values: Vec<HistogramValue>,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+}
+
+impl RunHistogramDecode {
+    fn into_fetched(self) -> FetchedHistogramSeries {
+        FetchedHistogramSeries {
+            series_id: self.series_id,
+            labels: self.labels,
+            timestamps: self.timestamps,
+            values: self.values,
             created_unix_ns: self.created_unix_ns,
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
@@ -744,7 +979,10 @@ mod tests {
     use ravel_catalog::SegmentRef;
     use ravel_object_store::PutOptions;
     use ravel_object_store::memory::MemoryStore;
-    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_segment::{
+        HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
+        SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
+    };
     use ravel_types::{Label, LabelSet};
     use uuid::Uuid;
 
@@ -878,6 +1116,153 @@ mod tests {
         // raw-f64 bytes (6-byte header + 2 * 8-byte values).
         assert_eq!(stats.raw_f64_pages, 1);
         assert_eq!(stats.raw_f64_bytes, 6 + 2 * 8);
+    }
+
+    /// A simple int-counts native histogram varying only by `count`/`sum`, so
+    /// two samples in one series are structurally distinct and their round-trip
+    /// is unambiguous.
+    fn hist_value(count: u64, sum: f64) -> HistogramValue {
+        HistogramValue {
+            scale: 2,
+            zero_threshold: 1e-9,
+            sum: Some(sum),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count,
+                positive: vec![count],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        }
+    }
+
+    fn hist_series(metric: &str, samples: Vec<HistogramSample>) -> SeriesInputV3 {
+        let label_set = labels(metric);
+        let tenant_id = ravel_types::TenantId::new("t".to_string());
+        let series_id =
+            ravel_types::SeriesId::compute(&tenant_id, metric, &label_set).expect("series id");
+        SeriesInputV3 {
+            series_id,
+            labels: label_set,
+            values: SeriesValues::Histogram(samples),
+        }
+    }
+
+    fn scalar_series_v3(metric: &str, samples: &[(i64, f64)]) -> SeriesInputV3 {
+        let label_set = labels(metric);
+        let tenant_id = ravel_types::TenantId::new("t".to_string());
+        let series_id =
+            ravel_types::SeriesId::compute(&tenant_id, metric, &label_set).expect("series id");
+        SeriesInputV3 {
+            series_id,
+            labels: label_set,
+            values: SeriesValues::Scalar(
+                samples
+                    .iter()
+                    .map(|(ts_ns, value)| ravel_types::Sample {
+                        ts_ns: *ts_ns,
+                        value: *value,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Writes a real HIST_PAGES segment (via `write_histograms`) carrying one
+    /// histogram-kind series and one scalar-kind series, puts it on a
+    /// `MemoryStore`, and returns a matching L0 `SegmentRef`.
+    async fn write_histogram_test_segment() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([9u8; 16]);
+        let writer_id = Uuid::from_u128(2);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let hist = hist_series(
+            "hist_metric",
+            vec![
+                HistogramSample {
+                    ts_ns: 1_000 * NS,
+                    value: hist_value(3, 6.0),
+                },
+                HistogramSample {
+                    ts_ns: 1_001 * NS,
+                    value: hist_value(5, 11.0),
+                },
+            ],
+        );
+        let scalar = scalar_series_v3("scalar_metric", &[(1_000 * NS, 1.0), (1_001 * NS, 2.0)]);
+        let written = SegmentWriter::write_histograms(vec![hist, scalar], identity, bounds)
+            .expect("write histogram segment");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/hist-segment.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment object");
+
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 77,
+            level: ravel_catalog::SegmentLevel::L0,
+        };
+        (store, tenant_hash, seg_ref)
+    }
+
+    #[tokio::test]
+    async fn fetch_histograms_round_trips_hist_pages_and_skips_scalar() {
+        let (store, tenant_hash, seg_ref) = write_histogram_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        // The histogram path returns only the histogram-kind series, with its
+        // samples decoded from HIST_PAGES back to the exact input values.
+        let hist = fetcher
+            .fetch_histograms(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_histograms");
+        assert_eq!(hist.len(), 1, "only the histogram-kind series is returned");
+        let series = &hist[0];
+        assert_eq!(series.labels, labels("hist_metric"));
+        assert_eq!(series.created_unix_ns, seg_ref.created_unix_ns);
+        const NS: i64 = 1_000_000_000;
+        assert_eq!(series.timestamps, vec![1_000 * NS, 1_001 * NS]);
+        assert_eq!(series.values, vec![hist_value(3, 6.0), hist_value(5, 11.0)]);
+
+        // The scalar path is the mirror image: it returns only the scalar-kind
+        // series and never the histogram one.
+        let (scalar, _stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+        assert_eq!(scalar.len(), 1, "only the scalar-kind series is returned");
+        assert_eq!(scalar[0].labels, labels("scalar_metric"));
     }
 
     // --- coalesce_ranges / FetchedRegions unit coverage (a5-F01).
