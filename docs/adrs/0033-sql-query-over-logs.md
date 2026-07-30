@@ -89,10 +89,56 @@ catalog level), and word/phrase text search via a `has_word(col,
 bloom-accelerated pruning inside `RlogReader::scan`. Schema: fixed
 columns (`ts`, `observed_ts`, `severity_num`, `severity_text`, `body`,
 `trace_id`, `span_id`, `flags`) plus one `attrs` `Map(Utf8, Utf8)`
-column for dynamic attributes — mirroring how the metrics table already
-exposes `labels` as a map rather than per-key columns, for the same
-reason: a per-tenant, per-key column schema is a v-next refinement, not
-a v1 requirement.
+column — mirroring how the metrics table already exposes `labels` as a
+map rather than per-key columns, for the same reason: a per-tenant,
+per-key column schema is a v-next refinement, not a v1 requirement.
+
+**`attrs` carries resource, scope, and record attributes merged into
+one map — not record attributes alone.** This is a correction of this
+ADR's own first draft, which described `attrs` as holding only
+per-record dynamic attributes while also treating `attrs['service.name']
+= 'api'` as a stream-identifying predicate. Those two claims cannot both
+hold under the `Inexact` discipline two paragraphs up: DataFusion's
+residual re-applies the *original expression* against the *emitted
+batch*, using only the columns in that batch. A predicate whose truth
+depends on data absent from the batch — here, resource/scope attributes
+that never appear in a record-only `attrs` column — is not sound to
+mark `Inexact`, because the residual will drop rows the fetcher and
+scan correctly matched. This is not a corner case: it silently loses
+every row whose only match is a genuine resource attribute (the common
+OTLP shape, e.g. `service.name` set once on the Resource and never
+repeated per record).
+
+The fix is architectural, not a scan-level patch: the column the
+residual evaluates and the data the stream-identity check matches must
+be the same data. `logs_scan.rs`'s `build_batch` populates `attrs` from
+`LogRecord.attrs` (record) merged with the key-value pairs decoded from
+`LogRecord.stream_attrs` (resource + scope, `ravel_logseg::
+stream_attrs_bytes`'s own encoding). Precedence on key collision:
+record wins over resource/scope. Log ingest (`ravel-otlp::logs_normalize`)
+does not reject or deduplicate across these three attribute sources —
+unlike the metrics path, which rejects a data-point attribute colliding
+with a synthesized `job`/`instance` label (`DuplicateLabelName`) —  so
+collisions are possible and this ADR fixes the resolution rule rather
+than leaving it to whichever source happens to be applied last.
+Record-wins matches the general OTel convention that the most specific
+scope overrides the least specific. Scope name and scope version
+(`stream_attrs_bytes`' first two fields) are positional, not key-value
+entries, and are excluded from the merged map — no synthetic
+`scope.name`/`scope.version` keys in v1; nothing in the query surface
+needs them yet, and inventing keys for them now risks exactly the kind
+of over-match the `Inexact` fix above is closing.
+
+An alternative was to give stream-identifying predicates their own
+syntax distinct from `attrs[...]` (e.g. a `stream_attr(key, value)`
+scalar predicate), so the record-only `attrs` column and the
+stream-identity check would never share a name. Rejected: it does not
+solve the underlying `Inexact` problem, it moves it — the residual
+would still need to re-evaluate `stream_attr(key, value)` against
+*some* column in the emitted batch, and no such column would exist
+under that design either. The one row-set columns can be evaluated
+against is the one actually returned to DataFusion; merging is the only
+way to give the residual real data to check.
 
 **Stream-identifying predicates resolve per-object, not per-catalog.**
 A SQL predicate like `attrs['service.name'] = 'api'` cannot become a
@@ -106,7 +152,28 @@ that object before calling `scan`. This costs one STREAM_DIR decode per
 candidate object surviving time-range pruning — acceptable for v1, and
 exactly the placeholder this ADR's Rejected Alternatives section below
 argues should stay a placeholder until real query latency says
-otherwise.
+otherwise. This per-object match is pruning only, same as the fetcher's
+STREAM_DIR check and the scan's own re-verification of it — correctness
+now comes from the residual re-applying the predicate against the fully
+merged `attrs` column, not from any pre-DataFusion filtering step being
+exact on its own.
+
+**`attrs['k']` subscript lowering is a known gap, not fixed by this
+ADR.** `ravel-sql`'s DataFusion dependency is configured with
+`features = ["sql"]` only — no nested-expression `ExprPlanner`
+(`GetFieldAccess`/`NamedStructField`) is registered, so
+`attrs['service.name']` fails query planning outright today with a
+loud `GetFieldAccess not supported` error, for both the record-only and
+merged-map cases; this is unrelated to the merge fix above. Fail-loud is
+acceptable for v1 under this repo's own posture (a hard planning error,
+never a silently wrong answer) but the SQL surface is not usable end to
+end until it is resolved. This is an explicit gate for the session/
+endpoint wiring task (design spec phase 3's remaining task, T4): either
+register the `ExprPlanner` (weighing it against the deliberate
+no-nested-expressions dependency-surface stance) or document the
+supported map-access syntax and have the planner reject the subscript
+form with a clear error. `has_word(col, 'literal')` and `LIKE` do not
+depend on this — both plan and push down today without it.
 
 **One SQL endpoint, two tables.** No new HTTP endpoint. `SqlExecutor`'s
 per-query `SessionContext` (`crates/ravel-sql/src/session.rs`) registers
