@@ -48,6 +48,11 @@ pub mod flight;
 #[cfg(feature = "flight-sql")]
 mod flight_ticket;
 mod labels;
+mod logs_provider;
+mod logs_pushdown;
+mod logs_scan;
+mod logs_schema;
+mod logs_udf;
 mod memory;
 mod minmax;
 mod output;
@@ -73,6 +78,14 @@ pub use flight::{
 pub use flight_ticket::{
     FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, TICKET_KEY_LEN, TicketKey,
 };
+pub use logs_provider::LogsTableProvider;
+pub use logs_pushdown::{LogsPushdown, extract_logs};
+pub use logs_scan::LogsScanExec;
+pub use logs_schema::{
+    LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS, LOG_COL_SEVERITY_NUM,
+    LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS, logs_schema,
+};
+pub use logs_udf::{HAS_WORD_UDF, has_word_udf};
 pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
