@@ -329,6 +329,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
             enabled: true,
             fold_interval: Duration::from_millis(200),
         },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
     };
     let running = ravel_server::start(config, store_dyn)
         .await
