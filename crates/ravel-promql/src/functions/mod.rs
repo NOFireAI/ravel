@@ -23,7 +23,7 @@ use ravel_types::{LabelSet, Sample};
 
 use crate::eval::{
     Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix, Value,
-    drop_metric_name, duration_to_ns, resolve_eval_ts, selector_eval_ts,
+    drop_metric_name, duration_to_ns, possible_non_counter_info, resolve_eval_ts, selector_eval_ts,
 };
 use crate::histogram::{FloatHistogram, TimedHistogram};
 use crate::source::SeriesSource;
@@ -199,6 +199,12 @@ pub(crate) fn eval_call(
             let window = range_window(arg, eval_ts_ns, ctx)?;
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             let mut out = apply_reduce(matrix, eval_ts_ns, |samples| float(samples, window));
+            // Gated on the *reduced* output, not the raw matrix: Prometheus'
+            // own check only runs once a rate/increase value was actually
+            // computed (its early return for fewer than two samples happens
+            // first), so a single-sample selector match must not raise this
+            // either (issue #234).
+            maybe_info_non_counter_selector_name(call.func.name, arg, !out.is_empty(), ctx);
             // Native-histogram series matching the same selector: reduce each
             // window to a histogram and emit it as a histogram element. A
             // subquery argument no longer reaches this histogram branch (it is
@@ -356,7 +362,7 @@ pub(crate) fn eval_range_call(
             // read path feeds native histograms into a range query yet (P11
             // report). The float reduction is identical to `RangeVector`.
             let arg = matrix_arg(&call.args.args[0])?;
-            eval_matrix_arg_range_reduction(
+            let result = eval_matrix_arg_range_reduction(
                 evaluator,
                 source,
                 arg,
@@ -376,7 +382,9 @@ pub(crate) fn eval_range_call(
                         },
                     )
                 },
-            )
+            )?;
+            maybe_info_non_counter_selector_name(call.func.name, arg, !result.is_empty(), ctx);
+            Ok(result)
         }
         // `eval_range`'s current architecture (`resolve_range_core`) only
         // supports a top-level call that reduces one series' matrix window
@@ -633,6 +641,47 @@ fn range_window(arg: MatrixArg, eval_ts_ns: i64, ctx: &QueryWindow) -> Result<Ra
             })
         }
     }
+}
+
+/// `rate()`/`increase()` (never `delta()`, which targets gauges and has no
+/// counterpart Prometheus check) over a literal-named vector selector whose
+/// name lacks a Prometheus counter-naming suffix: raises
+/// [`possible_non_counter_info`] (issue #234). The check runs against the
+/// argument's own selector name, not each matched series' `__name__` label
+/// -- matching the minimal scope #178's report left open -- so a
+/// label-matcher-only selector (no literal name) or a subquery's wrapped
+/// expression has nothing to check here. `produced_a_value` gates it to only
+/// fire once a rate/increase value was actually computed for at least one
+/// series, matching Prometheus: its own check sits after the "fewer than two
+/// samples" early return, so a selector that matched a series but produced
+/// no value (too few samples in the window) must not raise this either.
+fn maybe_info_non_counter_selector_name(
+    func_name: &str,
+    arg: MatrixArg,
+    produced_a_value: bool,
+    ctx: &QueryWindow,
+) {
+    if !produced_a_value || (func_name != "rate" && func_name != "increase") {
+        return;
+    }
+    let MatrixArg::Selector(ms) = arg else {
+        return;
+    };
+    let Some(name) = ms.vs.name.as_deref() else {
+        return;
+    };
+    if !has_counter_suffix(name) {
+        ctx.info(possible_non_counter_info(name));
+    }
+}
+
+/// Prometheus' counter-naming convention (`funcRate`'s own suffix check): a
+/// metric name ending in one of these is expected to be a counter.
+fn has_counter_suffix(name: &str) -> bool {
+    name.ends_with("_total")
+        || name.ends_with("_sum")
+        || name.ends_with("_count")
+        || name.ends_with("_bucket")
 }
 
 /// Evaluate a matrix-typed argument at one instant into a [`RangeMatrix`],
