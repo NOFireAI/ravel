@@ -326,6 +326,7 @@ fn default_true() -> bool {
 pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     let mut crd = RavelCluster::crd();
     inject_shards_immutability(&mut crd);
+    inject_minimum_bounds(&mut crd);
     crd
 }
 
@@ -364,6 +365,49 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
     }
 }
 
+/// Attach OpenAPI `minimum: 1` bounds to the count fields that must be positive:
+/// `spec.shards`, `spec.gateway.replicas`, and `spec.query.replicas`.
+///
+/// Without this, `shards: 0` or a negative replica count passes CRD validation
+/// and only fails much later as a confusing Deployment-apply error or a
+/// catalog-config panic. schemars 1.2.2 renders these fields as plain
+/// integers (a `u32`'s implicit `minimum: 0` is not a positive floor, and
+/// `i32` replicas get none), so the `minimum` keyword is injected here for the
+/// same reason the CEL rule is: post-hoc injection keeps it directly
+/// unit-testable without a live API server, and does not depend on which
+/// numeric-bound attributes this schemars major happens to emit.
+fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        if let Some(shards) = spec_props.get_mut("shards") {
+            shards.minimum = Some(1.0);
+        }
+        for tier in ["gateway", "query"] {
+            if let Some(replicas) = spec_props
+                .get_mut(tier)
+                .and_then(|t| t.properties.as_mut())
+                .and_then(|p| p.get_mut("replicas"))
+            {
+                replicas.minimum = Some(1.0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -392,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn shards_carries_cel_immutability_rule() {
+    fn crd_schema_includes_shard_immutability_rule() {
         let crd = ravel_cluster_crd();
         let version = &crd.spec.versions[0];
         let root = version
@@ -421,6 +465,49 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].rule, "self == oldSelf");
         assert!(rules[0].message.is_some());
+    }
+
+    #[test]
+    fn count_fields_carry_minimum_one_bound() {
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let root = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema");
+        let spec_props = root
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+
+        assert_eq!(
+            spec_props.get("shards").expect("shards prop").minimum,
+            Some(1.0),
+            "shards must reject 0"
+        );
+        for tier in ["gateway", "query"] {
+            let replicas = spec_props
+                .get(tier)
+                .expect("tier prop")
+                .properties
+                .as_ref()
+                .expect("tier props")
+                .get("replicas")
+                .expect("replicas prop");
+            assert_eq!(
+                replicas.minimum,
+                Some(1.0),
+                "{tier}.replicas must reject negative/zero"
+            );
+        }
     }
 
     #[test]
