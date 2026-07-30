@@ -98,18 +98,7 @@ pub async fn load_inputs(
         let got = store.get(key, GetRange::Full).await?;
         let record = record::decode(&got.data)?;
         // The record's key must reconstruct to the key we listed it at.
-        keys::commit_key_for_record(&record).and_then(|expected| {
-            if expected == *key {
-                Ok(())
-            } else {
-                Err(keys::KeyError::Malformed {
-                    key: key.clone(),
-                    reason: format!(
-                        "commit key does not match record identity (expected {expected:?})"
-                    ),
-                })
-            }
-        })?;
+        verify_commit_key(&record, key)?;
         verify_input_matches_bucket(bucket, &record)?;
         inputs.push(InputRecord {
             commit_key: key.clone(),
@@ -129,6 +118,24 @@ pub async fn load_inputs(
             ))
     });
     Ok(inputs)
+}
+
+/// Verify a decoded commit record reconstructs to the key it was fetched at
+/// (ADR-0010 §7 discipline). A corrupted-but-still-decodable record's own
+/// identity fields, which `keys::reconstruct_data_key` later trusts, must not
+/// name an object outside the tenant/shard/signal/hour the key it was stored
+/// under implies. Shared by [`load_inputs`], the retention sweep, and the
+/// superseded-input sweep.
+pub(crate) fn verify_commit_key(record: &CommitRecord, key: &str) -> Result<()> {
+    let expected = keys::commit_key_for_record(record)?;
+    if expected == key {
+        Ok(())
+    } else {
+        Err(MaintainError::Key(keys::KeyError::Malformed {
+            key: key.to_string(),
+            reason: format!("commit key does not match record identity (expected {expected:?})"),
+        }))
+    }
 }
 
 fn verify_input_matches_bucket(bucket: &Bucket, record: &CommitRecord) -> Result<()> {
