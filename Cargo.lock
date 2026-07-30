@@ -3940,6 +3940,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-otlp",
  "ravel-query",
+ "ravel-segment",
  "ravel-types",
  "reqwest 0.12.28",
  "serde",

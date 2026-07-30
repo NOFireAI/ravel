@@ -49,6 +49,15 @@ What exists today:
   over `/api/v1/query` and `/api/v1/query_range`, plus `/api/v1/labels`,
   `/api/v1/label/{name}/values`, and `/api/v1/series`. Aggregation operators
   (`sum by (...)`, `topk`, ...) and subqueries are not implemented yet.
+- Native (exponential) histograms end to end: ingested and stored (RSEG v5),
+  queried, and reduced to floats by the native-histogram PromQL functions
+  `histogram_count`, `histogram_sum`, and `histogram_avg`; `histogram_quantile`
+  and `histogram_fraction` over a native histogram; `rate`/`increase`/`delta`
+  over a histogram range; and `sum`/`avg` aggregation over histogram-valued
+  series. Native `histogram_quantile`/`histogram_fraction` currently
+  interpolate within a bucket linearly, where Prometheus 3.x interpolates
+  exponentially, so their values can differ from Prometheus for interior
+  quantiles.
 - SQL over the same data via DataFusion (`ravel-sql`): `POST /api/v1/sql`,
   behind `ravel-server`'s `sql` cargo feature, with a read-only `samples`
   table and the same duplicate-sample resolution as PromQL, bit-for-bit. See
@@ -64,8 +73,7 @@ What exists today:
 
 What is planned, not built:
 
-- Remote Write 1.0/2.0, OTel logs/traces/profiles, native histograms and
-  exemplars.
+- Remote Write 1.0/2.0, OTel logs/traces/profiles, and exemplars.
 - PromQL aggregation operators and subqueries, with a differential test
   suite against Prometheus for everything the evaluator does support.
 - Exact rollups (a second, aggregated level beyond L0/L1).
@@ -121,6 +129,14 @@ selectors, `offset`/`@`, binary operators, and most of the function library
 (`rate`, `histogram_quantile`, the `*_over_time` family, label and math
 functions). Aggregation operators (`sum by (...)`, `topk`, ...) and
 subqueries are not implemented yet.
+
+Native (exponential) histograms are queryable: `histogram_count`,
+`histogram_sum`, `histogram_avg`, `histogram_quantile`, and
+`histogram_fraction` over a native histogram, plus `rate`/`increase`/`delta`
+over a histogram range and `sum`/`avg` aggregation over histogram-valued
+series. Native `histogram_quantile`/`histogram_fraction` interpolate within a
+bucket linearly rather than exponentially, so interior-quantile values can
+differ from Prometheus 3.x.
 
 ```sh
 # Instant: a binary expression over a function result

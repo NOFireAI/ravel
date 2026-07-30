@@ -13,6 +13,7 @@ ravel-otlp = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-ingest = { workspace = true }
+ravel-segment = { workspace = true }
 ravel-query = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
