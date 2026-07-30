@@ -16,6 +16,22 @@ prost = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+# Only the criterion `[[bench]]` targets below understand `cargo bench`'s
+# `--quick` flag; leaving the lib's own `bench = true` default would make
+# `cargo bench -p ravel-logseg -- --quick` also run its unit tests under the
+# plain libtest harness, which rejects that flag (mirrors ravel-bench).
+bench = false
+
+[[bench]]
+name = "logseg_encode"
+harness = false
+
+[[bench]]
+name = "logseg_scan"
+harness = false
