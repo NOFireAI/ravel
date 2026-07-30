@@ -1,0 +1,50 @@
+# The Ravel operator Deployment and its namespace (ADR-0034 decision 6).
+#
+# Apply order: namespace, then crd.yaml, then rbac.yaml, then this file. The
+# image tag is a placeholder the kind scripts (issue #249) override with the
+# locally built tag.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ravel-system
+  labels:
+    app.kubernetes.io/name: ravel-operator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ravel-operator
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+spec:
+  replicas: 1
+  # The operator is not designed for concurrent active instances; a single
+  # replica is sufficient for the reconcile load (one CRD, stateless children).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ravel-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ravel-operator
+        app.kubernetes.io/managed-by: ravel-operator
+    spec:
+      serviceAccountName: ravel-operator
+      containers:
+        - name: ravel-operator
+          image: ravel-operator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi

@@ -1,0 +1,367 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "ravelclusters.ravel.nofire.ai"
+  },
+  "spec": {
+    "group": "ravel.nofire.ai",
+    "names": {
+      "kind": "RavelCluster",
+      "plural": "ravelclusters",
+      "shortNames": [
+        "rc"
+      ],
+      "singular": "ravelcluster"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for RavelClusterSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
+                "properties": {
+                  "gateway": {
+                    "default": {
+                      "replicas": 1
+                    },
+                    "description": "Gateway (ingest + query API) tier.",
+                    "properties": {
+                      "fold": {
+                        "description": "Catalog fold tuning. Fold is a pure query-cost optimization and only\nruns in the gateway tier, so it is a gateway-only field.",
+                        "nullable": true,
+                        "properties": {
+                          "disabled": {
+                            "default": false,
+                            "description": "Disable the background fold task entirely (`--disable-fold`). Never\nchanges query results, only their cost.",
+                            "type": "boolean"
+                          },
+                          "intervalSecs": {
+                            "description": "How often each tenant's fold task wakes, in seconds\n(`--fold-interval-secs`).",
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "nullable": true,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "replicas": {
+                        "default": 1,
+                        "description": "Replica count for the gateway Deployment.",
+                        "format": "int32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "resources": {
+                        "description": "Container resource requests/limits.",
+                        "nullable": true,
+                        "properties": {
+                          "limits": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Resource ceilings (`resources.limits`).",
+                            "nullable": true,
+                            "type": "object"
+                          },
+                          "requests": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Minimum guaranteed resources (`resources.requests`).",
+                            "nullable": true,
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "image": {
+                    "description": "Container image for every mode's pod (`ravel-server`).",
+                    "type": "string"
+                  },
+                  "imagePullPolicy": {
+                    "description": "Image pull policy (`Always`, `IfNotPresent`, `Never`). Defaults to the\nKubernetes default (`IfNotPresent`, or `Always` for a `:latest` tag)\nwhen unset.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "maintain": {
+                    "default": {
+                      "enabled": true
+                    },
+                    "description": "Background maintenance tier (compaction, retention, GC). Single replica,\n`Recreate` strategy, no replica field (ADR-0034 decision 3).",
+                    "properties": {
+                      "enabled": {
+                        "default": true,
+                        "description": "Whether the maintain Deployment exists at all. Defaults to true.",
+                        "type": "boolean"
+                      },
+                      "intervalSecs": {
+                        "description": "How often the maintenance task wakes, in seconds\n(`--maintain-interval-secs`).",
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "resources": {
+                        "description": "Container resource requests/limits.",
+                        "nullable": true,
+                        "properties": {
+                          "limits": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Resource ceilings (`resources.limits`).",
+                            "nullable": true,
+                            "type": "object"
+                          },
+                          "requests": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Minimum guaranteed resources (`resources.requests`).",
+                            "nullable": true,
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "query": {
+                    "default": {
+                      "replicas": 1
+                    },
+                    "description": "Query tier.",
+                    "properties": {
+                      "replicas": {
+                        "default": 1,
+                        "description": "Replica count for the query Deployment.",
+                        "format": "int32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "resources": {
+                        "description": "Container resource requests/limits.",
+                        "nullable": true,
+                        "properties": {
+                          "limits": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Resource ceilings (`resources.limits`).",
+                            "nullable": true,
+                            "type": "object"
+                          },
+                          "requests": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Minimum guaranteed resources (`resources.requests`).",
+                            "nullable": true,
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "retention": {
+                    "description": "Age-based retention: a default window plus per-tenant overrides. Enforced\nonly by the maintain tier, so these render onto the maintain Deployment.",
+                    "nullable": true,
+                    "properties": {
+                      "default": {
+                        "description": "Default age-based retention window as a humantime duration (`30d`,\n`720h`). Omitted means no default retention.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "tenants": {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "description": "Per-tenant retention overrides: tenant name to humantime duration.",
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "shards": {
+                    "description": "Shard count, rendered into `--shards` for gateway, query, and maintain\nalike so the must-match invariant is unrepresentable to break\n(ADR-0034 decision 2). Immutable after creation, enforced by a CEL\ntransition rule on this field's schema (see [`ravel_cluster_crd`]).",
+                    "format": "uint32",
+                    "minimum": 1.0,
+                    "type": "integer",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "shards is immutable after creation; resharding is out of scope (ADR-0034)",
+                        "rule": "self == oldSelf"
+                      }
+                    ]
+                  },
+                  "storage": {
+                    "description": "Object storage backend. S3 only: a per-process memory store is\nincoherent across pods (ADR-0034 decision 2).",
+                    "properties": {
+                      "s3": {
+                        "description": "S3 (or S3-compatible) backend.",
+                        "properties": {
+                          "bucket": {
+                            "description": "Bucket name (`--s3-bucket`).",
+                            "type": "string"
+                          },
+                          "credentialsSecretRef": {
+                            "description": "Secret with keys `accessKeyId` and `secretAccessKey`, injected as the\n`RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars.",
+                            "properties": {
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "endpoint": {
+                            "description": "Custom endpoint (`--s3-endpoint`) for S3-compatible backends such as\nMinIO or floci. Omit for real AWS S3.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "region": {
+                            "default": "us-east-1",
+                            "description": "AWS region (`--s3-region`). Defaults to `us-east-1`.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "bucket",
+                          "credentialsSecretRef"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "s3"
+                    ],
+                    "type": "object"
+                  },
+                  "tenantTokensSecretRef": {
+                    "description": "Secret whose keys are tenant names and whose values are the bearer\ntokens for those tenants. The operator renders `--tenant-token\n$(VAR)=<tenant>` using kubelet `$(VAR)` expansion so token values never\nappear in the Pod spec.\n\nWARNING: `ravel-server`'s `parse_tenant_tokens`\n(`services/ravel-server/src/config.rs`) splits each `--tenant-token`\nargument on the FIRST `=` via `str::split_once('=')`. A token VALUE that\ncontains `=` is therefore mis-parsed (the suffix after the first `=` is\ntaken as part of the tenant, not the token). This is pre-existing\nbehavior in a different crate, out of this operator's scope to change;\nchoose token values without `=` until a native token source lands.",
+                    "nullable": true,
+                    "properties": {
+                      "name": {
+                        "description": "Name of the Secret.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "image",
+                  "shards",
+                  "storage"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "description": "Observed status (ADR-0034 decision 2). Written by the operator on the status\nsubresource.",
+                "nullable": true,
+                "properties": {
+                  "conditions": {
+                    "description": "Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.",
+                    "items": {
+                      "description": "A standard Kubernetes status condition (the `metav1.Condition` shape). Kept\nas a local type rather than `k8s-openapi`'s `Condition` so the status schema\nderives from `schemars` without the `k8s-openapi` schemars coupling.",
+                      "properties": {
+                        "lastTransitionTime": {
+                          "description": "RFC3339 timestamp of the last transition.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "description": "Human-readable message.",
+                          "type": "string"
+                        },
+                        "observedGeneration": {
+                          "description": "The `.metadata.generation` the condition was set against.",
+                          "format": "int64",
+                          "nullable": true,
+                          "type": "integer"
+                        },
+                        "reason": {
+                          "description": "Machine-readable reason (PascalCase).",
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "`True`, `False`, or `Unknown`.",
+                          "type": "string"
+                        },
+                        "type": {
+                          "description": "Condition type, e.g. `Available`.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "message",
+                        "reason",
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "gatewayReadyReplicas": {
+                    "description": "Ready replicas reported by the gateway Deployment.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "maintainReadyReplicas": {
+                    "description": "Ready replicas reported by the maintain Deployment (0 or 1).",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "observedGeneration": {
+                    "description": "The `.metadata.generation` this status reflects.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "queryReadyReplicas": {
+                    "description": "Ready replicas reported by the query Deployment.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "RavelCluster",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}
