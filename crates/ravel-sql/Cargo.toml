@@ -16,6 +16,11 @@ ravel-catalog = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
+# The `logs` table (issue #239) uses the RLOG record/predicate/tokenizer types
+# directly (Predicate, FieldSel, LogRecord, AttrValue, tokenizer::tokens);
+# ravel-query re-exports the LogSegmentFetcher surface but not these logseg
+# types, so ravel-logseg is a direct dependency here.
+ravel-logseg = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the

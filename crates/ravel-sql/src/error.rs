@@ -33,7 +33,7 @@
 
 use datafusion::error::DataFusionError;
 use ravel_catalog::CatalogError;
-use ravel_query::FetchError;
+use ravel_query::{FetchError, LogFetchError};
 
 use crate::validate::ValidationError;
 
@@ -93,6 +93,12 @@ pub enum SqlError {
     /// A segment fetch or decode failed mid-scan.
     #[error("segment fetch failed: {0}")]
     Fetch(#[from] FetchError),
+
+    /// An RLOG log-segment fetch or decode failed mid-scan (the `logs` table's
+    /// sibling of [`SqlError::Fetch`], issue #239). Its `Display` embeds the
+    /// object key, so it redacts the same way [`SqlError::Fetch`] does.
+    #[error("log segment fetch failed: {0}")]
+    LogFetch(#[from] LogFetchError),
 
     /// A pinned segment vanished and the re-resolve-and-retry contract was
     /// exhausted (docs/consistency-model.md; plan section 2 retry contract,
@@ -160,9 +166,10 @@ impl SqlError {
     pub fn class(&self) -> ErrorClass {
         match self {
             SqlError::Validation(_) => ErrorClass::BadRequest,
-            SqlError::Catalog(_) | SqlError::Fetch(_) | SqlError::SnapshotInvalidated => {
-                ErrorClass::Unavailable
-            }
+            SqlError::Catalog(_)
+            | SqlError::Fetch(_)
+            | SqlError::LogFetch(_)
+            | SqlError::SnapshotInvalidated => ErrorClass::Unavailable,
             SqlError::DeadlineExceeded { .. } => ErrorClass::Timeout,
             SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
@@ -192,6 +199,10 @@ impl SqlError {
                     MSG_UNAVAILABLE.to_string()
                 }
             },
+            SqlError::LogFetch(fetch) => match fetch {
+                LogFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                LogFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+            },
             SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),
             SqlError::DeadlineExceeded { .. }
             | SqlError::TooManySamples { .. }
@@ -212,6 +223,9 @@ impl SqlError {
         matches!(
             self,
             SqlError::Fetch(FetchError::Store {
+                source: ravel_object_store::StoreError::NotFound,
+                ..
+            }) | SqlError::LogFetch(LogFetchError::Store {
                 source: ravel_object_store::StoreError::NotFound,
                 ..
             })
