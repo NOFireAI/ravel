@@ -42,7 +42,7 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{EngineConfig, SegmentFetcher};
+use ravel_query::{EngineConfig, LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{SqlConfig, SqlExecutor, SqlRequest};
 use ravel_types::{
@@ -234,6 +234,7 @@ impl Fixture {
         let executor = SqlExecutor::new(
             Arc::clone(&catalog),
             fetcher.clone(),
+            LogSegmentFetcher::new(Arc::clone(&store)),
             config,
             max_tenant_bytes,
         );

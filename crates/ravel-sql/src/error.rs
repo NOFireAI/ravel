@@ -86,6 +86,18 @@ pub enum SqlError {
     #[error(transparent)]
     Validation(#[from] ValidationError),
 
+    /// The query references both the `samples` and `logs` tables. ADR-0033
+    /// decision C admits exactly one signal per query in v1 (no query needs to
+    /// scan or join both metrics and logs), so this is rejected before any
+    /// catalog resolve. Its text names only the two fixed table names -- no
+    /// server state -- so it is safe to return verbatim, like a validation
+    /// error, and maps to HTTP 400.
+    #[error(
+        "a SQL query may reference either the samples table or the logs table, \
+         not both; metrics and logs cannot be scanned or joined together in v1"
+    )]
+    CrossSignalQuery,
+
     /// Snapshot resolution failed.
     #[error("snapshot resolution failed: {0}")]
     Catalog(#[from] CatalogError),
@@ -177,7 +189,7 @@ impl SqlError {
     /// The client-visible class, for HTTP status selection.
     pub fn class(&self) -> ErrorClass {
         match self {
-            SqlError::Validation(_) => ErrorClass::BadRequest,
+            SqlError::Validation(_) | SqlError::CrossSignalQuery => ErrorClass::BadRequest,
             SqlError::Catalog(_)
             | SqlError::Fetch(_)
             | SqlError::LogFetch(_)
@@ -205,6 +217,8 @@ impl SqlError {
     pub fn client_message(&self) -> String {
         match self {
             SqlError::Validation(e) => e.to_string(),
+            // Safe to echo: the text names only the two fixed table names.
+            SqlError::CrossSignalQuery => self.to_string(),
             SqlError::Catalog(catalog) => redact_catalog(catalog).to_string(),
             SqlError::Fetch(fetch) => match fetch {
                 FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
@@ -413,6 +427,18 @@ mod tests {
         let bad = SqlError::Validation(ValidationError::NotReadOnly { kind: "INSERT" });
         assert_eq!(bad.client_message(), bad.to_string());
         assert_eq!(bad.class(), ErrorClass::BadRequest);
+    }
+
+    #[test]
+    fn cross_signal_query_is_a_bad_request_that_keeps_its_own_text() {
+        let err = SqlError::CrossSignalQuery;
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        // Its own text is returned verbatim and names both tables.
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(err.client_message().contains("samples"));
+        assert!(err.client_message().contains("logs"));
+        // It carries no server state to redact.
+        assert_redacted(&err.client_message());
     }
 
     #[test]

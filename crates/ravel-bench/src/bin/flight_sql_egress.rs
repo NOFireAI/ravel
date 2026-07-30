@@ -51,7 +51,7 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::SegmentFetcher;
+use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{
     FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SqlConfig, SqlExecutor,
@@ -181,6 +181,7 @@ async fn run(args: &Args) -> Report {
     let executor = Arc::new(SqlExecutor::new(
         catalog,
         SegmentFetcher::new(Arc::clone(&store)),
+        LogSegmentFetcher::new(Arc::clone(&store)),
         SqlConfig::default(),
         1 << 30,
     ));

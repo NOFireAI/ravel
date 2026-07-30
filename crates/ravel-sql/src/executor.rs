@@ -7,11 +7,16 @@
 //!    anything else, so a rejected statement costs no catalog LIST and
 //!    builds no plan.
 //! 2. Resolve the snapshot exactly once, through
-//!    `catalog.resolve(&tenant_hash, Signal::Metrics, window, min_tokens,
-//!    now_ns)`, with `now_ns` threaded in from the caller's injected clock
-//!    (review F11; no `SystemTime::now()` in library logic).
+//!    `catalog.resolve(&tenant_hash, signal, window, min_tokens, now_ns)`,
+//!    with `now_ns` threaded in from the caller's injected clock (review F11;
+//!    no `SystemTime::now()` in library logic). `signal` is chosen from the
+//!    query's own `FROM` clause ([`SqlExecutor::target_signal`], ADR-0033):
+//!    `Signal::Logs` when the query references the `logs` table, otherwise
+//!    `Signal::Metrics`. A query referencing both tables is rejected here,
+//!    before the LIST, because v1 admits one signal per query (decision C).
 //! 3. Build the fresh single-tenant `SessionContext` around the owned
-//!    `Snapshot` (security invariant 2, crate::session).
+//!    `Snapshot`, registering the one table the query targets (security
+//!    invariant 2, crate::session).
 //! 4. Plan, then execute, draining the stream under the wall deadline.
 //!
 //! # Snapshot retry contract (plan section 2, review F9)
@@ -70,16 +75,38 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
-use ravel_query::SegmentFetcher;
+use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 
 use crate::config::SqlConfig;
 use crate::error::SqlError;
+use crate::logs_provider::LogsTableProvider;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
 use crate::provider::RavelTableProvider;
-use crate::session::build_session;
-use crate::validate::validate;
+use crate::session::{LOGS_TABLE, SAMPLES_TABLE, SessionTable, build_session};
+use crate::validate::{referenced_base_tables, validate};
+
+/// Which of the two v1 tables (and thus which `Signal`) a query targets.
+/// A closed two-variant enum rather than `Signal` directly: `Signal` carries
+/// variants (`Spans`, `Profiles`) the SQL surface has no table for, and the
+/// executor must never resolve or register those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetSignal {
+    /// The `samples` table, resolved against `Signal::Metrics`.
+    Metrics,
+    /// The `logs` table, resolved against `Signal::Logs`.
+    Logs,
+}
+
+impl TargetSignal {
+    fn signal(self) -> Signal {
+        match self {
+            TargetSignal::Metrics => Signal::Metrics,
+            TargetSignal::Logs => Signal::Logs,
+        }
+    }
+}
 
 /// One SQL request, fully resolved from its transport.
 #[derive(Debug, Clone)]
@@ -128,6 +155,9 @@ pub struct SqlOutcome {
 pub struct SqlExecutor {
     catalog: Arc<Catalog>,
     fetcher: SegmentFetcher,
+    /// The RLOG/logs sibling of `fetcher` (ADR-0033). Used only when a query
+    /// targets the `logs` table; a metrics-only query never touches it.
+    log_fetcher: LogSegmentFetcher,
     config: SqlConfig,
     max_tenant_bytes: usize,
     /// Per-tenant byte accountants, created on first use and shared across
@@ -145,12 +175,14 @@ impl SqlExecutor {
     pub fn new(
         catalog: Arc<Catalog>,
         fetcher: SegmentFetcher,
+        log_fetcher: LogSegmentFetcher,
         config: SqlConfig,
         max_tenant_bytes: usize,
     ) -> Self {
         SqlExecutor {
             catalog,
             fetcher,
+            log_fetcher,
             config,
             max_tenant_bytes,
             tenants: Mutex::new(HashMap::new()),
@@ -267,14 +299,24 @@ impl SqlExecutor {
         sql: &str,
     ) -> Result<PinnedQuery, SqlError> {
         let (pool, breach) = self.config.query_pool(self.tenant_budget(tenant_hash));
-        let provider = Arc::new(RavelTableProvider::new(
-            snapshot,
-            tenant_hash,
-            self.fetcher.clone(),
-            self.config,
-        ));
+        // Build the one table the query targets over the snapshot resolved for
+        // its signal. `resolve` already resolved `snapshot` against exactly
+        // this signal, so the provider and the snapshot always agree.
+        let table = match Self::target_signal(sql)? {
+            TargetSignal::Metrics => SessionTable::Metrics(Arc::new(RavelTableProvider::new(
+                snapshot,
+                tenant_hash,
+                self.fetcher.clone(),
+                self.config,
+            ))),
+            TargetSignal::Logs => SessionTable::Logs(Arc::new(LogsTableProvider::new(
+                snapshot,
+                self.log_fetcher.clone(),
+                self.config,
+            ))),
+        };
 
-        let ctx = build_session(&self.config, pool, provider).map_err(plan_error)?;
+        let ctx = build_session(&self.config, pool, table).map_err(plan_error)?;
         let frame = ctx.sql(sql).await.map_err(plan_error)?;
         let schema = frame.schema().inner().clone();
         Ok(PinnedQuery {
@@ -285,17 +327,20 @@ impl SqlExecutor {
         })
     }
 
-    /// One `Catalog::resolve` plus the `max_segments` budget check.
+    /// One `Catalog::resolve` plus the `max_segments` budget check. Resolves
+    /// the signal the query's `FROM` clause targets ([`Self::target_signal`]),
+    /// so a metrics-only query never lists the logs keyspace and vice versa.
     async fn resolve(
         &self,
         tenant_hash: TenantHash,
         req: &SqlRequest,
     ) -> Result<Snapshot, SqlError> {
+        let signal = Self::target_signal(&req.sql)?.signal();
         let snapshot = self
             .catalog
             .resolve(
                 &tenant_hash,
-                Signal::Metrics,
+                signal,
                 req.window,
                 &req.min_tokens,
                 req.now_ns,
@@ -308,6 +353,37 @@ impl SqlExecutor {
             });
         }
         Ok(snapshot)
+    }
+
+    /// The table (and thus the signal) a query resolves against, decided from
+    /// its `FROM` clause before any planning (ADR-0033 "one SQL endpoint, two
+    /// tables").
+    ///
+    /// The referenced table names come from the same `DFParser` front end the
+    /// validation gate uses ([`referenced_base_tables`]), never a raw-text
+    /// scan. The mapping:
+    ///
+    /// - references `logs` (and not `samples`) -> [`TargetSignal::Logs`].
+    /// - references `samples`, or references neither table ->
+    ///   [`TargetSignal::Metrics`].
+    /// - references both -> [`SqlError::CrossSignalQuery`], rejected before the
+    ///   catalog LIST (decision C: v1 admits one signal per query).
+    ///
+    /// The "neither" case (a constant query such as `SELECT 1`, or one whose
+    /// only source is a CTE with no base table) defaults to `Metrics`: it
+    /// preserves the pre-ADR-0033 behavior exactly -- such a query resolved a
+    /// metrics snapshot and never touched it -- and `crate::validate` already
+    /// rules out anything that would need a data source it cannot reach. Only
+    /// the both-tables case is genuinely unsupported, so only it is an error.
+    fn target_signal(sql: &str) -> Result<TargetSignal, SqlError> {
+        let tables = referenced_base_tables(sql)?;
+        let has_samples = tables.contains(SAMPLES_TABLE);
+        let has_logs = tables.contains(LOGS_TABLE);
+        match (has_samples, has_logs) {
+            (true, true) => Err(SqlError::CrossSignalQuery),
+            (_, true) => Ok(TargetSignal::Logs),
+            (_, false) => Ok(TargetSignal::Metrics),
+        }
     }
 
     /// Build a session over `snapshot`, plan, and drain the stream.
@@ -721,6 +797,38 @@ mod tests {
         // attempt. Never a retry, because the plan already handed rows out.
         assert_eq!(retry_decision(true, 1, 0), RetryDecision::FailInvalidated);
         assert_eq!(retry_decision(true, 7, 1), RetryDecision::FailInvalidated);
+    }
+
+    #[test]
+    fn target_signal_maps_the_from_clause_to_a_signal() {
+        // samples -> metrics; logs -> logs.
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT ts FROM samples").expect("ok"),
+            TargetSignal::Metrics
+        );
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT ts FROM logs").expect("ok"),
+            TargetSignal::Logs
+        );
+        // A tableless constant query defaults to metrics, matching the
+        // pre-ADR-0033 behavior (it resolved a metrics snapshot it never read).
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT 1").expect("ok"),
+            TargetSignal::Metrics
+        );
+        // A string literal naming the other table does not change the signal.
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT body FROM logs WHERE body = 'samples'").expect("ok"),
+            TargetSignal::Logs
+        );
+    }
+
+    #[test]
+    fn target_signal_rejects_a_query_touching_both_tables() {
+        let err =
+            SqlExecutor::target_signal("SELECT * FROM samples JOIN logs ON samples.ts = logs.ts")
+                .expect_err("both tables rejected");
+        assert!(matches!(err, SqlError::CrossSignalQuery));
     }
 
     #[test]

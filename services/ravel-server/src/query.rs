@@ -57,15 +57,19 @@ pub fn build_sql_state(
     shard_count: u32,
     tenant_resolver: Arc<dyn TenantResolver>,
 ) -> anyhow::Result<crate::sql::SqlState> {
-    use ravel_query::SegmentFetcher;
+    use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SqlConfig, SqlExecutor};
 
     let catalog = build_catalog(store.clone(), shard_count)?;
     let config = SqlConfig::default();
     let max_deadline = config.engine.deadline;
+    // The metrics fetcher (RSEG) and the logs fetcher (RLOG) both read the
+    // same object store; the executor uses whichever the query's target table
+    // needs (ADR-0033).
     let executor = SqlExecutor::new(
         catalog,
-        SegmentFetcher::new(store),
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store),
         config,
         DEFAULT_MAX_TENANT_BYTES,
     );
