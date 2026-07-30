@@ -7,6 +7,7 @@ pub mod config;
 pub mod flight;
 pub mod flight_auth;
 pub mod fold;
+pub mod health;
 pub mod ingest;
 pub mod logs_ingest;
 pub mod maintain;
@@ -206,7 +207,14 @@ pub async fn start(
         None
     };
 
-    let mut http_router = Router::new();
+    // Liveness/readiness routes are served in every mode, including
+    // maintain (whose router is otherwise empty). `readiness` starts false
+    // and is latched to true below, once both listeners are bound and the
+    // capability gate (enforced in `store::build_store` before `start` is
+    // called) has already passed. Merged like every other mode's routes, so
+    // `/healthz` truly reflects "the axum server task can route requests".
+    let readiness = health::Readiness::new();
+    let mut http_router = Router::new().merge(health::router(readiness.clone()));
     if let (Some(router), Some(log_router)) = (&ingest_router, &log_ingest_router) {
         let state = gateway_state(router, log_router, config.tenant_resolver.clone());
         http_router = http_router.merge(otlp_http::router(state));
@@ -337,6 +345,15 @@ pub async fn start(
     } else {
         (None, None, None)
     };
+
+    // Startup is complete: config was parsed and the capability gate passed
+    // before `start` was entered (see `store::build_store`), and both
+    // listeners this mode binds are now bound (HTTP above; gRPC just above
+    // when the mode serves it). This is the earliest point where every
+    // condition in ADR-0034's readiness definition holds, so latch readiness
+    // here rather than earlier (which would advertise a half-bound process)
+    // or on first request (which would never flip under low traffic).
+    readiness.mark_ready();
 
     Ok(Running {
         http_addr,

@@ -1,0 +1,31 @@
+# Keep the build context to what the builder's COPY actually needs: the
+# workspace manifests, crate/service sources, and the vendored proto/ trees the
+# build.rs protox passes compile. Everything below is either a build artifact,
+# local dev state, or documentation the build never reads.
+
+# Rust build artifacts (rebuilt inside the builder stage).
+target/
+**/*.rs.bk
+*.profraw
+
+# Local dev / test state.
+minio-data/
+.cache/
+.superpowers/
+node_modules/
+.DS_Store
+
+# Version control and CI metadata.
+.git/
+.github/
+.gitignore
+
+# Benchmark outputs and large reports.
+bench/reports/
+
+# Docs and top-level markdown: not read by any build.rs or by cargo.
+docs/
+*.md
+
+# Editor/OS cruft.
+**/__pycache__/

@@ -2,8 +2,8 @@
 //! every `ObjectStoreBackend` implementation this crate ships: the memory
 //! oracle at its default page size and at a tiny one to force pagination,
 //! `FaultStore` wrapping the oracle with an empty plan (must be fully
-//! transparent), and -- gated on `RAVEL_MINIO_URL` -- `S3Store` against a
-//! real MinIO.
+//! transparent), and -- gated on `RAVEL_MINIO_URL` / `RAVEL_FLOCI_URL` --
+//! `S3Store` against a real MinIO and against a real floci.
 //!
 //! This is an integration-test binary, a crate in its own right, so it
 //! inherits `[lints] workspace = true` (including `clippy::expect_used`
@@ -16,17 +16,22 @@ use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::path::Path as OsPath;
+use object_store::{MultipartUpload, ObjectStoreExt, PutPayload};
 use ravel_object_store::fault::{FaultPlan, FaultStore};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_object_store::{
-    GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum, list_all,
+    Capabilities, GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum,
+    list_all,
 };
 
 /// Runs every contract assertion against `store`. Each assertion gets its
 /// own key sub-prefix under `root` so they can share one backend instance
 /// (and, for the MinIO case, one long-lived bucket) without colliding.
 async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
+    assert_satisfies_mandatory_capabilities(store);
     assert_create_if_absent_atomicity(store, &format!("{root}/create-if-absent/")).await;
     assert_cas_version_semantics(store, &format!("{root}/cas/")).await;
     assert_range_and_suffix_reads(store, &format!("{root}/range/")).await;
@@ -34,6 +39,29 @@ async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
     assert_delimited_listing(store, &format!("{root}/delim/")).await;
     assert_idempotent_delete(store, &format!("{root}/delete/")).await;
     assert_upload_checksum_verification(store, &format!("{root}/checksum/")).await;
+}
+
+/// Every backend the suite runs must report at least the capability set
+/// ravel-server's startup gate requires (`Capabilities::mandatory`, checked by
+/// `ravel_server::store::check_capabilities` for every non-maintain mode). A
+/// backend may report more than the mandatory set: `MemoryStore` supports
+/// `upload_checksum` on the wire, `S3Store` cannot (issue #251), and both are
+/// startable. Asserting `satisfies` rather than equality keeps that difference
+/// legal while still failing the moment a backend loses a flag production
+/// needs.
+///
+/// Distinct from [`assert_mandatory_capabilities`] below: this is a cheap,
+/// synchronous check of the backend's static `capabilities()` declaration,
+/// run for every backend the suite exercises. The other function does live
+/// per-flag round trips against a real S3-compatible endpoint and is called
+/// only from the S3/MinIO/floci-specific tests.
+fn assert_satisfies_mandatory_capabilities(store: &dyn ObjectStoreBackend) {
+    let caps = store.capabilities();
+    assert!(
+        caps.satisfies(&Capabilities::mandatory()),
+        "backend must satisfy the mandatory capability set the server gates \
+         startup on, got {caps:?}"
+    );
 }
 
 async fn assert_create_if_absent_atomicity(store: &dyn ObjectStoreBackend, prefix: &str) {
@@ -304,6 +332,276 @@ async fn assert_upload_checksum_verification(store: &dyn ObjectStoreBackend, pre
     );
 }
 
+/// Probes every flag in [`Capabilities::mandatory()`] against a live
+/// endpoint, one assertion per capability name (ADR-0034 decision 8: a
+/// candidate backend either satisfies the mandatory set or the ADR's named
+/// fallback applies, so a failure here has to say *which* capability failed,
+/// not just which suite step tripped).
+///
+/// Deliberate overlap with [`run_contract_suite`]: `create_if_absent`,
+/// `cas_version`, `suffix_range`, and `prefix_list` are each already proven
+/// by a suite assertion, and this re-runs those assertions under their
+/// capability names on their own key sub-prefixes. The duplicated round
+/// trips are a few dozen requests against a local container, and in exchange
+/// a gate failure names the capability the ADR's decision turns on.
+/// `consistent_read` and `consistent_list` are probed directly here because
+/// no suite assertion isolates them.
+async fn assert_mandatory_capabilities(store: &dyn ObjectStoreBackend, prefix: &str) {
+    // consistent_read: read-after-write and read-after-overwrite, with no
+    // sleep and no retry loop. An eventually-consistent backend fails here.
+    let key = format!("{prefix}consistent-read/k");
+    store
+        .put(&key, Bytes::from_static(b"one"), PutOptions::default())
+        .await
+        .expect("put");
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("consistent_read: read-after-write");
+    assert_eq!(
+        &got.data[..],
+        b"one",
+        "consistent_read: a just-written object must be readable immediately"
+    );
+    store
+        .put(&key, Bytes::from_static(b"three"), PutOptions::default())
+        .await
+        .expect("overwrite");
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("consistent_read: read-after-overwrite");
+    assert_eq!(
+        &got.data[..],
+        b"three",
+        "consistent_read: an overwrite must be visible immediately, never a stale body"
+    );
+    assert_eq!(
+        store.head(&key).await.expect("head").size,
+        5,
+        "consistent_read: head must reflect the overwrite immediately"
+    );
+
+    // consistent_list: the listing reflects a creation and a deletion
+    // immediately, which is what the catalog scan depends on.
+    let list_prefix = format!("{prefix}consistent-list/");
+    let listed = format!("{list_prefix}k");
+    store
+        .put(&listed, Bytes::from_static(b"v"), PutOptions::default())
+        .await
+        .expect("put");
+    let keys: Vec<String> = list_all(store, &list_prefix)
+        .await
+        .expect("consistent_list: list after create")
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![listed.clone()],
+        "consistent_list: a just-written key must appear in the listing immediately"
+    );
+    store.delete(&listed).await.expect("delete");
+    let after_delete: Vec<String> = list_all(store, &list_prefix)
+        .await
+        .expect("consistent_list: list after delete")
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
+    assert!(
+        after_delete.is_empty(),
+        "consistent_list: a just-deleted key must be gone from the listing immediately, got {after_delete:?}"
+    );
+
+    // create_if_absent: the atomicity the commit protocol's single-writer
+    // claim rests on (ADR-0002).
+    assert_create_if_absent_atomicity(store, &format!("{prefix}create-if-absent/")).await;
+    // cas_version: If-Match semantics, mapped to PreconditionFailed.
+    assert_cas_version_semantics(store, &format!("{prefix}cas-version/")).await;
+    // suffix_range: the RSEG footer read (docs/segment-format.md).
+    assert_range_and_suffix_reads(store, &format!("{prefix}suffix-range/")).await;
+    // prefix_list: complete, ordered, paginated recursive listing plus the
+    // one-level delimited form the catalog uses.
+    assert_paginated_listing_completeness(store, &format!("{prefix}prefix-list/")).await;
+    assert_delimited_listing(store, &format!("{prefix}prefix-list-delimited/")).await;
+
+    // Declared capabilities must be exactly the mandatory set. `upload_checksum`
+    // is no longer part of `Capabilities::mandatory()` (issue #251: it is a
+    // permanent `object_store` 0.14 client-library limitation, not an
+    // endpoint-specific gap, so requiring it made the only durable backend
+    // unstartable everywhere). `S3Store::capabilities()` is a constant of the
+    // adapter, not a function of the endpoint, so this asserts the same thing
+    // for floci as it would for MinIO or real AWS S3. Written as an exact
+    // equality rather than `satisfies(&mandatory())` so movement in either
+    // direction -- a backend gaining a capability or the adapter losing one --
+    // fails here instead of passing silently.
+    assert_eq!(
+        store.capabilities(),
+        Capabilities::mandatory(),
+        "declared capabilities must be exactly the mandatory set (issue #251)"
+    );
+    // The behavior behind the flag still has to hold: the local CRC32C
+    // pre-flight rejects a mismatch without creating the object.
+    assert_upload_checksum_verification(store, &format!("{prefix}upload-checksum/")).await;
+}
+
+/// Builds the raw `object_store` client the multipart probe needs.
+///
+/// [`ObjectStoreBackend`] has no multipart method (nothing in Ravel writes
+/// multipart objects yet, and `S3Store::capabilities()` reports `multipart:
+/// false`), so the adapter cannot be asked whether the endpoint behind it
+/// supports multipart. The probe drops to the same `object_store` client
+/// `S3Store` wraps, then reads the result back *through* `S3Store` so what
+/// it asserts is bytes Ravel can actually see. This mirrors `S3Store::new`'s
+/// builder configuration field for field; if the two diverge, this probe
+/// stops exercising the real client, so they must stay in sync.
+fn raw_s3_client(config: &S3Config) -> AmazonS3 {
+    let mut builder = AmazonS3Builder::new()
+        .with_bucket_name(&config.bucket)
+        .with_region(&config.region)
+        .with_access_key_id(&config.access_key_id)
+        .with_secret_access_key(&config.secret_access_key)
+        .with_allow_http(config.allow_http)
+        .with_virtual_hosted_style_request(!config.force_path_style);
+    if let Some(endpoint) = &config.endpoint {
+        builder = builder.with_endpoint(endpoint.clone());
+    }
+    builder
+        .build()
+        .expect("raw AmazonS3 client must build from a valid S3Config")
+}
+
+/// S3's minimum size for any part but the last, so the probe drives a real
+/// two-part upload instead of a degenerate single-part one.
+const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+/// Short final part, also the size of the trailing read below.
+const MULTIPART_TAIL_SIZE: usize = 1024;
+
+/// Multipart probe: `Mode::Maintain` requires the `multipart` capability on
+/// top of [`Capabilities::mandatory()`] (services/ravel-server `store.rs`
+/// `required_capabilities`), so a backend that cannot serve
+/// `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` /
+/// `AbortMultipartUpload` cannot carry compaction.
+async fn assert_multipart_upload(config: &S3Config, store: &dyn ObjectStoreBackend, prefix: &str) {
+    let key = format!("{prefix}object");
+    // Position-dependent bytes: parts assembled out of order, a dropped
+    // part, or a duplicated one all change the checksum, which a constant
+    // fill pattern would hide.
+    let payload: Vec<u8> = (0..MULTIPART_PART_SIZE + MULTIPART_TAIL_SIZE)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let expected_crc = crc32c::crc32c(&payload);
+
+    let client = raw_s3_client(config);
+    let mut upload = client
+        .put_multipart(&OsPath::from(key.as_str()))
+        .await
+        .expect("multipart: CreateMultipartUpload must succeed");
+    upload
+        .put_part(PutPayload::from(payload[..MULTIPART_PART_SIZE].to_vec()))
+        .await
+        .expect("multipart: UploadPart 1 (5 MiB, S3's minimum non-final part) must succeed");
+    upload
+        .put_part(PutPayload::from(payload[MULTIPART_PART_SIZE..].to_vec()))
+        .await
+        .expect("multipart: UploadPart 2 (short final part) must succeed");
+    upload
+        .complete()
+        .await
+        .expect("multipart: CompleteMultipartUpload must succeed");
+
+    // Read back through `S3Store`, comparing checksums rather than 5 MiB
+    // buffers so a failure prints a diagnosis instead of megabytes of bytes.
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("multipart: full read of the completed object");
+    assert_eq!(
+        got.total_size,
+        payload.len() as u64,
+        "multipart: completed object must report the summed part length"
+    );
+    assert_eq!(
+        got.data.len(),
+        payload.len(),
+        "multipart: full read must return every byte of every part"
+    );
+    assert_eq!(
+        crc32c::crc32c(&got.data),
+        expected_crc,
+        "multipart: parts must reassemble in order, with no gap and no duplication"
+    );
+    assert_eq!(
+        store.head(&key).await.expect("multipart: head").size,
+        payload.len() as u64,
+        "multipart: head must report the assembled size"
+    );
+
+    // Proof the server really took the multipart path rather than collapsing
+    // the upload into one PUT: S3 gives a multipart object the composite
+    // `"<digest>-<partcount>"` ETag form, and the count must be the two parts
+    // sent above. Without this, a backend that quietly buffered both parts
+    // and wrote a single object would satisfy every byte-level assertion
+    // here while implementing none of the multipart API compaction needs.
+    let etag = got.etag.0.trim_matches('"').to_string();
+    assert!(
+        etag.ends_with("-2"),
+        "multipart: completed object must carry the composite 2-part ETag \
+         proving the parts were uploaded separately, got {etag:?}"
+    );
+
+    // The read shape Ravel actually uses against large segments: a footer
+    // suffix read of a multipart-written object.
+    let suffix = store
+        .get(&key, GetRange::Suffix(MULTIPART_TAIL_SIZE as u64))
+        .await
+        .expect("multipart: suffix read");
+    assert_eq!(
+        &suffix.data[..],
+        &payload[MULTIPART_PART_SIZE..],
+        "multipart: suffix read must return the tail of the assembled object"
+    );
+
+    // A range straddling the part boundary: proves the parts were joined,
+    // not merely stored side by side.
+    let straddle = store
+        .get(
+            &key,
+            GetRange::Range(
+                MULTIPART_PART_SIZE as u64 - 4,
+                MULTIPART_PART_SIZE as u64 + 4,
+            ),
+        )
+        .await
+        .expect("multipart: range read straddling the part boundary");
+    assert_eq!(
+        &straddle.data[..],
+        &payload[MULTIPART_PART_SIZE - 4..MULTIPART_PART_SIZE + 4],
+        "multipart: a range spanning two parts must be contiguous"
+    );
+
+    // Abort must leave nothing readable. Compaction's crash story assumes an
+    // interrupted upload never becomes a visible object (ADR-0034 decision
+    // 3: orphaned uploads degrade to wasted work, not to corrupt state).
+    let aborted_key = format!("{prefix}aborted");
+    let mut aborted = client
+        .put_multipart(&OsPath::from(aborted_key.as_str()))
+        .await
+        .expect("multipart: CreateMultipartUpload for the abort probe");
+    aborted
+        .put_part(PutPayload::from(vec![7u8; MULTIPART_TAIL_SIZE]))
+        .await
+        .expect("multipart: UploadPart for the abort probe");
+    aborted
+        .abort()
+        .await
+        .expect("multipart: AbortMultipartUpload must succeed");
+    assert!(
+        matches!(store.head(&aborted_key).await, Err(StoreError::NotFound)),
+        "multipart: an aborted upload must not be visible as an object"
+    );
+}
+
 #[tokio::test]
 async fn memory_store_contract() {
     let store = MemoryStore::new();
@@ -327,11 +625,15 @@ async fn fault_store_empty_plan_contract() {
 /// caller-supplied CRC32C to an outgoing `put` (its only integrity knob,
 /// `AmazonS3Builder::with_checksum_algorithm`, is a whole-client setting
 /// limited to SHA-256/CRC64NVME, and always has the crate compute the
-/// digest itself). So `S3Store` must report `upload_checksum` as
-/// unsupported rather than claim a mandatory capability
-/// (docs/object-store-contract.md "Mandatory capabilities") it cannot honor
-/// on the wire; production startup must fail loudly on this, per the
-/// contract, rather than trust integrity this adapter does not provide.
+/// digest itself). So `S3Store` must report `upload_checksum` as unsupported
+/// rather than claim on-the-wire integrity it cannot honor.
+///
+/// Because that gap is permanent and applies to every S3-compatible endpoint,
+/// `upload_checksum` is not startup-gating: it is not in
+/// `Capabilities::mandatory()` and no mode may require it
+/// (docs/object-store-contract.md, "Upload checksums"; issue #251). This test
+/// therefore also pins `S3Store`'s reported set to exactly the mandatory set,
+/// so the server's startup gate cannot start rejecting `--store s3` again.
 /// No `RAVEL_MINIO_URL` gate needed: `AmazonS3Builder::build` only
 /// validates configuration, it never talks to the network.
 #[test]
@@ -349,6 +651,12 @@ fn s3_store_reports_upload_checksum_unsupported() {
     assert!(
         !store.capabilities().upload_checksum,
         "S3Store must not claim upload_checksum support object_store 0.14 cannot provide"
+    );
+    assert_eq!(
+        store.capabilities(),
+        Capabilities::mandatory(),
+        "S3Store must report exactly the mandatory set, so the server's \
+         startup gate accepts --store s3 in every non-maintain mode (#251)"
     );
 }
 
@@ -400,6 +708,74 @@ async fn minio_contract() {
     let root = format!("contract-{run_id}");
 
     run_contract_suite(&store, &root).await;
+
+    let leftovers = list_all(&store, &format!("{root}/"))
+        .await
+        .expect("list_all for cleanup");
+    for meta in leftovers {
+        let _ = store.delete(&meta.key).await;
+    }
+}
+
+/// Real floci conformance test: the capability gate ADR-0034 decision 8 makes
+/// the first task of the k8s epic. floci is a LocalStack-class S3 emulator
+/// (single native-binary container, S3 on port 4566, path-style addressing),
+/// proposed as the fake backend for the kind development environment and the
+/// k8s CI lane. Whether its S3 implements Ravel's mandatory capability set
+/// and multipart is the open question this test answers; the ADR's fallback
+/// if it does not is MinIO, which is already proven in this repo's CI.
+///
+/// Gated on `RAVEL_FLOCI_URL` exactly like [`minio_contract`], so the suite
+/// skips cleanly wherever no floci is reachable. Optional overrides:
+/// `RAVEL_FLOCI_BUCKET` (must already exist -- this crate does not create
+/// buckets), `RAVEL_FLOCI_ACCESS_KEY`, `RAVEL_FLOCI_SECRET_KEY`,
+/// `RAVEL_FLOCI_REGION`. The credential defaults are floci's documented
+/// dummy values; it accepts any credentials.
+///
+/// Beyond the shared suite this runs [`assert_mandatory_capabilities`] and
+/// [`assert_multipart_upload`], the two probes that decide the ADR's
+/// question: every mode enforces `Capabilities::mandatory()` at startup and
+/// `Mode::Maintain` additionally enforces `multipart`.
+#[tokio::test]
+async fn floci_contract() {
+    let Ok(url) = env::var("RAVEL_FLOCI_URL") else {
+        println!("skipping floci contract test: RAVEL_FLOCI_URL not set");
+        return;
+    };
+    let bucket =
+        env::var("RAVEL_FLOCI_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
+    let access_key_id = env::var("RAVEL_FLOCI_ACCESS_KEY").unwrap_or_else(|_| "test".to_string());
+    let secret_access_key =
+        env::var("RAVEL_FLOCI_SECRET_KEY").unwrap_or_else(|_| "test".to_string());
+    let region = env::var("RAVEL_FLOCI_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let allow_http = url.starts_with("http://");
+
+    // `force_path_style: true` matches what `ravel-server` hardcodes and what
+    // floci addresses natively; its virtual-hosted form needs a
+    // `localhost.floci.io` DNS name Ravel never configures.
+    let config = S3Config {
+        bucket,
+        region,
+        endpoint: Some(url),
+        access_key_id,
+        secret_access_key,
+        allow_http,
+        force_path_style: true,
+    };
+    // A small page size, as in `minio_contract`, so the pagination assertion
+    // exercises `list_with_offset` continuation against the real bucket.
+    let store = S3Store::with_page_size(config.clone(), 2)
+        .expect("S3Store::with_page_size must succeed with a valid config");
+
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after the epoch")
+        .as_nanos();
+    let root = format!("contract-floci-{run_id}");
+
+    run_contract_suite(&store, &root).await;
+    assert_mandatory_capabilities(&store, &format!("{root}/mandatory/")).await;
+    assert_multipart_upload(&config, &store, &format!("{root}/multipart/")).await;
 
     let leftovers = list_all(&store, &format!("{root}/"))
         .await

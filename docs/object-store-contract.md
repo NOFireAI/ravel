@@ -70,6 +70,8 @@ alerts differently (misconfigured credentials or prefix policy).
 
 ## Mandatory capabilities (production)
 
+Every mode requires these; production startup fails if any is false.
+
 | Capability | Flag | Used by |
 |---|---|---|
 | Strongly consistent create + read-after-write | consistent_read | commit visibility |
@@ -77,23 +79,64 @@ alerts differently (misconfigured credentials or prefix policy).
 | `CreateIfAbsent` conditional put | create_if_absent | commit records, data objects |
 | Version CAS put | cas_version | catalog HEAD pointers |
 | Byte-range + suffix reads | suffix_range | footer-first segment reads |
-| Object checksums on upload | upload_checksum | L0 integrity |
 | Paginated prefix listing | prefix_list | discovery, GC |
-| Multipart upload | multipart | large L1/L2 segments (Phase 2) |
 
-Each row is a `Capabilities` flag; production startup fails if a mandatory
-flag is false (multipart becomes mandatory in Phase 2). Optional: batch
-delete, lifecycle expiration, SSE/KMS headers.
+Each row is a `Capabilities` flag, and the set is exactly
+`Capabilities::mandatory()`; `ravel_server::store::check_capabilities`
+enforces it before the backend is used. Optional: batch delete, lifecycle
+expiration, SSE/KMS headers.
+
+### Mode-conditional capabilities
+
+| Capability | Flag | Required by |
+|---|---|---|
+| Multipart upload | multipart | `--mode maintain` only (large L1/L2 segments) |
+
+Compaction is the only path that writes multipart objects, so `multipart` is
+required for maintain mode and for no other mode. It is not in
+`Capabilities::mandatory()`; `required_capabilities(Mode::Maintain)` adds it.
+
+### Upload checksums (best effort, never startup-gating)
+
+`upload_checksum` is a `Capabilities` flag, but it is NOT mandatory and no
+mode may require it. `PutOptions::checksum` is honored on a best-effort
+basis: backends that can put a caller-supplied CRC32C on the wire do, and
+those that cannot report `upload_checksum: false` and are still startable.
+
+This is a limitation of Ravel's S3 client library, not a gap in any
+particular server. `object_store` 0.14's `AmazonS3` client exposes no
+per-request checksum hook and no way to attach a caller-supplied precomputed
+digest to an outgoing request (its only knob,
+`AmazonS3Builder::with_checksum_algorithm`, is whole-client, SHA-256 or
+CRC64NVME only, and always computes the digest itself). So `S3Store` reports
+`upload_checksum: false` against every S3-compatible endpoint, MinIO and AWS
+S3 included, regardless of what those servers support. Requiring the flag at
+startup therefore made the only durable backend permanently unusable in
+every mode rather than catching a real regression (issue #251).
+
+What still holds with the flag false:
+
+- `put()` runs the CRC32C as a local pre-flight against its input buffer on
+  every backend, rejecting a caller/payload mismatch with `Corrupted` before
+  any network call. The contract suite asserts this
+  (`assert_upload_checksum_verification`).
+- Read-time integrity is the real backstop against corrupted bytes
+  surviving: the footer/section/page crc32c hierarchy
+  (docs/segment-format.md) verifies data on every read of format-bearing
+  bytes, independent of whether a wire-level upload checksum existed.
 
 Upload checksums are CRC32C-class integrity checks against transport
 corruption; they do not verify blake3. blake3 in commit records is an
-idempotency and identity discriminator; read-time integrity comes from the
-footer/section/page crc32c hierarchy (docs/segment-format.md).
+idempotency and identity discriminator, not a transport check.
+
+### Backend support notes
 
 AWS S3 since Dec 2020 provides strong read-after-write and list
 consistency; S3 conditional writes (If-None-Match/If-Match) provide
 CreateIfAbsent and CAS. GCS: generation preconditions. Azure: etags +
-leases. MinIO: full support.
+leases. MinIO supports the full mandatory set; like AWS S3, its
+server-side upload checksums are unreachable through `object_store`'s
+client, which is why `S3Store` reports `upload_checksum: false` for both.
 
 ## Implementations
 
