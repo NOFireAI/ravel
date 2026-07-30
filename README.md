@@ -31,7 +31,18 @@ What exists today:
 - Object-native commit: every flush produces one immutable segment object and
   one immutable commit record, both content-addressed.
 - A catalog that resolves a consistent snapshot of segments per query via
-  listing (no compaction yet).
+  listing.
+- L0-to-L1 compaction, age-based retention, and a garbage-collecting sweeper
+  (orphan GC, superseded-input sweep, unreferenced-part cleanup), signal-
+  generic across metrics and logs. Runs continuously via `ravel-server
+  --mode maintain`, or one-shot via `ravel-cli maintain
+  compact-bucket|sweep|status|audit-versions`. See
+  [docs/compaction-retention-plan.md](docs/compaction-retention-plan.md),
+  [ADR-0018](docs/adrs/0018-l0-l1-compaction.md),
+  [ADR-0019](docs/adrs/0019-age-based-retention.md). The continuous
+  background loop needs a multipart-capable object store backend, which
+  no shipped backend implements yet (issue #243); one-shot compaction/sweep
+  via `ravel-cli` work today regardless.
 - PromQL: vector/matrix selectors (all matcher types, `offset`, `@`, 5m
   lookback), binary operators, and most of the function library (`rate`,
   `histogram_quantile`, the `*_over_time` family, label and math functions)
@@ -57,10 +68,7 @@ What is planned, not built:
   exemplars.
 - PromQL aggregation operators and subqueries, with a differential test
   suite against Prometheus for everything the evaluator does support.
-- L0-to-L1 compaction, exact rollups, retention, and deletion GC. Today,
-  orphaned L0 objects (data written but never committed) are the only thing
-  garbage collected, and that collector is a documented design, not shipped
-  code yet.
+- Exact rollups (a second, aggregated level beyond L0/L1).
 - Catalog snapshots (an index object instead of per-query listing), needed
   before listing-based discovery runs out of headroom.
 - OTAP (OpenTelemetry Arrow) ingest, scaffolded but not wired into the
