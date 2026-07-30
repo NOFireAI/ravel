@@ -267,6 +267,19 @@ pub(crate) fn forced_monotonicity_info() -> String {
         .to_string()
 }
 
+/// Prometheus' `PossibleNonCounterInfo` message: `rate()`/`increase()` are
+/// meant for counters, and Prometheus' counter-naming convention names one
+/// with a `_total`, `_sum`, `_count`, or `_bucket` suffix. A name with none
+/// of those probably was not meant to be used this way. An info, not a
+/// warning: the computed value is unaffected, this only flags a likely
+/// naming/usage mismatch (issue #234).
+pub(crate) fn possible_non_counter_info(metric_name: &str) -> String {
+    format!(
+        "metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \
+         {metric_name:?}"
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -1651,6 +1664,173 @@ mod tests {
             1,
             "the per-step warning is de-duplicated to one: {:?}",
             annotations.warnings()
+        );
+    }
+
+    #[test]
+    fn rate_over_a_non_counter_named_metric_surfaces_an_info() {
+        // issue #234: `http_requests` has none of the counter-naming
+        // suffixes (`_total`/`_sum`/`_count`/`_bucket`), so `rate()` over it
+        // should raise `PossibleNonCounterInfo` even though the computed
+        // value is correct.
+        // Both samples fall strictly inside the window (0, 5m] (its start is
+        // exclusive), so `rate()` computes a value and the check runs.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "http_requests")],
+                &[
+                    (minutes(1) * NS_PER_MS, 1.0),
+                    (minutes(4) * NS_PER_MS, 61.0),
+                ],
+            )
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "rate(http_requests[5m])", minutes(5))
+            .expect("evaluates");
+        assert!(
+            annotations.warnings().is_empty(),
+            "not a counter is an info, not a warning: {:?}",
+            annotations.warnings()
+        );
+        assert_eq!(annotations.infos().len(), 1, "one non-counter-name info");
+        assert!(
+            annotations.infos()[0].contains("might not be a counter"),
+            "info names the non-counter-suffixed metric: {:?}",
+            annotations.infos()
+        );
+    }
+
+    #[test]
+    fn increase_over_a_non_counter_named_metric_surfaces_an_info() {
+        // Same check as `rate()`, since both are counter-oriented.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "http_requests")],
+                &[
+                    (minutes(1) * NS_PER_MS, 1.0),
+                    (minutes(4) * NS_PER_MS, 61.0),
+                ],
+            )
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "increase(http_requests[5m])", minutes(5))
+            .expect("evaluates");
+        assert_eq!(annotations.infos().len(), 1, "one non-counter-name info");
+    }
+
+    #[test]
+    fn rate_over_a_counter_named_metric_surfaces_no_info() {
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "http_requests_total")],
+                &[
+                    (minutes(1) * NS_PER_MS, 1.0),
+                    (minutes(4) * NS_PER_MS, 61.0),
+                ],
+            )
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "rate(http_requests_total[5m])", minutes(5))
+            .expect("evaluates");
+        assert!(
+            annotations.is_empty(),
+            "a _total-suffixed name needs no info: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn rate_over_a_single_sample_window_surfaces_no_info() {
+        // Only one sample falls in the window: `rate()` produces no value
+        // (fewer than two samples), and Prometheus' own check sits after
+        // that early return, so no info either, despite the non-counter name.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "http_requests")], &[(0, 1.0)])
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "rate(http_requests[5m])", minutes(5))
+            .expect("evaluates");
+        assert!(
+            annotations.is_empty(),
+            "no computed value means no info: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn delta_never_surfaces_the_non_counter_info() {
+        // `delta()` targets gauges; Prometheus has no counter-naming check
+        // for it at all, unlike `rate()`/`increase()`.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "http_requests")],
+                &[
+                    (minutes(1) * NS_PER_MS, 1.0),
+                    (minutes(4) * NS_PER_MS, 61.0),
+                ],
+            )
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "delta(http_requests[5m])", minutes(5))
+            .expect("evaluates");
+        assert!(
+            annotations.is_empty(),
+            "delta() never raises the non-counter info: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn rate_over_a_label_matcher_only_selector_surfaces_no_info() {
+        // `{job="x"}` has no literal selector name for the check to inspect
+        // (see `maybe_info_non_counter_selector_name`'s doc comment): the
+        // fix's scope is the selector's own literal name, not each matched
+        // series' `__name__` label.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "http_requests"), ("job", "x")],
+                &[
+                    (minutes(1) * NS_PER_MS, 1.0),
+                    (minutes(4) * NS_PER_MS, 61.0),
+                ],
+            )
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "rate({job=\"x\"}[5m])", minutes(5))
+            .expect("evaluates");
+        assert!(
+            annotations.is_empty(),
+            "a name-less selector has nothing to check: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn range_query_dedupes_the_non_counter_info_per_step() {
+        // Two samples per 5m step window (the window is left-open: `(t-5m,
+        // t]`), so both grid steps (5m, 10m) independently produce a rate
+        // and raise the identical info text.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "http_requests")],
+                &[
+                    (minutes(1) * NS_PER_MS, 1.0),
+                    (minutes(4) * NS_PER_MS, 2.0),
+                    (minutes(6) * NS_PER_MS, 3.0),
+                    (minutes(9) * NS_PER_MS, 4.0),
+                ],
+            )
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_range_annotated(
+                &source,
+                "rate(http_requests[5m])",
+                minutes(5),
+                minutes(10),
+                minutes(5),
+            )
+            .expect("evaluates");
+        assert_eq!(
+            annotations.infos().len(),
+            1,
+            "the per-step info is de-duplicated to one: {:?}",
+            annotations.infos()
         );
     }
 
