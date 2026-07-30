@@ -447,6 +447,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
             enabled: false,
             fold_interval: Duration::from_secs(60),
         },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
     };
     let running = ravel_server::start(config, store).await.expect("starts");
     let grpc_addr = running
