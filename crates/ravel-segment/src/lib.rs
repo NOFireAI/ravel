@@ -18,7 +18,7 @@ mod varint;
 mod writer;
 
 pub use error::{SegmentError, WriteError};
-pub use format::{ReaderLimits, V5_SPARSE_THRESHOLD, V5_STRIDE};
+pub use format::{ReaderLimits, V5_SPARSE_THRESHOLD, V5_STRIDE, VERSION_V5};
 
 pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};

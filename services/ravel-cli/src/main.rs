@@ -1,7 +1,8 @@
 //! ravel-cli: inspect segments, decode commit records, list catalog entries.
 
 use clap::{Parser, Subcommand};
-use ravel_cli::{catalog, now_ns, store};
+use ravel_cli::maintain::SignalArg;
+use ravel_cli::{catalog, maintain, now_ns, store};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, kind};
@@ -66,6 +67,12 @@ enum Command {
         #[command(subcommand)]
         command: CatalogCommand,
     },
+    /// Run and inspect maintenance: compaction, sweep, retention, version audit
+    /// (docs/compaction-retention-plan.md P8).
+    Maintain {
+        #[command(subcommand)]
+        command: MaintainCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -89,6 +96,64 @@ enum CommitCommand {
     Decode {
         /// Local file path or object store key.
         key: String,
+    },
+    /// Decode and print a CompactionRecord (proto).
+    DecodeCompaction {
+        /// Local file path or object store key.
+        key: String,
+    },
+    /// Decode and print a RetentionTombstone (proto).
+    DecodeTombstone {
+        /// Local file path or object store key.
+        key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintainCommand {
+    /// Run one compaction pass over a single sealed bucket.
+    CompactBucket {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        #[arg(long)]
+        shard: u32,
+        #[arg(long)]
+        hour: u32,
+        /// Compute the plan and report it, but write no L1 parts or record.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard.
+    Sweep {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        #[arg(long)]
+        shard: u32,
+        /// Compute the eligible set and report it, but delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Report a bucket's maintenance state (read-only; no --dry-run needed).
+    Status {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        #[arg(long)]
+        shard: u32,
+        #[arg(long)]
+        hour: u32,
+    },
+    /// Audit live on-object format versions for a tenant (both signals).
+    AuditVersions {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
     },
 }
 
@@ -145,6 +210,18 @@ async fn main() -> anyhow::Result<()> {
             let bytes = store::read_bytes(&cli.store, &key).await?;
             commit_decode(&bytes)
         }
+        Command::Commit {
+            command: CommitCommand::DecodeCompaction { key },
+        } => {
+            let bytes = store::read_bytes(&cli.store, &key).await?;
+            maintain::decode_compaction_record(&bytes)
+        }
+        Command::Commit {
+            command: CommitCommand::DecodeTombstone { key },
+        } => {
+            let bytes = store::read_bytes(&cli.store, &key).await?;
+            maintain::decode_retention_tombstone(&bytes)
+        }
         Command::Catalog {
             command:
                 CatalogCommand::List {
@@ -162,6 +239,65 @@ async fn main() -> anyhow::Result<()> {
         Command::Catalog {
             command: CatalogCommand::Verify { tenant },
         } => catalog::verify(store::build_store(&cli.store)?, &tenant).await,
+        Command::Maintain {
+            command:
+                MaintainCommand::CompactBucket {
+                    tenant,
+                    signal,
+                    shard,
+                    hour,
+                    dry_run,
+                },
+        } => {
+            maintain::compact(
+                store::build_store(&cli.store)?,
+                &tenant,
+                signal,
+                shard,
+                hour,
+                dry_run,
+            )
+            .await
+        }
+        Command::Maintain {
+            command:
+                MaintainCommand::Sweep {
+                    tenant,
+                    signal,
+                    shard,
+                    dry_run,
+                },
+        } => {
+            maintain::sweep(
+                store::build_store(&cli.store)?,
+                &tenant,
+                signal,
+                shard,
+                dry_run,
+            )
+            .await
+        }
+        Command::Maintain {
+            command:
+                MaintainCommand::Status {
+                    tenant,
+                    signal,
+                    shard,
+                    hour,
+                },
+        } => {
+            maintain::status(
+                store::build_store(&cli.store)?,
+                &tenant,
+                signal,
+                shard,
+                hour,
+            )
+            .await
+        }
+        Command::Maintain {
+            command: MaintainCommand::AuditVersions { tenant, shards },
+        } => maintain::audit_versions(store::build_store(&cli.store)?, &tenant, shards).await,
     }
 }
 
@@ -328,6 +464,7 @@ fn segment_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     println!("series_count (footer): {}", footer.series_count);
     println!("base_created_unix_ns: {}", footer.base_created_unix_ns);
     println!("level: {}", footer.level);
+    println!("input_set_hash: {}", hex::encode(&footer.input_set_hash));
     println!("part_index: {}", footer.part_index);
     println!("sections:");
     for section in &footer.sections {
