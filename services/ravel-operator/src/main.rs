@@ -2,8 +2,8 @@
 //!
 //! With `--print-crd` it prints the generated `RavelCluster`
 //! CustomResourceDefinition to stdout and exits, which is how
-//! `deploy/crd.yaml` is regenerated. Otherwise it runs the reconcile
-//! controller against the ambient Kubernetes environment.
+//! `deploy/k8s/operator/crd.yaml` is regenerated. Otherwise it runs the
+//! reconcile controller against the ambient Kubernetes environment.
 
 use std::process::ExitCode;
 
@@ -22,9 +22,10 @@ struct Cli {
     /// Print the RavelCluster CustomResourceDefinition to stdout and exit.
     ///
     /// The output is the CRD serialized as pretty JSON, which is valid YAML
-    /// (JSON is a strict subset), so it can be committed as `deploy/crd.yaml`
-    /// and applied with `kubectl apply -f`. JSON is used rather than a YAML
-    /// serializer to avoid adding a fifth external dependency.
+    /// (JSON is a strict subset), so it can be committed as
+    /// `deploy/k8s/operator/crd.yaml` and applied with `kubectl apply -f`. JSON
+    /// is used rather than a YAML serializer to avoid adding a fifth external
+    /// dependency.
     #[arg(long)]
     print_crd: bool,
 }

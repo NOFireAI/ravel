@@ -45,6 +45,18 @@ pub enum Error {
     #[error("RavelCluster has no namespace")]
     MissingNamespace,
 
+    /// A Secret the spec references does not exist in the namespace. Surfaced
+    /// as a `Degraded` status condition (with the Secret name) before the error
+    /// propagates, so `kubectl wait`/`describe` shows why nothing came up
+    /// rather than just timing out.
+    #[error("secret {name} not found: {reason}")]
+    SecretNotFound {
+        /// The missing Secret's name.
+        name: String,
+        /// Why the operator needed it (which spec field pointed at it).
+        reason: String,
+    },
+
     /// A Kubernetes API call failed.
     #[error("kube API error: {0}")]
     Kube(#[from] kube::Error),
@@ -60,21 +72,41 @@ pub struct Context {
     pub client: Client,
 }
 
-/// Read the tenant names (keys) from the token Secret named by the spec.
+/// What the controller resolves from the token Secret: the tenant names (its
+/// keys) and its `resourceVersion` (fed into the secrets checksum).
+struct TokenSecret {
+    /// Sorted, deduplicated tenant names (the Secret's keys).
+    tenant_names: Vec<String>,
+    /// The Secret's `resourceVersion`, or `None` when no token Secret is
+    /// configured. Bumps whenever the Secret's content changes, so it is a
+    /// cheap change-detection signal for the pod-template checksum.
+    resource_version: Option<String>,
+}
+
+/// Read the tenant names (keys) and `resourceVersion` from the token Secret
+/// named by the spec.
 ///
-/// Returns an empty list when no token Secret is configured. Keys are sorted so
-/// the rendered args and env are deterministic and do not churn the Pod
-/// template on unrelated Secret map reordering.
-async fn resolve_tenant_names(
+/// Returns empties when no token Secret is configured. Keys are sorted so the
+/// rendered args and env are deterministic and do not churn the Pod template on
+/// unrelated Secret map reordering. A missing Secret maps to
+/// [`Error::SecretNotFound`] so the reconcile can surface a `Degraded` status.
+async fn resolve_token_secret(
     client: &Client,
     namespace: &str,
     secret_ref: Option<&LocalSecretRef>,
-) -> Result<Vec<String>, Error> {
+) -> Result<TokenSecret, Error> {
     let Some(secret_ref) = secret_ref else {
-        return Ok(Vec::new());
+        return Ok(TokenSecret {
+            tenant_names: Vec::new(),
+            resource_version: None,
+        });
     };
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let secret = api.get(&secret_ref.name).await?;
+    let secret = api
+        .get(&secret_ref.name)
+        .await
+        .map_err(|err| secret_error(err, &secret_ref.name, "tenantTokensSecretRef"))?;
+    let resource_version = secret.resource_version();
     let mut names: Vec<String> = Vec::new();
     if let Some(data) = secret.data {
         names.extend(data.into_keys());
@@ -84,12 +116,68 @@ async fn resolve_tenant_names(
     }
     names.sort();
     names.dedup();
-    Ok(names)
+    Ok(TokenSecret {
+        tenant_names: names,
+        resource_version,
+    })
 }
 
-/// Server-side-apply a typed object. The object's `apiVersion`/`kind` are
-/// injected from its [`Resource`] impl because `k8s-openapi` types do not
-/// serialize a `TypeMeta`, and server-side apply requires both.
+/// Read a Secret's `resourceVersion` without pulling its values into operator
+/// memory. Used for the credentials Secret, whose keys are fixed
+/// (`accessKeyId`/`secretAccessKey`) so only change-detection is needed.
+async fn secret_resource_version(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    field: &str,
+) -> Result<Option<String>, Error> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret = api
+        .get(name)
+        .await
+        .map_err(|err| secret_error(err, name, field))?;
+    Ok(secret.resource_version())
+}
+
+/// Map a Secret `get` error: a 404 becomes [`Error::SecretNotFound`] naming the
+/// Secret and the spec field that referenced it; anything else stays a
+/// [`Error::Kube`].
+fn secret_error(err: kube::Error, name: &str, field: &str) -> Error {
+    if is_not_found(&err) {
+        Error::SecretNotFound {
+            name: name.to_string(),
+            reason: format!("referenced by spec.{field} but absent from the namespace"),
+        }
+    } else {
+        Error::Kube(err)
+    }
+}
+
+/// A deterministic change-detection checksum over the Secrets the pods depend
+/// on, built from their `resourceVersion`s.
+///
+/// A Secret's `resourceVersion` changes exactly when its content changes and is
+/// stable otherwise, so this value is stable across reconciles that see the
+/// same Secrets (it does not churn pods every reconcile) and changes the moment
+/// a token is rotated or a credential is rewritten. The hash is
+/// `DefaultHasher` (SipHash with fixed keys), which is deterministic across
+/// processes, so an operator restart does not roll pods. It is not a security
+/// boundary, only a signal.
+fn compute_secrets_checksum(token_rv: Option<&str>, credentials_rv: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token_rv.unwrap_or("").hash(&mut hasher);
+    credentials_rv.unwrap_or("").hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Server-side-apply a typed object. The object's `apiVersion`/`kind` are set
+/// explicitly from its [`Resource`] impl as a defensive belt-and-suspenders
+/// measure: server-side apply requires both, and `k8s-openapi` types do in fact
+/// serialize their `TypeMeta`, so this injection writes identical values and is
+/// redundant, not a workaround for a real gap. It is kept so the applied
+/// document is self-describing regardless of the source object's `TypeMeta`
+/// state.
 async fn apply<K>(api: &Api<K>, name: &str, obj: &K) -> Result<K, Error>
 where
     K: Resource<DynamicType = ()> + Serialize + DeserializeOwned + Clone + std::fmt::Debug,
@@ -111,51 +199,106 @@ where
 }
 
 /// Reconcile one `RavelCluster` to its desired Deployments and Services.
+///
+/// Wraps [`reconcile_inner`] so that any failure before the success-path status
+/// write still leaves a visible `Degraded` condition on `.status` (finding 3):
+/// otherwise a missing Secret or an apply error leaves `.status` empty forever
+/// and `kubectl wait --for=condition=Available` just times out with no reason.
+/// The original error is still returned so [`error_policy`]'s retry/backoff is
+/// unchanged.
 async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, Error> {
     let namespace = obj.namespace().ok_or(Error::MissingNamespace)?;
     let instance = obj.name_any();
     let client = &ctx.client;
 
-    let tenant_names = resolve_tenant_names(
+    match reconcile_inner(&obj, client, &namespace, &instance).await {
+        Ok(action) => Ok(action),
+        Err(err) => {
+            let (reason, message) = degraded_reason(&err);
+            // Best-effort: if even the status write fails, log and still return
+            // the original error for retry.
+            if let Err(status_err) = write_degraded_status(
+                client,
+                &namespace,
+                &instance,
+                obj.metadata.generation,
+                &reason,
+                &message,
+            )
+            .await
+            {
+                warn!(%status_err, "failed to write Degraded status after reconcile error");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// The reconcile body proper. Every fallible step here runs before the
+/// success-path [`write_status`]; a failure returns `Err` to [`reconcile`],
+/// which records a `Degraded` status first.
+async fn reconcile_inner(
+    obj: &RavelCluster,
+    client: &Client,
+    namespace: &str,
+    instance: &str,
+) -> Result<Action, Error> {
+    let token_secret = resolve_token_secret(
         client,
-        &namespace,
+        namespace,
         obj.spec.tenant_tokens_secret_ref.as_ref(),
     )
     .await?;
-    let render_ctx = RenderCtx { tenant_names };
+    // The credentials Secret is always referenced; read its resourceVersion so
+    // a credential rotation also rolls pods via the checksum.
+    let credentials_rv = secret_resource_version(
+        client,
+        namespace,
+        &obj.spec.storage.s3.credentials_secret_ref.name,
+        "storage.s3.credentialsSecretRef",
+    )
+    .await?;
+    let secrets_checksum = compute_secrets_checksum(
+        token_secret.resource_version.as_deref(),
+        credentials_rv.as_deref(),
+    );
+    let render_ctx = RenderCtx {
+        tenant_names: token_secret.tenant_names,
+        secrets_checksum,
+    };
 
     let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
 
-    let deployments: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
-    let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
 
     // Gateway.
-    let mut gateway = desired_gateway_deployment(&obj.spec, &instance, &render_ctx);
-    gateway.metadata.namespace = Some(namespace.clone());
+    let mut gateway = desired_gateway_deployment(&obj.spec, instance, &render_ctx);
+    gateway.metadata.namespace = Some(namespace.to_string());
     gateway.metadata.owner_references = owner.clone();
-    let gateway_applied = apply(&deployments, &child(&instance, "gateway"), &gateway).await?;
+    let gateway_applied = apply(&deployments, &child(instance, "gateway"), &gateway).await?;
 
-    let mut gateway_svc = desired_gateway_service(&obj.spec, &instance);
-    gateway_svc.metadata.namespace = Some(namespace.clone());
+    let mut gateway_svc = desired_gateway_service(&obj.spec, instance);
+    gateway_svc.metadata.namespace = Some(namespace.to_string());
     gateway_svc.metadata.owner_references = owner.clone();
-    apply(&services, &child(&instance, "gateway"), &gateway_svc).await?;
+    apply(&services, &child(instance, "gateway"), &gateway_svc).await?;
 
     // Query.
-    let mut query = desired_query_deployment(&obj.spec, &instance, &render_ctx);
-    query.metadata.namespace = Some(namespace.clone());
+    let mut query = desired_query_deployment(&obj.spec, instance, &render_ctx);
+    query.metadata.namespace = Some(namespace.to_string());
     query.metadata.owner_references = owner.clone();
-    let query_applied = apply(&deployments, &child(&instance, "query"), &query).await?;
+    let query_applied = apply(&deployments, &child(instance, "query"), &query).await?;
 
-    let mut query_svc = desired_query_service(&obj.spec, &instance);
-    query_svc.metadata.namespace = Some(namespace.clone());
+    let mut query_svc = desired_query_service(&obj.spec, instance);
+    query_svc.metadata.namespace = Some(namespace.to_string());
     query_svc.metadata.owner_references = owner.clone();
-    apply(&services, &child(&instance, "query"), &query_svc).await?;
+    apply(&services, &child(instance, "query"), &query_svc).await?;
 
     // Maintain: apply when enabled, delete when not.
-    let maintain_name = child(&instance, "maintain");
-    let maintain_ready = match desired_maintain_deployment(&obj.spec, &instance) {
+    let maintain_name = child(instance, "maintain");
+    let maintain_ready = match desired_maintain_deployment(&obj.spec, instance, &render_ctx) {
         Some(mut maintain) => {
-            maintain.metadata.namespace = Some(namespace.clone());
+            maintain.metadata.namespace = Some(namespace.to_string());
             maintain.metadata.owner_references = owner.clone();
             let applied = apply(&deployments, &maintain_name, &maintain).await?;
             ready_replicas(&applied)
@@ -175,8 +318,8 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
 
     write_status(
         client,
-        &namespace,
-        &instance,
+        namespace,
+        instance,
         obj.metadata.generation,
         ready_replicas(&gateway_applied),
         ready_replicas(&query_applied),
@@ -205,6 +348,30 @@ fn child(instance: &str, component: &str) -> String {
     format!("{instance}-{component}")
 }
 
+/// Build a status Condition, stamping the current time as its transition time.
+///
+/// `last_transition_time` is a display-only Kubernetes status field, not
+/// durability/correctness time, so using the system clock directly here is
+/// idiomatic and correct; the injected-clock discipline (no `SystemTime::now`
+/// in library logic) governs storage/query time, not an advisory Condition
+/// timestamp.
+fn condition(
+    r#type: &str,
+    status: bool,
+    observed_generation: Option<i64>,
+    reason: &str,
+    message: &str,
+) -> Condition {
+    Condition {
+        r#type: r#type.to_string(),
+        status: if status { "True" } else { "False" }.to_string(),
+        observed_generation,
+        last_transition_time: Some(now_rfc3339()),
+        reason: reason.to_string(),
+        message: message.to_string(),
+    }
+}
+
 /// Write the status subresource: observed generation, per-mode ready replicas,
 /// and an `Available` condition derived from whether the gateway and query
 /// tiers report ready replicas.
@@ -219,21 +386,22 @@ async fn write_status(
     maintain_ready: Option<i32>,
 ) -> Result<(), Error> {
     let available = gateway_ready.unwrap_or(0) > 0 && query_ready.unwrap_or(0) > 0;
-    let condition = Condition {
-        r#type: "Available".to_string(),
-        status: if available { "True" } else { "False" }.to_string(),
-        observed_generation,
-        last_transition_time: None,
-        reason: if available {
-            "MinimumReplicasAvailable".to_string()
-        } else {
-            "MinimumReplicasUnavailable".to_string()
-        },
-        message: if available {
-            "gateway and query tiers report ready replicas".to_string()
-        } else {
-            "waiting for gateway and query tiers to become ready".to_string()
-        },
+    let condition = if available {
+        condition(
+            "Available",
+            true,
+            observed_generation,
+            "MinimumReplicasAvailable",
+            "gateway and query tiers report ready replicas",
+        )
+    } else {
+        condition(
+            "Available",
+            false,
+            observed_generation,
+            "MinimumReplicasUnavailable",
+            "waiting for gateway and query tiers to become ready",
+        )
     };
     let status = RavelClusterStatus {
         observed_generation,
@@ -242,11 +410,96 @@ async fn write_status(
         maintain_ready_replicas: maintain_ready,
         conditions: vec![condition],
     };
+    patch_status(client, namespace, instance, &status).await
+}
+
+/// Write a `Degraded` status when reconcile failed before the success-path
+/// status write (finding 3), so the failure is visible on `.status` rather than
+/// only in operator logs. Also flips `Available` to `False` with the same
+/// reason so a `kubectl wait --for=condition=Available` fails fast with an
+/// explanation instead of silently timing out.
+async fn write_degraded_status(
+    client: &Client,
+    namespace: &str,
+    instance: &str,
+    observed_generation: Option<i64>,
+    reason: &str,
+    message: &str,
+) -> Result<(), Error> {
+    let status = RavelClusterStatus {
+        observed_generation,
+        gateway_ready_replicas: None,
+        query_ready_replicas: None,
+        maintain_ready_replicas: None,
+        conditions: vec![
+            condition("Degraded", true, observed_generation, reason, message),
+            condition("Available", false, observed_generation, reason, message),
+        ],
+    };
+    patch_status(client, namespace, instance, &status).await
+}
+
+/// Merge-patch the status subresource of `instance`.
+async fn patch_status(
+    client: &Client,
+    namespace: &str,
+    instance: &str,
+    status: &RavelClusterStatus,
+) -> Result<(), Error> {
     let api: Api<RavelCluster> = Api::namespaced(client.clone(), namespace);
     let patch = serde_json::json!({ "status": status });
     api.patch_status(instance, &PatchParams::default(), &Patch::Merge(&patch))
         .await?;
     Ok(())
+}
+
+/// Map a reconcile error to a `(reason, message)` for its `Degraded` condition.
+/// A missing Secret gets a specific `SecretNotFound` reason naming the Secret;
+/// anything else gets a generic `ReconcileError` with the error text.
+fn degraded_reason(err: &Error) -> (String, String) {
+    match err {
+        Error::SecretNotFound { name, reason } => (
+            "SecretNotFound".to_string(),
+            format!("Secret \"{name}\" not found: {reason}"),
+        ),
+        other => ("ReconcileError".to_string(), other.to_string()),
+    }
+}
+
+/// Current UTC time as an RFC3339 string for a status Condition's
+/// `lastTransitionTime`. Uses the system clock directly (see [`condition`]).
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_rfc3339_utc(secs)
+}
+
+/// Format a Unix timestamp (seconds) as an RFC3339 UTC string
+/// (`YYYY-MM-DDThh:mm:ssZ`). Kept dependency-free via Howard Hinnant's
+/// civil-from-days algorithm so no date/time crate enters the operator for one
+/// advisory status field.
+fn format_rfc3339_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60,
+    );
+    // civil_from_days: days since 1970-01-01 -> (year, month, day).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Requeue with a fixed backoff on reconcile failure.
@@ -265,10 +518,16 @@ pub async fn run() -> Result<(), Error> {
     let services: Api<Service> = Api::all(client.clone());
     let context = Arc::new(Context { client });
 
+    // Scope the owned-object watches to this operator's objects only. Without a
+    // label selector, `.owns()` builds a cluster-wide reflector cache of every
+    // Deployment and Service in the cluster; the selector keeps only the ones
+    // this operator manages.
+    let managed = watcher::Config::default().labels("app.kubernetes.io/managed-by=ravel-operator");
+
     info!("starting ravel-operator controller");
     Controller::new(clusters, watcher::Config::default())
-        .owns(deployments, watcher::Config::default())
-        .owns(services, watcher::Config::default())
+        .owns(deployments, managed.clone())
+        .owns(services, managed)
         .run(reconcile, error_policy, context)
         .for_each(|result| async move {
             match result {
@@ -278,4 +537,54 @@ pub async fn run() -> Result<(), Error> {
         })
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_checksum_changes_with_content_and_is_otherwise_stable() {
+        // Stable across reconciles seeing the same resourceVersions: no pod
+        // churn when nothing changed.
+        let a = compute_secrets_checksum(Some("100"), Some("200"));
+        let a_again = compute_secrets_checksum(Some("100"), Some("200"));
+        assert_eq!(a, a_again, "same inputs must yield the same checksum");
+
+        // A token Secret content change (its resourceVersion bumps) changes the
+        // checksum, so pods roll.
+        let token_rotated = compute_secrets_checksum(Some("101"), Some("200"));
+        assert_ne!(a, token_rotated, "token rotation must change the checksum");
+
+        // A credentials Secret content change likewise.
+        let creds_rotated = compute_secrets_checksum(Some("100"), Some("201"));
+        assert_ne!(
+            a, creds_rotated,
+            "credential change must change the checksum"
+        );
+
+        // Absent token Secret is a distinct, stable value.
+        let none = compute_secrets_checksum(None, Some("200"));
+        assert_eq!(none, compute_secrets_checksum(None, Some("200")));
+        assert_ne!(none, a);
+    }
+
+    #[test]
+    fn rfc3339_formats_known_instants() {
+        assert_eq!(format_rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        // 2026-07-30T12:34:56Z (Unix 1785414896).
+        assert_eq!(format_rfc3339_utc(1_785_414_896), "2026-07-30T12:34:56Z");
+    }
+
+    #[test]
+    fn degraded_reason_names_the_missing_secret() {
+        let err = Error::SecretNotFound {
+            name: "ravel-tokens".to_string(),
+            reason: "referenced by spec.tenantTokensSecretRef".to_string(),
+        };
+        let (reason, message) = degraded_reason(&err);
+        assert_eq!(reason, "SecretNotFound");
+        assert!(message.contains("ravel-tokens"), "message names the Secret");
+    }
 }

@@ -35,6 +35,14 @@ const S3_ACCESS_KEY_ID_KEY: &str = "accessKeyId";
 /// Secret key holding the S3 secret access key.
 const S3_SECRET_ACCESS_KEY_KEY: &str = "secretAccessKey";
 
+/// Pod-template annotation carrying a checksum of the Secrets the pod depends
+/// on (credentials and, where applicable, tenant tokens). Changing it changes
+/// the pod template, which makes the Deployment controller roll a new
+/// ReplicaSet, so a Secret value change (e.g. a token rotation or revocation)
+/// takes effect on running pods. The controller computes the value (see
+/// [`crate::controller`]) and threads it in through [`RenderCtx`].
+pub const SECRETS_CHECKSUM_ANNOTATION: &str = "ravel.nofire.ai/secrets-checksum";
+
 /// Inputs the controller resolves from the cluster that are not part of the
 /// CRD spec, threaded into the otherwise-pure render functions.
 ///
@@ -47,6 +55,14 @@ const S3_SECRET_ACCESS_KEY_KEY: &str = "secretAccessKey";
 pub struct RenderCtx {
     /// Tenant names (the token Secret's keys), rendered in the given order.
     pub tenant_names: Vec<String>,
+
+    /// Change-detection checksum over the Secrets the pods depend on
+    /// (credentials and, when configured, tenant tokens). Stamped onto every
+    /// Deployment's pod template as [`SECRETS_CHECKSUM_ANNOTATION`] so a Secret
+    /// value change rolls the pods. Computed by the controller (which reads the
+    /// Secrets); a pure render function must never compute it itself, since
+    /// that would require I/O.
+    pub secrets_checksum: String,
 }
 
 /// Standard object labels for a component of a named `RavelCluster`.
@@ -237,6 +253,7 @@ fn deployment(
     replicas: i32,
     resources_spec: Option<&ResourceRequirementsSpec>,
     strategy_type: &str,
+    secrets_checksum: &str,
 ) -> Deployment {
     let labels = labels(instance, component);
     let (liveness, readiness) = probes();
@@ -273,6 +290,10 @@ fn deployment(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
+                    annotations: Some(BTreeMap::from([(
+                        SECRETS_CHECKSUM_ANNOTATION.to_string(),
+                        secrets_checksum.to_string(),
+                    )])),
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
@@ -339,6 +360,7 @@ pub fn desired_gateway_deployment(
         spec.gateway.replicas,
         spec.gateway.resources.as_ref(),
         "RollingUpdate",
+        &ctx.secrets_checksum,
     )
 }
 
@@ -377,6 +399,7 @@ pub fn desired_query_deployment(
         spec.query.replicas,
         spec.query.resources.as_ref(),
         "RollingUpdate",
+        &ctx.secrets_checksum,
     )
 }
 
@@ -385,10 +408,25 @@ pub fn desired_query_deployment(
 ///
 /// Single replica with the `Recreate` strategy (ADR-0034 decision 3): there is
 /// only ever 0 or 1, so there is no replica field on the spec side. Maintain
-/// serves `--listen-http` for the health probes only and does not need tenant
-/// tokens (it authenticates no requests); retention flags render here because
-/// retention is enforced by this tier.
-pub fn desired_maintain_deployment(spec: &RavelClusterSpec, instance: &str) -> Option<Deployment> {
+/// serves `--listen-http` for the health probes only; retention flags render
+/// here because retention is enforced by this tier.
+///
+/// Maintain DOES get the same `--tenant-token` args and env as gateway and
+/// query, but for a different reason: it authenticates no incoming requests, so
+/// it does not need the tokens for AUTHENTICATION. It needs the tenant LIST.
+/// `ravel-server` derives the set of tenants it compacts, retires, and GCs
+/// entirely from the parsed `--tenant-token` map (`fold_tenants` in
+/// `services/ravel-server/src/main.rs`, also used as maintain's tenant list);
+/// with zero tokens rendered, `maintain::spawn` gets an empty tenant list and
+/// returns `MaintenanceTasks::none()`, so the whole tier is a silent no-op that
+/// still reports `Ready`. Rendering the tokens here is what gives maintain a
+/// non-empty tenant list to act on. The `$(VAR)` expansion keeps the raw token
+/// out of the Pod spec exactly as it does for gateway/query.
+pub fn desired_maintain_deployment(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    ctx: &RenderCtx,
+) -> Option<Deployment> {
     if !spec.maintain.enabled {
         return None;
     }
@@ -399,6 +437,7 @@ pub fn desired_maintain_deployment(spec: &RavelClusterSpec, instance: &str) -> O
         format!("0.0.0.0:{HTTP_PORT}"),
     ];
     args.extend(common_store_args(spec));
+    args.extend(tenant_token_args(spec, ctx));
     if let Some(secs) = spec.maintain.interval_secs {
         args.push("--maintain-interval-secs".to_string());
         args.push(secs.to_string());
@@ -414,7 +453,8 @@ pub fn desired_maintain_deployment(spec: &RavelClusterSpec, instance: &str) -> O
         }
     }
 
-    let env = s3_credential_env(spec);
+    let mut env = s3_credential_env(spec);
+    env.extend(tenant_token_env(spec, ctx));
 
     let ports = vec![ContainerPort {
         name: Some("http".to_string()),
@@ -432,6 +472,7 @@ pub fn desired_maintain_deployment(spec: &RavelClusterSpec, instance: &str) -> O
         1,
         spec.maintain.resources.as_ref(),
         "Recreate",
+        &ctx.secrets_checksum,
     ))
 }
 
@@ -546,6 +587,7 @@ mod tests {
     fn ctx() -> RenderCtx {
         RenderCtx {
             tenant_names: vec!["acme".to_string(), "globex".to_string()],
+            secrets_checksum: "deadbeef".to_string(),
         }
     }
 
@@ -583,12 +625,12 @@ mod tests {
         assert_eq!(arg_value(&args_of(&g), "--shards").as_deref(), Some("8"));
         assert_eq!(arg_value(&args_of(&q), "--shards").as_deref(), Some("8"));
         // And also into maintain, which sweeps every shard.
-        let m = desired_maintain_deployment(&spec, "prod").expect("maintain enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
         assert_eq!(arg_value(&args_of(&m), "--shards").as_deref(), Some("8"));
     }
 
     #[test]
-    fn gateway_renders_mode_listeners_and_store_flags() {
+    fn builds_gateway_deployment_from_spec() {
         let spec = base_spec();
         let g = desired_gateway_deployment(&spec, "prod", &ctx());
         let args = args_of(&g);
@@ -617,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn query_has_no_grpc_listener_or_port() {
+    fn builds_query_deployment_from_spec() {
         let spec = base_spec();
         let q = desired_query_deployment(&spec, "prod", &ctx());
         let args = args_of(&q);
@@ -693,9 +735,9 @@ mod tests {
     }
 
     #[test]
-    fn maintain_uses_recreate_single_replica_and_retention() {
+    fn maintain_deployment_uses_recreate_strategy_and_no_replica_field() {
         let spec = base_spec();
-        let m = desired_maintain_deployment(&spec, "prod").expect("enabled");
+        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("enabled");
         let dspec = m.spec.as_ref().expect("spec");
         assert_eq!(dspec.replicas, Some(1));
         assert_eq!(
@@ -716,15 +758,67 @@ mod tests {
             arg_value(&args, "--retention-tenant").as_deref(),
             Some("acme=7d")
         );
-        // Maintain authenticates nothing, so no tenant tokens.
-        assert!(!args.iter().any(|a| a == "--tenant-token"));
+    }
+
+    #[test]
+    fn maintain_gets_the_tenant_list_from_the_same_tokens_as_gateway_and_query() {
+        // Regression guard: maintain derives its compaction/retention/GC tenant
+        // set from the parsed --tenant-token map (ravel-server's fold_tenants).
+        // Rendering zero tokens made the whole tier a silent no-op that still
+        // reported Ready. Maintain must get the SAME --tenant-token args and
+        // env as gateway and query, using the same RenderCtx tenant list.
+        let spec = base_spec();
+        let ctx = ctx();
+        let m = desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled");
+        let g = desired_gateway_deployment(&spec, "prod", &ctx);
+
+        let margs = args_of(&m);
+        let gargs = args_of(&g);
+        // Same --tenant-token $(VAR)=<tenant> pairs as gateway, in the same order.
+        let tenant_pairs = |args: &[String]| -> Vec<String> {
+            args.iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "--tenant-token")
+                .map(|(i, _)| args[i + 1].clone())
+                .collect()
+        };
+        assert_eq!(
+            tenant_pairs(&margs),
+            vec![
+                "$(RAVEL_TENANT_TOKEN_0)=acme".to_string(),
+                "$(RAVEL_TENANT_TOKEN_1)=globex".to_string(),
+            ],
+            "maintain must render the tenant list or its tasks never spawn"
+        );
+        assert_eq!(tenant_pairs(&margs), tenant_pairs(&gargs));
+
+        // And the token env vars, sourced from the token Secret's per-tenant
+        // keys via secretKeyRef, exactly as gateway gets them.
+        let env = container_of(&m).env.clone().expect("env");
+        let tok0 = env
+            .iter()
+            .find(|e| e.name == "RAVEL_TENANT_TOKEN_0")
+            .expect("token env 0");
+        let sel = tok0
+            .value_from
+            .as_ref()
+            .expect("value_from")
+            .secret_key_ref
+            .as_ref()
+            .expect("secret_key_ref");
+        assert_eq!(sel.name, "ravel-tokens");
+        assert_eq!(sel.key, "acme");
+        assert!(
+            env.iter().all(|e| e.value.is_none()),
+            "no env var may carry a literal token value"
+        );
     }
 
     #[test]
     fn maintain_disabled_yields_none() {
         let mut spec = base_spec();
         spec.maintain.enabled = false;
-        assert!(desired_maintain_deployment(&spec, "prod").is_none());
+        assert!(desired_maintain_deployment(&spec, "prod", &ctx()).is_none());
     }
 
     #[test]
@@ -745,7 +839,7 @@ mod tests {
         for dep in [
             desired_gateway_deployment(&spec, "prod", &ctx()),
             desired_query_deployment(&spec, "prod", &ctx()),
-            desired_maintain_deployment(&spec, "prod").expect("enabled"),
+            desired_maintain_deployment(&spec, "prod", &ctx()).expect("enabled"),
         ] {
             let c = container_of(&dep);
             let live = c
@@ -766,6 +860,37 @@ mod tests {
                 .expect("httpGet");
             assert_eq!(ready.path.as_deref(), Some("/readyz"));
             assert_eq!(ready.port, IntOrString::Int(HTTP_PORT));
+        }
+    }
+
+    #[test]
+    fn secrets_checksum_is_stamped_on_every_pod_template() {
+        // The checksum annotation on the pod template is what makes the
+        // Deployment controller roll pods when a Secret value changes
+        // (ADR-0034 decision 2). It must appear on all three tiers.
+        let spec = base_spec();
+        let ctx = ctx();
+        let template_annotation = |dep: &Deployment| -> Option<String> {
+            dep.spec
+                .as_ref()?
+                .template
+                .metadata
+                .as_ref()?
+                .annotations
+                .as_ref()?
+                .get(SECRETS_CHECKSUM_ANNOTATION)
+                .cloned()
+        };
+        for dep in [
+            desired_gateway_deployment(&spec, "prod", &ctx),
+            desired_query_deployment(&spec, "prod", &ctx),
+            desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled"),
+        ] {
+            assert_eq!(
+                template_annotation(&dep).as_deref(),
+                Some("deadbeef"),
+                "every tier's pod template must carry the secrets checksum"
+            );
         }
     }
 

@@ -54,6 +54,7 @@
                         "default": 1,
                         "description": "Replica count for the gateway Deployment.",
                         "format": "int32",
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "resources": {
@@ -145,6 +146,7 @@
                         "default": 1,
                         "description": "Replica count for the query Deployment.",
                         "format": "int32",
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "resources": {
@@ -195,7 +197,7 @@
                   "shards": {
                     "description": "Shard count, rendered into `--shards` for gateway, query, and maintain\nalike so the must-match invariant is unrepresentable to break\n(ADR-0034 decision 2). Immutable after creation, enforced by a CEL\ntransition rule on this field's schema (see [`ravel_cluster_crd`]).",
                     "format": "uint32",
-                    "minimum": 0.0,
+                    "minimum": 1.0,
                     "type": "integer",
                     "x-kubernetes-validations": [
                       {

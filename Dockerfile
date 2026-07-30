@@ -5,9 +5,9 @@
 # spec, so no mode is baked in here. ravel-cli ships in the same image for
 # one-shot maintain and inspection use.
 #
-# This Dockerfile is designed to grow a second final stage (the operator image)
-# in a later task of the epic; today it has a single runtime target, `server`.
-# Stages are named so `--target server` builds only the server image.
+# This Dockerfile has two final runtime targets: `server` (ravel-server plus
+# ravel-cli) and `operator` (the Kubernetes operator). Stages are named so
+# `--target server` or `--target operator` builds only that one image.
 
 # ---- Builder ----------------------------------------------------------------
 # Pinned to the workspace toolchain (rust-toolchain.toml channel = 1.97.1) so
@@ -83,6 +83,6 @@ COPY --from=builder /app/target/release/ravel-operator /usr/local/bin/ravel-oper
 
 # The operator takes its configuration from the ambient Kubernetes environment
 # (in-cluster service account or kubeconfig). `--print-crd` emits the
-# CustomResourceDefinition and exits, which is how deploy/crd.yaml is
-# regenerated.
+# CustomResourceDefinition and exits, which is how deploy/k8s/operator/crd.yaml
+# is regenerated.
 ENTRYPOINT ["/usr/local/bin/ravel-operator"]
