@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use ravel_server::{Cli, FoldTaskConfig, ServerConfig};
+use ravel_maintain::{CompactorConfig, RetentionConfig};
+use ravel_server::{Cli, FoldTaskConfig, MaintenanceTaskConfig, Mode, ServerConfig};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -33,6 +34,22 @@ async fn main() -> anyhow::Result<()> {
     let store =
         ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
+    // Retention windows are validated at startup against the ADR-0019 floor,
+    // using the SAME max_ingest_lag this process's catalog resolve window uses
+    // (ravel_catalog::CatalogConfig, the value query::build_catalog builds the
+    // catalog with) rather than ravel_maintain's own constant in isolation: a
+    // mismatch would validate the retention floor against a different lag
+    // assumption than the catalog actually resolves with. A window below the
+    // floor fails startup here rather than being silently clamped.
+    let compactor = CompactorConfig::default();
+    let catalog_max_ingest_lag_ns = ravel_catalog::CatalogConfig::default().max_ingest_lag_ns;
+    let retention_policy = cli
+        .parse_retention_policy()
+        .context("failed to parse retention flags")?;
+    let retention =
+        RetentionConfig::from_policy(retention_policy, &compactor, catalog_max_ingest_lag_ns)
+            .map_err(|e| anyhow::anyhow!("invalid retention configuration: {e}"))?;
+
     let config = ServerConfig {
         mode: cli.mode,
         listen_http: cli.listen_http,
@@ -43,6 +60,13 @@ async fn main() -> anyhow::Result<()> {
         fold: FoldTaskConfig {
             enabled: !cli.disable_fold,
             fold_interval: Duration::from_secs(cli.fold_interval_secs),
+        },
+        maintain: MaintenanceTaskConfig {
+            enabled: matches!(cli.mode, Mode::Maintain),
+            interval: Duration::from_secs(cli.maintain_interval_secs),
+            shard_count: cli.shards,
+            compactor,
+            retention,
         },
     };
 

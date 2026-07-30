@@ -4043,6 +4043,7 @@ dependencies = [
  "ravel-commit",
  "ravel-ingest",
  "ravel-logseg",
+ "ravel-maintain",
  "ravel-object-store",
  "ravel-otlp",
  "ravel-promql",

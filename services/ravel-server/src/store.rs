@@ -7,7 +7,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_object_store::{Capabilities, ObjectStoreBackend};
 
-use crate::config::{Cli, StoreKind};
+use crate::config::{Cli, Mode, StoreKind};
 
 /// A constructed backend under-reports a capability Ravel's commit protocol
 /// and catalog require in production. Startup aborts here rather than trusting
@@ -34,11 +34,25 @@ impl std::fmt::Display for UnsatisfiedCapabilities {
 
 impl std::error::Error for UnsatisfiedCapabilities {}
 
-/// The mandatory flags a backend reports as unsupported, for the error text.
+/// The capability set required for `mode`. Every mode requires
+/// [`Capabilities::mandatory`]; [`Mode::Maintain`] additionally requires
+/// `multipart`, because compaction is the only path that writes multipart
+/// objects (large L1/L2 parts) and ingest/query never need it. Multipart is
+/// NOT made globally mandatory: a gateway/query/all deployment keeps today's
+/// `mandatory()` set exactly (docs/compaction-retention-plan.md P8; the
+/// `Capabilities::mandatory` "mandatory from Phase 2" note).
+pub fn required_capabilities(mode: Mode) -> Capabilities {
+    let mut required = Capabilities::mandatory();
+    if matches!(mode, Mode::Maintain) {
+        required.multipart = true;
+    }
+    required
+}
+
+/// The required flags a backend reports as unsupported, for the error text.
 /// Mirrors [`Capabilities::satisfies`]; kept in sync field-for-field so the
 /// diagnostic never disagrees with the gate that produced it.
-fn missing_mandatory(caps: &Capabilities) -> Vec<&'static str> {
-    let required = Capabilities::mandatory();
+fn missing_capabilities(caps: &Capabilities, required: &Capabilities) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if required.consistent_read && !caps.consistent_read {
         missing.push("consistent_read");
@@ -67,24 +81,36 @@ fn missing_mandatory(caps: &Capabilities) -> Vec<&'static str> {
     missing
 }
 
-/// Enforce the mandatory-capability contract against a constructed backend.
+/// Enforce the capability contract for `mode` against a constructed backend.
 ///
-/// A backend that under-reports any mandatory capability (see
-/// [`Capabilities::mandatory`]) must not carry production durability, so this
+/// A backend that under-reports any required capability (see
+/// [`required_capabilities`]) must not carry production durability, so this
 /// returns [`UnsatisfiedCapabilities`] listing the offending flags instead of
-/// letting the server start. This is the enforcement the struct doc on
-/// [`Capabilities`] refers to.
-pub fn check_mandatory_capabilities(
+/// letting the server start. Every mode enforces [`Capabilities::mandatory`];
+/// [`Mode::Maintain`] additionally enforces `multipart`. This is the
+/// enforcement the struct doc on [`Capabilities`] refers to.
+pub fn check_capabilities(
     backend: &dyn ObjectStoreBackend,
+    mode: Mode,
 ) -> Result<(), UnsatisfiedCapabilities> {
+    let required = required_capabilities(mode);
     let caps = backend.capabilities();
-    if caps.satisfies(&Capabilities::mandatory()) {
+    if caps.satisfies(&required) {
         Ok(())
     } else {
         Err(UnsatisfiedCapabilities {
-            missing: missing_mandatory(&caps).join(", "),
+            missing: missing_capabilities(&caps, &required).join(", "),
         })
     }
+}
+
+/// Backward-compatible mandatory-only check (every non-maintain mode). Kept as
+/// a thin wrapper over [`check_capabilities`] for callers and tests that only
+/// care about the always-mandatory set.
+pub fn check_mandatory_capabilities(
+    backend: &dyn ObjectStoreBackend,
+) -> Result<(), UnsatisfiedCapabilities> {
+    check_capabilities(backend, Mode::All)
 }
 
 pub fn build_store(cli: &Cli) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
@@ -125,7 +151,7 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
         }
     };
 
-    check_mandatory_capabilities(store.as_ref())?;
+    check_capabilities(store.as_ref(), cli.mode)?;
     Ok(store)
 }
 
@@ -238,6 +264,57 @@ mod tests {
             .expect_err("backend missing mandatory flags must fail the check");
         assert!(err.missing.contains("cas_version"), "got: {}", err.missing);
         assert!(err.missing.contains("prefix_list"), "got: {}", err.missing);
+    }
+
+    #[test]
+    fn maintain_mode_requires_multipart_and_fails_without_it() {
+        // A backend meeting every always-mandatory flag but not multipart
+        // (exactly what MemoryStore and S3Store report today) must fail startup
+        // in maintain mode, naming multipart as the offending flag.
+        let backend = StubBackend {
+            caps: Capabilities::mandatory(),
+        };
+        assert!(
+            !backend.caps.multipart,
+            "precondition: multipart unsupported"
+        );
+        let err = check_capabilities(&backend, Mode::Maintain)
+            .expect_err("maintain mode must reject a non-multipart backend");
+        assert!(
+            err.missing.contains("multipart"),
+            "error must name multipart, got: {}",
+            err.missing
+        );
+    }
+
+    #[test]
+    fn maintain_mode_passes_with_multipart() {
+        let mut caps = Capabilities::mandatory();
+        caps.multipart = true;
+        let backend = StubBackend { caps };
+        check_capabilities(&backend, Mode::Maintain)
+            .expect("maintain mode must start on a multipart-capable backend");
+    }
+
+    #[test]
+    fn non_maintain_modes_do_not_require_multipart() {
+        // multipart is NOT globally mandatory: the always-mandatory set (no
+        // multipart) must satisfy every non-maintain mode.
+        let backend = StubBackend {
+            caps: Capabilities::mandatory(),
+        };
+        for mode in [Mode::All, Mode::Gateway, Mode::Query] {
+            check_capabilities(&backend, mode)
+                .unwrap_or_else(|e| panic!("{mode:?} must not require multipart, got: {e}"));
+        }
+        assert!(
+            !required_capabilities(Mode::All).multipart,
+            "multipart must not be globally required"
+        );
+        assert!(
+            required_capabilities(Mode::Maintain).multipart,
+            "maintain mode must require multipart"
+        );
     }
 
     #[test]

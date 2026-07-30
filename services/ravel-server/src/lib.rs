@@ -9,6 +9,7 @@ pub mod flight_auth;
 pub mod fold;
 pub mod ingest;
 pub mod logs_ingest;
+pub mod maintain;
 pub mod otlp_grpc;
 pub mod otlp_grpc_logs;
 pub mod otlp_http;
@@ -36,6 +37,7 @@ use tokio::task::JoinHandle;
 
 pub use config::{Cli, Mode, StoreKind};
 pub use fold::FoldTaskConfig;
+pub use maintain::MaintenanceTaskConfig;
 
 const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -68,6 +70,10 @@ pub struct ServerConfig {
     /// stay indexed belongs here.
     pub fold_tenants: Vec<TenantHash>,
     pub fold: FoldTaskConfig,
+    /// Background maintenance (compaction, retention, sweep) config. Its
+    /// tenant list is `fold_tenants` (both derive from the same tenant-token
+    /// config). Only spawned in [`Mode::Maintain`]; `enabled` gates it.
+    pub maintain: MaintenanceTaskConfig,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -82,6 +88,7 @@ pub struct Running {
     ingest_router: Option<Arc<IngestRouter>>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     fold_tasks: fold::FoldTasks,
+    maintenance_tasks: maintain::MaintenanceTasks,
 }
 
 impl Running {
@@ -123,6 +130,7 @@ impl Running {
         }
 
         self.fold_tasks.shutdown().await;
+        self.maintenance_tasks.shutdown().await;
 
         Ok(())
     }
@@ -250,7 +258,19 @@ pub async fn start(
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }
 
-    let fold_tasks = fold::spawn(catalog, store.clone(), &config.fold_tenants, config.fold);
+    // Fold optimizes query-resolve cost; a maintain-only process serves no
+    // query surface, so folding would be wasted work. Skip it in maintain mode
+    // and run the maintenance loop instead. The two are independent background
+    // loops over the same tenant list, and no non-maintain mode runs
+    // maintenance.
+    let (fold_tasks, maintenance_tasks) = if matches!(config.mode, Mode::Maintain) {
+        let maintenance_tasks =
+            maintain::spawn(store.clone(), &config.fold_tenants, config.maintain.clone());
+        (fold::FoldTasks::none(), maintenance_tasks)
+    } else {
+        let fold_tasks = fold::spawn(catalog, store.clone(), &config.fold_tenants, config.fold);
+        (fold_tasks, maintain::MaintenanceTasks::none())
+    };
 
     let listener = tokio::net::TcpListener::bind(config.listen_http).await?;
     let http_addr = listener.local_addr()?;
@@ -328,5 +348,6 @@ pub async fn start(
         ingest_router,
         log_ingest_router,
         fold_tasks,
+        maintenance_tasks,
     })
 }

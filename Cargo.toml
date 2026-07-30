@@ -34,6 +34,7 @@ ravel-segment = { path = "crates/ravel-segment", version = "0.1.0" }
 ravel-logseg = { path = "crates/ravel-logseg", version = "0.1.0" }
 ravel-commit = { path = "crates/ravel-commit", version = "0.1.0" }
 ravel-catalog = { path = "crates/ravel-catalog", version = "0.1.0" }
+ravel-maintain = { path = "crates/ravel-maintain", version = "0.1.0" }
 ravel-otlp = { path = "crates/ravel-otlp", version = "0.1.0" }
 ravel-otap = { path = "crates/ravel-otap", version = "0.1.0" }
 ravel-remote-write = { path = "crates/ravel-remote-write", version = "0.1.0" }

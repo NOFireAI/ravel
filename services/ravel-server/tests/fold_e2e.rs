@@ -107,6 +107,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
             enabled: true,
             fold_interval: Duration::from_millis(200),
         },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
     };
     let running = ravel_server::start(config, store_dyn)
         .await
