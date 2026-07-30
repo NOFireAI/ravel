@@ -10,6 +10,10 @@
 //! drive the pinned binary, [`corpus`] parses query fixtures, and
 //! [`comparator`] and [`runner`] execute a corpus against both stacks and
 //! diff the results.
+//!
+//! [`scoring`] sits on top of all of that: it classifies the PromQL surface
+//! per ADR-0035 and turns a corpus run into the per-construct conformance
+//! table published in `docs/query-engine.md` (issue #133).
 
 pub mod comparator;
 pub mod corpus;
@@ -20,3 +24,4 @@ pub mod prometheus_process;
 mod proto;
 pub mod ravel_stack;
 pub mod runner;
+pub mod scoring;
