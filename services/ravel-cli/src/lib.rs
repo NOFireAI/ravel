@@ -6,6 +6,7 @@
 //! impossible to construct without a persistent S3/MinIO backend).
 
 pub mod catalog;
+pub mod maintain;
 pub mod store;
 
 use std::time::{SystemTime, UNIX_EPOCH};

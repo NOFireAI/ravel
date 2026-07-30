@@ -88,6 +88,15 @@ pub async fn publish_record(
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&payload));
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
 
+    // Dry-run: the record and its key are assembled identically, but the
+    // publishing PUT is skipped. A dry run only reaches here for a bucket with
+    // no existing compaction record (compact_bucket returns AlreadyCompacted
+    // before building anything otherwise), so the real run's outcome here is
+    // always Published; the convergence/repair path is never dry-run reachable.
+    if config.dry_run {
+        return Ok(PublishOutcome::Published);
+    }
+
     match store.put(&record_key, payload.into(), opts).await {
         Ok(_) => {
             tracing::info!(key = %record_key, parts = parts.len(), "compaction record published");

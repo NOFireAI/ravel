@@ -128,6 +128,7 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
             enabled: false,
             ..FoldTaskConfig::default()
         },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
     };
     let running = ravel_server::start(config, store_dyn)
         .await

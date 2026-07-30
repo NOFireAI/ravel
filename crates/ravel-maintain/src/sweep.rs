@@ -156,7 +156,9 @@ pub async fn sweep_orphans(
         if fresh.contains(&identity) {
             continue;
         }
-        store.delete(&meta.key).await?;
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
         deleted += 1;
     }
     Ok(deleted)
@@ -270,14 +272,18 @@ pub async fn sweep_superseded(
             if lease.is_protected(k) {
                 continue;
             }
-            store.delete(k).await?;
+            if !config.dry_run {
+                store.delete(k).await?;
+            }
             records_deleted += 1;
         }
         for k in &data_keys {
             if lease.is_protected(k) {
                 continue;
             }
-            store.delete(k).await?;
+            if !config.dry_run {
+                store.delete(k).await?;
+            }
             data_deleted += 1;
         }
     }
@@ -329,7 +335,9 @@ pub async fn sweep_unreferenced_parts(
             Some(fs) if !fs.contains(&meta.key) => {}
             _ => continue,
         }
-        store.delete(&meta.key).await?;
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
         deleted += 1;
     }
     Ok(deleted)
