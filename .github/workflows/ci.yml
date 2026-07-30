@@ -352,6 +352,90 @@ jobs:
         if: always()
         run: docker rm -f floci || true
 
+  # End-to-end ingest+query benchmark smoke test against real MinIO (issue
+  # #266): every other ravel-bench benchmark only runs against in-process
+  # MemoryStore, so none of them ever exercise the real S3 request shape
+  # (signing, multipart, listing pagination) that ravel-server depends on in
+  # production. This is not a benchmark run for numbers -- it is a
+  # correctness gate proving `s3_e2e_bench`'s ingest-then-query path still
+  # works end to end against a real object store. Same MinIO docker-run,
+  # health-check, and bucket-creation steps as object-store-contract above
+  # (kept separate rather than shared so this job's failure signal stays
+  # about the bench harness, not the contract suite).
+  bench-smoke:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+      - name: Wait for MinIO to be live
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live; then
+              echo "MinIO is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time"
+          docker logs minio || true
+          exit 1
+      - name: Create the bench-smoke bucket
+        run: |
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/ravel-object-store-test"
+      # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
+      # as the contract suite's minio_contract; set it (and the
+      # credentials/bucket the docker run above provisioned) so the gated
+      # test executes instead of skipping.
+      - name: Run end-to-end ingest+query smoke test against MinIO
+        env:
+          RAVEL_MINIO_URL: http://localhost:9000
+          RAVEL_MINIO_BUCKET: ravel-object-store-test
+          RAVEL_MINIO_ACCESS_KEY: minioadmin
+          RAVEL_MINIO_SECRET_KEY: minioadmin
+          RAVEL_MINIO_REGION: us-east-1
+        run: |
+          set -o pipefail
+          # Same invocation shape as object-store-contract's MinIO step; see
+          # its comment for why --no-capture and --color never are needed
+          # for the greps below.
+          cargo nextest run -p ravel-bench --test s3_e2e_smoke \
+            -E 'test(=minio_ingest_read_smoke)' --no-capture --color never 2>&1 \
+            | tee bench-smoke-output.txt
+          # Prove the test actually ran against MinIO rather than taking the
+          # RAVEL_MINIO_URL-unset early return.
+          if grep -q "skipping MinIO ingest+read smoke test" bench-smoke-output.txt; then
+            echo "::error::minio_ingest_read_smoke skipped despite RAVEL_MINIO_URL set"
+            exit 1
+          fi
+          if ! grep -qE "1 tests? run: 1 passed" bench-smoke-output.txt; then
+            echo "::error::minio_ingest_read_smoke did not run (expected 1 passed)"
+            exit 1
+          fi
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+
   # PromQL differential test (issue #124, docs/promql-evaluator-plan.md
   # section 5, ADR-0021 decisions 4-5): checks Ravel's PromQL evaluator
   # against a pinned real Prometheus binary for bit-exact correctness on

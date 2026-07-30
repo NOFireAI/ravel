@@ -2,7 +2,9 @@
 //! this crate never changes library behavior, it only measures it.
 
 pub mod codecs;
+pub mod e2e;
 pub mod generator;
+pub mod harness;
 #[cfg(feature = "parquet-baseline")]
 pub mod read_accounting;
 pub mod section_accounting;
