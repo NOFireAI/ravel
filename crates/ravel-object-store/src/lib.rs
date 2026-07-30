@@ -126,8 +126,10 @@ pub struct DelimitedList {
     pub common_prefixes: Vec<String>,
 }
 
-/// Capability flags mirroring the mandatory-capability table in the
-/// contract doc. Production startup fails if a mandatory flag is false.
+/// Capability flags mirroring the capability tables in the contract doc.
+/// Production startup fails if a flag [`Capabilities::mandatory`] requires is
+/// false; the flags outside that set are mode-conditional (`multipart`) or
+/// best-effort (`upload_checksum`), documented on `mandatory` below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub consistent_read: bool,
@@ -142,6 +144,29 @@ pub struct Capabilities {
 
 impl Capabilities {
     /// Everything Ravel's commit protocol and catalog require in production.
+    ///
+    /// Two flags are deliberately `false` here, for different reasons:
+    ///
+    /// - `multipart` is mode-conditional, not universally required: only
+    ///   compaction writes multipart objects, so ravel-server's
+    ///   `required_capabilities` adds it for `Mode::Maintain` alone.
+    /// - `upload_checksum` is not required by any mode. It cannot be
+    ///   satisfied by S3, the only durable backend Ravel ships: the
+    ///   `object_store` 0.14 `AmazonS3` client has no per-request checksum
+    ///   hook and no way to attach a caller-supplied precomputed digest to
+    ///   the wire, so [`crate::s3::S3Store`] reports it as unsupported (see
+    ///   that module's "Known divergences" doc). That is a permanent
+    ///   client-library limitation, not a per-endpoint or per-mode gap:
+    ///   requiring the flag made `--store s3` fail startup against every
+    ///   S3-compatible endpoint unconditionally (issue #251), which blocks
+    ///   the only durable backend instead of catching a real regression.
+    ///   Upload checksums are a CRC32C-class transport-corruption check;
+    ///   the actual backstop against corrupted data surviving is the
+    ///   read-time footer/section/page crc32c hierarchy
+    ///   (docs/segment-format.md), which is independent of them. Backends
+    ///   that can honor the flag still do, `put()` still runs its local
+    ///   pre-flight CRC32C check on every backend, and the contract suite
+    ///   still asserts that behavior; it is simply not startup-gating.
     pub fn mandatory() -> Self {
         Capabilities {
             consistent_read: true,
@@ -149,7 +174,7 @@ impl Capabilities {
             create_if_absent: true,
             cas_version: true,
             suffix_range: true,
-            upload_checksum: true,
+            upload_checksum: false, // unsatisfiable on S3 (see doc above)
             prefix_list: true,
             multipart: false, // mandatory from Phase 2 (large L1/L2 segments)
         }
