@@ -6,10 +6,17 @@
 //! is the semantics oracle used by tests.
 
 pub mod fault;
+pub mod instrument;
 pub mod memory;
 pub mod s3;
 
 use bytes::Bytes;
+
+/// Per-operation counters, latency histogram, and byte totals for any backend
+/// ([`instrument`]). Observability only: never correctness-bearing, and
+/// wrapping a backend is a zero behavior change (results and
+/// [`Capabilities`] pass through verbatim).
+pub use instrument::{InstrumentedStore, StoreMetrics};
 
 /// Content identity: used only for equality assertions between reads of the
 /// same immutable object. Never used as a CAS precondition (that is

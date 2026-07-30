@@ -157,6 +157,18 @@ client, which is why `S3Store` reports `upload_checksum: false` for both.
 3. `S3Store`: `object_store` crate adapter (AWS S3 + MinIO via endpoint
    override), honoring every MUST above.
 
+### Instrumentation decorator
+
+`InstrumentedStore<S>` wraps any backend and counts, per operation, calls, `ok`
+count, failures by `StoreError` variant, bytes (returned for `get`, offered for
+`put`), and a fixed-bucket latency histogram, read as a snapshot off a shared
+`StoreMetrics` handle. Observability only, never correctness-bearing, and a
+zero behavior change: every method delegates and forwards its result verbatim,
+and `capabilities()` passes straight through, so the startup gate still sees
+the wrapped backend's own declaration. `ravel-server`'s `build_store` wraps
+whichever backend it built, unconditionally in every mode, and the contract
+suite runs its full assertion set through the decorator to prove transparency.
+
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
 against all three. The `S3Store` case is gated on `RAVEL_MINIO_URL`; the CI
 `object-store-contract` job (`.github/workflows/ci.yml`) stands up MinIO,

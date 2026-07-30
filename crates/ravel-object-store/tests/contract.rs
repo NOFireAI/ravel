@@ -20,11 +20,12 @@ use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as OsPath;
 use object_store::{MultipartUpload, ObjectStoreExt, PutPayload};
 use ravel_object_store::fault::{FaultPlan, FaultStore};
+use ravel_object_store::instrument::{StoreErrorClass, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_object_store::{
-    Capabilities, GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum,
-    list_all,
+    Capabilities, GetRange, InstrumentedStore, ObjectStoreBackend, PutMode, PutOptions, StoreError,
+    UploadChecksum, list_all,
 };
 
 /// Runs every contract assertion against `store`. Each assertion gets its
@@ -618,6 +619,50 @@ async fn memory_store_paged_contract() {
 async fn fault_store_empty_plan_contract() {
     let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
     run_contract_suite(&store, "fault-empty").await;
+}
+
+/// The instrumentation decorator must be transparent (issue #272): every
+/// contract assertion, capability check included, holds identically with it in
+/// the path, because it forwards each result verbatim and passes
+/// `capabilities()` through. The counter assertions afterward prove the suite
+/// really ran *through* the decorator rather than past it, which is what makes
+/// this a transparency test instead of a second memory-oracle run.
+#[tokio::test]
+async fn instrumented_memory_store_contract() {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    let metrics = store.metrics();
+    run_contract_suite(&store, "instrumented-memory").await;
+
+    let snap = metrics.snapshot();
+    for op in StoreOp::ALL {
+        assert!(
+            snap.op(op).calls > 0,
+            "the suite must have driven {} through the decorator",
+            op.name()
+        );
+    }
+    // The suite writes objects and reads ranges, so both byte counters moved,
+    // and its deliberate failures (AlreadyExists, PreconditionFailed,
+    // InvalidRange, NotFound, Corrupted) are classified rather than lost.
+    assert!(snap.put.bytes > 0, "put bytes must have been counted");
+    assert!(snap.get.bytes > 0, "get bytes must have been counted");
+    for op in StoreOp::ALL {
+        let block = snap.op(op);
+        assert_eq!(
+            block.errors_total(),
+            block.calls - block.ok,
+            "{}: every failed call must land in exactly one error class",
+            op.name()
+        );
+    }
+    assert!(
+        snap.put.error_count(StoreErrorClass::AlreadyExists) > 0
+            && snap.put.error_count(StoreErrorClass::PreconditionFailed) > 0
+            && snap.put.error_count(StoreErrorClass::Corrupted) > 0
+            && snap.get.error_count(StoreErrorClass::InvalidRange) > 0
+            && snap.head.error_count(StoreErrorClass::NotFound) > 0,
+        "the suite's scripted failures must be classified, got {snap:?}"
+    );
 }
 
 /// Proves the path taken for issue #181: `object_store` 0.14's `AmazonS3`
