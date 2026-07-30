@@ -61,10 +61,31 @@ impl FoldTasks {
     }
 }
 
-/// Spawns one fold loop per tenant. `ravel-server` ingests metrics only
-/// today, so every task folds [`Signal::Metrics`]; a future signal would add
-/// another task per (tenant, signal) here, not change this function's shape
-/// (docs/metric-index-plan.md is written per (tenant, signal) throughout).
+/// Every signal `ravel-server` folds. One fold loop is spawned per
+/// (tenant, signal) pair, so adding a signal here doubles the task count per
+/// tenant without changing any loop's shape. `FoldTaskConfig` (enabled,
+/// fold_interval) is shared across signals for v1: both currently want the
+/// same 5-minute cadence (ADR-0033); a per-signal interval is a config-shape
+/// follow-up if that changes.
+const FOLD_SIGNALS: [Signal; 2] = [Signal::Metrics, Signal::Logs];
+
+/// Spawns one fold loop per (tenant, signal), for every signal in
+/// [`FOLD_SIGNALS`]. [`run_loop`] is signal-generic; a new signal is added by
+/// extending that array, not by restructuring this function (ADR-0033 gap 1;
+/// docs/metric-index-plan.md is written per (tenant, signal) throughout).
+///
+/// [`Signal::Logs`] folds through the same [`Catalog::fold`] path as metrics
+/// and produces `catalog/l/HEAD` plus snapshot parts, but no name-postings
+/// object: `Catalog::fold` always attempts the RSEG-specific postings build
+/// (`build_postings`/`fetch_entry_names`), which for a log entry issues one
+/// full-object GET and then fails to decode the bytes as RSEG (an RLOG object
+/// carries signal=2, RSEG expects signal=1), so `build_postings` returns
+/// `None` and the fold skips writing a postings ref without failing. That
+/// wasted GET-plus-failed-decode recurs every fold cycle for each log entry
+/// newly covered since the last fold: real I/O and CPU proportional to new
+/// log volume. It is accepted for v1 (ADR-0033), not a bug; fixing it would
+/// mean a signal-aware short-circuit inside `ravel-catalog`, deliberately out
+/// of scope here.
 ///
 /// Tenants come from the static tenant-token config, per the plan's own note
 /// (section 11) that no separate enumeration mechanism is needed. Returns
@@ -85,24 +106,17 @@ pub fn spawn(
     let mut shutdown = Vec::new();
     let mut handles = Vec::new();
     for &tenant in tenants {
-        let (tx, rx) = oneshot::channel();
-        let catalog = catalog.clone();
-        let store = store.clone();
-        let interval = config.fold_interval;
-        let handle = tokio::spawn(async move {
-            run_loop(
-                catalog,
-                store,
-                tenant,
-                Signal::Metrics,
-                folder_id,
-                interval,
-                rx,
-            )
-            .await;
-        });
-        shutdown.push(tx);
-        handles.push(handle);
+        for signal in FOLD_SIGNALS {
+            let (tx, rx) = oneshot::channel();
+            let catalog = catalog.clone();
+            let store = store.clone();
+            let interval = config.fold_interval;
+            let handle = tokio::spawn(async move {
+                run_loop(catalog, store, tenant, signal, folder_id, interval, rx).await;
+            });
+            shutdown.push(tx);
+            handles.push(handle);
+        }
     }
     FoldTasks { shutdown, handles }
 }
