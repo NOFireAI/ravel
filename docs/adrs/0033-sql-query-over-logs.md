@@ -197,3 +197,55 @@ gain.
   (`min`/`max`/`avg` in `crates/ravel-sql/src/session.rs`): one more
   function registered into the per-query `SessionContext`, no new
   isolation mechanism.
+
+## Amendment (issue #239, 2026-07-30): the `attrs` column carries merged resource + scope + record attributes
+
+The original decision above left one correctness gap unstated, found by an
+adversarial review of the first `LogsTableProvider` implementation. It is a
+data-loss bug, corrected here.
+
+`supports_filters_pushdown` returns `Inexact` for every filter, so
+DataFusion always re-applies the original predicate above the scan as a
+residual `FilterExec`. A stream-identifying predicate written as
+`attrs['service.name'] = 'api'` is thus evaluated twice: once by the scan
+(resolved per-object against `STREAM_DIR` and re-verified against each
+record's `stream_attrs` resource/scope blob, which is correct), and once by
+the residual against the Arrow `attrs` column. The first implementation
+populated that column from `LogRecord.attrs` alone (the per-record dynamic
+attributes). Resource and scope attributes were therefore absent from it, so
+the residual re-check of a resource attribute always failed, and a record
+whose only match was a genuine resource attribute (the normal OTLP shape,
+where `service.name` is a resource attribute) was silently dropped even
+though the scan had verified its stream matched.
+
+The fix: the `attrs` column carries each record's resource + scope
+attributes (decoded from its `stream_attrs` blob) merged with its dynamic
+per-record attributes, with the record's value winning on a key collision.
+The data the residual checks and the data the scan's stream-identity check
+verifies are then the same data, so the two agree and no row is lost. A
+top-level resource or scope attribute whose value is itself a nested `Map`
+or `List` is not projected into the map column (it is consumed but omitted),
+matching the scan's existing rule that a nested pair never satisfies a
+stream-attribute equality; a richer typed representation of nested values is
+the same v-next refinement the per-key column schema is. Per-record dynamic
+attributes with nested values are unaffected and still appear (rendered to
+text).
+
+This changes no persistent format and no query result that was previously
+correct; it only stops dropping rows that should have been returned. It is
+covered by an integration test that drives a real `TableProvider::scan`
+inside a `SessionContext` so the residual `FilterExec` actually runs
+(`crates/ravel-sql/tests/logs_provider.rs`).
+
+Related, unchanged by this amendment but clarified here because the first
+implementation's module docs misstated it: the `attrs['k']` subscript
+*syntax* does not plan on this crate's DataFusion build. Lowering
+`attrs['k']` to a `get_field(attrs, 'k')` scalar call needs a
+nested-expression `ExprPlanner`, and this crate depends on `datafusion` with
+`features = ["sql"]` only, registering no such planner. The subscript
+therefore fails query planning with a hard error (loudly, never silently
+mis-evaluated), for both the old record-only and the new merged-map `attrs`
+column alike. Registering the planner in the query session/endpoint is an
+explicit gate item for the session/endpoint wiring (issue #240); the
+pushdown extractor already recognizes the lowered `get_field(attrs, 'k')`
+shape so it works unchanged once that lands.
