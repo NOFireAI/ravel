@@ -210,12 +210,47 @@ supported map-access syntax and have the planner reject the subscript
 form with a clear error. `has_word(col, 'literal')` and `LIKE` do not
 depend on this — both plan and push down today without it.
 
-**One SQL endpoint, two tables.** No new HTTP endpoint. `SqlExecutor`'s
-per-query `SessionContext` (`crates/ravel-sql/src/session.rs`) registers
-`logs` alongside `samples`, resolving `Signal::Logs`'s snapshot only
-when the query text references the `logs` table (avoid an unconditional
-second catalog resolve on every metrics-only query). `POST /api/v1/sql`
-is unchanged; DataFusion picks the table from the query's `FROM` clause.
+**One SQL endpoint, two tables, exactly one registered per session.** No
+new HTTP endpoint; `POST /api/v1/sql` is unchanged. This paragraph's
+first draft said the per-query `SessionContext` "registers `logs`
+alongside `samples`" and that "DataFusion picks the table from the
+query's `FROM` clause" — that is not what was built, and not what
+should be built: registering both tables in one session would let
+DataFusion itself plan a query that scans or joins both signals, which
+Rejected Alternative C already says v1 has no use for and no operator
+semantics to support. Instead, `SqlExecutor::target_signal`
+(`crates/ravel-sql/src/executor.rs`) decides which single table a query
+needs *before* any planning, by parsing the query's referenced base
+tables with the same `sqlparser`/`DFParser` front end `crate::validate`
+already uses (`referenced_base_tables`, `crates/ravel-sql/src/validate.rs`)
+— never a raw-text scan, so a string literal or comment naming the other
+table cannot change the decision. A query referencing only `samples` (or
+neither table — a tableless constant query, preserving the exact
+pre-ADR-0033 behavior of such a query) resolves `Signal::Metrics`; one
+referencing only `logs` resolves `Signal::Logs`; one referencing both is
+rejected outright, before any catalog resolve, with a dedicated
+client-visible error (`SqlError::CrossSignalQuery`) rather than being
+handed to DataFusion to fail on its own. `build_session` then registers
+exactly the one table the query needs, plus that table's own scalar UDFs
+(`label`/`label_match` for `samples`, `has_word` for `logs`) and no
+others — the session exposes only what one query needs, the same
+posture `crate::session`'s security-invariant-2 doc already states for
+every other registration in that function. `Signal::Logs`'s snapshot is
+therefore resolved only when a query actually references `logs`,
+avoiding an unconditional second catalog resolve on every metrics-only
+query, as the original paragraph intended — just enforced before
+DataFusion is invoked, not by DataFusion itself.
+
+A base-table-name parse has one known sharp edge: a `WITH <name> AS
+(...)` common table expression named `logs` or `samples` shadows the
+real table of that name for the query's own scope, but the visitor
+above does not resolve CTE scoping — it collects every table-factor name
+in the query tree, CTE names included. `crates/ravel-sql/src/executor.rs`
+and `crates/ravel-sql/src/validate.rs` correct for this: CTE names
+declared in a `WITH` clause are collected separately and excluded from
+the signal decision, so `WITH logs AS (SELECT value FROM samples) SELECT
+count(*) FROM logs` resolves `Signal::Metrics` (the only base table it
+actually reads), not a false `CrossSignalQuery` rejection.
 
 **Correctness gate: exact equality, not bit-pattern, and scan-oracle
 only for v1.** Mirror the *structure* of the existing two-layer
