@@ -13,15 +13,25 @@
 //!   a literal timestamp (`>=`, `>`, `<`, `<=`, `=`), and `BETWEEN`. Feeds
 //!   segment-level pruning and the fetch's [`LogQuery`] ts bounds, identical to
 //!   the metrics `ts_lo`/`ts_hi` shape.
-//! - **stream-attribute equality** `attrs['k'] = 'v'`: the `attrs['k']`
-//!   subscript lowers to a `get_field(attrs, 'k')` scalar call (DataFusion's
-//!   `NamedStructField` planner), so this recognizes `get_field(attrs, 'k') =
-//!   'v'` with a Utf8 literal. It becomes a [`StreamAttrEquals`] resolved
-//!   per-object against STREAM_DIR (ADR-0033). This filter over-approximates at
-//!   fetch time; the same predicate is therefore carried in
-//!   [`LogsPushdown::stream_attrs`] for the mandatory post-fetch
-//!   re-verification the scan performs (crate::logs_scan) — it is not only a
-//!   fetch hint.
+//! - **stream-attribute equality** `get_field(attrs, 'k') = 'v'`: recognized
+//!   with a Utf8 literal, it becomes a [`StreamAttrEquals`] resolved per-object
+//!   against STREAM_DIR (ADR-0033). This filter over-approximates at fetch time;
+//!   the same predicate is therefore carried in [`LogsPushdown::stream_attrs`]
+//!   for the mandatory post-fetch re-verification the scan performs
+//!   (crate::logs_scan) — it is not only a fetch hint.
+//!
+//!   Note on the `attrs['k']` subscript *syntax*: it does **not** plan on this
+//!   crate's DataFusion build today. `attrs['k']` would have to lower to a
+//!   `get_field(attrs, 'k')` scalar call through a nested-expression
+//!   `ExprPlanner`, but this crate depends on `datafusion` with
+//!   `features = ["sql"]` only and registers no such planner, so the subscript
+//!   fails *query planning* with a hard error (planning stops loudly; it is
+//!   never silently mis-evaluated), independent of this extractor and of the
+//!   `attrs` column's contents. The extractor recognizes the lowered
+//!   `get_field(attrs, 'k')` shape so that once the subscript planning is wired
+//!   the pushdown works unchanged; wiring it (registering the planner in the
+//!   query session/endpoint) is an explicit gate item for issue #240, per the
+//!   ADR-0033 amendment.
 //! - **word/phrase search** `has_word(col, 'literal')` and the plain
 //!   `col LIKE '%word%'` substring shape: see below. Only `has_word` is pushed;
 //!   `LIKE` is deliberately not, for soundness.
@@ -82,25 +92,6 @@ impl LogsPushdown {
     /// bound, or `i64::MAX` when none was proven.
     pub fn ts_max(&self) -> i64 {
         self.ts_hi.unwrap_or(i64::MAX)
-    }
-
-    /// Whether a segment with event-time span `[min_ts, max_ts]` can hold any
-    /// row inside the extracted ts bounds. `true` when no bound was extracted
-    /// (widen to everything); a segment is dropped only when its whole span
-    /// lies outside a proven-required bound. Same widen-only rule as the metrics
-    /// pushdown.
-    pub fn segment_in_range(&self, min_ts: i64, max_ts: i64) -> bool {
-        if let Some(lo) = self.ts_lo
-            && max_ts < lo
-        {
-            return false;
-        }
-        if let Some(hi) = self.ts_hi
-            && min_ts > hi
-        {
-            return false;
-        }
-        true
     }
 }
 
@@ -379,22 +370,12 @@ mod tests {
     fn no_ts_bound_widens_to_everything() {
         let p = LogsPushdown::default();
         assert_eq!((p.ts_min(), p.ts_max()), (i64::MIN, i64::MAX));
-        assert!(p.segment_in_range(i64::MIN, i64::MAX));
 
         // An OR anywhere at the top level contributes no bound.
         let range = and(col("ts").gt_eq(ts_lit(100)), col("ts").lt(ts_lit(200)));
         let mixed = or(range, col("severity_num").gt(lit(5)));
         let p = extract_logs(&[mixed]);
         assert_eq!((p.ts_lo, p.ts_hi), (None, None));
-    }
-
-    #[test]
-    fn segment_in_range_is_widen_only() {
-        let p = extract_logs(&[col("ts").gt_eq(ts_lit(100)), col("ts").lt(ts_lit(200))]);
-        assert!(!p.segment_in_range(0, 99));
-        assert!(!p.segment_in_range(200, 300));
-        assert!(p.segment_in_range(150, 150));
-        assert!(p.segment_in_range(0, 100));
     }
 
     #[test]

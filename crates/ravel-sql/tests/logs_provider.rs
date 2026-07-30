@@ -23,11 +23,18 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{StringArray, TimestampNanosecondArray};
+use datafusion::arrow::array::{
+    Array, MapArray, StringArray, StringBuilder, StructArray, TimestampNanosecondArray,
+};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::physical_plan::collect;
-use datafusion::prelude::{col, lit};
+use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::tokenizer::tokens;
@@ -327,5 +334,196 @@ async fn scan_reverifies_stream_attr_over_approximation() {
         BTreeSet::from([(1, "hello from plain".to_string())]),
         "scan must exclude the nested-map false positive (ts=2) and keep only \
          the genuine top-level attribute record (ts=1)"
+    );
+}
+
+/// A minimal, functional `get_field(map, 'key') -> Utf8` over a
+/// `Map(Utf8, Utf8)` column: the value stored for `key` in each row's map, or
+/// NULL when the key is absent.
+///
+/// Named `get_field` so [`ravel_sql`]'s pushdown extractor recognizes the
+/// `attrs['k']` shape exactly as it would DataFusion's own subscript lowering,
+/// while giving the residual `FilterExec` a real evaluator to run. The crate's
+/// DataFusion build registers no nested-expression planner (`features =
+/// ["sql"]`), which is why the `attrs['k']` SQL *text* cannot plan today
+/// (tracked as a gate item for #240); this test therefore builds the equivalent
+/// expression programmatically.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct GetField {
+    signature: Signature,
+}
+
+impl GetField {
+    fn new() -> Self {
+        GetField {
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for GetField {
+    fn name(&self) -> &str {
+        "get_field"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    /// Accept the argument types as given (a `Map` first arg and a `Utf8` key);
+    /// `Signature::user_defined` delegates coercion here.
+    fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::error::Result<Vec<DataType>> {
+        Ok(arg_types.to_vec())
+    }
+
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let key = match &args.args[1] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(k))) => k.clone(),
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "get_field test udf: key must be a Utf8 literal, got {other:?}"
+                )));
+            }
+        };
+        let map_arr = match &args.args[0] {
+            ColumnarValue::Array(a) => Arc::clone(a),
+            ColumnarValue::Scalar(s) => s.to_array()?,
+        };
+        let map = map_arr
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("get_field test udf: first arg must be a Map column");
+        let mut out = StringBuilder::new();
+        for i in 0..map.len() {
+            if map.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let entries = map.value(i);
+            let entries = entries
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("map entries struct");
+            let keys = entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("map keys utf8");
+            let vals = entries
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("map values utf8");
+            let mut hit = None;
+            for j in 0..keys.len() {
+                if !keys.is_null(j) && keys.value(j) == key {
+                    hit = Some(j);
+                    break;
+                }
+            }
+            match hit {
+                Some(j) if !vals.is_null(j) => out.append_value(vals.value(j)),
+                _ => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// Regression test for the issue #239 data-loss bug: DataFusion's mandatory
+/// `Inexact` residual re-applies `attrs['service.name'] = 'api'` against the
+/// `attrs` column, so that column must carry the same resource/scope data the
+/// scan's stream-identity check verifies. If `attrs` holds only per-record
+/// dynamic attributes, a record whose `service.name` is a genuine *resource*
+/// attribute (the normal OTLP shape) is silently dropped by the residual even
+/// though the scan verified its stream matches.
+///
+/// This drives a REAL `TableProvider::scan` inside a `SessionContext` (unlike
+/// the two tests above, which execute the scan leaf directly and so never run
+/// the residual `FilterExec` that exposes this bug).
+///
+/// Records:
+/// - ts=1: `service.name = "api"` ONLY as a resource attribute, no dynamic
+///   attrs. The record-only `attrs` column omitted it -> the dropped row.
+/// - ts=2: a different resource `service.name = "worker"` (non-matching stream).
+/// - ts=3: `service.name = "api"` as a genuine per-record dynamic attribute, in
+///   a stream that ALSO carries resource `service.name = "api"` (exercises the
+///   merge collision rule: record value wins, one key, still `"api"`).
+#[tokio::test]
+async fn residual_recheck_keeps_resource_only_stream_attr_match() {
+    let store = MemoryStore::new();
+
+    let rec1 = record_with_resource(
+        &[("service.name".into(), AttrValue::Str("api".into()))],
+        1,
+        "resource only",
+    );
+    let rec2 = record_with_resource(
+        &[("service.name".into(), AttrValue::Str("worker".into()))],
+        2,
+        "other stream",
+    );
+    let mut rec3 = record_with_resource(
+        &[("service.name".into(), AttrValue::Str("api".into()))],
+        3,
+        "record attr",
+    );
+    rec3.attrs = vec![("service.name".into(), AttrValue::Str("api".into()))];
+
+    let seg = write_object(&store, "logs/resource-attr.rlog", &[rec1, rec2, rec3]).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+    };
+    let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(ScalarUDF::from(GetField::new()));
+    ctx.register_table("logs", Arc::new(provider))
+        .expect("register table");
+
+    // WHERE get_field(attrs, 'service.name') = 'api' -- the programmatic form of
+    // `attrs['service.name'] = 'api'`, so this drives the real
+    // supports_filters_pushdown -> scan -> residual FilterExec path.
+    let get_field = ScalarUDF::from(GetField::new());
+    let filter = get_field
+        .call(vec![col("attrs"), lit("service.name")])
+        .eq(lit("api"));
+
+    let df = ctx
+        .table("logs")
+        .await
+        .expect("table")
+        .filter(filter)
+        .expect("filter");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+    let batches = collect_plan(plan).await;
+
+    let mut got = BTreeSet::new();
+    for batch in &batches {
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("ts col");
+        for i in 0..batch.num_rows() {
+            got.insert(ts.value(i));
+        }
+    }
+
+    assert_eq!(
+        got,
+        BTreeSet::from([1, 3]),
+        "residual must keep ts=1 (resource-only match) and ts=3 (record attr), \
+         and exclude ts=2 (non-matching stream); got {got:?}"
     );
 }
