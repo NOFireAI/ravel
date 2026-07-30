@@ -31,6 +31,18 @@ COPY . .
 # ravel-server with the `sql` feature (POST /api/v1/sql). `flight-sql` stays
 # off while unimplemented (ADR-0034 decision 5). ravel-cli has no feature flags
 # and is built plain. --locked builds against the committed Cargo.lock.
+#
+# CARGO_BUILD_JOBS is capped, not left at cargo's default (one job per host
+# core): the root Cargo.toml's release profile (lto = "thin", codegen-units =
+# 1, debug = 1) gives each rustc a high peak RSS, and datafusion's crates are
+# the worst of them. Measured on an 8 GiB / 8-core Docker host: the default
+# (8 parallel jobs) reliably OOM-kills the build partway through
+# datafusion-functions-aggregate (docker stats showed 7+ GiB used just before
+# the kill); capping to 2 jobs, everything else identical, builds clean. 2 is
+# deliberately conservative rather than tuned to one specific host's RAM,
+# since this Dockerfile has to build on whatever the CI runner and every
+# developer's machine actually provide, not just the box this was measured on.
+ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release --locked -p ravel-server --features sql \
     && cargo build --release --locked -p ravel-cli
 
@@ -48,7 +60,10 @@ EXPOSE 4318 4317
 
 # No default CMD: the operator supplies every argument (--mode, --store, listen
 # addresses, tenant tokens, ...) from the CRD, so baking defaults in would only
-# create a second source of truth. A bare `docker run <image>` therefore runs
-# `ravel-server` with no args, which prints usage and exits; `docker run <image>
-# --help` is the runtime smoke test.
+# create a second source of truth. Every ravel-server flag defaults to
+# something runnable (--mode all, --store memory, --listen-http
+# 127.0.0.1:4318), so a bare `docker run <image>` does NOT print usage and
+# exit -- it starts a real server against an in-memory store and blocks.
+# `docker run <image> --help` is the runtime smoke test; a bare `docker run`
+# is a real (if minimally configured) server process, not a no-op.
 ENTRYPOINT ["/usr/local/bin/ravel-server"]
