@@ -60,7 +60,19 @@ ingest or query surface: it is a disposable background worker that drives
 `ravel-maintain`'s compaction, age-based retention, and GC sweeper per
 tenant over every shard (docs/compaction-retention-plan.md P8). It requires
 a `multipart`-capable object store (compaction is the only writer of
-multipart objects) and still binds `--listen-http` for liveness only.
+multipart objects) and still binds `--listen-http`, serving the `/healthz`
+and `/readyz` routes only (no ingest or query surface).
+
+Every mode, maintain included, serves two health routes on `--listen-http`
+(ADR-0034 decision 4). `/healthz` (liveness) returns 200 whenever the HTTP
+listener is serving, so a routed 200 proves the axum event loop is alive.
+`/readyz` (readiness) returns 503 until startup has fully completed (config
+parsed, the object-store capability gate passed, both listeners bound) and
+200 thereafter; it performs no object-store call per probe, deliberately, to
+avoid adding S3 cost on every kubelet probe and to avoid a transient S3 blip
+ejecting every pod from its Service at once. In maintain mode these two
+routes are the entire HTTP surface: liveness there means the routes answer,
+not merely that a TCP connection is accepted.
 
 Remote Write (ADR-0015) reuses this same gateway/router/shard pipeline: RW1
 and RW2 payloads decode and normalize to the same `NormalizedPoint` shape

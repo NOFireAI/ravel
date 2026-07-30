@@ -134,17 +134,27 @@ jobs:
         run: cargo nextest run -p ravel-otap --test fuzz_mutation
 
   # Runs the object-store contract suite (docs/object-store-contract.md)
-  # against a real MinIO endpoint. Without this job the `minio_contract`
-  # test in crates/ravel-object-store/tests/contract.rs early-returns
-  # (RAVEL_MINIO_URL unset), so the only durable backend Ravel ships against
-  # -- S3 -- gets zero CI coverage and an S3Store regression passes green
-  # (finding a11-F02). This job is required: object storage is the source of
-  # truth, so a break in the S3 adapter must fail CI, not be waved through.
+  # against real S3-compatible endpoints: MinIO, and floci. Without this job
+  # the `minio_contract` and `floci_contract` tests in
+  # crates/ravel-object-store/tests/contract.rs early-return
+  # (RAVEL_MINIO_URL / RAVEL_FLOCI_URL unset), so the only durable backend
+  # Ravel ships against -- S3 -- gets zero CI coverage and an S3Store
+  # regression passes green (finding a11-F02). This job is required: object
+  # storage is the source of truth, so a break in the S3 adapter must fail
+  # CI, not be waved through.
   #
   # MinIO is launched with `docker run` rather than a GitHub Actions service
   # container because the minio/minio image needs a `server /data` command,
   # which the `services:` syntax cannot supply. The image and default
   # credentials mirror deploy/docker-compose/minio.yml's role.
+  #
+  # floci runs as a second container alongside MinIO on its own port, not in
+  # place of it: MinIO stays the backend this repo has proven, and ADR-0034
+  # decision 8 names it as the fallback if floci ever regresses. This is the
+  # permanent gate for the fake-S3 backend of the kind development
+  # environment and the k8s CI lane -- a floci release that stops satisfying
+  # `Capabilities::mandatory()` or multipart must fail here rather than be
+  # discovered in the k8s lane.
   object-store-contract:
     runs-on: ubuntu-latest
     env:
@@ -223,9 +233,77 @@ jobs:
             echo "::error::minio_contract did not run (expected 1 passed)"
             exit 1
           fi
+      # floci: the fake-S3 backend ADR-0034 decision 8 gates here before the
+      # kind environment and the k8s lane are allowed to depend on it. Single
+      # native-binary container, S3 on port 4566, configured entirely by env
+      # vars, path-style addressing (which is what ravel-server hardcodes).
+      - name: Start floci
+        run: |
+          docker run -d --name floci \
+            -p 4566:4566 \
+            floci/floci:latest
+      - name: Wait for floci S3 to be live
+        run: |
+          # floci reports per-service readiness, so wait on S3 specifically
+          # rather than on the process being up: the container answers on
+          # 4566 before every handler is running.
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:4566/_floci/health | grep -q '"s3":"running"'; then
+              echo "floci S3 is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "floci did not become healthy in time"
+          docker logs floci || true
+          exit 1
+      - name: Create the contract-suite bucket in floci
+        run: |
+          # A plain CreateBucket PUT. floci accepts any credentials and does
+          # not verify request signatures, so this needs no SigV4 signing and
+          # therefore no AWS CLI and no extra container -- unlike MinIO,
+          # whose bucket step above needs `mc`. Idempotent: a repeat PUT of an
+          # existing bucket also returns 200.
+          curl -fsS -o /dev/null -X PUT http://localhost:4566/ravel-object-store-test
+          # Verify rather than trust: HEAD on a missing bucket returns 404, so
+          # a 200 here proves the bucket the test needs actually exists.
+          bucket_status=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+            http://localhost:4566/ravel-object-store-test)
+          if [ "$bucket_status" != "200" ]; then
+            echo "::error::floci bucket create did not take (HEAD returned $bucket_status)"
+            docker logs floci || true
+            exit 1
+          fi
+      - name: Run object-store contract suite against floci
+        env:
+          RAVEL_FLOCI_URL: http://localhost:4566
+          RAVEL_FLOCI_BUCKET: ravel-object-store-test
+          RAVEL_FLOCI_ACCESS_KEY: test
+          RAVEL_FLOCI_SECRET_KEY: test
+          RAVEL_FLOCI_REGION: us-east-1
+        run: |
+          set -o pipefail
+          # Same invocation shape as the MinIO step above; see its comment for
+          # why `--no-capture` and `--color never` are needed for the greps.
+          cargo nextest run -p ravel-object-store --test contract \
+            -E 'test(=floci_contract)' --no-capture --color never 2>&1 \
+            | tee floci-contract-output.txt
+          # Prove the suite ran against floci rather than taking the
+          # RAVEL_FLOCI_URL-unset early return.
+          if grep -q "skipping floci contract test" floci-contract-output.txt; then
+            echo "::error::floci_contract skipped despite RAVEL_FLOCI_URL set"
+            exit 1
+          fi
+          if ! grep -qE "1 tests? run: 1 passed" floci-contract-output.txt; then
+            echo "::error::floci_contract did not run (expected 1 passed)"
+            exit 1
+          fi
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio || true
+      - name: Stop floci
+        if: always()
+        run: docker rm -f floci || true
 
   # PromQL differential test (issue #124, docs/promql-evaluator-plan.md
   # section 5, ADR-0021 decisions 4-5): checks Ravel's PromQL evaluator

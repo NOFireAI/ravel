@@ -43,7 +43,11 @@
 //!   nowhere to go on the wire. `put()` still runs it as a local pre-flight
 //!   against the input buffer, catching a caller/payload mismatch before we
 //!   even talk to S3, but that check proves nothing about bytes actually
-//!   received by the server. See `capabilities()` below.
+//!   received by the server. Because the limitation is permanent and affects
+//!   every S3-compatible endpoint, `upload_checksum` is not part of
+//!   [`Capabilities::mandatory`] and does not gate startup (issue #251);
+//!   read-time integrity comes from the segment crc32c hierarchy instead.
+//!   See `capabilities()` below.
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -436,12 +440,14 @@ impl ObjectStoreBackend for S3Store {
             // request (see `Client::with_payload` in `object_store`'s
             // `aws/client.rs`). So `put()`'s CRC32C check above can only ever
             // be a local pre-flight against our own input buffer; it cannot
-            // catch corruption introduced in transit. Per the contract doc's
-            // mandatory-capabilities table, a backend that cannot honor
-            // `upload_checksum` must report it as unsupported so production
-            // startup fails loudly instead of trusting integrity this
-            // adapter does not provide (docs/object-store-contract.md
-            // "Mandatory capabilities").
+            // catch corruption introduced in transit, so this reports the
+            // capability as unsupported rather than claiming integrity the
+            // adapter does not provide. The flag is not startup-gating: it is
+            // not in `Capabilities::mandatory()` precisely because no
+            // S3-compatible endpoint can satisfy it through this client
+            // (issue #251), and read-time integrity comes from the
+            // footer/section/page crc32c hierarchy instead
+            // (docs/object-store-contract.md "Upload checksums").
             upload_checksum: false,
             prefix_list: true,
             multipart: false,
