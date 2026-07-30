@@ -140,9 +140,11 @@ curl -G http://127.0.0.1:4318/api/v1/query_range \
 
 ### SQL
 
-`POST /api/v1/sql` runs a read-only SQL statement against a `samples(ts,
-value, ...)` table via DataFusion. It is off by default: build or run
-`ravel-server` with the `sql` cargo feature to enable it.
+`POST /api/v1/sql` runs a read-only SQL statement via DataFusion, against
+either of two tables: `samples(ts, value, ...)` (metrics) or `logs(ts,
+severity_text, body, attrs, ...)` (ADR-0033). A query references one or the
+other, never both. It is off by default: build or run `ravel-server` with the
+`sql` cargo feature to enable it.
 
 ```sh
 cargo run -p ravel-server --features sql -- \
@@ -159,6 +161,16 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
         "end": 1893456000
       }'
 # {"status":"success","data":{"rows":[[100,1.0],[200,2.5]]}}
+
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "query": "SELECT ts, body FROM logs WHERE has_word(body, '\''timeout'\'') ORDER BY ts",
+        "start": 0,
+        "end": 1893456000
+      }'
+# {"status":"success","data":{"rows":[[150,"connection timeout"]]}}
 ```
 
 Only `SELECT` is accepted (no `INSERT`/`COPY`/`CREATE EXTERNAL TABLE`/`SET`/
@@ -168,7 +180,8 @@ raw backend or DataFusion plan text. Send `Accept:
 application/vnd.apache.arrow.stream` instead of JSON for a bit-exact Arrow
 IPC stream (needed for `NaN`/`-0.0` payloads, which JSON cannot represent
 exactly). Flight SQL (the gRPC equivalent) is available behind
-`ravel-server`'s `flight-sql` cargo feature.
+`ravel-server`'s `flight-sql` cargo feature; see docs/guides/query.md for the
+full `logs` table reference (schema, supported predicates, known gaps).
 
 ### Analytics
 
