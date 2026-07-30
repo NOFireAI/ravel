@@ -9,6 +9,7 @@ rust-version.workspace = true
 ravel-types = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-catalog = { workspace = true }
+ravel-maintain = { workspace = true }
 ravel-ingest = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-remote-write = { workspace = true }

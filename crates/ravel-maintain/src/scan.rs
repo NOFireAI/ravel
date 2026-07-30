@@ -12,8 +12,10 @@ use ravel_types::{Signal, TenantHash};
 use crate::bucket::Bucket;
 use crate::clock::Clock;
 use crate::compact::{CompactionOutcome, compact_bucket};
-use crate::config::CompactorConfig;
+use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
+use crate::retention::{RetentionOutcome, maintain_bucket};
+use crate::sweep::LeaseCheck;
 
 /// One-byte version tag on the advisory cursor payload. The cursor is not a
 /// frozen format; the tag only lets a future encoding change be detected and
@@ -50,22 +52,7 @@ pub async fn scan_and_compact(
     let cursor = read_cursor(store, &cursor_key).await?;
     let start_after = cursor.as_ref().map(|(hour, _)| *hour);
 
-    let shard_prefix = keys::commit_shard_prefix(&tenant_hash, signal, shard)?;
-    let listed = store.list_delimited(&shard_prefix).await?;
-    let mut hours: Vec<u32> = Vec::new();
-    for common in &listed.common_prefixes {
-        // common == "<shard_prefix><hour>/"; extract the hour segment.
-        let rest = common
-            .strip_prefix(&shard_prefix)
-            .and_then(|r| r.strip_suffix('/'))
-            .unwrap_or("");
-        match keys::parse_ingest_hour_string(rest) {
-            Ok(hour) => hours.push(hour),
-            // A non-hour common prefix under the shard is layout drift.
-            Err(e) => return Err(MaintainError::Key(e)),
-        }
-    }
-    hours.sort_unstable();
+    let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
 
     let mut report = ScanReport {
         compacted: 0,
@@ -106,6 +93,106 @@ pub async fn scan_and_compact(
         report.cursor_advanced_to = Some(hour);
     }
 
+    Ok(report)
+}
+
+/// Outcome of one full-scan maintenance pass over a `(tenant, signal, shard)`
+/// ([`scan_and_maintain`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintainReport {
+    /// Sealed buckets whose retention pass wrote or already held a tombstone
+    /// (expired), or that were physically swept this pass.
+    pub retired: usize,
+    /// Buckets compacted this pass (retention left them live and they were
+    /// eligible).
+    pub compacted: usize,
+    /// Buckets already compacted / below the input threshold (retention left
+    /// them live, compaction found nothing to do).
+    pub already_done: usize,
+    /// Buckets skipped because not yet sealed.
+    pub not_sealed: usize,
+}
+
+/// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
+/// ascending. Shared by [`scan_and_compact`] and [`scan_and_maintain`]; a
+/// non-hour common prefix under the shard is layout drift and errors.
+async fn list_shard_hours(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<Vec<u32>> {
+    let shard_prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
+    let listed = store.list_delimited(&shard_prefix).await?;
+    let mut hours: Vec<u32> = Vec::new();
+    for common in &listed.common_prefixes {
+        // common == "<shard_prefix><hour>/"; extract the hour segment.
+        let rest = common
+            .strip_prefix(&shard_prefix)
+            .and_then(|r| r.strip_suffix('/'))
+            .unwrap_or("");
+        match keys::parse_ingest_hour_string(rest) {
+            Ok(hour) => hours.push(hour),
+            Err(e) => return Err(MaintainError::Key(e)),
+        }
+    }
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+/// Run retention-before-compaction over *every* sealed bucket of one
+/// `(tenant, signal, shard)`, via [`maintain_bucket`]. Unlike
+/// [`scan_and_compact`], this does NOT use the advisory compaction cursor: the
+/// cursor advances monotonically past done buckets and never revisits them,
+/// but retention must re-evaluate every sealed bucket on every pass (a bucket
+/// compacted long ago becomes retention-expired only later, and a tombstoned
+/// bucket needs a later pass to run its horizon-gated physical sweep once the
+/// protection horizon has elapsed). A cursor-skipping driver would silently
+/// never retire aging data. So this walks all hours each pass, matching the
+/// cursorless full-scan model [`crate::sweep::sweep_shard`] uses, and pairs
+/// with a `sweep_shard` call for the same shard to run all three deletion
+/// paths per tick (plan §8). Idempotent: `maintain_bucket` and every rule it
+/// drives converge on re-run.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_and_maintain(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    retention: &RetentionConfig,
+    lease: &dyn LeaseCheck,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<MaintainReport> {
+    let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
+    let mut report = MaintainReport::default();
+    for hour in hours {
+        let bucket = Bucket::new(tenant_hash, signal, shard, hour);
+        let (retention_outcome, compaction) =
+            maintain_bucket(store, clock, config, retention, lease, &bucket).await?;
+        match retention_outcome {
+            // The bucket is (being) retired; compaction was skipped by design.
+            RetentionOutcome::Tombstoned
+            | RetentionOutcome::Swept
+            | RetentionOutcome::SweptPartial => {
+                report.retired += 1;
+            }
+            // Retention left the bucket live; the compaction outcome classifies
+            // it (compaction always ran in these arms; see maintain_bucket).
+            RetentionOutcome::NoPolicy
+            | RetentionOutcome::NotSealed
+            | RetentionOutcome::NotExpired => match compaction {
+                Some(CompactionOutcome::NotSealed) => report.not_sealed += 1,
+                Some(CompactionOutcome::Compacted { .. }) => report.compacted += 1,
+                Some(
+                    CompactionOutcome::AlreadyCompacted
+                    | CompactionOutcome::Tombstoned
+                    | CompactionOutcome::BelowMinInputs { .. },
+                ) => report.already_done += 1,
+                None => {}
+            },
+        }
+    }
     Ok(report)
 }
 

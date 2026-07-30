@@ -13,6 +13,7 @@ ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
+ravel-maintain = { workspace = true }
 prost = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }

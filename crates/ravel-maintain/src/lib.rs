@@ -54,7 +54,7 @@ pub use error::{MaintainError, Result};
 pub use publish::PublishOutcome;
 pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rlog::RlogCodec;
-pub use scan::{ScanReport, scan_and_compact};
+pub use scan::{MaintainReport, ScanReport, scan_and_compact, scan_and_maintain};
 pub use sweep::{
     LeaseCheck, NoLeases, SweepReport, sweep_orphans, sweep_shard, sweep_superseded,
     sweep_unreferenced_parts,

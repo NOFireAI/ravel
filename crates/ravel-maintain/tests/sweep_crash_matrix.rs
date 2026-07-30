@@ -691,3 +691,47 @@ async fn orphan_gc_respects_live_records_and_age_gate() {
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
 }
+
+// --- P8: dry-run reports the eligible set but deletes nothing ---------------
+
+#[tokio::test]
+async fn dry_run_sweep_reports_eligible_set_but_deletes_nothing() {
+    async fn run(sig: Sig) {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(sealed_now_ns());
+        let bucket = seed_and_compact(&store, &clock, sig).await;
+
+        let before_records = l0_commit_count(&store, &bucket).await;
+        let before_data = l0_data_count(&store, &bucket).await;
+        assert!(before_records >= 2 && before_data >= 2);
+
+        // Past the supersession horizon, so the superseded rule is eligible.
+        let record = fetch_compaction_record(&store, &bucket).await;
+        let mut config = cfg();
+        config.dry_run = true;
+        let now = past_horizon(record.created_unix_ns, &config);
+        let clock = FixedClock::new(now);
+
+        let report = sweep_shard(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+        )
+        .await
+        .expect("dry-run sweep");
+
+        // The report reflects exactly what a real run would delete...
+        assert_eq!(report.superseded_records_deleted, before_records);
+        assert_eq!(report.superseded_data_deleted, before_data);
+        // ...but nothing was actually deleted, and the L1 output is intact.
+        assert_eq!(l0_commit_count(&store, &bucket).await, before_records);
+        assert_eq!(l0_data_count(&store, &bucket).await, before_data);
+        assert_l1_intact(&store, &bucket).await;
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+}

@@ -102,6 +102,55 @@ async fn compacts_bucket_and_preserves_all_samples() {
 }
 
 #[tokio::test]
+async fn dry_run_reports_the_plan_but_writes_nothing() {
+    // P8: config.dry_run computes the identical eligible set and part plan a
+    // real run would, but skips every store.put. The reported outcome reflects
+    // what a real run *would* have written; the store is left untouched.
+    let store = MemoryStore::new();
+    let specs = three_inputs();
+    for s in &specs {
+        seed_input(&store, s).await;
+    }
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = bucket();
+
+    let mut config = cfg();
+    config.dry_run = true;
+    let outcome = compact_bucket(&store, &clock, &config, &bucket)
+        .await
+        .expect("dry-run compact");
+    match outcome {
+        CompactionOutcome::Compacted { parts, publish } => {
+            assert!(parts >= 1, "dry run must report the parts it would write");
+            assert_eq!(publish, PublishOutcome::Published);
+        }
+        other => panic!("expected Compacted, got {other:?}"),
+    }
+
+    // Nothing persisted: no l1/ part object anywhere.
+    let all = ravel_object_store::list_all(&store, "t/")
+        .await
+        .expect("list");
+    for meta in &all {
+        assert!(
+            !meta.key.contains("/l1/"),
+            "dry run wrote an L1 part: {}",
+            meta.key
+        );
+    }
+
+    // A subsequent real run still sees the bucket as uncompacted, proving the
+    // dry run published no compaction record.
+    let real = compact_bucket(&store, &clock, &cfg(), &bucket)
+        .await
+        .expect("real compact");
+    assert!(
+        matches!(real, CompactionOutcome::Compacted { .. }),
+        "dry run must not have persisted a record: {real:?}"
+    );
+}
+
+#[tokio::test]
 async fn not_sealed_is_skipped() {
     let store = MemoryStore::new();
     for s in &three_inputs() {

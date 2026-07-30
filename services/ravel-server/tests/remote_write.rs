@@ -148,6 +148,7 @@ async fn start_test_server() -> ravel_server::Running {
             enabled: false,
             ..FoldTaskConfig::default()
         },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
     };
     ravel_server::start(config, store)
         .await

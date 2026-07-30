@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use clap::{Parser, ValueEnum};
+use ravel_maintain::RetentionPolicy;
 use ravel_types::TenantId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -11,6 +12,10 @@ pub enum Mode {
     All,
     Gateway,
     Query,
+    /// Background maintenance only: compaction, age-based retention, and the
+    /// GC sweeper (docs/compaction-retention-plan.md P8). Serves no ingest or
+    /// query routes; requires a backend that supports multipart uploads.
+    Maintain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -79,6 +84,28 @@ pub struct Cli {
     /// hours, in seconds (docs/metric-index-plan.md section 4).
     #[arg(long, default_value_t = 300)]
     pub fold_interval_secs: u64,
+
+    /// How often each tenant's maintenance task (`--mode maintain`) wakes up to
+    /// run retention, compaction, and the sweeper over every shard, in seconds
+    /// (docs/compaction-retention-plan.md P8).
+    #[arg(long, default_value_t = 300)]
+    pub maintain_interval_secs: u64,
+
+    /// Default age-based retention window applied to every tenant with no
+    /// explicit `--retention-tenant` override, as a humantime duration
+    /// (e.g. `30d`, `720h`). Omitted means no default retention: nothing is
+    /// ever deleted by age unless a per-tenant window is set (ADR-0019 §5).
+    /// Validated at startup against the ADR-0019 floor; a window below the
+    /// floor fails startup rather than being clamped.
+    #[arg(long, value_name = "DURATION")]
+    pub retention_default: Option<String>,
+
+    /// Repeatable per-tenant retention override, `TENANT=DURATION`
+    /// (e.g. `acme=30d`), overriding `--retention-default` for that tenant.
+    /// The duration is parsed with `humantime::parse_duration`, matching the
+    /// existing duration-string convention in this crate.
+    #[arg(long = "retention-tenant", value_name = "TENANT=DURATION")]
+    pub retention_tenants: Vec<String>,
 }
 
 impl Cli {
@@ -95,4 +122,40 @@ impl Cli {
         }
         Ok(map)
     }
+
+    /// Build the raw [`RetentionPolicy`] from `--retention-default` and the
+    /// repeatable `--retention-tenant TENANT=DURATION`. Durations are parsed
+    /// with `humantime::parse_duration` (the existing duration convention in
+    /// this crate; see `analytics.rs`). This only parses the strings into
+    /// nanosecond windows; the ADR-0019 floor validation happens later, in
+    /// `RetentionConfig::from_policy`, so a below-floor window is rejected
+    /// against the running process's actual compactor and catalog config.
+    pub fn parse_retention_policy(&self) -> anyhow::Result<RetentionPolicy> {
+        let default = self
+            .retention_default
+            .as_deref()
+            .map(parse_window_ns)
+            .transpose()?;
+        let mut tenants = Vec::with_capacity(self.retention_tenants.len());
+        for pair in &self.retention_tenants {
+            let (tenant, dur) = pair.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("invalid --retention-tenant '{pair}', expected TENANT=DURATION")
+            })?;
+            if tenant.is_empty() || dur.is_empty() {
+                anyhow::bail!("invalid --retention-tenant '{pair}', expected TENANT=DURATION");
+            }
+            tenants.push((tenant.to_string(), parse_window_ns(dur)?));
+        }
+        Ok(RetentionPolicy { default, tenants })
+    }
+}
+
+/// Parse a humantime duration string into a nanosecond window, rejecting
+/// values that overflow `i64` nanoseconds (retention windows are far smaller
+/// than that in practice; this only guards against absurd input).
+fn parse_window_ns(s: &str) -> anyhow::Result<i64> {
+    let dur = humantime::parse_duration(s)
+        .map_err(|e| anyhow::anyhow!("invalid retention duration '{s}': {e}"))?;
+    i64::try_from(dur.as_nanos())
+        .map_err(|_| anyhow::anyhow!("retention duration '{s}' is too large"))
 }
