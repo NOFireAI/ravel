@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
-use ravel_object_store::{Capabilities, ObjectStoreBackend};
+use ravel_object_store::{Capabilities, InstrumentedStore, ObjectStoreBackend, StoreMetrics};
 
 use crate::config::{Cli, Mode, StoreKind};
 
@@ -122,9 +122,27 @@ pub fn check_mandatory_capabilities(
     check_capabilities(backend, Mode::All)
 }
 
-pub fn build_store(cli: &Cli) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
-    let store: Arc<dyn ObjectStoreBackend> = match cli.store {
-        StoreKind::Memory => Arc::new(MemoryStore::new()),
+/// Build the configured backend, wrap it in the instrumentation decorator, and
+/// enforce the capability contract for `cli.mode`.
+///
+/// Returns the store the whole process shares plus the metrics handle the
+/// decorator counts into. Every backend is wrapped, unconditionally and in
+/// every mode: the decorator is observability only, never
+/// correctness-bearing, and wrapping is a zero behavior change (results
+/// forward verbatim and `capabilities()` passes through), so there is no
+/// configuration to get wrong and no "instrumented vs not" pair of behaviors
+/// to reason about. Because capabilities pass through, the gate below still
+/// checks the real backend's declaration.
+///
+/// Nothing surfaces the handle yet (no scrape endpoint, no exporter); it is
+/// returned so the caller can hold it for that later work.
+pub fn build_store(cli: &Cli) -> anyhow::Result<(Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>)> {
+    let (store, metrics): (Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>) = match cli.store {
+        StoreKind::Memory => {
+            let instrumented = InstrumentedStore::new(MemoryStore::new());
+            let metrics = instrumented.metrics();
+            (Arc::new(instrumented), metrics)
+        }
         StoreKind::S3 => {
             let bucket = cli
                 .s3_bucket
@@ -156,12 +174,16 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
             };
             let store = S3Store::new(config)
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
-            Arc::new(store)
+            let instrumented = InstrumentedStore::new(store);
+            let metrics = instrumented.metrics();
+            (Arc::new(instrumented), metrics)
         }
     };
 
+    // Runs against the decorator, which passes `capabilities()` straight
+    // through, so this still gates on the wrapped backend's own declaration.
     check_capabilities(store.as_ref(), cli.mode)?;
-    Ok(store)
+    Ok((store, metrics))
 }
 
 #[cfg(test)]
@@ -396,5 +418,41 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert!(matches!(cli.store, StoreKind::Memory));
         build_store(&cli).expect("memory backend must build and satisfy the capability gate");
+    }
+
+    /// The built store is instrumented, and the instrumentation is invisible
+    /// to the capability gate: `MemoryStore` supports `upload_checksum` on the
+    /// wire, so the decorator must report that flag too rather than flattening
+    /// the set to `mandatory()` (issue #272). The counters are proven to be
+    /// the returned handle's by driving one operation through the store.
+    #[tokio::test]
+    async fn build_store_wraps_the_backend_and_passes_capabilities_through() {
+        use clap::Parser;
+        use ravel_object_store::PutOptions;
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let (store, metrics) = build_store(&cli).expect("memory backend must build");
+        assert_eq!(
+            store.capabilities(),
+            MemoryStore::new().capabilities(),
+            "the decorator must report the wrapped backend's capabilities verbatim"
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            ravel_object_store::instrument::StoreMetricsSnapshot::default(),
+            "a freshly built store has recorded nothing"
+        );
+
+        store
+            .put("t/k", Bytes::from_static(b"abc"), PutOptions::default())
+            .await
+            .expect("put through the instrumented store");
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.put.calls, 1,
+            "the returned handle must be the live one"
+        );
+        assert_eq!(snap.put.ok, 1);
+        assert_eq!(snap.put.bytes, 3);
     }
 }

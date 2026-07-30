@@ -31,7 +31,11 @@ async fn main() -> anyhow::Result<()> {
     let fold_tenants = tenant_tokens.values().map(|id| id.hash()).collect();
     let tenant_resolver =
         ravel_server::tenant::build_resolver(tenant_tokens, cli.dev_insecure_tenant_header);
-    let store =
+    // Every object-store call this process makes is counted by the decorator
+    // `build_store` wraps the backend in (issue #272). Held for the whole
+    // process lifetime so a later task can surface the counters; nothing
+    // scrapes or exports them yet, and nothing correctness-bearing reads them.
+    let (store, _store_metrics) =
         ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
     // Retention windows are validated at startup against the ADR-0019 floor,
