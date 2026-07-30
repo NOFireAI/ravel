@@ -31,6 +31,7 @@ use ravel_object_store::{
 /// own key sub-prefix under `root` so they can share one backend instance
 /// (and, for the MinIO case, one long-lived bucket) without colliding.
 async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
+    assert_satisfies_mandatory_capabilities(store);
     assert_create_if_absent_atomicity(store, &format!("{root}/create-if-absent/")).await;
     assert_cas_version_semantics(store, &format!("{root}/cas/")).await;
     assert_range_and_suffix_reads(store, &format!("{root}/range/")).await;
@@ -38,6 +39,29 @@ async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
     assert_delimited_listing(store, &format!("{root}/delim/")).await;
     assert_idempotent_delete(store, &format!("{root}/delete/")).await;
     assert_upload_checksum_verification(store, &format!("{root}/checksum/")).await;
+}
+
+/// Every backend the suite runs must report at least the capability set
+/// ravel-server's startup gate requires (`Capabilities::mandatory`, checked by
+/// `ravel_server::store::check_capabilities` for every non-maintain mode). A
+/// backend may report more than the mandatory set: `MemoryStore` supports
+/// `upload_checksum` on the wire, `S3Store` cannot (issue #251), and both are
+/// startable. Asserting `satisfies` rather than equality keeps that difference
+/// legal while still failing the moment a backend loses a flag production
+/// needs.
+///
+/// Distinct from [`assert_mandatory_capabilities`] below: this is a cheap,
+/// synchronous check of the backend's static `capabilities()` declaration,
+/// run for every backend the suite exercises. The other function does live
+/// per-flag round trips against a real S3-compatible endpoint and is called
+/// only from the S3/MinIO/floci-specific tests.
+fn assert_satisfies_mandatory_capabilities(store: &dyn ObjectStoreBackend) {
+    let caps = store.capabilities();
+    assert!(
+        caps.satisfies(&Capabilities::mandatory()),
+        "backend must satisfy the mandatory capability set the server gates \
+         startup on, got {caps:?}"
+    );
 }
 
 async fn assert_create_if_absent_atomicity(store: &dyn ObjectStoreBackend, prefix: &str) {
@@ -401,25 +425,20 @@ async fn assert_mandatory_capabilities(store: &dyn ObjectStoreBackend, prefix: &
     assert_paginated_listing_completeness(store, &format!("{prefix}prefix-list/")).await;
     assert_delimited_listing(store, &format!("{prefix}prefix-list-delimited/")).await;
 
-    // upload_checksum, the one mandatory flag left. `S3Store::capabilities()`
-    // is a constant of the adapter, not a function of the endpoint, so this
-    // asserts the same thing for floci as it would for MinIO or real AWS S3:
-    // every mandatory flag is declared supported except `upload_checksum`,
-    // which `object_store` 0.14 cannot put on the wire at all (see
-    // `s3_store_reports_upload_checksum_unsupported` above and the module
-    // docs on `s3::S3Store`). Written as an exact equality rather than
-    // `satisfies(&mandatory())` so movement in either direction -- a backend
-    // gaining a capability or the adapter losing one -- fails here instead of
-    // passing silently. Note what this therefore records: the declared set
-    // does NOT satisfy `mandatory()`, because of that adapter-wide gap and
-    // for no reason to do with the endpoint under test.
-    let mut expected = Capabilities::mandatory();
-    expected.upload_checksum = false;
+    // Declared capabilities must be exactly the mandatory set. `upload_checksum`
+    // is no longer part of `Capabilities::mandatory()` (issue #251: it is a
+    // permanent `object_store` 0.14 client-library limitation, not an
+    // endpoint-specific gap, so requiring it made the only durable backend
+    // unstartable everywhere). `S3Store::capabilities()` is a constant of the
+    // adapter, not a function of the endpoint, so this asserts the same thing
+    // for floci as it would for MinIO or real AWS S3. Written as an exact
+    // equality rather than `satisfies(&mandatory())` so movement in either
+    // direction -- a backend gaining a capability or the adapter losing one --
+    // fails here instead of passing silently.
     assert_eq!(
         store.capabilities(),
-        expected,
-        "declared capabilities must be the full mandatory set minus the \
-         adapter-wide upload_checksum gap"
+        Capabilities::mandatory(),
+        "declared capabilities must be exactly the mandatory set (issue #251)"
     );
     // The behavior behind the flag still has to hold: the local CRC32C
     // pre-flight rejects a mismatch without creating the object.
@@ -606,11 +625,15 @@ async fn fault_store_empty_plan_contract() {
 /// caller-supplied CRC32C to an outgoing `put` (its only integrity knob,
 /// `AmazonS3Builder::with_checksum_algorithm`, is a whole-client setting
 /// limited to SHA-256/CRC64NVME, and always has the crate compute the
-/// digest itself). So `S3Store` must report `upload_checksum` as
-/// unsupported rather than claim a mandatory capability
-/// (docs/object-store-contract.md "Mandatory capabilities") it cannot honor
-/// on the wire; production startup must fail loudly on this, per the
-/// contract, rather than trust integrity this adapter does not provide.
+/// digest itself). So `S3Store` must report `upload_checksum` as unsupported
+/// rather than claim on-the-wire integrity it cannot honor.
+///
+/// Because that gap is permanent and applies to every S3-compatible endpoint,
+/// `upload_checksum` is not startup-gating: it is not in
+/// `Capabilities::mandatory()` and no mode may require it
+/// (docs/object-store-contract.md, "Upload checksums"; issue #251). This test
+/// therefore also pins `S3Store`'s reported set to exactly the mandatory set,
+/// so the server's startup gate cannot start rejecting `--store s3` again.
 /// No `RAVEL_MINIO_URL` gate needed: `AmazonS3Builder::build` only
 /// validates configuration, it never talks to the network.
 #[test]
@@ -628,6 +651,12 @@ fn s3_store_reports_upload_checksum_unsupported() {
     assert!(
         !store.capabilities().upload_checksum,
         "S3Store must not claim upload_checksum support object_store 0.14 cannot provide"
+    );
+    assert_eq!(
+        store.capabilities(),
+        Capabilities::mandatory(),
+        "S3Store must report exactly the mandatory set, so the server's \
+         startup gate accepts --store s3 in every non-maintain mode (#251)"
     );
 }
 

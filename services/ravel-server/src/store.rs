@@ -41,6 +41,15 @@ impl std::error::Error for UnsatisfiedCapabilities {}
 /// NOT made globally mandatory: a gateway/query/all deployment keeps today's
 /// `mandatory()` set exactly (docs/compaction-retention-plan.md P8; the
 /// `Capabilities::mandatory` "mandatory from Phase 2" note).
+///
+/// `upload_checksum` is not required by any mode, including maintain, and no
+/// mode may add it. Unlike `multipart`, which some backend could supply and
+/// which one mode genuinely needs, `upload_checksum` is permanently
+/// unsatisfiable by S3, the only durable backend: the `object_store` client
+/// cannot put a caller-supplied CRC32C on the wire at all (issue #251, and
+/// the `Capabilities::mandatory` doc). Gating startup on it rejected every
+/// S3-compatible endpoint in every mode. Read-time integrity still comes
+/// from the segment crc32c hierarchy and `put()`'s local pre-flight check.
 pub fn required_capabilities(mode: Mode) -> Capabilities {
     let mut required = Capabilities::mandatory();
     if matches!(mode, Mode::Maintain) {
@@ -233,24 +242,86 @@ mod tests {
     #[test]
     fn backend_lying_about_mandatory_flag_fails_startup() {
         // A backend that reports a mandatory flag as unsupported (here
-        // upload_checksum, exactly as S3Store does today) must abort startup
-        // with a clear, actionable error rather than starting silently.
+        // suffix_range, which footer-first segment reads cannot work without)
+        // must abort startup with a clear, actionable error rather than
+        // starting silently.
         let mut caps = Capabilities::mandatory();
-        caps.upload_checksum = false;
+        caps.suffix_range = false;
         let backend = StubBackend { caps };
 
         let err = check_mandatory_capabilities(&backend)
             .expect_err("backend missing a mandatory flag must fail the check");
         assert!(
-            err.missing.contains("upload_checksum"),
+            err.missing.contains("suffix_range"),
             "error must name the offending flag, got: {}",
             err.missing
         );
         let rendered = err.to_string();
         assert!(
-            rendered.contains("mandatory capabilities") && rendered.contains("upload_checksum"),
+            rendered.contains("mandatory capabilities") && rendered.contains("suffix_range"),
             "error message must be actionable, got: {rendered}"
         );
+    }
+
+    /// Regression test for issue #251: `ravel-server --store s3` could not
+    /// start in any mode against any S3-compatible endpoint, because
+    /// `Capabilities::mandatory()` required `upload_checksum`, which
+    /// `S3Store` permanently reports as unsupported (`object_store` 0.14 has
+    /// no way to put a caller-supplied CRC32C on the wire). This stub
+    /// reports exactly the S3Store/MemoryStore-shaped set: every mandatory
+    /// flag, no `upload_checksum`, no `multipart`. It must pass the
+    /// non-maintain gate, and `upload_checksum` must not be requestable by
+    /// any mode.
+    #[test]
+    fn s3_shaped_backend_missing_only_upload_checksum_and_multipart_now_starts() {
+        let caps = Capabilities {
+            consistent_read: true,
+            consistent_list: true,
+            create_if_absent: true,
+            cas_version: true,
+            suffix_range: true,
+            upload_checksum: false,
+            prefix_list: true,
+            multipart: false,
+        };
+        let backend = StubBackend { caps };
+
+        check_mandatory_capabilities(&backend)
+            .expect("an S3-shaped backend without upload_checksum must start (issue #251)");
+        for mode in [Mode::All, Mode::Gateway, Mode::Query] {
+            check_capabilities(&backend, mode).unwrap_or_else(|e| {
+                panic!("{mode:?} must not require upload_checksum (issue #251), got: {e}")
+            });
+        }
+        for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
+            assert!(
+                !required_capabilities(mode).upload_checksum,
+                "no mode may require upload_checksum, {mode:?} does"
+            );
+        }
+    }
+
+    /// The real `S3Store`, not a stub: the backend `--store s3` builds must
+    /// satisfy the startup gate for every non-maintain mode. `S3Store::new`
+    /// only validates configuration, so this needs no endpoint.
+    #[test]
+    fn s3_store_satisfies_mandatory_capabilities() {
+        let store = S3Store::new(S3Config {
+            bucket: "ravel-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            access_key_id: "test".to_string(),
+            secret_access_key: "test".to_string(),
+            allow_http: true,
+            force_path_style: true,
+        })
+        .expect("dummy S3 config must build without network access");
+        assert!(
+            !store.capabilities().upload_checksum,
+            "precondition: S3Store reports upload_checksum unsupported"
+        );
+        check_mandatory_capabilities(&store)
+            .expect("S3Store must satisfy mandatory capabilities (issue #251)");
     }
 
     #[test]
