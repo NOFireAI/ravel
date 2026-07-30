@@ -831,6 +831,30 @@ mod tests {
         assert!(matches!(err, SqlError::CrossSignalQuery));
     }
 
+    /// A CTE named after the other table is query-local, not a base-table
+    /// reference, so it must not flip the signal or trip the cross-signal
+    /// rejection (ADR-0033 amendment; regression for the wiring wave, which
+    /// collected CTE names as if they were real tables).
+    #[test]
+    fn target_signal_does_not_treat_a_cte_name_as_the_real_table() {
+        // A CTE named `logs` reading only `samples` is a metrics query.
+        assert_eq!(
+            SqlExecutor::target_signal(
+                "WITH logs AS (SELECT value FROM samples) SELECT count(*) FROM logs"
+            )
+            .expect("cte named logs over samples is metrics-only"),
+            TargetSignal::Metrics
+        );
+        // A CTE named `samples` reading only `logs` is a logs query.
+        assert_eq!(
+            SqlExecutor::target_signal(
+                "WITH samples AS (SELECT body FROM logs) SELECT count(*) FROM samples"
+            )
+            .expect("cte named samples over logs is logs-only"),
+            TargetSignal::Logs
+        );
+    }
+
     #[test]
     fn resources_exhausted_keeps_its_own_counts() {
         let df = DataFusionError::ResourcesExhausted("needs 40 bytes, limit 8".to_string());

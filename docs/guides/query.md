@@ -189,9 +189,10 @@ server's configured default.
 ## SQL over the `logs` table
 
 `POST /api/v1/sql` (see README "SQL") serves two tables from one endpoint:
-`samples` (metrics) and `logs`. DataFusion picks the table from the query's
-`FROM` clause; a single query may reference one or the other, never both (a
-query naming both is rejected with HTTP 400). The request body, auth, window
+`samples` (metrics) and `logs`. The server parses the query's `FROM` clause
+before planning and registers only that one table for the query; a single
+query may reference one or the other, never both (a query naming both is
+rejected with HTTP 400). The request body, auth, window
 (`start`/`end`), and `min_commit_token` handling are identical to the `samples`
 case.
 

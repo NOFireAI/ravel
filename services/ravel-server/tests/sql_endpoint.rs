@@ -741,6 +741,44 @@ async fn sql_query_against_logs_table_returns_rows() {
     assert_eq!(rows[0][0], serde_json::json!(150));
 }
 
+/// A planning failure on a `logs` query returns the shared, redacted planning
+/// message -- and that message must not tell the client the problem is about
+/// the `samples` table (it named only `samples` before this fix). The
+/// `attrs['k']` subscript form is the documented logs planning gap (ADR-0033:
+/// no nested-expression `ExprPlanner` is registered, so it fails to plan
+/// loudly rather than answering wrong).
+#[tokio::test]
+async fn a_logs_plan_error_does_not_blame_the_samples_table() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_log_segment(
+        store.as_ref(),
+        &tenant,
+        0,
+        &[log_record("api", 100, "hello world")],
+    )
+    .await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    let (status, value) =
+        post_json(&app, "acme-token", "SELECT attrs['service.name'] FROM logs").await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert_eq!(value["errorType"], "execution");
+    let error = value["error"].as_str().expect("error string");
+    assert_eq!(error, ravel_sql::MSG_PLAN);
+    // The message must be accurate for a `logs` query: it names `logs`, and it
+    // must not tell the client the fix is about the `samples` table.
+    assert!(
+        error.contains("logs"),
+        "planning message must be accurate for a logs query: {error}"
+    );
+    assert!(
+        !error.contains("samples table"),
+        "planning message must not blame the samples table: {error}"
+    );
+}
+
 /// A `samples`-only query must not trigger a `Signal::Logs` catalog resolve
 /// (ADR-0033: resolve the logs snapshot only when the query references `logs`).
 /// Proven by counting the LIST calls against the logs commit keyspace

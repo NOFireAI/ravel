@@ -52,8 +52,15 @@ pub const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; 
 /// Stable client message for a DataFusion planning failure. Deliberately
 /// says nothing about which column, type, or plan node was at fault: those
 /// strings carry schema detail. The full error is logged server-side.
+///
+/// It names both v1 tables rather than one: a `Plan` error is built from a
+/// bare `DataFusionError` in `crate::executor::plan_error`, which has no
+/// handle on which table the failed query targeted, and a `logs` query can
+/// now fail to plan too (e.g. the `attrs['k']` subscript gap ADR-0033
+/// documents). Naming only `samples` would point a `logs` client at the
+/// wrong table.
 pub const MSG_PLAN: &str = "the SQL query could not be planned; check that it uses only the v1 subset \
-     over the samples table";
+     over the samples or logs table";
 
 /// Stable client message for a DataFusion execution failure that is not one
 /// of the classes above.
