@@ -256,7 +256,10 @@ impl ObjectStoreBackend for CountingStore {
 
 pub async fn run(config: &E2eConfig) -> Report {
     let store = Arc::clone(&config.store);
-    let tenant = TenantId::new("bench-tenant");
+    // Unique per run, not a fixed literal: `bytes_written`/`write_amplification`
+    // below list by tenant prefix, so a fixed tenant would let consecutive
+    // local runs against the same bucket inflate each other's byte counts.
+    let tenant = TenantId::new(format!("bench-tenant-{}", uuid::Uuid::new_v4()));
     let tenant_hash = tenant.hash();
     let signal = Signal::Metrics;
 
@@ -358,6 +361,7 @@ pub async fn run(config: &E2eConfig) -> Report {
         }
     });
 
+    let wall_start = std::time::Instant::now();
     let mut handles = Vec::with_capacity(batches.len());
     let mut next_dispatch = tokio::time::Instant::now();
     for batch in batches {
@@ -412,7 +416,6 @@ pub async fn run(config: &E2eConfig) -> Report {
         }));
     }
 
-    let wall_start = std::time::Instant::now();
     let mut latencies_ns = Vec::with_capacity(handles.len());
     let mut accepted_points: u64 = 0;
     for handle in handles {
@@ -449,9 +452,14 @@ pub async fn run(config: &E2eConfig) -> Report {
     };
 
     let metrics = router.metrics().snapshot();
-    let objects = list_all(store.as_ref(), "")
+    // Scoped to this run's own tenant prefix (t/<tenant_hash_hex>/, see
+    // ravel_commit::keys::data_key), not the whole bucket -- otherwise
+    // pre-existing objects from other tenants/benches sharing the same
+    // bucket would silently inflate bytes_written/write_amplification.
+    let tenant_prefix = format!("t/{}/", tenant_hash.to_hex());
+    let objects = list_all(store.as_ref(), &tenant_prefix)
         .await
-        .expect("list all objects");
+        .expect("list tenant objects");
     let bytes_written: u64 = objects.iter().map(|o| o.size).sum();
     let logical_bytes = accepted_points * LOGICAL_BYTES_PER_SAMPLE;
     let write_amplification = if logical_bytes == 0 {
