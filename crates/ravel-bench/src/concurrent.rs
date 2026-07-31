@@ -21,6 +21,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ravel_catalog::{Catalog, CatalogConfig};
@@ -309,6 +310,7 @@ async fn run_reader(
     query_t_ms: i64,
     run_deadline: Instant,
     query_deadline: Duration,
+    writers_flushed: Arc<AtomicBool>,
 ) -> ReaderOutcome {
     let mut queries_run = 0u64;
     let mut non_empty_results = 0u64;
@@ -326,6 +328,30 @@ async fn run_reader(
             Ok(_) => {}
             Err(err) => eprintln!("reader {reader_id}: query error: {err}"),
         }
+    }
+    // `run`'s main task joins every writer, then calls `router.flush_all()`,
+    // then flips `writers_flushed` -- only after that point is every accepted
+    // point in this run guaranteed durable and query-able. Under scheduler
+    // contention the writer/flush phase can itself take longer than
+    // `run_deadline` allowed for, in which case the loop above may have
+    // exited before any commit ever landed; without this, this reader would
+    // report zero non-empty results regardless of real ingest success. This
+    // final query runs only once the flag is set, so it always observes the
+    // fully-flushed run.
+    while !writers_flushed.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let now_ns = clock.now_ns();
+    let start = Instant::now();
+    let result = engine
+        .instant(tenant_hash, &query, query_t_ms, &[], now_ns, query_deadline)
+        .await;
+    latencies_ns.push(start.elapsed().as_nanos() as u64);
+    queries_run += 1;
+    match result {
+        Ok(Value::Vector(v)) if !v.is_empty() => non_empty_results += 1,
+        Ok(_) => {}
+        Err(err) => eprintln!("reader {reader_id}: final query error: {err}"),
     }
     ReaderOutcome {
         reader_id,
@@ -404,6 +430,7 @@ pub async fn run(config: &ConcurrentConfig) -> Report {
         )));
     }
 
+    let writers_flushed = Arc::new(AtomicBool::new(false));
     let mut reader_handles = Vec::with_capacity(readers);
     for reader_id in 0..readers {
         reader_handles.push(tokio::spawn(run_reader(
@@ -415,6 +442,7 @@ pub async fn run(config: &ConcurrentConfig) -> Report {
             query_t_ms,
             run_deadline,
             query_deadline,
+            Arc::clone(&writers_flushed),
         )));
     }
 
@@ -425,10 +453,11 @@ pub async fn run(config: &ConcurrentConfig) -> Report {
     }
     let write_elapsed_secs = wall_start.elapsed().as_secs_f64().max(1e-9);
 
-    // Catches any writer's still-buffered tail so the cold/warm phase below
-    // (and any reader still polling past this point) sees every accepted
-    // point, not just what auto-flush already published.
+    // Catches any writer's still-buffered tail so the cold/warm phase below,
+    // and every reader's guaranteed final query (see `run_reader`), sees
+    // every accepted point, not just what auto-flush already published.
     router.flush_all().await;
+    writers_flushed.store(true, Ordering::Release);
 
     let mut reader_outcomes = Vec::with_capacity(readers);
     for handle in reader_handles {
