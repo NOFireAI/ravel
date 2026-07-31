@@ -24,7 +24,8 @@ use ravel_promql_difftest::generator::{DatasetConfig, generate};
 use ravel_promql_difftest::ravel_stack::RavelStack;
 use ravel_promql_difftest::scoring::{
     BEGIN_MARKER, ConformanceReport, ConstructState, CorpusFile, END_MARKER, REGISTRY,
-    REJECTION_CASES, RejectionEval, splice_generated_block,
+    REJECTION_CASES, RejectionEval, TYPED_ERROR_TAGS, TypedErrorTag, UNIT_TEST_PREFIX,
+    declared_typed_error, scan_test_fn_names, splice_generated_block,
 };
 use ravel_types::TenantId;
 use serde_json::Value as Json;
@@ -100,6 +101,20 @@ fn query_engine_doc() -> PathBuf {
         .join("..")
         .join("docs")
         .join("query-engine.md")
+}
+
+/// The `ravel-promql` crate directory, whose test function names are the
+/// evidence a `ravel-promql:<fn>` citation resolves against.
+#[allow(clippy::expect_used)]
+fn ravel_promql_crate() -> PathBuf {
+    let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set");
+    Path::new(&manifest).join("..").join("ravel-promql")
+}
+
+/// Every test function name the `ravel-promql` crate defines.
+#[allow(clippy::expect_used)]
+fn ravel_promql_test_names() -> BTreeSet<String> {
+    scan_test_fn_names(&ravel_promql_crate()).expect("scanning ravel-promql for test names")
 }
 
 /// ADR-0035 decision: "each construct gets exactly one state". A Rust enum
@@ -206,6 +221,122 @@ async fn intentionally_rejected_constructs_return_typed_errors() {
     );
 }
 
+/// Issue #262 gap 1: the rejection check compares the registry's *declared*
+/// status and `errorType` against the observed response, so a construct that
+/// regresses from one typed-error variant to another is caught.
+///
+/// The synthetic regression is a deliberately wrong declared typed error fed
+/// against a real, well-formed 422 `execution` rejection: the shape is
+/// impeccable and only the identity is wrong, which is exactly what the old
+/// check could not see.
+#[test]
+fn a_rejection_that_does_not_match_the_declared_typed_error_is_flagged() {
+    let body = serde_json::json!({
+        "status": "error",
+        "errorType": "execution",
+        "error": "Unsupported: histogram_stddev",
+    });
+    let declared = TypedErrorTag {
+        status: 422,
+        error_type: "execution",
+    };
+
+    // Control: the observed rejection matches what the row declares.
+    let ok = check_rejection(
+        "histogram_stddev",
+        "histogram_stddev(diff_native_hist)",
+        "histogram_stddev",
+        declared,
+        422,
+        &body,
+    );
+    assert!(ok.ok, "{}", ok.detail);
+
+    // The same rejection against a row declaring 500 internal: a regression
+    // from one typed-error variant to another.
+    let wrong_tag = check_rejection(
+        "histogram_stddev",
+        "histogram_stddev(diff_native_hist)",
+        "histogram_stddev",
+        TypedErrorTag {
+            status: 500,
+            error_type: "internal",
+        },
+        422,
+        &body,
+    );
+    assert!(!wrong_tag.ok);
+    assert!(
+        wrong_tag.detail.contains("is not the declared 'internal'")
+            && wrong_tag
+                .detail
+                .contains("HTTP 422 is not the declared 500"),
+        "detail was '{}'",
+        wrong_tag.detail
+    );
+
+    // Status alone regressing is caught too: same errorType, 500 instead of
+    // the declared 422.
+    let wrong_status = check_rejection(
+        "histogram_stddev",
+        "histogram_stddev(diff_native_hist)",
+        "histogram_stddev",
+        declared,
+        500,
+        &body,
+    );
+    assert!(!wrong_status.ok);
+    assert!(
+        wrong_status
+            .detail
+            .contains("HTTP 500 is not the declared 422"),
+        "detail was '{}'",
+        wrong_status.detail
+    );
+}
+
+/// Every rejection case's construct declares a typed error the check can
+/// compare against, and every declared tag is a stable one.
+#[test]
+#[allow(clippy::expect_used)]
+fn every_rejection_case_has_a_declared_typed_error_to_compare_against() {
+    for case in REJECTION_CASES {
+        let tag = declared_typed_error(case.construct)
+            .unwrap_or_else(|e| panic!("{}: {e}", case.construct));
+        assert!(
+            TYPED_ERROR_TAGS.contains(&tag.error_type),
+            "{} declares errorType '{}', which the HTTP layer never emits",
+            case.construct,
+            tag.error_type
+        );
+    }
+}
+
+/// Issue #262 gap 2: a `ravel-promql:<fn>` citation is only evidence while
+/// that test exists, so the scan must find every cited name in the real crate.
+#[test]
+fn every_cited_ravel_promql_unit_test_exists() {
+    let names = ravel_promql_test_names();
+    assert!(
+        names.len() > 50,
+        "the scan found only {} test names in ravel-promql, so it did not run",
+        names.len()
+    );
+    let missing: Vec<&str> = REGISTRY
+        .iter()
+        .filter_map(|c| match c.state {
+            ConstructState::Supported { test } => test.strip_prefix(UNIT_TEST_PREFIX),
+            _ => None,
+        })
+        .filter(|unit_test| !names.contains(*unit_test))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "registry rows cite `ravel-promql` unit tests that no longer exist: \
+         {missing:?}"
+    );
+}
+
 /// The generated table in `docs/query-engine.md` must match what a run
 /// produces. Because the table is generated, a regression from supported to
 /// unclassified shows up as a diff in the same change that caused it, and
@@ -303,6 +434,7 @@ async fn build_report() -> ConformanceReport {
     )
     .await;
     report.apply_ravel_outcomes(&outcomes);
+    report.apply_unit_test_names(&ravel_promql_test_names());
 
     let rejection_results = run_rejection_cases().await;
     let mut per_construct: BTreeMap<&str, bool> = BTreeMap::new();
@@ -321,17 +453,6 @@ struct RejectionResult {
     ok: bool,
     detail: String,
 }
-
-/// The stable `errorType` tags `ravel-query`'s HTTP layer emits. A rejection
-/// carrying anything else is not the typed error the table claims.
-const TYPED_ERROR_TAGS: &[&str] = &[
-    "bad_data",
-    "execution",
-    "internal",
-    "unavailable",
-    "timeout",
-    "unauthorized",
-];
 
 /// Runs every rejection case against a freshly ingested Ravel stack.
 #[allow(clippy::expect_used)]
@@ -361,10 +482,16 @@ async fn run_rejection_cases() -> Vec<RejectionResult> {
             ),
         };
         let (status, body) = get(&ravel.app, ravel.token, &uri).await;
+        // The registry's own declared typed error is the expectation, so a
+        // construct that regresses from one typed-error variant to another
+        // fails here instead of passing as "some typed error came back".
+        let expected = declared_typed_error(case.construct)
+            .unwrap_or_else(|e| panic!("{}: {e}", case.construct));
         results.push(check_rejection(
             case.construct,
             case.query,
             case.message_contains,
+            expected,
             status,
             &body,
         ));
@@ -373,12 +500,20 @@ async fn run_rejection_cases() -> Vec<RejectionResult> {
 }
 
 /// The typed-rejection contract, in one place: not a 2xx, a Prometheus error
-/// envelope, one of the stable `errorType` tags, a non-empty message, no
-/// `data` payload, and the expected message substring when the case names one.
+/// envelope, the exact HTTP status and `errorType` the registry row declares, a
+/// non-empty message, no `data` payload, and the expected message substring
+/// when the case names one.
+///
+/// `expected` is the `(status, errorType)` pair parsed out of the construct's
+/// own `typed_error` string, which is what makes this an identity check rather
+/// than a shape check (issue #262 gap 1): a construct whose rejection moves
+/// from 422 `execution` to 500 `internal` still rejects cleanly by shape, but
+/// no longer matches the error the published table names.
 fn check_rejection(
     construct: &'static str,
     query: &'static str,
     message_contains: &str,
+    expected: TypedErrorTag,
     status: u16,
     body: &Json,
 ) -> RejectionResult {
@@ -403,6 +538,17 @@ fn check_rejection(
     }
     if !TYPED_ERROR_TAGS.contains(&error_type) {
         problems.push(format!("errorType '{error_type}' is not a stable tag"));
+    } else if error_type != expected.error_type {
+        problems.push(format!(
+            "errorType '{error_type}' is not the declared '{}'",
+            expected.error_type
+        ));
+    }
+    if status != expected.status {
+        problems.push(format!(
+            "HTTP {status} is not the declared {}",
+            expected.status
+        ));
     }
     if message.is_empty() {
         problems.push("the error message is empty".to_string());

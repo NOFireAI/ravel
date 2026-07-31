@@ -66,6 +66,7 @@ query: sum_over_time(diff_boundary[1m])
 kind: instant
 time: -600s
 mode: unordered
+expect: empty
 
 name: range_stddev_over_time_gauge_walk
 query: stddev_over_time(diff_gauge_walk[5m])
@@ -120,6 +121,7 @@ query: absent_over_time(diff_gauge_walk[5m])
 kind: instant
 time: +600s
 mode: unordered
+expect: empty
 
 name: instant_absent_over_time_synthesizes_labels_from_the_selector
 query: absent_over_time(diff_gauge_walk{shape="nonexistent"}[5m])

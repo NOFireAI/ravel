@@ -40,6 +40,15 @@
 //! unattainable and where the tolerance number came from; see
 //! docs/adrs/0025-promql-differential-float-precision-residue.md.
 //!
+//! `expect` is optional and takes the single value `empty`: the entry's whole
+//! point is that a successful answer carries no result at all (`absent` over a
+//! present series, a selector that matches nothing, a comparison filter that
+//! keeps nothing). Scoring reads the payload, not just the envelope status, so
+//! an entry that answers empty without declaring it counts as a failure and
+//! demotes every construct it exercises (issue #262): "success" with no data
+//! proves nothing. The declaration is checked in both directions, so an entry
+//! marked `expect: empty` that starts returning data fails too.
+//!
 //! `mode` is one of `unordered`, `ordered`, `error`, or
 //! `ravel_error_prom_success`. The last (ADR-0030's allowlist) marks an
 //! accepted one-sided divergence: Ravel rejects the query by design and
@@ -92,6 +101,10 @@ pub struct CorpusEntry {
     /// only on entries with a written justification in the corpus file
     /// itself for why exact bits are unattainable.
     pub tolerance_ulps: Option<u32>,
+    /// From an optional `expect: empty` field: a successful answer carrying no
+    /// result at all is what this entry pins. Absent by default, which means
+    /// the entry must answer with values (issue #262 gap 3).
+    pub expects_empty: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -261,12 +274,34 @@ fn build_entry(
         None => None,
     };
 
+    let expects_empty = match get("expect") {
+        Some(("empty", _)) => true,
+        Some((other, line)) => {
+            return Err(err(
+                index,
+                line,
+                format!("unknown expect '{other}', the only value is 'empty'"),
+            ));
+        }
+        None => false,
+    };
+
+    if expects_empty && mode == ComparisonMode::ExpectError {
+        return Err(err(
+            index,
+            mode_line,
+            "'expect: empty' contradicts 'mode: error': an entry cannot both \
+             be rejected and answer with an empty result",
+        ));
+    }
+
     Ok(CorpusEntry {
         name: name.to_string(),
         query: query.to_string(),
         eval,
         mode,
         tolerance_ulps,
+        expects_empty,
     })
 }
 
@@ -298,6 +333,36 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(entries[0].tolerance_ulps, Some(256));
+    }
+
+    #[test]
+    fn parses_the_optional_expect_empty_field() {
+        let entries = parse_corpus(
+            "name: absent\nquery: absent(up)\nkind: instant\ntime: +0s\nmode: unordered\nexpect: empty\n",
+        )
+        .expect("parse");
+        assert!(entries[0].expects_empty);
+        // Absent by default: an entry must answer with values unless it says
+        // otherwise.
+        let entries =
+            parse_corpus("name: simple\nquery: up\nkind: instant\ntime: +0s\nmode: unordered\n")
+                .expect("parse");
+        assert!(!entries[0].expects_empty);
+    }
+
+    #[test]
+    fn rejects_an_unknown_expect_value_and_the_error_mode_combination() {
+        let err = parse_corpus(
+            "name: e\nquery: up\nkind: instant\ntime: +0s\nmode: unordered\nexpect: nonsense\n",
+        )
+        .expect_err("must reject an unknown expect value");
+        assert!(matches!(err, CorpusError::Malformed { .. }));
+
+        let err = parse_corpus(
+            "name: e\nquery: sum(\nkind: instant\ntime: +0s\nmode: error\nexpect: empty\n",
+        )
+        .expect_err("must reject expect: empty on an error entry");
+        assert!(matches!(err, CorpusError::Malformed { .. }));
     }
 
     #[test]

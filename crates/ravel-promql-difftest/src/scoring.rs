@@ -33,6 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use axum::Router;
 use serde_json::Value as Json;
@@ -54,6 +55,105 @@ pub const CORPUS_TEST_PREFIX: &str = "corpus/";
 /// crate's differential corpus does not exercise it, which the generated table
 /// reports as a corpus gap.
 pub const UNIT_TEST_PREFIX: &str = "ravel-promql:";
+
+/// The stable `errorType` tags `ravel-query`'s HTTP layer emits. A rejection
+/// carrying anything else is not the typed error the table claims, and a
+/// registry row declaring anything else names an error the endpoint cannot
+/// produce.
+pub const TYPED_ERROR_TAGS: &[&str] = &[
+    "bad_data",
+    "execution",
+    "internal",
+    "unavailable",
+    "timeout",
+    "unauthorized",
+];
+
+/// The machine-checkable half of a [`ConstructState::IntentionallyRejected`]
+/// row's `typed_error` string: the HTTP status the endpoint answers with and
+/// the `errorType` tag its envelope carries.
+///
+/// The prose half (`"Unsupported: subquery over native histograms"`) is what a
+/// reader of the table needs; this pair is what a run can compare against, so
+/// a construct that regresses from one typed-error variant to another (422
+/// `execution` to 500 `internal`, say) fails the rejection check instead of
+/// passing as "some typed error came back".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypedErrorTag {
+    /// The HTTP status code the rejection must answer with.
+    pub status: u16,
+    /// The `errorType` tag the error envelope must carry.
+    pub error_type: &'static str,
+}
+
+impl fmt::Display for TypedErrorTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.status, self.error_type)
+    }
+}
+
+/// Parses the `(<status> <errorType>)` suffix every `typed_error` string ends
+/// with, e.g. `"Unsupported: function call (422 execution)"`.
+///
+/// Strict on purpose: an unparseable suffix, a status outside the 4xx/5xx
+/// range, or an `errorType` outside [`TYPED_ERROR_TAGS`] is a malformed
+/// registry row, not a row to check loosely.
+pub fn parse_typed_error(typed_error: &'static str) -> Result<TypedErrorTag, ScoringError> {
+    let malformed = |why: &str| {
+        ScoringError::MalformedTypedError(format!(
+            "typed error '{typed_error}' {why}; expected a trailing \
+             '(<status> <errorType>)', e.g. '(422 execution)'"
+        ))
+    };
+    let trimmed = typed_error.trim_end();
+    let body = trimmed
+        .strip_suffix(')')
+        .ok_or_else(|| malformed("does not end with ')'"))?;
+    let open = body
+        .rfind('(')
+        .ok_or_else(|| malformed("has no opening '('"))?;
+    let inside = &body[open + 1..];
+    let (status, tag) = inside
+        .split_once(' ')
+        .ok_or_else(|| malformed("does not carry '<status> <errorType>'"))?;
+    let status: u16 = status
+        .trim()
+        .parse()
+        .map_err(|_| malformed("does not start with a numeric HTTP status"))?;
+    if !(400..600).contains(&status) {
+        return Err(malformed("declares a status outside the 4xx/5xx range"));
+    }
+    let tag = tag.trim();
+    let error_type = TYPED_ERROR_TAGS
+        .iter()
+        .find(|known| **known == tag)
+        .ok_or_else(|| malformed("names an errorType that is not a stable tag"))?;
+    Ok(TypedErrorTag { status, error_type })
+}
+
+/// The [`REGISTRY`] row with this name, or `None`.
+pub fn registry_entry(name: &str) -> Option<&'static Construct> {
+    REGISTRY.iter().find(|c| c.name == name)
+}
+
+/// The [`TypedErrorTag`] a [`RejectionCase`]'s construct declares.
+///
+/// A rejection case whose construct is missing from the registry, or whose
+/// declared `typed_error` does not parse, is an error rather than an absent
+/// expectation: without a declared tag there is nothing to compare the
+/// observed rejection against.
+pub fn declared_typed_error(construct: &str) -> Result<TypedErrorTag, ScoringError> {
+    let entry = registry_entry(construct)
+        .ok_or_else(|| ScoringError::UnknownRejectionConstruct(construct.to_string()))?;
+    match entry.state {
+        ConstructState::IntentionallyRejected { typed_error } => parse_typed_error(typed_error),
+        other => Err(ScoringError::MalformedTypedError(format!(
+            "construct '{construct}' is '{}', not intentionally rejected, so \
+             it declares no typed error",
+            other.slug()
+        ))),
+    }
+}
 
 /// Which part of the PromQL surface a construct belongs to. Only used to
 /// group the generated table's rows.
@@ -1182,6 +1282,11 @@ pub struct ConstructOutcome {
     /// rejection cases actually rejected. `None` until
     /// [`ConformanceReport::apply_rejection_results`] runs.
     pub rejection_confirmed: Option<bool>,
+    /// For a [`ConstructState::Supported`] row citing a `ravel-promql` unit
+    /// test: whether a function by that name still exists in that crate.
+    /// `None` until [`ConformanceReport::apply_unit_test_names`] runs, and a
+    /// row citing a unit test publishes as supported only on `Some(true)`.
+    pub unit_test_confirmed: Option<bool>,
 }
 
 impl ConstructOutcome {
@@ -1206,6 +1311,12 @@ impl ConstructOutcome {
         )
     }
 
+    /// Whether the construct cites a `ravel-promql` unit test the run did not
+    /// find: a renamed or deleted test, or a run that never looked.
+    pub fn cited_unit_test_missing(&self) -> bool {
+        self.is_corpus_gap() && self.unit_test_confirmed != Some(true)
+    }
+
     /// The state the table publishes, recomputed from the run rather than
     /// taken from the registry.
     pub fn published_state(&self) -> ConstructState {
@@ -1217,6 +1328,13 @@ impl ConstructOutcome {
                 if test.starts_with(CORPUS_TEST_PREFIX)
                     && (self.evidence.is_empty() || self.cited_corpus_file_missing())
                 {
+                    return ConstructState::Unclassified;
+                }
+                // A `ravel-promql:<fn>` citation needs the same treatment a
+                // corpus citation gets: the named test has to still exist. A
+                // row whose unit test was renamed or deleted is an unverified
+                // claim, not evidence.
+                if self.cited_unit_test_missing() {
                     return ConstructState::Unclassified;
                 }
                 ConstructState::Supported { test }
@@ -1284,9 +1402,94 @@ pub enum ScoringError {
     /// A [`RejectionCase`] names a construct that is not in [`REGISTRY`].
     #[error("rejection case names unknown construct '{0}'")]
     UnknownRejectionConstruct(String),
+    /// A [`ConstructState::IntentionallyRejected`] row's `typed_error` string
+    /// does not name a checkable `(<status> <errorType>)` pair.
+    #[error("{0}")]
+    MalformedTypedError(String),
+    /// Walking a crate's sources for its test function names failed.
+    #[error("scanning '{path}' for unit test names: {message}")]
+    UnitTestScan {
+        /// The path being read when the walk failed.
+        path: String,
+        /// The underlying I/O error.
+        message: String,
+    },
     /// The generated-table markers are missing or out of order.
     #[error("{0}")]
     Markers(String),
+}
+
+// ---------------------------------------------------------------------------
+// Cited unit tests
+// ---------------------------------------------------------------------------
+
+/// Every `#[test]`/`#[tokio::test]` function name in one Rust source file.
+///
+/// A `ravel-promql:<fn>` citation is only evidence while that function still
+/// exists, so the run has to look. The scan reads the attribute rather than
+/// every zero-argument function, so a helper named like a deleted test cannot
+/// stand in for it.
+pub fn collect_test_fn_names(source: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut saw_test_attr = false;
+    for line in source.lines() {
+        let line = line.trim();
+        if line.starts_with("#[test]")
+            || line.starts_with("#[tokio::test")
+            || line.starts_with("#[test(")
+        {
+            saw_test_attr = true;
+            continue;
+        }
+        let signature = line
+            .strip_prefix("async fn ")
+            .or_else(|| line.strip_prefix("fn "))
+            .or_else(|| line.strip_prefix("pub async fn "))
+            .or_else(|| line.strip_prefix("pub fn "));
+        if let Some(signature) = signature {
+            if saw_test_attr && let Some(name) = signature.split('(').next() {
+                names.insert(name.trim().to_string());
+            }
+            saw_test_attr = false;
+            continue;
+        }
+        // Attributes and doc comments may sit between `#[test]` and the
+        // signature; anything else ends the run (a blank line, an item, a
+        // closing brace), so a stray attribute cannot leak onto a later
+        // function.
+        if !line.is_empty() && !line.starts_with('#') && !line.starts_with("//") {
+            saw_test_attr = false;
+        }
+    }
+    names
+}
+
+/// Every test function name under `root`, walking `.rs` files recursively.
+///
+/// Pointed at `crates/ravel-promql`, this is the set a
+/// `ravel-promql:<fn>` citation must be found in.
+pub fn scan_test_fn_names(root: &Path) -> Result<BTreeSet<String>, ScoringError> {
+    let mut names = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    let io = |path: &Path, e: std::io::Error| ScoringError::UnitTestScan {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    };
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::metadata(&path).map_err(|e| io(&path, e))?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|e| io(&path, e))? {
+                let entry = entry.map_err(|e| io(&path, e))?;
+                stack.push(entry.path());
+            }
+            continue;
+        }
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            let text = std::fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            names.extend(collect_test_fn_names(&text));
+        }
+    }
+    Ok(names)
 }
 
 /// The per-construct breakdown ADR-0035's Consequences asks
@@ -1315,6 +1518,7 @@ impl ConformanceReport {
                 evidence: Vec::new(),
                 failures: Vec::new(),
                 rejection_confirmed: None,
+                unit_test_confirmed: None,
             })
             .collect();
 
@@ -1388,6 +1592,35 @@ impl ConformanceReport {
         }
     }
 
+    /// Folds in the unit-test citations: `names` is every test function name
+    /// the `ravel-promql` crate still defines (see [`scan_test_fn_names`]).
+    /// A row citing `ravel-promql:<fn>` publishes as supported only when `<fn>`
+    /// is in that set, so a renamed or deleted test drops the row to
+    /// [`ConstructState::Unclassified`] in the same run.
+    pub fn apply_unit_test_names(&mut self, names: &BTreeSet<String>) {
+        for outcome in &mut self.outcomes {
+            if let ConstructState::Supported { test } = outcome.construct.state
+                && let Some(unit_test) = test.strip_prefix(UNIT_TEST_PREFIX)
+            {
+                outcome.unit_test_confirmed = Some(names.contains(unit_test));
+            }
+        }
+    }
+
+    /// Every construct citing a `ravel-promql` unit test the run did not find,
+    /// with the citation, so a failure message can name the renamed test
+    /// rather than only the construct.
+    pub fn missing_unit_tests(&self) -> Vec<(&'static str, &'static str)> {
+        self.outcomes
+            .iter()
+            .filter(|o| o.cited_unit_test_missing())
+            .filter_map(|o| match o.construct.state {
+                ConstructState::Supported { test } => Some((o.construct.name, test)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Per-state totals over the published states.
     pub fn counts(&self) -> StateCounts {
         let mut counts = StateCounts::default();
@@ -1414,12 +1647,17 @@ impl ConformanceReport {
     }
 
     /// Checks the registry's own well-formedness: no duplicate construct
-    /// names, and every [`RejectionCase`] naming a real construct.
+    /// names, every [`ConstructState::IntentionallyRejected`] row declaring a
+    /// checkable `(<status> <errorType>)` pair, and every [`RejectionCase`]
+    /// naming a real construct.
     pub fn validate_registry() -> Result<(), ScoringError> {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for construct in REGISTRY {
             if !seen.insert(construct.name) {
                 return Err(ScoringError::DuplicateConstruct(construct.name.to_string()));
+            }
+            if let ConstructState::IntentionallyRejected { typed_error } = construct.state {
+                parse_typed_error(typed_error)?;
             }
         }
         for case in REJECTION_CASES {
@@ -1517,6 +1755,11 @@ impl ConformanceReport {
             ConstructState::Unclassified => {
                 if outcome.rejection_confirmed == Some(false) {
                     parts.push("claimed rejected but the query was answered".to_string());
+                } else if outcome.cited_unit_test_missing() {
+                    parts.push(
+                        "the cited `ravel-promql` unit test was not found in that crate"
+                            .to_string(),
+                    );
                 } else if !outcome.failures.is_empty() {
                     parts.push(format!(
                         "{} exercising entries failed: {}",
@@ -1599,11 +1842,214 @@ pub struct RavelOutcome {
     /// The entry's `name:` field.
     pub entry: String,
     /// Whether Ravel's answer matched what the entry's mode requires: an
-    /// error for `mode: error` and `mode: ravel_error_prom_success`, a
-    /// success for `mode: unordered` and `mode: ordered`.
+    /// error for `mode: error` and `mode: ravel_error_prom_success`, and for
+    /// `mode: unordered`/`mode: ordered` a success *carrying values*, not
+    /// merely `status: "success"`.
     pub as_expected: bool,
     /// What actually happened, for a failure message.
     pub detail: String,
+}
+
+/// What a successful Prometheus-envelope response actually carried.
+///
+/// A `status: "success"` envelope is not evidence a construct works: an empty
+/// vector is a perfectly successful answer to a query that matched nothing, and
+/// a construct scored off status alone counts that as coverage. So the run reads
+/// the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadVerdict {
+    /// The result carried `samples` well-formed values across `series`
+    /// elements (a scalar or string result counts as one of each).
+    Values {
+        /// How many result elements the payload carried.
+        series: usize,
+        /// How many timestamp/value pairs those elements carried in total.
+        samples: usize,
+    },
+    /// A successful envelope whose result set is empty.
+    Empty,
+    /// A successful envelope whose payload does not have the shape its
+    /// `resultType` promises.
+    Malformed(String),
+}
+
+impl fmt::Display for PayloadVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PayloadVerdict::Values { series, samples } => {
+                write!(f, "{series} series, {samples} samples")
+            }
+            PayloadVerdict::Empty => f.write_str("the result set is empty"),
+            PayloadVerdict::Malformed(why) => write!(f, "malformed payload: {why}"),
+        }
+    }
+}
+
+/// Reads a Prometheus `data` payload: how many elements and values it carries,
+/// or why it is empty or malformed.
+///
+/// Every value is parsed, not just counted: a sample is a `[<ts>, "<float>"]`
+/// pair whose float actually parses (`NaN` and `Inf` included, which is how
+/// Prometheus spells them), or a native-histogram element. A payload whose
+/// values are unparseable strings is `Malformed`, not `Values`.
+pub fn check_payload(json: &Json) -> PayloadVerdict {
+    let Some(data) = json.get("data") else {
+        return PayloadVerdict::Malformed("no 'data' member".to_string());
+    };
+    let result_type = data.get("resultType").and_then(Json::as_str).unwrap_or("");
+    let Some(result) = data.get("result") else {
+        return PayloadVerdict::Malformed("no 'data.result' member".to_string());
+    };
+
+    match result_type {
+        "vector" | "matrix" => {
+            let Some(elements) = result.as_array() else {
+                return PayloadVerdict::Malformed(format!(
+                    "resultType '{result_type}' but 'result' is not an array"
+                ));
+            };
+            if elements.is_empty() {
+                return PayloadVerdict::Empty;
+            }
+            let mut samples = 0usize;
+            for element in elements {
+                if !element.get("metric").is_some_and(Json::is_object) {
+                    return PayloadVerdict::Malformed(
+                        "a result element carries no 'metric' object".to_string(),
+                    );
+                }
+                // A float element carries `value`/`values`; a native-histogram
+                // element carries `histogram`/`histograms` instead.
+                let float_points: Vec<&Json> = match (element.get("value"), element.get("values")) {
+                    (Some(point), None) => vec![point],
+                    (None, Some(points)) => match points.as_array() {
+                        Some(points) => points.iter().collect(),
+                        None => {
+                            return PayloadVerdict::Malformed(
+                                "'values' is not an array".to_string(),
+                            );
+                        }
+                    },
+                    _ => Vec::new(),
+                };
+                let histogram_points = match (element.get("histogram"), element.get("histograms")) {
+                    (Some(_), None) => 1,
+                    (None, Some(points)) => points.as_array().map(Vec::len).unwrap_or(0),
+                    _ => 0,
+                };
+                if float_points.is_empty() && histogram_points == 0 {
+                    return PayloadVerdict::Malformed(
+                        "a result element carries neither values nor histograms".to_string(),
+                    );
+                }
+                for point in &float_points {
+                    if let Err(why) = parse_sample(point) {
+                        return PayloadVerdict::Malformed(why);
+                    }
+                }
+                samples += float_points.len() + histogram_points;
+            }
+            PayloadVerdict::Values {
+                series: elements.len(),
+                samples,
+            }
+        }
+        "scalar" => match parse_sample(result) {
+            Ok(()) => PayloadVerdict::Values {
+                series: 1,
+                samples: 1,
+            },
+            Err(why) => PayloadVerdict::Malformed(why),
+        },
+        "string" => match result.as_array() {
+            Some(pair) if pair.len() == 2 && pair[1].is_string() => PayloadVerdict::Values {
+                series: 1,
+                samples: 1,
+            },
+            _ => {
+                PayloadVerdict::Malformed("a string result is not a [ts, string] pair".to_string())
+            }
+        },
+        other => PayloadVerdict::Malformed(format!("unknown resultType '{other}'")),
+    }
+}
+
+/// Checks one `[<ts>, "<float>"]` sample pair, parsing the value.
+fn parse_sample(point: &Json) -> Result<(), String> {
+    let Some(pair) = point.as_array() else {
+        return Err("a sample is not a [ts, value] pair".to_string());
+    };
+    if pair.len() != 2 {
+        return Err(format!("a sample has {} members, not 2", pair.len()));
+    }
+    if !pair[0].is_number() {
+        return Err("a sample's timestamp is not a number".to_string());
+    }
+    let raw = pair[1]
+        .as_str()
+        .ok_or_else(|| "a sample's value is not a string".to_string())?;
+    // Prometheus spells the non-finite values `NaN`, `+Inf`, `-Inf`, all of
+    // which `f64::from_str` accepts.
+    raw.parse::<f64>()
+        .map(|_| ())
+        .map_err(|_| format!("a sample's value '{raw}' does not parse as a float"))
+}
+
+/// Classifies one entry's Ravel-side answer: the mode says whether an error or
+/// an answer is expected, and an expected answer must carry values unless the
+/// entry declared `expect: empty`.
+///
+/// The empty declaration is checked in both directions: an undeclared empty
+/// answer fails (it is not evidence the construct works), and a declared-empty
+/// entry that starts returning data fails too (the semantics it pins moved).
+pub fn classify_ravel_answer(
+    entry: &str,
+    expects_error: bool,
+    expects_empty: bool,
+    body: &Json,
+) -> RavelOutcome {
+    let status = body
+        .get("status")
+        .and_then(Json::as_str)
+        .unwrap_or("<missing>");
+    let errored = status == "error";
+    let message = body.get("error").and_then(Json::as_str);
+    let mut detail = match message {
+        Some(message) => format!("status={status} error={message}"),
+        None => format!("status={status}"),
+    };
+
+    if errored != expects_error {
+        return RavelOutcome {
+            entry: entry.to_string(),
+            as_expected: false,
+            detail,
+        };
+    }
+    if expects_error {
+        return RavelOutcome {
+            entry: entry.to_string(),
+            as_expected: true,
+            detail,
+        };
+    }
+
+    let payload = check_payload(body);
+    let as_expected = if expects_empty {
+        payload == PayloadVerdict::Empty
+    } else {
+        matches!(payload, PayloadVerdict::Values { samples, .. } if samples > 0)
+    };
+    detail = if expects_empty {
+        format!("{detail} payload={payload} (expect: empty)")
+    } else {
+        format!("{detail} payload={payload}")
+    };
+    RavelOutcome {
+        entry: entry.to_string(),
+        as_expected,
+        detail,
+    }
 }
 
 /// Runs every entry against the Ravel side only and reports whether each
@@ -1652,25 +2098,18 @@ pub async fn run_ravel_only(
                     .await
                 }
             };
-            let (errored, detail) = match body {
+            out.push(match body {
                 Ok(json) => {
-                    let status = json
-                        .get("status")
-                        .and_then(Json::as_str)
-                        .unwrap_or("<missing>")
-                        .to_string();
-                    let detail = match json.get("error").and_then(Json::as_str) {
-                        Some(message) => format!("status={status} error={message}"),
-                        None => format!("status={status}"),
-                    };
-                    (status == "error", detail)
+                    classify_ravel_answer(&entry.name, expects_error, entry.expects_empty, &json)
                 }
-                Err(err) => (true, format!("transport error: {err}")),
-            };
-            out.push(RavelOutcome {
-                entry: entry.name.clone(),
-                as_expected: errored == expects_error,
-                detail,
+                // A transport error is never the answer any mode asks for: a
+                // `mode: error` entry expects Ravel's own typed rejection
+                // envelope, not a dropped request.
+                Err(err) => RavelOutcome {
+                    entry: entry.name.clone(),
+                    as_expected: false,
+                    detail: format!("transport error: {err}"),
+                },
             });
         }
     }
@@ -1971,6 +2410,343 @@ mod tests {
             report.outcomes[index].published_state(),
             ConstructState::Unclassified
         );
+    }
+
+    /// Gap 2 of issue #262, from the other side: a row proven by a
+    /// `ravel-promql` unit test used to need no evidence at all, so a renamed
+    /// or deleted test kept publishing "supported". The synthetic regression
+    /// here is a name set that no longer carries the cited test.
+    #[test]
+    fn a_supported_row_citing_a_renamed_unit_test_publishes_as_unclassified() {
+        let files: [CorpusFile<'_>; 0] = [];
+        let mut report = ConformanceReport::from_corpus(&files);
+        let index = report
+            .outcomes
+            .iter()
+            .position(|o| o.construct.name == "unary expression")
+            .expect("unary expression is registered");
+        let cited = match report.outcomes[index].construct.state {
+            ConstructState::Supported { test } => test
+                .strip_prefix(UNIT_TEST_PREFIX)
+                .expect("unary expression cites a ravel-promql unit test")
+                .to_string(),
+            other => panic!("expected a supported row, got {other:?}"),
+        };
+
+        // The run finds every cited test: the rows publish supported.
+        let present: BTreeSet<String> = REGISTRY
+            .iter()
+            .filter_map(|c| match c.state {
+                ConstructState::Supported { test } => test.strip_prefix(UNIT_TEST_PREFIX),
+                _ => None,
+            })
+            .map(str::to_string)
+            .collect();
+        report.apply_unit_test_names(&present);
+        assert!(matches!(
+            report.outcomes[index].published_state(),
+            ConstructState::Supported { .. }
+        ));
+        assert!(report.missing_unit_tests().is_empty());
+
+        // That one test renamed: nothing proves its row any more.
+        let renamed: BTreeSet<String> = present
+            .iter()
+            .map(|name| {
+                if *name == cited {
+                    format!("{name}_renamed")
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        report.apply_unit_test_names(&renamed);
+        assert!(report.outcomes[index].cited_unit_test_missing());
+        assert_eq!(
+            report.outcomes[index].published_state(),
+            ConstructState::Unclassified
+        );
+        assert_eq!(
+            report.missing_unit_tests(),
+            vec![(
+                "unary expression",
+                "ravel-promql:unary_minus_negates_value_and_drops_metric_name"
+            )]
+        );
+        // And the table says why, rather than rendering a bare miss.
+        assert!(
+            report
+                .render_evidence(&report.outcomes[index])
+                .contains("cited `ravel-promql` unit test was not found")
+        );
+    }
+
+    /// A run that never looked for the cited unit tests may not publish them
+    /// as supported either: absent evidence is not evidence.
+    #[test]
+    fn a_unit_test_citation_is_unverified_until_the_run_looks() {
+        let files: [CorpusFile<'_>; 0] = [];
+        let report = ConformanceReport::from_corpus(&files);
+        let outcome = report
+            .outcomes
+            .iter()
+            .find(|o| o.construct.name == "unary expression")
+            .expect("unary expression is registered");
+        assert_eq!(outcome.unit_test_confirmed, None);
+        assert_eq!(outcome.published_state(), ConstructState::Unclassified);
+    }
+
+    #[test]
+    fn the_test_name_scan_reads_test_attributes_not_every_function() {
+        let source = "\
+#[test]
+fn a_plain_test() {}
+
+#[tokio::test(flavor = \"multi_thread\")]
+async fn an_async_test() {}
+
+#[test]
+#[allow(clippy::expect_used)]
+fn a_test_behind_another_attribute() {}
+
+fn a_bare_helper() {}
+
+#[allow(dead_code)]
+fn an_attributed_helper() {}
+";
+        let names = collect_test_fn_names(source);
+        assert!(names.contains("a_plain_test"));
+        assert!(names.contains("an_async_test"));
+        assert!(names.contains("a_test_behind_another_attribute"));
+        assert!(!names.contains("a_bare_helper"));
+        assert!(!names.contains("an_attributed_helper"));
+    }
+
+    /// Gap 1 of issue #262 at the registry end: every state-2 row must declare
+    /// a status/`errorType` pair a run can actually compare against.
+    #[test]
+    fn every_rejected_row_declares_a_parseable_typed_error() {
+        for construct in REGISTRY {
+            if let ConstructState::IntentionallyRejected { typed_error } = construct.state {
+                let tag = parse_typed_error(typed_error)
+                    .unwrap_or_else(|e| panic!("{}: {e}", construct.name));
+                assert!(TYPED_ERROR_TAGS.contains(&tag.error_type));
+            }
+        }
+        for case in REJECTION_CASES {
+            declared_typed_error(case.construct)
+                .unwrap_or_else(|e| panic!("{}: {e}", case.construct));
+        }
+    }
+
+    #[test]
+    fn a_typed_error_string_without_a_checkable_tag_is_rejected() {
+        assert_eq!(
+            parse_typed_error("Unsupported: function call (422 execution)").expect("parses"),
+            TypedErrorTag {
+                status: 422,
+                error_type: "execution",
+            }
+        );
+        // No suffix, no status, a status outside 4xx/5xx, and an errorType the
+        // HTTP layer never emits are all malformed rows.
+        for bad in [
+            "Unsupported: function call",
+            "Unsupported: function call (execution)",
+            "Unsupported: function call (200 execution)",
+            "Unsupported: function call (422 nonsense)",
+        ] {
+            assert!(
+                matches!(
+                    parse_typed_error(bad),
+                    Err(ScoringError::MalformedTypedError(_))
+                ),
+                "'{bad}' must not parse"
+            );
+        }
+        // A row that is not state 2 declares no typed error at all.
+        assert!(matches!(
+            declared_typed_error("rate"),
+            Err(ScoringError::MalformedTypedError(_))
+        ));
+        assert!(matches!(
+            declared_typed_error("no such construct"),
+            Err(ScoringError::UnknownRejectionConstruct(_))
+        ));
+    }
+
+    /// Gap 3 of issue #262: a `status: "success"` envelope carrying an empty
+    /// result set used to count as a passing entry, so a construct that
+    /// silently stopped returning data still published as supported.
+    #[test]
+    fn an_empty_but_successful_answer_does_not_count_as_a_pass() {
+        let empty = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+        });
+        let outcome = classify_ravel_answer("selector_simple_match", false, false, &empty);
+        assert!(!outcome.as_expected);
+        assert!(
+            outcome.detail.contains("the result set is empty"),
+            "detail was '{}'",
+            outcome.detail
+        );
+        assert_eq!(check_payload(&empty), PayloadVerdict::Empty);
+
+        // The same entry answered with a value passes.
+        let answered = serde_json::json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [{"metric": {"__name__": "up"}, "value": [1.0, "1"]}],
+            },
+        });
+        let outcome = classify_ravel_answer("selector_simple_match", false, false, &answered);
+        assert!(outcome.as_expected, "detail was '{}'", outcome.detail);
+        assert_eq!(
+            check_payload(&answered),
+            PayloadVerdict::Values {
+                series: 1,
+                samples: 1,
+            }
+        );
+
+        // An entry declaring `expect: empty` is judged the other way round:
+        // the empty answer is the point, and returning data means the
+        // semantics it pins moved.
+        assert!(
+            classify_ravel_answer(
+                "instant_absent_over_present_series_is_empty",
+                false,
+                true,
+                &empty
+            )
+            .as_expected
+        );
+        assert!(
+            !classify_ravel_answer(
+                "instant_absent_over_present_series_is_empty",
+                false,
+                true,
+                &answered
+            )
+            .as_expected
+        );
+    }
+
+    /// A demoted entry demotes every construct it exercises, so the empty
+    /// answer above reaches the published table.
+    #[test]
+    fn an_empty_but_successful_answer_demotes_the_constructs_it_exercises() {
+        let entries = vec![entry("rate(up[5m])")];
+        let files = [CorpusFile {
+            path: "corpus/rate.txt",
+            entries: &entries,
+        }];
+        let mut report = ConformanceReport::from_corpus(&files);
+        let index = report
+            .outcomes
+            .iter()
+            .position(|o| o.construct.name == "rate")
+            .expect("rate is registered");
+        let empty = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "matrix", "result": []},
+        });
+        report.apply_ravel_outcomes(&[classify_ravel_answer("t", false, false, &empty)]);
+        assert_eq!(
+            report.outcomes[index].published_state(),
+            ConstructState::Unclassified
+        );
+    }
+
+    #[test]
+    fn a_payload_whose_values_do_not_parse_is_malformed_not_covered() {
+        let matrix = serde_json::json!({
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [{"metric": {}, "values": [[1.0, "nonsense"]]}],
+            },
+        });
+        assert!(matches!(
+            check_payload(&matrix),
+            PayloadVerdict::Malformed(_)
+        ));
+        assert!(!classify_ravel_answer("t", false, false, &matrix).as_expected);
+
+        // Prometheus' own spellings of the non-finite values are values.
+        let non_finite = serde_json::json!({
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [{"metric": {}, "values": [[1.0, "NaN"], [2.0, "+Inf"], [3.0, "-Inf"]]}],
+            },
+        });
+        assert_eq!(
+            check_payload(&non_finite),
+            PayloadVerdict::Values {
+                series: 1,
+                samples: 3,
+            }
+        );
+
+        // A native-histogram element carries `histograms`, not `values`.
+        let histograms = serde_json::json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [{"metric": {}, "histogram": [1.0, {"count": "3", "sum": "6"}]}],
+            },
+        });
+        assert_eq!(
+            check_payload(&histograms),
+            PayloadVerdict::Values {
+                series: 1,
+                samples: 1,
+            }
+        );
+
+        // A scalar and a string result are one value each.
+        let scalar = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "scalar", "result": [1.0, "2"]},
+        });
+        assert_eq!(
+            check_payload(&scalar),
+            PayloadVerdict::Values {
+                series: 1,
+                samples: 1,
+            }
+        );
+        let string = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "string", "result": [1.0, "hello"]},
+        });
+        assert_eq!(
+            check_payload(&string),
+            PayloadVerdict::Values {
+                series: 1,
+                samples: 1,
+            }
+        );
+    }
+
+    /// An error envelope is judged by its mode, not its payload: a
+    /// `mode: error` entry passes on the rejection and fails on an answer.
+    #[test]
+    fn an_error_mode_entry_is_judged_on_the_rejection() {
+        let rejected = serde_json::json!({
+            "status": "error",
+            "errorType": "bad_data",
+            "error": "unexpected end of input",
+        });
+        assert!(classify_ravel_answer("bad_paren", true, false, &rejected).as_expected);
+        let answered = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []},
+        });
+        assert!(!classify_ravel_answer("bad_paren", true, false, &answered).as_expected);
     }
 
     #[test]

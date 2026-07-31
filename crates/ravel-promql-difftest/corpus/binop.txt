@@ -59,8 +59,13 @@ kind: instant
 time: +300s
 mode: unordered
 
+# `diff_agg_group` rather than `diff_gauge_walk`: the walk's sign at any
+# instant depends on the dataset seed, so `diff_gauge_walk > 0` answered with
+# an empty vector for the default seed and this entry pinned nothing about
+# keeping the metric name (issue #262). The agg-group values are fixed
+# (10/20/20 and 5/5/15), so `> 10` always drops three series and keeps three.
 name: instant_filter_comparison_keeps_name
-query: diff_gauge_walk > 0
+query: diff_agg_group > 10
 kind: instant
 time: +300s
 mode: unordered
@@ -88,6 +93,7 @@ query: diff_special_values == diff_special_values
 kind: instant
 time: +120s
 mode: unordered
+expect: empty
 
 name: instant_nan_ne_bool_is_true
 query: diff_special_values != bool diff_special_values
