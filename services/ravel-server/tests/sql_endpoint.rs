@@ -922,6 +922,11 @@ impl ObjectStoreBackend for LogsCommitListSpy {
     }
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
-        self.inner.capabilities()
+        // multipart: false to match the refusing default `put_multipart` this
+        // double inherits (issue #298).
+        ravel_object_store::Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
     }
 }

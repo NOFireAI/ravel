@@ -104,14 +104,23 @@ expiration, SSE/KMS headers.
 
 | Capability | Flag | Required by |
 |---|---|---|
-| Multipart upload | multipart | `--mode maintain` only (large L1/L2 segments) |
+| Multipart upload | multipart | `--mode maintain` (forward-looking, see below) |
 
-Compaction is the only path that writes multipart objects, so `multipart` is
-required for maintain mode and for no other mode. It is not in
-`Capabilities::mandatory()`; `required_capabilities(Mode::Maintain)` adds it.
-`MemoryStore` and `S3Store` both report `multipart: true` (issue #243), so
-`--mode maintain` starts against the memory oracle and against any
-S3-compatible endpoint.
+`multipart` is not in `Capabilities::mandatory()`;
+`required_capabilities(Mode::Maintain)` adds it, and no other mode requires it.
+That gate is **forward-looking**, not a description of current behavior: today
+`ravel-maintain` writes its compaction outputs as single-PUT content-addressed
+objects (its `build.rs` records this, citing issue #243), and no production
+caller invokes `put_multipart` yet. The maintain-mode requirement stands so
+that once compaction does stream large L1/L2 segments as multipart uploads, the
+backend is already known to serve the create/upload-part/complete/abort
+sequence rather than discovering the gap at runtime. `MemoryStore` and
+`S3Store` both report `multipart: true` and implement the sequence (issue
+#243), so `--mode maintain` starts against the memory oracle and against any
+S3-compatible endpoint whether or not any caller exercises the path yet.
+(`S3Store::put` does take an internal multipart path above its threshold, but
+that is a size-driven implementation detail of `put`, not a caller reaching for
+`put_multipart`; see "When `put()` uses it" below.)
 
 ### Multipart upload
 

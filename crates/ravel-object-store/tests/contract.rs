@@ -21,8 +21,9 @@ use ravel_object_store::instrument::{StoreErrorClass, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3Store};
 use ravel_object_store::{
-    Capabilities, GetRange, InstrumentedStore, MULTIPART_MIN_PART_SIZE, ObjectStoreBackend,
-    PutMode, PutOptions, StoreError, UploadChecksum, list_all,
+    Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
+    MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions,
+    PutOutcome, StoreError, UploadChecksum, list_all,
 };
 
 /// Runs every contract assertion against `store`. Each assertion gets its
@@ -908,10 +909,82 @@ async fn assert_put_above_threshold_uses_multipart(store: &dyn ObjectStoreBacken
     assert!(matches!(err, StoreError::AlreadyExists), "got {err:?}");
 }
 
+/// Wraps the memory oracle but truthfully reports `multipart: false`, so it
+/// inherits the trait's refusing default `put_multipart`. It exists to keep the
+/// `multipart: false` branch of [`assert_multipart_upload`] live (issue #298):
+/// every other suite backend reports `multipart: true`, so without a registered
+/// refusing backend that branch --- the one asserting the flag and the method
+/// agree in the negative direction --- never executes. Every other method
+/// delegates verbatim, so the rest of the contract suite runs unchanged.
+struct RefusingMultipartStore {
+    inner: MemoryStore,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for RefusingMultipartStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    // No `put_multipart`: it must inherit the trait's refusing default, which
+    // is the behavior the `multipart: false` branch of the suite checks.
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        // The one flag that differs from the oracle: this backend does not
+        // implement multipart, and says so.
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
 #[tokio::test]
 async fn memory_store_contract() {
     let store = MemoryStore::new();
     run_contract_suite(&store, "memory").await;
+}
+
+/// The whole suite against a backend that declares `multipart: false`, so the
+/// refusal branch of [`assert_multipart_upload`] actually runs: `put_multipart`
+/// must be refused with `Permanent`, proving the flag and the method agree in
+/// the negative direction (issue #298). Every non-multipart assertion still
+/// holds because the backend delegates to the memory oracle.
+#[tokio::test]
+async fn refusing_multipart_store_contract() {
+    let store = RefusingMultipartStore {
+        inner: MemoryStore::new(),
+    };
+    assert!(
+        !store.capabilities().multipart,
+        "the refusing backend must report multipart: false so the suite exercises the refusal"
+    );
+    run_contract_suite(&store, "refusing-multipart").await;
 }
 
 #[tokio::test]

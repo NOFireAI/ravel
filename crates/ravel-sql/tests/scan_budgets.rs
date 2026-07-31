@@ -82,7 +82,12 @@ impl ObjectStoreBackend for CountingStore {
         self.inner.delete(key).await
     }
     fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
+        // multipart: false to match the refusing default `put_multipart` this
+        // double inherits (issue #298).
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
     }
 }
 
