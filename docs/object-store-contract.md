@@ -148,12 +148,25 @@ orphaned parts, which are billed until a bucket lifecycle rule reaps them, and
 never a readable object. Operators SHOULD configure such a rule
 (`AbortIncompleteMultipartUpload`) on Ravel buckets.
 
-**Retry.** Nothing retries internally beyond what `object_store`'s client
-already does per request. A failed `put_part` returns the same classified
-`StoreError` a `put` would, so `StoreError::is_retryable` applies unchanged,
-and the caller decides: retry the part, or abort the upload. `complete` and
-`abort` consume the handle logically; a second call on the same handle fails
-with `Permanent` rather than re-issuing a request against a spent upload id.
+**Retry and failure.** Nothing retries internally beyond what `object_store`'s
+client already does per request. A `put_part` that still fails *poisons the
+handle*: the first failure surfaces the classified `StoreError` a `put` would
+(so the original cause stays visible), but the handle is now dead, and every
+later `put_part` and `complete` fails with a non-retryable `Permanent` error.
+The documented recovery is to `abort` and restart the whole upload, never to
+retry the part. This is not a Ravel policy choice but what `object_store`'s S3
+upload permits: `S3MultiPartUpload::put_part` fixes the part's index
+synchronously at call time and `complete` errors unless it holds exactly that
+many parts, so a retried part lands at a *new* index and the hole the failed
+part left can never be filled (retrying it is the live-lock issue #296 fixes). A
+part-sequence violation (an empty part, or a non-final part below the minimum)
+poisons the handle the same way (issue #297): a later `complete` errors rather
+than publishing a truncated object. A checksum mismatch is the one *recoverable*
+rejection: it does not poison, so the caller may re-send the same bytes with the
+correct checksum. `complete` and `abort` consume the handle logically; a second
+call on the same handle fails with `Permanent` rather than re-issuing a request
+against a spent upload id. `abort` stays callable on a poisoned handle, so the
+caller can still release the uploaded parts.
 
 **Write mode.** `complete` publishes unconditionally, exactly like
 `PutMode::Overwrite`. There is no multipart `CreateIfAbsent` or `CasVersion`:

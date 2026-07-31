@@ -73,7 +73,7 @@ use object_store::{
 use crate::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
-    UploadChecksum, Version, multipart_finished,
+    UploadChecksum, Version, multipart_finished, multipart_poisoned,
 };
 
 /// Default entries per `ListPage`, chosen to line up with S3's own
@@ -346,10 +346,19 @@ fn outcome_of(key: &str, result: object_store::PutResult) -> Result<PutOutcome, 
 /// becomes visible only when `complete` succeeds --- S3's own multipart
 /// guarantee, which is what makes an interrupted compaction upload wasted work
 /// rather than a partial object. Nothing here retries: `object_store`'s client
-/// already retries each request internally, and a part that still fails
-/// surfaces to the caller, which owns the abort/retry decision (the same
-/// classification `put` produces, so `StoreError::is_retryable` applies
-/// unchanged).
+/// already retries each request internally.
+///
+/// A part upload that still fails after those internal retries is
+/// unrecoverable, so it *poisons* the handle (issue #296) rather than inviting
+/// the caller to retry the part. `object_store`'s `S3MultiPartUpload`
+/// increments its part index synchronously at `put_part` call time and
+/// `complete` errors unless it holds exactly that many parts, so a failed part
+/// leaves a permanent hole: a retried part lands at a *new* index and the hole
+/// never fills. The first failure surfaces the classified `StoreError` a `put`
+/// would (so a diagnostic keeps the original cause), but every later `put_part`
+/// or `complete` returns a non-retryable [`multipart_poisoned`] error telling
+/// the caller to abort and restart. A part-sequence violation poisons the same
+/// way (issue #297). `abort` stays callable on a poisoned handle.
 pub struct S3MultipartUpload {
     key: String,
     upload: Box<dyn OsMultipartUpload>,
@@ -357,6 +366,12 @@ pub struct S3MultipartUpload {
     /// Set by `complete`/`abort`; every later call on this handle fails
     /// instead of issuing a second request against a dead upload id.
     finished: bool,
+    /// Set once a part upload fails at the backend (issue #296) or a part
+    /// violates the sequence rules (issue #297). Carries the original cause's
+    /// text; every later `put_part`/`complete` fails with [`multipart_poisoned`]
+    /// while `abort` stays callable. A checksum mismatch deliberately does not
+    /// set this (it leaves the upload open for a re-send).
+    poison: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -369,19 +384,40 @@ impl MultipartUpload for S3MultipartUpload {
         if self.finished {
             return Err(multipart_finished(&self.key));
         }
-        // Both checks run before the request, so a rejected part is not a
-        // part: the upload stays open and the caller can retry or abort.
+        if let Some(cause) = &self.poison {
+            return Err(multipart_poisoned(&self.key, cause));
+        }
+        // The checksum pre-flight runs before anything touches upload state and
+        // is the one recoverable rejection: a mismatch is not a part, the
+        // upload stays open, and the caller can re-send the same bytes.
         preflight_checksum(&data, checksum)?;
-        self.sequence.accept(&self.key, data.len())?;
-        self.upload
-            .put_part(PutPayload::from(data))
-            .await
-            .map_err(map_error_common)
+        // A sequence-rule violation poisons the handle (issue #297): once
+        // `accept` counts a short non-final part or an empty part, the object
+        // would be truncated, so no further part or completion may proceed.
+        if let Err(e) = self.sequence.accept(&self.key, data.len()) {
+            self.poison = Some(e.to_string());
+            return Err(e);
+        }
+        // A backend part failure poisons the handle (issue #296): the part
+        // index is already spent, so a retry would land at a new index and
+        // `complete` could never assemble a whole object. The first failure
+        // surfaces the classified cause; later calls get the poison error.
+        match self.upload.put_part(PutPayload::from(data)).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let mapped = map_error_common(e);
+                self.poison = Some(mapped.to_string());
+                Err(mapped)
+            }
+        }
     }
 
     async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
         if self.finished {
             return Err(multipart_finished(&self.key));
+        }
+        if let Some(cause) = &self.poison {
+            return Err(multipart_poisoned(&self.key, cause));
         }
         self.sequence.finish(&self.key)?;
         let result = self.upload.complete().await.map_err(map_error_common)?;
@@ -528,6 +564,7 @@ impl ObjectStoreBackend for S3Store {
             upload,
             sequence: PartSequence::default(),
             finished: false,
+            poison: None,
         }))
     }
 
@@ -681,7 +718,109 @@ impl ObjectStoreBackend for S3Store {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use object_store::{PutResult, UploadPart};
+
     use super::*;
+
+    /// A fake `object_store` multipart upload whose every `put_part` fails,
+    /// modeling a backend part upload that already exhausted `object_store`'s
+    /// internal retries. `complete` is wired to fail too, because the poison
+    /// logic must guarantee it is never reached after a failed part. `abort`
+    /// calls are counted so the test can prove `abort` still runs on a poisoned
+    /// handle.
+    #[derive(Debug)]
+    struct FailingPartUpload {
+        aborts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl OsMultipartUpload for FailingPartUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+            Box::pin(async {
+                Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "injected part upload failure".into(),
+                })
+            })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            Err(object_store::Error::Generic {
+                store: "test",
+                source: "complete must never be reached on a poisoned handle".into(),
+            })
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A backend `put_part` failure poisons the S3 handle (issue #296): the
+    /// first failure surfaces the classified (here retryable) cause, but every
+    /// later `put_part`/`complete` returns a non-retryable poison error telling
+    /// the caller to abort and restart, breaking the retry-forever live-lock.
+    /// `abort` stays callable and reaches the backend.
+    #[tokio::test]
+    async fn backend_put_part_failure_poisons_handle() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let mut handle = S3MultipartUpload {
+            key: "poison".to_string(),
+            upload: Box::new(FailingPartUpload {
+                aborts: Arc::clone(&aborts),
+            }),
+            sequence: PartSequence::default(),
+            finished: false,
+            poison: None,
+        };
+
+        let part = Bytes::from(vec![0u8; crate::MULTIPART_MIN_PART_SIZE]);
+        // First failure: the classified backend error (Transient here), which
+        // on its own would invite a retry -- exactly the live-lock #296 fixes.
+        let first = handle
+            .put_part(part.clone(), None)
+            .await
+            .expect_err("the backend part upload must fail");
+        assert!(matches!(first, StoreError::Transient(_)), "got {first:?}");
+
+        // The handle is now poisoned: a retried part is refused non-retryably,
+        // so the caller's is_retryable-driven loop stops instead of spinning.
+        let retried = handle
+            .put_part(part, None)
+            .await
+            .expect_err("a poisoned handle must refuse further parts");
+        assert!(
+            matches!(retried, StoreError::Permanent(_)),
+            "got {retried:?}"
+        );
+        assert!(!retried.is_retryable());
+
+        // complete is likewise poisoned: no truncated object may be published,
+        // and the fake's own failing complete proves it was never reached.
+        let completed = handle
+            .complete()
+            .await
+            .expect_err("completing a poisoned upload must fail");
+        assert!(matches!(completed, StoreError::Permanent(_)));
+
+        // abort stays callable and actually reaches the backend.
+        handle
+            .abort()
+            .await
+            .expect("abort after poison must succeed");
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+
+        // The handle is now spent: a later call fails as finished, not poisoned.
+        let after_abort = handle
+            .put_part(Bytes::from_static(b"late"), None)
+            .await
+            .expect_err("put_part after abort must fail");
+        assert!(matches!(after_abort, StoreError::Permanent(_)));
+    }
 
     fn test_config() -> S3Config {
         S3Config {
