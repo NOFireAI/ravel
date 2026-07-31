@@ -96,6 +96,33 @@ git and invites someone copying it into a real cluster.
 - `ravel-tenant-tokens`, where each key is a tenant name and its value is that
   tenant's bearer token.
 
+### The same environment in CI
+
+The `k8s-integration` job in `.github/workflows/ci.yml` runs these same three
+scripts on every pull request, so the local and CI paths cannot drift. Two
+differences, both about build time rather than about what is tested:
+
+- The cluster is created by `helm/kind-action` (pinned by commit SHA) rather
+  than by `kind-up.sh`. The node image the action is given is read out of
+  `kind-up.sh` so there is only one pinned digest, and `kind-up.sh` then reuses
+  that cluster; the job fails if the cluster it expects is not there, so a name
+  drift cannot turn into a silently self-provisioned second cluster.
+- The two release binaries are built on the runner, where the workflow's cargo
+  and sccache caches apply, and the images are assembled from them with
+  `Dockerfile.prebuilt` (the runtime stages only) under
+  `RAVEL_SKIP_IMAGE_BUILD=1`. Running the root `Dockerfile`'s builder stage
+  instead would recompile the workspace inside Docker with no cache, which was
+  measured at 57 minutes. The job smoke-runs `--help` in both assembled images
+  before creating the cluster, so a binary that cannot exec on the runtime base
+  fails with the dynamic linker's message instead of as a `CrashLoopBackOff`.
+  Building outside Docker has one consequence worth knowing about: binaries
+  built on the runner need a newer glibc than the shipping image's Debian 12
+  base has, so the CI images use a Debian 13 distroless base instead.
+  `Dockerfile.prebuilt` records the measured symbols and the alternatives.
+
+`kind-demo.sh` asserts the round-trip value and exits nonzero on any failure,
+so the job needs no extra proof-of-run check over its output.
+
 ## Installing the operator yourself
 
 ```sh
