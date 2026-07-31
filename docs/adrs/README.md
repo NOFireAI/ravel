@@ -37,3 +37,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0031](0031-empty-label-identity.md) | Empty-valued labels absent from series identity everywhere; empty-named labels always rejected | Proposed |
 | [0035](0035-conformance-scoring.md) | Conformance scoring: three-state classification over the full PromQL and SQL surfaces, scored on the claimed subset | Proposed |
 | [0037](0037-container-image-ci-registry.md) | CI-built container images published to GHCR, tag-push/dispatch only, public after a manual visibility flip | Proposed |
+| [0038](0038-empty-value-label-drop-otlp-otap.md) | Drop empty-valued labels at OTLP and OTAP admission, matching remote-write | Accepted |

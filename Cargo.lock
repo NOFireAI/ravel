@@ -4455,6 +4455,7 @@ dependencies = [
  "prost-build",
  "protox",
  "ravel-otlp",
+ "ravel-remote-write",
  "ravel-types",
  "stats_alloc",
  "thiserror",

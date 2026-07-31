@@ -28,6 +28,7 @@ protox = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 opentelemetry-proto = { workspace = true }
+ravel-remote-write = { workspace = true }
 criterion = { workspace = true }
 stats_alloc = "0.1.10"
 

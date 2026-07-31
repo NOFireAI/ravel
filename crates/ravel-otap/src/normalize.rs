@@ -1173,6 +1173,14 @@ fn check_attrs_in_input_order(
     for (raw_key, cell) in raw {
         let name = sanitize_label_name(raw_key);
         let value = raw_cell_value(cell)?;
+        // ADR-0038: an empty-valued label is dropped as absent by
+        // `push_checked` before any length check, so this ordered validation
+        // pass must skip it too, or an empty-valued label with an over-long
+        // name would reject here while the canonical build silently drops it,
+        // breaking the ADR-0011 identical-rejection-class contract.
+        if value.is_empty() {
+            continue;
+        }
         if name.len() > limits.max_label_name_len {
             return Err(Rejection::LabelNameTooLong {
                 len: name.len(),
@@ -1227,6 +1235,13 @@ fn push_checked(
     value: String,
     limits: &IngestLimits,
 ) -> Result<(), Rejection> {
+    // ADR-0038: an empty-valued label is treated as absent (Prometheus
+    // convention, matching ravel-remote-write and ravel-otlp). Drop it before
+    // the length checks, mirroring ravel_otlp::push_checked exactly, so both
+    // OTLP and OTAP hand SeriesId::compute the same label set.
+    if value.is_empty() {
+        return Ok(());
+    }
     if name.len() > limits.max_label_name_len {
         return Err(Rejection::LabelNameTooLong {
             len: name.len(),
