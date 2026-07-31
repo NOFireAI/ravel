@@ -144,6 +144,11 @@ docker pull ghcr.io/nofireai/ravel-server:latest
 docker pull ghcr.io/nofireai/ravel-operator:latest
 ```
 
+GHCR creates a package private on its first push. Until someone flips
+`ravel-server` and `ravel-operator` to public in the package settings (a
+one-time step after the first tag is published), the pull above needs
+`docker login ghcr.io` with a PAT that has `read:packages` first.
+
 Tags: `X.Y.Z`, `X.Y`, `X`, and `latest` on a `vX.Y.Z` git tag push;
 `manual-<short-sha>` from a manual `workflow_dispatch` run of
 [`publish-images.yml`](.github/workflows/publish-images.yml). There is no
