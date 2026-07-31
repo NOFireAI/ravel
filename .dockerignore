@@ -27,5 +27,14 @@ bench/reports/
 docs/
 *.md
 
+# Deployment manifests and shell scripts: same reason as docs/, and they matter
+# more than docs do. `COPY . .` is one layer, so before these were excluded,
+# editing a Kubernetes manifest or a kind script invalidated the cached builder
+# layer and forced a full release rebuild of the workspace (tens of minutes) to
+# produce a byte-identical binary. No build.rs or cargo target reads either
+# tree; the release binaries do not change when they do.
+deploy/
+scripts/
+
 # Editor/OS cruft.
 **/__pycache__/

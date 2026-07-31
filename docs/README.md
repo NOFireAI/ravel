@@ -17,6 +17,10 @@ Start here if you want to run Ravel, ingest into it, or query it.
   flag and env reference, storage backend setup, tenancy, the disposability
   model, and what garbage collection does and doesn't do today. Read this if
   you're deploying or operating Ravel.
+- [guides/kubernetes.md](guides/kubernetes.md): the Ravel operator and the
+  `RavelCluster` custom resource, the kind development environment
+  (`scripts/kind-up.sh`), and what the `/healthz` and `/readyz` probes mean.
+  Read this if you're deploying Ravel on Kubernetes.
 - [guides/inspecting-data.md](guides/inspecting-data.md): `ravel-cli`
   worked examples for reading segments, commit records, and catalog listings
   directly out of the object store. Read this when you need to see what's

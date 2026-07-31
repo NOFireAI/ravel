@@ -116,6 +116,21 @@ curl -G http://127.0.0.1:4318/api/v1/query \
   --data-urlencode "min_commit_token=<token from the export response>"
 ```
 
+### On Kubernetes
+
+The same round trip against a real local Kubernetes cluster, driven by the
+Ravel operator instead of a local process:
+
+```sh
+scripts/kind-up.sh     # kind cluster, both images, fake S3, operator, RavelCluster
+scripts/kind-demo.sh   # OTLP ingest via the gateway, query back via the query tier
+scripts/kind-down.sh   # delete the cluster
+```
+
+Needs `docker`, `kind`, and `kubectl`. Full walkthrough, the `RavelCluster`
+field reference, and probe semantics:
+[docs/guides/kubernetes.md](docs/guides/kubernetes.md).
+
 ## Querying
 
 Once data is ingested (see Quickstart), query it either as PromQL or as SQL.
@@ -264,7 +279,10 @@ built this way.
 - `docs/`: specs, ADRs, diagrams, and the user guides in `docs/guides/`
 - `proto/`: protobuf schemas, vendored OTAP protos
 - `deploy/docker-compose/`: local MinIO stack
-- `scripts/`: `demo.sh`, the end-to-end demo driver
+- `deploy/k8s/`: operator manifests (CRD, RBAC, Deployment), an example
+  `RavelCluster`, and the fake-S3 backends for the kind environment
+- `scripts/`: `demo.sh`, the end-to-end demo driver, and `kind-up.sh` /
+  `kind-demo.sh` / `kind-down.sh`, the same round trip on Kubernetes
 
 ## Documentation
 
@@ -276,7 +294,7 @@ built this way.
   byte-layout diagram in
   [docs/diagrams/rseg-layout.svg](docs/diagrams/rseg-layout.svg)
 - [docs/guides/](docs/guides/): getting started, ingest, query, operations,
-  inspecting data
+  inspecting data, Kubernetes
 - [docs/adrs/](docs/adrs/): one decision record per architectural choice
 - [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
   conformance table and score — every construct classified supported,
