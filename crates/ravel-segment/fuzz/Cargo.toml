@@ -14,6 +14,13 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# `arbitrary` splits one fuzz buffer into the several independent byte slices a
+# catalog decoder takes (footer + section bodies). `prost` decodes the untrusted
+# `Footer` protobuf that every catalog decoder is handed. Both are pinned to the
+# versions already used across the main workspace (prost 0.14) but declared here
+# only, never in the root Cargo.toml.
+arbitrary = { version = "1", features = ["derive"] }
+prost = "0.14"
 
 [dependencies.ravel-segment]
 path = ".."
@@ -21,6 +28,34 @@ path = ".."
 [[bin]]
 name = "parse_footer"
 path = "fuzz_targets/parse_footer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_catalog_v4"
+path = "fuzz_targets/decode_catalog_v4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_catalog_matching_v4"
+path = "fuzz_targets/decode_catalog_matching_v4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_catalog_v5"
+path = "fuzz_targets/decode_catalog_v5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sparse_probe"
+path = "fuzz_targets/sparse_probe.rs"
 test = false
 doc = false
 bench = false
