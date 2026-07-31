@@ -48,6 +48,8 @@ exists for disk-hungry jobs.
 
 ## Decision
 
+![Ravel Kubernetes operator reconcile loop](../diagrams/k8s-operator-reconcile.svg)
+
 1. **Operator in Rust with kube-rs.** New crate
    `services/ravel-operator` using `kube`, `kube-runtime`,
    `k8s-openapi`, and `schemars` (CRD schema derived from the Rust spec
