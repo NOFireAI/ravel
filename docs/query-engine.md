@@ -272,7 +272,7 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 133 constructs over 214 corpus entries in 10 corpus files.
+Surface: 133 constructs over 216 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
