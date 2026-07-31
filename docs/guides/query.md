@@ -2,9 +2,9 @@
 
 ![query path](../diagrams/query-path.svg)
 
-All five endpoints live under `/api/v1` on `--listen-http`, require the same
-tenant authentication as ingest (`Authorization: Bearer <token>`, or the
-dev header if `--dev-insecure-tenant-header` is set), and return the same
+All five endpoints live under `/api/v1` on `--listen-http`. They require the
+same tenant authentication as ingest (`Authorization: Bearer <token>`, or the
+dev header if `--dev-insecure-tenant-header` is set). They return the same
 Prometheus-compatible JSON envelope:
 
 ```json
@@ -110,21 +110,21 @@ curl -G http://127.0.0.1:4318/api/v1/series \
 {"status": "success", "data": [{"__name__": "demo_requests_total", "job": "checkout"}]}
 ```
 
-Omitting `match[]` on `/series` is a `400 bad_data` error
-(`missing required parameter "match[]"`); `/labels` and `/label/{name}/values`
+If you omit `match[]` on `/series`, you get a `400 bad_data` error
+(`missing required parameter "match[]"`). `/labels` and `/label/{name}/values`
 allow it and match every series in the window instead.
 
 `/labels`, `/label/{name}/values`, and `/series` default their window to the
-hour before now (`start`/`end` unset). If more than one `match[]` selector
-is given, each one resolves its own catalog snapshot independently and the
-results are unioned by series identity, rather than all selectors sharing
-one snapshot for the request.
+hour before now (`start`/`end` unset). If you give more than one `match[]`
+selector, each one resolves its own catalog snapshot independently, and Ravel
+unions the results by series identity. The selectors do not share one snapshot
+for the request.
 
 ## PromQL subset
 
 Ravel's evaluator (`ravel-promql`) supports exactly one AST shape: a bare
-vector selector, optionally with `offset`. Everything else is rejected with
-`422 unprocessable_entity` and an error naming the construct:
+vector selector, optionally with `offset`. Everything else gets a
+`422 unprocessable_entity` error that names the construct:
 
 | Rejected | Error names it as |
 |---|---|
@@ -144,30 +144,30 @@ What is supported, precisely:
 - All four matcher operators: `=`, `!=`, `=~`, `!~`.
 - Absent-label semantics match Prometheus: an absent label reads as an
   empty string for every operator. `{foo=""}` matches series without
-  `foo`; `{foo=~".*"}` matches everything, including series without `foo`;
-  `{foo!=""}` matches only series where `foo` is present and non-empty;
+  `foo`. `{foo=~".*"}` matches everything, including series without `foo`.
+  `{foo!=""}` matches only series where `foo` is present and non-empty.
   `{foo=~""}` matches only series where `foo` is absent (the regex is
   anchored, so this is `^(?:)$`, which only an empty string satisfies).
-  Regex matchers are always fully anchored (`^(?:pattern)$`), matching
+  Regex matchers are always fully anchored (`^(?:pattern)$`), the same as
   Prometheus, so `job=~"api"` does not match `job="api-server"`.
 - `offset`, both the standard positive form (look backward) and the
   negative form (look forward, experimental in upstream PromQL too).
 - A fixed 5-minute lookback: at evaluation instant `T` (shifted by
-  `offset` if present), a series' value is its most recent sample with
-  timestamp in `(T - 5m, T]`. The window's start is exclusive: a sample
-  exactly 5 minutes old is not used; a series with no sample in that window
+  `offset` if present), a series' value is its most recent sample with a
+  timestamp in `(T - 5m, T]`. The window's start is exclusive. A sample
+  exactly 5 minutes old is not used. A series with no sample in that window
   is omitted from the result entirely, not reported as absent or zero.
 
 ## `min_commit_token`
 
 Pass a commit token from an ingest response's `x-ravel-commit-token`
-header as `min_commit_token` (repeatable if you have more than one, e.g.
-from a request that flushed to multiple shards) to guarantee the query
-sees that write. The catalog resolves each token to its exact commit
-record directly rather than depending on a listing that might race the
-write. If a token can't be resolved, the query fails outright
-(`503 unavailable`) instead of silently returning a snapshot older than
-what you asked for. See [docs/guides/ingest.md](ingest.md#commit-tokens-and-read-your-write).
+header as `min_commit_token` to guarantee that the query sees that write. It
+is repeatable if you have more than one, for example from a request that
+flushed to multiple shards. The catalog resolves each token to its exact commit
+record directly, rather than depend on a listing that might race the write. If
+the catalog cannot resolve a token, the query fails outright
+(`503 unavailable`). It does not silently return a snapshot older than what you
+asked for. See [docs/guides/ingest.md](ingest.md#commit-tokens-and-read-your-write).
 
 ## Query budgets
 
@@ -183,23 +183,24 @@ truncation ([crates/ravel-query/src/config.rs](../../crates/ravel-query/src/conf
 | Wall-clock deadline | 30s | `query exceeded its deadline of {deadline}` |
 
 `timeout` (Prometheus duration syntax like `30s`/`5m`, or bare float
-seconds) lowers the deadline per request; it cannot raise it above the
+seconds) lowers the deadline per request. It cannot raise it above the
 server's configured default.
 
 ## SQL over the `logs` table
 
 `POST /api/v1/sql` (see README "SQL") serves two tables from one endpoint:
 `samples` (metrics) and `logs`. The server parses the query's `FROM` clause
-before planning and registers only that one table for the query; a single
-query may reference one or the other, never both (a query naming both is
-rejected with HTTP 400). The request body, auth, window
+before it plans, and registers only that one table for the query. A single
+query may reference one table or the other, never both; a query that names
+both gets an HTTP 400. The request body, auth, window
 (`start`/`end`), and `min_commit_token` handling are identical to the `samples`
 case.
 
 The `logs` table columns are `ts`, `observed_ts` (both `Timestamp(ns)`),
 `severity_num`, `severity_text`, `body`, `trace_id`, `span_id`, `flags`, and an
-`attrs` `Map(Utf8, Utf8)` merging each record's resource, scope, and per-record
-attributes (see docs/query-engine.md for the full schema and semantics).
+`attrs` `Map(Utf8, Utf8)` that merges each record's resource, scope, and
+per-record attributes (see docs/query-engine.md for the full schema and
+semantics).
 
 A `ts` range scan. `ts` is a timestamp, so the bounds are `TIMESTAMP` literals,
 not bare integers:
@@ -215,7 +216,7 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
       }'
 ```
 
-A word/phrase content search with `has_word(body, 'literal')`, which pushes
+A word or phrase content search with `has_word(body, 'literal')`. It pushes
 down to the RLOG bloom-accelerated scan and matches whole tokens (so `timeout`
 matches `connection timeout` but not `timed out`):
 
@@ -226,12 +227,12 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
   -d '{"query": "SELECT ts, body FROM logs WHERE has_word(body, '\''timeout'\'') ORDER BY ts"}'
 ```
 
-Filtering by an attribute value (the `attrs['service.name'] = 'api'` shape) is
-**not yet available over SQL**: this build registers no nested-expression
+A filter by an attribute value (the `attrs['service.name'] = 'api'` shape) is
+**not yet available over SQL**. This build registers no nested-expression
 planner, so the `attrs['k']` subscript fails query planning with a loud error
-rather than returning a wrong answer (a documented ADR-0033 gap). Until it is
-wired, use `has_word` over `body` for content search; only the `attrs['k']`
-subscript form is affected, and other predicates (`ts`, `has_word`) are
+rather than returns a wrong answer (a documented ADR-0033 gap). Until it is
+wired, use `has_word` over `body` for content search. Only the `attrs['k']`
+subscript form is affected; other predicates (`ts`, `has_word`) are
 unaffected.
 
 ## HTTP status codes

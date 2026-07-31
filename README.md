@@ -6,98 +6,101 @@
 [![Rust](https://img.shields.io/badge/rust-1.97.1-orange.svg)](rust-toolchain.toml)
 
 Ravel is an OpenTelemetry-native observability database. It stores metrics
-(logs, traces, and profiles are planned) directly on S3-compatible object
-storage, with no local disk state and no coordination service. A query talks
-PromQL over HTTP; an ingest client talks OTLP over HTTP or gRPC.
+directly on S3-compatible object storage. It keeps no local disk state and uses
+no coordination service. Logs, traces, and profiles are planned. A query uses
+PromQL over HTTP. An ingest client uses OTLP over HTTP or gRPC.
 
-The core property: the object store is the only durable thing in the system.
-Every Ravel process (gateway, ingest shard, query frontend) is disposable and
-stateless. Once a write is acknowledged in strict mode, that data survives the
-crash, restart, or redeployment of any Ravel process, because it survives
-anything the object store survives.
+The main property is this: the object store is the only durable part of the
+system. Every Ravel process (gateway, ingest shard, query frontend) is
+disposable and stateless. If Ravel acknowledges a write in strict mode, that
+data survives the crash, restart, or redeployment of any Ravel process. It
+survives because the object store survives it.
 
 ## Status
 
-Research prototype: a working vertical slice for metrics, OTLP ingest through
-PromQL and SQL query, running end to end against MinIO or S3. See
-[PROGRESS.md](PROGRESS.md) for the living log of what has been built and
-when.
+Ravel is a research prototype. It is a working vertical slice for metrics: OTLP
+ingest through PromQL and SQL query, from end to end against MinIO or S3. For a
+log of what is built and when, see [PROGRESS.md](PROGRESS.md).
 
-What exists today:
+Ravel has these features today:
 
-- OTLP HTTP and gRPC metrics ingest (gauges and cumulative sums), with
+- OTLP HTTP and gRPC metrics ingest (gauges and cumulative sums). It has
   admission limits, event-time skew bounds, and strict or buffered
   acknowledgement.
-- Object-native commit: every flush produces one immutable segment object and
-  one immutable commit record, both content-addressed.
-- A catalog that resolves a consistent snapshot of segments per query via
-  listing.
+- Object-native commit: each flush produces one immutable segment object and
+  one immutable commit record. Both are content-addressed.
+- A catalog that resolves a consistent snapshot of segments for each query
+  through listing.
 - L0-to-L1 compaction, age-based retention, and a garbage-collecting sweeper
-  (orphan GC, superseded-input sweep, unreferenced-part cleanup), signal-
-  generic across metrics and logs. Runs continuously via `ravel-server
-  --mode maintain`, or one-shot via `ravel-cli maintain
+  (orphan GC, superseded-input sweep, unreferenced-part cleanup). It is signal-
+  generic across metrics and logs. It runs continuously with `ravel-server
+  --mode maintain`, or one-shot with `ravel-cli maintain
   compact-bucket|sweep|status|audit-versions`. See
   [docs/compaction-retention-plan.md](docs/compaction-retention-plan.md),
   [ADR-0018](docs/adrs/0018-l0-l1-compaction.md),
-  [ADR-0019](docs/adrs/0019-age-based-retention.md). The continuous
-  background loop needs a multipart-capable object store backend, which
-  no shipped backend implements yet (issue #243); one-shot compaction/sweep
-  via `ravel-cli` work today regardless.
-- PromQL: vector/matrix selectors (all matcher types, `offset`, `@`, 5m
+  [ADR-0019](docs/adrs/0019-age-based-retention.md). The continuous background
+  loop needs a multipart-capable object store backend. No shipped backend
+  implements one yet (issue #243). One-shot compaction and sweep via
+  `ravel-cli` work today regardless.
+- PromQL: vector and matrix selectors (all matcher types, `offset`, `@`, 5m
   lookback), binary operators, and most of the function library (`rate`,
-  `histogram_quantile`, the `*_over_time` family, label and math functions)
-  over `/api/v1/query` and `/api/v1/query_range`, plus `/api/v1/labels`,
-  `/api/v1/label/{name}/values`, and `/api/v1/series`. Aggregation operators
-  (`sum by (...)`, `topk`, ...) and subqueries are not implemented yet.
-- Native (exponential) histograms end to end: ingested and stored (RSEG v5),
-  queried, and reduced to floats by the native-histogram PromQL functions
-  `histogram_count`, `histogram_sum`, and `histogram_avg`; `histogram_quantile`
-  and `histogram_fraction` over a native histogram; `rate`/`increase`/`delta`
-  over a histogram range; and `sum`/`avg` aggregation over histogram-valued
-  series. Native `histogram_quantile`/`histogram_fraction` currently
-  interpolate within a bucket linearly, where Prometheus 3.x interpolates
-  exponentially, so their values can differ from Prometheus for interior
-  quantiles.
-- SQL over the same data via DataFusion (`ravel-sql`): `POST /api/v1/sql`,
-  behind `ravel-server`'s `sql` cargo feature, with a read-only `samples`
+  `histogram_quantile`, the `*_over_time` family, label and math functions).
+  These work over `/api/v1/query` and `/api/v1/query_range`, plus
+  `/api/v1/labels`, `/api/v1/label/{name}/values`, and `/api/v1/series`.
+  Aggregation operators (`sum by (...)`, `topk`, ...) and subqueries do not work
+  yet.
+- Native (exponential) histograms from end to end. Ravel ingests and stores
+  them (RSEG v5), queries them, and reduces them to floats with the native-
+  histogram PromQL functions: `histogram_count`, `histogram_sum`, and
+  `histogram_avg`; `histogram_quantile` and `histogram_fraction` over a native
+  histogram; `rate`/`increase`/`delta` over a histogram range; and `sum`/`avg`
+  aggregation over histogram-valued series. Native
+  `histogram_quantile`/`histogram_fraction` interpolate linearly within a
+  bucket, but Prometheus 3.x interpolates exponentially. Their values can
+  therefore differ from Prometheus for interior quantiles.
+- SQL over the same data through DataFusion (`ravel-sql`): `POST /api/v1/sql`,
+  behind `ravel-server`'s `sql` cargo feature. It has a read-only `samples`
   table and the same duplicate-sample resolution as PromQL, bit-for-bit. See
   [ADR-0013](docs/adrs/0013-arrow-zero-copy-and-datafusion.md).
-- Post-evaluation analytics (`ravel-analytics`): `POST /api/v1/analytics`
-  runs a range query and applies change point detection or robust summary
-  statistics per series. See
+- Post-evaluation analytics (`ravel-analytics`): `POST /api/v1/analytics` runs a
+  range query, then applies change point detection or robust summary statistics
+  to each series. See
   [ADR-0028](docs/adrs/0028-analytics-stage.md).
 - `ravel-server` (dev binary, all roles in one process) and `ravel-cli`
-  (segment/commit/catalog inspection).
+  (segment, commit, and catalog inspection).
 - Flight SQL: the same query path as `/api/v1/sql`, over Arrow Flight's gRPC
-  surface, behind `ravel-server`'s `flight-sql` cargo feature (implies `sql`).
+  surface, behind `ravel-server`'s `flight-sql` cargo feature (which implies
+  `sql`).
 
-What is planned, not built:
+These features are planned, not built:
 
 - Remote Write 1.0/2.0, OTel logs/traces/profiles, and exemplars.
 - PromQL aggregation operators and subqueries, with a differential test
-  suite against Prometheus for everything the evaluator does support.
+  suite against Prometheus for every construct the evaluator supports.
 - Exact rollups (a second, aggregated level beyond L0/L1).
-- Catalog snapshots (an index object instead of per-query listing), needed
-  before listing-based discovery runs out of headroom.
-- OTAP (OpenTelemetry Arrow) ingest, scaffolded but not wired into the
-  gateway.
+- Catalog snapshots (an index object instead of per-query listing). These are
+  necessary before listing-based discovery runs out of headroom.
+- OTAP (OpenTelemetry Arrow) ingest. It is scaffolded but not yet wired into
+  the gateway.
 
 ## Quickstart
 
-Prerequisites: Rust via `rust-toolchain.toml` (rustc pinned, installed
-automatically by `rustup` if you have it), Docker with `docker compose`.
+Prerequisites: Rust through `rust-toolchain.toml` (the rustc version is pinned;
+`rustup` installs it automatically if you have it), and Docker with `docker
+compose`.
 
 ```sh
 make minio   # starts MinIO + bucket creation via docker compose
 make demo    # builds ravel-server/ravel-cli, ingests one OTLP export, queries it back
 ```
 
-`make demo` runs [scripts/demo.sh](scripts/demo.sh): it starts `ravel-server`
+`make demo` runs [scripts/demo.sh](scripts/demo.sh). It starts `ravel-server`
 against MinIO, sends a generated OTLP metrics export over HTTP, prints the
-commit token it got back, and queries that metric by `min_commit_token`. Full
-walkthrough with expected output: [docs/guides/getting-started.md](docs/guides/getting-started.md).
+commit token it receives, and queries that metric by `min_commit_token`. For the
+full walkthrough with expected output, see
+[docs/guides/getting-started.md](docs/guides/getting-started.md).
 
-The same flow by hand, once MinIO is up:
+After MinIO is up, here is the same flow by hand:
 
 ```sh
 cargo run -p ravel-server -- \
@@ -118,8 +121,8 @@ curl -G http://127.0.0.1:4318/api/v1/query \
 
 ### On Kubernetes
 
-The same round trip against a real local Kubernetes cluster, driven by the
-Ravel operator instead of a local process:
+Here is the same round trip against a real local Kubernetes cluster. The Ravel
+operator drives it instead of a local process:
 
 ```sh
 scripts/kind-up.sh     # kind cluster, both images, fake S3, operator, RavelCluster
@@ -127,14 +130,14 @@ scripts/kind-demo.sh   # OTLP ingest via the gateway, query back via the query t
 scripts/kind-down.sh   # delete the cluster
 ```
 
-Needs `docker`, `kind`, and `kubectl`. Full walkthrough, the `RavelCluster`
-field reference, and probe semantics:
+This needs `docker`, `kind`, and `kubectl`. For the full walkthrough, the
+`RavelCluster` field reference, and probe semantics, see
 [docs/guides/kubernetes.md](docs/guides/kubernetes.md).
 
 ## Querying
 
-Once data is ingested (see Quickstart), query it either as PromQL or as SQL.
-Both read the same catalog and segments and apply the same duplicate-sample
+After you ingest data (see Quickstart), you can query it as PromQL or as SQL.
+Both read the same catalog and segments. Both apply the same duplicate-sample
 resolution, so they agree on results.
 
 ### PromQL
@@ -143,14 +146,14 @@ resolution, so they agree on results.
 selectors, `offset`/`@`, binary operators, and most of the function library
 (`rate`, `histogram_quantile`, the `*_over_time` family, label and math
 functions). Aggregation operators (`sum by (...)`, `topk`, ...) and
-subqueries are not implemented yet.
+subqueries do not work yet.
 
-Native (exponential) histograms are queryable: `histogram_count`,
+You can query native (exponential) histograms: `histogram_count`,
 `histogram_sum`, `histogram_avg`, `histogram_quantile`, and
 `histogram_fraction` over a native histogram, plus `rate`/`increase`/`delta`
 over a histogram range and `sum`/`avg` aggregation over histogram-valued
-series. Native `histogram_quantile`/`histogram_fraction` interpolate within a
-bucket linearly rather than exponentially, so interior-quantile values can
+series. Native `histogram_quantile`/`histogram_fraction` interpolate linearly
+within a bucket, not exponentially. Interior-quantile values can therefore
 differ from Prometheus 3.x.
 
 ```sh
@@ -171,11 +174,11 @@ curl -G http://127.0.0.1:4318/api/v1/query_range \
 
 ### SQL
 
-`POST /api/v1/sql` runs a read-only SQL statement via DataFusion, against
-either of two tables: `samples(ts, value, ...)` (metrics) or `logs(ts,
-severity_text, body, attrs, ...)` (ADR-0033). A query references one or the
-other, never both. It is off by default: build or run `ravel-server` with the
-`sql` cargo feature to enable it.
+`POST /api/v1/sql` runs a read-only SQL statement through DataFusion. It uses
+one of two tables: `samples(ts, value, ...)` (metrics) or `logs(ts,
+severity_text, body, attrs, ...)` (ADR-0033). A query uses one table or the
+other, never both. This endpoint is off by default. To enable it, build or run
+`ravel-server` with the `sql` cargo feature.
 
 ```sh
 cargo run -p ravel-server --features sql -- \
@@ -204,25 +207,25 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
 # {"status":"success","data":{"rows":[[150,"connection timeout"]]}}
 ```
 
-Only `SELECT` is accepted (no `INSERT`/`COPY`/`CREATE EXTERNAL TABLE`/`SET`/
-multi-statement bodies); rejected statements and execution errors come back
-as a redacted `{"status":"error","errorType":...,"error":...}` body, never
-raw backend or DataFusion plan text. Send `Accept:
-application/vnd.apache.arrow.stream` instead of JSON for a bit-exact Arrow
-IPC stream (needed for `NaN`/`-0.0` payloads, which JSON cannot represent
-exactly). Flight SQL (the gRPC equivalent) is available behind
-`ravel-server`'s `flight-sql` cargo feature; see docs/guides/query.md for the
-full `logs` table reference (schema, supported predicates, known gaps).
+The endpoint accepts only `SELECT` (no `INSERT`/`COPY`/`CREATE EXTERNAL
+TABLE`/`SET`/multi-statement bodies). Rejected statements and execution errors
+return a redacted `{"status":"error","errorType":...,"error":...}` body. They
+never return raw backend or DataFusion plan text. For a bit-exact Arrow IPC
+stream, send `Accept: application/vnd.apache.arrow.stream` instead of JSON. This
+is necessary for `NaN`/`-0.0` payloads, which JSON cannot represent exactly.
+Flight SQL (the gRPC equivalent) is available behind `ravel-server`'s
+`flight-sql` cargo feature. For the full `logs` table reference (schema,
+supported predicates, known gaps), see docs/guides/query.md.
 
 ### Analytics
 
 `POST /api/v1/analytics` runs a range query exactly as `/api/v1/query_range`
-does (same planner, budgets, staleness handling, and deadline), then applies
+does (same planner, budgets, staleness handling, and deadline). It then applies
 one analytic operation to each series of the result (ADR-0028). Two ops are
-available: `change_point` (PELT change point detection, classifying spikes,
-dips, step changes, trend changes, and distribution changes) and `summary`
-(exact median, MAD, percentiles, standard deviation, and variance). It shares
-the query listener and needs no cargo feature.
+available. `change_point` does PELT change point detection; it classifies
+spikes, dips, step changes, trend changes, and distribution changes. `summary`
+computes the exact median, MAD, percentiles, standard deviation, and variance.
+This endpoint shares the query listener and needs no cargo feature.
 
 ```sh
 curl -X POST http://127.0.0.1:4318/api/v1/analytics \
@@ -241,33 +244,33 @@ curl -X POST http://127.0.0.1:4318/api/v1/analytics \
 #              "downsampled":false,"original_points":120,"nan_excluded":0}}]}}
 ```
 
-`start`/`end`/`step` use the same syntax as `/api/v1/query_range`. A series
-over 2000 points needs `"downsample": true` to run `change_point`
-(approximation is opt-in and visible); a call matching over 1000 series is
-rejected. See [docs/analytics.md](docs/analytics.md) for the request and
-response schema, a worked example per op, and the error table.
+`start`/`end`/`step` use the same syntax as `/api/v1/query_range`. A series with
+more than 2000 points needs `"downsample": true` to run `change_point`
+(approximation is opt-in and visible). A call that matches more than 1000 series
+is rejected. For the request and response schema, a worked example for each op,
+and the error table, see [docs/analytics.md](docs/analytics.md).
 
 ## Architecture
 
 ![architecture](docs/diagrams/architecture.svg)
 
-OTLP arrives at the gateway, which authenticates the request, resolves a
-tenant, and checks admission limits before anything is buffered. Points route
-to a shard actor by `hash(tenant, series_id)`; each shard actor is a single
-task with no locks, buffering points until a size or age trigger fires a
-flush. A flush serializes an RSEG segment, PUTs it to the object store,
-mints an immutable commit record, and PUTs that too, in that order; only
-then are waiting requests acknowledged with a commit token.
+OTLP arrives at the gateway. The gateway authenticates the request, resolves a
+tenant, and checks admission limits before it buffers anything. Points route to
+a shard actor by `hash(tenant, series_id)`. Each shard actor is a single task
+with no locks. It buffers points until a size or age trigger fires a flush. A
+flush does these steps in order: it serializes an RSEG segment, PUTs it to the
+object store, mints an immutable commit record, and PUTs that record too. Only
+then does Ravel acknowledge the waiting requests with a commit token.
 
-On the query side, `/api/v1/*` resolves a snapshot of segments from the
-catalog (by listing commit records in the relevant shard/hour buckets),
-fetches each segment's footer, prunes series by label matchers, fetches the
-needed pages, and hands the merged samples to the PromQL evaluator.
+On the query side, `/api/v1/*` resolves a snapshot of segments from the catalog.
+It lists commit records in the relevant shard and hour buckets. It then fetches
+each segment's footer, prunes series by label matchers, fetches the necessary
+pages, and hands the merged samples to the PromQL evaluator.
 
-Everything downstream of "PUT succeeded" is derived, replaceable, and
-disposable. See [docs/architecture.md](docs/architecture.md) for the full
-crate dependency graph and [docs/adrs/](docs/adrs/) for why each piece is
-built this way.
+Everything after "PUT succeeded" is derived, replaceable, and disposable. For
+the full crate dependency graph, see
+[docs/architecture.md](docs/architecture.md). For the reason each piece is built
+this way, see [docs/adrs/](docs/adrs/).
 
 ## Repository layout
 
@@ -287,25 +290,24 @@ built this way.
 ## Documentation
 
 - [docs/README.md](docs/README.md): index of every guide and spec
-- [docs/segment-format.md](docs/segment-format.md): the RSEG data format —
+- [docs/segment-format.md](docs/segment-format.md): the RSEG data format. It is
   a self-contained specification of RSEG v5 (the columnar catalog, native
-  histograms, multi-run compaction layout, and the optional sparse catalog),
-  the only version readable or writable pre-release (ADR-0027), with the
-  byte-layout diagram in
-  [docs/diagrams/rseg-layout.svg](docs/diagrams/rseg-layout.svg)
+  histograms, multi-run compaction layout, and the optional sparse catalog).
+  RSEG v5 is the only version you can read or write pre-release (ADR-0027). The
+  byte-layout diagram is in
+  [docs/diagrams/rseg-layout.svg](docs/diagrams/rseg-layout.svg).
 - [docs/guides/](docs/guides/): getting started, ingest, query, operations,
   inspecting data, Kubernetes
 - [docs/adrs/](docs/adrs/): one decision record per architectural choice
 - [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
-  conformance table and score — every construct classified supported,
-  intentionally rejected, or unclassified (ADR-0035)
+  conformance table and score. It classifies every construct as supported,
+  intentionally rejected, or unclassified (ADR-0035).
 - [BENCHMARKS.md](BENCHMARKS.md): measured numbers, with the exact commands
   and environment that produced them
 
 ## Reading the history
 
-[PROGRESS.md](PROGRESS.md) is a living log, newest first, of what has been
-built, what broke, and what's next; it's the fastest way to see how the
-project actually got here versus what the specs describe in the abstract.
-The GitHub issue tracker carries the same story in smaller, resolved-or-not
-pieces.
+[PROGRESS.md](PROGRESS.md) is a living log, newest first, of what is built, what
+broke, and what is next. It is the fastest way to see how the project got here,
+against what the specs describe in the abstract. The GitHub issue tracker
+carries the same story in smaller pieces, resolved or not.
