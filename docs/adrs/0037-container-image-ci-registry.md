@@ -12,7 +12,7 @@ The root `Dockerfile` (ADR-0034 decision 5) and its CI companion
 push that touches it, and `k8s-integration` (ci.yml:527-636) assembles
 both from prebuilt binaries for the kind lane. Both are build-only: no
 job tags or pushes an image anywhere, no registry is referenced anywhere
-in the repo (`deploy/k8s/operator/operator.yaml:37` hardcodes
+in the repo (`deploy/k8s/operator/operator.yaml:40` hardcodes
 `image: ravel-operator:latest` as a placeholder the kind scripts
 override), and no publish workflow exists.
 
@@ -154,8 +154,11 @@ repo config). The GitHub org is `NOFireAI`, repo `store`.
   that job's whole purpose (per its own comments, ci.yml:641-664) is a
   cheap, path-gated build-only proof that the shipping Dockerfile still
   works; giving it `packages: write` and registry credentials widens its
-  blast radius for no benefit, since the publish workflow already
-  re-verifies the build as its first step.
+  blast radius for no benefit, since the publish workflow's own build
+  step fails closed the same way and simply does not push on failure.
+  It runs no separate `--help` smoke test the way `docker-build` does;
+  that gap is acceptable because a broken build never reaches `push:
+  true` in the first place.
 - **Publishing on every push to `main`.** Rejected in decision 4: the
   root Dockerfile's single `COPY . .` plus one `RUN cargo build` layer
   means `type=gha` caching structurally cannot hit on a source change,

@@ -27,6 +27,7 @@ jobs:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix:
         target: [server, operator]
     steps:
@@ -38,7 +39,10 @@ jobs:
         id: tags
         run: |
           image="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-${{ matrix.target }}"
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+          # event_name, not ref_type: a workflow_dispatch run can be launched
+          # from a tag ref too, and that must still take the manual-<sha>
+          # branch below, not silently move latest/X/X.Y for that tag.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
             version="${GITHUB_REF_NAME#v}"
             major="${version%%.*}"
             minor="${version%.*}"
@@ -58,6 +62,10 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # No cache-from/cache-to: type=gha. The builder stage's single
+      # COPY-then-build layer changes on every commit (ADR-0037 decision 4),
+      # so a GHA cache export here could never hit and would only spend the
+      # 10 GB per-repo budget shared with sccache/rust-cache in ci.yml.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -65,5 +73,3 @@ jobs:
           target: ${{ matrix.target }}
           push: true
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=publish-${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=publish-${{ matrix.target }}
