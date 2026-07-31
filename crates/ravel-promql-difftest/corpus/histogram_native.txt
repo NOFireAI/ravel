@@ -30,18 +30,19 @@
 # "no allowlist entry without numeric evidence" rule means no tolerance entry
 # is added for either.
 #
-# EXCLUDED pending an evaluator fix: histogram_quantile (interior phi) and
-# histogram_fraction. The real run showed a genuine evaluator semantic gap, not
-# a float residue: Prometheus 3.13.1 interpolates within a native-histogram
-# bucket exponentially, Ravel interpolates linearly
-# (crates/ravel-promql/src/histogram.rs:489 quantile, :523 fraction). For the
-# median of diff_native_hist at +0s (bucket (2,4], rank fraction 1/6):
-# Prometheus returns 2*2^(1/6)=2.244924096618746, Ravel 2+(2/6)=2.3333333333333335;
-# histogram_fraction(0,4,...) returns 6/7=0.8571428571428571 vs Ravel
-# 5.5/7=0.7857142857142857. This is a ravel-promql evaluator fix (exponential
-# interpolation), out of this crate's scope; see the stage-2 report. The
-# out-of-range-phi clamp is kept below because it returns +Inf without
-# exercising interpolation, so it matches.
+# FIXED (#252): histogram_quantile (interior phi) and histogram_fraction. The
+# real run had shown a genuine evaluator semantic gap, not a float residue:
+# Prometheus 3.13.1 interpolates within a native-histogram bucket
+# exponentially, while Ravel interpolated linearly. ravel-promql now matches:
+# it places the interpolated point on a log scale within the bucket
+# (lower*(upper/lower)^within for the quantile, the log-ratio inverse for the
+# fraction), and applies the same one-sided zero-bucket bound (lower/upper -> 0)
+# to histogram_fraction that histogram_quantile already used. For the median of
+# diff_native_hist at +0s (bucket (2,4], rank fraction 1/6) both now return
+# 2*2^(1/6)=2.244924096618746; histogram_fraction(0,4,...) returns
+# 6/7=0.8571428571428571 (rank_at(0)=0 via the zero-bucket bound, rank_at(4)=6).
+# Those two queries are re-added below. The out-of-range-phi clamp stays too
+# because it returns +Inf without exercising interpolation.
 #
 # Dataset: diff_native_hist{kind="counter"} is a monotonic counter native
 # histogram (schema 0, three positive buckets, populated zero bucket).
@@ -68,6 +69,18 @@ mode: unordered
 
 name: native_histogram_quantile_phi_out_of_range
 query: histogram_quantile(1.5, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_quantile_median
+query: histogram_quantile(0.5, diff_native_hist)
+kind: instant
+time: +0s
+mode: unordered
+
+name: native_histogram_fraction
+query: histogram_fraction(0, 4, diff_native_hist)
 kind: instant
 time: +0s
 mode: unordered

@@ -486,13 +486,59 @@ pub fn histogram_quantile(phi: f64, h: &FloatHistogram) -> f64 {
         return upper;
     }
     let within = (rank - count_before) / chosen.count;
-    lower + (upper - lower) * within
+    interpolate_value(lower, upper, within, h.uses_custom_buckets())
+}
+
+/// The value at fractional position `within` (in `0..=1`) inside a bucket
+/// `(lower, upper]`, the inverse of [`bucket_fraction`]. Native-histogram
+/// buckets have exponentially spaced boundaries, so Prometheus places the
+/// interpolated point on a log scale within the bucket
+/// (`promql/quantile.go`): `lower * (upper/lower)^within`. Custom-boundary
+/// (NHCB) buckets and any bucket with a zero or sign-crossing edge (the zero
+/// bucket after the caller's straddle adjustment) fall back to linear, exactly
+/// as Prometheus does.
+fn interpolate_value(lower: f64, upper: f64, within: f64, custom: bool) -> f64 {
+    if is_exponential_bucket(lower, upper, custom) {
+        lower * (upper / lower).powf(within)
+    } else {
+        lower + (upper - lower) * within
+    }
+}
+
+/// The fraction (in `0..=1`) of a bucket `(lower, upper]` that lies at or below
+/// `value`, the inverse of [`interpolate_value`]. Exponential (log-scale) share
+/// on native buckets, linear on custom/zero-straddling ones, matching
+/// Prometheus' `histogramFraction`.
+fn bucket_fraction(lower: f64, upper: f64, value: f64, custom: bool) -> f64 {
+    if is_exponential_bucket(lower, upper, custom) {
+        (value / lower).ln() / (upper / lower).ln()
+    } else {
+        let span = upper - lower;
+        if span > 0.0 {
+            (value - lower) / span
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Whether a bucket's interior is interpolated on an exponential (log) scale:
+/// a native-histogram bucket (`!custom`) whose bounds are finite, nonzero, and
+/// share a sign. The zero bucket (a sign-crossing edge, or a `0` edge after
+/// the one-sided straddle adjustment) and custom NHCB buckets are linear.
+fn is_exponential_bucket(lower: f64, upper: f64, custom: bool) -> bool {
+    !custom
+        && lower.is_finite()
+        && upper.is_finite()
+        && lower != 0.0
+        && upper != 0.0
+        && lower.signum() == upper.signum()
 }
 
 /// Prometheus `histogramFraction` over one native histogram: the estimated
-/// fraction of observations in `(lower, upper)`, linearly interpolating the
-/// partial buckets. Argument edges (`NaN`, inverted range) are handled by the
-/// caller.
+/// fraction of observations in `(lower, upper)`, interpolating the partial
+/// buckets exponentially (native buckets) or linearly (custom/zero buckets).
+/// Argument edges (`NaN`, inverted range) are handled by the caller.
 pub fn histogram_fraction(lower: f64, upper: f64, h: &FloatHistogram) -> f64 {
     if h.count == 0.0 || lower >= upper {
         return 0.0;
@@ -511,20 +557,33 @@ fn fraction_rank(value: f64, h: &FloatHistogram) -> f64 {
     if value == f64::NEG_INFINITY {
         return 0.0;
     }
+    let custom = h.uses_custom_buckets();
     let mut cumulative = 0.0f64;
     for b in h.all_buckets() {
-        if value >= b.upper {
+        let mut lower = b.lower;
+        let mut upper = b.upper;
+        // Same zero-straddle adjustment as `histogram_quantile`: a one-sided
+        // histogram's zero bucket is bounded at 0 on the populated side, so a
+        // query value of exactly 0 sits on the bucket edge and contributes
+        // none of the zero-bucket count, matching Prometheus.
+        if !custom && lower < 0.0 && upper > 0.0 {
+            if h.negative_buckets.is_empty() && !h.positive_buckets.is_empty() {
+                lower = 0.0;
+            } else if h.positive_buckets.is_empty() && !h.negative_buckets.is_empty() {
+                upper = 0.0;
+            }
+        }
+        if value >= upper {
             cumulative += b.count;
             continue;
         }
-        if value <= b.lower {
+        if value <= lower {
             break;
         }
-        // Partial bucket: linear share of its count.
-        let span = b.upper - b.lower;
-        if span > 0.0 {
-            cumulative += b.count * ((value - b.lower) / span);
-        }
+        // Partial bucket: exponential share on native buckets, linear on
+        // custom/zero-straddling ones (the inverse of the quantile
+        // interpolation).
+        cumulative += b.count * bucket_fraction(lower, upper, value, custom);
         break;
     }
     cumulative
@@ -677,14 +736,57 @@ mod tests {
         assert_eq!(buckets[2].upper, 2.0);
     }
 
+    /// Build the `diff_native_hist` value at +0s from issue #252: schema 0,
+    /// zero_threshold 1e-9, zero_count 1, positive buckets [2,3,1] from index
+    /// 1. Cumulative buckets: zero 1, (1,2] 2, (2,4] 3, (4,8] 1; total 7.
+    fn diff_native_hist() -> FloatHistogram {
+        let mut h = positive(0, 1, &[2.0, 3.0, 1.0], 0.0);
+        h.zero_threshold = 1e-9;
+        h.zero_count = 1.0;
+        h.count += 1.0;
+        h
+    }
+
     #[test]
     fn quantile_interpolates_within_the_owning_bucket() {
         // Buckets (1,2]:2, (2,4]:2, total 4. Median rank 2 lands at the end
         // of the first bucket -> upper bound 2.
         let h = positive(0, 1, &[2.0, 2.0], 0.0);
         assert_eq!(histogram_quantile(0.5, &h), 2.0);
-        // phi 0.25 -> rank 1, halfway into (1,2] -> 1.5.
-        assert_eq!(histogram_quantile(0.25, &h), 1.5);
+        // phi 0.25 -> rank 1, the log-scale midpoint of (1,2]: native buckets
+        // interpolate exponentially, so 1 * (2/1)^0.5 = sqrt(2), not 1.5.
+        let got = histogram_quantile(0.25, &h);
+        assert!((got - 2.0f64.sqrt()).abs() < 1e-12, "got {got}");
+    }
+
+    #[test]
+    fn quantile_interpolates_exponentially_within_native_bucket() {
+        // Issue #252 reproduction. Median rank 3.5 lands in (2,4] at within
+        // 1/6. Prometheus interpolates exponentially: 2*(4/2)^(1/6) =
+        // 2*2^(1/6) = 2.244..., not the old linear 2 + 2/6 = 2.333....
+        let h = diff_native_hist();
+        let got = histogram_quantile(0.5, &h);
+        let want = 2.0 * 2.0f64.powf(1.0 / 6.0);
+        assert!(
+            (got - want).abs() < 1e-12,
+            "exponential median: got {got}, want {want}"
+        );
+        // The regressed linear formula would have returned 2 + 2/6.
+        assert!(
+            (got - (2.0 + 2.0 / 6.0)).abs() > 1e-6,
+            "should not be the linear value: got {got}"
+        );
+    }
+
+    #[test]
+    fn fraction_matches_prometheus_zero_bucket_and_exponential() {
+        // Issue #252 reproduction of histogram_fraction(0, 4, diff_native_hist).
+        // rank_at(4) = 6 (through (2,4]); rank_at(0) = 0 because the one-sided
+        // zero bucket is bounded at 0 on the populated side. => 6/7, matching
+        // Prometheus, not Ravel's old linear 5.5/7.
+        let h = diff_native_hist();
+        let got = histogram_fraction(0.0, 4.0, &h);
+        assert!((got - 6.0 / 7.0).abs() < 1e-12, "got {got}");
     }
 
     #[test]
