@@ -42,13 +42,9 @@ cd "$ROOT_DIR"
 CLUSTER_NAME="${RAVEL_KIND_CLUSTER:-ravel-dev}"
 # Pinned by tag and digest. kind node images are tied to a kind release; a
 # floating tag would silently change the control-plane version under a
-# reproduction. This digest is the one the kind v0.32.0 release body attests
-# for its default node image, Kubernetes v1.36.1, so the CLI version pinned in
-# the k8s-integration CI job (helm/kind-action version: v0.32.0) and this node
-# image come from the same release. The digest is the multi-arch index digest,
-# so it resolves on both amd64 and arm64 hosts. Do not swap this for whatever a
-# tag currently resolves to: pin the digest the release itself published.
-NODE_IMAGE="${RAVEL_KIND_NODE_IMAGE:-kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5}"
+# reproduction. This is the image kind v0.32.0 ships with, and the digest is
+# the multi-arch index digest, so it resolves on both amd64 and arm64 hosts.
+NODE_IMAGE="${RAVEL_KIND_NODE_IMAGE:-kindest/node:v1.32.2@sha256:142f543559cc55d64e1ab9341df08e5ced84bd2e893736da8f51320f26f5950b}"
 SERVER_IMAGE="${RAVEL_SERVER_IMAGE:-ravel-server:kind-dev}"
 OPERATOR_IMAGE="${RAVEL_OPERATOR_IMAGE:-ravel-operator:kind-dev}"
 SKIP_IMAGE_BUILD="${RAVEL_SKIP_IMAGE_BUILD:-0}"
