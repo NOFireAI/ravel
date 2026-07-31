@@ -8,10 +8,15 @@ target/
 **/*.rs.bk
 *.profraw
 
-# Local dev / test state.
+# Local dev / test state. .claude/ includes any local git worktrees a session
+# left behind (e.g. under .claude/worktrees/); each is a full duplicate source
+# tree that is never needed by the build and has been observed to inflate the
+# build context by an order of magnitude on a dev machine with a few stale
+# ones lying around.
 minio-data/
 .cache/
 .superpowers/
+.claude/
 node_modules/
 .DS_Store
 

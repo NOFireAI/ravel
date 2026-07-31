@@ -50,8 +50,8 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use crate::{
-    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutMode, PutOptions, PutOutcome, StoreError,
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutMode, PutOptions, PutOutcome, StoreError,
 };
 
 /// Operation kind used to match [`Rule`]s. `List` matches both `list()` and
@@ -616,6 +616,20 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
                 Err(not_applicable("get"))
             }
         }
+    }
+
+    /// Passthrough: multipart uploads carry no injectable faults today, like
+    /// reordered completion (module doc, "Deliberately out of scope"). A plan
+    /// scripted against `Op::Put` does not fire here, and the parts of a
+    /// multipart upload are not fault sites, so no test may be built on
+    /// faulting one. Delegation keeps the wrapper transparent, so a
+    /// `FaultStore` over a multipart-capable backend still satisfies the
+    /// multipart contract its `capabilities()` passthrough claims.
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(key).await
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
