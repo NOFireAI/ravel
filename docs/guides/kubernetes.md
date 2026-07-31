@@ -13,6 +13,8 @@ bucket. See [operations.md](operations.md) for the full flag reference behind
 the CRD fields and [../adrs/0034-k8s-operator.md](../adrs/0034-k8s-operator.md)
 for why the design is shaped this way.
 
+![Ravel Kubernetes operator reconcile loop](../diagrams/k8s-operator-reconcile.svg)
+
 ## The kind development environment
 
 Three scripts bring up a complete cluster on your machine: the operator, a
@@ -29,6 +31,8 @@ You need `docker`, `kind`, `kubectl`, and (for `kind-demo.sh`) a Rust
 toolchain. The first `kind-up.sh` run builds both container images from the
 root `Dockerfile`, which is a full release build of the workspace and takes a
 while; later runs reuse the docker layer cache.
+
+![kind local development environment](../diagrams/k8s-dev-environment.svg)
 
 `kind-up.sh` does, in order:
 
@@ -99,8 +103,11 @@ git and invites someone copying it into a real cluster.
 ### The same environment in CI
 
 The `k8s-integration` job in `.github/workflows/ci.yml` runs these same three
-scripts on every pull request, so the local and CI paths cannot drift. Two
-differences, both about build time rather than about what is tested:
+scripts on every pull request, so the local and CI paths cannot drift.
+
+![k8s-integration CI lane vs local dev](../diagrams/k8s-ci-integration.svg)
+
+Two differences, both about build time rather than about what is tested:
 
 - The cluster is created by `helm/kind-action` (pinned by commit SHA) rather
   than by `kind-up.sh`. The node image the action is given is read out of
