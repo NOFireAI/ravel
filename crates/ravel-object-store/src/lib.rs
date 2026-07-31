@@ -306,8 +306,12 @@ impl Capabilities {
     /// Two flags are deliberately `false` here, for different reasons:
     ///
     /// - `multipart` is mode-conditional, not universally required: only
-    ///   compaction writes multipart objects, so ravel-server's
-    ///   `required_capabilities` adds it for `Mode::Maintain` alone.
+    ///   `Mode::Maintain` gates on it, via ravel-server's
+    ///   `required_capabilities`. That gate is forward-looking: no production
+    ///   caller invokes `put_multipart` yet (ravel-maintain writes single-PUT
+    ///   content-addressed compaction outputs today, issue #243), so the flag
+    ///   reserves the capability for when compaction streams large L1/L2
+    ///   segments as multipart uploads rather than describing current traffic.
     /// - `upload_checksum` is not required by any mode. It cannot be
     ///   satisfied by S3, the only durable backend Ravel ships: the
     ///   `object_store` 0.14 `AmazonS3` client has no per-request checksum

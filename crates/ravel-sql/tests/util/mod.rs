@@ -384,7 +384,12 @@ impl ObjectStoreBackend for CountingStore {
     }
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
-        self.inner.capabilities()
+        // multipart: false to match the refusing default `put_multipart` this
+        // double inherits (issue #298).
+        ravel_object_store::Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
     }
 }
 
@@ -460,7 +465,12 @@ impl ObjectStoreBackend for StallingStore {
     }
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
-        self.inner.capabilities()
+        // multipart: false to match the refusing default `put_multipart` this
+        // double inherits (issue #298).
+        ravel_object_store::Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
     }
 }
 

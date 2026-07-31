@@ -170,7 +170,12 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
     }
 
     fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
+        // multipart: false so the flag matches the refusing default
+        // `put_multipart` this double inherits (issue #298).
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
     }
 }
 
