@@ -13,6 +13,10 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     async fn put(&self, key: &str, data: Bytes, opts: PutOptions) -> Result<PutOutcome, StoreError>;
     /// Read whole object or a byte range. Suffix(n) = last n bytes, n > 0.
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError>;
+    /// Begin a multipart upload. Only backends reporting `multipart` provide
+    /// it; the default implementation refuses. See "Multipart upload" below.
+    async fn put_multipart<'a>(&'a self, key: &str)
+        -> Result<Box<dyn MultipartUpload + 'a>, StoreError>;
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError>;
     /// Paginated recursive prefix listing, lexicographic order.
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError>;
@@ -31,6 +35,16 @@ pub struct GetOutcome { pub data: Bytes, pub etag: Etag, pub version: Version, p
 pub struct ObjectMeta { pub key: String, pub size: u64, pub etag: Etag, pub version: Version, pub last_modified_unix_ms: i64 }
 pub struct ListPage { pub objects: Vec<ObjectMeta>, pub next: Option<PageToken> }
 pub struct DelimitedList { pub objects: Vec<ObjectMeta>, pub common_prefixes: Vec<String> }
+
+#[async_trait]
+pub trait MultipartUpload: Send {
+    /// Append one part. `checksum` is a local pre-flight (see below).
+    async fn put_part(&mut self, data: Bytes, checksum: Option<UploadChecksum>) -> Result<(), StoreError>;
+    /// Publish every part so far as one object, atomically.
+    async fn complete(&mut self) -> Result<PutOutcome, StoreError>;
+    /// Discard the upload; the object must not exist afterwards.
+    async fn abort(&mut self) -> Result<(), StoreError>;
+}
 ```
 
 `Etag` is content identity (equality checks). `Version` is an opaque
@@ -95,6 +109,93 @@ expiration, SSE/KMS headers.
 Compaction is the only path that writes multipart objects, so `multipart` is
 required for maintain mode and for no other mode. It is not in
 `Capabilities::mandatory()`; `required_capabilities(Mode::Maintain)` adds it.
+`MemoryStore` and `S3Store` both report `multipart: true` (issue #243), so
+`--mode maintain` starts against the memory oracle and against any
+S3-compatible endpoint.
+
+### Multipart upload
+
+`ObjectStoreBackend::put_multipart(key)` returns a `MultipartUpload` handle: a
+sequence of `put_part` calls followed by exactly one `complete` or `abort`. The
+flag and the method must agree — a backend reporting `multipart: false` MUST
+refuse `put_multipart` with `Permanent`, which is what the default trait
+implementation does, and the contract suite asserts both directions.
+
+**Part bounds.** Enforced locally by every backend, at the call that violates
+them, rather than deferred to the server's `CompleteMultipartUpload`:
+
+| Rule | Value | Constant |
+|---|---|---|
+| Minimum size, any part but the last | 5 MiB | `MULTIPART_MIN_PART_SIZE` |
+| Minimum size, last part | 1 byte (no part may be empty) | — |
+| Maximum parts per upload | 10 000 | `MULTIPART_MAX_PARTS` |
+
+These are S3's own limits. A short part is legal while it is the last one, so
+it is the *next* `put_part` that fails, naming the part that became non-final.
+A `complete` with zero parts fails. Every one of these failures is
+`StoreError::Permanent` (caller misuse, never retryable) and leaves no object.
+
+**Ordering.** Parts are ordered by the sequence of `put_part` calls, not by the
+order they finish; an implementation may upload them concurrently.
+
+**Visibility and abort.** Nothing is readable at `key` until `complete`
+returns `Ok`; an incomplete, aborted, dropped, or crashed upload never becomes
+a visible object, not even a truncated one (S3's own multipart guarantee, and
+the reason compaction's crash story degrades to wasted work rather than corrupt
+state). `abort` releases the uploaded parts. It is best effort against the
+server but final for the handle: an upload S3 never heard the abort for leaves
+orphaned parts, which are billed until a bucket lifecycle rule reaps them, and
+never a readable object. Operators SHOULD configure such a rule
+(`AbortIncompleteMultipartUpload`) on Ravel buckets.
+
+**Retry.** Nothing retries internally beyond what `object_store`'s client
+already does per request. A failed `put_part` returns the same classified
+`StoreError` a `put` would, so `StoreError::is_retryable` applies unchanged,
+and the caller decides: retry the part, or abort the upload. `complete` and
+`abort` consume the handle logically; a second call on the same handle fails
+with `Permanent` rather than re-issuing a request against a spent upload id.
+
+**Write mode.** `complete` publishes unconditionally, exactly like
+`PutMode::Overwrite`. There is no multipart `CreateIfAbsent` or `CasVersion`:
+`object_store` 0.14's `PutMultipartOptions` carries tags, attributes, and
+extensions, with no `PutMode`, so no precondition can ride on
+`CompleteMultipartUpload`. Callers needing create-once semantics must write
+keys that are unique by construction; Ravel's data objects and compaction
+parts are content-addressed, so they are.
+
+**When `put()` uses it.** `S3Store::put` switches from one PUT to a multipart
+upload above `s3::MULTIPART_THRESHOLD` (16 MiB), cutting the payload into
+`s3::MULTIPART_PART_SIZE` (8 MiB) parts with at most 4 in flight. The
+threshold is two whole parts, so the multipart path never produces a
+degenerate single-part upload, and every part but the last is exactly 8 MiB —
+uniform non-final part sizes, which the strictest S3-compatible backends (R2)
+require. 8 MiB parts keep the 10 000-part ceiling at 80 GiB, far above any
+object Ravel writes. The switch is invisible to callers: same `PutOutcome`,
+same bytes back. It applies to `Overwrite` only; a `CreateIfAbsent` or
+`CasVersion` put stays on the single-PUT path at every size (bounded by S3's
+5 GiB single-request limit) rather than silently dropping its precondition.
+`MemoryStore::put` has no threshold: there is no transport to chunk.
+
+**Checksum coverage.** `put_part`'s optional `UploadChecksum` is verified
+per part, before the part is sent, with exactly the reach `PutOptions::checksum`
+has on the same backend: a real check on `MemoryStore`, a local pre-flight
+against the caller's buffer on `S3Store` (see "Upload checksums" — nothing can
+be put on the wire through `object_store` 0.14). A mismatch fails that
+`put_part` with `Corrupted`, does not count as a part, and leaves the upload
+open, so the caller may re-send the same bytes with a correct checksum. There
+is **no whole-object checksum** for a multipart upload: `complete` takes no
+checksum argument, and the object never exists as one buffer to digest. Ravel's
+integrity guarantee for these objects is therefore read-time only, from the
+footer/section/page crc32c hierarchy (docs/segment-format.md), same as for any
+other object.
+
+**Observability and faults.** `InstrumentedStore` passes `put_multipart`
+through uncounted: a multipart upload is a handle, not a call, and no `StoreOp`
+describes its parts. `put()`'s own above-threshold multipart path is counted,
+as one `put`, because that is what the caller invoked. `FaultStore` likewise
+passes through: multipart operations are not fault sites today, so no fault
+test can be built on one (like reordered completion). Both gaps are
+observability/testing gaps, not correctness ones.
 
 ### Upload checksums (best effort, never startup-gating)
 
@@ -142,7 +243,10 @@ client, which is why `S3Store` reports `upload_checksum: false` for both.
 
 1. `MemoryStore`: reference implementation and semantics oracle; strong
    consistency, monotonic etags/versions, injectable clock. Note the fake
-   clock defaults to 0: GC-grace tests must set it explicitly.
+   clock defaults to 0: GC-grace tests must set it explicitly. Its multipart
+   upload buffers parts in the handle (nothing to chunk in process) but
+   enforces the same part bounds and produces exactly the object a single
+   `put` of the concatenated parts would, from the same etag/version counter.
 2. `FaultStore<S>`: wraps any backend; deterministic seeded fault plan
    injecting: timeouts, throttling, partial-write-then-error (object must
    NOT become visible), failed conditional writes, duplicate delivery (op
@@ -170,7 +274,13 @@ whichever backend it built, unconditionally in every mode, and the contract
 suite runs its full assertion set through the decorator to prove transparency.
 
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
-against all three. The `S3Store` case is gated on `RAVEL_MINIO_URL`; the CI
+against all three, multipart included (`assert_multipart_upload` is part of
+`run_contract_suite`, written against the trait so it holds for the oracle, the
+wrappers, and a real endpoint alike). Two multipart assertions are S3-shaped and
+run only against a live endpoint: the composite `"<digest>-<partcount>"` ETag,
+which proves the parts really went out as parts rather than being buffered into
+one PUT, and `put()`'s own threshold switch. The `S3Store` case is gated on
+`RAVEL_MINIO_URL`; the CI
 `object-store-contract` job (`.github/workflows/ci.yml`) stands up MinIO,
 creates the bucket, sets that variable, and asserts the gated test executed
 rather than skipping. This job is required: S3 is the only durable backend,

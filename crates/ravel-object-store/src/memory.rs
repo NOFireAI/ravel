@@ -8,9 +8,9 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 
 use crate::{
-    Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutMode, PutOptions, PutOutcome, StoreError, UploadChecksum,
-    Version,
+    Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
+    UploadChecksum, Version, multipart_finished,
 };
 
 #[derive(Debug, Clone)]
@@ -109,6 +109,75 @@ impl MemoryStore {
     }
 }
 
+/// In-process multipart upload against [`MemoryStore`]: the oracle for the
+/// multipart contract (docs/object-store-contract.md, "Multipart upload").
+///
+/// It deliberately does not chunk anything --- there is no transport to chunk
+/// for --- but it accepts the same part sequence a real backend does, enforces
+/// the same part-size and part-count rules ([`PartSequence`]), and produces
+/// exactly the object a single [`MemoryStore::put`] of the concatenated parts
+/// would have produced, with an etag and version drawn from the same counter.
+/// Parts are buffered here and nowhere else: until `complete` succeeds the key
+/// does not exist in the store, so an aborted or dropped upload cannot leak a
+/// partial object.
+pub struct MemoryMultipartUpload<'a> {
+    store: &'a MemoryStore,
+    key: String,
+    parts: Vec<Bytes>,
+    sequence: PartSequence,
+    /// Set by `complete`/`abort`; every later call on this handle fails.
+    finished: bool,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for MemoryMultipartUpload<'_> {
+    async fn put_part(
+        &mut self,
+        data: Bytes,
+        checksum: Option<UploadChecksum>,
+    ) -> Result<(), StoreError> {
+        if self.finished {
+            return Err(multipart_finished(&self.key));
+        }
+        // Pre-flight before the sequence rules touch any state: a rejected
+        // part is not a part, and the upload stays usable.
+        MemoryStore::verify_checksum(&data, checksum)?;
+        self.sequence.accept(&self.key, data.len())?;
+        self.parts.push(data);
+        Ok(())
+    }
+
+    async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
+        if self.finished {
+            return Err(multipart_finished(&self.key));
+        }
+        self.sequence.finish(&self.key)?;
+        let total: usize = self.parts.iter().map(Bytes::len).sum();
+        let mut assembled = Vec::with_capacity(total);
+        for part in &self.parts {
+            assembled.extend_from_slice(part);
+        }
+        // Only now does the key become visible, and by the same code path a
+        // single put would take, so the two are indistinguishable afterwards.
+        let outcome = self
+            .store
+            .put(&self.key, Bytes::from(assembled), PutOptions::default())
+            .await?;
+        self.finished = true;
+        self.parts.clear();
+        Ok(outcome)
+    }
+
+    async fn abort(&mut self) -> Result<(), StoreError> {
+        if self.finished {
+            return Err(multipart_finished(&self.key));
+        }
+        self.finished = true;
+        self.parts.clear();
+        Ok(())
+    }
+}
+
 /// Minimal CRC-32C (Castagnoli), bitwise; the oracle favors clarity over
 /// speed. Production paths use the crc32c crate.
 fn crc32c(data: &[u8]) -> u32 {
@@ -171,6 +240,19 @@ impl ObjectStoreBackend for MemoryStore {
             version: entry.version.clone(),
             total_size: entry.data.len() as u64,
         })
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        Ok(Box::new(MemoryMultipartUpload {
+            store: self,
+            key: key.to_string(),
+            parts: Vec::new(),
+            sequence: PartSequence::default(),
+            finished: false,
+        }))
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -247,7 +329,10 @@ impl ObjectStoreBackend for MemoryStore {
             suffix_range: true,
             upload_checksum: true,
             prefix_list: true,
-            multipart: false,
+            // Real: `put_multipart` above accepts the full part sequence,
+            // enforces the same part-size and part-count rules S3 does, and
+            // publishes the assembled object atomically at `complete`.
+            multipart: true,
         }
     }
 }
@@ -407,6 +492,151 @@ mod tests {
     async fn delete_is_idempotent() {
         let store = MemoryStore::new();
         store.delete("missing").await.expect("idempotent delete");
+    }
+
+    /// The oracle's multipart end state must be indistinguishable from the
+    /// single put of the same bytes: same content, same size, and an
+    /// etag/version from the same counter (issue #243).
+    #[tokio::test]
+    async fn multipart_matches_a_single_put_of_the_same_bytes() {
+        let store = MemoryStore::new();
+        let head = vec![0xABu8; crate::MULTIPART_MIN_PART_SIZE];
+        let tail = b"tail".to_vec();
+        let whole: Vec<u8> = head.iter().copied().chain(tail.iter().copied()).collect();
+
+        let mut upload = store.put_multipart("multi").await.expect("start upload");
+        upload
+            .put_part(Bytes::from(head), None)
+            .await
+            .expect("part 1");
+        assert!(
+            matches!(store.head("multi").await, Err(StoreError::NotFound)),
+            "an incomplete upload must not be visible"
+        );
+        upload
+            .put_part(Bytes::from(tail), None)
+            .await
+            .expect("part 2");
+        let multipart_outcome = upload.complete().await.expect("complete");
+
+        let single_outcome = store
+            .put("single", Bytes::from(whole.clone()), PutOptions::default())
+            .await
+            .expect("single put");
+
+        let multi = store.get("multi", GetRange::Full).await.expect("get multi");
+        let single = store
+            .get("single", GetRange::Full)
+            .await
+            .expect("get single");
+        assert!(multi.data == single.data, "same bytes both ways");
+        assert_eq!(multi.total_size, whole.len() as u64);
+        assert_eq!(multi.etag, multipart_outcome.etag);
+        assert_eq!(multi.version, multipart_outcome.version);
+        assert_ne!(
+            multipart_outcome.etag, single_outcome.etag,
+            "distinct writes still get distinct etags"
+        );
+    }
+
+    /// An aborted upload leaves no object and no reusable handle. The bytes
+    /// only ever lived in the handle, so there is nothing to leak.
+    #[tokio::test]
+    async fn aborted_multipart_leaves_no_object() {
+        let store = MemoryStore::new();
+        let mut upload = store.put_multipart("gone").await.expect("start upload");
+        upload
+            .put_part(Bytes::from(vec![1u8; crate::MULTIPART_MIN_PART_SIZE]), None)
+            .await
+            .expect("part 1");
+        upload.abort().await.expect("abort");
+        assert!(matches!(
+            store.head("gone").await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get("gone", GetRange::Full).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(
+            matches!(upload.complete().await, Err(StoreError::Permanent(_))),
+            "an aborted upload cannot be completed"
+        );
+        assert!(matches!(
+            store.head("gone").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    /// The oracle enforces S3's part rules locally, at the call that violates
+    /// them, so a test backend never accepts a sequence a real bucket would
+    /// reject at `CompleteMultipartUpload`.
+    #[tokio::test]
+    async fn multipart_part_rules_are_enforced() {
+        let store = MemoryStore::new();
+
+        let mut no_parts = store.put_multipart("no-parts").await.expect("start");
+        assert!(matches!(
+            no_parts.complete().await,
+            Err(StoreError::Permanent(_))
+        ));
+
+        let mut empty_part = store.put_multipart("empty-part").await.expect("start");
+        assert!(matches!(
+            empty_part.put_part(Bytes::new(), None).await,
+            Err(StoreError::Permanent(_))
+        ));
+
+        let mut short_non_final = store.put_multipart("short").await.expect("start");
+        short_non_final
+            .put_part(Bytes::from_static(b"short"), None)
+            .await
+            .expect("a short part is legal while it is the last one");
+        assert!(
+            matches!(
+                short_non_final
+                    .put_part(Bytes::from_static(b"more"), None)
+                    .await,
+                Err(StoreError::Permanent(_))
+            ),
+            "the part that makes a sub-minimum part non-final must be rejected"
+        );
+
+        for key in ["no-parts", "empty-part", "short"] {
+            assert!(
+                matches!(store.head(key).await, Err(StoreError::NotFound)),
+                "{key} must not exist"
+            );
+        }
+    }
+
+    /// A per-part checksum is verified before the part is accepted, and a
+    /// mismatch leaves the upload usable (the part simply never happened).
+    #[tokio::test]
+    async fn multipart_part_checksum_verified() {
+        let store = MemoryStore::new();
+        let part = Bytes::from_static(b"part-payload");
+        let good = crc32c(&part);
+        let mut upload = store.put_multipart("checked").await.expect("start");
+        assert!(matches!(
+            upload
+                .put_part(part.clone(), Some(UploadChecksum::Crc32c(good ^ 1)))
+                .await,
+            Err(StoreError::Corrupted(_))
+        ));
+        upload
+            .put_part(part.clone(), Some(UploadChecksum::Crc32c(good)))
+            .await
+            .expect("matching checksum");
+        upload.complete().await.expect("complete");
+        let got = store
+            .get("checked", GetRange::Full)
+            .await
+            .expect("get checked");
+        assert_eq!(
+            got.data, part,
+            "the rejected part must not be in the object"
+        );
     }
 
     #[test]
