@@ -4,10 +4,15 @@
 //! label handling.
 //!
 //! [`promql_parser`]'s `check_ast_for_aggregate_expr` (run at parse time)
-//! already guarantees: `op` is one of the twelve aggregators; `expr` is
+//! already guarantees: `op` is one of the known aggregators; `expr` is
 //! Vector-typed; `topk`/`bottomk`/`quantile` always carry a Scalar-typed
 //! `param`; `count_values` always carries a String-typed `param`; every other
 //! aggregator never carries a param. None of that is re-checked here.
+//!
+//! promql-parser 0.10 also parses `limitk`/`limit_ratio` (Prometheus'
+//! experimental sampling aggregators). Those are not evaluated here; the
+//! dispatch below rejects them with a typed [`Error::Unsupported`] rather
+//! than panicking, so no tenant query can panic the query path (#260).
 //!
 //! Grouping (Prometheus' `generateGroupingKey`/output-metric construction):
 //! `without (labels)` keeps every label except `__name__` and the named
@@ -72,8 +77,8 @@ use std::collections::HashMap;
 
 use promql_parser::label::Labels;
 use promql_parser::parser::token::{
-    T_AVG, T_BOTTOMK, T_COUNT, T_COUNT_VALUES, T_GROUP, T_MAX, T_MIN, T_QUANTILE, T_STDDEV,
-    T_STDVAR, T_SUM, T_TOPK, TokenId,
+    T_AVG, T_BOTTOMK, T_COUNT, T_COUNT_VALUES, T_GROUP, T_LIMIT_RATIO, T_LIMITK, T_MAX, T_MIN,
+    T_QUANTILE, T_STDDEV, T_STDVAR, T_SUM, T_TOPK, TokenId,
 };
 use promql_parser::parser::{AggregateExpr, LabelModifier};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL};
@@ -137,8 +142,20 @@ pub(crate) fn eval_aggregate(
                 eval_ts_ns,
             )))
         }
+        T_LIMITK | T_LIMIT_RATIO => {
+            // promql-parser 0.10 parses `limitk`/`limit_ratio` (Prometheus'
+            // experimental sampling aggregators), so this arm is reachable
+            // from any tenant query. They are not implemented here: reject
+            // with a typed `Error::Unsupported` naming the operator, the same
+            // pattern used for every other deliberately-unsupported construct,
+            // rather than panicking (docs/query-engine.md state-2 conformance
+            // guarantee, #260).
+            Err(Error::Unsupported {
+                construct: format!("aggregation operator {}", agg.op),
+            })
+        }
         _ => {
-            unreachable!("promql-parser only produces the twelve known aggregator tokens, got {op}")
+            unreachable!("promql-parser only produces the known aggregator tokens, got {op}")
         }
     }
 }
@@ -705,6 +722,30 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// promql-parser 0.10 parses `limitk`/`limit_ratio`, so both reach the
+    /// aggregation dispatch. They are not implemented; each must return a
+    /// typed `Error::Unsupported` naming the operator rather than panicking on
+    /// the old `unreachable!` arm (#260, docs/query-engine.md state-2).
+    #[test]
+    fn limitk_and_limit_ratio_reject_without_panicking() {
+        use crate::eval::Error;
+        for (query, name) in [
+            ("limitk(2, m)", "limitk"),
+            ("limit_ratio(0.5, m)", "limit_ratio"),
+        ] {
+            let err = Evaluator::new()
+                .instant(&source(), query, 0)
+                .expect_err("must reject, not panic");
+            let Error::Unsupported { construct } = err else {
+                panic!("expected Error::Unsupported for {query:?}, got {err:?}");
+            };
+            assert!(
+                construct.contains(name),
+                "rejection for {query:?} should name {name:?}, got {construct:?}"
+            );
+        }
     }
 
     #[test]
