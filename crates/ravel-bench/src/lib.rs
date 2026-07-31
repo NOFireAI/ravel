@@ -2,6 +2,7 @@
 //! this crate never changes library behavior, it only measures it.
 
 pub mod codecs;
+pub mod concurrent;
 pub mod e2e;
 pub mod generator;
 pub mod harness;

@@ -110,6 +110,13 @@ pub struct WorkloadConfig {
     pub counter_fraction: f64,
     pub cardinality: CardinalityProfile,
     pub batch_size: BatchSizeDistribution,
+    /// Added to every generated series' `series_idx` label value (issue
+    /// #269): lets independent `generate_batches` calls that share a
+    /// tenant, metric name pool, and cardinality profile still produce
+    /// disjoint `SeriesId`s, by giving each call its own slice of the
+    /// index space. Zero (the default) reproduces the original,
+    /// unpartitioned behavior.
+    pub series_idx_offset: usize,
 }
 
 /// Total sample budget the axis-sweep cells hold fixed (issue #98): every
@@ -160,6 +167,7 @@ impl Default for WorkloadConfig {
             counter_fraction: 0.5,
             cardinality: CardinalityProfile::many_small(100),
             batch_size: BatchSizeDistribution::fixed(64),
+            series_idx_offset: 0,
         }
     }
 }
@@ -361,7 +369,7 @@ fn generate_series(config: &WorkloadConfig) -> Result<Vec<GeneratedSeries>, Type
         let mut base_labels = base_label_set(base_idx, profile.labels_per_set);
         base_labels.push(Label {
             name: "series_idx".to_string(),
-            value: i.to_string(),
+            value: (i + config.series_idx_offset).to_string(),
         });
 
         let churn_at = rng
@@ -629,6 +637,28 @@ mod tests {
         for (x, y) in a.iter().zip(&b) {
             assert_eq!(x.series_id, y.series_id);
             assert_eq!(x.values, y.values);
+        }
+    }
+
+    #[test]
+    fn series_idx_offset_gives_disjoint_ids() {
+        // Two calls sharing every knob except `series_idx_offset` (as two
+        // concurrent writers partitioning one tenant's series space would)
+        // must produce non-overlapping `SeriesId`s.
+        let a_config = WorkloadConfig {
+            series_count: 10,
+            samples_per_series: 5,
+            ..Default::default()
+        };
+        let b_config = WorkloadConfig {
+            series_idx_offset: 10,
+            ..a_config.clone()
+        };
+        let a = generate_raw(&a_config).expect("generate a");
+        let b = generate_raw(&b_config).expect("generate b");
+        let a_ids: std::collections::HashSet<_> = a.iter().map(|(id, _, _)| *id).collect();
+        for (id, _, _) in &b {
+            assert!(!a_ids.contains(id), "offset series must not collide");
         }
     }
 

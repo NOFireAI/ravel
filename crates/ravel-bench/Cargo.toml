@@ -103,6 +103,11 @@ name = "s3_e2e_bench"
 path = "src/bin/s3_e2e_bench.rs"
 bench = false
 
+[[bin]]
+name = "concurrent_bench"
+path = "src/bin/concurrent_bench.rs"
+bench = false
+
 
 [[bin]]
 name = "segment_alloc_profile"
@@ -175,6 +180,11 @@ bench = false
 [[test]]
 name = "s3_e2e_smoke"
 path = "tests/s3_e2e_smoke.rs"
+bench = false
+
+[[test]]
+name = "concurrent_smoke"
+path = "tests/concurrent_smoke.rs"
 bench = false
 
 [[bench]]
