@@ -26,7 +26,15 @@ fn small_config(
         readers: 2,
         target_series: 20,
         points_per_sec: 2_000,
-        duration_secs: 2,
+        // 2s flaked on shared CI runners (readers and writers run
+        // concurrently for the whole window here, unlike s3_e2e_smoke's
+        // sequential ingest-then-forced-flush-then-query shape, so there is
+        // no guaranteed flush before a reader polls) -- a reader could
+        // exhaust its polling window before the first 500ms age-trigger
+        // flush lands under scheduler contention. 6s gives roughly 10-12
+        // flush-tick opportunities instead of 3-4, without meaningfully
+        // slowing the smoke test.
+        duration_secs: 6,
         batch_size: 50,
         ack_timeout_secs: 5,
         query: "bench_gauge".to_string(),
