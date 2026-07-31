@@ -70,15 +70,23 @@ use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId
 use crate::proto::experimental::arrow::v1::ArrowPayloadType;
 use crate::stream::DecodedBatch;
 
-/// AnyValue `type` discriminant (otap-spec.md section 5.5.1).
+/// AnyValue `type` discriminant, matching otap-spec.md section 5.5.1's
+/// mapping table exactly (0=empty, 1=str, 2=int, 3=double, 4=bool, 5=map,
+/// 6=slice, 7=bytes). This is a wire contract: `normalize_decoded` reads
+/// these values out of real decoded OTAP batches, so they must be the
+/// spec's discriminants, not an internal convention. See issue #232: an
+/// earlier revision had these ordered after OTLP's `AnyValue` oneof field
+/// numbers (2=bool, 3=int, 4=double, 5=bytes, 6=array, 7=map), which
+/// disagrees with the OTAP spec on every slot from 2 upward and would
+/// misclassify real attributes (e.g. a spec `int`, type 2, read as bool).
 pub const ANY_VALUE_TYPE_EMPTY: u8 = 0;
 pub const ANY_VALUE_TYPE_STRING: u8 = 1;
-pub const ANY_VALUE_TYPE_BOOL: u8 = 2;
-pub const ANY_VALUE_TYPE_INT: u8 = 3;
-pub const ANY_VALUE_TYPE_DOUBLE: u8 = 4;
-pub const ANY_VALUE_TYPE_BYTES: u8 = 5;
-pub const ANY_VALUE_TYPE_ARRAY: u8 = 6;
-pub const ANY_VALUE_TYPE_MAP: u8 = 7;
+pub const ANY_VALUE_TYPE_INT: u8 = 2;
+pub const ANY_VALUE_TYPE_DOUBLE: u8 = 3;
+pub const ANY_VALUE_TYPE_BOOL: u8 = 4;
+pub const ANY_VALUE_TYPE_MAP: u8 = 5;
+pub const ANY_VALUE_TYPE_SLICE: u8 = 6;
+pub const ANY_VALUE_TYPE_BYTES: u8 = 7;
 
 /// METRICS table `metric_type` discriminant (data_model.md). No fixed
 /// numeric mapping is given in the vendored spec docs beyond "Metric type
