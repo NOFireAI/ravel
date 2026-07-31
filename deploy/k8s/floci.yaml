@@ -1,0 +1,195 @@
+# floci as the fake-S3 backend for the kind development environment
+# (ADR-0034 decision 6, and decision 8's default after the floci_contract
+# capability gate went green: crates/ravel-object-store/tests/contract.rs).
+#
+# This is a development backend only. It stores everything in the container's
+# ephemeral filesystem, has no persistent volume, and accepts any credentials
+# without verifying request signatures. Nothing here is suitable for a real
+# deployment; production points `spec.storage.s3.endpoint` at real S3 or a real
+# MinIO and supplies real credentials.
+#
+# The `ravel-system` Namespace is not defined here on purpose. It is created by
+# deploy/k8s/operator/operator.yaml (and by scripts/kind-up.sh before either
+# manifest is applied), and defining it twice with different labels would make
+# two `kubectl apply` invocations fight over the same object.
+#
+# Apply with:
+#   kubectl apply -f deploy/k8s/floci.yaml
+#   kubectl wait --for=condition=Complete --timeout=180s \
+#     -n ravel-system job/floci-create-bucket
+#
+# Waiting on the Job rather than on the Deployment is deliberate: the Job's
+# retry loop is what actually proves the S3 handler answers and the bucket
+# Ravel needs exists (see its script below).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: floci
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: floci
+    app.kubernetes.io/component: fake-s3
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the store is the container's own filesystem,
+  # so two overlapping replicas would serve two different, diverging buckets.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: floci
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: floci
+        app.kubernetes.io/component: fake-s3
+    spec:
+      # Kubernetes injects a legacy Docker-link environment variable per
+      # Service in the namespace, so the Service named `floci` below produces
+      # FLOCI_PORT=tcp://<clusterIP>:4566 in this pod. floci reads its own
+      # `floci.port` config property, and SmallRye maps that property from
+      # exactly that variable name, so the injected value wins and the
+      # container dies at startup:
+      #
+      #   The config property floci.port with the config value
+      #   "tcp://10.96.237.141:4566" threw an Exception whilst being converted
+      #   SRCFG00029: Expected an integer value
+      #
+      # Service links are only injected for Services that already exist when
+      # the pod is created, so leaving this on makes startup depend on whether
+      # the Deployment or the Service won the race inside a single
+      # `kubectl apply -f` -- it comes up on one run and crash-loops on the
+      # next. Nothing in this pod consumes service-link variables, so turn
+      # them off and let floci read its own defaults.
+      enableServiceLinks: false
+      containers:
+        - name: floci
+          # Same image the object-store-contract CI job gates on, so the
+          # backend this environment runs is the backend the contract suite
+          # proved satisfies Capabilities::mandatory() and multipart.
+          image: floci/floci:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: s3
+              containerPort: 4566
+          # No env vars. floci needs none for the S3 path, and it ignores
+          # LocalStack's `SERVICES` allowlist (measured: `SERVICES=s3` still
+          # reports its whole service catalogue as running), so setting it
+          # would only be a comment that lies about what the pod does.
+          #
+          # /_floci/health answers before every service handler is running, so
+          # a plain 200 here is a liveness signal, not a readiness one. The
+          # readiness probe greps for the S3 handler specifically. `sh -c` is
+          # available: the floci image ships a shell (it is not distroless).
+          livenessProbe:
+            httpGet:
+              path: /_floci/health
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'curl -fsS http://127.0.0.1:4566/_floci/health | grep -q ''"s3":"running"'''
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 40
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: floci
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: floci
+    app.kubernetes.io/component: fake-s3
+spec:
+  selector:
+    app.kubernetes.io/name: floci
+  ports:
+    - name: s3
+      port: 4566
+      targetPort: s3
+---
+# Bucket creation, mirroring the `createbucket` sidecar in
+# deploy/docker-compose/minio.yml. floci needs no `mc` and no SigV4 signing
+# (it accepts any credentials and does not verify signatures), so a plain
+# CreateBucket PUT with curl is enough -- the same approach the
+# object-store-contract CI job uses.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: floci-create-bucket
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: floci
+    app.kubernetes.io/component: fake-s3
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: floci
+        app.kubernetes.io/component: fake-s3
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: create-bucket
+          image: curlimages/curl:8.11.1
+          imagePullPolicy: IfNotPresent
+          env:
+            # Must match spec.storage.s3.bucket of the RavelCluster that uses
+            # this backend (deploy/k8s/examples/ravelcluster-dev.yaml).
+            - name: BUCKET
+              value: ravel
+            - name: ENDPOINT
+              value: http://floci.ravel-system.svc:4566
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # Wait for the S3 handler specifically. The Service can route to
+              # a pod whose HTTP listener is up before S3 is running, and a
+              # CreateBucket against that loses.
+              i=0
+              while [ "$i" -lt 60 ]; do
+                if curl -fsS "${ENDPOINT}/_floci/health" | grep -q '"s3":"running"'; then
+                  echo "floci S3 is running"
+                  break
+                fi
+                i=$((i + 1))
+                sleep 2
+              done
+              if [ "$i" -ge 60 ]; then
+                echo "floci S3 did not start in time" >&2
+                exit 1
+              fi
+              # Idempotent: a repeat PUT of an existing bucket also returns 200.
+              curl -fsS -o /dev/null -X PUT "${ENDPOINT}/${BUCKET}"
+              # Verify rather than trust: HEAD on a missing bucket is 404, so a
+              # 200 here proves the bucket Ravel needs actually exists.
+              status="$(curl -sS -o /dev/null -w '%{http_code}' -I "${ENDPOINT}/${BUCKET}")"
+              if [ "$status" != "200" ]; then
+                echo "bucket ${BUCKET} missing after create (HEAD ${status})" >&2
+                exit 1
+              fi
+              echo "bucket ${BUCKET} ready"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi

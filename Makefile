@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test build minio minio-down demo bench audit difftest
+.PHONY: check fmt clippy test build minio minio-down demo kind-up kind-demo kind-down bench audit difftest
 
 check: fmt clippy test
 
@@ -22,6 +22,20 @@ minio-down:
 
 demo: build
 	./scripts/demo.sh
+
+# The same ingest/query round trip on a real local Kubernetes cluster, driven
+# by the operator (ADR-0034 decision 6; docs/guides/kubernetes.md). No `build`
+# prerequisite: kind-up.sh builds the binaries inside the container image, and
+# kind-demo.sh only needs the gen_otlp_fixture example, which cargo builds
+# on demand.
+kind-up:
+	./scripts/kind-up.sh
+
+kind-demo:
+	./scripts/kind-demo.sh
+
+kind-down:
+	./scripts/kind-down.sh
 
 bench:
 	cargo bench --workspace
