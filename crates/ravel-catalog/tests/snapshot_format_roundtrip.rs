@@ -245,3 +245,51 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 }
+
+/// A part mixing an L0 entry (16-byte writer_id) and an L1 compaction-part
+/// entry (level 1, 32-byte writer_id holding the input_set_hash) encodes and
+/// decodes byte-for-byte, proving the level-dependent field-length rule
+/// (docs/metric-index-plan.md section 7) accepts both shapes in one part.
+#[test]
+fn mixed_l0_l1_part_roundtrips() {
+    let l0 = SnapshotEntry {
+        level: 0,
+        shard: 0,
+        ingest_hour_bucket: 5,
+        writer_id: vec![0xAA; 16],
+        writer_epoch: 1,
+        writer_seq: 1,
+        content_hash: vec![0xBB; 32],
+        object_size: 100,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: 100,
+        sample_count: 1,
+        series_count: 1,
+        segment_format_version: 5,
+        created_unix_ns: 1_000,
+    };
+    let l1 = SnapshotEntry {
+        level: 1,
+        shard: 0,
+        ingest_hour_bucket: 5,
+        // L1: writer_id carries the 32-byte input_set_hash, writer_epoch the
+        // part_index.
+        writer_id: vec![0xCC; 32],
+        writer_epoch: 0,
+        writer_seq: 0,
+        content_hash: vec![0xDD; 32],
+        object_size: 4096,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: 100,
+        sample_count: 10,
+        series_count: 2,
+        segment_format_version: 5,
+        created_unix_ns: 2_000,
+    };
+    // Sorted by (hour, shard, writer_id bytes, ...): the 16-byte L0 writer_id
+    // sorts before the 32-byte L1 one.
+    let entries = vec![l0, l1];
+    let encoded = encode_part([0x11; 16], 1, 8, 5, &entries).expect("encode");
+    let decoded = decode_part(&encoded, &PartLimits::default()).expect("decode");
+    assert_eq!(decoded.entries, entries);
+}

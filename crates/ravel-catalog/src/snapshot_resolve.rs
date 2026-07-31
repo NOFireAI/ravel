@@ -393,30 +393,87 @@ fn build_segment_ref_from_entry(
     signal: Signal,
     entry: &SnapshotEntry,
 ) -> Result<SegmentRef, CatalogError> {
+    let entry_label = || {
+        format!(
+            "snapshot entry (level {}, shard {}, hour {})",
+            entry.level, entry.shard, entry.ingest_hour_bucket
+        )
+    };
     let content_hash: [u8; 32] =
         entry
             .content_hash
             .clone()
             .try_into()
             .map_err(|_| CatalogError::FieldMismatch {
-                key: format!(
-                    "snapshot entry (shard {}, hour {})",
-                    entry.shard, entry.ingest_hour_bucket
-                ),
+                key: entry_label(),
                 field: "content_hash",
                 expected: "32 bytes".to_string(),
                 actual: format!("{} bytes", entry.content_hash.len()),
             })?;
+
+    // Level 1 is a compaction (L1) part. Its identity is carried in the
+    // writer_* slots by the fold (`build_l1_snapshot_entry`): writer_id holds
+    // the 32-byte input_set_hash, writer_epoch holds the part_index. Rebuild
+    // exactly the `SegmentRef` a live listing produces from the compaction
+    // record and part (`build_l1_segment_ref`): the L1 data key from
+    // `keys::l1_part_key`, and writer_* left nil since an L1 part has no
+    // writer identity (docs/metric-index-plan.md section 7).
+    if entry.level != 0 {
+        let input_set_hash: [u8; 32] =
+            entry
+                .writer_id
+                .clone()
+                .try_into()
+                .map_err(|_| CatalogError::FieldMismatch {
+                    key: entry_label(),
+                    field: "writer_id (input_set_hash)",
+                    expected: "32 bytes".to_string(),
+                    actual: format!("{} bytes", entry.writer_id.len()),
+                })?;
+        let part_index =
+            u32::try_from(entry.writer_epoch).map_err(|_| CatalogError::FieldMismatch {
+                key: entry_label(),
+                field: "writer_epoch (part_index)",
+                expected: "u32".to_string(),
+                actual: entry.writer_epoch.to_string(),
+            })?;
+        let data_object_key = keys::l1_part_key(
+            tenant,
+            signal,
+            entry.shard,
+            entry.ingest_hour_bucket,
+            &hex16(&input_set_hash),
+            part_index,
+            &hex16(&content_hash),
+        )?;
+        return Ok(SegmentRef {
+            data_object_key,
+            object_size: entry.object_size,
+            min_event_ts_ns: entry.min_event_ts_ns,
+            max_event_ts_ns: entry.max_event_ts_ns,
+            ingest_hour_bucket: entry.ingest_hour_bucket,
+            sample_count: entry.sample_count,
+            series_count: entry.series_count,
+            shard: entry.shard,
+            content_hash,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: entry.created_unix_ns,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index,
+            },
+        });
+    }
+
     let writer_id_bytes: [u8; 16] =
         entry
             .writer_id
             .clone()
             .try_into()
             .map_err(|_| CatalogError::FieldMismatch {
-                key: format!(
-                    "snapshot entry (shard {}, hour {})",
-                    entry.shard, entry.ingest_hour_bucket
-                ),
+                key: entry_label(),
                 field: "writer_id",
                 expected: "16 bytes".to_string(),
                 actual: format!("{} bytes", entry.writer_id.len()),
@@ -447,4 +504,11 @@ fn build_segment_ref_from_entry(
         created_unix_ns: entry.created_unix_ns,
         level: SegmentLevel::L0,
     })
+}
+
+/// Lowercase hex of a 32-byte hash's first 8 bytes: the 16-char `hash16`
+/// component the L0 data-key and L1 part-key layouts embed
+/// (crates/ravel-commit/src/keys.rs), matching `hex::encode(&hash[..8])`.
+fn hex16(hash: &[u8; 32]) -> String {
+    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }

@@ -430,7 +430,7 @@ impl Catalog {
     /// tenant_hash/signal/shard against the (tenant, signal, shard) it was
     /// listed under plus the reconstruct-and-verify of its own key
     /// (ADR-0010 §7).
-    async fn load_and_validate_compaction(
+    pub(crate) async fn load_and_validate_compaction(
         &self,
         tenant: &TenantHash,
         signal: Signal,

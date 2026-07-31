@@ -22,7 +22,7 @@ use ravel_object_store::{
     GetRange, PutMode, PutOptions, StoreError, UploadChecksum, Version, list_all,
 };
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
-use ravel_proto::commit::v1::CommitRecord;
+use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
 use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
 use uuid::Uuid;
@@ -260,6 +260,96 @@ fn build_snapshot_entry(key: &str, record: &CommitRecord) -> Result<SnapshotEntr
     })
 }
 
+/// Build a level-1 [`SnapshotEntry`] for one part of a compaction record
+/// (docs/metric-index-plan.md section 7 point 2). The proto's frozen entry
+/// shape has no dedicated field for an L1 part's identity, so the writer_*
+/// slots -- which an L1 part has no native use for -- carry it: `writer_id`
+/// holds the 32-byte `input_set_hash` and `writer_epoch` holds the
+/// `part_index`. A resolve reads them back verbatim
+/// (`build_segment_ref_from_entry`) to reconstruct the exact same
+/// `SegmentRef` a live listing builds from the record and part directly
+/// (`build_l1_segment_ref`), keyed by `reconstruct_l1_part_key`. `level` is
+/// pinned to 1: the resolver treats every compaction record as an L1 part
+/// regardless of its declared level, and the fold matches that.
+fn build_l1_snapshot_entry(
+    key: &str,
+    record: &CompactionRecord,
+    part: &CompactionPart,
+) -> Result<SnapshotEntry, CatalogError> {
+    if record.input_set_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "input_set_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", record.input_set_hash.len()),
+        });
+    }
+    if part.content_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "part content_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", part.content_hash.len()),
+        });
+    }
+    Ok(SnapshotEntry {
+        level: 1,
+        shard: record.shard,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        writer_id: record.input_set_hash.clone(),
+        writer_epoch: u64::from(part.part_index),
+        writer_seq: 0,
+        content_hash: part.content_hash.clone(),
+        object_size: part.object_size,
+        min_event_ts_ns: part.min_event_ts_ns,
+        max_event_ts_ns: part.max_event_ts_ns,
+        sample_count: part.sample_count,
+        series_count: part.series_count,
+        segment_format_version: part.segment_format_version,
+        created_unix_ns: record.created_unix_ns,
+    })
+}
+
+/// Fold one entry into the running set, deduping by commit/part identity.
+/// `is_canonical` marks whether this occurrence sits under the hour directory
+/// its own embedded `ingest_hour_bucket` names. On a duplicate identity the
+/// canonical occurrence is preferred and the collision is counted as layout
+/// drift (docs/catalog-and-mvcc.md key layout: "layout drift must be visible,
+/// not swallowed"), never fatal, since a duplicate identity is a permanent
+/// property of the sealed layout and aborting would block the watermark
+/// forever.
+fn fold_in_entry(
+    entries: &mut Vec<SnapshotEntry>,
+    seen: &mut HashMap<EntryIdentity, (usize, bool)>,
+    layout_drift_count: &mut u64,
+    entry: SnapshotEntry,
+    is_canonical: bool,
+) {
+    match seen.entry(entry_identity(&entry)) {
+        Entry::Vacant(slot) => {
+            slot.insert((entries.len(), is_canonical));
+            entries.push(entry);
+        }
+        Entry::Occupied(mut slot) => {
+            *layout_drift_count += 1;
+            tracing::warn!(
+                level = entry.level,
+                shard = entry.shard,
+                ingest_hour_bucket = entry.ingest_hour_bucket,
+                writer_id = %writer_id_display(&entry.writer_id),
+                writer_epoch = entry.writer_epoch,
+                writer_seq = entry.writer_seq,
+                "duplicate entry identity while folding, preferring the entry in its correct hour directory"
+            );
+            let &(existing_index, existing_canonical) = slot.get();
+            if !existing_canonical && is_canonical {
+                entries[existing_index] = entry;
+                slot.insert((existing_index, true));
+            }
+        }
+    }
+}
+
 /// (shard, hour) pairs newly sealed since `watermark_hour_old`, exclusive of
 /// the old watermark and inclusive of the new one, across every shard.
 fn incremental_buckets(
@@ -287,10 +377,13 @@ impl Catalog {
     /// UUIDv4 per folder process start (proto/ravel/catalog.proto,
     /// `SnapshotHead.folder_id`).
     ///
-    /// `transactions` is the future extension point for compaction/retention
-    /// integration (docs/metric-index-plan.md section 7); this phase only
-    /// ever receives an empty slice, since [`Transaction`] has no public
-    /// constructor yet.
+    /// Compaction and retention are folded in from the same per-bucket
+    /// listing this fold already performs (docs/metric-index-plan.md section
+    /// 7 point 1): a bucket's `CompactionRecord`s contribute their parts as
+    /// level-1 entries and supersede their named L0 inputs, and a bucket
+    /// holding a `RetentionTombstone` contributes nothing. No separate
+    /// discovery mechanism is needed, so `transactions` stays an unused
+    /// extension point ([`Transaction`] has no public constructor).
     ///
     /// Returns `Ok` with `no_op: true` if no hour has newly sealed since the
     /// last fold. Every other failure mode that the metric index is allowed
@@ -389,46 +482,21 @@ impl Catalog {
                 let listing = list_all(self.store(), &prefix).await?;
                 counters.list_requests += 1;
 
+                // Partition the bucket's keys by shape, mirroring the
+                // resolve-time listing (`Catalog::list_hour_bucket`,
+                // docs/catalog-and-mvcc.md step 2) so a fold and a live
+                // resolve derive identical bucket state
+                // (docs/metric-index-plan.md section 7).
+                let mut l0_keys: Vec<&str> = Vec::new();
+                let mut compaction_keys: Vec<&str> = Vec::new();
+                let mut has_tombstone = false;
                 for meta in &listing {
                     match keys::partition_bucket_entry(&meta.key) {
-                        Ok(BucketEntry::CommitRecord(_)) => {
-                            let record = self
-                                .load_and_validate(tenant, signal, *shard, &meta.key)
-                                .await?;
-                            counters.get_requests += 1;
-                            let entry = build_snapshot_entry(&meta.key, &record)?;
-                            let is_canonical = *hour == entry.ingest_hour_bucket;
-                            match seen.entry(entry_identity(&entry)) {
-                                Entry::Vacant(slot) => {
-                                    slot.insert((entries.len(), is_canonical));
-                                    entries.push(entry);
-                                }
-                                Entry::Occupied(mut slot) => {
-                                    layout_drift_count += 1;
-                                    tracing::warn!(
-                                        key = %meta.key,
-                                        shard = entry.shard,
-                                        ingest_hour_bucket = entry.ingest_hour_bucket,
-                                        writer_id = %writer_id_display(&entry.writer_id),
-                                        writer_epoch = entry.writer_epoch,
-                                        writer_seq = entry.writer_seq,
-                                        "duplicate commit identity while folding, preferring the entry in its correct hour directory"
-                                    );
-                                    let &(existing_index, existing_canonical) = slot.get();
-                                    if !existing_canonical && is_canonical {
-                                        entries[existing_index] = entry;
-                                        slot.insert((existing_index, true));
-                                    }
-                                }
-                            }
+                        Ok(BucketEntry::CommitRecord(_)) => l0_keys.push(meta.key.as_str()),
+                        Ok(BucketEntry::CompactionRecord(_)) => {
+                            compaction_keys.push(meta.key.as_str())
                         }
-                        // Compaction records and the retention tombstone
-                        // live in the same bucket (docs/catalog-and-mvcc.md
-                        // key layout, ADR-0018/ADR-0019). Recognized but not
-                        // yet folded: section 7 integration is deferred past
-                        // this phase, hence the `Transaction` extension
-                        // point above.
-                        Ok(BucketEntry::CompactionRecord(_)) | Ok(BucketEntry::Tombstone(_)) => {}
+                        Ok(BucketEntry::Tombstone(_)) => has_tombstone = true,
                         Err(err) => {
                             layout_drift_count += 1;
                             tracing::warn!(
@@ -438,6 +506,70 @@ impl Catalog {
                             );
                         }
                     }
+                }
+
+                // Retention tombstone: the bucket contributes nothing, so
+                // neither its L1 parts nor its L0 records are folded in
+                // (ADR-0019 section 3, docs/metric-index-plan.md section 7
+                // point 2/3).
+                if has_tombstone {
+                    continue;
+                }
+
+                // Compaction records: fold each part as a level-1 entry and
+                // collect the L0 input identities it supersedes
+                // (docs/metric-index-plan.md section 7 point 2). Two records
+                // with different input sets in one bucket both contribute
+                // their parts (a harmless overlap the resolver alarms on but
+                // still serves); the fold matches that inclusion.
+                let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
+                for ckey in &compaction_keys {
+                    let record = self
+                        .load_and_validate_compaction(tenant, signal, *shard, ckey)
+                        .await?;
+                    counters.get_requests += 1;
+                    for part in &record.parts {
+                        let entry = build_l1_snapshot_entry(ckey, &record, part)?;
+                        fold_in_entry(
+                            &mut entries,
+                            &mut seen,
+                            &mut layout_drift_count,
+                            entry,
+                            true,
+                        );
+                    }
+                    for input in &record.inputs {
+                        excluded.insert((
+                            input.writer_id.clone(),
+                            input.writer_epoch,
+                            input.writer_seq,
+                        ));
+                    }
+                }
+
+                // L0 commit records: fold every one not named by a compaction
+                // input list above (docs/metric-index-plan.md section 7 point
+                // 2). An unlisted L0 is included exactly as the resolver
+                // includes it.
+                for key in &l0_keys {
+                    let record = self.load_and_validate(tenant, signal, *shard, key).await?;
+                    counters.get_requests += 1;
+                    if excluded.contains(&(
+                        record.writer_id.clone(),
+                        record.writer_epoch,
+                        record.writer_seq,
+                    )) {
+                        continue;
+                    }
+                    let entry = build_snapshot_entry(key, &record)?;
+                    let is_canonical = *hour == entry.ingest_hour_bucket;
+                    fold_in_entry(
+                        &mut entries,
+                        &mut seen,
+                        &mut layout_drift_count,
+                        entry,
+                        is_canonical,
+                    );
                 }
             }
 
@@ -505,27 +637,27 @@ impl Catalog {
             // build failure at any entry from `decode_start` onward aborts
             // the whole index, never publishes a partial one
             // (docs/metric-index-plan.md P5a).
-            let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) = if rebuilt
-            {
-                (Vec::new(), 0)
-            } else if let HeadState::Valid { head, .. } = &head_state {
-                match self
-                    .load_previous_postings(
-                        tenant,
-                        head,
-                        previous_entries_len as u64,
-                        &mut counters,
-                    )
-                    .await
-                {
-                    Some(names) => (names, previous_entries_len),
-                    None => (Vec::new(), 0),
-                }
-            } else {
-                (Vec::new(), 0)
-            };
-            let postings_names = self
-                .build_postings(
+            let postings_names = if entries.iter().all(|entry| entry.level == 0) {
+                let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) =
+                    if rebuilt {
+                        (Vec::new(), 0)
+                    } else if let HeadState::Valid { head, .. } = &head_state {
+                        match self
+                            .load_previous_postings(
+                                tenant,
+                                head,
+                                previous_entries_len as u64,
+                                &mut counters,
+                            )
+                            .await
+                        {
+                            Some(names) => (names, previous_entries_len),
+                            None => (Vec::new(), 0),
+                        }
+                    } else {
+                        (Vec::new(), 0)
+                    };
+                self.build_postings(
                     tenant,
                     signal,
                     &entries,
@@ -533,7 +665,17 @@ impl Catalog {
                     postings_baseline,
                     &mut counters,
                 )
-                .await;
+                .await
+            } else {
+                // A level-1 (compaction) entry is present. The forward
+                // postings merge assumes append-only, hour-major L0 growth
+                // with stable ordinals, which a compaction rewrite breaks, and
+                // an L1 part carries no L0 segment to decode `__name__` from.
+                // Publish no postings ref so a resolve considers every entry
+                // exactly rather than pruning against a stale or partial index
+                // (docs/metric-index-plan.md 3.1, section 7 point 6).
+                None
+            };
             let mut postings_built = false;
             let mut postings_size = 0u64;
             let postings_ref = match postings_names {
