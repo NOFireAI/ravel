@@ -20,6 +20,7 @@ pub mod error;
 pub mod field_dir;
 pub mod footer;
 pub mod page;
+pub mod ranged;
 pub mod reader;
 pub mod record;
 pub mod skip_index;
@@ -29,7 +30,9 @@ pub mod varint;
 pub mod writer;
 
 pub use error::LogSegError;
-pub use reader::{RlogReader, ScanStats, read_section};
+pub use footer::{SuffixOutcome, open_from_suffix};
+pub use ranged::{RlogRangeReader, StreamBlockSpan};
+pub use reader::{RlogReader, ScanStats, decode_section, read_section};
 pub use record::{FieldSel, LogRecord, Predicate, stream_attrs_bytes};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
 

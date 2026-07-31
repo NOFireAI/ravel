@@ -19,17 +19,17 @@
 //! modules and take a [`crate::bucket::Bucket`] whose `signal` field already
 //! routes them. The plan's memory bound is on *decoded* data: catalog metadata
 //! plus one in-flight part buffer's decoded records, never the whole bucket's
-//! decoded data at once (`build.rs`/`read.rs` header comments). [`RsegCodec`]
-//! holds this as a contract on the impl, not a hint: its ranged reader
-//! (`ravel_segment::open_from_suffix`) fetches only the footer and the
-//! page/block bytes a part actually needs. [`crate::rlog::RlogCodec`] is a
-//! documented exception on the *raw-bytes* axis only: RLOG has no ranged
-//! `.rlog` section reader, so `build_parts` GETs every input object whole and
-//! holds all N raw buffers resident for the merge (see that module's "Memory"
-//! note). It still bounds *decoded* data to one part plus one stream, which is
-//! the part the plan's bound is about; the raw-bytes gap is tracked as a
-//! follow-up (a ranged RLOG reader), not a silent violation of a claimed
-//! universal contract.
+//! decoded data at once (`build.rs`/`read.rs` header comments). Both codecs
+//! hold this as a contract on the impl, not a hint, and bound *raw* fetched
+//! bytes as well: each has a ranged reader that reads the footer and directory
+//! from a suffix probe and then fetches only the bytes a part actually needs --
+//! RSEG's `ravel_segment::open_from_suffix` fetching the page bytes of one
+//! series' runs, RLOG's `ravel_logseg::open_from_suffix` plus `RlogRangeReader`
+//! fetching the blocks of one stream (issue #275). So for both, peak resident
+//! bytes -- decoded and raw -- are bounded by catalog metadata plus one part
+//! plus one series/stream, never the whole bucket. The earlier RLOG merge held
+//! every input object whole (RLOG then had no ranged `.rlog` section reader);
+//! that gap is now closed and the two codecs share the same footprint contract.
 //!
 //! [`RsegCodec`] is a behavior-preserving thin wrapper over the existing
 //! `read.rs`/`build.rs` RSEG logic; [`crate::rlog::RlogCodec`] is the RLOG
@@ -68,12 +68,12 @@ pub trait SegmentCodec {
 
     /// Stream-merge every input into size-capped [`BuiltPart`]s and PUT each
     /// one `CreateIfAbsent` (build.rs's job). `catalogs` is aligned one-to-one
-    /// with `inputs` in canonical input order. Fetches page/block bytes lazily;
-    /// peak *decoded* memory is bounded by catalog metadata plus one in-flight
-    /// part. RSEG additionally bounds raw fetched bytes (ranged reader); RLOG
-    /// is a documented exception that holds all inputs' raw bytes resident
-    /// (no ranged `.rlog` reader), while still bounding decoded data as above
-    /// -- see the trait doc above and [`crate::rlog::RlogCodec`].
+    /// with `inputs` in canonical input order. Fetches page/block bytes lazily
+    /// by range; peak *decoded* memory is bounded by catalog metadata plus one
+    /// in-flight part, and both codecs additionally bound raw fetched bytes via
+    /// their ranged readers (RSEG's `open_from_suffix`, RLOG's `RlogRangeReader`,
+    /// issue #275) to one part plus one series/stream -- see the trait doc above
+    /// and [`crate::rlog::RlogCodec`].
     async fn build_parts(
         store: &dyn ObjectStoreBackend,
         config: &CompactorConfig,

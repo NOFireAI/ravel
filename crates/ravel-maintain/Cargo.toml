@@ -25,6 +25,7 @@ tracing = { workspace = true }
 ravel-segment = { workspace = true }
 tokio = { workspace = true }
 proptest = { workspace = true }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

@@ -362,7 +362,7 @@ pub fn logs_bucket() -> Bucket {
 
 /// Synthetic log stream `n`: its id and canonical resource+scope blob, the id
 /// being the true hash of the blob (real stream identity, never a placeholder).
-fn log_stream_ident(n: u32) -> (ravel_types::logstream::LogStreamId, Vec<u8>) {
+pub fn log_stream_ident(n: u32) -> (ravel_types::logstream::LogStreamId, Vec<u8>) {
     use ravel_types::logstream::{AttrValue, log_stream_id};
     let res = vec![(
         "service.name".to_string(),
@@ -373,7 +373,7 @@ fn log_stream_ident(n: u32) -> (ravel_types::logstream::LogStreamId, Vec<u8>) {
     (id, blob)
 }
 
-fn log_record(stream_n: u32, ts: i64, body: &str) -> ravel_logseg::LogRecord {
+pub fn log_record(stream_n: u32, ts: i64, body: &str) -> ravel_logseg::LogRecord {
     let (stream_id, stream_attrs) = log_stream_ident(stream_n);
     ravel_logseg::LogRecord {
         stream_id,

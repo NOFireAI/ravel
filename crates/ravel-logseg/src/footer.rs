@@ -187,14 +187,53 @@ pub fn write_footer_and_trailer(out: &mut Vec<u8>, footer: &LogFooter) {
     out.extend_from_slice(&MAGIC);
 }
 
+/// Outcome of opening a `.rlog` object from a suffix probe (the ranged reader
+/// protocol): either the footer parsed, or the suffix did not reach the whole
+/// footer and the caller must fetch the named absolute byte range (itself a
+/// true suffix of the object) and call [`open_from_suffix`] again with it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SuffixOutcome {
+    /// The footer was fully covered and validated.
+    Ready(LogFooter),
+    /// The suffix covered the trailer but not the whole footer. Fetch
+    /// `[offset, offset + len)` (footer + trailer) and retry.
+    NeedRange { offset: u64, len: u64 },
+}
+
 /// Opens a whole RLOG object: verifies the trailer, the footer crc, decodes the
 /// footer, and validates the section table. Every violation is `Corrupted`.
+/// The whole object always covers the footer, so this never asks for a range.
 pub fn open(bytes: &[u8]) -> Result<LogFooter, LogSegError> {
-    let total = bytes.len();
+    match open_from_suffix(bytes, bytes.len() as u64)? {
+        SuffixOutcome::Ready(footer) => Ok(footer),
+        // Unreachable: a whole object covers its own footer.
+        SuffixOutcome::NeedRange { .. } => Err(LogSegError::Corrupted(
+            "footer not covered by whole object".into(),
+        )),
+    }
+}
+
+/// Opens a `.rlog` object from a suffix of its bytes (docs/log-segment-format.md
+/// "Reader protocol"). `suffix` is the last `suffix.len()` bytes of an object of
+/// `total_size` bytes. When the suffix covers the footer and trailer, this
+/// validates the trailer, the footer crc, and the section table, then returns
+/// the footer; when it covers the trailer but not the whole footer, it returns
+/// [`SuffixOutcome::NeedRange`] naming the absolute footer+trailer range to
+/// fetch and retry. This is the RLOG analogue of `ravel_segment::open_from_suffix`
+/// and lets a caller read the footer and section directory with one or two
+/// ranged GETs instead of the whole object. Every violation is `Corrupted`.
+pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome, LogSegError> {
+    let total = usize::try_from(total_size)
+        .map_err(|_| LogSegError::Corrupted("total_size range".into()))?;
     if total < TRAILER_LEN {
         return Err(LogSegError::Corrupted("object smaller than trailer".into()));
     }
-    let trailer = &bytes[total - TRAILER_LEN..];
+    if suffix.len() < TRAILER_LEN || suffix.len() > total {
+        return Err(LogSegError::Corrupted(
+            "suffix does not cover the trailer".into(),
+        ));
+    }
+    let trailer = &suffix[suffix.len() - TRAILER_LEN..];
     let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
     let footer_crc32c = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
     let version = u16::from_le_bytes([trailer[8], trailer[9]]);
@@ -221,11 +260,24 @@ pub fn open(bytes: &[u8]) -> Result<LogFooter, LogSegError> {
     if footer_len == 0 {
         return Err(LogSegError::Corrupted("footer_len is zero".into()));
     }
+    // Absolute footer region [footer_start, total - TRAILER_LEN).
     let footer_start = total
         .checked_sub(TRAILER_LEN)
         .and_then(|v| v.checked_sub(footer_len as usize))
         .ok_or_else(|| LogSegError::Corrupted("footer_len past object".into()))?;
-    let footer_bytes = &bytes[footer_start..total - TRAILER_LEN];
+
+    // The suffix covers [suffix_start, total). If the footer starts before it,
+    // ask the caller for the footer+trailer range and retry.
+    let suffix_start = total - suffix.len();
+    if footer_start < suffix_start {
+        return Ok(SuffixOutcome::NeedRange {
+            offset: footer_start as u64,
+            len: (total - footer_start) as u64,
+        });
+    }
+    let rel_start = footer_start - suffix_start;
+    let rel_end = suffix.len() - TRAILER_LEN;
+    let footer_bytes = &suffix[rel_start..rel_end];
 
     let expected = footer_crc(footer_bytes, footer_len, version, signal, reserved);
     if expected != footer_crc32c {
@@ -237,7 +289,7 @@ pub fn open(bytes: &[u8]) -> Result<LogFooter, LogSegError> {
     let footer = LogFooter::from_proto(proto)?;
 
     validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
-    Ok(footer)
+    Ok(SuffixOutcome::Ready(footer))
 }
 
 /// Validates the section table: at most one of each known kind, all five v1
