@@ -501,15 +501,7 @@ pub static REGISTRY: &[Construct] = &[
         unit("ravel-promql:scalar_vector_filter_and_bool_both_directions"),
     ),
     binop(">=", corpus("corpus/binop.txt")),
-    Construct {
-        name: "<=",
-        category: Category::BinaryOp,
-        state: ConstructState::Unclassified,
-        probe: Probe::InfixOp("<="),
-        note: "implemented in ravel-promql's `binop` comparison table but \
-               exercised by no corpus entry and no unit test in either crate; \
-               state 3 per ADR-0035, and a ticket, not a silent pass",
-    },
+    binop("<=", corpus("corpus/binop.txt")),
     word_binop("and"),
     word_binop("or"),
     word_binop("unless"),

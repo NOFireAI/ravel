@@ -71,6 +71,18 @@ kind: instant
 time: +300s
 mode: unordered
 
+name: instant_le_filter_comparison_keeps_name
+query: diff_gauge_walk <= 0
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_le_bool_comparison
+query: diff_gauge_walk <= bool 0
+kind: instant
+time: +300s
+mode: unordered
+
 name: instant_nan_eq_filter_is_empty
 query: diff_special_values == diff_special_values
 kind: instant
