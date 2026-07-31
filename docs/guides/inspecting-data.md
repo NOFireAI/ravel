@@ -1,8 +1,8 @@
 # Inspecting data
 
-`ravel-cli` reads segments and commit records straight out of the object
-store; nothing here needs `ravel-server` running. The examples below run
-against the bucket `make demo` writes to
+`ravel-cli` reads segments and commit records directly from the object
+store. Nothing here needs `ravel-server` running. The examples below run
+against the bucket that `make demo` writes to
 ([docs/guides/getting-started.md](getting-started.md)). Every command
 needs the same store flags:
 
@@ -28,7 +28,7 @@ t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt commit r
 `tenant_hash` is BLAKE3 of the tenant name, hex-encoded. `m` is the signal
 (metrics; logs and spans would be `l`/`s`, not implemented yet). `shard` is
 the ingest shard, zero-padded to 4 digits. `ingest_hour` is the UTC hour the
-commit landed in (`YYYYMMDDTHH`), which is what lets the catalog find recent
+commit landed in (`YYYYMMDDTHH`). This lets the catalog find recent
 commits by listing a small, bounded set of prefixes instead of the whole
 bucket.
 
@@ -43,11 +43,11 @@ t/3f2a.../m/l0/0000/6a9c....rseg shard=0 samples=120 series=3 min_event_ts_ns=17
 1 segment(s)
 ```
 
-This resolves the same catalog snapshot a query would, over the last
-`--hours` hours (default 1) and `--shards` shards (default 4; must match
-whatever shard count the writer used, `4` for `make demo`). Each line is
-one committed segment: the data object key it's stored under, its shard,
-sample and series counts, its event-time span, and when the flush that
+This resolves the same catalog snapshot that a query would, over the last
+`--hours` hours (default 1) and `--shards` shards (default 4; it must match
+the shard count the writer used, `4` for `make demo`). Each line is
+one committed segment. It shows the data object key it is stored under, its
+shard, sample and series counts, its event-time span, and when the flush that
 created it ran (`created_unix_ns`). This is the fastest way to get a real
 key to feed into `segment inspect` or `commit decode`.
 
@@ -55,7 +55,7 @@ key to feed into `segment inspect` or `commit decode`.
 
 ![RSEG layout](../diagrams/rseg-layout.svg)
 
-Every segment is RSEG v5 (ADR-0027 left it the only version). The command:
+Every segment is RSEG v5 (ADR-0027 left it the only version). The command is:
 
 ```sh
 cargo run -p ravel-cli -- segment inspect \
@@ -105,26 +105,25 @@ series:
 
 Field by field:
 
-- `total_size`, `trailer_offset`, `footer_offset`: byte layout of the
-  object. RSEG segments are footer-first-readable: the 16-byte trailer at
-  the very end gives the footer's length and checksum, so a reader needs
-  one suffix GET to find and validate the footer before fetching anything
-  else.
+- `total_size`, `trailer_offset`, `footer_offset`: the byte layout of the
+  object. RSEG segments are footer-first-readable. The 16-byte trailer at
+  the very end gives the footer's length and checksum. A reader therefore
+  needs one suffix GET to find and validate the footer before it fetches
+  anything else.
 - `version`: the trailer format version, always `5`. A non-5 version (a
-  stray pre-release object) is rejected with a typed error, never
-  half-parsed.
+  stray pre-release object) gets a typed error; Ravel never half-parses it.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
-  identity components embedded in the object's key and its commit token, so
-  a segment and a commit token/record can be confirmed to agree on what
+  identity components embedded in the object's key and its commit token. They
+  let you confirm that a segment and a commit token or record agree on what
   wrote it.
 - `min/max_event_ts_ns`: the span of sample timestamps inside the segment.
 - `min/max_ingest_ts_ns`: when this server received those points.
 - `base_created_unix_ns`, `level`, `part_index`: compaction provenance from
-  the footer. An L0 flush stamps `level = 0`, `part_index = 0`; a compacted
+  the footer. An L0 flush stamps `level = 0`, `part_index = 0`. A compacted
   object carries real values (as here). `base_created_unix_ns` is the
-  minimum run creation time, the base the per-run `created_unix_ns` deltas
-  reconstruct against.
-- `sample_count`, `series_count (footer)`: totals the footer claims.
+  minimum run creation time, the base that the per-run `created_unix_ns`
+  deltas reconstruct against.
+- `sample_count`, `series_count (footer)`: the totals that the footer claims.
 - `sections`: the object's sections and byte ranges. `kind=1` `LABEL_DICT`
   (the string table), `kind=5` `SERIES_IDS` (the sorted ids), `kind=6`
   `SERIES_META` (the run-major catalog: each series' schema, value kind,
@@ -132,29 +131,29 @@ Field by field:
   `VAL_PAGES` (scalar values), `kind=7` `HIST_PAGES` (histogram values). A
   large object (`series_count >= 4096`) instead carries `kind=8`
   `SERIES_IDX` and `kind=9` `SERIES_META_CHUNKS` in place of the whole
-  `SERIES_META` -- the sparse catalog. `VAL_PAGES` is omitted when no series
-  is scalar, `HIST_PAGES` when none is a histogram. `comp` is the raw wire
+  `SERIES_META`: the sparse catalog. `VAL_PAGES` is absent when no series
+  is scalar, and `HIST_PAGES` when none is a histogram. `comp` is the raw wire
   integer (`0` none, `1` lz4, `2` zstd).
 - `schema_count (derived)` / `schema[N]:`: SERIES_META groups series by
-  distinct label-*name* set (a "schema"); each line lists that schema's
-  names, resolved through `LABEL_DICT`. Derived by `ravel-cli` from the
+  distinct label-*name* set (a "schema"). Each line lists that schema's
+  names, resolved through `LABEL_DICT`. `ravel-cli` derives this from the
   decoded per-series label sets.
-- `series`: one line per series -- id, resolved labels, sample count,
+- `series`: one line per series: id, resolved labels, sample count,
   event-timestamp bounds, `value_kind` (`VAL_SCALAR` or `HIST_SPANS`), and
-  `run_count`. Each series then prints one `run[N]` line per run: its
-  provenance (`created_unix_ns`, `writer_epoch`, `writer_seq`), sample
-  count, and the **absolute** byte ranges of that run's TS and
-  VAL-or-HIST pages (`ts_range`/`val_range`/`hist_range`, half-open
-  `[start, end)`), reconstructed from SERIES_META the way the reader does
-  before fetching the bytes. An L0 flush produces one run per series; a
-  compacted object can carry several.
+  `run_count`. Each series then prints one `run[N]` line per run. Each
+  `run[N]` line gives its provenance (`created_unix_ns`, `writer_epoch`,
+  `writer_seq`), sample count, and the **absolute** byte ranges of that run's
+  TS and VAL-or-HIST pages (`ts_range`/`val_range`/`hist_range`, half-open
+  `[start, end)`). `ravel-cli` reconstructs these from SERIES_META the way
+  the reader does before it fetches the bytes. An L0 flush produces one run
+  per series; a compacted object can carry several.
 - Every `HIST_SPANS` run is followed by one `hist[N]:` line per decoded
-  histogram sample: `scale`, `zero_threshold`, `sum` (`none` if absent),
-  `reset_hint`, then `count_kind` (`INT`/`FLOAT`) with `zero_count`/`count`,
-  then the positive and negative sides' spans (`(offset, length)` pairs)
-  and bucket counts, in stored order.
-- `series_count (decoded)`: series count from decoding the catalog, not
-  just trusting the footer; matching `series_count (footer)` means the
+  histogram sample. Each line gives `scale`, `zero_threshold`, `sum` (`none`
+  if absent), and `reset_hint`, then `count_kind` (`INT`/`FLOAT`) with
+  `zero_count`/`count`, then the positive and negative sides' spans
+  (`(offset, length)` pairs) and bucket counts, in stored order.
+- `series_count (decoded)`: the series count from decoding the catalog, not
+  just from trusting the footer. If it matches `series_count (footer)`, the
   segment is internally consistent.
 
 
@@ -162,12 +161,12 @@ Field by field:
 
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
 (docs/log-segment-format.md, ADR-0029; trailer version 2, ADR-0032). RLOG is
-a sibling of RSEG: same 16-byte trailer, protobuf footer, and crc32c
-discipline, but its own sections and none of the bytes. As of log storage
-phase 1 the format crate (`ravel-logseg`) ships on its own; ingest, query,
-and lifecycle are later phases, so today an RLOG object is produced by the
-writer directly (in tests and tooling) rather than by the ingest path. The
-command:
+a sibling of RSEG. It shares the same 16-byte trailer, protobuf footer, and
+crc32c discipline, but it has its own sections and none of the bytes. As of
+log storage phase 1, the format crate (`ravel-logseg`) ships on its own.
+Ingest, query, and lifecycle are later phases. Today the writer produces an
+RLOG object directly (in tests and tooling), not the ingest path. The
+command is:
 
 ```sh
 cargo run -p ravel-cli -- rlog inspect "t/abab.../l/l0/0000/....rlog"
@@ -213,57 +212,58 @@ field_dir (2 entry(ies)):
 
 Field by field:
 
-- `total_size`, `version`, `signal`: byte length of the object, the trailer
-  format version (currently `2`; any other version is rejected with a typed
-  error, no dual-reader path), and the signal byte (`2` = logs). Like RSEG,
-  the object is footer-first-readable: the 16-byte trailer at the end gives
-  the footer's
-  length and crc, so a reader validates the footer in one suffix GET before
-  fetching anything else.
+- `total_size`, `version`, `signal`: the byte length of the object, the
+  trailer format version (currently `2`; any other version gets a typed
+  error, with no dual-reader path), and the signal byte (`2` = logs). Like
+  RSEG, the object is footer-first-readable. The 16-byte trailer at the end
+  gives the footer's length and crc. A reader therefore validates the footer
+  in one suffix GET before it fetches anything else.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
-  identity components, which must match the commit record the reader resolved
-  the object from. `writer_id` and `tenant_hash` are printed as hex.
+  identity components. They must match the commit record that the reader
+  resolved the object from. `writer_id` and `tenant_hash` are printed as hex.
 - `min/max_ts_ns`: the span of record event timestamps.
   `min/max_observed_ts_ns`: the span of observed (ingest-side) timestamps.
-  These four plus the counts are the skip index's level 2, the whole-object
-  summary in the footer.
-- `record_count`, `block_count`, `stream_count`: totals the footer claims.
+  These four values plus the counts are the skip index's level 2, the
+  whole-object summary in the footer.
+- `record_count`, `block_count`, `stream_count`: the totals that the footer
+  claims.
 - `level`, `input_set_hash`, `part_index`: compaction provenance (ADR-0032),
-  the same convention RSEG uses. An L0 flush object (every object shown in
-  this guide) stamps the sentinels `level=0`, `input_set_hash` empty,
-  `part_index=0`; a future L1 compacted object carries real values.
+  the same convention that RSEG uses. An L0 flush object (every object shown in
+  this guide) stamps the sentinels `level=0`, empty `input_set_hash`, and
+  `part_index=0`. A future L1 compacted object carries real values.
 - `sections`: the five mandatory sections and their byte ranges. `kind=1`
   `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
   `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
   columnar row blocks), `kind=4` `SKIP_IDX` (the multi-level min/max index),
   `kind=5` `BLOOM` (per-block token blooms). STREAM_DIR, FIELD_DIR, and
-  SKIP_IDX are whole-section zstd (`comp=zstd`); BLOCKS and BLOOM are
-  containers read entry by entry, so they are `comp=none`. `comp` is printed
-  by name (`none`/`zstd`).
-- `skip_index level 0`: one line per row block -- its byte `offset` (into
-  BLOCKS) and `len`, the `crc32c` the reader verifies before decoding the
-  block, `record_count`, and the block's `ts_range` and `stream_ref_range`
-  (both inclusive), which are what the skip index prunes on. Under each block
-  line is one `stat` line per numeric column present in the block:
-  `column_id`, `type` (`i64`/`f64`/`bool`/`bytes`), `min_bits`/`max_bits` (the
-  bit pattern the min/max are stored as -- two's complement for i64, `to_bits`
-  for f64, so f64 comparison is bit-exact), `null_count`, and `has_nan`. In
-  the example both blocks carry column 10 (`code`), an i64 attribute; the
-  string column `svc` is not numeric and so has no stat.
+  SKIP_IDX use whole-section zstd (`comp=zstd`). BLOCKS and BLOOM are
+  containers that a reader reads entry by entry, so they are `comp=none`.
+  `comp` is printed by name (`none`/`zstd`).
+- `skip_index level 0`: one line per row block. Each line gives its byte
+  `offset` (into BLOCKS) and `len`, the `crc32c` that the reader verifies
+  before it decodes the block, `record_count`, and the block's `ts_range` and
+  `stream_ref_range` (both inclusive). The skip index prunes on those two
+  ranges. Under each block line is one `stat` line per numeric column present
+  in the block: `column_id`, `type` (`i64`/`f64`/`bool`/`bytes`),
+  `min_bits`/`max_bits`, `null_count`, and `has_nan`. `min_bits`/`max_bits`
+  are the bit pattern that the min/max are stored as: two's complement for
+  i64, and `to_bits` for f64, so f64 comparison is bit-exact. In the example,
+  both blocks carry column 10 (`code`), an i64 attribute. The string column
+  `svc` is not numeric and so has no stat.
 - `stream_dir`: one line per stream, in the object's sorted stream_id order.
   The line number is the `stream_ref` used everywhere else (the entry's
-  0-based ordinal); `stream_id` is the 16-byte identity in hex; `blob_len` is
-  the length of the canonical resource+scope attribute blob; `blocks` is the
-  half-open-printed inclusive block range holding that stream's records.
-- `field_dir`: one line per dynamic attribute column -- `column_id` (dynamic
+  0-based ordinal). `stream_id` is the 16-byte identity in hex. `blob_len` is
+  the length of the canonical resource+scope attribute blob. `blocks` is the
+  inclusive block range that holds that stream's records, printed half-open.
+- `field_dir`: one line per dynamic attribute column: `column_id` (dynamic
   columns start at 10; fixed columns 0..=9 are implicit and never listed),
   `name`, `type`, `present_blocks` (blocks with at least one value), and the
   object-wide `null_count`. A key seen with two value types appears as two
   entries (per-type splitting).
 
-A corrupt object never half-prints: the footer open protocol and every
+A corrupt object never half-prints. The footer open protocol and every
 section decode return a typed `Corrupted` error with a non-zero exit. A
-corrupt SKIP_IDX in particular is loud rather than a degrade, because its
+corrupt SKIP_IDX in particular is loud, not a degrade, because its
 level-0 entries are the only source of block byte ranges and per-block
 checksums.
 
@@ -296,14 +296,14 @@ created_unix_ns: 1732400060123456789
 ingest_hour_bucket: 2025112718
 ```
 
-A commit record never holds sample data itself; it's a small pointer plus
+A commit record never holds sample data itself. It is a small pointer plus
 enough metadata to prune without opening the segment. `object_key` and
-`object_size` name the segment this record publishes; `content_hash` is
+`object_size` name the segment that this record publishes. `content_hash` is
 the blake3 hash embedded in that segment's own key (`hash16` above,
-extended here to the full hash), which is how a retried commit PUT can
-tell "already published, same content" (safe) from "already published,
-different content" (a fatal split-brain, since two different segments
-should never share a `(writer_id, epoch, seq)`) apart. `signal` is the
+extended here to the full hash). It lets a retried commit PUT tell two cases
+apart: "already published, same content" (safe) and "already published,
+different content" (a fatal split-brain, because two different segments
+should never share a `(writer_id, epoch, seq)`). `signal` is the
 numeric signal code (`1` = metrics). `ingest_hour_bucket` is the same hour
-encoded in the object's own key, and is what the catalog groups listings
+encoded in the object's own key, and it is what the catalog groups listings
 by.
