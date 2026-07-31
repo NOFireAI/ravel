@@ -59,8 +59,8 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::{
-    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
 };
 
 /// The operation kinds counted separately. One [`OpMetrics`] block each.
@@ -481,22 +481,6 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
             .map_or(0, |outcome| outcome.data.len() as u64);
         self.record(StoreOp::Get, start, bytes, &result);
         result
-    }
-
-    /// Passthrough, uncounted. A multipart upload is a handle, not a call:
-    /// counting it would mean wrapping the returned [`MultipartUpload`] and
-    /// attributing its parts to some [`StoreOp`], and no `StoreOp` describes
-    /// them (folding part bytes into `put` would make `put.calls` disagree with
-    /// the number of `put()` calls a caller made). Multipart traffic is
-    /// therefore invisible to these counters; only compaction writes it, and
-    /// its own metrics cover part counts and bytes. `put()`'s own
-    /// above-threshold multipart path *is* counted, as one `put`, because that
-    /// is what the caller invoked.
-    async fn put_multipart<'a>(
-        &'a self,
-        key: &str,
-    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
-        self.inner.put_multipart(key).await
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {

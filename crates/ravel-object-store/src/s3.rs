@@ -47,74 +47,27 @@
 //!   every S3-compatible endpoint, `upload_checksum` is not part of
 //!   [`Capabilities::mandatory`] and does not gate startup (issue #251);
 //!   read-time integrity comes from the segment crc32c hierarchy instead.
-//!   See `capabilities()` below. The same gap applies per part: a multipart
-//!   part's checksum is a local pre-flight too.
-//! - **Multipart completion is unconditional.** `object_store` 0.14's
-//!   `put_multipart_opts` takes a `PutMultipartOptions` carrying tags,
-//!   attributes, and extensions --- no `PutMode` --- so no
-//!   `If-None-Match`/`If-Match` precondition can ride on
-//!   `CompleteMultipartUpload`. [`S3MultipartUpload::complete`] is therefore
-//!   equivalent to a [`PutMode::Overwrite`] put, and `put()` only takes its
-//!   multipart path (above [`MULTIPART_THRESHOLD`]) under `Overwrite`: a
-//!   `CreateIfAbsent` or `CasVersion` put stays on the single-PUT path at
-//!   every size rather than silently dropping the precondition the commit
-//!   protocol depends on.
+//!   See `capabilities()` below.
 
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path;
 use object_store::{
-    GetOptions as OsGetOptions, GetRange as OsGetRange, MultipartUpload as OsMultipartUpload,
-    ObjectStore, ObjectStoreExt, PutMode as OsPutMode, PutOptions as OsPutOptions, PutPayload,
-    UpdateVersion,
+    GetOptions as OsGetOptions, GetRange as OsGetRange, ObjectStore, ObjectStoreExt,
+    PutMode as OsPutMode, PutOptions as OsPutOptions, PutPayload, UpdateVersion,
 };
 
 use crate::{
-    Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
-    UploadChecksum, Version, multipart_finished,
+    Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutMode, PutOptions, PutOutcome, StoreError, UploadChecksum,
+    Version,
 };
 
 /// Default entries per `ListPage`, chosen to line up with S3's own
 /// `ListObjectsV2` page size. Overridable per instance via
 /// [`S3Store::with_page_size`].
 const LIST_PAGE_SIZE: usize = 1000;
-
-/// Part size [`S3Store::put`] cuts an over-threshold payload into: 8 MiB.
-///
-/// Above S3's 5 MiB non-final-part minimum ([`crate::MULTIPART_MIN_PART_SIZE`]) with
-/// margin, and a fixed size for every part but the last, which is what the
-/// strictest S3-compatible backends require (R2 rejects mixed non-final part
-/// sizes). 8 MiB also keeps the part count low enough that S3's 10 000-part
-/// ceiling only binds at 80 GiB, far above any segment Ravel writes.
-pub const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
-
-/// Payload size above which [`S3Store::put`] switches from one PUT to a
-/// multipart upload: 16 MiB, exactly two [`MULTIPART_PART_SIZE`] parts.
-///
-/// Chosen so the multipart path is never degenerate: a payload that takes it
-/// always produces at least two parts, and every part but the last is exactly
-/// 8 MiB. A lower threshold would produce single-part multipart uploads (three
-/// round trips where one PUT would do, for no benefit); a much higher one
-/// would leave large L1/L2 compaction outputs on the single-PUT path, whose
-/// failure mode is re-sending the entire object.
-pub const MULTIPART_THRESHOLD: usize = 2 * MULTIPART_PART_SIZE;
-
-// The chunking constants satisfy S3's part rules by construction, checked at
-// compile time rather than by a test: non-final parts at or above the 5 MiB
-// minimum and all the same size, never fewer than two parts on the multipart
-// path, and a part ceiling that only binds at 80 GiB, far above any object
-// compaction produces (`max_l1_part_bytes` is measured in MiB).
-const _: () = assert!(MULTIPART_PART_SIZE >= crate::MULTIPART_MIN_PART_SIZE);
-const _: () = assert!(MULTIPART_THRESHOLD == 2 * MULTIPART_PART_SIZE);
-const _: () = assert!(crate::MULTIPART_MAX_PARTS * MULTIPART_PART_SIZE >= 64 * 1024 * 1024 * 1024);
-
-/// How many part uploads [`S3Store::put`] keeps in flight. Bounded because a
-/// large object cut into 8 MiB parts can be hundreds of parts, and a
-/// compactor writing several objects at once must not open an unbounded
-/// number of connections per object.
-const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
 
 /// Explicit configuration for the S3 / MinIO adapter. No environment or
 /// credential-chain magic: every value that changes behavior is a field
@@ -307,167 +260,6 @@ fn classify_generic(
     StoreError::Transient(format!("{store}: {msg}"))
 }
 
-/// Local CRC32C pre-flight, shared by [`S3Store::put`] and
-/// [`S3MultipartUpload::put_part`]: recomputes the digest over the buffer we
-/// are about to hand `object_store` and rejects a caller/payload mismatch
-/// before any network call. It is never attached to the outgoing request and
-/// proves nothing about bytes actually landing on S3/MinIO; see the doc
-/// comment on [`S3Store::capabilities`] for why this crate cannot close that
-/// gap with `object_store` 0.14's `AmazonS3` client.
-fn preflight_checksum(data: &Bytes, checksum: Option<UploadChecksum>) -> Result<(), StoreError> {
-    if let Some(UploadChecksum::Crc32c(expected)) = checksum {
-        let actual = crc32c::crc32c(data);
-        if actual != expected {
-            return Err(StoreError::Corrupted(format!(
-                "upload checksum mismatch: expected {expected:08x}, computed {actual:08x}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// `PutResult -> PutOutcome`. Both our `Etag` and our `Version` come from the
-/// response ETag, never `PutResult::version` (module doc, second divergence).
-fn outcome_of(key: &str, result: object_store::PutResult) -> Result<PutOutcome, StoreError> {
-    let etag = result
-        .e_tag
-        .ok_or_else(|| StoreError::Permanent(format!("S3 returned no ETag for {key}")))?;
-    Ok(PutOutcome {
-        etag: Etag(etag.clone()),
-        version: Version(etag),
-    })
-}
-
-/// One in-flight S3 multipart upload: `CreateMultipartUpload` already issued,
-/// `UploadPart` per [`MultipartUpload::put_part`] call, and
-/// `CompleteMultipartUpload` / `AbortMultipartUpload` at the end.
-///
-/// Part numbers follow the order `put_part` is called in, and the object
-/// becomes visible only when `complete` succeeds --- S3's own multipart
-/// guarantee, which is what makes an interrupted compaction upload wasted work
-/// rather than a partial object. Nothing here retries: `object_store`'s client
-/// already retries each request internally, and a part that still fails
-/// surfaces to the caller, which owns the abort/retry decision (the same
-/// classification `put` produces, so `StoreError::is_retryable` applies
-/// unchanged).
-pub struct S3MultipartUpload {
-    key: String,
-    upload: Box<dyn OsMultipartUpload>,
-    sequence: PartSequence,
-    /// Set by `complete`/`abort`; every later call on this handle fails
-    /// instead of issuing a second request against a dead upload id.
-    finished: bool,
-}
-
-#[async_trait::async_trait]
-impl MultipartUpload for S3MultipartUpload {
-    async fn put_part(
-        &mut self,
-        data: Bytes,
-        checksum: Option<UploadChecksum>,
-    ) -> Result<(), StoreError> {
-        if self.finished {
-            return Err(multipart_finished(&self.key));
-        }
-        // Both checks run before the request, so a rejected part is not a
-        // part: the upload stays open and the caller can retry or abort.
-        preflight_checksum(&data, checksum)?;
-        self.sequence.accept(&self.key, data.len())?;
-        self.upload
-            .put_part(PutPayload::from(data))
-            .await
-            .map_err(map_error_common)
-    }
-
-    async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
-        if self.finished {
-            return Err(multipart_finished(&self.key));
-        }
-        self.sequence.finish(&self.key)?;
-        let result = self.upload.complete().await.map_err(map_error_common)?;
-        self.finished = true;
-        outcome_of(&self.key, result)
-    }
-
-    async fn abort(&mut self) -> Result<(), StoreError> {
-        if self.finished {
-            return Err(multipart_finished(&self.key));
-        }
-        // Marked finished before the request: whether or not
-        // `AbortMultipartUpload` reaches the server, this handle is spent, and
-        // an upload S3 never heard the abort for is orphaned parts (billed
-        // until a lifecycle rule reaps them), never a visible object.
-        self.finished = true;
-        self.upload.abort().await.map_err(map_error_common)
-    }
-}
-
-impl S3Store {
-    /// The [`MULTIPART_THRESHOLD`] path of [`ObjectStoreBackend::put`]: cut the
-    /// buffer into [`MULTIPART_PART_SIZE`] parts, upload at most
-    /// [`MULTIPART_UPLOAD_CONCURRENCY`] of them at a time, then complete. Any
-    /// failure aborts the upload best-effort (so parts are not left billed)
-    /// and surfaces the original error, never a partial object.
-    async fn put_via_multipart(&self, key: &str, data: Bytes) -> Result<PutOutcome, StoreError> {
-        // Only reachable for an in-memory buffer above 80 GiB, but refuse
-        // before opening an upload S3 would reject at completion.
-        let part_count = data.len().div_ceil(MULTIPART_PART_SIZE);
-        if part_count > crate::MULTIPART_MAX_PARTS {
-            return Err(StoreError::Permanent(format!(
-                "put of {key}: {} bytes needs {part_count} parts of \
-                 {MULTIPART_PART_SIZE} bytes, over the {}-part limit",
-                data.len(),
-                crate::MULTIPART_MAX_PARTS
-            )));
-        }
-        let path = path_of(key);
-        let mut upload = self
-            .store
-            .put_multipart(&path)
-            .await
-            .map_err(map_error_common)?;
-
-        // Every part but the last is exactly MULTIPART_PART_SIZE, which is
-        // both above S3's minimum and uniform, as R2-class backends require.
-        // Slices are zero-copy views of the caller's buffer.
-        let mut pending = Vec::with_capacity(data.len().div_ceil(MULTIPART_PART_SIZE));
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let end = (offset + MULTIPART_PART_SIZE).min(data.len());
-            pending.push(upload.put_part(PutPayload::from(data.slice(offset..end))));
-            offset = end;
-        }
-
-        // `UploadPart` futures are `'static`, so they can be driven with
-        // bounded concurrency after all of them have been handed out; part
-        // numbers were fixed by the `put_part` call order above, so completing
-        // out of order does not reorder the object.
-        let mut failure = None;
-        {
-            let mut inflight =
-                futures::stream::iter(pending).buffer_unordered(MULTIPART_UPLOAD_CONCURRENCY);
-            while let Some(result) = inflight.next().await {
-                if let Err(e) = result {
-                    failure = Some(map_error_common(e));
-                    break;
-                }
-            }
-        }
-        if let Some(e) = failure {
-            let _ = upload.abort().await;
-            return Err(e);
-        }
-
-        match upload.complete().await {
-            Ok(result) => outcome_of(key, result),
-            Err(e) => {
-                let _ = upload.abort().await;
-                Err(map_error_common(e))
-            }
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl ObjectStoreBackend for S3Store {
     async fn put(
@@ -476,18 +268,20 @@ impl ObjectStoreBackend for S3Store {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
-        preflight_checksum(&data, opts.checksum)?;
-        // Large payloads go out as a multipart upload, but only under
-        // `Overwrite`: `object_store` 0.14 has no conditional
-        // `CompleteMultipartUpload` (`PutMultipartOptions` carries tags and
-        // attributes, no `PutMode`), so routing a conditional put through
-        // multipart would silently drop the precondition the commit protocol
-        // depends on. A `CreateIfAbsent`/`CasVersion` put therefore stays on
-        // the single-PUT path at every size (S3's 5 GiB single-request limit
-        // is the ceiling there). See docs/object-store-contract.md,
-        // "Multipart upload".
-        if matches!(opts.mode, PutMode::Overwrite) && data.len() > MULTIPART_THRESHOLD {
-            return self.put_via_multipart(key, data).await;
+        // Cheap pre-flight only: this recomputes CRC32C over the same buffer
+        // we are about to hand to `object_store`, so it catches a checksum
+        // the caller mismatched against its own payload before encoding it,
+        // but it is never attached to the outgoing request and proves
+        // nothing about bytes actually landing on S3/MinIO. See the doc
+        // comment on `capabilities()` for why this crate cannot close that
+        // gap with `object_store` 0.14's `AmazonS3` client.
+        if let Some(UploadChecksum::Crc32c(expected)) = opts.checksum {
+            let actual = crc32c::crc32c(&data);
+            if actual != expected {
+                return Err(StoreError::Corrupted(format!(
+                    "upload checksum mismatch: expected {expected:08x}, computed {actual:08x}"
+                )));
+            }
         }
         let os_mode = match &opts.mode {
             PutMode::Overwrite => OsPutMode::Overwrite,
@@ -511,24 +305,13 @@ impl ObjectStoreBackend for S3Store {
             )
             .await
             .map_err(|e| map_put_error(e, &opts.mode))?;
-        outcome_of(key, result)
-    }
-
-    async fn put_multipart<'a>(
-        &'a self,
-        key: &str,
-    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
-        let upload = self
-            .store
-            .put_multipart(&path_of(key))
-            .await
-            .map_err(map_error_common)?;
-        Ok(Box::new(S3MultipartUpload {
-            key: key.to_string(),
-            upload,
-            sequence: PartSequence::default(),
-            finished: false,
-        }))
+        let etag = result
+            .e_tag
+            .ok_or_else(|| StoreError::Permanent(format!("S3 returned no ETag for {key}")))?;
+        Ok(PutOutcome {
+            etag: Etag(etag.clone()),
+            version: Version(etag),
+        })
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
@@ -667,42 +450,7 @@ impl ObjectStoreBackend for S3Store {
             // (docs/object-store-contract.md "Upload checksums").
             upload_checksum: false,
             prefix_list: true,
-            // Real: `put_multipart` above drives
-            // CreateMultipartUpload/UploadPart/CompleteMultipartUpload/
-            // AbortMultipartUpload through `object_store`, and `put` itself
-            // takes that path above `MULTIPART_THRESHOLD`. This is the flag
-            // `required_capabilities(Mode::Maintain)` adds, so `--mode
-            // maintain` starts against an S3-compatible backend (issue #243).
-            multipart: true,
+            multipart: false,
         }
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    fn test_config() -> S3Config {
-        S3Config {
-            bucket: "ravel-test".to_string(),
-            region: "us-east-1".to_string(),
-            endpoint: Some("http://localhost:0".to_string()),
-            access_key_id: "test".to_string(),
-            secret_access_key: "test".to_string(),
-            allow_http: true,
-            force_path_style: true,
-        }
-    }
-
-    /// `S3Store` declares the capability `required_capabilities(Mode::
-    /// Maintain)` demands, and it is not a claim about the endpoint: the
-    /// adapter implements the create/upload-part/complete/abort sequence for
-    /// every S3-compatible backend (issue #243). `S3Store::new` only validates
-    /// configuration, so no endpoint is needed here.
-    #[test]
-    fn capabilities_declare_multipart() {
-        let store = S3Store::new(test_config()).expect("dummy config must build");
-        assert!(store.capabilities().multipart);
     }
 }
