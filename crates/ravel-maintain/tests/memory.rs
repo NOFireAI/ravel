@@ -112,3 +112,77 @@ async fn peak_memory_on_3600_input_bucket() {
         }
     }
 }
+
+/// The RLOG analogue (issue #275): the ranged reader means the merge holds only
+/// per-input directories plus one stream's blocks at a time, so the compactor's
+/// incremental peak stays bounded as the input count grows rather than scaling
+/// with the whole bucket's raw bytes (the pre-#275 merge held every input
+/// object whole and resident at once). Same method and loose ceiling as the
+/// RSEG test above.
+#[tokio::test]
+async fn peak_memory_on_rlog_input_bucket() {
+    const INPUTS: usize = 3_600;
+    const HOT_STREAMS: u32 = 10;
+
+    let store = MemoryStore::new();
+    // Each input is one flush of the same HOT_STREAMS log streams with 2 records
+    // each, so the merge produces HOT_STREAMS output streams each with
+    // INPUTS * 2 records (the hot-stream shape).
+    for i in 0..INPUTS {
+        let records: Vec<_> = (0..HOT_STREAMS)
+            .flat_map(|s| {
+                [
+                    log_record(s, 1_000 + i as i64, "hot log line one"),
+                    log_record(s, 2_000 + i as i64, "hot log line two"),
+                ]
+            })
+            .collect();
+        seed_rlog_input(
+            &store,
+            Uuid::from_u128(i as u128 + 1),
+            1,
+            i as u64 + 1,
+            &records,
+        )
+        .await;
+    }
+
+    let after_seed = mem_kib();
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = logs_bucket();
+    let outcome = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket)
+        .await
+        .expect("compact 3600-input rlog bucket");
+    let after_compact = mem_kib();
+
+    let record = fetch_compaction_record(&store, &bucket).await;
+    let total_samples: u64 = record.parts.iter().map(|p| p.sample_count).sum();
+    assert!(matches!(outcome, CompactionOutcome::Compacted { .. }));
+    assert_eq!(record.inputs.len(), INPUTS);
+    assert_eq!(total_samples, (INPUTS as u64) * u64::from(HOT_STREAMS) * 2);
+
+    match (after_seed, after_compact) {
+        (Some((rss_seed, hwm_seed)), Some((rss_c, hwm_c))) => {
+            let incremental = hwm_c.saturating_sub(rss_seed);
+            println!(
+                "[memory:rlog] inputs={INPUTS} hot_streams={HOT_STREAMS} \
+                 parts={} total_samples={total_samples}",
+                record.parts.len()
+            );
+            println!(
+                "[memory:rlog] after_seed: VmRSS={rss_seed} KiB VmHWM={hwm_seed} KiB | \
+                 after_compact: VmRSS={rss_c} KiB VmHWM={hwm_c} KiB"
+            );
+            println!(
+                "[memory:rlog] compaction incremental peak (VmHWM_after - VmRSS_after_seed) = {incremental} KiB"
+            );
+            assert!(
+                incremental < 512 * 1024,
+                "rlog compaction incremental peak {incremental} KiB exceeded 512 MiB ceiling"
+            );
+        }
+        _ => {
+            println!("[memory:rlog] /proc/self/status unavailable; skipping RSS assertion");
+        }
+    }
+}

@@ -25,9 +25,9 @@ use crate::stream_dir::StreamDir;
 use crate::tokenizer::tokens;
 use crate::writer::RlogConfig;
 
-const MAX_STREAMS: u64 = 1 << 24;
-const MAX_FIELDS: u64 = 1 << 20;
-const MAX_BLOCKS: u64 = 1 << 24;
+pub(crate) const MAX_STREAMS: u64 = 1 << 24;
+pub(crate) const MAX_FIELDS: u64 = 1 << 20;
+pub(crate) const MAX_BLOCKS: u64 = 1 << 24;
 
 /// Counters describing how much a scan pruned (docs/log-segment-format.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,14 +78,7 @@ impl<'a> RlogReader<'a> {
 
     /// The column plans for every dynamic column, for block decode.
     fn plans(&self) -> Vec<ColumnPlan> {
-        self.field_dir
-            .entries()
-            .iter()
-            .map(|e| ColumnPlan {
-                column_id: e.column_id,
-                ty: e.ty,
-            })
-            .collect()
+        column_plans(&self.field_dir)
     }
 
     /// Scans the object for records matching `pred`.
@@ -393,61 +386,88 @@ impl<'a> RlogReader<'a> {
 
     /// Rebuilds a full [`LogRecord`] from a decoded row.
     fn rebuild_record(&self, block: &DecodedBlock, row: usize) -> Result<LogRecord, LogSegError> {
-        let sref = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
-            .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-        // The STREAM_DIR entry carries both the stream id and the canonical
-        // resource+scope blob it was derived from, so a rebuilt record is a
-        // faithful round-trip of what the writer was handed.
-        let stream_entry = self
-            .stream_dir
-            .entries()
-            .get(sref as usize)
-            .ok_or_else(|| LogSegError::Corrupted("stream_ref out of range".into()))?;
-        let stream_id = stream_entry.stream_id;
-        let stream_attrs = stream_entry.blob.clone();
-        let severity_text = str_at(block, COL_SEVERITY_TEXT, row)
-            .map(string_from_bytes)
-            .transpose()?
-            .unwrap_or_default();
-        let body = str_at(block, COL_BODY, row)
-            .map(string_from_bytes)
-            .transpose()?
-            .unwrap_or_default();
-        let trace_id = fixed_at(block, COL_TRACE_ID, row)
-            .map(|v| <[u8; 16]>::try_from(v.as_slice()))
-            .transpose()
-            .map_err(|_| LogSegError::Corrupted("trace_id width".into()))?;
-        let span_id = fixed_at(block, COL_SPAN_ID, row)
-            .map(|v| <[u8; 8]>::try_from(v.as_slice()))
-            .transpose()
-            .map_err(|_| LogSegError::Corrupted("span_id width".into()))?;
-
-        let mut attrs = Vec::new();
-        for e in self.field_dir.entries() {
-            if let Some(v) = get_attr_value(block, e.column_id, e.ty, row) {
-                attrs.push((e.name.clone(), v));
-            }
-        }
-        if let Some(col) = block.str_col(crate::record::COL_ATTRS_RAW)
-            && let Some(Some(raw)) = col.get(row)
-        {
-            attrs.extend(decode_canonical_attrs(raw)?);
-        }
-
-        Ok(LogRecord {
-            stream_id,
-            stream_attrs,
-            ts_ns: i64_at(block, COL_TS, row)?,
-            observed_ts_ns: i64_at(block, COL_OBSERVED_TS, row)?,
-            severity_num: i64_at(block, COL_SEVERITY_NUM, row)? as u8,
-            severity_text,
-            body,
-            trace_id,
-            span_id,
-            flags: i64_at(block, COL_FLAGS, row)? as u32,
-            attrs,
-        })
+        rebuild_record(&self.stream_dir, &self.field_dir, block, row)
     }
+}
+
+/// The column plans for every dynamic column, for block decode. Shared by the
+/// whole-object [`RlogReader`] and the ranged [`crate::ranged::RlogRangeReader`]
+/// so both decode blocks through one column-plan derivation.
+pub(crate) fn column_plans(field_dir: &FieldDir) -> Vec<ColumnPlan> {
+    field_dir
+        .entries()
+        .iter()
+        .map(|e| ColumnPlan {
+            column_id: e.column_id,
+            ty: e.ty,
+        })
+        .collect()
+}
+
+/// Rebuilds a full [`LogRecord`] from a decoded row, given the object's
+/// STREAM_DIR and FIELD_DIR. Shared by the whole-object [`RlogReader`] and the
+/// ranged [`crate::ranged::RlogRangeReader`], so a record decoded through a
+/// selective block fetch is byte-for-byte the record the whole-object reader
+/// would produce.
+pub(crate) fn rebuild_record(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<LogRecord, LogSegError> {
+    let sref = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
+        .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+    // The STREAM_DIR entry carries both the stream id and the canonical
+    // resource+scope blob it was derived from, so a rebuilt record is a
+    // faithful round-trip of what the writer was handed.
+    let stream_entry = stream_dir
+        .entries()
+        .get(sref as usize)
+        .ok_or_else(|| LogSegError::Corrupted("stream_ref out of range".into()))?;
+    let stream_id = stream_entry.stream_id;
+    let stream_attrs = stream_entry.blob.clone();
+    let severity_text = str_at(block, COL_SEVERITY_TEXT, row)
+        .map(string_from_bytes)
+        .transpose()?
+        .unwrap_or_default();
+    let body = str_at(block, COL_BODY, row)
+        .map(string_from_bytes)
+        .transpose()?
+        .unwrap_or_default();
+    let trace_id = fixed_at(block, COL_TRACE_ID, row)
+        .map(|v| <[u8; 16]>::try_from(v.as_slice()))
+        .transpose()
+        .map_err(|_| LogSegError::Corrupted("trace_id width".into()))?;
+    let span_id = fixed_at(block, COL_SPAN_ID, row)
+        .map(|v| <[u8; 8]>::try_from(v.as_slice()))
+        .transpose()
+        .map_err(|_| LogSegError::Corrupted("span_id width".into()))?;
+
+    let mut attrs = Vec::new();
+    for e in field_dir.entries() {
+        if let Some(v) = get_attr_value(block, e.column_id, e.ty, row) {
+            attrs.push((e.name.clone(), v));
+        }
+    }
+    if let Some(col) = block.str_col(crate::record::COL_ATTRS_RAW)
+        && let Some(Some(raw)) = col.get(row)
+    {
+        attrs.extend(decode_canonical_attrs(raw)?);
+    }
+
+    Ok(LogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns: i64_at(block, COL_TS, row)?,
+        observed_ts_ns: i64_at(block, COL_OBSERVED_TS, row)?,
+        severity_num: i64_at(block, COL_SEVERITY_NUM, row)? as u8,
+        severity_text,
+        body,
+        trace_id,
+        span_id,
+        flags: i64_at(block, COL_FLAGS, row)? as u32,
+        attrs,
+    })
 }
 
 fn section(footer: &LogFooter, k: u32) -> Result<&SectionDesc, LogSegError> {
@@ -484,6 +504,30 @@ pub fn read_section(
     let stored = bytes
         .get(start..end)
         .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))?;
+    decode_section(stored, desc, cfg)
+}
+
+/// The crc-and-decompress half of [`read_section`], taking a section's stored
+/// bytes directly (offset 0) rather than slicing them out of a whole object.
+///
+/// This is what a ranged reader ([`crate::ranged::RlogRangeReader`]) uses: it
+/// fetches exactly `[desc.offset, desc.offset + desc.len)` with a ranged GET,
+/// so the fetched buffer *is* the stored section, and passes it here. `stored`
+/// MUST be exactly `desc.len` bytes. The crc is verified against `desc.crc32c`
+/// before any decompression, the `uncomp_len` is rejected above
+/// `cfg.max_uncomp_section` before allocating, and the decompressed length must
+/// equal `desc.uncomp_len` exactly (the same discipline [`read_section`]
+/// applies to a whole-object slice).
+pub fn decode_section(
+    stored: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+) -> Result<Vec<u8>, LogSegError> {
+    if stored.len() as u64 != desc.len {
+        return Err(LogSegError::Corrupted(
+            "section stored length != desc.len".into(),
+        ));
+    }
     if crc32c::crc32c(stored) != desc.crc32c {
         return Err(LogSegError::Corrupted("section crc mismatch".into()));
     }
@@ -518,7 +562,7 @@ fn flatten<'p>(pred: &'p Predicate, out: &mut Vec<&'p Predicate>) {
     }
 }
 
-fn i64_at(block: &DecodedBlock, col: u32, row: usize) -> Result<i64, LogSegError> {
+pub(crate) fn i64_at(block: &DecodedBlock, col: u32, row: usize) -> Result<i64, LogSegError> {
     block
         .i64_col(col)
         .and_then(|c| c.get(row).copied())

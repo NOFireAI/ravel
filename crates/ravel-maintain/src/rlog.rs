@@ -37,29 +37,24 @@
 //! # Memory
 //!
 //! The read side ([`RlogCodec::load_input_catalog`]) retains only per-input
-//! metadata (the `STREAM_DIR` and the object key), never block/bloom bytes.
-//! The merge decodes one merged stream at a time (via a `StreamIn` scan per
-//! input) and accumulates at most one in-flight part's records before flushing,
-//! so decoded page data is bounded by one part plus one stream, never the whole
-//! bucket's decoded data at once (the plan's load-bearing memory bound).
-//!
-//! Unlike RSEG, the merge does re-fetch each input object whole during the
-//! merge: RLOG's reader is whole-object (there is no ranged footer/section
-//! reader for `.rlog` the way `ravel_segment::open_from_suffix` gives RSEG), so
-//! the raw object bytes are resident while their blocks are decoded. That keeps
-//! *decoded* memory bounded, which is the part the plan cares about, but it
-//! does hold the raw input bytes; a ranged RLOG reader would close that gap and
-//! is noted as a follow-up rather than built here (it is outside this task's
-//! one authorized ravel-logseg change).
+//! catalog metadata: a [`RlogRangeReader`] holding the decoded STREAM_DIR,
+//! FIELD_DIR, and SKIP_IDX plus the object key, never block or bloom bytes. The
+//! merge fetches one stream's blocks at a time by range (issue #275) via
+//! [`RlogRangeReader::stream_block_span`] and decodes them, accumulating at
+//! most one in-flight part's records before flushing. So both *decoded* data
+//! and resident *raw* bytes are bounded by one part plus one stream, never the
+//! whole bucket -- the same footprint RSEG's ranged reader gives. The first
+//! RLOG merge held every input object whole (RLOG then had no ranged section
+//! reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue of
+//! `ravel_segment::open_from_suffix` and closes that raw-bytes gap.
 
 use std::collections::BTreeMap;
 
 use ravel_commit::keys;
-use ravel_logseg::footer::{self, kind};
-use ravel_logseg::stream_dir::StreamDir;
+use ravel_logseg::footer::{self, SuffixOutcome, kind};
 use ravel_logseg::{
-    AttrValue, LogRecord, LogStreamId, Predicate, RlogConfig, RlogReader, RlogWriter,
-    field_dir::FieldDir, read_section, writer::ObjectIdentity,
+    AttrValue, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter, decode_section,
+    writer::ObjectIdentity,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
@@ -76,20 +71,16 @@ use crate::read::InputRecord;
 /// the log analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`].
 pub const OUTPUT_FORMAT_VERSION: u32 = 2;
 
-/// Untrusted-input caps for the two directory sections decoded on the read
-/// path (mirroring the reader's own private caps: a real object never
-/// approaches them, they only bound allocation from a hostile footer).
-const MAX_STREAMS: u64 = 1 << 24;
-const MAX_FIELDS: u64 = 1 << 20;
-
-/// One decoded RLOG input's catalog metadata: the data-object key and its
-/// `STREAM_DIR`. This is all the read side retains; the block/skip/bloom bytes
-/// are decoded lazily during the merge (docs/log-segment-format.md, this
-/// module's memory note).
+/// One RLOG input's retained catalog metadata: the data-object key and a
+/// [`RlogRangeReader`] over its directories (STREAM_DIR, FIELD_DIR, SKIP_IDX).
+/// This is all the read side retains; the block/bloom bytes are fetched by
+/// range one stream at a time during the merge (issue #275, docs/log-segment-format.md,
+/// this module's memory note). The untrusted-input caps on the directory
+/// sections live inside the ranged reader.
 #[derive(Debug, Clone)]
 pub struct RlogInputCatalog {
     pub object_key: String,
-    pub stream_dir: StreamDir,
+    pub reader: RlogRangeReader,
 }
 
 /// The logs codec: implements the [`SegmentCodec`] seam for `.rlog` objects.
@@ -100,30 +91,48 @@ impl SegmentCodec for RlogCodec {
 
     async fn load_input_catalog(
         store: &dyn ObjectStoreBackend,
-        _config: &CompactorConfig,
+        config: &CompactorConfig,
         input: &InputRecord,
     ) -> Result<Self::Catalog> {
         let object_key = keys::reconstruct_data_key(&input.record)?;
-        // RLOG has no ranged footer reader, so the whole object is fetched to
-        // read its footer; only metadata is retained past this scope.
-        let got = store.get(&object_key, GetRange::Full).await?;
-        let bytes = got.data;
         let cfg = RlogConfig::default();
 
-        let ftr = footer::open(&bytes)?;
-        // Decode STREAM_DIR and FIELD_DIR (catalog metadata only, mirroring the
-        // RSEG read path). FIELD_DIR is decoded to validate it and to fail loud
-        // on a corrupt input before the merge, but the merge rebuilds it from
-        // the merged column set, so it is not retained.
-        let stream_raw = read_section(&bytes, section(&ftr, kind::STREAM_DIR)?, &cfg)?;
-        let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
-        let field_raw = read_section(&bytes, section(&ftr, kind::FIELD_DIR)?, &cfg)?;
-        let _field_dir = FieldDir::decode(&field_raw, MAX_FIELDS)?;
+        // Locate the footer and section directory from a suffix probe: one
+        // ranged GET, growing to a second only if the probe missed the footer
+        // (the RLOG analogue of the RSEG read path, issue #275).
+        let probe = store
+            .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
+            .await?;
+        let total = probe.total_size;
+        let ftr = match footer::open_from_suffix(&probe.data, total)? {
+            SuffixOutcome::Ready(f) => f,
+            SuffixOutcome::NeedRange { offset, len } => {
+                let tail = store
+                    .get(&object_key, GetRange::Range(offset, offset + len))
+                    .await?;
+                match footer::open_from_suffix(&tail.data, total)? {
+                    SuffixOutcome::Ready(f) => f,
+                    SuffixOutcome::NeedRange { .. } => {
+                        return Err(MaintainError::Invariant(
+                            "rlog footer not covered by ranged fetch".into(),
+                        ));
+                    }
+                }
+            }
+        };
 
-        Ok(RlogInputCatalog {
-            object_key,
-            stream_dir,
-        })
+        // Fetch and decode the three whole-read directory sections by range.
+        // BLOCKS and BLOOM are never fetched here; the merge streams blocks by
+        // range one stream at a time. FIELD_DIR is decoded (and validated) even
+        // though the merge rebuilds it, so a corrupt input fails loud here.
+        let stream_dir_raw =
+            fetch_section(store, &object_key, &ftr, kind::STREAM_DIR, &cfg).await?;
+        let field_dir_raw = fetch_section(store, &object_key, &ftr, kind::FIELD_DIR, &cfg).await?;
+        let skip_idx_raw = fetch_section(store, &object_key, &ftr, kind::SKIP_IDX, &cfg).await?;
+
+        let reader =
+            RlogRangeReader::from_sections(&ftr, &stream_dir_raw, &field_dir_raw, &skip_idx_raw)?;
+        Ok(RlogInputCatalog { object_key, reader })
     }
 
     async fn build_parts(
@@ -147,7 +156,7 @@ impl SegmentCodec for RlogCodec {
         // same stream_id with different blobs is a fatal invariant breach.
         let mut merged: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
         for catalog in catalogs {
-            for entry in catalog.stream_dir.entries() {
+            for entry in catalog.reader.stream_dir().entries() {
                 match merged.entry(entry.stream_id) {
                     std::collections::btree_map::Entry::Vacant(slot) => {
                         slot.insert(entry.blob.clone());
@@ -165,20 +174,10 @@ impl SegmentCodec for RlogCodec {
             }
         }
 
-        // Fetch every input whole and open a reader over it. RLOG's reader is
-        // whole-object; the raw bytes stay resident for the merge, but only one
-        // stream's records are decoded at a time (StreamIn scan below).
-        let cfg = RlogConfig::default();
-        let mut objects: Vec<bytes::Bytes> = Vec::with_capacity(catalogs.len());
-        for catalog in catalogs {
-            let got = store.get(&catalog.object_key, GetRange::Full).await?;
-            objects.push(got.data);
-        }
-        let mut readers: Vec<RlogReader<'_>> = Vec::with_capacity(objects.len());
-        for obj in &objects {
-            readers.push(RlogReader::new(obj, &cfg)?);
-        }
-
+        // No whole-object fetch: the per-input ranged readers are already in the
+        // catalogs. Each stream's blocks are fetched by range one stream at a
+        // time in gather_stream below, so raw resident bytes stay bounded to one
+        // stream, never the whole bucket (issue #275).
         let identity = compactor_identity(bucket, config);
         let mut parts = Vec::new();
         let mut part_index: u32 = 0;
@@ -191,7 +190,7 @@ impl SegmentCodec for RlogCodec {
         // it reaches the size cap (so a stream never straddles two parts, the
         // log analogue of RSEG's series-boundary split).
         for stream_id in merged.keys() {
-            let mut recs = gather_stream(&readers, stream_id)?;
+            let mut recs = gather_stream(store, catalogs, stream_id).await?;
             // Stable sort by ts: within one stream this is the format's
             // (stream_ref, ts) order, and ts ties keep canonical input order
             // (readers are iterated in the inputs' canonical order). No dedup:
@@ -236,18 +235,30 @@ impl SegmentCodec for RlogCodec {
     }
 }
 
-/// Gather one stream's records from every input carrying it. A `StreamIn` scan
-/// prunes to the stream's blocks and returns exactly its records, decoded in ts
-/// order; an input that does not carry the stream returns nothing. This reuses
-/// the reader's full decode path (fixed columns, dynamic columns, and
-/// `attrs_raw` overflow), so a merged record is a faithful round-trip of the
-/// input record.
-fn gather_stream(readers: &[RlogReader<'_>], stream_id: &LogStreamId) -> Result<Vec<LogRecord>> {
+/// Gather one stream's records from every input carrying it. Each input's
+/// ranged reader gives the absolute byte range of exactly the blocks that
+/// stream occupies; that one range is fetched and decoded, and an input that
+/// does not carry the stream is fetched not at all. This reuses the reader's
+/// full block-decode path (fixed columns, dynamic columns, and `attrs_raw`
+/// overflow), so a merged record is a faithful round-trip of the input record.
+/// Only one stream's blocks from one input are resident at a time (issue #275).
+async fn gather_stream(
+    store: &dyn ObjectStoreBackend,
+    catalogs: &[RlogInputCatalog],
+    stream_id: &LogStreamId,
+) -> Result<Vec<LogRecord>> {
     let mut out = Vec::new();
-    let pred = Predicate::StreamIn(vec![*stream_id]);
-    for reader in readers {
-        let (rows, _stats) = reader.scan(&pred)?;
-        out.extend(rows);
+    for catalog in catalogs {
+        let Some(span) = catalog.reader.stream_block_span(stream_id)? else {
+            continue;
+        };
+        let got = store
+            .get(
+                &catalog.object_key,
+                GetRange::Range(span.start(), span.end()),
+            )
+            .await?;
+        out.extend(catalog.reader.decode_stream(&span, got.data.as_ref())?);
     }
     Ok(out)
 }
@@ -374,11 +385,26 @@ fn attr_value_estimate(v: &AttrValue) -> u64 {
     }
 }
 
-/// The descriptor for a required section kind, or a typed error if absent.
-fn section(ftr: &footer::LogFooter, k: u32) -> Result<&footer::SectionDesc> {
-    ftr.section(k).ok_or_else(|| {
+/// Fetch one required whole-read section by range and return its decompressed,
+/// crc-verified bytes. Fetches exactly `[offset, offset + len)` (the section's
+/// stored bytes), never the whole object.
+async fn fetch_section(
+    store: &dyn ObjectStoreBackend,
+    object_key: &str,
+    ftr: &footer::LogFooter,
+    k: u32,
+    cfg: &RlogConfig,
+) -> Result<Vec<u8>> {
+    let desc = ftr.section(k).ok_or_else(|| {
         MaintainError::Invariant(format!("input .rlog object missing section kind {k}"))
-    })
+    })?;
+    let got = store
+        .get(
+            object_key,
+            GetRange::Range(desc.offset, desc.offset + desc.len),
+        )
+        .await?;
+    Ok(decode_section(got.data.as_ref(), desc, cfg)?)
 }
 
 #[cfg(test)]
@@ -402,6 +428,10 @@ mod tests {
 
     use super::*;
     use crate::{Bucket, CompactionOutcome, CompactorConfig, FixedClock, compact_bucket};
+
+    /// FIELD_DIR entry-count cap for the test-only `field_dir_len` decode (a
+    /// real object never approaches it; the reader carries its own copy).
+    const MAX_FIELDS: u64 = 1 << 20;
 
     const TENANT: &str = "acme";
     const SHARD: u32 = 7;
