@@ -16,12 +16,14 @@
 //! or a NaN scalar argument, evaluates to `NaN` for that group rather than
 //! being omitted: the result vector always has one entry per group, exactly
 //! like Prometheus. These cases now raise the annotations Prometheus does
-//! (issue #178), through the `&QueryWindow` threaded into both functions: a
-//! malformed bucket set (missing `+Inf`, or fewer than two usable buckets)
-//! and an out-of-range quantile argument are `warnings`; a forced
-//! monotonicity fixup is an `info`. See [`crate::Annotations`] for the
-//! warning/info distinction. The native-histogram path's own Prometheus
-//! annotations are not wired here yet (see this ticket's final report).
+//! (issues #178, #235), through the `&QueryWindow` threaded into both
+//! functions: a malformed bucket set (missing `+Inf`, or fewer than two
+//! usable buckets), a series excluded because its `le` label is missing or
+//! does not parse as a float, and an out-of-range quantile argument are
+//! `warnings`; a forced monotonicity fixup is an `info`. See
+//! [`crate::Annotations`] for the warning/info distinction. The
+//! native-histogram path's own Prometheus annotations are not wired here yet
+//! (see this ticket's final report).
 
 use std::collections::{HashMap, HashSet};
 
@@ -56,20 +58,36 @@ struct Bucket {
     count: f64,
 }
 
+/// The result of [`group_by_bucket`]: the per-group cumulative buckets, plus
+/// whether any input series was excluded because its `le` label was missing
+/// or did not parse as a float. That exclusion is Prometheus'
+/// `BadBucketLabelWarning` (issue #235); like the out-of-range quantile
+/// warning it is a whole-input property rather than a per-output-group one,
+/// so it is surfaced as a single flag here and raised once by the caller via
+/// `ctx.warn`, matching the compute-detects/caller-raises split the rest of
+/// this module already uses for its #178 annotations.
+struct GroupedBuckets {
+    groups: Vec<(LabelSet, Vec<Bucket>)>,
+    bad_le_label: bool,
+}
+
 /// Groups `vector` by every label except `le` and `__name__` (Prometheus
 /// drops the metric name from any function result). A series with no `le`
 /// label, or one that does not parse as a float, is not a valid classic
 /// bucket and is dropped from the histogram entirely (the pinned Prometheus
-/// excludes it too, with its own warning annotation this crate does not yet
-/// carry, see the module doc).
-fn group_by_bucket(vector: InstantVector) -> Vec<(LabelSet, Vec<Bucket>)> {
+/// excludes it too); such an exclusion sets [`GroupedBuckets::bad_le_label`]
+/// so the caller can raise the matching `BadBucketLabelWarning` (issue #235).
+fn group_by_bucket(vector: InstantVector) -> GroupedBuckets {
     let mut groups: Vec<(LabelSet, Vec<Bucket>)> = Vec::new();
     let mut index: HashMap<LabelSet, usize> = HashMap::new();
+    let mut bad_le_label = false;
     for sample in vector {
         let Some(le_str) = sample.labels.get(LE_LABEL) else {
+            bad_le_label = true;
             continue;
         };
         let Ok(upper_bound) = le_str.parse::<f64>() else {
+            bad_le_label = true;
             continue;
         };
         let key: Vec<Label> = sample
@@ -93,7 +111,21 @@ fn group_by_bucket(vector: InstantVector) -> Vec<(LabelSet, Vec<Bucket>)> {
             }
         }
     }
-    groups
+    GroupedBuckets {
+        groups,
+        bad_le_label,
+    }
+}
+
+/// Prometheus' `BadBucketLabelWarning` message: a classic-histogram series was
+/// excluded from its group because its `le` label was missing or did not parse
+/// as a float, so it could not be placed as a bucket. A warning, not an info:
+/// a silently dropped series changes the computed quantile/fraction, which is
+/// rarely what the caller intended.
+fn bad_bucket_label_warning() -> String {
+    "bucket label \"le\" is missing or has a malformed value on a classic \
+     histogram series, which was excluded from the histogram"
+        .to_string()
 }
 
 /// The outcome of [`prepare`]: the cleaned bucket list plus whether its
@@ -274,7 +306,14 @@ fn histogram_quantile(phi: f64, vector: InstantVector, ctx: &QueryWindow) -> Vec
         out.push((labels.clone(), native_quantile(phi, &h)));
         seen.insert(labels);
     }
-    for (labels, buckets) in group_by_bucket(classic) {
+    let GroupedBuckets {
+        groups,
+        bad_le_label,
+    } = group_by_bucket(classic);
+    if bad_le_label {
+        ctx.warn(bad_bucket_label_warning());
+    }
+    for (labels, buckets) in groups {
         // Mixed native+classic on the same output labels: native already
         // produced this group; drop the classic form (Prometheus keeps the
         // native value and warns, #178).
@@ -399,7 +438,14 @@ fn histogram_fraction(
         out.push((labels.clone(), native_fraction(lower, upper, &h)));
         seen.insert(labels);
     }
-    for (labels, buckets) in group_by_bucket(classic) {
+    let GroupedBuckets {
+        groups,
+        bad_le_label,
+    } = group_by_bucket(classic);
+    if bad_le_label {
+        ctx.warn(bad_bucket_label_warning());
+    }
+    for (labels, buckets) in groups {
         if seen.contains(&labels) {
             continue;
         }
@@ -555,6 +601,52 @@ mod tests {
         // interpolates halfway across the (0, 1] bucket.
         let got = hq(0.5, vector);
         assert_eq!(got[0].1, 0.5);
+    }
+
+    #[test]
+    fn grouping_flags_a_missing_le_label() {
+        // A series with no `le` label at all is not a classic bucket: it is
+        // excluded and the bad-le-label flag is set so the caller warns.
+        let vector = vec![
+            sample(&[("job", "a")], 10.0),
+            sample(&[("job", "a"), ("le", "1")], 10.0),
+            sample(&[("job", "a"), ("le", "+Inf")], 10.0),
+        ];
+        let grouped = group_by_bucket(vector);
+        assert!(grouped.bad_le_label, "missing le label sets the warn flag");
+    }
+
+    #[test]
+    fn grouping_flags_an_unparseable_le_label() {
+        // A present but non-numeric `le` label is likewise excluded and flags
+        // the warning.
+        let vector = vec![
+            sample(&[("job", "a"), ("le", "not-a-number")], 10.0),
+            sample(&[("job", "a"), ("le", "1")], 10.0),
+            sample(&[("job", "a"), ("le", "+Inf")], 10.0),
+        ];
+        let grouped = group_by_bucket(vector);
+        assert!(
+            grouped.bad_le_label,
+            "unparseable le label sets the warn flag"
+        );
+    }
+
+    #[test]
+    fn grouping_does_not_flag_a_wellformed_vector() {
+        // Every series has a parseable `le`: no bad-le-label warning.
+        let grouped = group_by_bucket(wellformed_vector());
+        assert!(
+            !grouped.bad_le_label,
+            "a well-formed bucket set raises no bad-le-label warning"
+        );
+    }
+
+    #[test]
+    fn bad_bucket_label_warning_names_the_le_label() {
+        // The message the caller raises when bad_le_label is set identifies
+        // the offending label, matching Prometheus' BadBucketLabelWarning.
+        assert!(bad_bucket_label_warning().contains("bucket label \"le\""));
     }
 
     #[test]
