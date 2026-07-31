@@ -321,13 +321,15 @@ fn watermark_exceeded() {
 
 #[test]
 fn unsupported_level() {
+    // Level 0 (L0 commit) and level 1 (L1 compaction part) are defined;
+    // anything higher is reserved and must be rejected, not guessed at.
     let mut entries = base_entries();
-    entries[0].level = 1;
+    entries[0].level = 2;
     let raw = encode_entries_raw(&entries);
     let header = base_header(&entries, raw.len() as u64);
     let bytes = assemble(&header, &raw, None, None);
     let err = decode_part(&bytes, &PartLimits::default()).expect_err("decode must fail");
-    assert_eq!(err, SnapshotFormatError::UnsupportedLevel(1));
+    assert_eq!(err, SnapshotFormatError::UnsupportedLevel(2));
 }
 
 #[test]

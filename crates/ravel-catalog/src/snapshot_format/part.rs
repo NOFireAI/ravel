@@ -179,13 +179,22 @@ fn validate_entries(
     watermark_hour: u32,
 ) -> Result<(), SnapshotFormatError> {
     for (i, entry) in entries.iter().enumerate() {
-        if entry.level != 0 {
-            return Err(SnapshotFormatError::UnsupportedLevel(entry.level));
-        }
-        if entry.writer_id.len() != 16 {
+        // Level 0 is an L0 commit; level 1 is a compaction (L1) part
+        // (docs/metric-index-plan.md section 7). An L0 entry's writer_id is
+        // the 16-byte flush writer id; an L1 entry has no writer identity, so
+        // its writer_id slot instead carries the parent compaction record's
+        // 32-byte input_set_hash (fold.rs `build_l1_snapshot_entry`). A level
+        // beyond these is reserved: a reader rejects a level it does not
+        // understand rather than guess its layout.
+        let writer_id_expected_len = match entry.level {
+            0 => 16,
+            1 => 32,
+            other => return Err(SnapshotFormatError::UnsupportedLevel(other)),
+        };
+        if entry.writer_id.len() != writer_id_expected_len {
             return Err(SnapshotFormatError::BadFieldLen {
                 field: "writer_id",
-                expected: 16,
+                expected: writer_id_expected_len,
                 actual: entry.writer_id.len(),
             });
         }
