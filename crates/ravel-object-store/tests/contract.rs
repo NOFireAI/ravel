@@ -690,6 +690,53 @@ async fn assert_multipart_sequence_rules(store: &dyn ObjectStoreBackend, prefix:
         "multipart: a rejected sequence must not create the object"
     );
 
+    // A rejected part poisons the handle (issue #297): a `complete` afterward
+    // must error rather than publish the truncated single short part. The
+    // sequence check runs before any backend call, so this covers the memory
+    // oracle and the S3-shaped path alike. `abort` stays callable throughout.
+    let poisoned_key = format!("{prefix}poisoned-then-complete");
+    let mut poisoned = store
+        .put_multipart(&poisoned_key)
+        .await
+        .expect("start upload for the poison-then-complete probe");
+    poisoned
+        .put_part(Bytes::from(multipart_payload(MULTIPART_TAIL_SIZE)), None)
+        .await
+        .expect("multipart: a short part is legal until another follows it");
+    let err = poisoned
+        .put_part(Bytes::from(multipart_payload(MULTIPART_TAIL_SIZE)), None)
+        .await
+        .expect_err("multipart: the part making a short part non-final must be rejected");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    // The poisoned handle refuses a further part non-retryably...
+    let err = poisoned
+        .put_part(Bytes::from(multipart_payload(MULTIPART_PART_SIZE)), None)
+        .await
+        .expect_err("multipart: a poisoned handle must refuse further parts");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    assert!(
+        !err.is_retryable(),
+        "the poison error must be non-retryable"
+    );
+    // ...and `complete` errors instead of publishing a truncated object.
+    let err = poisoned
+        .complete()
+        .await
+        .expect_err("multipart: completing after a rejected part must fail, not truncate");
+    assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    assert!(
+        matches!(store.head(&poisoned_key).await, Err(StoreError::NotFound)),
+        "multipart: a poisoned upload must not publish a truncated object"
+    );
+    poisoned
+        .abort()
+        .await
+        .expect("multipart: abort stays callable on a poisoned handle");
+    assert!(
+        matches!(store.head(&poisoned_key).await, Err(StoreError::NotFound)),
+        "multipart: aborting a poisoned upload leaves no object"
+    );
+
     // The legal degenerate case: one part, smaller than the minimum, is a
     // complete object. `S3Store::put` never produces this shape (it only goes
     // multipart above 16 MiB), but a caller streaming parts may.

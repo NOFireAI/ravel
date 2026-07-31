@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use crate::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
-    UploadChecksum, Version, multipart_finished,
+    UploadChecksum, Version, multipart_finished, multipart_poisoned,
 };
 
 #[derive(Debug, Clone)]
@@ -127,6 +127,14 @@ pub struct MemoryMultipartUpload<'a> {
     sequence: PartSequence,
     /// Set by `complete`/`abort`; every later call on this handle fails.
     finished: bool,
+    /// Set once a part violates the sequence rules (issue #297): a rejected
+    /// non-final or empty part would truncate the object, so every later
+    /// `put_part`/`complete` fails with [`multipart_poisoned`] while `abort`
+    /// stays callable. Mirrors [`crate::s3::S3MultipartUpload`], whose backend
+    /// part failures poison the same field (issue #296); the oracle has no
+    /// transport to fail, so only the sequence path sets this here. A checksum
+    /// mismatch does not poison (it leaves the upload open for a re-send).
+    poison: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -139,10 +147,19 @@ impl MultipartUpload for MemoryMultipartUpload<'_> {
         if self.finished {
             return Err(multipart_finished(&self.key));
         }
-        // Pre-flight before the sequence rules touch any state: a rejected
-        // part is not a part, and the upload stays usable.
+        if let Some(cause) = &self.poison {
+            return Err(multipart_poisoned(&self.key, cause));
+        }
+        // Checksum pre-flight before the sequence rules touch any state: a
+        // mismatch is the one recoverable rejection, so it is not a part and
+        // the upload stays usable for a re-send (it must not poison).
         MemoryStore::verify_checksum(&data, checksum)?;
-        self.sequence.accept(&self.key, data.len())?;
+        // A sequence-rule violation poisons the handle (issue #297) so a later
+        // `complete` cannot publish a truncated object; `abort` stays callable.
+        if let Err(e) = self.sequence.accept(&self.key, data.len()) {
+            self.poison = Some(e.to_string());
+            return Err(e);
+        }
         self.parts.push(data);
         Ok(())
     }
@@ -150,6 +167,9 @@ impl MultipartUpload for MemoryMultipartUpload<'_> {
     async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
         if self.finished {
             return Err(multipart_finished(&self.key));
+        }
+        if let Some(cause) = &self.poison {
+            return Err(multipart_poisoned(&self.key, cause));
         }
         self.sequence.finish(&self.key)?;
         let total: usize = self.parts.iter().map(Bytes::len).sum();
@@ -252,6 +272,7 @@ impl ObjectStoreBackend for MemoryStore {
             parts: Vec::new(),
             sequence: PartSequence::default(),
             finished: false,
+            poison: None,
         }))
     }
 
@@ -637,6 +658,57 @@ mod tests {
             got.data, part,
             "the rejected part must not be in the object"
         );
+    }
+
+    /// A part that violates the sequence rules poisons the handle (issue
+    /// #297): completing afterward must error rather than publish a truncated
+    /// object, the poison error is non-retryable, and `abort` stays callable.
+    /// The sequence check happens before any backend call, so this in-process
+    /// oracle covers the S3-shaped path too.
+    #[tokio::test]
+    async fn sequence_rejection_poisons_handle() {
+        let store = MemoryStore::new();
+        let mut upload = store.put_multipart("poisoned").await.expect("start");
+        // A short part is legal while it is the last one...
+        upload
+            .put_part(Bytes::from_static(b"short"), None)
+            .await
+            .expect("a short part is legal while it is the last one");
+        // ...but the next part makes it a sub-minimum non-final part: rejected.
+        let rejected = upload
+            .put_part(Bytes::from_static(b"more"), None)
+            .await
+            .expect_err("the part making a short part non-final must be rejected");
+        assert!(matches!(rejected, StoreError::Permanent(_)));
+
+        // The handle is now poisoned: further parts are refused non-retryably.
+        let after = upload
+            .put_part(Bytes::from(vec![0u8; crate::MULTIPART_MIN_PART_SIZE]), None)
+            .await
+            .expect_err("a poisoned handle must refuse further parts");
+        assert!(matches!(after, StoreError::Permanent(_)));
+        assert!(!after.is_retryable());
+
+        // complete must error, never publish the truncated single short part.
+        let completed = upload
+            .complete()
+            .await
+            .expect_err("completing a poisoned upload must fail, not truncate");
+        assert!(matches!(completed, StoreError::Permanent(_)));
+        assert!(
+            matches!(store.head("poisoned").await, Err(StoreError::NotFound)),
+            "a poisoned upload must not have published a truncated object"
+        );
+
+        // abort stays callable on a poisoned handle and leaves no object.
+        upload
+            .abort()
+            .await
+            .expect("abort after poison must succeed");
+        assert!(matches!(
+            store.head("poisoned").await,
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]
