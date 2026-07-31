@@ -6,6 +6,7 @@ pub mod concurrent;
 pub mod e2e;
 pub mod generator;
 pub mod harness;
+pub mod query_latency;
 #[cfg(feature = "parquet-baseline")]
 pub mod read_accounting;
 pub mod section_accounting;
