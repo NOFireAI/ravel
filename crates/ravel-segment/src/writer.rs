@@ -1138,6 +1138,7 @@ mod v4_tests {
     use ravel_types::Label;
 
     use super::*;
+    use crate::ReaderLimits;
     use crate::histogram::{HistogramCounts, HistogramSpan, ResetHint};
     use crate::varint::read_uvarint;
 
@@ -2098,5 +2099,63 @@ mod v4_tests {
         section_desc(footer, section_kind::VAL_PAGES)
             .map(|s| s.offset)
             .unwrap_or(0)
+    }
+
+    /// #282: a below-threshold (dense) v5 object carries the whole-section
+    /// SERIES_META, so `decode_catalog_v5` decodes LABEL_DICT + SERIES_IDS
+    /// itself and then builds the catalog via `decode_catalog_v4_from_decoded`.
+    /// Pin that LABEL_DICT is decompressed exactly once per catalog decode:
+    /// before the fix, `decode_catalog_v5` decoded it, then handed the raw
+    /// section bytes to `decode_catalog_v4`, which decoded it a second time,
+    /// so this counter read 2.
+    #[test]
+    fn dense_v5_catalog_decode_decompresses_label_dict_once() {
+        let mk = |id: u8, metric: &str, k: &str, v: &str| {
+            let series_id = SeriesId([id; 16]);
+            SeriesInputV4 {
+                series_id,
+                labels: labels_kv(metric, k, v),
+                runs: vec![scalar_run(
+                    100,
+                    1,
+                    1,
+                    &series_id,
+                    &[10, 11],
+                    &[1.0, 2.0],
+                    false,
+                )],
+            }
+        };
+        // A handful of series, well below V5_SPARSE_THRESHOLD (4096), so the
+        // object keeps the whole SERIES_META section (kind 6).
+        let series = vec![
+            mk(0x01, "zeta", "zzz", "yyy"),
+            mk(0x02, "alpha", "aaa", "bbb"),
+            mk(0x03, "mu", "mmm", "nnn"),
+        ];
+        let written = SegmentWriter::write_v5(
+            series,
+            test_identity(),
+            test_bounds(),
+            test_compaction_meta(),
+        )
+        .expect("write v5");
+        let object = written.bytes.as_ref();
+        let loc = crate::open_from_full(object, ReaderLimits::default()).expect("open v5");
+        assert_eq!(loc.version, 5);
+        assert!(
+            section_desc(&loc.footer, section_kind::SERIES_META).is_some(),
+            "below-threshold v5 must carry whole SERIES_META"
+        );
+
+        crate::reader::decode_counter::reset();
+        let entries =
+            crate::decode_catalog_v5(&loc.footer, object, ReaderLimits::default()).expect("decode");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            crate::reader::decode_counter::label_dict_decodes(),
+            1,
+            "LABEL_DICT must be decompressed exactly once per catalog decode"
+        );
     }
 }

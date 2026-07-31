@@ -325,6 +325,34 @@ pub(crate) fn to_usize(v: u64) -> Result<usize, SegmentError> {
     usize::try_from(v).map_err(|_| SegmentError::SectionOutOfBounds)
 }
 
+/// Test-only decode-count hook (#282). Counts how many times LABEL_DICT is
+/// decompressed by [`decode_section_bytes`], so a test can pin that a
+/// below-threshold v5 catalog decode decompresses it exactly once. The
+/// pre-fix `decode_catalog_v5` decoded LABEL_DICT (and SERIES_IDS) itself and
+/// then handed the raw section bytes to `decode_catalog_v4`, which decoded
+/// them a second time; the counter would read 2 there and reads 1 now.
+/// Thread-local so parallel test threads never see each other's counts.
+#[cfg(test)]
+pub(crate) mod decode_counter {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LABEL_DICT_DECODES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        LABEL_DICT_DECODES.with(|c| c.set(0));
+    }
+
+    pub(crate) fn label_dict_decodes() -> u64 {
+        LABEL_DICT_DECODES.with(Cell::get)
+    }
+
+    pub(crate) fn record_label_dict() {
+        LABEL_DICT_DECODES.with(|c| c.set(c.get() + 1));
+    }
+}
+
 /// Decompresses and crc-verifies a whole section's stored bytes, per
 /// docs/segment-format.md ("Section crc32c covers the stored bytes";
 /// "uncompressed_len must match the decompressed size exactly").
@@ -333,6 +361,10 @@ pub(crate) fn decode_section_bytes(
     stored: &[u8],
     limits: ReaderLimits,
 ) -> Result<Vec<u8>, SegmentError> {
+    #[cfg(test)]
+    if section.kind == section_kind::LABEL_DICT {
+        decode_counter::record_label_dict();
+    }
     if stored.len() as u64 != section.len {
         return Err(SegmentError::SectionOutOfBounds);
     }
@@ -1714,23 +1746,50 @@ pub fn decode_catalog_v4(
 
     let dict_index = index_label_dict(&dict_bytes)?;
     let series_ids = parse_series_ids_v2(&ids_bytes)?;
+
+    decode_catalog_v4_from_decoded(
+        footer,
+        &dict_bytes,
+        &dict_index,
+        &series_ids,
+        &meta_bytes,
+        limits,
+    )
+}
+
+/// Builds the run-major v4 catalog from the already-decompressed LABEL_DICT
+/// (`dict_bytes` plus its `dict_index`), the already-parsed `series_ids`, and
+/// the already-decompressed SERIES_META (`meta_bytes`). The decode core shared
+/// by [`decode_catalog_v4`] and [`crate::sparse::decode_catalog_v5`]'s
+/// below-threshold path: the v5 whole-object path decompresses LABEL_DICT and
+/// SERIES_IDS to run its own structural checks, and passing the decoded bytes
+/// straight in here means those two sections are not decompressed a second
+/// time (#282). SERIES_META is decompressed exactly once, by whichever caller
+/// holds the raw section bytes.
+pub(crate) fn decode_catalog_v4_from_decoded(
+    footer: &Footer,
+    dict_bytes: &[u8],
+    dict_index: &[(usize, usize)],
+    series_ids: &[[u8; 16]],
+    meta_bytes: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     let series_ids_count = series_ids.len() as u64;
 
     let mut pos = 0usize;
-    let (meta_count, schemas) =
-        parse_schema_list_v2(&meta_bytes, &mut pos, &dict_bytes, &dict_index)?;
+    let (meta_count, schemas) = parse_schema_list_v2(meta_bytes, &mut pos, dict_bytes, dict_index)?;
     check_series_counts_v2(series_ids_count, u64::from(meta_count), footer.series_count)?;
-    let run_total = take_u32_le(&meta_bytes, &mut pos)?;
+    let run_total = take_u32_le(meta_bytes, &mut pos)?;
 
     let schema_count = schemas.len() as u32;
-    let schema_ref = parse_schema_ref_block_v2(&meta_bytes, &mut pos, meta_count, schema_count)?;
+    let schema_ref = parse_schema_ref_block_v2(meta_bytes, &mut pos, meta_count, schema_count)?;
     let value_ord =
-        parse_value_ord_block_all_v2(&meta_bytes, &mut pos, meta_count, &schema_ref, &schemas)?;
+        parse_value_ord_block_all_v2(meta_bytes, &mut pos, meta_count, &schema_ref, &schemas)?;
     let tail =
-        parse_series_meta_tail_v4(&meta_bytes, &mut pos, footer, meta_count, run_total, limits)?;
+        parse_series_meta_tail_v4(meta_bytes, &mut pos, footer, meta_count, run_total, limits)?;
     check_value_kind_pages_v4(footer, &tail.value_kind, &tail.run_count, &tail.runs)?;
 
-    let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
+    let mut resolver = DictResolver::new(dict_bytes, dict_index);
     let mut entries = Vec::with_capacity(series_ids.len());
     let mut voff = 0usize;
     let mut roff = 0usize;

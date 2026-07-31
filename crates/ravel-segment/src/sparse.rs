@@ -717,13 +717,21 @@ pub fn decode_catalog_v5(
     let dict_index = index_label_dict(&dict_bytes)?;
     let series_ids = parse_series_ids_v2(&ids_bytes)?;
 
-    // Whole-section (below-threshold) path: delegate to v4.
+    // Whole-section (below-threshold) path: delegate to v4's decode core.
+    // LABEL_DICT and SERIES_IDS are already decompressed above (and their
+    // crcs verified there), so pass the decoded bytes straight in rather than
+    // handing raw section slices to `decode_catalog_v4`, which would decode
+    // both a second time (#282). SERIES_META is the one section decompressed
+    // here.
     if let Some(meta_section) = find_section(footer, section_kind::SERIES_META) {
-        return crate::reader::decode_catalog_v4(
+        let meta_bytes =
+            decode_section_bytes(meta_section, slice(object_bytes, meta_section)?, limits)?;
+        return crate::reader::decode_catalog_v4_from_decoded(
             footer,
-            slice(object_bytes, label_dict_section)?,
-            slice(object_bytes, series_ids_section)?,
-            slice(object_bytes, meta_section)?,
+            &dict_bytes,
+            &dict_index,
+            &series_ids,
+            &meta_bytes,
             limits,
         );
     }
