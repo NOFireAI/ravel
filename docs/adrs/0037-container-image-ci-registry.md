@@ -73,37 +73,64 @@ repo config). The GitHub org is `NOFireAI`, repo `store`.
    arm64 is deferred rather than added now.
 
 4. **Trigger and tag scheme**, new workflow
-   `.github/workflows/publish-images.yml`, gated the same way
-   `docker-build` is (skip on docs-only changes) but not sharing its
-   job, since this one needs registry credentials the build-verification
-   job should never hold:
-   - Push to `main`: tags `main` and `sha-<short-sha>`.
+   `.github/workflows/publish-images.yml`, a separate workflow file from
+   `ci.yml` (not a shared job), since this one needs registry credentials
+   the build-verification job should never hold. Triggers only on
+   **release tags and manual dispatch, never on a plain push to
+   `main`**:
    - Push of a tag matching `v[0-9]+.[0-9]+.[0-9]+`: tags `X.Y.Z`, `X.Y`,
      `X`, and `latest`.
    - `workflow_dispatch`: tag `manual-<short-sha>`, for an on-demand
      publish without cutting a release tag.
-   No tag scheme exists yet in the repo (workspace version is `0.1.0`
-   pre-release, no git tags cut); this ADR establishes the first one.
-   `docker/build-push-action` with `cache-from`/`cache-to: type=gha`
-   amortizes the 57-minute cold-build cost (Dockerfile.prebuilt:8)
-   across repeated pushes to the same branch.
+   A `main`-push trigger was considered and dropped: the root
+   Dockerfile's builder stage is one `COPY . .` layer followed by a
+   single `RUN cargo build` (Dockerfile:29,46), so any source change
+   invalidates that layer and `cache-from: type=gha` cannot hit it on a
+   main push — this is structural, not a cache-tuning gap. Running the
+   ~57-minute (Dockerfile.prebuilt:8), OOM-prone-at-high-parallelism
+   build on every push to `main` would make this the most expensive job
+   in the repo, on exactly the path `docker-build` already avoids for
+   that reason (ci.yml:651-655), and would thrash the 10 GB per-repo
+   GHA cache shared with `sccache`-gha and `Swatinem/rust-cache` across
+   `check`/`coverage`/`k8s-integration`. Tag pushes and manual dispatch
+   are infrequent enough that the same cache-miss cost is acceptable.
+   Per-main-commit images are deferred to the same arm64/prebuilt
+   follow-up as multi-arch, not solved here. No tag scheme exists yet in
+   the repo (workspace version is `0.1.0` pre-release, no git tags cut);
+   this ADR establishes the first one.
+   The job declares `permissions: {contents: read, packages: write}`
+   explicitly rather than relying on the org default (which may be
+   read-only), and the image path is the hardcoded, already-lowercase
+   `ghcr.io/nofireai/...` rather than an interpolated
+   `${{ github.repository_owner }}` (`NOFireAI`, mixed case — Docker
+   rejects non-lowercase repository names).
 
-5. **Visibility: public packages.** A private GHCR package would need
-   every puller (a developer's laptop, a real k8s cluster, this repo's
-   own `k8s-integration` job if it ever switched from local kind-load to
-   a registry pull) to hold a PAT with `read:packages` and an
-   `imagePullSecret` for cluster use. Nothing in this codebase is
-   currently secret-gated at the image layer, and public GHCR packages
-   still require write auth to push, so build integrity is unaffected.
-   Access is then `docker pull ghcr.io/nofireai/ravel-server:<tag>`,
-   no login step. Flipping to private later is a GHCR setting, not an
-   architecture change.
+5. **Visibility: public packages, flipped after first publish.** A
+   private GHCR package would need every puller (a developer's laptop,
+   a real k8s cluster, this repo's own `k8s-integration` job if it ever
+   switched from local kind-load to a registry pull) to hold a PAT with
+   `read:packages` and an `imagePullSecret` for cluster use. Nothing in
+   this codebase is currently secret-gated at the image layer, and
+   public GHCR packages still require write auth to push, so build
+   integrity is unaffected. Access is then
+   `docker pull ghcr.io/nofireai/ravel-server:<tag>`, no login step.
+   GHCR creates a package **private** on its first push regardless of
+   this decision — visibility is a package setting, not something the
+   publish workflow itself can set — so making it public is an explicit
+   one-time step after the first successful publish (`gh api` or the
+   package settings page for both `ravel-server` and `ravel-operator`),
+   done and verified (anonymous `docker pull` succeeds) before the
+   README documents a login-free pull. Flipping back to private later
+   is the same kind of setting change, not an architecture change.
 
 6. **Documentation**: a new "Container images" section in README.md
    (pull commands, tag scheme, which Dockerfile produces the published
    image) and an update to `deploy/k8s/operator/operator.yaml`'s
    placeholder-tag comment pointing at the published `ravel-operator`
    tags as the real-cluster alternative to a kind-loaded local image.
+   This section is written to describe the end state and is only fully
+   true once decision 5's visibility flip has happened and been
+   verified.
 
 ## Rejected alternatives
 
@@ -129,6 +156,15 @@ repo config). The GitHub org is `NOFireAI`, repo `store`.
   works; giving it `packages: write` and registry credentials widens its
   blast radius for no benefit, since the publish workflow already
   re-verifies the build as its first step.
+- **Publishing on every push to `main`.** Rejected in decision 4: the
+  root Dockerfile's single `COPY . .` plus one `RUN cargo build` layer
+  means `type=gha` caching structurally cannot hit on a source change,
+  so this would run the full ~57-minute OOM-prone build on every main
+  push, the exact cost `docker-build`'s path gate exists to avoid, while
+  also contending the shared 10 GB GHA cache with `check`/`coverage`/
+  `k8s-integration`. Tag pushes and manual dispatch are infrequent
+  enough to absorb that cost; per-main-commit images are deferred to
+  the arm64/prebuilt-image follow-up.
 
 ## Consequences
 
@@ -141,3 +177,8 @@ repo config). The GitHub org is `NOFireAI`, repo `store`.
   placeholder tag now has a stated real-world replacement.
 - arm64 images remain a known gap, explicitly deferred rather than
   silently absent.
+- No image is published on an ordinary main-branch push; a release
+  requires cutting a `vX.Y.Z` tag or running `workflow_dispatch`.
+- The published packages are private until someone completes the
+  decision-5 visibility flip; the README's "no login pull" claim is
+  only true after that step is done and verified.
