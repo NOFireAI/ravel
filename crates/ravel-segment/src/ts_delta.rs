@@ -28,12 +28,15 @@ pub fn encode_ts_deltas_into(out: &mut Vec<u8>, timestamps: &[i64]) -> Option<()
     Some(())
 }
 
-/// Decodes exactly `count` timestamps with overflow-checked accumulation
-/// into a caller-supplied buffer (`out` is cleared, then filled; on error
-/// its contents are unspecified, reusable across pages instead of
-/// allocating fresh per page); each decoded value is validated against
-/// `[min_ts_ns, max_ts_ns]` (docs/segment-format.md). Rejects trailing
-/// bytes past the declared count.
+/// Decodes exactly `count` timestamps with overflow-checked accumulation,
+/// *appending* them to a caller-supplied buffer (existing contents are
+/// preserved; on error the appended tail is unspecified). Each decoded value
+/// is validated against `[min_ts_ns, max_ts_ns]` (docs/segment-format.md).
+/// Rejects trailing bytes past the declared count. Appending (rather than
+/// clearing first) lets a caller concatenate several runs' pages into one
+/// buffer, which the query fetcher's L0 branch relies on to emit one unit per
+/// series with every run's samples in on-disk order (#283); a caller that
+/// wants a fresh decode clears the buffer itself.
 pub fn decode_ts_deltas_into(
     bytes: &[u8],
     count: usize,
@@ -41,7 +44,6 @@ pub fn decode_ts_deltas_into(
     max_ts_ns: i64,
     out: &mut Vec<i64>,
 ) -> Result<(), SegmentError> {
-    out.clear();
     let mut pos = 0usize;
     let mut accum = 0i64;
     for i in 0..count {

@@ -2158,4 +2158,80 @@ mod v4_tests {
             "LABEL_DICT must be decompressed exactly once per catalog decode"
         );
     }
+
+    /// #283: the page decoders append, so decoding a second run into the same
+    /// timestamp/value buffers (what the fetcher's L0 one-unit-per-series path
+    /// does) concatenates both runs instead of the second clobbering the
+    /// first. Hand-build two runs' pages and decode them into shared buffers;
+    /// before the fix the first run's samples were silently dropped.
+    #[test]
+    fn decode_run_pages_soa_appends_second_run_onto_first() {
+        use crate::reader::{RunEntry, decode_run_pages_soa};
+
+        let series_id = SeriesId([0x5A; 16]);
+        let run = |sample_count: u32, min_ts_ns: i64, max_ts_ns: i64| RunEntry {
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: 0,
+            sample_count,
+            min_ts_ns,
+            max_ts_ns,
+            ts_page: (0, 0),
+            val_page: (0, 0),
+            hist_page: (0, 0),
+        };
+
+        let run0_ts = [10i64, 11, 12];
+        let run0_vals = [1.0f64, 2.0, 3.0];
+        let run1_ts = [20i64, 21];
+        let run1_vals = [4.0f64, 5.0];
+
+        let ts0 = ts_page(&series_id, &run0_ts);
+        let val0 = val_raw_f64_page(&series_id, &run0_vals);
+        let ts1 = ts_page(&series_id, &run1_ts);
+        let val1 = val_raw_f64_page(&series_id, &run1_vals);
+
+        let mut scratch = Vec::new();
+        let mut timestamps = Vec::new();
+        let mut values = Vec::new();
+
+        decode_run_pages_soa(
+            &series_id,
+            &run(3, 10, 12),
+            &ts0,
+            &val0,
+            ReaderLimits::default(),
+            &mut scratch,
+            &mut timestamps,
+            &mut values,
+        )
+        .expect("run 0 decodes");
+        decode_run_pages_soa(
+            &series_id,
+            &run(2, 20, 21),
+            &ts1,
+            &val1,
+            ReaderLimits::default(),
+            &mut scratch,
+            &mut timestamps,
+            &mut values,
+        )
+        .expect("run 1 decodes");
+
+        assert_eq!(
+            timestamps,
+            vec![10, 11, 12, 20, 21],
+            "both runs' timestamps must survive, in on-disk order"
+        );
+        // Bit-pattern compare per the storage-path float rule.
+        let got: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
+        let want: Vec<u64> = [1.0f64, 2.0, 3.0, 4.0, 5.0]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(
+            got, want,
+            "both runs' values must survive, in on-disk order"
+        );
+    }
 }
