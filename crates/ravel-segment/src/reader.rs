@@ -720,12 +720,15 @@ fn decode_ts_page_into(
     crate::ts_delta::decode_ts_deltas_into(scratch, count, min_ts_ns, max_ts_ns, out)
 }
 
+/// Decodes `count` little-endian f64s, *appending* them to `out` (existing
+/// contents preserved; on error the appended tail is unspecified). Appending
+/// matches the other page decoders so the query fetcher's L0 branch can
+/// concatenate a series' runs into one buffer (#283).
 fn decode_raw_f64_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result<(), SegmentError> {
     let expected_len = count.checked_mul(8).ok_or(SegmentError::FieldOverflow)?;
     if bytes.len() != expected_len {
         return Err(SegmentError::Truncated);
     }
-    out.clear();
     out.reserve(count);
     for chunk in bytes.chunks_exact(8) {
         let arr: [u8; 8] = chunk.try_into().map_err(|_| SegmentError::Truncated)?;
@@ -988,12 +991,17 @@ fn decode_hist_page_into(
     Ok(())
 }
 
-/// Decodes one v4 run's TS and VAL pages directly into separate
+/// Decodes one v4 run's TS and VAL pages, *appending* into separate
 /// timestamp/value vecs (SoA), the per-run page decoder for a v5 (v4-grammar)
 /// [`RunEntry`] (docs/segment-format.md). Validation contract: page crc
 /// (bound to `series_id`), enc/comp validity, overflow- and bounds-checked
 /// timestamp accumulation, on-disk order (including duplicate timestamps)
-/// preserved.
+/// preserved. Because the underlying page decoders append, calling this
+/// repeatedly with the same `timestamps`/`values` concatenates each run's
+/// samples in call order (the query fetcher's L0 one-unit-per-series path);
+/// `scratch` is per-page working space and is overwritten each call. The
+/// `timestamps.len() == values.len()` post-check holds over the cumulative
+/// buffers, so a run whose TS and VAL sample counts disagree is still caught.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_run_pages_soa(
     series_id: &SeriesId,

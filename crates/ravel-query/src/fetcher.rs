@@ -569,7 +569,14 @@ impl SegmentFetcher {
             match &seg_ref.level {
                 SegmentLevel::L0 => {
                     // One unit per series: concatenate every run's samples in
-                    // on-disk order, segment-level provenance.
+                    // on-disk order, segment-level provenance. `decode_run`
+                    // appends (its page decoders append, #283), so the shared
+                    // `timestamps`/`values` accumulate across runs rather than
+                    // each run clobbering the last. An L0 flush frames exactly
+                    // one run per series today, so this is normally a single
+                    // pass; the concatenation is what keeps a multi-run L0
+                    // (were one ever produced) correct instead of silently
+                    // dropping all but the final run.
                     let mut timestamps = Vec::new();
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {

@@ -156,18 +156,20 @@ pub fn encode_gorilla_into(values: &[f64], out: &mut Vec<u8>) {
     w.finish()
 }
 
-/// Decodes exactly `count` Gorilla-encoded values from `bytes` into a
-/// caller-supplied buffer: `out` is cleared, then filled (on error, its
-/// contents are unspecified), reusable across pages instead of allocating
-/// fresh per page. Rejects any malformed control sequence (out-of-range
-/// window arithmetic, truncated stream) as [`SegmentError::CorruptGorilla`]
-/// or [`SegmentError::Truncated`]; never panics.
+/// Decodes exactly `count` Gorilla-encoded values from `bytes`, *appending*
+/// them to a caller-supplied buffer (existing contents are preserved; on
+/// error the appended tail is unspecified). Rejects any malformed control
+/// sequence (out-of-range window arithmetic, truncated stream) as
+/// [`SegmentError::CorruptGorilla`] or [`SegmentError::Truncated`]; never
+/// panics. Appending (rather than clearing first) lets a caller concatenate
+/// several runs' pages into one buffer, which the query fetcher's L0 branch
+/// relies on (#283); a caller that wants a fresh decode clears the buffer
+/// itself.
 pub fn decode_gorilla_into(
     bytes: &[u8],
     count: usize,
     out: &mut Vec<f64>,
 ) -> Result<(), SegmentError> {
-    out.clear();
     if count == 0 {
         return Ok(());
     }
