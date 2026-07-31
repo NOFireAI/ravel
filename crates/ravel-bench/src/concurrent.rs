@@ -157,13 +157,15 @@ pub struct ReaderReport {
 /// "Cold" is the first instant query issued against that fresh pair; "warm"
 /// is the same query repeated immediately after, against the same pair.
 ///
-/// `ravel-query` has no segment-footer cache yet (docs/benchmarking.md
-/// "Profiling"), so this establishes the current no-cache baseline for a
-/// first query versus a repeat, not a cache-hit-rate measurement -- any gap
-/// between the two numbers reflects object-store or OS-level effects
-/// (e.g. `MemoryStore`'s in-process map already holding the object,  a
-/// real backend's connection reuse), not anything ravel-query itself
-/// caches.
+/// `ravel-query` itself has no segment-footer or page cache yet
+/// (docs/benchmarking.md "Profiling"), but the fresh `Catalog` this
+/// comparison builds owns five caches on the resolve path (commit
+/// records, compaction records, HEAD, snapshot parts, postings --
+/// `ravel_catalog::catalog::Catalog`), all cold at construction. The
+/// cold query populates them; the warm query hits them. So this *is*
+/// a cache-hit-rate measurement, of the catalog's caches, not of
+/// segment-level caching (which does not exist) or of object-store/OS
+/// effects.
 #[derive(Serialize)]
 pub struct ColdWarmReport {
     pub cold_latency_ms: f64,
