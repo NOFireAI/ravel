@@ -15,10 +15,19 @@
 //!    deleted before data objects, so a crash mid-sweep never leaves a commit
 //!    record pointing at a deleted data object visible to a resolver.
 //! 3. **Unreferenced-part cleanup**: an `l1/` object referenced by no
-//!    compaction record in its bucket, once a compaction record exists for
-//!    that bucket and the object is older than `grace +
-//!    max_compaction_lifetime`. Non-reference is re-verified with a fresh
-//!    strongly consistent LIST immediately before each delete.
+//!    compaction record in its bucket, once the object is older than `grace +
+//!    max_compaction_lifetime` and one of two branch conditions holds:
+//!    (a) a compaction record already exists for the bucket, so any object no
+//!    record names is a leftover; or (b) a retention tombstone exists for the
+//!    bucket and no compaction record does, which makes any future compaction
+//!    impossible (`compact_bucket`'s tombstone gate returns before building or
+//!    publishing, ADR-0019), so every record-less `l1/` object in the bucket
+//!    can never be re-referenced by a legal future publish (issue #273). A
+//!    bucket with neither a record nor a tombstone keeps its record-less
+//!    parts: a future compaction over the same sealed, content-addressed input
+//!    set will republish the identical keys and name them. The exact branch
+//!    condition is re-verified with a fresh strongly consistent LIST
+//!    immediately before each delete.
 //!
 //! All three are **signal-generic**: they operate only on commit-record,
 //! compaction-record, and object *keys* plus store `last_modified`, never on a
@@ -292,10 +301,14 @@ pub async fn sweep_superseded(
 
 // --- Rule 3: unreferenced-part cleanup -------------------------------------
 
-/// Delete every `l1/` object in a bucket that already holds a compaction
-/// record but is referenced by none of that bucket's records, once the object
-/// is older than the unreferenced-part age gate. Non-reference is re-verified
-/// with a fresh strongly consistent LIST immediately before each delete.
+/// Delete every `l1/` object older than the unreferenced-part age gate that a
+/// legal future publish can never name, re-verifying the exact branch
+/// condition with a fresh strongly consistent LIST immediately before each
+/// delete. Two branches make an object collectable (see [`PartBranch`]): its
+/// bucket holds a compaction record and no record references it, or its bucket
+/// holds a retention tombstone and no compaction record (issue #273). A bucket
+/// with neither is left alone: its record-less parts belong to a future
+/// compaction that will republish the identical content-addressed keys.
 /// Returns the number deleted.
 pub async fn sweep_unreferenced_parts(
     store: &dyn ObjectStoreBackend,
@@ -308,32 +321,33 @@ pub async fn sweep_unreferenced_parts(
 ) -> Result<usize> {
     let now = clock.now_ns();
     let gate = config.unreferenced_part_age_gate_ns();
-    let referenced = referenced_l1_parts(store, tenant, signal, shard).await?;
+    let (referenced, tombstoned) = bucket_reference_map(store, tenant, signal, shard).await?;
 
     let prefix = l1_prefix(tenant, signal, shard)?;
     let objects = list_all(store, &prefix).await?;
     let mut deleted = 0usize;
     for meta in objects {
         let parsed = keys::parse_l1_part_key(&meta.key)?;
-        // Precondition: a compaction record must already exist for the bucket.
-        // Only such buckets appear as keys in `referenced`.
-        let Some(bucket_refs) = referenced.get(&parsed.ingest_hour_bucket) else {
+        let bucket = parsed.ingest_hour_bucket;
+        let Some(branch) = classify_part(&meta.key, bucket, &referenced, &tombstoned) else {
             continue;
         };
-        if bucket_refs.contains(&meta.key) {
-            continue;
-        }
         if object_age_ns(now, &meta) <= gate {
             continue;
         }
         if lease.is_protected(&meta.key) {
             continue;
         }
-        // Re-verify non-reference immediately before the delete.
-        let fresh = referenced_l1_parts(store, tenant, signal, shard).await?;
-        match fresh.get(&parsed.ingest_hour_bucket) {
-            Some(fs) if !fs.contains(&meta.key) => {}
-            _ => continue,
+        // Re-verify the exact branch condition immediately before the delete,
+        // via a fresh strongly consistent LIST. Requiring the same branch (not
+        // merely "still collectable") preserves the record-present rule's old
+        // skip-when-the-bucket-is-absent-from-the-fresh-map behavior: if the
+        // bucket's compaction record vanished between the two listings, the
+        // fresh classification is no longer `UnreferencedWithRecord`, so the
+        // delete is skipped.
+        let (fresh_ref, fresh_tomb) = bucket_reference_map(store, tenant, signal, shard).await?;
+        if classify_part(&meta.key, bucket, &fresh_ref, &fresh_tomb) != Some(branch) {
+            continue;
         }
         if !config.dry_run {
             store.delete(&meta.key).await?;
@@ -343,29 +357,74 @@ pub async fn sweep_unreferenced_parts(
     Ok(deleted)
 }
 
-/// For each bucket (ingest hour) that holds at least one compaction record,
-/// the set of L1 part keys those records reference. A bucket absent from the
-/// map has no compaction record, so its `l1/` objects fail the
-/// unreferenced-part precondition and are never swept by rule 3.
-async fn referenced_l1_parts(
+/// Why an `l1/` object is a rule-3 deletion candidate. The pre-delete
+/// re-verify re-checks the exact condition of the branch that first admitted
+/// the object, never a weaker "still collectable somehow" test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartBranch {
+    /// The bucket holds at least one compaction record and none of them names
+    /// this object: a leftover (a losing/superseded build's part, or a part
+    /// whose split boundary changed). Safe because a sealed bucket's input set
+    /// is frozen, so no record will ever start naming it.
+    UnreferencedWithRecord,
+    /// The bucket holds a retention tombstone and no compaction record. The
+    /// tombstone makes any future compaction impossible (`compact_bucket`
+    /// returns `Tombstoned` before it builds or publishes, ADR-0019), so no
+    /// legal future publish can name this object (issue #273).
+    TombstonedRecordless,
+}
+
+/// Classify one `l1/` object for rule 3, or `None` if it must not be swept.
+/// A bucket with a compaction record protects the parts its records name and
+/// exposes the rest ([`PartBranch::UnreferencedWithRecord`]); a bucket with a
+/// tombstone but no record exposes every part ([`PartBranch::TombstonedRecordless`]);
+/// a bucket with neither exposes nothing (a future compaction may still name
+/// its record-less parts).
+fn classify_part(
+    key: &str,
+    bucket: u32,
+    referenced: &HashMap<u32, HashSet<String>>,
+    tombstoned: &HashSet<u32>,
+) -> Option<PartBranch> {
+    match referenced.get(&bucket) {
+        Some(refs) if refs.contains(key) => None,
+        Some(_) => Some(PartBranch::UnreferencedWithRecord),
+        None if tombstoned.contains(&bucket) => Some(PartBranch::TombstonedRecordless),
+        None => None,
+    }
+}
+
+/// One LIST of the shard's commit prefix, reduced to what rule 3 needs: for
+/// each bucket that holds at least one compaction record, the set of L1 part
+/// keys those records reference; and the set of buckets that hold a retention
+/// tombstone. A bucket in neither collection has no compaction record and no
+/// tombstone, so its `l1/` objects are never swept by rule 3 (a future
+/// compaction may still publish a record naming them; issue #273).
+async fn bucket_reference_map(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
     shard: u32,
-) -> Result<HashMap<u32, HashSet<String>>> {
+) -> Result<(HashMap<u32, HashSet<String>>, HashSet<u32>)> {
     let entries = list_commit_entries(store, tenant, signal, shard).await?;
-    let mut out: HashMap<u32, HashSet<String>> = HashMap::new();
+    let mut referenced: HashMap<u32, HashSet<String>> = HashMap::new();
+    let mut tombstoned: HashSet<u32> = HashSet::new();
     for (key, entry) in &entries {
-        if !matches!(entry, BucketEntry::CompactionRecord(_)) {
-            continue;
-        }
-        let record = get_compaction_record(store, key).await?;
-        let set = out.entry(record.ingest_hour_bucket).or_default();
-        for part in &record.parts {
-            set.insert(keys::reconstruct_l1_part_key(&record, part)?);
+        match entry {
+            BucketEntry::CompactionRecord(_) => {
+                let record = get_compaction_record(store, key).await?;
+                let set = referenced.entry(record.ingest_hour_bucket).or_default();
+                for part in &record.parts {
+                    set.insert(keys::reconstruct_l1_part_key(&record, part)?);
+                }
+            }
+            BucketEntry::Tombstone(pk) => {
+                tombstoned.insert(pk.ingest_hour_bucket);
+            }
+            BucketEntry::CommitRecord(_) => {}
         }
     }
-    Ok(out)
+    Ok((referenced, tombstoned))
 }
 
 // --- shared helpers --------------------------------------------------------

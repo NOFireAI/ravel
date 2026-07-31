@@ -16,16 +16,18 @@
 mod common;
 
 use common::*;
+use prost::Message;
 use ravel_commit::keys;
 use ravel_maintain::{
-    Bucket, Clock, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, compact_bucket,
-    sweep_orphans, sweep_shard, sweep_superseded,
+    Bucket, Clock, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, PublishOutcome,
+    compact_bucket, sweep_orphans, sweep_shard, sweep_superseded,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, list_all};
+use ravel_proto::commit::v1::RetentionTombstone;
 use uuid::Uuid;
 
 /// Which signal fixture a shared test runs over.
@@ -607,6 +609,18 @@ async fn sweep_unreferenced(
     config: &CompactorConfig,
     bucket: &Bucket,
 ) -> usize {
+    sweep_unreferenced_result(store, clock, config, bucket)
+        .await
+        .expect("unreferenced sweep")
+}
+
+/// Like [`sweep_unreferenced`] but surfaces the `Result` (fault-path tests).
+async fn sweep_unreferenced_result(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+) -> ravel_maintain::Result<usize> {
     ravel_maintain::sweep_unreferenced_parts(
         store,
         clock,
@@ -617,7 +631,313 @@ async fn sweep_unreferenced(
         bucket.shard,
     )
     .await
-    .expect("unreferenced sweep")
+}
+
+// --- Issue #273: abandoned-compaction L1 leak (option (b)) ------------------
+//
+// The fix collects record-less `l1/` parts ONLY in buckets that hold a
+// retention tombstone (which makes any future compaction impossible), and
+// never in a bucket that still lacks both a record and a tombstone (where a
+// future recovery compaction may republish and name those exact
+// content-addressed parts). These tests pin both halves, and the decisive
+// interleaving the first attempt lost data on.
+
+/// Seed two compactable L0 inputs, then run a compaction that builds and PUTs
+/// its L1 parts but abandons past `max_compaction_lifetime` without publishing
+/// (plan §3.4 point 4). The bucket is left with record-less `l1/` parts and no
+/// compaction record. Returns the bucket.
+async fn seed_and_abandon(store: &dyn ObjectStoreBackend, clock: &dyn Clock, sig: Sig) -> Bucket {
+    let bucket = seed_two(store, sig).await;
+    let mut config = cfg();
+    // Any elapsed time (>= 0, and a FixedClock gives exactly 0) exceeds this,
+    // so publish_record returns Abandoned after the parts are already PUT.
+    config.max_compaction_lifetime_ns = -1;
+    let outcome = compact_bucket(store, clock, &config, &bucket)
+        .await
+        .expect("compact");
+    assert!(
+        matches!(
+            outcome,
+            CompactionOutcome::Compacted {
+                publish: PublishOutcome::Abandoned,
+                ..
+            }
+        ),
+        "expected an abandoned compaction, got {outcome:?}"
+    );
+    bucket
+}
+
+/// Write a retention tombstone at the bucket's fixed tombstone key. The
+/// sweeper classifies it by key shape alone (it never GETs the body), so a
+/// minimal valid `RetentionTombstone` suffices.
+async fn seed_tombstone(store: &dyn ObjectStoreBackend, bucket: &Bucket) {
+    let tombstone = RetentionTombstone {
+        format_version: 1,
+        tenant_hash: bucket.tenant_hash.0.to_vec(),
+        signal: ravel_commit::signal::to_proto(bucket.signal) as i32,
+        shard: bucket.shard,
+        ingest_hour_bucket: bucket.ingest_hour_bucket,
+        retired_at_ns: 0,
+        retention_window_ns: 0,
+        record_count_observed: 0,
+    };
+    let key = keys::retention_tombstone_key_for(&tombstone).expect("tombstone key");
+    store
+        .put(
+            &key,
+            tombstone.encode_to_vec().into(),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put tombstone");
+}
+
+/// The sorted `l1/` part keys currently present in a bucket.
+async fn l1_part_keys(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Vec<String> {
+    let prefix = format!(
+        "t/{}/{}/l1/{:04}/{}/",
+        bucket.tenant_hash.to_hex(),
+        bucket.signal.key_prefix(),
+        bucket.shard,
+        keys::ingest_hour_string(bucket.ingest_hour_bucket),
+    );
+    let mut out: Vec<String> = list_all(store, &prefix)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
+    out.sort();
+    out
+}
+
+/// THE decisive test (issue #273, second attempt). Models exactly the
+/// data-loss interleaving the first attempt introduced: an abandoned run
+/// leaves record-less L1 parts older than the age gate, the sweeper fires
+/// while the bucket is still record-less (the worst point: mid recovery
+/// build), then the recovery compaction publishes. Every part the published
+/// record names MUST still exist and the bucket MUST read back correctly.
+///
+/// The first attempt swept the record-less parts here (record-less, old
+/// enough, fresh re-verify saw no record) and then let the recovery publish a
+/// record naming the now-deleted parts: permanent loss. Option (b) refuses to
+/// collect in a bucket that lacks both a record and a tombstone, so the sweep
+/// is a no-op and nothing is lost.
+#[tokio::test]
+async fn recovery_over_abandoned_parts_never_loses_a_named_part() {
+    async fn run(sig: Sig) {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(sealed_now_ns());
+
+        // Run A: build parts, abandon without publishing.
+        let bucket = seed_and_abandon(&store, &clock, sig).await;
+        let abandoned = l1_part_keys(&store, &bucket).await;
+        assert!(!abandoned.is_empty(), "the abandoned run left L1 parts");
+
+        // The parts' store last_modified is 0, so at `sealed_now_ns()` (which
+        // the recovery compaction also needs, to see the bucket as sealed) they
+        // are already far past the unreferenced-part age gate: exactly the
+        // precondition the first attempt keyed its (unsafe) delete on.
+        let config = cfg();
+        assert!(
+            sealed_now_ns() > config.unreferenced_part_age_gate_ns(),
+            "the abandoned parts are already past the age gate"
+        );
+
+        // The sweeper fires mid-recovery, while the bucket is record-less and
+        // NOT tombstoned. It must delete nothing.
+        let report = sweep_shard(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+        )
+        .await
+        .expect("mid-recovery sweep");
+        assert_eq!(
+            report.unreferenced_parts_deleted, 0,
+            "record-less, non-tombstoned parts are never swept: {report:?}"
+        );
+        assert_eq!(
+            l1_part_keys(&store, &bucket).await,
+            abandoned,
+            "every abandoned part survives the sweep"
+        );
+
+        // Run B: the normal recovery path compacts the same sealed bucket and
+        // publishes. Its deterministic content-addressed parts are exactly the
+        // surviving ones (same input_set_hash), so the record names live parts.
+        let outcome = compact_bucket(&store, &clock, &config, &bucket)
+            .await
+            .expect("recovery compact");
+        assert!(
+            matches!(
+                outcome,
+                CompactionOutcome::Compacted {
+                    publish: PublishOutcome::Published,
+                    ..
+                }
+            ),
+            "recovery published, got {outcome:?}"
+        );
+
+        // A post-publish sweep now sees a record; it must not touch a part the
+        // record references.
+        let report = sweep_shard(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+        )
+        .await
+        .expect("post-publish sweep");
+        assert_eq!(report.unreferenced_parts_deleted, 0, "{report:?}");
+
+        // Every part the published record names EXISTS.
+        let record = fetch_compaction_record(&store, &bucket).await;
+        assert!(!record.parts.is_empty());
+        for part in &record.parts {
+            let key = keys::reconstruct_l1_part_key(&record, part).unwrap();
+            store
+                .head(&key)
+                .await
+                .expect("a part the published record names is present");
+        }
+        assert_l1_intact(&store, &bucket).await;
+
+        // And the bucket queries correctly (metrics: exact sample equivalence).
+        if matches!(sig, Sig::Metrics) {
+            let got = read_record_samples(&store, &record).await;
+            let expected = expected_samples(&metrics_specs());
+            assert_eq!(got, expected, "bucket reads back the full input set");
+        }
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+}
+
+/// The plain abandoned-then-retired bucket: once a retention tombstone is
+/// present, the record-less parts are collectable (they can never be
+/// re-referenced, since a tombstoned bucket is never compacted again). The
+/// pre-delete re-verify LIST is proven by injecting a fault on the SECOND
+/// commit-prefix LIST of the pass (the re-verify) and asserting it fired: the
+/// store is seeded BEFORE it is wrapped, so the pass's first commit LIST is
+/// the initial reference map and its second is the re-verify.
+#[tokio::test]
+async fn tombstoned_abandoned_parts_collected_reverify_proven() {
+    async fn run(sig: Sig) {
+        let mem = MemoryStore::new();
+        let clock = FixedClock::new(sealed_now_ns());
+        let bucket = seed_and_abandon(&mem, &clock, sig).await;
+        seed_tombstone(&mem, &bucket).await;
+        let abandoned = l1_part_keys(&mem, &bucket).await;
+        assert!(!abandoned.is_empty());
+
+        // Fault the second commit-prefix LIST (the pre-delete re-verify).
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::List, ScriptedFault::Timeout)
+                .with_key_contains("/c/")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = FaultStore::new(mem, plan);
+
+        let config = cfg();
+        clock.set(config.unreferenced_part_age_gate_ns() + 1);
+
+        // The candidate passes the age gate and the initial LIST; the
+        // re-verify LIST faults, aborting before any delete.
+        let res = sweep_unreferenced_result(&store, &clock, &config, &bucket).await;
+        assert!(res.is_err(), "the re-verify LIST fault aborts the pass");
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Timeout),
+            1,
+            "exactly the pre-delete re-verify LIST faulted"
+        );
+        assert_eq!(
+            l1_part_keys(&store, &bucket).await,
+            abandoned,
+            "nothing deleted when the re-verify faults"
+        );
+
+        // The one-shot fault is spent; the re-run collects the tombstoned
+        // bucket's record-less parts.
+        let n = sweep_unreferenced(&store, &clock, &config, &bucket).await;
+        assert_eq!(
+            n,
+            abandoned.len(),
+            "all record-less parts of the tombstoned bucket collected"
+        );
+        assert!(
+            l1_part_keys(&store, &bucket).await.is_empty(),
+            "tombstoned bucket's record-less parts gone"
+        );
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+}
+
+/// A record-less part in a tombstoned bucket younger than the age gate
+/// survives; it is collected only once strictly past the gate. Proves the
+/// tombstoned branch is age-gated exactly like the record-present branch.
+#[tokio::test]
+async fn young_tombstoned_recordless_part_survives_age_gate() {
+    async fn run(sig: Sig) {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(sealed_now_ns());
+        let bucket = seed_and_abandon(&store, &clock, sig).await;
+        seed_tombstone(&store, &bucket).await;
+        let abandoned = l1_part_keys(&store, &bucket).await;
+        assert!(!abandoned.is_empty());
+
+        let config = cfg();
+        // Exactly at the gate: age == gate is treated as too young.
+        clock.set(config.unreferenced_part_age_gate_ns());
+        let n = sweep_unreferenced(&store, &clock, &config, &bucket).await;
+        assert_eq!(n, 0, "younger-than-gate part survives even when tombstoned");
+        assert_eq!(l1_part_keys(&store, &bucket).await, abandoned);
+
+        // One ns past the gate: collectable.
+        clock.set(config.unreferenced_part_age_gate_ns() + 1);
+        let n = sweep_unreferenced(&store, &clock, &config, &bucket).await;
+        assert_eq!(n, abandoned.len(), "collected once strictly past the gate");
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
+}
+
+/// A record-less part in a bucket with NEITHER a compaction record NOR a
+/// tombstone is never swept, no matter how old: a future recovery compaction
+/// may still publish a record naming it (issue #273; the leak stays open until
+/// the bucket is either compacted or retired). This is the safety boundary of
+/// option (b), asserted directly.
+#[tokio::test]
+async fn recordless_untombstoned_part_is_never_swept() {
+    async fn run(sig: Sig) {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(sealed_now_ns());
+        let bucket = seed_and_abandon(&store, &clock, sig).await;
+        let abandoned = l1_part_keys(&store, &bucket).await;
+        assert!(!abandoned.is_empty());
+
+        let config = cfg();
+        // Far past the gate: age alone would satisfy every timing precondition.
+        clock.set(config.unreferenced_part_age_gate_ns() + 100 * NS_PER_HOUR);
+        let n = sweep_unreferenced(&store, &clock, &config, &bucket).await;
+        assert_eq!(
+            n, 0,
+            "no record and no tombstone: the part is retained for a future publish"
+        );
+        assert_eq!(l1_part_keys(&store, &bucket).await, abandoned);
+    }
+    run(Sig::Metrics).await;
+    run(Sig::Logs).await;
 }
 
 /// Orphan GC never touches a live input (one with a commit record), and a

@@ -27,10 +27,18 @@ pub enum PublishOutcome {
     Converged { parts_repaired: usize },
     /// The `max_compaction_lifetime` deadline passed before the record PUT;
     /// the run abandoned and did NOT publish (plan §3.4 point 4). Its parts
-    /// age out as unreferenced (sweep rule 3) only once some compaction record
-    /// already exists for the bucket; parts of a bucket that has never had a
-    /// successful compaction record published are not collectable by rule 3
-    /// (its standing precondition; docs/consistency-model.md, plan §5).
+    /// are content-addressed and deterministic for the sealed bucket, so any
+    /// later successful compaction over the same frozen input set republishes
+    /// the identical keys and its record references them: an abandoned run's
+    /// parts are never orphaned while the bucket can still be compacted. Sweep
+    /// rule 3 collects them in exactly two cases: once some compaction record
+    /// exists for the bucket (a leftover part no record names ages out as
+    /// unreferenced), or once a retention tombstone exists (which makes any
+    /// future compaction impossible, so every record-less part in the bucket
+    /// is collectable; issue #273). A bucket with neither a compaction record
+    /// nor a tombstone keeps its record-less parts, because a future
+    /// compaction may still publish a record naming them
+    /// (docs/consistency-model.md, plan §5).
     Abandoned,
 }
 

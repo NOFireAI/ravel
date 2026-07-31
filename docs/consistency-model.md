@@ -160,7 +160,7 @@ grace` and `grace` (default 24 h) are shared across all four rules.
 |---|---|---|---|
 | orphan (first implementation, ADR-0010 §11) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified immediately before delete | object last_modified |
 | superseded input (ADR-0018) | L0 commit records + data objects named in a compaction record's input list | now >= record.created_unix_ns + protection_horizon | compaction record created_unix_ns |
-| unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record exists for the bucket; age > grace + max_compaction_lifetime; non-reference re-verified immediately before delete | part last_modified |
+| unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced; issue #273); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
 
 - Orphan GC (data objects with no commit record) considers only objects
