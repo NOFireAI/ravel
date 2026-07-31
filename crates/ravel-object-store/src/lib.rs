@@ -146,13 +146,29 @@ pub const MULTIPART_MAX_PARTS: usize = 10_000;
 /// - `complete` and `abort` consume the upload logically: any later call on
 ///   the same handle fails with [`StoreError::Permanent`] rather than
 ///   re-issuing a request.
+/// - A `put_part` that fails at the backend, or a part that violates the
+///   sequence rules (empty, or a non-final part below
+///   [`MULTIPART_MIN_PART_SIZE`]), *poisons* the handle: every later `put_part`
+///   and `complete` fails with a non-retryable [`StoreError::Permanent`], and
+///   the caller must `abort` and restart the whole upload rather than retry the
+///   part. This matches what `object_store`'s S3 upload actually permits: it
+///   fixes each part's index at `put_part` call time and `complete` demands
+///   exactly that many parts, so a retried part lands at a fresh index and the
+///   hole a failed part left can never be filled. `abort` stays callable on a
+///   poisoned handle. A checksum mismatch is the one recoverable rejection: it
+///   does not poison, leaving the upload open so the caller can re-send the
+///   same bytes with the correct checksum.
 #[async_trait::async_trait]
 pub trait MultipartUpload: Send {
     /// Append one part. `checksum`, if given, is verified locally against
     /// `data` before anything is sent (the same pre-flight `put` runs, with
     /// the same limits: see [`Capabilities::mandatory`] on `upload_checksum`).
-    /// A mismatch fails this call with [`StoreError::Corrupted`], does not
-    /// count as a part, and leaves the upload usable and abortable.
+    /// A checksum mismatch fails this call with [`StoreError::Corrupted`], does
+    /// not count as a part, and leaves the upload usable and abortable. A
+    /// sequence-rule violation or a backend part-upload failure instead poisons
+    /// the handle (see the type-level docs): this and every later `put_part`
+    /// and `complete` return a non-retryable [`StoreError::Permanent`], and the
+    /// upload must be aborted and restarted.
     async fn put_part(
         &mut self,
         data: Bytes,
@@ -226,6 +242,23 @@ impl PartSequence {
 pub(crate) fn multipart_finished(key: &str) -> StoreError {
     StoreError::Permanent(format!(
         "multipart upload of {key}: already completed or aborted"
+    ))
+}
+
+/// The error a poisoned multipart handle returns from `put_part` and
+/// `complete` after a part upload failed (issue #296) or a part-sequence rule
+/// was violated (issue #297). Unlike a checksum mismatch, which leaves the
+/// upload open for a re-send, these are unrecoverable: `object_store`'s S3
+/// upload fixes each part's index at `put_part` call time and `complete`
+/// demands exactly that many parts, so a failed or rejected part leaves a
+/// permanent hole a retried part (landing at a fresh index) can never fill.
+/// The handle is dead; the caller must `abort` and restart the whole upload.
+/// Always [`StoreError::Permanent`], so never retryable, and `abort` stays
+/// callable on the poisoned handle.
+pub(crate) fn multipart_poisoned(key: &str, cause: &str) -> StoreError {
+    StoreError::Permanent(format!(
+        "multipart upload of {key} is poisoned by an earlier failure and must be \
+         aborted and restarted, not retried: {cause}"
     ))
 }
 
