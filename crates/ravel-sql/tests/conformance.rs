@@ -22,16 +22,32 @@
 mod util;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use datafusion::arrow::array::Array;
+use ravel_commit::publish::RetryPolicy;
+use ravel_commit::record::NewCommitRecord;
+use ravel_commit::{keys, publish, record};
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_sql::conformance::{
-    Classification, Construct, Verdict, Verified, registry, render_document, score,
+    Category, Classification, Construct, Verdict, Verified, registry, render_document, score,
 };
-use ravel_sql::{SqlError, ValidationError, validate};
+use ravel_sql::{QueryOutput, SqlError, ValidationError, validate};
+use ravel_types::{Signal, TenantId, logstream};
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
+use uuid::Uuid;
 
 /// A small metrics dataset the supported constructs execute against: two
 /// series, overlapping timestamps, a negative value so `WHERE value > 0`
 /// actually filters.
+///
+/// The values are load-bearing, not just present: [`expectation`] states the
+/// exact aggregate each admitted aggregate must return over them and the exact
+/// row count each clause must produce, so a construct that executes but answers
+/// wrongly (or answers with nothing) is a state-3 row (issue #262 gap 3).
 fn dataset() -> Vec<SegSpec> {
     vec![SegSpec::new(
         10,
@@ -42,6 +58,120 @@ fn dataset() -> Vec<SegSpec> {
             SeriesSpec::new("b", vec![(1, -1.0), (3, 3.0)]),
         ],
     )]
+}
+
+/// The four sample values [`dataset`] publishes, in no particular order.
+const SAMPLE_VALUES: [f64; 4] = [1.0, 2.0, -1.0, 3.0];
+
+/// How many log records [`publish_logs`] writes.
+const LOG_RECORD_COUNT: usize = 3;
+
+/// What a supported construct's result must look like. Every supported registry
+/// row needs one: "the query returned `Ok`" is not evidence, because an empty
+/// result set is a perfectly successful answer to a query that found nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Expect {
+    /// One row, one column, carrying exactly this `f64` (compared by bit
+    /// pattern, per the repo's float rule).
+    Scalar(f64),
+    /// Exactly this many rows, each of which must carry a value in every
+    /// column (no all-null padding row standing in for data).
+    Rows(usize),
+}
+
+/// The declared result for one supported construct, or `None` when the
+/// construct is a rejected row (whose expectation is its typed error).
+///
+/// Total over the supported surface by construction: [`verify`] reports a
+/// supported construct with no expectation as broken, so a new supported row
+/// cannot be added without stating what it must return.
+fn expectation(construct: &Construct) -> Option<Expect> {
+    let sum: f64 = SAMPLE_VALUES.iter().sum();
+    let count = SAMPLE_VALUES.len();
+    match (construct.category, construct.name.as_str()) {
+        (Category::Aggregate, "count") => Some(Expect::Scalar(count as f64)),
+        (Category::Aggregate, "sum") => Some(Expect::Scalar(sum)),
+        (Category::Aggregate, "min") => Some(Expect::Scalar(-1.0)),
+        (Category::Aggregate, "max") => Some(Expect::Scalar(3.0)),
+        (Category::Aggregate, "avg" | "mean") => Some(Expect::Scalar(sum / count as f64)),
+        // The four samples, projected and ordered.
+        (Category::Clause, "Projection" | "ORDER BY") => Some(Expect::Rows(count)),
+        // `WHERE value > 0` drops the one negative sample.
+        (Category::Clause, "Filter (WHERE)") => Some(Expect::Rows(count - 1)),
+        // One row per series.
+        (Category::Clause, "GROUP BY") => Some(Expect::Rows(2)),
+        (Category::Clause, "LIMIT") => Some(Expect::Rows(1)),
+        (Category::TableDispatch, "samples -> Signal::Metrics") => Some(Expect::Rows(count)),
+        (Category::TableDispatch, "logs -> Signal::Logs") => Some(Expect::Rows(LOG_RECORD_COUNT)),
+        _ => None,
+    }
+}
+
+/// Checks a query's actual output against its declared expectation. `Ok(())`
+/// means the construct answered with the values the registry claims for it.
+fn check_output(expect: Expect, output: &QueryOutput) -> Result<(), String> {
+    match expect {
+        Expect::Scalar(want) => {
+            if output.num_rows() != 1 {
+                return Err(format!(
+                    "expected 1 row carrying {want}, got {} rows",
+                    output.num_rows()
+                ));
+            }
+            let got = single_f64(output)?;
+            // Bit-pattern comparison, per CLAUDE.md's float rule: NaN and
+            // -0.0 are significant in an aggregate result.
+            if got.to_bits() != want.to_bits() {
+                return Err(format!("expected {want}, got {got}"));
+            }
+            Ok(())
+        }
+        Expect::Rows(want) => {
+            if output.num_rows() != want {
+                return Err(format!("expected {want} rows, got {}", output.num_rows()));
+            }
+            for batch in output.batches() {
+                for column in batch.columns() {
+                    if !column.is_empty() && column.null_count() == column.len() {
+                        return Err(
+                            "a result column is entirely null, so the rows carry no values"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The single numeric cell of a one-row, one-column result, as an `f64`.
+/// `count` comes back as an integer column, so both cases are read.
+fn single_f64(output: &QueryOutput) -> Result<f64, String> {
+    use datafusion::arrow::array::{Float64Array, Int64Array, UInt64Array};
+
+    let batch = output
+        .batches()
+        .iter()
+        .find(|b| b.num_rows() == 1)
+        .ok_or_else(|| "no single-row batch in the result".to_string())?;
+    if batch.num_columns() != 1 {
+        return Err(format!("expected 1 column, got {}", batch.num_columns()));
+    }
+    let column = batch.column(0);
+    if let Some(floats) = column.as_any().downcast_ref::<Float64Array>() {
+        return Ok(floats.value(0));
+    }
+    if let Some(ints) = column.as_any().downcast_ref::<Int64Array>() {
+        return Ok(ints.value(0) as f64);
+    }
+    if let Some(ints) = column.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(ints.value(0) as f64);
+    }
+    Err(format!(
+        "result column has type {}, which is not a number",
+        column.data_type()
+    ))
 }
 
 /// The stable name of a [`ValidationError`] variant, for matching a live
@@ -57,22 +187,130 @@ fn validation_variant(err: &ValidationError) -> &'static str {
     }
 }
 
+/// Publishes one RLOG object of [`LOG_RECORD_COUNT`] records plus its
+/// `Signal::Logs` commit record, so the `logs` dispatch row has real rows to
+/// return instead of passing on an empty-but-successful answer.
+async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("conformance".to_string()),
+    )];
+    let stream_id = logstream::log_stream_id(&resource, "scope", "1.0", &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+
+    let writer_id = Uuid::from_u128(2_000);
+    let mut writer = RlogWriter::new(
+        RlogConfig::default(),
+        ObjectIdentity {
+            tenant_hash: tenant.hash().0,
+            shard: 0,
+            writer_id: *writer_id.as_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+    );
+    for i in 0..LOG_RECORD_COUNT {
+        let ts_ns = 1_000 + i as i64;
+        writer
+            .push(LogRecord {
+                stream_id,
+                stream_attrs: stream_attrs.clone(),
+                ts_ns,
+                observed_ts_ns: ts_ns,
+                severity_num: 9,
+                severity_text: "INFO".to_string(),
+                body: format!("conformance record {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: Vec::new(),
+            })
+            .expect("push log record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+
+    // The RLOG fetch path never re-hashes the object (unlike RSEG's reader), so
+    // a fixed content hash is enough here: it only has to be the same bytes the
+    // data key is derived from.
+    let content_hash = [7u8; 32];
+    let new_record = NewCommitRecord {
+        tenant_hash: tenant.hash(),
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: LOG_RECORD_COUNT as u64,
+        series_count: 1,
+        min_event_ts_ns: 1_000,
+        max_event_ts_ns: 1_000 + LOG_RECORD_COUNT as i64 - 1,
+        min_ingest_ts_ns: 1_000,
+        max_ingest_ts_ns: 1_000 + LOG_RECORD_COUNT as i64 - 1,
+        segment_format_version: 1,
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    };
+    let rec = record::build(new_record).expect("valid logs commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("logs data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put rlog object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish logs commit record");
+}
+
+/// A fixture carrying both the metrics dataset and the logs object, which is
+/// what every construct in the registry is verified against.
+async fn conformance_fixture() -> Fixture {
+    let tenant = tenant_id("conformance");
+    let specs = dataset();
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let fixture = Fixture::build(
+        Arc::clone(&store),
+        &[(&tenant, &specs)],
+        ravel_sql::SqlConfig::default(),
+        1 << 30,
+    )
+    .await;
+    publish_logs(store.as_ref(), &tenant).await;
+    fixture
+}
+
+/// Runs one supported construct's example and checks the result against a
+/// declared expectation, rather than against `Ok(_)` alone.
+async fn verify_supported(example: &str, expect: Expect, fixture: &Fixture) -> Verdict {
+    let tenant = tenant_id("conformance");
+    match fixture
+        .executor
+        .execute(tenant.hash(), &request(example))
+        .await
+    {
+        Ok(outcome) => match check_output(expect, &outcome.output) {
+            Ok(()) => Verdict::Confirmed,
+            Err(observed) => Verdict::Broken { observed },
+        },
+        Err(e) => Verdict::Broken {
+            observed: format!("query failed: {e}"),
+        },
+    }
+}
+
 /// Check one construct's live behavior against its declared classification.
 async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
     let tenant = tenant_id("conformance");
     match construct.classification {
-        Classification::SupportedAndCovered { .. } => {
-            match fixture
-                .executor
-                .execute(tenant.hash(), &request(&construct.example))
-                .await
-            {
-                Ok(_) => Verdict::Confirmed,
-                Err(e) => Verdict::Broken {
-                    observed: format!("query failed: {e}"),
-                },
-            }
-        }
+        Classification::SupportedAndCovered { .. } => match expectation(construct) {
+            Some(expect) => verify_supported(&construct.example, expect, fixture).await,
+            // A supported row with no declared result is unverifiable: `Ok(_)`
+            // alone would let an empty answer publish as covered.
+            None => Verdict::Broken {
+                observed: "no result expectation is declared for this construct".to_string(),
+            },
+        },
         Classification::IntentionallyRejected { typed_error } => {
             if typed_error == "SqlError::CrossSignalQuery" {
                 match fixture
@@ -117,9 +355,7 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
 
 /// Verify every enumerated construct and return the annotated surface.
 async fn verify_all() -> Vec<Verified> {
-    let tenant = tenant_id("conformance");
-    let specs = dataset();
-    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+    let fixture = conformance_fixture().await;
 
     let mut verified = Vec::new();
     for construct in registry() {
@@ -138,28 +374,50 @@ fn doc_path() -> PathBuf {
 // Acceptance tests
 // ---------------------------------------------------------------------------
 
-/// Every construct declared supported executes through the real pipeline. This
-/// is the test the registry names as evidence for its state-1 rows.
+/// Every construct declared supported executes through the real pipeline *and*
+/// returns the result its expectation declares. This is the test the registry
+/// names as evidence for its state-1 rows, and the value check is what keeps an
+/// empty-but-successful answer from counting as coverage (issue #262 gap 3).
+///
+/// The name is load-bearing: the registry cites
+/// `tests/conformance.rs::supported_constructs_execute` as the evidence for
+/// every state-1 row, so this function keeps that name.
 #[tokio::test]
 async fn supported_constructs_execute() {
     let tenant = tenant_id("conformance");
-    let specs = dataset();
-    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+    let fixture = conformance_fixture().await;
 
+    let mut checked = 0usize;
     for construct in registry() {
         if let Classification::SupportedAndCovered { .. } = construct.classification {
+            let expect = expectation(&construct).unwrap_or_else(|| {
+                panic!(
+                    "supported construct `{}` declares no result expectation",
+                    construct.name
+                )
+            });
             let outcome = fixture
                 .executor
                 .execute(tenant.hash(), &request(&construct.example))
                 .await;
-            assert!(
-                outcome.is_ok(),
-                "supported construct `{}` must execute: {:?}",
-                construct.name,
-                outcome.err()
-            );
+            let output = outcome
+                .unwrap_or_else(|e| {
+                    panic!("supported construct `{}` must execute: {e}", construct.name)
+                })
+                .output;
+            if let Err(why) = check_output(expect, &output) {
+                panic!(
+                    "supported construct `{}` ran `{}` but {why}",
+                    construct.name, construct.example
+                );
+            }
+            checked += 1;
         }
     }
+    assert!(
+        checked > 0,
+        "the registry must enumerate supported constructs"
+    );
 }
 
 /// Every construct declared intentionally rejected returns its declared typed
@@ -233,6 +491,83 @@ async fn registry_has_exactly_one_state_per_construct() {
     assert_eq!(
         s.unclassified, 0,
         "no construct may be left unclassified once verified"
+    );
+}
+
+/// Issue #262 gap 3: a construct that executes but answers with nothing is
+/// broken, not covered.
+///
+/// The synthetic regression is a real query that really succeeds and really
+/// returns zero rows (`WHERE value > 1000` over a dataset whose largest value
+/// is 3). Under the old `Ok(_)`-only check this was a confirmed state-1 row; the
+/// value check makes it a state-3 row, and the same check catches a wrong
+/// aggregate value.
+#[tokio::test]
+async fn an_empty_but_successful_result_is_not_coverage() {
+    let fixture = conformance_fixture().await;
+
+    let verdict = verify_supported(
+        "SELECT ts, value FROM samples WHERE value > 1000 ORDER BY ts",
+        Expect::Rows(SAMPLE_VALUES.len()),
+        &fixture,
+    )
+    .await;
+    match verdict {
+        Verdict::Broken { observed } => assert_eq!(observed, "expected 4 rows, got 0"),
+        Verdict::Confirmed => panic!("an empty result must not confirm a supported construct"),
+    }
+
+    // The control: the same shape of query over the real data confirms.
+    assert_eq!(
+        verify_supported(
+            "SELECT ts, value FROM samples WHERE value > 0 ORDER BY ts",
+            Expect::Rows(SAMPLE_VALUES.len() - 1),
+            &fixture,
+        )
+        .await,
+        Verdict::Confirmed
+    );
+
+    // A successful query answering with the wrong value is caught the same
+    // way: `sum` over this dataset is 5, not 4.
+    match verify_supported(
+        "SELECT sum(value) FROM samples",
+        Expect::Scalar(4.0),
+        &fixture,
+    )
+    .await
+    {
+        Verdict::Broken { observed } => assert_eq!(observed, "expected 4, got 5"),
+        Verdict::Confirmed => panic!("a wrong aggregate value must not confirm"),
+    }
+}
+
+/// Every supported row states what it must return, so no construct can be
+/// added to the registry and verified on `Ok(_)` alone.
+#[test]
+fn every_supported_construct_declares_a_result_expectation() {
+    let mut supported = 0usize;
+    for construct in registry() {
+        if let Classification::SupportedAndCovered { .. } = construct.classification {
+            assert!(
+                expectation(&construct).is_some(),
+                "supported construct `{}` ({}) declares no result expectation",
+                construct.name,
+                construct.category.label()
+            );
+            supported += 1;
+        }
+        if let Classification::IntentionallyRejected { .. } = construct.classification {
+            assert!(
+                expectation(&construct).is_none(),
+                "rejected construct `{}` declares a result expectation",
+                construct.name
+            );
+        }
+    }
+    assert!(
+        supported > 0,
+        "the registry must enumerate supported constructs"
     );
 }
 

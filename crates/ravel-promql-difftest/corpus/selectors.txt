@@ -101,6 +101,7 @@ query: diff_metric_that_does_not_exist
 kind: instant
 time: +0s
 mode: unordered
+expect: empty
 
 name: instant_special_values_plus_inf
 query: diff_special_values
@@ -136,6 +137,7 @@ query: diff_stale
 kind: instant
 time: +30s
 mode: unordered
+expect: empty
 
 name: instant_stale_marker_recovers
 query: diff_stale
@@ -233,3 +235,4 @@ query: diff_gauge_walk{job="api",}
 kind: instant
 time: +0s
 mode: unordered
+expect: empty
