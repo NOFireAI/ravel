@@ -1054,6 +1054,15 @@ fn push_checked(
     value: String,
     limits: &IngestLimits,
 ) -> Result<(), Rejection> {
+    // ADR-0038: a label with an empty value is treated as absent from the
+    // series, matching Prometheus convention and what ravel-remote-write
+    // already does (normalize.rs's `l.value.is_empty()` drop) and what
+    // ravel-promql's matcher assumes (a missing label reads as ""). Drop it
+    // before the length checks, exactly like remote-write, so every ingest
+    // path hands SeriesId::compute the same label set for one logical series.
+    if value.is_empty() {
+        return Ok(());
+    }
     if name.len() > limits.max_label_name_len {
         return Err(Rejection::LabelNameTooLong {
             len: name.len(),

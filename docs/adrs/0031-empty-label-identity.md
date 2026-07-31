@@ -2,6 +2,11 @@
 
 Status: Proposed (2026-07-28)
 
+Update (2026-08-01): the empty-*value* half of this proposal, for the OTLP and
+OTAP paths, was accepted and implemented in ADR-0038 (issue #202). The
+empty-*name* rejection and the RW1 decode fix described below remain proposed
+and unimplemented.
+
 ## Context
 
 `SeriesId::compute` (ADR-0005, `crates/ravel-types/src/lib.rs`) hashes every
