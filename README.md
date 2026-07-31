@@ -134,6 +134,26 @@ This needs `docker`, `kind`, and `kubectl`. For the full walkthrough, the
 `RavelCluster` field reference, and probe semantics, see
 [docs/guides/kubernetes.md](docs/guides/kubernetes.md).
 
+### Container images
+
+`ravel-server` and `ravel-operator` images are built in CI on native amd64
+runners and published to GitHub Container Registry (ADR-0037):
+
+```sh
+docker pull ghcr.io/nofireai/ravel-server:latest
+docker pull ghcr.io/nofireai/ravel-operator:latest
+```
+
+Tags: `X.Y.Z`, `X.Y`, `X`, and `latest` on a `vX.Y.Z` git tag push;
+`manual-<short-sha>` from a manual `workflow_dispatch` run of
+[`publish-images.yml`](.github/workflows/publish-images.yml). There is no
+image for an ordinary push to `main`; see the ADR for why.
+
+Building an amd64 image locally on an Apple Silicon Mac (`docker build
+--platform linux/amd64 ...`) is not supported: Docker Desktop cross-emulates
+amd64 through QEMU, and `rustc` reliably segfaults under that emulation. Pull
+the published image, or build natively on an amd64 host, instead.
+
 ## Querying
 
 After you ingest data (see Quickstart), you can query it as PromQL or as SQL.

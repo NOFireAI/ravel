@@ -2,7 +2,8 @@
 #
 # Apply order: namespace, then crd.yaml, then rbac.yaml, then this file. The
 # image tag is a placeholder the kind scripts (issue #249) override with the
-# locally built tag.
+# locally built tag. For a real (non-kind) cluster, set this to a published
+# tag instead, e.g. ghcr.io/nofireai/ravel-operator:latest (ADR-0037).
 ---
 apiVersion: v1
 kind: Namespace
