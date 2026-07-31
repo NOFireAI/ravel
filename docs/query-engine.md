@@ -206,13 +206,14 @@ of reason -- it is promql-parser's hook for downstream dialects and has no
 Prometheus counterpart -- and Ravel rejects it with a typed
 `Error::Unsupported` regardless.
 
-One caveat on those out-of-surface constructs: the experimental aggregation
-operators `limitk` and `limit_ratio` do **not** currently reject cleanly.
-promql-parser 0.10 parses both, and `ravel-promql`'s aggregation dispatch
-reaches an `unreachable!` that still assumes twelve aggregator tokens, so the
-query panics instead of returning a typed error. That is a defect, not a
-documented position, and it is reported for triage rather than recorded here
-as a state; the table stays limited to the stable surface either way.
+One note on those out-of-surface constructs: promql-parser 0.10 parses the
+experimental aggregation operators `limitk` and `limit_ratio`, so a tenant
+can reach them on the query path even though they are outside the scored
+surface. `ravel-promql`'s aggregation dispatch rejects both with a typed
+`Error::Unsupported` naming the operator, never a panic, honoring the state-2
+"rejected, not panicking" guarantee (#260). They stay out of the scored
+surface (they are not part of the stable language), and are not implemented;
+the clean rejection is what the guarantee requires.
 
 The table below is generated from a run, not hand-maintained: the state
 column is recomputed from which corpus entries actually exercise each
