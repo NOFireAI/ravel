@@ -12,7 +12,7 @@ The root `Dockerfile` (ADR-0034 decision 5) and its CI companion
 push that touches it, and `k8s-integration` (ci.yml:527-636) assembles
 both from prebuilt binaries for the kind lane. Both are build-only: no
 job tags or pushes an image anywhere, no registry is referenced anywhere
-in the repo (`deploy/k8s/operator/operator.yaml:40` hardcodes
+in the repo (`deploy/k8s/operator/operator.yaml:41` hardcodes
 `image: ravel-operator:latest` as a placeholder the kind scripts
 override), and no publish workflow exists.
 
@@ -151,7 +151,7 @@ repo config). The GitHub org is `NOFireAI`, repo `store`.
   deliberate CI-lane optimizations, not properties a published,
   externally-pulled image should inherit.
 - **Reusing the `docker-build` job for push.** Rejected in decision 4:
-  that job's whole purpose (per its own comments, ci.yml:641-664) is a
+  that job's whole purpose (per its own comments, ci.yml:638-664) is a
   cheap, path-gated build-only proof that the shipping Dockerfile still
   works; giving it `packages: write` and registry credentials widens its
   blast radius for no benefit, since the publish workflow's own build
