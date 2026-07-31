@@ -35,8 +35,9 @@ use ravel_otap::encode::{
 };
 use ravel_otap::normalize::{
     AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA,
-    AGGREGATION_TEMPORALITY_UNSPECIFIED, ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE,
-    METRIC_TYPE_HISTOGRAM, normalize_decoded,
+    AGGREGATION_TEMPORALITY_UNSPECIFIED, ANY_VALUE_TYPE_BYTES, ANY_VALUE_TYPE_MAP,
+    ANY_VALUE_TYPE_SLICE, ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM,
+    normalize_decoded,
 };
 use ravel_otap::proto::experimental::arrow::v1::{ArrowPayloadType, BatchArrowRecords};
 use ravel_otap::stream::{DecodedBatch, StreamConfig, StreamState};
@@ -496,7 +497,7 @@ fn complex_attribute_value_rejected_on_both_paths() {
             flags: 0,
             attrs: vec![AttrRow {
                 key: "blob".to_string(),
-                value: AttrValue::Complex,
+                value: AttrValue::Complex(ANY_VALUE_TYPE_BYTES),
             }],
         }],
     }];
@@ -507,6 +508,60 @@ fn complex_attribute_value_rejected_on_both_paths() {
     let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
     assert!(otap_out.points.is_empty());
     assert_eq!(otap_out.rejected, vec![Rejection::ComplexAttributeValue]);
+}
+
+/// Issue #232: all three non-scalar AnyValue `type` slots -- map (5), slice
+/// (6), and bytes (7) per otap-spec.md section 5.5.1 -- must survive
+/// encode-then-decode and land on the normalizer's `ComplexAttributeValue`
+/// rejection path. This pins the spec-aligned discriminant values: an
+/// earlier revision numbered these 7=map/6=array/5=bytes (after OTLP's oneof
+/// field numbers), so a regression that reverted them would still reject
+/// here (every slot 5-7 is non-scalar) but would misread the scalar slots,
+/// which the differential proptests catch. This test's job is to prove the
+/// three complex slots are all reachable and all rejected together.
+#[test]
+fn complex_attribute_type_slots_round_trip_rejected() {
+    let tenant = TenantId::new("acme");
+    let limits = IngestLimits::default();
+
+    // One gauge metric per complex type slot, each with a single point
+    // carrying one attribute of that type. Each point must be rejected.
+    let metrics: Vec<MetricRow> = [
+        ("map_attr", ANY_VALUE_TYPE_MAP),
+        ("slice_attr", ANY_VALUE_TYPE_SLICE),
+        ("bytes_attr", ANY_VALUE_TYPE_BYTES),
+    ]
+    .into_iter()
+    .map(|(name, ty)| MetricRow {
+        name: name.to_string(),
+        kind: MetricKind::Gauge,
+        data_points: vec![DataPointRow {
+            time_unix_nano: INGEST_TS_NS,
+            value: 1.0,
+            flags: 0,
+            attrs: vec![AttrRow {
+                key: "blob".to_string(),
+                value: AttrValue::Complex(ty),
+            }],
+        }],
+    })
+    .collect();
+
+    let mut encoder = MetricsStreamEncoder::new("complex-slots").expect("new encoder");
+    let raw_batch = encoder.encode_batch(0, &metrics).expect("encode");
+    let mut state = StreamState::new(StreamConfig::default());
+    let decoded = state.decode(raw_batch).expect("decode");
+    let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+
+    assert!(otap_out.points.is_empty());
+    assert_eq!(
+        otap_out.rejected,
+        vec![
+            Rejection::ComplexAttributeValue,
+            Rejection::ComplexAttributeValue,
+            Rejection::ComplexAttributeValue,
+        ]
+    );
 }
 
 #[test]

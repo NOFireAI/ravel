@@ -25,9 +25,10 @@
 //!   fixed for a `MetricsStreamEncoder`'s lifetime.
 //! - `NUMBER_DP_ATTRS`: `parent_id` (UInt32, FK to `NUMBER_DATA_POINTS.id`),
 //!   `key` (Utf8), `type` (UInt8, an AnyValue discriminant per otap-spec.md
-//!   section 5.5.1: 1=String, 2=Bool, 3=Int, 4=Double; `AttrValue::Complex`
-//!   uses 6=Array purely as a marker with no populated value column, to
-//!   exercise the normalizer's `ComplexAttributeValue` rejection path),
+//!   section 5.5.1: 1=str, 2=int, 3=double, 4=bool; `AttrValue::Complex`
+//!   carries a 5=map/6=slice/7=bytes discriminant purely as a marker with no
+//!   populated value column, to exercise the normalizer's
+//!   `ComplexAttributeValue` rejection path),
 //!   `str`/`bool`/`int`/`double` (nullable, one populated per row per its
 //!   `type`). A real exporter would omit whichever of these four columns no
 //!   row in a given schema generation ever populates (otap-spec.md section
@@ -74,23 +75,23 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit, UInt8Type};
 use arrow_ipc::writer::StreamWriter;
 
 use crate::normalize::{
-    ANY_VALUE_TYPE_ARRAY, ANY_VALUE_TYPE_BOOL, ANY_VALUE_TYPE_DOUBLE, ANY_VALUE_TYPE_INT,
-    ANY_VALUE_TYPE_STRING, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM, METRIC_TYPE_SUM,
-    METRIC_TYPE_SUMMARY,
+    ANY_VALUE_TYPE_BOOL, ANY_VALUE_TYPE_DOUBLE, ANY_VALUE_TYPE_INT, ANY_VALUE_TYPE_STRING,
+    METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM, METRIC_TYPE_SUM, METRIC_TYPE_SUMMARY,
 };
 use crate::proto::experimental::arrow::v1::{ArrowPayload, ArrowPayloadType, BatchArrowRecords};
 
 /// A data-point attribute's value, mirroring the AnyValue arms this encoder
-/// can emit (see module docs for the `type` discriminant mapping). `Complex`
-/// stands in for the Array/KVList/Bytes arms, none of which this encoder
-/// gives a real column: it exists only to produce a `type` discriminant the
-/// normalizer must reject.
+/// can emit (see module docs for the `type` discriminant mapping).
+/// `Complex(type)` stands in for the map/slice/bytes arms, none of which this
+/// encoder gives a real value column: it exists only to produce a non-scalar
+/// `type` discriminant (5=map, 6=slice, or 7=bytes per otap-spec.md section
+/// 5.5.1) the normalizer must reject as `ComplexAttributeValue`.
 pub enum AttrValue {
     Str(String),
     Bool(bool),
     Int(i64),
     Double(f64),
-    Complex,
+    Complex(u8),
 }
 
 /// A single data-point attribute.
@@ -384,7 +385,7 @@ impl AttrColumnBuilder {
             AttrValue::Bool(b) => (ANY_VALUE_TYPE_BOOL, None, Some(*b), None, None),
             AttrValue::Int(i) => (ANY_VALUE_TYPE_INT, None, None, Some(*i), None),
             AttrValue::Double(d) => (ANY_VALUE_TYPE_DOUBLE, None, None, None, Some(*d)),
-            AttrValue::Complex => (ANY_VALUE_TYPE_ARRAY, None, None, None, None),
+            AttrValue::Complex(ty) => (*ty, None, None, None, None),
         };
         self.types.push(ty);
         self.strs.push(str_v);
