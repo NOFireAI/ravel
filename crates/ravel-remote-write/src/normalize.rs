@@ -50,6 +50,9 @@ pub enum RwRejection {
     #[error("{reason} (rejecting {count} point(s))")]
     Otlp { reason: Rejection, count: usize },
 
+    #[error("label name is empty (rejecting {count} point(s))")]
+    EmptyLabelName { count: usize },
+
     #[error(
         "native histogram schema {schema} is below the -53 custom-buckets sentinel, which no bucket layout defines"
     )]
@@ -100,6 +103,7 @@ impl RwRejection {
     pub fn rejected_count(&self) -> usize {
         match self {
             RwRejection::Otlp { count, .. } => *count,
+            RwRejection::EmptyLabelName { count } => *count,
             RwRejection::NativeHistogramSchemaUnsupported { .. }
             | RwRejection::NativeHistogramCountKindMixed
             | RwRejection::NativeHistogramBucketEncodingMixed { .. }
@@ -240,11 +244,8 @@ fn normalize_series(
 
     let (metric_name, label_set) = match resolve_series_identity(series, limits, point_count) {
         Ok(v) => v,
-        Err(reason) => {
-            rejected.push(RwRejection::Otlp {
-                reason,
-                count: point_count,
-            });
+        Err(rejection) => {
+            rejected.push(rejection);
             return;
         }
     };
@@ -297,60 +298,78 @@ fn normalize_series(
 
 /// Resolve one series' `__name__` and remaining labels into a metric name
 /// and validated [`LabelSet`], per docs/ingest-breadth-plan.md section 2.1:
-/// `__name__` must be present and non-empty; empty-value labels are dropped
-/// as absent; duplicate names (including a duplicated `__name__`) reject;
-/// existing `IngestLimits` length/count limits apply unchanged, with
+/// `__name__` must be present and non-empty; an empty label *name* is
+/// rejected as malformed regardless of its value (ADR-0031), which is what
+/// RW2 already enforces at decode (`Rw2DecodeError::EmptyLabelName`) and RW1
+/// did not; enforcing it here makes both decoders agree on the resolved
+/// series and keeps an empty-named label out of `SeriesId::compute`.
+/// Empty-*value* labels are dropped as absent (ADR-0031, unchanged);
+/// duplicate names (including a duplicated `__name__`) reject; existing
+/// `IngestLimits` length/count limits apply unchanged, with
 /// `max_attributes_per_point` counted over labels excluding `__name__` to
 /// match the OTLP surface, where the metric name is a separate proto field.
 fn resolve_series_identity(
     series: &ResolvedSeries,
     limits: &IngestLimits,
     point_count: usize,
-) -> Result<(String, LabelSet), Rejection> {
+) -> Result<(String, LabelSet), RwRejection> {
+    let otlp = |reason| RwRejection::Otlp {
+        reason,
+        count: point_count,
+    };
+
     let mut name_labels = series.labels.iter().filter(|l| l.name == METRIC_NAME_LABEL);
     let name_label = name_labels.next();
     if name_labels.next().is_some() {
-        return Err(Rejection::DuplicateLabelName(METRIC_NAME_LABEL.to_string()));
+        return Err(otlp(Rejection::DuplicateLabelName(
+            METRIC_NAME_LABEL.to_string(),
+        )));
     }
     let metric_name = match name_label {
-        None => return Err(Rejection::EmptyMetricName { count: point_count }),
+        None => return Err(otlp(Rejection::EmptyMetricName { count: point_count })),
         Some(l) if l.value.is_empty() => {
-            return Err(Rejection::EmptyMetricName { count: point_count });
+            return Err(otlp(Rejection::EmptyMetricName { count: point_count }));
         }
         Some(l) => l.value.clone(),
     };
     if metric_name.len() > limits.max_metric_name_len {
-        return Err(Rejection::MetricNameTooLong {
+        return Err(otlp(Rejection::MetricNameTooLong {
             len: metric_name.len(),
             max: limits.max_metric_name_len,
             count: point_count,
-        });
+        }));
     }
 
     let mut labels = Vec::with_capacity(series.labels.len());
     for l in &series.labels {
+        // Reject an empty label name before the empty-value drop below:
+        // ADR-0031 rejects an empty name independent of its value, so a
+        // `{name: "", value: ""}` label must not slip through as "absent".
+        if l.name.is_empty() {
+            return Err(RwRejection::EmptyLabelName { count: point_count });
+        }
         if l.name == METRIC_NAME_LABEL || l.value.is_empty() {
             continue;
         }
         if l.name.len() > limits.max_label_name_len {
-            return Err(Rejection::LabelNameTooLong {
+            return Err(otlp(Rejection::LabelNameTooLong {
                 len: l.name.len(),
                 max: limits.max_label_name_len,
-            });
+            }));
         }
         if l.value.len() > limits.max_label_value_len {
-            return Err(Rejection::LabelValueTooLong {
+            return Err(otlp(Rejection::LabelValueTooLong {
                 len: l.value.len(),
                 max: limits.max_label_value_len,
-            });
+            }));
         }
         labels.push(l.clone());
     }
     if labels.len() > limits.max_attributes_per_point {
-        return Err(Rejection::TooManyAttributes {
+        return Err(otlp(Rejection::TooManyAttributes {
             attribute_count: labels.len(),
             max: limits.max_attributes_per_point,
-        });
+        }));
     }
     labels.push(Label {
         name: METRIC_NAME_LABEL.to_string(),
@@ -358,11 +377,13 @@ fn resolve_series_identity(
     });
 
     let label_set = LabelSet::new(labels).map_err(|err| match err {
-        ravel_types::TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
+        ravel_types::TypeError::DuplicateLabelName(name) => {
+            otlp(Rejection::DuplicateLabelName(name))
+        }
         // LabelSet::new only ever returns DuplicateLabelName; this arm
         // exists so a future TypeError variant can't silently pass through
         // as an accepted series.
-        _ => Rejection::DuplicateLabelName(String::new()),
+        _ => otlp(Rejection::DuplicateLabelName(String::new())),
     })?;
 
     Ok((metric_name, label_set))
@@ -932,6 +953,34 @@ mod tests {
                 count: 1,
             }]
         );
+    }
+
+    #[test]
+    fn empty_label_name_rejects_series() {
+        // RW2 rejects this at decode (Rw2DecodeError::EmptyLabelName); the
+        // normalizer must reject it too so RW1, which copies the empty name
+        // verbatim, agrees and the empty-named label never reaches
+        // SeriesId::compute (ADR-0031, issue #204).
+        let req = request(vec![series(
+            vec![label("__name__", "up"), label("", "surprise")],
+            vec![sample(1_000, 1.0)],
+        )]);
+        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![RwRejection::EmptyLabelName { count: 1 }]);
+    }
+
+    #[test]
+    fn empty_label_name_rejects_even_with_empty_value() {
+        // ADR-0031 rejects an empty name independent of its value: the
+        // empty-value "treat as absent" drop must not swallow it first.
+        let req = request(vec![series(
+            vec![label("__name__", "up"), label("", "")],
+            vec![sample(1_000, 1.0), sample(2_000, 2.0)],
+        )]);
+        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        assert!(out.points.is_empty());
+        assert_eq!(out.rejected, vec![RwRejection::EmptyLabelName { count: 2 }]);
     }
 
     #[test]

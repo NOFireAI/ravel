@@ -204,6 +204,37 @@ fn empty_value_label_dropped_identically_across_decoders() {
 }
 
 #[test]
+fn empty_label_name_rejects_identically_across_decoders() {
+    // The same logical payload carrying a label with an empty name must be
+    // rejected by both wire formats (ADR-0015 protocol parity, ADR-0031,
+    // issue #204). RW2 rejects it at decode (`Rw2DecodeError::EmptyLabelName`,
+    // because an empty label name resolves through `symbols[0]`); RW1 copies
+    // the empty name verbatim and the shared normalizer rejects it. Different
+    // layers, but the series is admitted by neither, so the empty-named label
+    // never reaches `SeriesId::compute` from either path.
+    let series = vec![logical_series(
+        &[("__name__", "up"), ("", "surprise")],
+        &[(1_700_000_000_000, 1.0)],
+    )];
+    let tenant = TenantId::new("t-differential");
+    let limits = IngestLimits::default();
+    let ingest_ts_ns = 1_700_000_100_000_000_000;
+
+    // RW1: decode succeeds, normalization rejects the whole series.
+    let resolved1 = decode_write_request(&build_rw1(&series), 10_000_000).expect("rw1 decode");
+    let out1 = normalize_resolved(&tenant, resolved1, &limits, ingest_ts_ns);
+    assert!(out1.points.is_empty(), "{:?}", out1.points);
+    assert!(!out1.rejected.is_empty());
+
+    // RW2: rejected earlier, at decode, before normalization is reached.
+    let rw2 = decode_request(&build_rw2(&series), 10_000_000);
+    assert!(
+        rw2.is_err(),
+        "rw2 must reject an empty label name at decode"
+    );
+}
+
+#[test]
 fn zero_timestamp_rejects_identically_across_decoders() {
     let series = vec![logical_series(&[("__name__", "up")], &[(0, 1.0)])];
     let (out1, out2) = diff_normalize(&series);
