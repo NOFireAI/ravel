@@ -279,10 +279,10 @@ enum AttrEqValue<'b> {
 /// 6.4.3): each row's `parent_id` is a delta from the previous row when that
 /// row's equality columns -- `type`, `key`, and the type's Active Field value
 /// -- all match, and an absolute value otherwise. Rows whose type has no
-/// scalar Active Field (empty, and the complex Bytes/Array/Map arms this
-/// crate reads no value column for) or whose active value is null are never
-/// delta-encoded and always read absolute, matching the spec's "Map and Slice
-/// ... and null values" exceptions. The running sum wraps rather than panics
+/// scalar Active Field (a null `type` discriminant, empty, and the complex
+/// Bytes/Array/Map arms this crate reads no value column for) or whose active
+/// value is null are never delta-encoded and always read absolute, matching the
+/// spec's "Map and Slice ... and null values" exceptions. The running sum wraps rather than panics
 /// on adversarial input, matching [`decode_delta_u32`]; a null `parent_id`
 /// carries the accumulator through unchanged, as delta decoding does.
 fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32> {
@@ -297,12 +297,22 @@ fn decode_quasi_delta_attrs(rb: &RecordBatch, encoded: &UInt32Array) -> Vec<u32>
     // ineligible for delta encoding (missing key/type column, null key, a
     // non-scalar type, or a null active value).
     let eq_key = |i: usize| -> Option<(u8, &str, AttrEqValue)> {
-        let types = types?;
         let keys = keys?;
         if keys.is_null(i) {
             return None;
         }
-        let ty = types.value(i);
+        // A null `type` discriminant has no in-contract Active Field, so the
+        // row is ineligible for delta encoding and reads absolute, exactly like
+        // the null-active-value scalar arms below and the non-scalar arm. Read
+        // through the null-checking `opt_u8` (same as the sibling `str`/`bool`/
+        // `int`/`double` value columns), never `types.value(i)` directly: a
+        // malformed producer can unset the discriminant's validity bit while
+        // leaving a scalar-type byte in the buffer, and without this guard the
+        // run-continuation decision would read that stale byte instead of
+        // taking the "no scalar Active Field -> always absolute" fallback this
+        // function's doc comment promises. `opt_u8` also yields `None` when the
+        // `type` column is absent entirely (the prior `let types = types?`).
+        let ty = opt_u8(types, i)?;
         let value = match ty {
             ANY_VALUE_TYPE_STRING => AttrEqValue::Str(opt_str(strs, i)?),
             ANY_VALUE_TYPE_BOOL => AttrEqValue::Bool(opt_bool(bools, i)?),
@@ -779,7 +789,11 @@ struct FlatSummaryDp {
 struct FlatAttr<'b> {
     parent_id: u32,
     key: &'b str,
-    ty: u8,
+    /// The AnyValue `type` discriminant, or `None` when this row's discriminant
+    /// is null (validity bit unset). A null discriminant is out of contract and
+    /// [`raw_cell`] routes it through the complex/rejected fallback rather than
+    /// reading whatever byte the buffer still holds.
+    ty: Option<u8>,
     str_val: Option<&'b str>,
     bool_val: Option<bool>,
     int_val: Option<i64>,
@@ -859,6 +873,10 @@ fn name_at(col: &Arc<dyn Array>, i: usize) -> Option<String> {
         return Some(s.value(i).to_string());
     }
     None
+}
+
+fn opt_u8(col: Option<&UInt8Array>, i: usize) -> Option<u8> {
+    col.filter(|c| !c.is_null(i)).map(|c| c.value(i))
 }
 
 fn opt_i32(col: Option<&Int32Array>, i: usize) -> Option<i32> {
@@ -1007,7 +1025,12 @@ fn flatten_attrs<'b>(
             out.push(FlatAttr {
                 parent_id,
                 key: keys.value(i),
-                ty: types.value(i),
+                // Read the discriminant through the null-checking `opt_u8`, like
+                // the sibling value columns: a null `type` (validity bit unset,
+                // even with a scalar byte still in the buffer) is out of
+                // contract and must reach `raw_cell`'s rejection fallback, not
+                // be read as that stale byte.
+                ty: opt_u8(Some(types), i),
                 str_val: opt_str(strs, i),
                 bool_val: opt_bool(bools, i),
                 int_val: opt_i64(ints, i),
@@ -1020,12 +1043,18 @@ fn flatten_attrs<'b>(
 
 fn raw_cell(a: &FlatAttr) -> RawCell {
     match a.ty {
-        ANY_VALUE_TYPE_EMPTY => RawCell::Str(String::new()),
-        ANY_VALUE_TYPE_STRING => RawCell::Str(a.str_val.unwrap_or("").to_string()),
-        ANY_VALUE_TYPE_BOOL => RawCell::Bool(a.bool_val.unwrap_or(false)),
-        ANY_VALUE_TYPE_INT => RawCell::Int(a.int_val.unwrap_or(0)),
-        ANY_VALUE_TYPE_DOUBLE => RawCell::Double(a.double_val.unwrap_or(0.0).to_bits()),
-        _ => RawCell::Complex,
+        Some(ANY_VALUE_TYPE_EMPTY) => RawCell::Str(String::new()),
+        Some(ANY_VALUE_TYPE_STRING) => RawCell::Str(a.str_val.unwrap_or("").to_string()),
+        Some(ANY_VALUE_TYPE_BOOL) => RawCell::Bool(a.bool_val.unwrap_or(false)),
+        Some(ANY_VALUE_TYPE_INT) => RawCell::Int(a.int_val.unwrap_or(0)),
+        Some(ANY_VALUE_TYPE_DOUBLE) => RawCell::Double(a.double_val.unwrap_or(0.0).to_bits()),
+        // A null `type` discriminant (`None`) is out of contract: a malformed
+        // producer can unset the validity bit while leaving a scalar byte in
+        // the buffer. Like the complex Bytes/Array/Map types it carries no
+        // usable scalar value here, so it takes the same per-point
+        // `ComplexAttributeValue` rejection (via [`raw_cell_value`]) rather than
+        // being silently read as the buffer's stale scalar byte.
+        None | Some(_) => RawCell::Complex,
     }
 }
 

@@ -2065,6 +2065,92 @@ fn attrs_quasi_delta_parent_id_decodes_to_literal_values() {
     assert_eq!(by_value[&40.0f64.to_bits()].as_deref(), Some("eu"));
 }
 
+/// Issue #233: a null `type` discriminant in a `*Attrs` batch (validity bit
+/// unset) must be treated as out of contract, never read from whatever byte the
+/// buffer still holds. An adversarial producer can mark a row's `type` null
+/// while leaving a scalar-type byte (here `ANY_VALUE_TYPE_STRING`) in the
+/// buffer; the QUASI-DELTA run-continuation decision in `decode_quasi_delta_attrs`
+/// must take the documented "no scalar Active Field -> always absolute"
+/// fallback for that row instead of matching the previous row and continuing
+/// the delta run.
+///
+/// Three rows, all key=region str=us, the middle one's `type` marked null with
+/// a `STRING` byte still in its buffer, encoded QUASI-DELTA parent_ids
+/// `[0, 50, 2]`:
+/// - With the fix: row 0 absolute -> 0, row 1 (null type) absolute -> 50 and
+///   resets `prev`, row 2 absolute -> 2. So the third attr joins data point 2.
+/// - Without the fix: the null row is read as a normal `STRING` row that
+///   matches the run, so row 1 deltas to `0 + 50 = 50` and row 2 deltas to
+///   `50 + 2 = 52`, stranding the third attr on non-existent data point 52 and
+///   leaving data point 2 with no `region` label.
+///
+/// The middle attr's own decoded parent (50) matches no data point, so its
+/// out-of-contract cell is never consulted; the observable signal is whether
+/// data point 2 carries `region=us`.
+#[test]
+fn attrs_null_type_discriminant_reads_absolute_not_run_continuation() {
+    use arrow::buffer::{NullBuffer, ScalarBuffer};
+
+    let root = single_gauge_root("widgets");
+    let dp = plain_number_dp_batch(&[0, 2], 0, &[10.0, 20.0], &[INGEST_TS_NS, INGEST_TS_NS + 1]);
+
+    // The `type` column: buffer holds a scalar `STRING` byte on every row, but
+    // row 1's validity bit is unset (null), the adversarial shape #233 guards.
+    let type_values = ScalarBuffer::<u8>::from(vec![
+        ANY_VALUE_TYPE_STRING,
+        ANY_VALUE_TYPE_STRING,
+        ANY_VALUE_TYPE_STRING,
+    ]);
+    let type_nulls = NullBuffer::from(vec![true, false, true]);
+    let types = UInt8Array::new(type_values, Some(type_nulls));
+
+    let schema = Schema::new(vec![
+        id_field("parent_id", DataType::UInt32, Some("quasidelta")),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("type", DataType::UInt8, true),
+        Field::new("str", DataType::Utf8, true),
+    ]);
+    let attrs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32, 50, 2])),
+            Arc::new(StringArray::from(vec!["region", "region", "region"])),
+            Arc::new(types),
+            Arc::new(StringArray::from(vec![Some("us"), Some("us"), Some("us")])),
+        ],
+    )
+    .expect("build null-type attrs batch");
+
+    let out = decode_custom_batch(vec![
+        (ArrowPayloadType::UnivariateMetrics, root),
+        (ArrowPayloadType::NumberDataPoints, dp),
+        (ArrowPayloadType::NumberDpAttrs, attrs),
+    ]);
+
+    assert_eq!(
+        out.rejected,
+        Vec::new(),
+        "unexpected rejections: {:?}",
+        out.rejected
+    );
+    assert_eq!(out.points.len(), 2);
+
+    let mut by_value: BTreeMap<u64, Option<String>> = BTreeMap::new();
+    for p in &out.points {
+        by_value.insert(p.sample.value.to_bits(), region_of(p));
+    }
+    // Data point id 0 (value 10.0) joins the first attr as before.
+    assert_eq!(by_value[&10.0f64.to_bits()].as_deref(), Some("us"));
+    // Data point id 2 (value 20.0) only carries `region=us` if the null-type
+    // row read absolute (breaking the run) rather than continuing the delta.
+    assert_eq!(
+        by_value[&20.0f64.to_bits()].as_deref(),
+        Some("us"),
+        "null-type row must reset the QUASI-DELTA run so the third attr \
+         decodes to parent 2, not continue it to parent 52"
+    );
+}
+
 /// A `HISTOGRAM_DP_EXEMPLARS.parent_id` column defaults to QUASI-DELTA with
 /// `int_value`/`double_value` as its equality columns (otap-spec.md section
 /// 6.4.3). Encoded `[0, 3, 0, 3, 0]` with `double_value` `[1, 1, 7, 7, 7]`
