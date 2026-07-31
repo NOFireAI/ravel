@@ -108,6 +108,11 @@ name = "concurrent_bench"
 path = "src/bin/concurrent_bench.rs"
 bench = false
 
+[[bin]]
+name = "query_latency_bench"
+path = "src/bin/query_latency_bench.rs"
+bench = false
+
 
 [[bin]]
 name = "segment_alloc_profile"
@@ -185,6 +190,11 @@ bench = false
 [[test]]
 name = "concurrent_smoke"
 path = "tests/concurrent_smoke.rs"
+bench = false
+
+[[test]]
+name = "query_latency_smoke"
+path = "tests/query_latency_smoke.rs"
 bench = false
 
 [[bench]]
