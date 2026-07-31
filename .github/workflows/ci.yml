@@ -635,6 +635,80 @@ jobs:
         if: always()
         run: scripts/kind-down.sh
 
+  # Builds the root Dockerfile's two shipping images (`server` and `operator`)
+  # to prove the images the project actually ships still build (issue #292,
+  # found at epic #244's Wave 4 checkpoint review). No other job runs this
+  # Dockerfile: k8s-integration builds from Dockerfile.prebuilt with
+  # RAVEL_SKIP_IMAGE_BUILD=1 specifically to avoid this slow, OOM-prone build on
+  # every PR, so a broken COPY path, a bad `--target` stage name, or a
+  # toolchain-pin drift in this file would otherwise ship completely undetected.
+  #
+  # Build-only: the images are not run or smoke-tested here. k8s-integration
+  # already covers runtime behavior (via Dockerfile.prebuilt's `--help` smoke
+  # run and the kind round trip); this job's sole purpose is to prove the
+  # shipping Dockerfile itself still builds and assembles.
+  #
+  # Path-gated rather than run on every push. This Dockerfile recompiles the
+  # whole workspace inside Docker at CARGO_BUILD_JOBS=2 (the cap that keeps it
+  # from OOM-killing, issue #251) with no access to this workflow's sccache --
+  # 57 minutes measured on an 8 GiB arm64 host, per k8s-integration's notes --
+  # so running it on every PR push would be by far the most expensive job here.
+  # Every regression the issue names (a broken COPY path, a bad stage name, a
+  # toolchain-pin drift) is itself an edit to the Dockerfile, so building only
+  # when the Dockerfile or .dockerignore changes catches all of them at a
+  # fraction of the cost. The detection is done inline with the same merge-base
+  # diff the `changes` job uses, rather than a top-level `on.*.paths` filter,
+  # because a top-level filter would gate the entire workflow, not this one job.
+  # It keeps the standard `needs: changes` / docs_only gate every compiling job
+  # uses (a Dockerfile change is never docs-only, so that gate is a no-op here
+  # but stays for consistency); the inline check is the additional narrowing.
+  docker-build:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: dockerfile-changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "::notice::no usable base commit, building images to be safe"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          merge_base=$(git merge-base "$base" "${{ github.sha }}")
+          changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
+          # Whole-line match on the two root paths only: -x stops
+          # `Dockerfile.prebuilt` (built and covered by k8s-integration) from
+          # matching, and this job never builds that file.
+          if echo "$changed" | grep -qxE 'Dockerfile|\.dockerignore'; then
+            echo "::notice::Dockerfile or .dockerignore changed, building shipping images"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no Dockerfile change, skipping shipping-image build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+      # This build is disk-hungry (a full workspace compile plus two runtime
+      # image layers) and OOM-prone at high parallelism; same reasoning as
+      # k8s-integration's use of this action.
+      - name: Free disk space
+        if: steps.dockerfile-changed.outputs.build == 'true'
+        uses: ./.github/actions/free-disk-space
+      # CARGO_BUILD_JOBS stays at the Dockerfile's own cap of 2 (issue #251); it
+      # is deliberately not raised here.
+      - name: Build the server image
+        if: steps.dockerfile-changed.outputs.build == 'true'
+        run: docker build --target server .
+      - name: Build the operator image
+        if: steps.dockerfile-changed.outputs.build == 'true'
+        run: docker build --target operator .
+
   coverage:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
