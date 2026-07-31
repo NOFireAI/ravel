@@ -26,37 +26,12 @@ use std::time::{Duration, Instant};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::NormalizedPoint;
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
-use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Signal, TenantId};
+use ravel_types::{Signal, TenantId};
 use serde::Serialize;
 
 use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
-
-/// Same rationale and shape as `ravel_bench::e2e`'s and
-/// `ravel_bench::concurrent`'s private helper of the same name:
-/// `generate_batches` derives each series' identity from a metric name but
-/// never stores that name as a `__name__` label, so a PromQL selector
-/// matches nothing without it. Duplicated rather than shared -- see the
-/// final report for why a third copy-site for two lines of struct-building
-/// was not worth extracting.
-fn with_metric_name_label(point: NormalizedPoint) -> NormalizedPoint {
-    let metric_name = if point.is_monotonic_sum {
-        "bench_counter_total"
-    } else {
-        "bench_gauge"
-    };
-    let mut labels: Vec<Label> = point.labels.iter().cloned().collect();
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: metric_name.to_string(),
-    });
-    NormalizedPoint {
-        labels: LabelSet::new(labels).expect("add __name__ label"),
-        ..point
-    }
-}
 
 /// Duplicated from `ravel_bench::e2e`/`ravel_bench::concurrent` rather than
 /// extracted to a shared module: the task that added this bench was scoped
@@ -208,11 +183,9 @@ pub async fn run(config: &QueryLatencyConfig) -> Report {
         batch_size: BatchSizeDistribution::fixed(config.batch_size),
         ..WorkloadConfig::default()
     };
-    let batches: Vec<Vec<_>> = generate_batches(&workload)
-        .expect("generate workload")
-        .into_iter()
-        .map(|batch| batch.into_iter().map(with_metric_name_label).collect())
-        .collect();
+    // The generator now stamps every series with a __name__ label (issue
+    // #277), so the instant/range query phases match by name directly.
+    let batches: Vec<Vec<_>> = generate_batches(&workload).expect("generate workload");
 
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);
 

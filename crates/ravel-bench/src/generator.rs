@@ -9,7 +9,7 @@ use ravel_segment::{
     HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint, SeriesInputV3,
     SeriesValues,
 };
-use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId, TypeError};
+use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId, TypeError};
 
 /// Gauge or cumulative counter, matching docs/benchmarking.md's workload list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +47,9 @@ impl CardinalityProfile {
 
     /// [`many_small`](Self::many_small) with an explicit base-label count
     /// instead of the fixed 4, for the label-count axis sweep (issue #98).
-    /// The generator always appends one uniquifying `series_idx` label, so a
-    /// series built from this profile carries `labels_per_set + 1` labels.
+    /// The generator always appends a `__name__` label and one uniquifying
+    /// `series_idx` label, so a series built from this profile carries
+    /// `labels_per_set + 2` labels.
     pub fn many_small_with_labels(series_count: usize, labels_per_set: usize) -> Self {
         CardinalityProfile {
             distinct_sets: series_count.max(1),
@@ -133,16 +134,18 @@ impl WorkloadConfig {
     /// divides evenly, otherwise the largest whole-series total at or below
     /// it), and sets a `many_small` cardinality whose series each carry
     /// exactly `labels_per_series` labels (the profile holds
-    /// `labels_per_series - 1` base labels; the generator appends one
-    /// uniquifying `series_idx` label). Every other knob keeps its
+    /// `labels_per_series - 2` base labels; the generator appends a
+    /// `__name__` label and one uniquifying `series_idx` label). Every
+    /// other knob keeps its
     /// [`Default`] value, so this is additive: existing entry points and
     /// callers that build `WorkloadConfig` directly are untouched.
     pub fn axis_sweep(samples_per_series: usize, labels_per_series: usize) -> Self {
         let samples_per_series = samples_per_series.max(1);
         let series_count = (AXIS_SWEEP_TOTAL_SAMPLES / samples_per_series).max(1);
-        // series_idx is always appended by the generator, so the base label
-        // count is one less than the requested per-series total.
-        let labels_per_set = labels_per_series.max(1) - 1;
+        // The generator always appends a __name__ label and a uniquifying
+        // series_idx label, so the base label count is two less than the
+        // requested per-series total.
+        let labels_per_set = labels_per_series.max(2) - 2;
         WorkloadConfig {
             series_count,
             samples_per_series,
@@ -367,6 +370,15 @@ fn generate_series(config: &WorkloadConfig) -> Result<Vec<GeneratedSeries>, Type
         };
 
         let mut base_labels = base_label_set(base_idx, profile.labels_per_set);
+        // Every series carries __name__ = its metric name, exactly as the real
+        // ingest path does (ADR-0005). SeriesId::compute hashes the metric name
+        // separately and skips the __name__ label, so the id is unchanged by
+        // this label's presence; storing it lets a PromQL selector match the
+        // series by name. Issue #277.
+        base_labels.push(Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric_name.to_string(),
+        });
         base_labels.push(Label {
             name: "series_idx".to_string(),
             value: (i + config.series_idx_offset).to_string(),
@@ -660,6 +672,48 @@ mod tests {
         for (id, _, _) in &b {
             assert!(!a_ids.contains(id), "offset series must not collide");
         }
+    }
+
+    #[test]
+    fn generated_series_carry_matching_name_label() {
+        // Every generated series must carry __name__ = its metric name, and
+        // that name must be the same one SeriesId::compute derived the id
+        // from, so the labels and id agree (issue #277). A mismatch would
+        // trip the shard buffer's collision check on ingest.
+        let config = WorkloadConfig {
+            series_count: 32,
+            samples_per_series: 4,
+            // Exercise both counters and gauges so both metric names appear.
+            counter_fraction: 0.5,
+            ..Default::default()
+        };
+        let tenant = TenantId::new(config.tenant.clone());
+        let series = generate_series(&config).expect("generate");
+        assert!(!series.is_empty());
+        let mut saw_counter = false;
+        let mut saw_gauge = false;
+        for s in &series {
+            let expected_name = match s.kind {
+                MetricKind::Counter => "bench_counter_total",
+                MetricKind::Gauge => "bench_gauge",
+            };
+            match s.kind {
+                MetricKind::Counter => saw_counter = true,
+                MetricKind::Gauge => saw_gauge = true,
+            }
+            // The LabelSet carries __name__ equal to the metric name.
+            assert_eq!(
+                s.labels.get(METRIC_NAME_LABEL),
+                Some(expected_name),
+                "series must carry __name__ = metric name"
+            );
+            // Recomputing the id over the canonical label set (which now
+            // includes __name__) yields exactly the id the generator assigned.
+            let recomputed =
+                SeriesId::compute(&tenant, expected_name, &s.labels).expect("recompute id");
+            assert_eq!(recomputed, s.series_id, "labels and id must agree");
+        }
+        assert!(saw_counter && saw_gauge, "expected both metric kinds");
     }
 
     #[test]
