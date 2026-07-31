@@ -598,13 +598,19 @@ jobs:
           echo "node image: $image"
           echo "image=$image" >> "$GITHUB_OUTPUT"
       # kind itself, and the cluster kind-up.sh then reuses. Pinned by commit
-      # SHA (v1.14.0); `version` is the kind release whose default node image is
-      # the one pinned in kind-up.sh, so the CLI and the node image match.
+      # SHA (v1.14.0); `version` is the kind release whose release body attests
+      # the node image digest pinned in kind-up.sh (v0.32.0, default node image
+      # kindest/node:v1.36.1), so the CLI and the node image come from one
+      # release. `kubectl_version` is held to the node image's Kubernetes minor
+      # (v1.36) so kubectl stays inside Kubernetes' supported +/-1 minor skew;
+      # left unset, kind-action installs a much newer default that drifts past
+      # that skew against a v1.36 control plane.
       - name: Create the kind cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
         with:
           version: v0.32.0
           node_image: ${{ steps.node-image.outputs.image }}
+          kubectl_version: v1.36.1
           cluster_name: ravel-ci
           wait: 120s
       - name: Bring up the kind environment
