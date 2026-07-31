@@ -23,36 +23,10 @@ use ravel_object_store::{
 };
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
-use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Signal, TenantId, TimeRange};
+use ravel_types::{Signal, TenantId, TimeRange};
 use serde::Serialize;
 
 use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
-
-/// `generate_batches` derives each series' `SeriesId` from a metric name
-/// (`bench_gauge`/`bench_counter_total`) but never stores that name as a
-/// `__name__` label -- nothing in the shared generator has needed to select
-/// series by name before. A PromQL instant selector matches on labels, not
-/// `SeriesId`, so without this the query phase below always returns an empty
-/// vector regardless of what was ingested. Scoped to this bin's own points
-/// rather than fixing `generator.rs`, since that module is shared by
-/// non-querying benches (e.g. `catalog_byte_gates`) this task's scope does
-/// not cover.
-fn with_metric_name_label(point: ravel_otlp::NormalizedPoint) -> ravel_otlp::NormalizedPoint {
-    let metric_name = if point.is_monotonic_sum {
-        "bench_counter_total"
-    } else {
-        "bench_gauge"
-    };
-    let mut labels: Vec<Label> = point.labels.iter().cloned().collect();
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: metric_name.to_string(),
-    });
-    ravel_otlp::NormalizedPoint {
-        labels: LabelSet::new(labels).expect("add __name__ label"),
-        ..point
-    }
-}
 
 /// Bytes on the wire per logical sample: `ts_ns: i64` + `value: f64`
 /// (docs/benchmarking.md "write amplification (bytes stored / bytes
@@ -303,11 +277,9 @@ pub async fn run(config: &E2eConfig) -> Report {
         batch_size: BatchSizeDistribution::fixed(config.batch_size),
         ..WorkloadConfig::default()
     };
-    let batches: Vec<Vec<_>> = generate_batches(&workload)
-        .expect("generate workload")
-        .into_iter()
-        .map(|batch| batch.into_iter().map(with_metric_name_label).collect())
-        .collect();
+    // The generator now stamps every series with a __name__ label (issue
+    // #277), so the query phase's PromQL selector matches by name directly.
+    let batches: Vec<Vec<_>> = generate_batches(&workload).expect("generate workload");
 
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);
     let pacing_interval = if config.points_per_sec == 0 {

@@ -30,33 +30,10 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::NormalizedPoint;
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
-use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Signal, TenantId};
+use ravel_types::{Signal, TenantId};
 use serde::Serialize;
 
 use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
-
-/// Same rationale and shape as `ravel_bench::e2e`'s private helper of the
-/// same name: `generate_batches` derives each series' identity from a
-/// metric name but never stores that name as a `__name__` label, so a
-/// PromQL selector matches nothing without it. Duplicated rather than
-/// shared -- see the final report for why extracting it was not worth a
-/// third copy-site for two lines of struct-building.
-fn with_metric_name_label(point: NormalizedPoint) -> NormalizedPoint {
-    let metric_name = if point.is_monotonic_sum {
-        "bench_counter_total"
-    } else {
-        "bench_gauge"
-    };
-    let mut labels: Vec<Label> = point.labels.iter().cloned().collect();
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: metric_name.to_string(),
-    });
-    NormalizedPoint {
-        labels: LabelSet::new(labels).expect("add __name__ label"),
-        ..point
-    }
-}
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
     if sorted_ns.is_empty() {
@@ -233,11 +210,10 @@ async fn run_writer(
         series_idx_offset,
         ..WorkloadConfig::default()
     };
-    let batches: Vec<Vec<NormalizedPoint>> = generate_batches(&workload)
-        .expect("generate writer workload")
-        .into_iter()
-        .map(|batch| batch.into_iter().map(with_metric_name_label).collect())
-        .collect();
+    // The generator now stamps every series with a __name__ label (issue
+    // #277), so reader tasks' PromQL selector matches by name directly.
+    let batches: Vec<Vec<NormalizedPoint>> =
+        generate_batches(&workload).expect("generate writer workload");
 
     let pacing_interval = if points_per_sec == 0 {
         Duration::ZERO
