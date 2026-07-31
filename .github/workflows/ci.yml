@@ -412,6 +412,145 @@ jobs:
             exit 1
           fi
 
+  # The Kubernetes lane (ADR-0034 decision 7, issue #250). Runs the same three
+  # scripts a developer runs locally -- scripts/kind-up.sh, scripts/kind-demo.sh,
+  # scripts/kind-down.sh -- against a real kind cluster, so the local and CI
+  # paths cannot drift.
+  #
+  # What no other job covers: the operator reconciling a RavelCluster into
+  # Deployments whose pods actually reach Ready against a real S3-compatible
+  # backend, the images actually starting under Kubernetes, and an OTLP export
+  # accepted by the gateway Service being read back through the query Service.
+  # `check` compiles and unit-tests the operator; only this job runs it.
+  #
+  # The release binaries are built on the runner and the images are assembled
+  # from them (Dockerfile.prebuilt) instead of letting kind-up.sh run the root
+  # Dockerfile's builder stage: that stage recompiles the whole workspace inside
+  # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's caches (57
+  # minutes measured on an 8 GiB arm64 host). RAVEL_SKIP_IMAGE_BUILD=1 exists
+  # for exactly this split, and the sccache/rust-cache setup below is the same
+  # one `check` uses, so the release build here starts warm.
+  #
+  # kind-demo.sh asserts the round-trip value and exits nonzero on any failure,
+  # so unlike the object-store-contract and promql-difftest jobs this needs no
+  # grep over the output to prove it really ran: it has no environment-gated
+  # skip path that could be mistaken for a pass.
+  #
+  # Budget expectation (ADR-0034 decision 7): the slowest job in this workflow,
+  # dominated by the release build. If it grows past roughly 25 minutes
+  # warm-cache, the named remedy is to split the binary build into a shared
+  # artifact job rather than to trim what the lane covers.
+  k8s-integration:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # The tags the assembly step writes and kind-up.sh then loads into the
+      # cluster and points the RavelCluster at. Set explicitly rather than
+      # relying on the script's defaults so both halves read one value. Not the
+      # script's `:kind-dev` default on purpose: a developer's local kind-dev
+      # images and a CI-assembled image are built two different ways and should
+      # not share a tag.
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+      # Must match the cluster_name passed to helm/kind-action below: kind-up.sh
+      # reuses an existing cluster of this name rather than creating its own.
+      RAVEL_KIND_CLUSTER: ravel-ci
+    steps:
+      - uses: actions/checkout@v4
+      # First, before anything pulls: a kind node image, two Ravel images, floci,
+      # and a release target directory together need real headroom.
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+      # Exactly what the root Dockerfile's builder stage compiles for these two
+      # images, minus ravel-cli (see Dockerfile.prebuilt for why it is omitted).
+      - name: Build the release binaries on the host
+        run: |
+          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-operator
+      - name: Assemble both images from the prebuilt binaries
+        run: |
+          # A staging directory as the build context: the repo root cannot be
+          # used because .dockerignore excludes target/ from it, and the context
+          # needs nothing but the two binaries anyway.
+          ctx=$(mktemp -d)
+          cp target/release/ravel-server target/release/ravel-operator "$ctx/"
+          docker build --file Dockerfile.prebuilt --target server \
+            --tag "$RAVEL_SERVER_IMAGE" "$ctx"
+          docker build --file Dockerfile.prebuilt --target operator \
+            --tag "$RAVEL_OPERATOR_IMAGE" "$ctx"
+          rm -rf "$ctx"
+      - name: Smoke-run both assembled images
+        run: |
+          # `--help` in both images before kind is involved. A binary that
+          # cannot exec on the runtime base -- the glibc case Dockerfile.prebuilt
+          # documents, where a runner-built binary needs symbol versions the base
+          # image lacks -- fails here with the dynamic linker's own message,
+          # instead of as an opaque CrashLoopBackOff inside the cluster several
+          # minutes later.
+          docker run --rm "$RAVEL_SERVER_IMAGE" --help >/dev/null
+          docker run --rm "$RAVEL_OPERATOR_IMAGE" --help >/dev/null
+      - name: Resolve the pinned kind node image
+        id: node-image
+        run: |
+          # Single source of truth: scripts/kind-up.sh pins the node image (tag
+          # plus multi-arch index digest) and helm/kind-action needs the same
+          # value, so read it out of the script instead of pinning a second copy
+          # here that could silently drift from it.
+          # shellcheck disable=SC2016  # the ${...} below is sed's pattern, not
+          # a shell expansion: it matches the script's default-value syntax.
+          image=$(sed -n 's/^NODE_IMAGE="\${RAVEL_KIND_NODE_IMAGE:-\(.*\)}"$/\1/p' \
+            scripts/kind-up.sh)
+          if [ -z "$image" ]; then
+            echo "::error::could not read the pinned node image from scripts/kind-up.sh"
+            exit 1
+          fi
+          echo "node image: $image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      # kind itself, and the cluster kind-up.sh then reuses. Pinned by commit
+      # SHA (v1.14.0); `version` is the kind release whose default node image is
+      # the one pinned in kind-up.sh, so the CLI and the node image match.
+      - name: Create the kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          version: v0.32.0
+          node_image: ${{ steps.node-image.outputs.image }}
+          cluster_name: ravel-ci
+          wait: 120s
+      - name: Bring up the kind environment
+        env:
+          # The images are already built and in the runner's docker daemon;
+          # kind-up.sh verifies both tags exist, loads them into the cluster,
+          # and skips its own docker build.
+          RAVEL_SKIP_IMAGE_BUILD: "1"
+        run: |
+          # Fail loudly if the cluster name above and RAVEL_KIND_CLUSTER ever
+          # drift: kind-up.sh would otherwise quietly create a second cluster of
+          # its own and the job would still pass while testing nothing that the
+          # provisioning step did.
+          if ! kind get clusters | grep -qx "$RAVEL_KIND_CLUSTER"; then
+            echo "::error::helm/kind-action did not create cluster $RAVEL_KIND_CLUSTER"
+            kind get clusters
+            exit 1
+          fi
+          scripts/kind-up.sh
+      - name: OTLP round trip through the gateway and query Services
+        run: scripts/kind-demo.sh
+      # helm/kind-action also deletes the cluster in its own post step, so this
+      # looks redundant and is not: the teardown path a developer uses has to be
+      # exercised too, and both are idempotent (`kind delete cluster` on a
+      # cluster that is already gone exits 0), so running both is safe in either
+      # order.
+      - name: Delete the kind cluster
+        if: always()
+        run: scripts/kind-down.sh
+
   coverage:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
