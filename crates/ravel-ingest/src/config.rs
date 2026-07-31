@@ -35,6 +35,9 @@ pub struct IngestConfig {
     pub flush_tick: Duration,
     /// Retries after the first attempt for the data-object PUT (total
     /// attempts = this + 1). Also bounds retries of the commit-record PUT.
+    /// This matches `ravel_commit::publish::RetryPolicy::max_attempts`'s own
+    /// "retries after the first attempt" convention, so both retry budgets in
+    /// the flush path count the same way.
     pub put_retry_max_attempts: u32,
     pub put_retry_base_delay: Duration,
     pub put_retry_max_delay: Duration,

@@ -517,7 +517,11 @@ impl LogShardActor {
             match self.bound_to_deadline(deadline_ns, call).await {
                 Some(Ok(())) => return true,
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
-                    attempt += 1;
+                    // `put_retry_max_attempts` is the number of retries after
+                    // the first attempt (total attempts = this + 1), matching
+                    // `ravel_commit::publish::RetryPolicy`. Check the budget
+                    // before consuming a retry so the first attempt is not
+                    // itself counted against it.
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
@@ -525,6 +529,7 @@ impl LogShardActor {
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
+                    attempt += 1;
                 }
                 Some(Err(_)) | None => return false,
             }
@@ -559,7 +564,8 @@ impl LogShardActor {
                     );
                 }
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
-                    attempt += 1;
+                    // See `put_data_object_with_retry`: `put_retry_max_attempts`
+                    // is retries after the first attempt (total = this + 1).
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
@@ -567,6 +573,7 @@ impl LogShardActor {
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
+                    attempt += 1;
                 }
                 Some(Err(_)) | None => return None,
             }
@@ -582,7 +589,11 @@ impl LogShardActor {
         let capped = exp.min(self.config.put_retry_max_delay);
         let capped_ms = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);
         let jittered_ms = rand::rng().random_range(0..=capped_ms);
-        tokio::time::sleep(Duration::from_millis(jittered_ms)).await;
+        // Route the backoff wait through the injected `Clock`, not the tokio
+        // timer, so retry timing shares the one clock the rest of the flush
+        // path already uses (`bound_to_deadline`) and a test can drive it
+        // deterministically by advancing that clock, with no real sleep.
+        self.clock.sleep(Duration::from_millis(jittered_ms)).await;
     }
 }
 
@@ -594,6 +605,9 @@ mod tests {
 
     use ravel_commit::{keys, record};
     use ravel_logseg::{Predicate, RlogReader, stream_attrs_bytes};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, list_all};
     use ravel_types::TenantHash;
@@ -688,7 +702,10 @@ mod tests {
 
     impl Harness {
         fn spawn(config: IngestConfig) -> Self {
-            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            Self::spawn_with_store(config, Arc::new(MemoryStore::new()))
+        }
+
+        fn spawn_with_store(config: IngestConfig, store: Arc<dyn ObjectStoreBackend>) -> Self {
             let clock = TestClock::new(BASE_NS);
             let metrics = Arc::new(LogIngestMetrics::default());
             let (tx, rx) = mpsc::channel(64);
@@ -977,6 +994,171 @@ mod tests {
         assert_eq!(rec.series_count, 1);
         assert_eq!(scanned.len(), 2);
         assert_eq!(h.metrics.snapshot().stream_id_collisions, 0);
+        h.shutdown().await;
+    }
+
+    /// Flushes on the first write with zero backoff, so a retry-exhaustion
+    /// count is deterministic with no clock advance.
+    fn exhaustion_config(max_attempts: u32) -> IngestConfig {
+        IngestConfig {
+            shard_count: 1,
+            target_bytes: 1,
+            max_flush_delay: Duration::from_secs(3600),
+            flush_tick: Duration::from_millis(10),
+            put_retry_max_attempts: max_attempts,
+            put_retry_base_delay: Duration::from_millis(0),
+            put_retry_max_delay: Duration::from_millis(0),
+            ..IngestConfig::default()
+        }
+    }
+
+    /// A permanently-retryable fault on every RLOG data-object PUT drives
+    /// exactly `put_retry_max_attempts + 1` inner PUT calls (issue #281): one
+    /// first attempt plus `max_attempts` retries, counted off the FaultStore.
+    #[tokio::test]
+    async fn log_data_put_makes_exactly_max_attempts_plus_one_calls() {
+        let max_attempts = 3;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Transient("data down".into()))
+                .with_key_contains("/l0/"),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(exhaustion_config(max_attempts), Arc::clone(&store));
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("send write");
+        let err = ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect_err("a data PUT that always fails must abandon the flush");
+        assert!(matches!(err, LogWriteError::Abandoned(_)));
+
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Transient),
+            u64::from(max_attempts) + 1,
+            "total data PUT calls must be max_attempts + 1"
+        );
+        let snap = h.metrics.snapshot();
+        assert_eq!(snap.put_retries, u64::from(max_attempts));
+        assert_eq!(snap.abandoned_retry_exhausted, 1);
+        h.shutdown().await;
+    }
+
+    /// Same budget on the commit-record PUT: the data object lands, then every
+    /// commit PUT fails, giving `max_attempts + 1` commit PUT calls.
+    #[tokio::test]
+    async fn log_commit_put_makes_exactly_max_attempts_plus_one_calls() {
+        let max_attempts = 3;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Transient("commit down".into()))
+                .with_key_contains("/c/"),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(exhaustion_config(max_attempts), Arc::clone(&store));
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("send write");
+        let err = ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect_err("a commit PUT that always fails must abandon the flush");
+        assert!(matches!(err, LogWriteError::Abandoned(_)));
+
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Transient),
+            u64::from(max_attempts) + 1,
+            "total commit PUT calls must be max_attempts + 1"
+        );
+        let snap = h.metrics.snapshot();
+        assert_eq!(snap.put_retries, u64::from(max_attempts));
+        assert_eq!(snap.abandoned_retry_exhausted, 1);
+
+        let objects = list_all(store.as_ref(), "t/").await.expect("list");
+        assert!(
+            objects.iter().any(|o| o.key.contains("/l0/")),
+            "the data object landed (orphan) before the commit PUT failed"
+        );
+        assert!(
+            !objects.iter().any(|o| o.key.contains("/c/")),
+            "no commit record ever lands"
+        );
+        h.shutdown().await;
+    }
+
+    /// The retry backoff waits on the injected `Clock`: with a huge backoff
+    /// delay the flush parks after one retryable data-PUT fault and does not
+    /// ack until the test advances the injected clock past that delay. A real
+    /// timer would ignore the advance and could only finish by truly sleeping.
+    #[tokio::test]
+    async fn log_retry_backoff_waits_on_the_injected_clock() {
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put)
+                .with_key_contains("/l0/")
+                .then_fault(ScriptedFault::Transient("blip".into()))
+                .then_passthrough(),
+        );
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let backoff = Duration::from_secs(1_000);
+        let config = IngestConfig {
+            shard_count: 1,
+            target_bytes: 1,
+            max_flush_delay: Duration::from_secs(3600),
+            flush_tick: Duration::from_millis(10),
+            put_retry_max_attempts: 4,
+            put_retry_base_delay: backoff,
+            put_retry_max_delay: backoff,
+            ..IngestConfig::default()
+        };
+        let h = Harness::spawn_with_store(config, Arc::clone(&store));
+        let tenant = TenantId::new("acme");
+
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: tenant.clone(),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("send write");
+
+        // Wait until the one retry is taken and the flush parks in backoff.
+        while h.metrics.snapshot().put_retries < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(
+                ack_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the flush must stay parked in backoff while the injected clock is still"
+        );
+
+        h.clock.advance_ns(1_100 * 1_000_000_000);
+        let token = ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect("the retried flush commits once the clock advances");
+        let (_rec, scanned) = read_back(h.store.as_ref(), &tenant.hash(), &token).await;
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(h.metrics.snapshot().put_retries, 1);
         h.shutdown().await;
     }
 }

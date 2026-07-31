@@ -591,7 +591,11 @@ impl ShardActor {
             match self.bound_to_deadline(deadline_ns, call).await {
                 Some(Ok(())) => return true,
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
-                    attempt += 1;
+                    // `put_retry_max_attempts` is the number of retries after
+                    // the first attempt (total attempts = this + 1), matching
+                    // `ravel_commit::publish::RetryPolicy`. Check the budget
+                    // before consuming a retry so the first attempt is not
+                    // itself counted against it.
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
@@ -599,6 +603,7 @@ impl ShardActor {
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
+                    attempt += 1;
                 }
                 Some(Err(_)) | None => return false,
             }
@@ -636,7 +641,8 @@ impl ShardActor {
                     );
                 }
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
-                    attempt += 1;
+                    // See `put_data_object_with_retry`: `put_retry_max_attempts`
+                    // is retries after the first attempt (total = this + 1).
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
@@ -644,6 +650,7 @@ impl ShardActor {
                     }
                     self.metrics.record_put_retry();
                     self.backoff_sleep(attempt).await;
+                    attempt += 1;
                 }
                 Some(Err(_)) | None => return None,
             }
@@ -659,6 +666,10 @@ impl ShardActor {
         let capped = exp.min(self.config.put_retry_max_delay);
         let capped_ms = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);
         let jittered_ms = rand::rng().random_range(0..=capped_ms);
-        tokio::time::sleep(Duration::from_millis(jittered_ms)).await;
+        // Route the backoff wait through the injected `Clock`, not the tokio
+        // timer, so retry timing shares the one clock the rest of the flush
+        // path already uses (`bound_to_deadline`) and a test can drive it
+        // deterministically by advancing that clock, with no real sleep.
+        self.clock.sleep(Duration::from_millis(jittered_ms)).await;
     }
 }

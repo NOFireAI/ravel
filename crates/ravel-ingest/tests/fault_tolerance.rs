@@ -21,8 +21,12 @@ fn config() -> IngestConfig {
         max_flush_delay: Duration::from_secs(3600),
         flush_tick: Duration::from_millis(20),
         put_retry_max_attempts: 4,
-        put_retry_base_delay: Duration::from_millis(1),
-        put_retry_max_delay: Duration::from_millis(20),
+        // Zero backoff: the retry backoff now sleeps on the injected clock
+        // (deterministic time, no real wall-clock wait), and these tests do
+        // not advance that clock, so a nonzero delay would park the flush
+        // forever. Backoff timing is covered separately in put_retry_budget.rs.
+        put_retry_base_delay: Duration::from_millis(0),
+        put_retry_max_delay: Duration::from_millis(0),
         ..IngestConfig::default()
     }
 }
