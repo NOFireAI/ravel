@@ -35,6 +35,7 @@ use datafusion::error::DataFusionError;
 use ravel_catalog::CatalogError;
 use ravel_query::{FetchError, LogFetchError};
 
+use crate::spans_fetcher::SpanFetchError;
 use crate::validate::ValidationError;
 
 /// Stable client message for a data-integrity fault (corrupt segment,
@@ -119,6 +120,13 @@ pub enum SqlError {
     #[error("log segment fetch failed: {0}")]
     LogFetch(#[from] LogFetchError),
 
+    /// An RSPAN span-segment fetch or decode failed mid-scan (the `spans`
+    /// table's sibling of [`SqlError::Fetch`], issue #356). Its `Display`
+    /// embeds the object key, so it redacts the same way [`SqlError::Fetch`]
+    /// does.
+    #[error("span segment fetch failed: {0}")]
+    SpanFetch(#[from] SpanFetchError),
+
     /// A record's canonical `stream_attrs` blob failed to decode during the
     /// scan's stream-attribute re-verification or `attrs`-column build
     /// (crate::logs_scan). This is the same data-integrity fault as the
@@ -200,6 +208,7 @@ impl SqlError {
             SqlError::Catalog(_)
             | SqlError::Fetch(_)
             | SqlError::LogFetch(_)
+            | SqlError::SpanFetch(_)
             | SqlError::CorruptStreamAttrs(_)
             | SqlError::SnapshotInvalidated => ErrorClass::Unavailable,
             SqlError::DeadlineExceeded { .. } => ErrorClass::Timeout,
@@ -237,6 +246,10 @@ impl SqlError {
                 LogFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
                 LogFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
             },
+            SqlError::SpanFetch(fetch) => match fetch {
+                SpanFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                SpanFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+            },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),
             SqlError::DeadlineExceeded { .. }
@@ -261,6 +274,9 @@ impl SqlError {
                 source: ravel_object_store::StoreError::NotFound,
                 ..
             }) | SqlError::LogFetch(LogFetchError::Store {
+                source: ravel_object_store::StoreError::NotFound,
+                ..
+            }) | SqlError::SpanFetch(SpanFetchError::Store {
                 source: ravel_object_store::StoreError::NotFound,
                 ..
             })

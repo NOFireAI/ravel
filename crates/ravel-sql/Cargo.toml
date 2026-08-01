@@ -21,6 +21,12 @@ ravel-object-store = { workspace = true }
 # ravel-query re-exports the LogSegmentFetcher surface but not these logseg
 # types, so ravel-logseg is a direct dependency here.
 ravel-logseg = { workspace = true }
+# The `spans` table (issue #356) reads RSPAN span segments through the
+# ravel-rspan reader/record/query types (RspanReader, SpanQuery, SpanRecord,
+# ScanStats, SpanSegError) directly; ravel-query has no span fetcher yet
+# (ADR-0041 phase 5 is the SQL table alone), so ravel-rspan is a direct
+# dependency here, the same way ravel-logseg is for the `logs` table.
+ravel-rspan = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the

@@ -4679,6 +4679,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-promql",
  "ravel-query",
+ "ravel-rspan",
  "ravel-segment",
  "ravel-types",
  "serde_json",
