@@ -354,6 +354,15 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
     }
     assert_eq!(spans_seen, 6, "every exported span is durable");
     assert_eq!(shard_of_trace.len(), 2, "both traces landed");
+    let mut distinct_shards: Vec<&String> = shard_of_trace.values().collect();
+    distinct_shards.sort_unstable();
+    distinct_shards.dedup();
+    assert_eq!(
+        distinct_shards.len(),
+        2,
+        "the two traces must land on different shards, not just be two distinct \
+         trace_ids that happen to coexist on the same one"
+    );
 
     running.shutdown().await.expect("graceful shutdown");
 }
