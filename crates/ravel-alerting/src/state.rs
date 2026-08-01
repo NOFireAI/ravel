@@ -61,12 +61,22 @@ impl AlertState {
     /// Maps the state onto `severity_num`, reused per ADR-0040 decision 2
     /// (higher = more urgent). The authoritative state lives in the `state`
     /// attr; this is a mirror for consumers that sort by severity.
+    ///
+    /// `severity_num` is OTLP's 0..=24 `SeverityNumber` space everywhere else
+    /// it's used in this repo (`ravel-otlp/src/logs_normalize.rs` maps a real
+    /// OTLP severity straight in with 0 = UNSPECIFIED; `ravel-sql`'s `logs`
+    /// table exposes and pushdown-filters it as that same space). Small
+    /// sequential values (0-3) would collide with that space: a firing alert
+    /// would read as TRACE2 and a resolved one as UNSPECIFIED, silently
+    /// breaking any severity-range filter written against the `alerts` table
+    /// once it exists. Using the WARN/ERROR bands keeps alert severities
+    /// meaningful under the same numeric space logs already use.
     pub fn severity_num(self) -> u8 {
         match self {
-            AlertState::Resolved => 0,
-            AlertState::Suppressed => 1,
-            AlertState::Pending => 2,
-            AlertState::Firing => 3,
+            AlertState::Resolved => 9,   // INFO: no longer a problem
+            AlertState::Suppressed => 9, // INFO: intentionally silenced
+            AlertState::Pending => 13,   // WARN: not yet confirmed
+            AlertState::Firing => 17,    // ERROR: confirmed and active
         }
     }
 }

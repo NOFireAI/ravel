@@ -32,9 +32,13 @@ impl QueryResultSummary {
 }
 
 /// Applies `op` between a series value and the threshold. `Eq`/`Ne` use exact
-/// IEEE-754 comparison. A `NaN` series value satisfies none of the ordering
-/// comparators (and `Ne`), so a series that evaluated to `NaN` never fires a
-/// `>`/`>=`/`<`/`<=`/`==` threshold, matching PromQL alerting.
+/// IEEE-754 comparison. A `NaN` series value satisfies none of the five
+/// ordering-shaped comparators (`>`, `>=`, `<`, `<=`, `==`), but DOES satisfy
+/// `Ne`: IEEE-754 defines `NaN != x` as true for every `x`, including `NaN`
+/// itself, and this repo's own PromQL evaluator already relies on exactly
+/// that (`crates/ravel-promql/src/binop.rs`'s `!=` keeps a NaN sample rather
+/// than dropping it). Matching that existing behavior here, not inventing a
+/// different NaN rule for alerting, is the deliberate choice.
 fn compare(op: ThresholdOp, value: f64, threshold: f64) -> bool {
     match op {
         ThresholdOp::Gt => value > threshold,
@@ -131,6 +135,22 @@ mod tests {
                 "NaN must not fire {op:?}"
             );
         }
+    }
+
+    #[test]
+    fn nan_series_value_does_fire_ne() {
+        // IEEE-754: NaN != x is true for every x, including NaN itself. This
+        // repo's own PromQL evaluator already relies on the same rule
+        // (binop.rs's `!=` keeps a NaN sample); alerting matches it rather
+        // than inventing a different NaN rule for Ne alone.
+        let cond = RuleCondition::Threshold {
+            op: ThresholdOp::Ne,
+            threshold: 0.0,
+        };
+        assert!(
+            condition_met(&cond, &numeric(&[f64::NAN])).expect("met"),
+            "NaN must fire Ne, matching IEEE-754 and this repo's own PromQL != semantics"
+        );
     }
 
     #[test]
