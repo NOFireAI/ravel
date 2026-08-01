@@ -9,6 +9,8 @@ enum Signal {
   SIGNAL_LOGS = 2;
   SIGNAL_SPANS = 3;
   SIGNAL_PROFILES = 4;
+  SIGNAL_ALERTS = 5;
+  SIGNAL_AUDIT = 6;
 }
 
 message CommitRecord {
