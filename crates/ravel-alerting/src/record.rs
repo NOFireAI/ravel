@@ -11,7 +11,7 @@ use ravel_logseg::{LogRecord, ObjectIdentity, RlogConfig, RlogWriter};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
 use crate::error::AlertError;
-use crate::generation::guard_generation;
+use crate::generation::{compute_generation, guard_generation};
 use crate::rule::Rule;
 use crate::state::{AlertState, StateTransition};
 
@@ -256,19 +256,28 @@ fn as_generation(key: &str, value: &AttrValue) -> Result<u32, AlertError> {
 /// Builds the [`AlertRecord`] a transition writes: the rule's identity and
 /// labels, the transition's target state, the computed generation, and the
 /// tick's clock reading as the event time.
+///
+/// `rule.labels` is sorted before storing, mirroring [`compute_alert_id`]'s
+/// own canonicalization: `alert_id` already treats labels as an order-
+/// independent set, and a record that stored them in whatever order the rule
+/// happened to list them would silently disagree with that -- two records
+/// for the same `alert_id`, differing only in label insertion order, must
+/// compare equal once decoded.
 pub fn build_transition_record(
     rule: &Rule,
     state: AlertState,
     generation: u32,
     now_ns: i64,
 ) -> AlertRecord {
+    let mut labels = rule.labels.clone();
+    labels.sort_unstable();
     AlertRecord {
         alert_id: compute_alert_id(&rule.rule_id, &rule.labels),
         rule_id: rule.rule_id.clone(),
         state,
         generation,
         ts_ns: now_ns,
-        labels: rule.labels.clone(),
+        labels,
         annotations: rule.annotations.clone(),
         body: format!("{} {}", rule.rule_id, state.as_str()),
     }
@@ -288,8 +297,17 @@ pub fn encode_record_object(
 }
 
 /// The full write path (deliverable 5): given a rule, the transition decision
-/// for this tick, the computed generation, and the RLOG writer parameters,
-/// produce the record bytes to PUT.
+/// for this tick, the most recent prior record for this alert (if any), the
+/// generations of any alert records this tick's query consumed as input (only
+/// meaningful when `rule.query.targets_alerts_table()`; pass `&[]` otherwise),
+/// and the RLOG writer parameters, produce the record bytes to PUT.
+///
+/// Generation is computed here, not passed in by the caller, precisely so a
+/// caller cannot accidentally recompute it fresh from a tick's inputs for an
+/// alert that already has history: `prior` is threaded straight into
+/// [`compute_generation`], which returns the prior record's generation
+/// unchanged when one exists (see that function's doc for why - generation is
+/// a property of the alert's whole lifecycle, not of any one tick).
 ///
 /// Returns `Ok(None)` when `transition.write_record` is false: a tick that only
 /// re-confirms the current state writes nothing (ADR-0043 decision 4). When a
@@ -299,7 +317,8 @@ pub fn encode_record_object(
 pub fn write_alert_record(
     rule: &Rule,
     transition: &StateTransition,
-    generation: u32,
+    prior: Option<&AlertRecord>,
+    input_alert_generations: &[u32],
     now_ns: i64,
     cfg: RlogConfig,
     identity: ObjectIdentity,
@@ -307,6 +326,11 @@ pub fn write_alert_record(
     if !transition.write_record {
         return Ok(None);
     }
+    let generation = compute_generation(
+        prior.map(|r| r.generation),
+        rule.query.targets_alerts_table(),
+        input_alert_generations,
+    );
     guard_generation(generation, rule.max_alert_generation)?;
     let record = build_transition_record(rule, transition.next_state, generation, now_ns);
     Ok(Some(encode_record_object(&record, cfg, identity)?))
@@ -465,8 +489,16 @@ mod tests {
             next_state: AlertState::Firing,
             write_record: false,
         };
-        let out = write_alert_record(&rule, &keep, 0, 0, RlogConfig::default(), identity())
-            .expect("no error");
+        let out = write_alert_record(
+            &rule,
+            &keep,
+            None,
+            &[],
+            0,
+            RlogConfig::default(),
+            identity(),
+        )
+        .expect("no error");
         assert!(out.is_none(), "a re-confirming tick writes nothing");
     }
 
@@ -485,7 +517,60 @@ mod tests {
             next_state: AlertState::Firing,
             write_record: true,
         };
-        let err = write_alert_record(&rule, &fire, 3, 0, RlogConfig::default(), identity());
+        // targets_alerts_table() is true (query mentions "alerts"), prior is
+        // None (new alert), so generation = max(input_alert_generations, 0) +
+        // 1: an input at generation 2 produces generation 3, over the cap.
+        let err = write_alert_record(
+            &rule,
+            &fire,
+            None,
+            &[2],
+            0,
+            RlogConfig::default(),
+            identity(),
+        );
         assert!(matches!(err, Err(AlertError::GenerationExceeded { .. })));
+    }
+
+    #[test]
+    fn write_alert_record_keeps_priors_generation_on_a_later_transition() {
+        // The regression this fix targets: a firing record at generation 5,
+        // then the same alert_id resolves on a tick whose query (this rule
+        // targets the alerts table) matched zero alert rows this time.
+        // Without stickiness this would recompute to 1.
+        let rule = Rule {
+            rule_id: "r".into(),
+            query: RuleQuery::Sql("select * from alerts".into()),
+            condition: RuleCondition::NonEmptyResult,
+            labels: vec![],
+            annotations: vec![],
+            for_duration: None,
+            max_alert_generation: None,
+        };
+        let firing_record = build_transition_record(&rule, AlertState::Firing, 5, 0);
+        let resolve = StateTransition {
+            next_state: AlertState::Resolved,
+            write_record: true,
+        };
+        let bytes = write_alert_record(
+            &rule,
+            &resolve,
+            Some(&firing_record),
+            &[],
+            1,
+            RlogConfig::default(),
+            identity(),
+        )
+        .expect("no error")
+        .expect("a transition writes a record");
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&bytes, &cfg).expect("open");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        let decoded = AlertRecord::from_log_record(&rows[0]).expect("decode");
+        assert_eq!(
+            decoded.generation, 5,
+            "generation carries forward unchanged"
+        );
+        assert_eq!(decoded.state, AlertState::Resolved);
     }
 }

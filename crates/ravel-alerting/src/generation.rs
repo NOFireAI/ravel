@@ -1,12 +1,28 @@
 //! Generation computation and the recursion guard for alerts-on-alerts
 //! (deliverable 4, ADR-0040 decision 4 / ADR-0043 decision 5).
 //!
-//! Only rules whose query reads the `alerts` table consume other alert records
-//! as input; those are the only rules where generation is non-trivial. An
-//! ordinary metric or log rule consumes no alert records, so
-//! `compute_generation(&[])` yields `1` for its first alerts-on-alerts hop and
-//! callers treat metric/log rules as generation `0` (they never route through
-//! here).
+//! Generation is a property of the alert *entity* (one `alert_id`'s whole
+//! lifecycle), not of any single tick's evaluation: it is computed once, when
+//! an alert is newly created (no prior record for its `alert_id`), and every
+//! later transition of that same alert (fires again, resolves, is
+//! suppressed) carries the same value forward unchanged. Recomputing it fresh
+//! from each tick's inputs would make a `resolved` record's generation depend
+//! on how many alert rows *this tick's* query happened to return, so the same
+//! alert's own history could read generation 5 then 1 then 5 again -- a
+//! foldable field flip-flopping on nothing but query timing, which defeats
+//! the point of a recursion-depth counter.
+//!
+//! For a brand new alert, two ADR texts describe two different cases:
+//! ADR-0043 decision 5 says an ordinary metric/log rule "always computes
+//! `generation = 0`" (it structurally never consumes alert records, a static
+//! property of the rule's query, [`crate::rule::RuleQuery::targets_alerts_table`]).
+//! ADR-0040 decision 4's formula, `max(consumed, default 0) + 1`, is for the
+//! other case: a rule that DOES target the alerts table. The two are not in
+//! tension once the discriminator is explicit: pass `false` and this returns
+//! `0` unconditionally (ADR-0043); pass `true` and it applies ADR-0040's
+//! formula, including when that rule's query currently matches zero alert
+//! rows (still generation 1, because the rule is structurally one hop removed
+//! from raw signal data regardless of what matched on any given tick).
 
 use crate::error::AlertError;
 
@@ -14,15 +30,27 @@ use crate::error::AlertError;
 /// `max_alert_generation` override replaces this; `None` uses it.
 pub const DEFAULT_MAX_ALERT_GENERATION: u32 = 8;
 
-/// The generation a new alert record gets, given the generations of every
-/// alert record its rule's query consumed as input: `max(inputs, default 0)`
-/// plus one. With no alert inputs (an ordinary metric/log rule, or the first
-/// hop of an alerts-on-alerts chain seeded from non-alert data) the max is 0
-/// and the result is 1.
+/// The generation for an alert record. `prior_generation` is the most recent
+/// existing record's generation for this `alert_id` (`None` for a brand new
+/// alert); when `Some`, it is returned unchanged -- generation is fixed at
+/// creation, never recomputed on a later transition. For a new alert,
+/// `targets_alerts_table` selects the formula: `false` (an ordinary
+/// metric/log rule) always yields `0`; `true` yields `max(input_alert_
+/// generations, default 0) + 1`.
 ///
 /// Saturating so a pathological `u32::MAX` input cannot wrap; a value that high
 /// is rejected by [`guard_generation`] against any sane cap anyway.
-pub fn compute_generation(input_alert_generations: &[u32]) -> u32 {
+pub fn compute_generation(
+    prior_generation: Option<u32>,
+    targets_alerts_table: bool,
+    input_alert_generations: &[u32],
+) -> u32 {
+    if let Some(generation) = prior_generation {
+        return generation;
+    }
+    if !targets_alerts_table {
+        return 0;
+    }
     input_alert_generations
         .iter()
         .copied()
@@ -49,22 +77,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_inputs_is_generation_one() {
-        // An ordinary metric/log rule consumes no alert records: max(∅) = 0,
-        // so the first alerts-on-alerts hop is generation 1.
-        assert_eq!(compute_generation(&[]), 1);
+    fn ordinary_rule_is_always_generation_zero() {
+        // targets_alerts_table = false: always 0, regardless of inputs (which
+        // should be empty for such a rule anyway, but 0 holds even if not).
+        assert_eq!(compute_generation(None, false, &[]), 0);
+        assert_eq!(compute_generation(None, false, &[3, 4]), 0);
     }
 
     #[test]
-    fn generation_is_max_of_inputs_plus_one() {
-        assert_eq!(compute_generation(&[0]), 1);
-        assert_eq!(compute_generation(&[0, 3, 1]), 4);
-        assert_eq!(compute_generation(&[2, 2, 2]), 3);
+    fn alerts_table_rule_with_no_matching_rows_is_generation_one() {
+        // targets_alerts_table = true, but this tick's query matched zero
+        // alert rows: still generation 1, the rule's structural hop depth,
+        // not 0 (which would misrepresent it as an ordinary rule).
+        assert_eq!(compute_generation(None, true, &[]), 1);
+    }
+
+    #[test]
+    fn new_alert_generation_is_max_of_inputs_plus_one() {
+        assert_eq!(compute_generation(None, true, &[0]), 1);
+        assert_eq!(compute_generation(None, true, &[0, 3, 1]), 4);
+        assert_eq!(compute_generation(None, true, &[2, 2, 2]), 3);
+    }
+
+    #[test]
+    fn existing_alert_keeps_its_generation_regardless_of_this_ticks_inputs() {
+        // The bug this fixes: a firing record at generation 5, then the same
+        // alert_id resolves on a tick whose query returned zero alert rows.
+        // Without stickiness this would recompute to 1; with it, the
+        // resolved record keeps generation 5, matching its own history.
+        assert_eq!(compute_generation(Some(5), true, &[]), 5);
+        assert_eq!(compute_generation(Some(5), true, &[9, 9, 9]), 5);
+        assert_eq!(compute_generation(Some(0), false, &[]), 0);
     }
 
     #[test]
     fn generation_saturates_instead_of_wrapping() {
-        assert_eq!(compute_generation(&[u32::MAX]), u32::MAX);
+        assert_eq!(compute_generation(None, true, &[u32::MAX]), u32::MAX);
     }
 
     #[test]
@@ -75,12 +123,12 @@ mod tests {
         let limit = DEFAULT_MAX_ALERT_GENERATION; // 8
 
         // Inputs at generation 7 -> produced generation 8 == limit: accepted.
-        let at_limit = compute_generation(&[limit - 1]);
+        let at_limit = compute_generation(None, true, &[limit - 1]);
         assert_eq!(at_limit, limit);
         assert!(guard_generation(at_limit, None).is_ok());
 
         // Inputs at generation 8 -> produced generation 9 > limit: rejected.
-        let over = compute_generation(&[limit]);
+        let over = compute_generation(None, true, &[limit]);
         assert_eq!(over, limit + 1);
         match guard_generation(over, None) {
             Err(AlertError::GenerationExceeded {
