@@ -325,7 +325,10 @@ impl DecodedBlock {
             ),
             None => None,
         };
-        let name = string_from(self.str_at(COL_NAME, row).unwrap_or_default())?;
+        let name = string_from(
+            self.str_at(COL_NAME, row)
+                .ok_or_else(|| SpanSegError::Corrupted("missing name".into()))?,
+        )?;
         let start_ts_ns = self.i64_at(COL_START_TS, row)?;
         let end_ts_ns = self.i64_at(COL_END_TS, row)?;
         let code_byte = u8::try_from(self.i64_at(COL_STATUS_CODE, row)?)
@@ -336,10 +339,11 @@ impl DecodedBlock {
             Some(bytes) => Some(string_from(bytes)?),
             None => None,
         };
-        let attrs = match self.str_at(COL_ATTRS, row) {
-            Some(bytes) => crate::record::decode_attrs(&bytes)?,
-            None => Vec::new(),
-        };
+        let attrs = crate::record::decode_attrs(
+            &self
+                .str_at(COL_ATTRS, row)
+                .ok_or_else(|| SpanSegError::Corrupted("missing attrs".into()))?,
+        )?;
         Ok(SpanRecord {
             trace_id,
             span_id,
