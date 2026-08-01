@@ -49,10 +49,11 @@ above).
 | `ravel-cli commit decode <key>` | local file path or object store key | Decodes one commit record: identity, referenced data object key/size/hash, sample/series counts, timestamps. |
 | `ravel-cli commit decode-compaction <key>` | local file path or object store key | Decodes one `CompactionRecord`: identity, `input_set_hash`, each input identity, and each part's summary (`part_index`, series-id range, content hash, sizes, level, `segment_format_version`). |
 | `ravel-cli commit decode-tombstone <key>` | local file path or object store key | Decodes one `RetentionTombstone`: identity, `retired_at_ns`, `retention_window_ns`, observed record count. |
-| `ravel-cli maintain compact-bucket --tenant <n> --signal <metrics\|logs> --shard <n> --hour <n> [--dry-run]` | | Runs one compaction pass over a single sealed bucket and prints the outcome. `--dry-run` computes the same plan (part count, publish outcome) but writes no L1 parts or record. |
-| `ravel-cli maintain sweep --tenant <n> --signal <metrics\|logs> --shard <n> [--dry-run]` | | Runs one sweep pass (orphan GC, superseded inputs, unreferenced parts) over a shard and prints the four delete counts. `--dry-run` reports the eligible set but deletes nothing. |
-| `ravel-cli maintain status --tenant <n> --signal <metrics\|logs> --shard <n> --hour <n>` | | Reports a bucket's state (sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 parts present, unreferenced-part count). Read-only, so no `--dry-run`. |
-| `ravel-cli maintain audit-versions --tenant <n> [--shards <n>]` | `--shards` default `4` | Audits live on-object format versions across both signals. It flags any RSEG object at a version other than the one supported version (ADR-0027), and reports the RLOG population by trailer version (1 vs 2, ADR-0032). Exits nonzero on any anomaly. |
+| `ravel-cli maintain compact-bucket --tenant <n> --signal <metrics\|logs\|spans> --shard <n> --hour <n> [--dry-run]` | | Runs one compaction pass over a single sealed bucket and prints the outcome. `--dry-run` computes the same plan (part count, publish outcome) but writes no L1 parts or record. |
+| `ravel-cli maintain sweep --tenant <n> --signal <metrics\|logs\|spans> --shard <n> [--dry-run]` | | Runs one sweep pass (orphan GC, superseded inputs, unreferenced parts) over a shard and prints the four delete counts. `--dry-run` reports the eligible set but deletes nothing. |
+| `ravel-cli maintain status --tenant <n> --signal <metrics\|logs\|spans> --shard <n> --hour <n>` | | Reports a bucket's state (sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 parts present, unreferenced-part count). Read-only, so no `--dry-run`. |
+| `ravel-cli maintain audit-versions --tenant <n> [--shards <n>]` | `--shards` default `4` | Audits live on-object format versions across all three signals. It flags any RSEG object at a version other than the one supported version (ADR-0027), reports the RLOG population by trailer version (1 vs 2, ADR-0032), and the RSPAN population by trailer version. Exits nonzero on any anomaly. |
+| `ravel-cli maintain verify-custody --tenant <n> [--shards <n>]` | `--shards` default `4` | Read-only, no `--dry-run` (nothing is written or deleted). Re-verifies the content-addressed chain at rest: every live data object's key-embedded `hash16` against its actual content hash, and every surviving compaction record's referenced inputs (a mismatch is an anomaly; an input the sweeper already legitimately reclaimed past its protection horizon is reported separately, not as an anomaly). Exits nonzero on any anomaly. |
 | `ravel-cli catalog list --tenant <name> [--hours <n>] [--shards <n>]` | `--hours` default `1`, `--shards` default `4` | Lists commit records that the catalog resolves for that tenant over the last `hours` hours. `--shards` must match the shard count the data was written with. |
 | `ravel-cli catalog fold --tenant <name> [--shards <n>]` | `--shards` default `4` | One-shot catalog fold: seals every eligible hour into a new snapshot part and CAS-advances HEAD. Prints the fold report (watermark before/after, buckets folded, entry count, request counts). This is the same operation that the background fold task runs on a timer. |
 | `ravel-cli catalog inspect --tenant <name>` | | Decodes and prints HEAD and every referenced snapshot part: watermark, part keys, hashes, entry counts. It reports rather than errors when no HEAD exists yet. |
@@ -244,14 +245,15 @@ maintenance loop uses the defaults.
 ### Running it
 
 - **Continuously**: `ravel-server --mode maintain` runs the loop per
-  tenant over both signals and every shard on `--maintain-interval-secs`.
-  It needs a `multipart`-capable backend and serves no ingest or query
-  routes.
+  tenant over all three signals and every shard on
+  `--maintain-interval-secs`. It needs a `multipart`-capable backend and
+  serves no ingest or query routes.
 - **One-shot / inspection**: `ravel-cli maintain compact-bucket`,
-  `maintain sweep`, `maintain status`, and `maintain audit-versions` (see
-  the CLI table above). `compact-bucket` and `sweep` take `--dry-run` to
-  report exactly what a real run would write or delete, without mutating
-  anything.
+  `maintain sweep`, `maintain status`, `maintain audit-versions`, and
+  `maintain verify-custody` (see the CLI table above). `compact-bucket`
+  and `sweep` take `--dry-run` to report exactly what a real run would
+  write or delete, without mutating anything; `verify-custody` is
+  read-only and has no `--dry-run` since there is nothing to simulate.
 
 ## Known limitations
 
