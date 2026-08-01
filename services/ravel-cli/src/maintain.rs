@@ -23,6 +23,7 @@ use ravel_types::{Signal, TenantId};
 pub enum SignalArg {
     Metrics,
     Logs,
+    Spans,
 }
 
 impl SignalArg {
@@ -30,6 +31,7 @@ impl SignalArg {
         match self {
             SignalArg::Metrics => Signal::Metrics,
             SignalArg::Logs => Signal::Logs,
+            SignalArg::Spans => Signal::Spans,
         }
     }
 }
@@ -209,17 +211,19 @@ pub async fn status(
 }
 
 /// `maintain audit-versions`: a safety audit of the on-object format versions
-/// live for a tenant, across both signals (issue #115 rescoped text). For RSEG
-/// (metrics) it confirms the ADR-0027 single-version policy holds: any live
-/// object at a version other than the one supported version is an anomaly
-/// (there is no migration path, only this report). For RLOG (logs) it reports
-/// the live population by trailer version (1 vs 2), since the v1->v2 bump
-/// (ADR-0032) also has no dual-reader path: a live v1 object post-bump is
-/// unreadable, so this is a safety audit, not a migration tool.
+/// live for a tenant, across all three signals (issue #115 rescoped text,
+/// extended to spans by #355). For RSEG (metrics) it confirms the ADR-0027
+/// single-version policy holds: any live object at a version other than the
+/// one supported version is an anomaly (there is no migration path, only this
+/// report). For RLOG (logs) and RSPAN (spans) it reports the live population
+/// by trailer version, since neither format has a dual-reader path today: a
+/// live object at an unsupported version is unreadable, so this is a safety
+/// audit, not a migration tool.
 ///
 /// The supported version is read from each reader crate's own constant
-/// (`ravel_segment::VERSION_V5`, `ravel_logseg::footer::VERSION`) so a future
-/// version bump does not silently make this audit stale. Version numbers are
+/// (`ravel_segment::VERSION_V5`, `ravel_logseg::footer::VERSION`,
+/// `ravel_rspan::footer::VERSION`) so a future version bump does not silently
+/// make this audit stale. Version numbers are
 /// read from each surviving commit record's `segment_format_version` (an L0
 /// object's liveness == a surviving commit record) and each compaction
 /// record's parts (live L1 objects). Exits nonzero if any anomaly is found.
@@ -232,10 +236,11 @@ pub async fn audit_versions(
 
     let tenant_hash = TenantId::new(tenant).hash();
     let mut anomalies = 0usize;
-    for signal in [Signal::Metrics, Signal::Logs] {
+    for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
         let supported: u32 = match signal {
             Signal::Metrics => u32::from(ravel_segment::VERSION_V5),
             Signal::Logs => u32::from(ravel_logseg::footer::VERSION),
+            Signal::Spans => u32::from(ravel_rspan::footer::VERSION),
             other => {
                 return Err(anyhow::anyhow!(
                     "audit-versions does not support signal {other:?}"
@@ -301,7 +306,8 @@ pub async fn audit_versions(
     if anomalies > 0 {
         anyhow::bail!(
             "audit-versions found {anomalies} live object(s) at an unsupported version; there is \
-             no dual-reader or migration path (ADR-0027 for RSEG, ADR-0032 for RLOG)"
+             no dual-reader or migration path (ADR-0027 for RSEG, ADR-0032 for RLOG, ADR-0041 for \
+             RSPAN)"
         );
     }
     println!("audit-versions: all live objects are at a supported version");
