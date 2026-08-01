@@ -4298,6 +4298,7 @@ dependencies = [
  "ravel-maintain",
  "ravel-object-store",
  "ravel-proto",
+ "ravel-rspan",
  "ravel-segment",
  "ravel-types",
  "serde_json",
@@ -4576,6 +4577,19 @@ dependencies = [
  "snap",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "ravel-rspan"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "proptest",
+ "prost",
+ "prost-build",
+ "protox",
+ "thiserror",
+ "zstd",
 ]
 
 [[package]]

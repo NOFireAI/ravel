@@ -57,6 +57,11 @@ enum Command {
         #[command(subcommand)]
         command: RlogCommand,
     },
+    /// Inspect an RSPAN span segment (footer, sections, skip index).
+    Rspan {
+        #[command(subcommand)]
+        command: RspanCommand,
+    },
     /// Fetch and decode a commit record.
     Commit {
         #[command(subcommand)]
@@ -85,6 +90,14 @@ enum SegmentCommand {
 
 #[derive(Debug, Subcommand)]
 enum RlogCommand {
+    Inspect {
+        /// Local file path or object store key.
+        path: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RspanCommand {
     Inspect {
         /// Local file path or object store key.
         path: String,
@@ -203,6 +216,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let bytes = store::read_bytes(&cli.store, &path).await?;
             rlog_inspect(&bytes)
+        }
+        Command::Rspan {
+            command: RspanCommand::Inspect { path },
+        } => {
+            let bytes = store::read_bytes(&cli.store, &path).await?;
+            rspan_inspect(&bytes)
         }
         Command::Commit {
             command: CommitCommand::Decode { key },
@@ -743,6 +762,98 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
             rlog_field_type_name(entry.ty),
             entry.present_blocks,
             entry.null_count,
+        );
+    }
+
+    Ok(())
+}
+
+/// Human-readable name for a known RSPAN section kind
+/// (docs/span-segment-format.md).
+fn rspan_section_kind_name(kind: u32) -> &'static str {
+    match kind {
+        ravel_rspan::footer::kind::BLOCKS => "BLOCKS",
+        ravel_rspan::footer::kind::SKIP_IDX => "SKIP_IDX",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Human-readable name for an RSPAN section `comp` tag (0=none, 2=zstd).
+fn rspan_comp_name(comp: u8) -> &'static str {
+    match comp {
+        ravel_rspan::footer::COMP_NONE => "none",
+        ravel_rspan::footer::COMP_ZSTD => "zstd",
+        _ => "unknown",
+    }
+}
+
+/// Inspects a whole RSPAN object (docs/span-segment-format.md): footer identity
+/// and summary, the section table, and the interval-aware skip index (one line
+/// per block). Every decode is the reader's own path, so a corrupt SKIP_IDX or a
+/// section crc mismatch surfaces as a typed error with a non-zero exit, never a
+/// panic.
+fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
+    let footer = ravel_rspan::open(bytes)
+        .map_err(|err| anyhow::anyhow!("failed to parse rspan segment: {err}"))?;
+
+    println!("total_size: {}", bytes.len());
+    println!("version: {}", ravel_rspan::footer::VERSION);
+    println!("signal: {}", ravel_rspan::footer::SIGNAL_SPANS);
+    println!("tenant_hash: {}", hex::encode(footer.tenant_hash));
+    println!("shard: {}", footer.shard);
+    println!("writer_id: {}", hex::encode(footer.writer_id));
+    println!("writer_epoch: {}", footer.writer_epoch);
+    println!("writer_seq: {}", footer.writer_seq);
+    println!("min_start_ts_ns: {}", footer.min_start_ts_ns);
+    println!("max_end_ts_ns: {}", footer.max_end_ts_ns);
+    println!("record_count: {}", footer.record_count);
+    println!("block_count: {}", footer.block_count);
+    println!("min_trace_id: {}", hex::encode(footer.min_trace_id));
+    println!("max_trace_id: {}", hex::encode(footer.max_trace_id));
+    println!("level: {}", footer.level);
+    println!("input_set_hash: {}", hex::encode(&footer.input_set_hash));
+    println!("part_index: {}", footer.part_index);
+    println!("sections:");
+    for section in &footer.sections {
+        println!(
+            "  kind={} name={} offset={} len={} comp={} uncompressed_len={}",
+            section.kind,
+            rspan_section_kind_name(section.kind),
+            section.offset,
+            section.len,
+            rspan_comp_name(section.comp),
+            section.uncomp_len,
+        );
+    }
+
+    // The skip index is reconstructed through ravel-rspan's own `read_section`
+    // (the reader's crc-verify-and-decompress path), so the inspector applies the
+    // exact `Corrupted` discipline the reader does.
+    let skip_desc = footer
+        .section(ravel_rspan::footer::kind::SKIP_IDX)
+        .ok_or_else(|| anyhow::anyhow!("missing SKIP_IDX section"))?;
+    let skip_raw = ravel_rspan::read_section(
+        bytes,
+        skip_desc,
+        ravel_rspan::footer::DEFAULT_MAX_SECTION_UNCOMP,
+    )
+    .map_err(|err| anyhow::anyhow!("failed to read skip index section: {err}"))?;
+    let skip =
+        ravel_rspan::skip_index::SkipIndex::decode(&skip_raw, ravel_rspan::reader::MAX_BLOCKS)
+            .map_err(|err| anyhow::anyhow!("failed to decode skip index: {err}"))?;
+    println!("skip_index ({} block(s)):", skip.blocks.len());
+    for (i, entry) in skip.blocks.iter().enumerate() {
+        println!(
+            "  block[{i}] offset={} len={} crc32c={:08x} record_count={} \
+             trace_id_range=[{}, {}] start_ts_min={} end_ts_max={}",
+            entry.block_offset,
+            entry.block_len,
+            entry.block_crc32c,
+            entry.record_count,
+            hex::encode(entry.min_trace_id),
+            hex::encode(entry.max_trace_id),
+            entry.min_start_ts,
+            entry.max_end_ts,
         );
     }
 
