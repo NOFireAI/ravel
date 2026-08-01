@@ -704,26 +704,25 @@ pub fn decode_catalog_v5(
         .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
     let series_ids_section = find_section(footer, section_kind::SERIES_IDS)
         .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
-    let dict_bytes = decode_section_bytes(
-        label_dict_section,
-        slice(object_bytes, label_dict_section)?,
-        limits,
-    )?;
-    let ids_bytes = decode_section_bytes(
-        series_ids_section,
-        slice(object_bytes, series_ids_section)?,
-        limits,
-    )?;
-    let dict_index = index_label_dict(&dict_bytes)?;
-    let series_ids = parse_series_ids_v2(&ids_bytes)?;
 
     // Whole-section (below-threshold) path: delegate to v4's decode core.
-    // LABEL_DICT and SERIES_IDS are already decompressed above (and their
-    // crcs verified there), so pass the decoded bytes straight in rather than
-    // handing raw section slices to `decode_catalog_v4`, which would decode
-    // both a second time (#282). SERIES_META is the one section decompressed
-    // here.
+    // LABEL_DICT and SERIES_IDS are decompressed here (and their crcs
+    // verified) so the decoded bytes go straight in rather than handing raw
+    // section slices to `decode_catalog_v4`, which would decode both a second
+    // time (#282). SERIES_META is the one further section decompressed here.
     if let Some(meta_section) = find_section(footer, section_kind::SERIES_META) {
+        let dict_bytes = decode_section_bytes(
+            label_dict_section,
+            slice(object_bytes, label_dict_section)?,
+            limits,
+        )?;
+        let ids_bytes = decode_section_bytes(
+            series_ids_section,
+            slice(object_bytes, series_ids_section)?,
+            limits,
+        )?;
+        let dict_index = index_label_dict(&dict_bytes)?;
+        let series_ids = parse_series_ids_v2(&ids_bytes)?;
         let meta_bytes =
             decode_section_bytes(meta_section, slice(object_bytes, meta_section)?, limits)?;
         return crate::reader::decode_catalog_v4_from_decoded(
@@ -736,14 +735,61 @@ pub fn decode_catalog_v5(
         );
     }
 
-    // Chunked path: SERIES_IDX + SERIES_META_CHUNKS.
+    // Chunked path: SERIES_IDX + SERIES_META_CHUNKS. Slice the four catalog
+    // sections out of the whole object and hand them to the section-based
+    // entry, so the whole-object decode and a catalog-only range-fetch
+    // (`decode_catalog_v5_chunked`, #276) share one implementation.
     let idx_section = find_section(footer, section_kind::SERIES_IDX)
         .ok_or(SegmentError::SparseSectionsIncomplete)?;
     let chunks_section = find_section(footer, section_kind::SERIES_META_CHUNKS)
         .ok_or(SegmentError::SparseSectionsIncomplete)?;
-    let idx_bytes = decode_section_bytes(idx_section, slice(object_bytes, idx_section)?, limits)?;
-    let chunk_bytes =
-        decode_section_bytes(chunks_section, slice(object_bytes, chunks_section)?, limits)?;
+    decode_catalog_v5_chunked(
+        footer,
+        slice(object_bytes, label_dict_section)?,
+        slice(object_bytes, series_ids_section)?,
+        slice(object_bytes, idx_section)?,
+        slice(object_bytes, chunks_section)?,
+        limits,
+    )
+}
+
+/// Decodes the v5 chunked catalog (at or above [`crate::V5_SPARSE_THRESHOLD`]
+/// series) from the already-fetched raw stored bytes of its four catalog
+/// sections -- LABEL_DICT, SERIES_IDS, SERIES_IDX, SERIES_META_CHUNKS --
+/// instead of the whole object. This is the production selective-read entry
+/// (issue #276): a reader that has range-GET only the catalog sections
+/// (skipping the TS/VAL/HIST page sections a whole-object GET would pull in)
+/// decodes exactly the `SeriesEntryV4` values [`decode_catalog_v5`] returns.
+///
+/// Each `*_stored` slice must be the exact stored section bytes named by
+/// `footer`; [`decode_section_bytes`] re-verifies each section's length and
+/// crc32c before use, so a corrupt or mis-ranged fetch is a typed error, never
+/// wrong data. The reconstructed run page ranges stay absolute-in-object (they
+/// carry the TS/VAL/HIST section bases from `footer`), so a caller can fetch
+/// those pages afterward exactly as on the whole-object path.
+pub fn decode_catalog_v5_chunked(
+    footer: &Footer,
+    label_dict_stored: &[u8],
+    series_ids_stored: &[u8],
+    series_idx_stored: &[u8],
+    meta_chunks_stored: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let series_ids_section = find_section(footer, section_kind::SERIES_IDS)
+        .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
+    let idx_section = find_section(footer, section_kind::SERIES_IDX)
+        .ok_or(SegmentError::SparseSectionsIncomplete)?;
+    let chunks_section = find_section(footer, section_kind::SERIES_META_CHUNKS)
+        .ok_or(SegmentError::SparseSectionsIncomplete)?;
+
+    let dict_bytes = decode_section_bytes(label_dict_section, label_dict_stored, limits)?;
+    let ids_bytes = decode_section_bytes(series_ids_section, series_ids_stored, limits)?;
+    let dict_index = index_label_dict(&dict_bytes)?;
+    let series_ids = parse_series_ids_v2(&ids_bytes)?;
+    let idx_bytes = decode_section_bytes(idx_section, series_idx_stored, limits)?;
+    let chunk_bytes = decode_section_bytes(chunks_section, meta_chunks_stored, limits)?;
     let index = parse_series_idx(&idx_bytes)?;
 
     // Section header: count, schema_count, schemas, run_total. The schemas

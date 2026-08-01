@@ -10,17 +10,21 @@ use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
     ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry, SeriesEntry,
     SeriesEntryV4, ValPageKind, ValueKind, check_identity, decode_catalog_v4, decode_catalog_v5,
-    decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
+    decode_catalog_v5_chunked, decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix,
+    plan_ranges_v4,
 };
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 
 /// Section kinds from docs/segment-format.md (not exported by
 /// `ravel-segment`). LABEL_DICT + SERIES_IDS + SERIES_META are the catalog
-/// sections a below-threshold v5 object carries; their absence (SERIES_META
-/// replaced by the chunked SERIES_META_CHUNKS) marks a sparse object.
+/// sections a below-threshold v5 object carries; SERIES_META's absence (it is
+/// replaced by SERIES_IDX + SERIES_META_CHUNKS) marks a sparse object at or
+/// above the 4096-series threshold.
 const SECTION_LABEL_DICT: u32 = 1;
 const SECTION_SERIES_IDS: u32 = 5;
 const SECTION_SERIES_META: u32 = 6;
+const SECTION_SERIES_IDX: u32 = 8;
+const SECTION_SERIES_META_CHUNKS: u32 = 9;
 
 /// Absolute `(offset, len)` of a section by kind, from the footer.
 fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
@@ -51,6 +55,28 @@ pub const DEFAULT_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 /// semaphore, so this also bounds the total in-flight GETs across every
 /// concurrent segment fetch in a query, not just within one segment.
 pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
+
+/// Object-size floor for taking the sparse catalog-probe path in
+/// [`SegmentFetcher::decode_selected`] instead of the whole-object fallback
+/// (issue #276). A sparse (>=4096-series) v5 object lays its catalog sections
+/// (LABEL_DICT, SERIES_IDS, SERIES_META_CHUNKS, SERIES_IDX) contiguously at the
+/// front, ahead of the TS/VAL/HIST page sections. Fetching only that catalog
+/// prefix -- one contiguous range GET -- skips the page bytes a whole-object
+/// GET pulls in, then the matched series' pages are fetched selectively
+/// afterward, exactly as the below-threshold path already does.
+///
+/// The crossover this constant guards is a round-trip-vs-bytes tradeoff, not a
+/// pure win: below the floor the whole object is small enough that a single GET
+/// beats one catalog GET plus the extra selective page-range GETs (each a fresh
+/// round trip: ~15-80 ms on S3, ~1-5 ms on loopback MinIO per the epic #264
+/// Wave 1 panel, BENCHMARKS.md 2026-07-31). Wave 1 measured per-request latency
+/// but did NOT meter this specific within-segment crossover, so this floor is
+/// set conservatively rather than fit to a measured point (see the #276 report
+/// and docs/query-engine.md). 256 KiB is above the four fixed 64 KiB suffix/gap
+/// probes yet far below any real compacted sparse L1 part, so production sparse
+/// objects take the probe path while a degenerate tiny sparse object keeps the
+/// cheaper single GET.
+pub const SPARSE_PROBE_MIN_OBJECT_SIZE: u64 = 256 * 1024;
 
 /// Errors fetching and decoding one segment. Every variant is a hard error:
 /// the caller never receives partial or silently-wrong data for a segment
@@ -174,6 +200,18 @@ impl FetchedRegions {
             }
         })
     }
+}
+
+/// The four sparse-catalog section ranges (`(offset, len)` each) the
+/// catalog-probe path fetches instead of the whole object: LABEL_DICT,
+/// SERIES_IDS, SERIES_IDX, and SERIES_META_CHUNKS. They lie contiguously at the
+/// object front (ahead of the TS/VAL/HIST page sections), so `ensure_ranges`
+/// coalesces them into as few GETs as their layout allows.
+struct SparseCatalogRanges {
+    label_dict: (u64, u64),
+    series_ids: (u64, u64),
+    series_idx: (u64, u64),
+    meta_chunks: (u64, u64),
 }
 
 /// Merges (start, end) ranges into ordered, non-overlapping groups, joining
@@ -409,14 +447,26 @@ impl SegmentFetcher {
     }
 
     /// Decodes the catalog and returns the run-major series matching
-    /// `matchers`, fetching only the catalog sections. Below the sparse
-    /// threshold a v5 object carries the whole SERIES_META (kind 6): fetch
-    /// LABEL_DICT + SERIES_IDS + SERIES_META and decode the run-major catalog,
-    /// so a label-pruned read fetches no page bytes it will not return. At or
-    /// above the threshold the chunked catalog spans sections, so fall back to
-    /// a whole-object decode (selective sparse reads within one large segment
-    /// are a compacted-tier concern, #111). Page bytes are fetched afterwards
-    /// by the caller from `regions`.
+    /// `matchers`, fetching only the catalog sections when it can.
+    ///
+    /// - **Below the sparse threshold** a v5 object carries the whole
+    ///   SERIES_META (kind 6): fetch LABEL_DICT + SERIES_IDS + SERIES_META and
+    ///   decode the run-major catalog, so a label-pruned read fetches no page
+    ///   bytes it will not return.
+    /// - **At or above the threshold** (SERIES_META absent) the catalog is the
+    ///   chunked SERIES_META_CHUNKS plus the SERIES_IDX directory. When the
+    ///   object qualifies for the sparse catalog-probe path (issue #276), fetch
+    ///   just its four catalog sections (LABEL_DICT, SERIES_IDS, SERIES_IDX, and
+    ///   SERIES_META_CHUNKS, contiguous at the object front) and decode via
+    ///   [`decode_catalog_v5_chunked`], skipping the TS/VAL/HIST page bytes the
+    ///   whole-object GET would pull in.
+    ///   [`Self::sparse_probe_qualifies`] gives the crossover.
+    /// - **Otherwise** (a non-qualifying sparse object) fall back to the
+    ///   whole-object decode, unchanged.
+    ///
+    /// Page bytes are fetched afterwards by the caller from `regions`; the run
+    /// page ranges are absolute-in-object on every path, so that step is
+    /// identical regardless of which catalog path ran here.
     async fn decode_selected(
         &self,
         key: &str,
@@ -461,6 +511,9 @@ impl SegmentFetcher {
                 .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
             decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
                 .map_err(|source| corrupt(key, source))?
+        } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
+            self.decode_sparse_catalog(key, footer, suffix_etag, regions, &sparse)
+                .await?
         } else {
             self.ensure_ranges(key, suffix_etag, &[(0, total_size)], regions)
                 .await?;
@@ -474,6 +527,89 @@ impl SegmentFetcher {
             .into_iter()
             .filter(|e| matches_series(matchers, &e.entry.labels))
             .collect())
+    }
+
+    /// Decides whether a sparse (SERIES_META-absent) v5 object takes the
+    /// catalog-probe path, returning the four catalog section ranges to fetch
+    /// when it does. `None` means fall back to the whole-object decode.
+    ///
+    /// Qualifies when all hold:
+    /// - the object carries both sparse sections (SERIES_IDX +
+    ///   SERIES_META_CHUNKS); a malformed footer missing either falls back,
+    ///   where `decode_catalog_v5` surfaces the same typed error it always did;
+    /// - `matchers` is non-empty. An empty matcher matches every series, so the
+    ///   query wants all pages anyway; a single whole-object GET beats one
+    ///   catalog GET plus a page GET spanning the whole object;
+    /// - the object is at least [`SPARSE_PROBE_MIN_OBJECT_SIZE`], so the page
+    ///   bytes skipped outweigh the extra selective page-range round trips.
+    fn sparse_probe_qualifies(
+        &self,
+        footer: &Footer,
+        total_size: u64,
+        matchers: &[LabelMatcher],
+    ) -> Option<SparseCatalogRanges> {
+        if matchers.is_empty() || total_size < SPARSE_PROBE_MIN_OBJECT_SIZE {
+            return None;
+        }
+        let (ld_off, ld_len) = section_range(footer, SECTION_LABEL_DICT)?;
+        let (si_off, si_len) = section_range(footer, SECTION_SERIES_IDS)?;
+        let (idx_off, idx_len) = section_range(footer, SECTION_SERIES_IDX)?;
+        let (ch_off, ch_len) = section_range(footer, SECTION_SERIES_META_CHUNKS)?;
+        Some(SparseCatalogRanges {
+            label_dict: (ld_off, ld_len),
+            series_ids: (si_off, si_len),
+            series_idx: (idx_off, idx_len),
+            meta_chunks: (ch_off, ch_len),
+        })
+    }
+
+    /// Fetches the four sparse catalog sections named by `ranges` (coalesced
+    /// into as few GETs as their layout allows) and decodes the chunked catalog
+    /// from them, without the page sections. Each section is crc-verified by
+    /// [`decode_catalog_v5_chunked`], so a mis-ranged or corrupt fetch is a
+    /// typed error, never wrong data.
+    async fn decode_sparse_catalog(
+        &self,
+        key: &str,
+        footer: &Footer,
+        suffix_etag: &Etag,
+        regions: &mut FetchedRegions,
+        ranges: &SparseCatalogRanges,
+    ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+        let needed = [
+            (
+                ranges.label_dict.0,
+                ranges.label_dict.0 + ranges.label_dict.1,
+            ),
+            (
+                ranges.series_ids.0,
+                ranges.series_ids.0 + ranges.series_ids.1,
+            ),
+            (
+                ranges.series_idx.0,
+                ranges.series_idx.0 + ranges.series_idx.1,
+            ),
+            (
+                ranges.meta_chunks.0,
+                ranges.meta_chunks.0 + ranges.meta_chunks.1,
+            ),
+        ];
+        self.ensure_ranges(key, suffix_etag, &needed, regions)
+            .await?;
+        let dict = regions
+            .slice(ranges.label_dict.0, ranges.label_dict.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let ids = regions
+            .slice(ranges.series_ids.0, ranges.series_ids.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let idx = regions
+            .slice(ranges.series_idx.0, ranges.series_idx.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let chunks = regions
+            .slice(ranges.meta_chunks.0, ranges.meta_chunks.1)
+            .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, self.limits)
+            .map_err(|source| corrupt(key, source))
     }
 
     /// Coalesced page ranges for the scalar runs of `selected` (histogram
@@ -1495,6 +1631,156 @@ mod tests {
             .expect("fetch_soa");
         assert_eq!(scalar.len(), 1, "only the scalar-kind series is returned");
         assert_eq!(scalar[0].labels, labels("scalar_metric"));
+    }
+
+    /// Writes a real sparse (>= 4096-series) v5 RSEG object. Above the
+    /// threshold `SegmentWriter::write` emits the SERIES_IDX + chunked
+    /// SERIES_META sections (ADR-0026), so `SERIES_META` (kind 6) is absent and
+    /// the fetcher sees a sparse object. `samples_per` scalar samples per series
+    /// keep the TS/VAL page sections large relative to the catalog, so the
+    /// catalog-probe path's byte win is unambiguous. Returns the object bytes
+    /// and a matching L0 `SegmentRef`.
+    async fn write_sparse_test_segment(
+        n_series: usize,
+        samples_per: usize,
+    ) -> (Bytes, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([5u8; 16]);
+        let writer_id = Uuid::from_u128(3);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let mut inputs = Vec::with_capacity(n_series);
+        for i in 0..n_series {
+            let metric = format!("sparse_metric_{i}");
+            let samples: Vec<(i64, f64)> = (0..samples_per)
+                .map(|j| {
+                    (
+                        (1_000 + j as i64) * NS,
+                        (i as f64) * 7.0 + (j as f64) * 13.0 + 0.5,
+                    )
+                })
+                .collect();
+            inputs.push(series(&metric, &samples));
+        }
+        let written = SegmentWriter::write(inputs, identity, bounds).expect("write sparse segment");
+
+        let seg_ref = SegmentRef {
+            data_object_key: "test/sparse-segment.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 99,
+            level: ravel_catalog::SegmentLevel::L0,
+        };
+        (written.bytes, tenant_hash, seg_ref)
+    }
+
+    /// Puts `bytes` on a fresh `MemoryStore` wrapped in an `InstrumentedStore`,
+    /// returning a fetcher over it plus the shared metrics handle. The metrics
+    /// count exactly the GET calls and bytes the fetcher issued.
+    async fn metered_fetcher(
+        key: &str,
+        bytes: Bytes,
+    ) -> (SegmentFetcher, Arc<ravel_object_store::StoreMetrics>) {
+        let memory = MemoryStore::new();
+        memory
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put sparse object");
+        let instrumented = Arc::new(ravel_object_store::InstrumentedStore::new(memory));
+        let metrics = instrumented.metrics();
+        let backend: Arc<dyn ObjectStoreBackend> = instrumented;
+        (SegmentFetcher::new(backend), metrics)
+    }
+
+    /// #276: a matcher-pruned read of a sparse (>= 4096-series) v5 segment now
+    /// fetches only the catalog sections (LABEL_DICT + SERIES_IDS + SERIES_IDX +
+    /// SERIES_META_CHUNKS) plus the matched series' pages, instead of a
+    /// whole-object GET. The probe read moves far fewer bytes than the object
+    /// size, and returns exactly the matched series' samples.
+    #[tokio::test]
+    async fn sparse_segment_uses_catalog_probe_path_not_whole_object() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 8).await;
+        let object_size = seg_ref.object_size;
+        assert!(
+            object_size > SPARSE_PROBE_MIN_OBJECT_SIZE,
+            "sparse test object ({object_size} B) must exceed the probe-path floor"
+        );
+
+        // Matcher pins one metric, so only its series' pages should be fetched.
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let (soa, _stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &matchers)
+            .await
+            .expect("fetch_soa probe path");
+
+        assert_eq!(soa.len(), 1, "exactly the matched series is returned");
+        assert_eq!(soa[0].labels, labels("sparse_metric_2000"));
+        assert_eq!(soa[0].timestamps.len(), 8);
+        assert_eq!(soa[0].values.len(), 8);
+
+        let probe = metrics.snapshot().get;
+        // The probe path never GETs the whole object: its total bytes stay well
+        // under the object size (catalog sections + one series' pages + the
+        // 64 KiB footer suffix), where the whole-object fallback would move at
+        // least `object_size` bytes in one GET.
+        assert!(
+            probe.bytes < object_size,
+            "probe path moved {} B, must be under the {object_size} B object",
+            probe.bytes
+        );
+        assert!(
+            probe.bytes < object_size / 2,
+            "probe path ({} B) should be far under half the object ({object_size} B)",
+            probe.bytes
+        );
+    }
+
+    /// #276: an object that does not qualify for the probe path keeps the
+    /// unchanged whole-object fallback. An empty matcher matches every series,
+    /// so the fetcher takes the whole-object GET (one GET covering the object)
+    /// rather than the catalog-probe path. Proven by the metered GET bytes
+    /// reaching at least the object size.
+    #[tokio::test]
+    async fn sparse_segment_empty_matcher_keeps_whole_object_fallback() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 8).await;
+        let object_size = seg_ref.object_size;
+
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let (soa, _stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa whole-object fallback");
+
+        assert_eq!(soa.len(), 4096, "an empty matcher returns every series");
+
+        let get = metrics.snapshot().get;
+        // The whole-object fallback fetches the entire object in one GET, so the
+        // metered bytes include at least `object_size` (plus the earlier 64 KiB
+        // footer suffix). The probe path would have stayed strictly under it.
+        assert!(
+            get.bytes >= object_size,
+            "whole-object fallback moved {} B, must be at least the {object_size} B object",
+            get.bytes
+        );
     }
 
     // --- coalesce_ranges / FetchedRegions unit coverage (a5-F01).

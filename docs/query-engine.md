@@ -69,6 +69,43 @@ and passes through bit-exactly (issue #75).
    regex/negative matchers evaluate on materialized label sets.
 3. Page level: v1 has one page pair per series; nothing further to prune.
 
+## Segment catalog fetch: whole-object vs sparse catalog-probe (#276)
+
+`SegmentFetcher::decode_selected` decodes one segment's catalog before it
+plans page ranges. How it fetches the catalog depends on the object's v5
+shape (docs/segment-format.md, ADR-0026):
+
+- **Below the 4096-series sparse threshold** the object carries the
+  whole-section SERIES_META (kind 6). The fetcher GETs LABEL_DICT +
+  SERIES_IDS + SERIES_META and decodes the run-major catalog. No page bytes
+  are pulled.
+- **At or above the threshold** SERIES_META is replaced by the SERIES_IDX
+  directory (kind 8) and the chunked SERIES_META_CHUNKS (kind 9). These four
+  catalog sections (LABEL_DICT, SERIES_IDS, SERIES_META_CHUNKS, SERIES_IDX)
+  sit contiguously at the object front, ahead of the TS/VAL/HIST page
+  sections. When the object qualifies for the **catalog-probe path**, the
+  fetcher range-GETs only that catalog prefix (coalesced into as few GETs as
+  the layout allows) and decodes via `decode_catalog_v5_chunked`, skipping
+  the page bytes a whole-object GET would move. The matched series' pages are
+  fetched selectively afterward, exactly as the below-threshold path already
+  does. Each catalog section's crc32c is re-verified on the fetched bytes, so
+  a mis-ranged or corrupt fetch is a typed error, never wrong data.
+- **Otherwise** (a sparse object that does not qualify) the fetcher keeps the
+  unchanged whole-object GET and `decode_catalog_v5`.
+
+Qualification (`SegmentFetcher::sparse_probe_qualifies`) requires all of: the
+object carries both sparse sections; the query's matcher set is non-empty (an
+empty matcher wants every series, so one whole-object GET beats a catalog GET
+plus a page GET spanning the object); and the object is at least
+`SPARSE_PROBE_MIN_OBJECT_SIZE`. The size floor is the crossover between one
+whole-object GET and one catalog GET plus the extra selective page-range round
+trips. Epic #264 Wave 1 (BENCHMARKS.md, 2026-07-31 MinIO panel) measured
+per-request latency (~1-5 ms loopback, ~15-80 ms projected real S3) but did
+not meter this specific within-segment crossover, so the floor is set
+conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
+below any real compacted sparse L1 part) rather than fit to a measured point.
+The within-segment GET/byte model is the `selective_read_accounting` bench.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
