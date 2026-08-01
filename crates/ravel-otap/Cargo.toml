@@ -36,5 +36,9 @@ stats_alloc = "0.1.10"
 name = "decode"
 harness = false
 
+[[bench]]
+name = "ingest_panel"
+harness = false
+
 [lints]
 workspace = true
