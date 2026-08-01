@@ -120,6 +120,22 @@ selector, each one resolves its own catalog snapshot independently, and Ravel
 unions the results by series identity. The selectors do not share one snapshot
 for the request.
 
+### `GET /api/v1/status/buildinfo` and `GET /api/v1/metadata`
+
+Two routes Grafana's built-in Prometheus datasource probes on every datasource
+save. They take no parameters.
+
+```json
+{"status": "success", "data": {"version": "0.1.0", "revision": "", "branch": "", "buildUser": "", "buildDate": "", "goVersion": ""}}
+```
+
+`version` is Ravel's own version, not a Prometheus one. `revision` is the
+build's git SHA when the build exported `RAVEL_GIT_SHA`, empty otherwise.
+
+`/api/v1/metadata` always returns `{"status": "success", "data": {}}`: Ravel
+captures no OTLP metric type, help, or unit metadata today, so there is
+nothing truthful to report.
+
 ## PromQL subset
 
 Ravel's evaluator (`ravel-promql`) supports exactly one AST shape: a bare

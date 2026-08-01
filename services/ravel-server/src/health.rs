@@ -16,6 +16,10 @@
 //!   kubelet probe of every pod would add real S3 cost, and a transient S3
 //!   blip would eject every pod from its Service at once. Continuous store
 //!   health probing is a deliberate follow-up, not an omission here.
+//!
+//! `/-/healthy` and `/-/ready` are Prometheus' own spellings of the same two
+//! probes, routed to the same handler functions (issue #336) so a
+//! Prometheus-shaped client can probe the paths it already knows.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +64,12 @@ pub fn router(readiness: Readiness) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // Prometheus' own health/readiness paths, pointed at the same two
+        // handler functions rather than reimplemented: Grafana and other
+        // Prometheus-shaped clients probe these, and any divergence between
+        // the two spellings would be a bug by construction.
+        .route("/-/healthy", get(healthz))
+        .route("/-/ready", get(readyz))
         .with_state(readiness)
 }
 

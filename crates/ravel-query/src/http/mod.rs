@@ -2,6 +2,7 @@
 //! (docs/query-engine.md "HTTP API"). Library only: binding a listener and
 //! wiring this into a service is left to the caller.
 
+mod compat;
 mod error;
 mod handlers;
 mod json;
@@ -47,4 +48,8 @@ pub fn router(state: AppState) -> Router {
             get(handlers::series).post(handlers::series),
         )
         .with_state(state)
+        // Stateless Prometheus compatibility routes (buildinfo, metadata).
+        // Merged here so every service mounting this router serves them
+        // without any extra wiring of its own.
+        .merge(compat::router())
 }

@@ -113,6 +113,13 @@ The within-segment GET/byte model is the `selective_read_accounting` bench.
 - `GET /api/v1/labels`, `/api/v1/label/{name}/values` (match[] optional,
   start/end optional): from snapshot SERIES_META label dictionaries.
 - `GET/POST /api/v1/series` (match[] required, start/end).
+- `GET /api/v1/status/buildinfo`: Ravel's own crate version under `version`,
+  never a Prometheus version string. `revision` carries the build's git SHA
+  when the build environment exported `RAVEL_GIT_SHA`, otherwise it is empty,
+  as are `branch`, `buildUser`, `buildDate`, and `goVersion`.
+- `GET /api/v1/metadata`: always `{"status":"success","data":{}}`. Ravel
+  captures no OTLP metric type/help/unit metadata, and an empty object is a
+  valid Prometheus response; inventing entries would not be.
 - All accept `min_commit_token`. Errors use the Prometheus JSON error
   envelope (`status:"error"`, `errorType`, `error`) with correct HTTP codes
   (400 bad_data, 422 unprocessable for unsupported constructs, 503
