@@ -57,7 +57,7 @@ impl Clock for WallClock {
 /// The signals this server ingests, and therefore maintains, today. Metrics
 /// (RSEG) and logs (RLOG) both flow through the same signal-generic
 /// compaction/retention/sweep code (ADR-0032).
-const MAINTAINED_SIGNALS: [Signal; 2] = [Signal::Metrics, Signal::Logs];
+const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
 /// Everything the maintenance task needs beyond the store and the tenant list.
 #[derive(Debug, Clone)]

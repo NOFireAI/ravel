@@ -19,23 +19,36 @@
 //! modules and take a [`crate::bucket::Bucket`] whose `signal` field already
 //! routes them. The plan's memory bound is on *decoded* data: catalog metadata
 //! plus one in-flight part buffer's decoded records, never the whole bucket's
-//! decoded data at once (`build.rs`/`read.rs` header comments). Both codecs
-//! hold this as a contract on the impl, not a hint, and bound *raw* fetched
-//! bytes as well: each has a ranged reader that reads the footer and directory
-//! from a suffix probe and then fetches only the bytes a part actually needs --
-//! RSEG's `ravel_segment::open_from_suffix` fetching the page bytes of one
-//! series' runs, RLOG's `ravel_logseg::open_from_suffix` plus `RlogRangeReader`
-//! fetching the blocks of one stream (issue #275). So for both, peak resident
-//! bytes -- decoded and raw -- are bounded by catalog metadata plus one part
-//! plus one series/stream, never the whole bucket. The earlier RLOG merge held
-//! every input object whole (RLOG then had no ranged `.rlog` section reader);
-//! that gap is now closed and the two codecs share the same footprint contract.
+//! decoded data at once (`build.rs`/`read.rs` header comments). RSEG and RLOG
+//! hold this as a contract on the impl, not a hint, and additionally bound
+//! *raw* fetched bytes: each has a ranged reader that reads the footer and
+//! directory from a suffix probe and then fetches only the bytes a part
+//! actually needs -- RSEG's `ravel_segment::open_from_suffix` fetching the
+//! page bytes of one series' runs, RLOG's `ravel_logseg::open_from_suffix`
+//! plus `RlogRangeReader` fetching the blocks of one stream (issue #275). For
+//! those two, peak resident bytes -- decoded and raw -- are bounded by
+//! catalog metadata plus one part plus one series/stream, never the whole
+//! bucket. The earlier RLOG merge held every input object whole (RLOG then
+//! had no ranged `.rlog` section reader); that gap is now closed.
+//!
+//! [`crate::rspan_codec::SpanCodec`] (RSPAN, spans) is the third
+//! implementation and does NOT yet hold the same bound: `ravel-rspan` has no
+//! ranged reader, so the codec fetches and decodes each input object whole
+//! (raw bytes bounded to one input at a time; *decoded* records for the whole
+//! bucket are held in memory across the merge). This is a named v1 tradeoff
+//! (`rspan_codec.rs`'s own module doc), the same shape the RLOG merge had
+//! before issue #275, not an oversight -- but it means the "bounded decoded
+//! memory" sentence above is a two-codec-out-of-three contract today, not a
+//! trait-wide guarantee. Closing it for RSPAN (a ranged reader over
+//! `ravel-rspan`, mirroring `RlogRangeReader`) is a natural follow-up once
+//! span bucket sizes in practice justify it.
 //!
 //! [`RsegCodec`] is a behavior-preserving thin wrapper over the existing
 //! `read.rs`/`build.rs` RSEG logic; [`crate::rlog::RlogCodec`] is the RLOG
+//! implementation; [`crate::rspan_codec::SpanCodec`] is the RSPAN
 //! implementation. [`crate::compact::compact_bucket`] dispatches on
-//! `bucket.signal` to one or the other and runs the identical shared pipeline
-//! around whichever it picked.
+//! `bucket.signal` to whichever of the three it picked and runs the identical
+//! shared pipeline around it.
 
 use ravel_object_store::ObjectStoreBackend;
 
@@ -68,12 +81,15 @@ pub trait SegmentCodec {
 
     /// Stream-merge every input into size-capped [`BuiltPart`]s and PUT each
     /// one `CreateIfAbsent` (build.rs's job). `catalogs` is aligned one-to-one
-    /// with `inputs` in canonical input order. Fetches page/block bytes lazily
-    /// by range; peak *decoded* memory is bounded by catalog metadata plus one
-    /// in-flight part, and both codecs additionally bound raw fetched bytes via
-    /// their ranged readers (RSEG's `open_from_suffix`, RLOG's `RlogRangeReader`,
-    /// issue #275) to one part plus one series/stream -- see the trait doc above
-    /// and [`crate::rlog::RlogCodec`].
+    /// with `inputs` in canonical input order. RSEG and RLOG fetch page/block
+    /// bytes lazily by range, bounding peak *decoded* memory to catalog
+    /// metadata plus one in-flight part, and additionally bound raw fetched
+    /// bytes via their ranged readers (RSEG's `open_from_suffix`, RLOG's
+    /// `RlogRangeReader`, issue #275) to one part plus one series/stream -- see
+    /// the trait doc above and [`crate::rlog::RlogCodec`]. RSPAN
+    /// ([`crate::rspan_codec::SpanCodec`]) fetches each input whole (raw bytes
+    /// bounded to one input, decoded records unbounded across the merge) --
+    /// see the trait doc's RSPAN paragraph.
     async fn build_parts(
         store: &dyn ObjectStoreBackend,
         config: &CompactorConfig,

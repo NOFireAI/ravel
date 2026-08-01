@@ -213,3 +213,31 @@ Same per-section/per-block crc32c discipline as RLOG/RSEG. Each section's
 covers the whole block; `footer_crc32c` covers the footer and trailer as defined
 above. There is no separate BLOOM checksum surface because there is no BLOOM
 section.
+
+## Compaction (L0 → L1)
+
+Compaction (ADR-0032's per-signal codec seam, `SpanCodec` in
+`ravel-maintain`) rewrites many small L0 RSPAN flush objects for one sealed
+`(tenant, shard, ingest-hour)` bucket into a handful of large L1 parts, the
+span analogue of RSEG's and RLOG's L0→L1 compaction. The transaction
+machinery (seal detection, `CreateIfAbsent` publish, convergence,
+abandonment, the advisory cursor) is shared and signal-generic. An L1 part
+is byte-for-byte a normal RSPAN object with `level = 1`; readers need no
+special path.
+
+RSPAN's merge is simpler than RLOG's because every `SpanRecord` field is
+stored inline per row (there is no per-object stream directory a record
+references indirectly, unlike RLOG's `STREAM_DIR`): a decoded span
+re-encodes verbatim with no cross-object identity reconciliation. The merge
+decodes each input's records, groups the union by `trace_id`, re-sorts by
+`(trace_id, start_ts)` (this format's canonical order), and rebuilds
+size-capped parts via `RspanWriter::finish_compacted`, splitting output on
+trace boundaries so one trace's spans never straddle two parts.
+
+Memory: `ravel-rspan` has no ranged section reader (no equivalent of RLOG's
+`RlogRangeReader`), so the merge fetches and decodes each input object
+whole. Raw bytes are bounded to one input at a time; decoded records for
+the whole bucket are held in memory across the merge. This is the same
+tradeoff RLOG's merge had before issue #275, not an oversight — a ranged
+RSPAN reader is the natural follow-up once span bucket sizes in practice
+justify it.
