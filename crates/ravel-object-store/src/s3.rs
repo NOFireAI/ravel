@@ -134,6 +134,18 @@ pub struct S3Config {
     /// virtual-hosted style (`https://bucket.host/key`); MinIO deployments
     /// typically require this.
     pub force_path_style: bool,
+    /// Per-tenant SSE-KMS key id for bring-your-own-key encryption
+    /// (ADR-0042 decision 1). `Some(key)` makes [`S3Store::new`] call
+    /// `object_store`'s `with_sse_kms_encryption`, so S3 encrypts every PUT
+    /// under this key inside AWS itself; Ravel adds no crypto code and does
+    /// not manage keys --- BYOK means the tenant supplies (and can revoke)
+    /// their own `kms_key_id`. `None` (every current caller) changes
+    /// nothing: whatever bucket-default SSE the deployment has continues to
+    /// apply, exactly as before. Single-layer SSE-KMS is the deliberate
+    /// default; dual-layer (DSSE) is available from the same builder via
+    /// `with_dsse_kms_encryption` if a future requirement needs it, but
+    /// nothing here builds for that today.
+    pub kms_key_id: Option<String>,
 }
 
 /// S3 / MinIO backend implementing [`ObjectStoreBackend`] over
@@ -145,6 +157,22 @@ pub struct S3Store {
 
 impl S3Store {
     pub fn new(config: S3Config) -> Result<Self, StoreError> {
+        let store = Self::builder(&config)
+            .build()
+            .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
+        Ok(S3Store {
+            store,
+            page_size: LIST_PAGE_SIZE,
+        })
+    }
+
+    /// Build the `AmazonS3Builder` from a [`S3Config`], with no network
+    /// access (`build()` only validates local config shape). Split out from
+    /// [`S3Store::new`] so a test can assert the fully-configured builder
+    /// without a live endpoint. The `kms_key_id` branch is the only
+    /// behavioral addition over the historical build path: when it is `None`
+    /// this produces byte-for-byte the same builder as before ADR-0042.
+    fn builder(config: &S3Config) -> AmazonS3Builder {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
             .with_region(&config.region)
@@ -155,13 +183,14 @@ impl S3Store {
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint.clone());
         }
-        let store = builder
-            .build()
-            .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
-        Ok(S3Store {
-            store,
-            page_size: LIST_PAGE_SIZE,
-        })
+        // Single-key SSE-KMS (ADR-0042 decision 1): the KMS call happens
+        // inside S3 on every PUT, no crypto code here. Dual-layer DSSE is
+        // reachable via `with_dsse_kms_encryption` on this same builder if a
+        // future requirement needs it; single-layer is the sufficient default.
+        if let Some(kms_key_id) = &config.kms_key_id {
+            builder = builder.with_sse_kms_encryption(kms_key_id);
+        }
+        builder
     }
 
     /// Same backend, a smaller `list()` page size. Mirrors
@@ -831,6 +860,7 @@ mod tests {
             secret_access_key: "test".to_string(),
             allow_http: true,
             force_path_style: true,
+            kms_key_id: None,
         }
     }
 
@@ -843,5 +873,56 @@ mod tests {
     fn capabilities_declare_multipart() {
         let store = S3Store::new(test_config()).expect("dummy config must build");
         assert!(store.capabilities().multipart);
+    }
+
+    /// A `kms_key_id: Some(..)` config builds successfully (ADR-0042
+    /// decision 1). `AmazonS3Builder::build()` only validates local config
+    /// shape --- no live AWS credentials, no reachable KMS key, no network
+    /// --- so this is deterministic and needs no Docker/AWS (confirmed:
+    /// `capabilities_declare_multipart` above already relies on the same
+    /// no-network `new()` against an unreachable `localhost:0` endpoint).
+    #[test]
+    fn sse_kms_config_builds() {
+        let mut config = test_config();
+        config.kms_key_id = Some("arn:aws:kms:us-east-1:111122223333:key/abcd".to_string());
+        S3Store::new(config).expect("SSE-KMS config must build without live credentials");
+    }
+
+    /// `kms_key_id: None` yields byte-for-byte the same builder configuration
+    /// as the pre-ADR-0042 build path, so the unconfigured case (every
+    /// current caller) has no accidental behavior change. Comparing the
+    /// builder's `Debug` (it derives `Debug` but not `PartialEq`) proves the
+    /// `None` branch touches no encryption field, and `Some` does.
+    #[test]
+    fn none_kms_key_leaves_builder_unchanged() {
+        let config = test_config();
+        assert!(config.kms_key_id.is_none());
+
+        // The historical build path, reproduced verbatim without any KMS knob.
+        let mut baseline = AmazonS3Builder::new()
+            .with_bucket_name(&config.bucket)
+            .with_region(&config.region)
+            .with_access_key_id(&config.access_key_id)
+            .with_secret_access_key(&config.secret_access_key)
+            .with_allow_http(config.allow_http)
+            .with_virtual_hosted_style_request(!config.force_path_style);
+        if let Some(endpoint) = &config.endpoint {
+            baseline = baseline.with_endpoint(endpoint.clone());
+        }
+
+        assert_eq!(
+            format!("{:?}", S3Store::builder(&config)),
+            format!("{baseline:?}"),
+            "None kms_key_id must not change the builder"
+        );
+
+        // And a configured key must change it, or the test above is vacuous.
+        let mut with_key = config.clone();
+        with_key.kms_key_id = Some("arn:aws:kms:us-east-1:111122223333:key/abcd".to_string());
+        assert_ne!(
+            format!("{:?}", S3Store::builder(&with_key)),
+            format!("{baseline:?}"),
+            "Some kms_key_id must change the builder"
+        );
     }
 }

@@ -1070,6 +1070,7 @@ fn s3_store_reports_upload_checksum_unsupported() {
         secret_access_key: "test".to_string(),
         allow_http: true,
         force_path_style: true,
+        kms_key_id: None,
     };
     let store = S3Store::new(config).expect("dummy config must build without network access");
     assert!(
@@ -1102,6 +1103,7 @@ fn s3_store_satisfies_maintain_mode_capabilities() {
         secret_access_key: "test".to_string(),
         allow_http: true,
         force_path_style: true,
+        kms_key_id: None,
     })
     .expect("dummy config must build without network access");
     let maintain_required = Capabilities {
@@ -1153,6 +1155,7 @@ async fn minio_contract() {
         secret_access_key,
         allow_http,
         force_path_style: true,
+        kms_key_id: None,
     };
     // A small page size, like `memory_store_paged_contract`, so the
     // pagination assertion exercises `list_with_offset` continuation
@@ -1230,6 +1233,7 @@ async fn floci_contract() {
         secret_access_key,
         allow_http,
         force_path_style: true,
+        kms_key_id: None,
     };
     // A small page size, as in `minio_contract`, so the pagination assertion
     // exercises `list_with_offset` continuation against the real bucket.

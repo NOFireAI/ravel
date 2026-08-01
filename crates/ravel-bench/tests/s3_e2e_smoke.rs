@@ -76,6 +76,7 @@ async fn minio_ingest_read_smoke() {
         secret_access_key,
         allow_http,
         force_path_style: true,
+        kms_key_id: None,
     };
     let store = S3Store::new(config).expect("S3Store::new must succeed with a valid config");
 

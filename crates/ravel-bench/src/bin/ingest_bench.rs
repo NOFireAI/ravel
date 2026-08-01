@@ -70,6 +70,7 @@ fn s3_config_from_env() -> S3Config {
         secret_access_key: get("RAVEL_S3_SECRET_ACCESS_KEY"),
         allow_http: std::env::var("RAVEL_S3_ALLOW_HTTP").as_deref() == Ok("true"),
         force_path_style: std::env::var("RAVEL_S3_FORCE_PATH_STYLE").as_deref() != Ok("false"),
+        kms_key_id: None,
     }
 }
 

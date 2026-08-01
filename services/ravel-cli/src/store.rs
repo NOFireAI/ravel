@@ -66,6 +66,7 @@ pub fn build_store(args: &StoreArgs) -> anyhow::Result<Arc<dyn ObjectStoreBacken
                 secret_access_key,
                 allow_http,
                 force_path_style: true,
+                kms_key_id: None,
             };
             let store = S3Store::new(config)
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;

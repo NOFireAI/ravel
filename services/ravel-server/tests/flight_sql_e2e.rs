@@ -180,6 +180,7 @@ impl Minio {
             secret_access_key: MINIO_PASSWORD.to_string(),
             allow_http: true,
             force_path_style: true,
+            kms_key_id: None,
         }
     }
 }
