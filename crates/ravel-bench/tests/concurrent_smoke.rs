@@ -124,6 +124,7 @@ async fn readers_writers_minio_smoke() {
         secret_access_key,
         allow_http,
         force_path_style: true,
+        kms_key_id: None,
     };
     let store = S3Store::new(s3_config).expect("S3Store::new must succeed with a valid config");
 

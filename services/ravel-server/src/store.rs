@@ -171,6 +171,7 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<(Arc<dyn ObjectStoreBackend>, Ar
                 secret_access_key,
                 allow_http,
                 force_path_style: true,
+                kms_key_id: None,
             };
             let store = S3Store::new(config)
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
@@ -336,6 +337,7 @@ mod tests {
             secret_access_key: "test".to_string(),
             allow_http: true,
             force_path_style: true,
+            kms_key_id: None,
         })
         .expect("dummy S3 config must build without network access");
         assert!(

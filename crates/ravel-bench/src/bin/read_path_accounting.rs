@@ -161,6 +161,7 @@ fn s3_config_from_env() -> Option<ravel_object_store::s3::S3Config> {
         secret_access_key,
         allow_http,
         force_path_style,
+        kms_key_id: None,
     })
 }
 
