@@ -1727,6 +1727,15 @@ mod tests {
         // Matcher pins one metric, so only its series' pages should be fetched.
         let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
         let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        // #278 item 5 reads an object whole on its first GET when its size is at
+        // or below `whole_object_threshold` (default 512 KiB); this test's
+        // sparse object is smaller than that, so without disabling it here the
+        // first GET alone would already cover the whole object and the
+        // catalog-probe path below would correctly find nothing left to fetch
+        // -- exercising #278's optimization instead of the one this test is
+        // for. Disable it so the first GET stays a footer suffix and this test
+        // isolates the #276 catalog-probe path on its own.
+        let fetcher = fetcher.with_whole_object_threshold(0);
         let (soa, _stats) = fetcher
             .fetch_soa(tenant_hash, &seg_ref, &matchers)
             .await
