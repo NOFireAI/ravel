@@ -16,6 +16,14 @@ ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-analytics = { workspace = true }
+# OTAP (OpenTelemetry Arrow) ingest, linked only by the `otap` feature. It
+# pulls the arrow / arrow-ipc dependency tree, so it stays out of the default
+# build (docs/otap-ingest.md risk mitigation).
+ravel-otap = { workspace = true, optional = true }
+# The `otap` gRPC service returns a `BatchStatus` stream; `futures` provides
+# the stream combinator that drives one batch to one status. Also a
+# dev-dependency (Flight SQL tests), independent of this optional link.
+futures = { workspace = true, optional = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
@@ -46,6 +54,14 @@ ravel-sql = { path = "../../crates/ravel-sql", version = "0.1.0", optional = tru
 arrow-flight = { workspace = true, optional = true }
 
 [features]
+# OTAP (OpenTelemetry Arrow) metrics ingest on the gRPC listener: registers
+# `ArrowMetricsService` alongside the OTLP gRPC services. Off by default so the
+# default server build links neither `ravel-otap` nor the arrow dependency tree
+# it carries (docs/otap-ingest.md: "the gateway builds without it by default
+# until the bench panel justifies default-on"). Metrics only for now; the OTAP
+# logs and traces services are follow-up work.
+otap = ["dep:ravel-otap", "dep:futures"]
+
 # `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
 # server binary, and the SQL surface is opt-in per deployment
 # (docs/arrow-datafusion-plan.md section 3, ADR-0013 structural isolation).

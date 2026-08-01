@@ -50,10 +50,14 @@ tonic OTAP stream
 ```
 
 New crate `ravel-otap` (protocol decode + normalizer). Gateway wiring in
-`ravel-server` behind cargo feature `otap` and flag `--otap` is planned,
-not present: as shipped, `services/` has no `ravel-otap` dependency and the
-server ingest router exposes no OTAP surface. The decode/normalizer crate
-stands alone; wiring it into the server is tracked in issue #12.
+`ravel-server` behind cargo feature `otap` (default off) is present as of
+phase 3: with the feature on, `ravel-server` links `ravel-otap` and
+registers `ArrowMetricsService` on the same gRPC listener as the OTLP
+services (`services/ravel-server/src/otap_grpc.rs`), driving the per-stream
+`StreamState` and replying `BatchStatus` with commit tokens (see "Strict
+ack" and phase 3 below). The default build links neither `ravel-otap` nor
+its arrow dependency tree. Metrics only so far; the OTAP logs and traces
+services remain follow-up work under issue #12.
 
 Dependency decisions:
 - Vendored OTAP `.proto` files (Apache-2.0) compiled with protox, same as

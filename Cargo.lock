@@ -4634,6 +4634,7 @@ dependencies = [
  "ravel-logseg",
  "ravel-maintain",
  "ravel-object-store",
+ "ravel-otap",
  "ravel-otlp",
  "ravel-promql",
  "ravel-query",
