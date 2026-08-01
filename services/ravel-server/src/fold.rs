@@ -62,12 +62,20 @@ impl FoldTasks {
 }
 
 /// Every signal `ravel-server` folds. One fold loop is spawned per
-/// (tenant, signal) pair, so adding a signal here doubles the task count per
-/// tenant without changing any loop's shape. `FoldTaskConfig` (enabled,
-/// fold_interval) is shared across signals for v1: both currently want the
+/// (tenant, signal) pair, so adding a signal here adds one loop per tenant
+/// without changing any loop's shape. `FoldTaskConfig` (enabled,
+/// fold_interval) is shared across signals for v1: all currently want the
 /// same 5-minute cadence (ADR-0033); a per-signal interval is a config-shape
 /// follow-up if that changes.
-const FOLD_SIGNALS: [Signal; 2] = [Signal::Metrics, Signal::Logs];
+///
+/// [`Signal::Spans`] is added once span compaction exists (ADR-0041 phase 3):
+/// span buckets now produce L1 `.rspan` parts the resolver serves from
+/// snapshots, exactly as logs do. Spans fold through the same
+/// [`Catalog::fold`] path as logs and share the same accepted no-op-postings
+/// cost described below (an `.rspan` object carries signal=3, so the
+/// RSEG-specific postings build fails to decode it and skips writing a
+/// postings ref, same as logs' signal=2).
+const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
 /// Spawns one fold loop per (tenant, signal), for every signal in
 /// [`FOLD_SIGNALS`]. [`run_loop`] is signal-generic; a new signal is added by

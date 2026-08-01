@@ -16,6 +16,7 @@ use crate::publish::{PublishOutcome, publish_record};
 use crate::read;
 use crate::read::{input_set_hash, list_bucket, load_inputs};
 use crate::rlog::RlogCodec;
+use crate::rspan_codec::SpanCodec;
 
 /// The result of a `compact_bucket` call. Every variant except
 /// [`CompactionOutcome::Compacted`] means the bucket was left untouched, with
@@ -80,6 +81,10 @@ pub async fn compact_bucket(
         }
         Signal::Logs => {
             run_pipeline::<RlogCodec>(store, clock, config, bucket, &listing.commit_keys, start_ns)
+                .await
+        }
+        Signal::Spans => {
+            run_pipeline::<SpanCodec>(store, clock, config, bucket, &listing.commit_keys, start_ns)
                 .await
         }
         other => Err(MaintainError::Invariant(format!(

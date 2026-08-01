@@ -6,6 +6,7 @@ use ravel_commit::keys::{KeyError, ReconstructionError};
 use ravel_commit::record::RecordError;
 use ravel_logseg::LogSegError;
 use ravel_object_store::StoreError;
+use ravel_rspan::SpanSegError;
 use ravel_segment::SegmentError;
 
 /// A compaction run's failure. Retryable store faults surface as
@@ -27,6 +28,8 @@ pub enum MaintainError {
     Segment(#[from] SegmentError),
     #[error(transparent)]
     LogSeg(#[from] LogSegError),
+    #[error(transparent)]
+    SpanSeg(#[from] SpanSegError),
     #[error("segment write error: {0}")]
     Write(String),
     #[error(

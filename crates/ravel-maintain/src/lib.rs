@@ -46,6 +46,7 @@ pub mod publish;
 pub mod read;
 pub mod retention;
 pub mod rlog;
+pub mod rspan_codec;
 pub mod scan;
 pub mod sweep;
 
@@ -58,6 +59,7 @@ pub use error::{MaintainError, Result};
 pub use publish::PublishOutcome;
 pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rlog::RlogCodec;
+pub use rspan_codec::SpanCodec;
 pub use scan::{MaintainReport, ScanReport, scan_and_compact, scan_and_maintain};
 pub use sweep::{
     LeaseCheck, NoLeases, SweepReport, sweep_orphans, sweep_shard, sweep_superseded,

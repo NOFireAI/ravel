@@ -32,6 +32,7 @@ ravel-proto = { path = "crates/ravel-proto", version = "0.1.0" }
 ravel-object-store = { path = "crates/ravel-object-store", version = "0.1.0" }
 ravel-segment = { path = "crates/ravel-segment", version = "0.1.0" }
 ravel-logseg = { path = "crates/ravel-logseg", version = "0.1.0" }
+ravel-rspan = { path = "crates/ravel-rspan", version = "0.1.0" }
 ravel-commit = { path = "crates/ravel-commit", version = "0.1.0" }
 ravel-catalog = { path = "crates/ravel-catalog", version = "0.1.0" }
 ravel-maintain = { path = "crates/ravel-maintain", version = "0.1.0" }

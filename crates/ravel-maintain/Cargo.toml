@@ -11,6 +11,7 @@ ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
+ravel-rspan = { workspace = true }
 ravel-commit = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
