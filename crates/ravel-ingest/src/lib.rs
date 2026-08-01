@@ -15,14 +15,23 @@ mod log_shard;
 mod metrics;
 mod router;
 mod shard;
+mod span_error;
+mod span_metrics;
+mod span_router;
+mod span_shard;
 mod value;
 
 pub use clock::{Clock, SystemClock};
-pub use config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION};
+pub use config::{
+    IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
+};
 pub use error::WriteError;
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 pub use log_router::{LogIngestRouter, LogWriteReceipt};
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};
+pub use span_error::SpanWriteError;
+pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
+pub use span_router::{SpanIngestRouter, SpanWriteReceipt, shard_for_span};
 pub use value::{IngestPoint, IngestValue};

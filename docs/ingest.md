@@ -151,6 +151,70 @@ and there is no query path over log objects yet. Ingest durability does not
 depend on it (a commit token resolves to its commit record directly), but a
 catalog-based read does; that is the log query phase's prerequisite.
 
+## Span pipeline
+
+Spans run a third parallel pipeline on the same terms (ADR-0041):
+
+```
+POST /v1/traces (axum) | trace.v1.TraceService/Export (tonic)
+  -> auth + tenant resolve (the same TenantResolver every ingest surface uses)
+  -> normalize_traces (ravel-otlp::traces_normalize) -> Vec<NormalizedSpan> + rejects
+  -> SpanIngestRouter::write(tenant, spans, mode) -> SpanWriteReceipt
+```
+
+`SpanIngestRouter` and `SpanShardActor` mirror `LogIngestRouter`/
+`LogShardActor` structurally (one bounded mpsc channel and one actor task
+per shard, the same `IngestConfig` knobs, the same flush triggers, the same
+pinned writer identity, the same commit sequence) and diverge in these
+places:
+
+- Objects are RSPAN, built with `ravel_rspan::RspanWriter`. They land under
+  the `s` keyspace (`t/<tenant>/s/l0/...`); commit records under
+  `t/<tenant>/s/c/...`.
+- Routing is by trace, `shard_for_span(trace_id, shard_count)`, with the
+  identical leading-8-bytes-mod-shard_count math `shard_for` uses on a
+  `SeriesId`. Keying on `trace_id` rather than on a resource-derived
+  identity is ADR-0041 decision 2: it keeps one trace's spans confined to
+  one shard, so trace-by-id assembly is a bounded scan instead of a
+  fan-out across every shard. The tradeoff ADR-0041 accepts is that
+  service-scoped span search is cross-shard.
+  `shard_for_span` currently lives in `crates/ravel-ingest/src/span_router.rs`
+  rather than beside `shard_for`/`shard_for_log` in `ravel-types`, because
+  `ravel-types` was outside the scope of the change that added it. The
+  placement is provisional; the routing rule itself is frozen, since it
+  determines which shard's object keys a trace's spans land under.
+- There is no derived identity, so no identity-collision check anywhere in
+  the path: `trace_id` and `span_id` come from the sender verbatim, unlike
+  a metric's `series_id` or a log's `stream_id`. `SpanWriteError`
+  accordingly has no collision variant and `SpanIngestMetrics` no
+  collision counter.
+- Resource and scope attributes are merged into each span's single `attrs`
+  map at normalization time (`ravel_rspan::merge_attrs`, resource beats
+  scope beats span), not carried as a separate identity blob. Because they
+  feed no identity, a resource attribute that cannot be converted is
+  dropped and reported on its own rather than rejecting every span under
+  the resource the way the log path must. Span kind, trace state, flags,
+  events, and links have no RSPAN column and are stored under reserved
+  underscore-prefixed `attrs` keys (`_kind`, `_trace_state`, `_flags`,
+  `_events_raw`, `_links_raw`); events and links are opaque hex blobs in
+  v1 (ADR-0041 decision 4).
+
+Commit-record fields the span flush fills differently: `sample_count` is the
+span count, `series_count` is the number of distinct `trace_id`s in the batch
+(tracked in the actor), `segment_format_version` is
+`SPAN_SEGMENT_FORMAT_VERSION`, and the event-time bounds are the batch's
+interval — the minimum `start_ts_ns` and the maximum `end_ts_ns` — so a
+commit record advertises the same interval RSPAN's skip index prunes with.
+
+`SpanIngestMetrics` mirrors `LogIngestMetrics` counter for counter, minus
+`stream_id_collisions` and with `buffered_spans_total` in place of
+`buffered_records_total`.
+
+Snapshot resolution for spans is not wired: `services/ravel-server/src/fold.rs`
+folds metrics and logs only, so `catalog/s/HEAD` is never produced and there is
+no query path over span objects yet (ADR-0041 phases 3 and 5). Ingest
+durability does not depend on it.
+
 ## Modes
 
 `mode=strict` (default): ack after step 3 for every flush the request's

@@ -11,12 +11,19 @@
 //! `ExportLogsServiceRequest` to canonical log records carrying a log stream
 //! identity (ADR-0029), computed once per `ScopeLogs` from the resource and
 //! scope attributes.
+//!
+//! Traces take a third path: `traces_normalize` maps an
+//! `ExportTraceServiceRequest` to canonical spans (ADR-0041). Spans have no
+//! stream identity at all, so resource and scope attributes are merged into
+//! each span's single `attrs` map instead of feeding an identity hash.
 
 pub mod limits;
 pub mod logs_limits;
 pub mod logs_normalize;
 pub mod normalize;
 pub mod promcompat;
+pub mod traces_limits;
+pub mod traces_normalize;
 
 pub use limits::{IngestLimits, Rejection};
 pub use logs_limits::{LogIngestLimits, LogRejection};
@@ -24,3 +31,5 @@ pub use logs_normalize::{LogNormalizeOutput, NormalizedLogRecord, normalize_logs
 pub use normalize::{
     NormalizeOutput, NormalizedHistogramPoint, NormalizedPoint, normalize_metrics,
 };
+pub use traces_limits::{SpanIngestLimits, SpanRejection};
+pub use traces_normalize::{NormalizedSpan, SpanNormalizeOutput, normalize_traces};

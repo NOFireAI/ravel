@@ -97,6 +97,12 @@ blake3 = { workspace = true }
 # flushed, straight out of the object store. The server binary never reads a
 # log object back; only the test does.
 ravel-logseg = { workspace = true }
+# Test-only, same reason for spans: the trace ingest end-to-end test decodes the
+# RSPAN object the write flushed. ravel-rspan (ADR-0041) is new and not yet
+# listed in the workspace [workspace.dependencies]; the root Cargo.toml is out
+# of this task's scope, so this is a version-pinned path dependency (the pin
+# keeps cargo-deny from counting it as a wildcard).
+ravel-rspan = { path = "../../crates/ravel-rspan", version = "0.1.0" }
 uuid = { workspace = true }
 # Test-only: decodes the Arrow IPC response. This is the workspace arrow pin
 # (59), not the arrow 58 datafusion carries, so the assertion doubles as a

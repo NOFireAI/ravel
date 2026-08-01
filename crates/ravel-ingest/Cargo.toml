@@ -13,6 +13,11 @@ ravel-object-store = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-logseg = { workspace = true }
+# ravel-rspan (ADR-0041) is new and not yet listed in the workspace
+# [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
+# this is a version-pinned path dependency (the pin keeps cargo-deny from
+# counting it as a wildcard, matching the workspace's path-dep convention).
+ravel-rspan = { path = "../ravel-rspan", version = "0.1.0" }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
