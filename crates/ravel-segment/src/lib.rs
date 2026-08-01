@@ -35,8 +35,9 @@ pub use reader::{
 /// SERIES_IDS window, then a crc-verified meta chunk, then decode that
 /// series' runs.
 pub use sparse::{
-    ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_chunk_runs,
-    find_index_in_window, parse_series_idx, verify_and_decompress_chunk_frame, verify_id_window,
+    ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_catalog_v5_chunked,
+    decode_chunk_runs, find_index_in_window, parse_series_idx, verify_and_decompress_chunk_frame,
+    verify_id_window,
 };
 pub use writer::{
     CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity,
