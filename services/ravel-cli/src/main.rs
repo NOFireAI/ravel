@@ -168,6 +168,16 @@ enum MaintainCommand {
         #[arg(long, default_value_t = 4)]
         shards: u32,
     },
+    /// Re-verify the content-addressed chain for a tenant at rest (both
+    /// signals): every live data object's content still hashes to the hash16
+    /// its key embeds, and every compaction record's referenced inputs still
+    /// match. Read-only; no --dry-run (it never writes or deletes).
+    VerifyCustody {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -317,6 +327,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Maintain {
             command: MaintainCommand::AuditVersions { tenant, shards },
         } => maintain::audit_versions(store::build_store(&cli.store)?, &tenant, shards).await,
+        Command::Maintain {
+            command: MaintainCommand::VerifyCustody { tenant, shards },
+        } => maintain::verify_custody(store::build_store(&cli.store)?, &tenant, shards).await,
     }
 }
 

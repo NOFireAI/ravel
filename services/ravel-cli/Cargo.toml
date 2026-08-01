@@ -20,6 +20,7 @@ ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-maintain = { workspace = true }
 prost = { workspace = true }
+blake3 = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
 tokio = { workspace = true }
@@ -29,7 +30,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
-blake3 = { workspace = true }
 
 [lints]
 workspace = true
