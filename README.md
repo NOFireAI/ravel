@@ -6,17 +6,18 @@
 [![Rust](https://img.shields.io/badge/rust-1.97.1-orange.svg)](rust-toolchain.toml)
 
 Ravel is an OpenTelemetry-native observability database. Object storage is
-its only durable backend: metrics and logs land as immutable segments and
-commit records on S3 or MinIO, and every Ravel process (gateway, ingest
-shard, query frontend) is disposable. If Ravel acknowledges a write in
-strict mode, that data survives the crash, restart, or redeployment of any
-Ravel process, because it survives on the object store, not in any
-process's memory or local disk.
+its only durable backend: metrics, logs, and traces land as immutable
+segments and commit records on S3 or MinIO, and every Ravel process
+(gateway, ingest shard, query frontend) is disposable. If Ravel
+acknowledges a write in strict mode, that data survives the crash,
+restart, or redeployment of any Ravel process, because it survives on the
+object store, not in any process's memory or local disk.
 
 Ravel is a research prototype. Metrics and logs run end to end today, from
 OTLP or Remote Write ingest through PromQL, SQL, and Flight SQL query,
-against real S3/MinIO. Traces are in progress: the span segment format
-(RSPAN, ADR-0041) exists; ingest and query routing do not yet.
+against real S3/MinIO. Traces ingest, compact, and retain end to end too
+(the span segment format, RSPAN, ADR-0041); there is no query surface over
+them yet.
 
 ## See it run
 
@@ -81,9 +82,13 @@ piece, see [docs/adrs/](docs/adrs/).
 
 ## What's built
 
-- **OTLP ingest**, HTTP and gRPC, for metrics (gauges and cumulative sums)
-  and logs, with admission limits, event-time skew bounds, and strict or
-  buffered acknowledgement.
+- **OTLP ingest**, HTTP and gRPC, for metrics (gauges and cumulative sums),
+  logs, and traces, with admission limits, event-time skew bounds, and
+  strict or buffered acknowledgement. Trace ingest (`POST /v1/traces`,
+  `trace.v1.TraceService/Export`) routes and sorts spans by `trace_id`
+  ([ADR-0041](docs/adrs/0041-rspan-v1-span-segment-format.md)) into
+  immutable RSPAN objects; there is no query surface over spans yet (see
+  What's next).
 - **Prometheus Remote Write** ingest, `POST /api/v1/write`, both Remote
   Write 1.0 and 2.0, through the same admission and routing path as OTLP.
 - **PromQL**: vector and matrix selectors, `offset`/`@`, binary operators,
@@ -105,8 +110,8 @@ piece, see [docs/adrs/](docs/adrs/).
 - **Compaction, retention, and garbage collection** (`ravel-maintain`):
   L0-to-L1 compaction, age-based retention, and a sweeper that removes
   orphaned objects, superseded inputs, and unreferenced parts. Signal-
-  generic across metrics and logs, runs continuously under `ravel-server
-  --mode maintain` or one-shot via `ravel-cli maintain`.
+  generic across metrics, logs, and traces, runs continuously under
+  `ravel-server --mode maintain` or one-shot via `ravel-cli maintain`.
 - **Grafana and Prometheus compatibility routes**: `/api/v1/labels`,
   `/api/v1/label/{name}/values`, `/api/v1/series`,
   `/api/v1/status/buildinfo`, `/api/v1/metadata`, `/-/healthy`, `/-/ready`.
@@ -124,9 +129,10 @@ quantiles can differ.
 
 ## What's next
 
-- Trace ingest and query. The span segment format (RSPAN v1, ADR-0041) is
-  merged; the ingest router, compaction arm, and SQL table follow the same
-  path logs took.
+- A query surface for traces: a `spans` SQL table (built, not yet wired
+  into `POST /api/v1/sql`) and trace-by-id lookup. Ingest, compaction, and
+  retention for spans already run end to end (see What's built); nothing
+  reads them back yet.
 - Profiles and exemplars.
 - Catalog snapshots: an index object in place of per-query listing, needed
   before listing-based discovery runs out of headroom.

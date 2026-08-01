@@ -15,6 +15,7 @@ pub mod maintain;
 pub mod otap_grpc;
 pub mod otlp_grpc;
 pub mod otlp_grpc_logs;
+pub mod otlp_grpc_traces;
 pub mod otlp_http;
 pub mod query;
 pub mod remote_write;
@@ -22,6 +23,7 @@ pub mod remote_write;
 pub mod sql;
 pub mod store;
 pub mod tenant;
+pub mod traces_ingest;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,11 +32,12 @@ use std::time::Duration;
 use axum::Router;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
-use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SystemClock};
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
+use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, SystemClock};
 use ravel_object_store::ObjectStoreBackend;
 #[cfg(feature = "otap")]
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsServiceServer;
-use ravel_otlp::{IngestLimits, LogIngestLimits};
+use ravel_otlp::{IngestLimits, LogIngestLimits, SpanIngestLimits};
 use ravel_query::http::TenantResolver;
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
@@ -92,14 +95,15 @@ pub struct Running {
     grpc_task: Option<JoinHandle<anyhow::Result<()>>>,
     ingest_router: Option<Arc<IngestRouter>>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
+    span_ingest_router: Option<Arc<SpanIngestRouter>>,
     fold_tasks: fold::FoldTasks,
     maintenance_tasks: maintain::MaintenanceTasks,
 }
 
 impl Running {
     /// Stops accepting new connections, waits for both listeners to drain,
-    /// then flushes and joins every ingest shard actor, metrics and logs
-    /// alike.
+    /// then flushes and joins every ingest shard actor: metrics, logs, and
+    /// spans alike.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let _ = self.http_shutdown.send(());
         self.http_task.await??;
@@ -134,6 +138,18 @@ impl Running {
             }
         }
 
+        if let Some(router) = self.span_ingest_router {
+            match Arc::try_unwrap(router) {
+                Ok(router) => router.shutdown().await,
+                Err(_) => {
+                    tracing::warn!(
+                        "span ingest router still has outstanding references; shard actors not \
+                         drained"
+                    );
+                }
+            }
+        }
+
         self.fold_tasks.shutdown().await;
         self.maintenance_tasks.shutdown().await;
 
@@ -144,6 +160,7 @@ impl Running {
 fn gateway_state(
     ingest_router: &Arc<IngestRouter>,
     log_ingest_router: &Arc<LogIngestRouter>,
+    span_ingest_router: &Arc<SpanIngestRouter>,
     tenant_resolver: Arc<dyn TenantResolver>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
@@ -156,6 +173,11 @@ fn gateway_state(
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
             limits: LogIngestLimits::default(),
+            ack_deadline: DEFAULT_ACK_DEADLINE,
+        },
+        traces_ingest: traces_ingest::SpanIngestState {
+            router: span_ingest_router.clone(),
+            limits: SpanIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
         },
     })
@@ -211,6 +233,24 @@ pub async fn start(
         None
     };
 
+    // The span pipeline is a third parallel router on exactly the same terms:
+    // same shard count, same store, same clock, but RSPAN objects under the `s`
+    // keyspace and routing by trace_id rather than by a derived identity
+    // (ADR-0041). It exists in exactly the modes that serve ingest, so all
+    // three options are always Some together.
+    let span_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+        Some(Arc::new(SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: config.shard_count,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Arc::new(SystemClock),
+        )))
+    } else {
+        None
+    };
+
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
     // and is latched to true below, once both listeners are bound and the
@@ -219,8 +259,15 @@ pub async fn start(
     // `/healthz` truly reflects "the axum server task can route requests".
     let readiness = health::Readiness::new();
     let mut http_router = Router::new().merge(health::router(readiness.clone()));
-    if let (Some(router), Some(log_router)) = (&ingest_router, &log_ingest_router) {
-        let state = gateway_state(router, log_router, config.tenant_resolver.clone());
+    if let (Some(router), Some(log_router), Some(span_router)) =
+        (&ingest_router, &log_ingest_router, &span_ingest_router)
+    {
+        let state = gateway_state(
+            router,
+            log_router,
+            span_router,
+            config.tenant_resolver.clone(),
+        );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(router, config.tenant_resolver.clone());
         http_router = http_router.merge(remote_write::router(rw_state));
@@ -296,22 +343,31 @@ pub async fn start(
         Ok(())
     });
 
-    // Both OTLP services share one `GatewayState`: they resolve tenants and
-    // read write-mode metadata identically, and each dispatches to its own
+    // All three OTLP services share one `GatewayState`: they resolve tenants
+    // and read write-mode metadata identically, and each dispatches to its own
     // signal's ingest state inside it.
-    let otlp_grpc_state =
-        ingest_router
-            .as_ref()
-            .zip(log_ingest_router.as_ref())
-            .map(|(router, log_router)| {
-                gateway_state(router, log_router, config.tenant_resolver.clone())
-            });
+    let otlp_grpc_state = match (
+        ingest_router.as_ref(),
+        log_ingest_router.as_ref(),
+        span_ingest_router.as_ref(),
+    ) {
+        (Some(router), Some(log_router), Some(span_router)) => Some(gateway_state(
+            router,
+            log_router,
+            span_router,
+            config.tenant_resolver.clone(),
+        )),
+        _ => None,
+    };
     let metrics_service = otlp_grpc_state
         .as_ref()
         .map(|state| MetricsServiceServer::new(otlp_grpc::GrpcMetricsService::new(state.clone())));
     let logs_service = otlp_grpc_state
         .as_ref()
         .map(|state| LogsServiceServer::new(otlp_grpc_logs::GrpcLogsService::new(state.clone())));
+    let traces_service = otlp_grpc_state.as_ref().map(|state| {
+        TraceServiceServer::new(otlp_grpc_traces::GrpcTraceService::new(state.clone()))
+    });
 
     // OTAP metrics ride the same gRPC listener and share the same
     // `GatewayState` (tenant resolution, ingest router) as the OTLP metrics
@@ -335,7 +391,8 @@ pub async fn start(
     let (grpc_addr, grpc_shutdown, grpc_task) = if serve_grpc {
         let grpc = tonic::transport::Server::builder()
             .add_optional_service(metrics_service)
-            .add_optional_service(logs_service);
+            .add_optional_service(logs_service)
+            .add_optional_service(traces_service);
         #[cfg(feature = "flight-sql")]
         let grpc = grpc.add_optional_service(flight_service);
         #[cfg(feature = "otap")]
@@ -379,6 +436,7 @@ pub async fn start(
         grpc_task,
         ingest_router,
         log_ingest_router,
+        span_ingest_router,
         fold_tasks,
         maintenance_tasks,
     })

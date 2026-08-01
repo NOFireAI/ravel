@@ -17,6 +17,13 @@ pub const SEGMENT_FORMAT_VERSION: u16 = 5;
 /// a format-level ADR, not a routine edit.
 pub const LOG_SEGMENT_FORMAT_VERSION: u16 = 2;
 
+/// RSPAN trailer version every span flush emits. Mirrors `ravel_rspan`'s own
+/// object trailer version (`docs/span-segment-format.md`, ADR-0041); like the
+/// two constants above it is not a configurable knob, and is stamped verbatim
+/// into the commit record's `segment_format_version`. Changing it is a
+/// format-level ADR, not a routine edit.
+pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = 1;
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -88,5 +95,10 @@ mod tests {
     #[test]
     fn log_segment_format_version_is_v2() {
         assert_eq!(LOG_SEGMENT_FORMAT_VERSION, 2);
+    }
+
+    #[test]
+    fn span_segment_format_version_is_v1() {
+        assert_eq!(SPAN_SEGMENT_FORMAT_VERSION, 1);
     }
 }
