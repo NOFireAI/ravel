@@ -3,8 +3,9 @@
 //! (docs/query-engine.md "Flow", docs/segment-format.md reader protocol).
 
 use bytes::Bytes;
+use futures::future::join_all;
 use ravel_catalog::{SegmentLevel, SegmentRef};
-use ravel_object_store::{Etag, GetRange, ObjectStoreBackend, StoreError};
+use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
     ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry, SeriesEntry,
@@ -35,6 +36,21 @@ pub const DEFAULT_SUFFIX_LEN: u64 = 64 * 1024;
 /// Default maximum gap between two planned byte ranges that still get
 /// coalesced into a single GET.
 pub const DEFAULT_COALESCE_GAP: u64 = 64 * 1024;
+/// Default size at or below which the first GET fetches the whole object in
+/// one request instead of a footer suffix (#278 item 5). The commit record
+/// carries the exact object size, so a small object is read whole up front:
+/// its footer, catalog sections, and page bytes then all resolve from that
+/// one buffer with no second probe. Above the threshold the footer-suffix
+/// path is kept, which reads only the tail and coalesces the page GETs it
+/// actually needs. 512 KiB comfortably covers a typical ~30 KiB L0 flush and
+/// the small end of the L1 part distribution while never whole-object-reading
+/// a large compacted part just to reach its footer.
+pub const DEFAULT_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
+/// Default bound on the number of byte-range GETs a single segment fetch
+/// keeps in flight at once (#278 item 2). The fetcher clones share one
+/// semaphore, so this also bounds the total in-flight GETs across every
+/// concurrent segment fetch in a query, not just within one segment.
+pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
 
 /// Errors fetching and decoding one segment. Every variant is a hard error:
 /// the caller never receives partial or silently-wrong data for a segment
@@ -186,7 +202,17 @@ pub struct SegmentFetcher {
     store: std::sync::Arc<dyn ObjectStoreBackend>,
     suffix_len: u64,
     coalesce_gap: u64,
+    /// Object size at or below which the first GET reads the whole object
+    /// instead of a footer suffix (#278 item 5).
+    whole_object_threshold: u64,
     limits: ReaderLimits,
+    /// Bounds the byte-range GETs kept in flight. Shared across `clone`s (it
+    /// is an `Arc`), so every concurrent segment fetch in one query draws
+    /// from the same permit pool rather than each opening its own unbounded
+    /// fan-out (#278 item 2). It is only ever held around a single leaf
+    /// `store.get`, never across a scope that acquires another permit, so no
+    /// fetch can deadlock waiting on permits it already holds.
+    get_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl SegmentFetcher {
@@ -195,7 +221,11 @@ impl SegmentFetcher {
             store,
             suffix_len: DEFAULT_SUFFIX_LEN,
             coalesce_gap: DEFAULT_COALESCE_GAP,
+            whole_object_threshold: DEFAULT_WHOLE_OBJECT_THRESHOLD,
             limits: ReaderLimits::default(),
+            get_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_GETS,
+            )),
         }
     }
 
@@ -209,6 +239,39 @@ impl SegmentFetcher {
     pub fn with_coalesce_gap(mut self, n: u64) -> Self {
         self.coalesce_gap = n;
         self
+    }
+
+    /// Sets the whole-object fetch threshold (#278 item 5). An object whose
+    /// commit-record size is at or below `n` is read whole on its first GET;
+    /// a larger one keeps the footer-suffix path. `0` disables the
+    /// whole-object path entirely (every object takes the suffix path),
+    /// which is what the multi-GET suffix tests use to exercise the footer
+    /// `NeedRange` chase on a small object.
+    #[must_use]
+    pub fn with_whole_object_threshold(mut self, n: u64) -> Self {
+        self.whole_object_threshold = n;
+        self
+    }
+
+    /// Sets the in-flight byte-range GET bound (#278 item 2). Shared across
+    /// this fetcher's clones.
+    #[must_use]
+    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
+        self.get_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(n.max(1)));
+        self
+    }
+
+    /// One store GET, bounded by the shared in-flight semaphore (#278 item
+    /// 2). The permit is released the moment the GET resolves; callers must
+    /// never hold the returned future's permit across another
+    /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
+    /// already fill the pool could wait on itself.
+    async fn guarded_get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        let _permit =
+            self.get_semaphore.acquire().await.map_err(|_| {
+                StoreError::Transient("fetch concurrency semaphore closed".to_string())
+            })?;
+        self.store.get(key, range).await
     }
 
     async fn ensure_ranges(
@@ -226,21 +289,33 @@ impl SegmentFetcher {
         if missing.is_empty() {
             return Ok(());
         }
-        for (start, end) in coalesce_ranges(missing, self.coalesce_gap) {
-            let got = self
-                .store
-                .get(key, GetRange::Range(start, end))
-                .await
-                .map_err(|source| FetchError::Store {
-                    key: key.to_string(),
-                    source,
-                })?;
-            if &got.etag != suffix_etag {
-                return Err(FetchError::EtagChanged {
-                    key: key.to_string(),
-                });
-            }
-            regions.insert(start, got.data);
+        // Fetch the coalesced ranges concurrently rather than one await at a
+        // time (#278 item 2): a multi-page selection over a large segment
+        // used to pay one round trip per coalesced range in series. The
+        // shared semaphore inside `guarded_get` bounds the actual in-flight
+        // GETs; `join_all` preserves input order, so the resulting
+        // `regions` insert order is identical to the old sequential loop.
+        let gets = join_all(coalesce_ranges(missing, self.coalesce_gap).into_iter().map(
+            |(start, end)| async move {
+                let got = self
+                    .guarded_get(key, GetRange::Range(start, end))
+                    .await
+                    .map_err(|source| FetchError::Store {
+                        key: key.to_string(),
+                        source,
+                    })?;
+                if &got.etag != suffix_etag {
+                    return Err(FetchError::EtagChanged {
+                        key: key.to_string(),
+                    });
+                }
+                Ok::<(u64, Bytes), FetchError>((start, got.data))
+            },
+        ))
+        .await;
+        for got in gets {
+            let (start, data) = got?;
+            regions.insert(start, data);
         }
         Ok(())
     }
@@ -263,14 +338,25 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
     ) -> Result<(Footer, u64, Etag, FetchedRegions), FetchError> {
         let key = &seg_ref.data_object_key;
-        let first = self
-            .store
-            .get(key, GetRange::Suffix(self.suffix_len))
-            .await
-            .map_err(|source| FetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
+        // Size-aware first GET (#278 item 5): the commit record already
+        // carries the exact object size, so a small object is read whole in
+        // one request (its footer, catalog, and pages then all come from that
+        // buffer, never a second probe), while a large one keeps the
+        // footer-suffix read that touches only the tail. `whole_object_threshold
+        // == 0` disables the whole-object path.
+        let first_range =
+            if seg_ref.object_size != 0 && seg_ref.object_size <= self.whole_object_threshold {
+                GetRange::Full
+            } else {
+                GetRange::Suffix(self.suffix_len)
+            };
+        let first =
+            self.guarded_get(key, first_range)
+                .await
+                .map_err(|source| FetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })?;
         let total_size = first.total_size;
         let suffix_etag = first.etag.clone();
         let mut regions = FetchedRegions::default();
@@ -283,8 +369,7 @@ impl SegmentFetcher {
             FooterOutcome::Ready(loc) => loc.footer,
             FooterOutcome::NeedRange { offset, len } => {
                 let got = self
-                    .store
-                    .get(key, GetRange::Range(offset, offset + len))
+                    .guarded_get(key, GetRange::Range(offset, offset + len))
                     .await
                     .map_err(|source| FetchError::Store {
                         key: key.to_string(),
@@ -561,11 +646,28 @@ impl SegmentFetcher {
         let planned = self
             .fetch_scalar_pages(key, &footer, &scalar, &suffix_etag, &mut regions)
             .await?;
+        self.build_scalar_decodes(key, seg_ref, &scalar, &planned, &regions, count_stats)
+    }
 
+    /// Decodes the already-fetched scalar page bytes of `scalar` into one
+    /// [`RunDecode`] per emitted unit (see [`fetch_runs`](Self::fetch_runs)
+    /// for the per-level emission contract). Split out so the scalar-only
+    /// [`fetch_runs`](Self::fetch_runs) and the combined
+    /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) share
+    /// one decode body rather than drifting apart (#278 item 1).
+    fn build_scalar_decodes(
+        &self,
+        key: &str,
+        seg_ref: &SegmentRef,
+        scalar: &[&SeriesEntryV4],
+        planned: &[ravel_segment::PlannedRunRange],
+        regions: &FetchedRegions,
+        count_stats: bool,
+    ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
         let mut stats = FetchStats::default();
         let mut scratch = Vec::new();
         let mut out = Vec::with_capacity(scalar.len());
-        for entry in &scalar {
+        for entry in scalar {
             match &seg_ref.level {
                 SegmentLevel::L0 => {
                     // One unit per series: concatenate every run's samples in
@@ -580,7 +682,7 @@ impl SegmentFetcher {
                     let mut timestamps = Vec::new();
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(&planned, &entry.entry.series_id, run_index)
+                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
                             .ok_or_else(|| {
                                 corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
                             })?;
@@ -589,7 +691,7 @@ impl SegmentFetcher {
                             &entry.entry.series_id,
                             run,
                             plan,
-                            &regions,
+                            regions,
                             &mut scratch,
                             &mut timestamps,
                             &mut values,
@@ -613,7 +715,7 @@ impl SegmentFetcher {
                     // provenance so cross-input duplicate samples resolve
                     // under the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(&planned, &entry.entry.series_id, run_index)
+                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
                             .ok_or_else(|| {
                                 corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
                             })?;
@@ -624,7 +726,7 @@ impl SegmentFetcher {
                             &entry.entry.series_id,
                             run,
                             plan,
-                            &regions,
+                            regions,
                             &mut scratch,
                             &mut timestamps,
                             &mut values,
@@ -684,9 +786,26 @@ impl SegmentFetcher {
         let planned = self
             .fetch_histogram_pages(key, &footer, &histogram, &suffix_etag, &mut regions)
             .await?;
+        self.build_histogram_decodes(key, seg_ref, &histogram, &planned, &regions)
+    }
 
+    /// Histogram counterpart to
+    /// [`build_scalar_decodes`](Self::build_scalar_decodes): decodes the
+    /// already-fetched histogram page bytes of `histogram` into one
+    /// [`RunHistogramDecode`] per emitted unit. Shared by the histogram-only
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) and the combined
+    /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) (#278
+    /// item 1).
+    fn build_histogram_decodes(
+        &self,
+        key: &str,
+        seg_ref: &SegmentRef,
+        histogram: &[&SeriesEntryV4],
+        planned: &[ravel_segment::PlannedRunRange],
+        regions: &FetchedRegions,
+    ) -> Result<Vec<RunHistogramDecode>, FetchError> {
         let mut out = Vec::with_capacity(histogram.len());
-        for entry in &histogram {
+        for entry in histogram {
             match &seg_ref.level {
                 SegmentLevel::L0 => {
                     // One unit per series: concatenate every run's samples in
@@ -694,7 +813,7 @@ impl SegmentFetcher {
                     let mut timestamps = Vec::new();
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(&planned, &entry.entry.series_id, run_index)
+                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
                             .ok_or_else(|| {
                                 corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
                             })?;
@@ -703,7 +822,7 @@ impl SegmentFetcher {
                             &entry.entry.series_id,
                             run,
                             plan,
-                            &regions,
+                            regions,
                             &mut timestamps,
                             &mut values,
                         )?;
@@ -723,7 +842,7 @@ impl SegmentFetcher {
                     // provenance so cross-input duplicate samples resolve under
                     // the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(&planned, &entry.entry.series_id, run_index)
+                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
                             .ok_or_else(|| {
                                 corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
                             })?;
@@ -734,7 +853,7 @@ impl SegmentFetcher {
                             &entry.entry.series_id,
                             run,
                             plan,
-                            &regions,
+                            regions,
                             &mut timestamps,
                             &mut values,
                         )?;
@@ -752,6 +871,78 @@ impl SegmentFetcher {
             }
         }
         Ok(out)
+    }
+
+    /// Opens the segment once and decodes both its matched scalar and matched
+    /// histogram series in a single pass (#278 item 1). The scalar-only
+    /// [`fetch_runs`](Self::fetch_runs) and histogram-only
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) each re-run
+    /// `open_segment` (a footer GET) and `decode_selected` (catalog decode)
+    /// from scratch; a PromQL/SQL prefetch needs both kinds off every segment,
+    /// so calling the two in sequence opened and decoded each segment twice.
+    /// This shares the one `open_segment` + `decode_selected`, then fetches
+    /// and decodes the scalar and histogram pages off the same `regions`,
+    /// returning byte-for-byte the same units the two separate calls did.
+    async fn fetch_runs_and_histograms(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        count_stats: bool,
+    ) -> Result<(Vec<RunDecode>, FetchStats, Vec<RunHistogramDecode>), FetchError> {
+        let key = &seg_ref.data_object_key;
+        let (footer, total_size, suffix_etag, mut regions) =
+            self.open_segment(tenant_hash, seg_ref).await?;
+        let selected = self
+            .decode_selected(
+                key,
+                &footer,
+                total_size,
+                &suffix_etag,
+                &mut regions,
+                matchers,
+            )
+            .await?;
+        let scalar: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Scalar)
+            .collect();
+        let histogram: Vec<&SeriesEntryV4> = selected
+            .iter()
+            .filter(|e| e.entry.value_kind == ValueKind::Histogram)
+            .collect();
+
+        let scalar_planned = if scalar.is_empty() {
+            Vec::new()
+        } else {
+            self.fetch_scalar_pages(key, &footer, &scalar, &suffix_etag, &mut regions)
+                .await?
+        };
+        let histogram_planned = if histogram.is_empty() {
+            Vec::new()
+        } else {
+            self.fetch_histogram_pages(key, &footer, &histogram, &suffix_etag, &mut regions)
+                .await?
+        };
+
+        let (scalar_out, stats) = if scalar.is_empty() {
+            (Vec::new(), FetchStats::default())
+        } else {
+            self.build_scalar_decodes(
+                key,
+                seg_ref,
+                &scalar,
+                &scalar_planned,
+                &regions,
+                count_stats,
+            )?
+        };
+        let histogram_out = if histogram.is_empty() {
+            Vec::new()
+        } else {
+            self.build_histogram_decodes(key, seg_ref, &histogram, &histogram_planned, &regions)?
+        };
+        Ok((scalar_out, stats, histogram_out))
     }
 
     /// Returns the series (labels only, no samples) in this segment matching
@@ -837,6 +1028,39 @@ impl SegmentFetcher {
             .into_iter()
             .map(RunHistogramDecode::into_fetched)
             .collect())
+    }
+
+    /// Single-open counterpart to calling [`fetch_soa`](Self::fetch_soa) and
+    /// [`fetch_histograms`](Self::fetch_histograms) back to back on the same
+    /// segment (#278 item 1): opens the segment once, decodes its catalog
+    /// once, and returns both the scalar SoA series (with page-kind stats) and
+    /// the native-histogram series. The scalar and histogram results are
+    /// identical to the two separate calls; only the segment open and catalog
+    /// decode are shared instead of paid twice.
+    pub async fn fetch_soa_and_histograms(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+    ) -> Result<
+        (
+            Vec<FetchedSeriesSoa>,
+            FetchStats,
+            Vec<FetchedHistogramSeries>,
+        ),
+        FetchError,
+    > {
+        let (runs, stats, hist_runs) = self
+            .fetch_runs_and_histograms(tenant_hash, seg_ref, matchers, true)
+            .await?;
+        Ok((
+            runs.into_iter().map(RunDecode::into_soa).collect(),
+            stats,
+            hist_runs
+                .into_iter()
+                .map(RunHistogramDecode::into_fetched)
+                .collect(),
+        ))
     }
 }
 
@@ -985,6 +1209,7 @@ mod tests {
 
     use ravel_catalog::SegmentRef;
     use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence};
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{
         HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
@@ -1345,6 +1570,153 @@ mod tests {
         assert_eq!(s.as_ptr() as usize, base + 3);
         // Out-of-range slice is rejected, never a copy of the wrong bytes.
         assert!(regions.slice(108, 4).is_none());
+    }
+
+    /// A `FaultStore` whose only rule is a long run of pass-throughs on the
+    /// object key, so `sequence_progress(0)` faithfully counts the GETs a
+    /// fetch issued (the same GET-counting trick as tests/fetch_multi_get.rs).
+    async fn counting_store(bytes: Bytes, key: &str) -> Arc<FaultStore<MemoryStore>> {
+        let inner = MemoryStore::new();
+        inner
+            .put(key, bytes, PutOptions::default())
+            .await
+            .expect("put segment object");
+        let mut seq = Sequence::new(Op::Get).with_key_contains(key);
+        for _ in 0..64 {
+            seq = seq.then_passthrough();
+        }
+        Arc::new(FaultStore::new(
+            inner,
+            FaultPlan::empty().with_sequence(seq),
+        ))
+    }
+
+    /// #278 item 1: opening a segment once with `fetch_soa_and_histograms`
+    /// returns byte-for-byte the same scalar and histogram series the two
+    /// separate `fetch_soa` + `fetch_histograms` passes did, while issuing
+    /// strictly fewer GETs (one segment open instead of two).
+    #[tokio::test]
+    async fn fetch_soa_and_histograms_matches_separate_passes_in_one_open() {
+        let (mem, tenant_hash, seg_ref) = write_histogram_test_segment().await;
+        let bytes = mem
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get bytes")
+            .data;
+
+        let ref_store = counting_store(bytes.clone(), &seg_ref.data_object_key).await;
+        let ref_backend: Arc<dyn ObjectStoreBackend> = ref_store.clone();
+        let ref_fetcher = SegmentFetcher::new(ref_backend);
+        let (soa_ref, _s) = ref_fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+        let hist_ref = ref_fetcher
+            .fetch_histograms(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_histograms");
+        let two_pass_gets = ref_store.sequence_progress(0);
+
+        let comb_store = counting_store(bytes, &seg_ref.data_object_key).await;
+        let comb_backend: Arc<dyn ObjectStoreBackend> = comb_store.clone();
+        let (mut soa, _s2, mut hist) = SegmentFetcher::new(comb_backend)
+            .fetch_soa_and_histograms(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("combined fetch");
+        let combined_gets = comb_store.sequence_progress(0);
+
+        let mut soa_ref = soa_ref;
+        soa.sort_by_key(|s| s.series_id.0);
+        soa_ref.sort_by_key(|s| s.series_id.0);
+        assert_eq!(soa.len(), soa_ref.len());
+        for (x, y) in soa.iter().zip(soa_ref.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.labels, y.labels);
+            assert_eq!(x.timestamps, y.timestamps);
+            let xv: Vec<u64> = x.values.iter().map(|v| v.to_bits()).collect();
+            let yv: Vec<u64> = y.values.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(xv, yv);
+        }
+
+        let mut hist_ref = hist_ref;
+        hist.sort_by_key(|s| s.series_id.0);
+        hist_ref.sort_by_key(|s| s.series_id.0);
+        assert_eq!(hist.len(), hist_ref.len());
+        for (x, y) in hist.iter().zip(hist_ref.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.labels, y.labels);
+            assert_eq!(x.timestamps, y.timestamps);
+            assert_eq!(x.values, y.values);
+        }
+
+        assert_eq!(
+            two_pass_gets, 2,
+            "the two separate passes open the segment twice"
+        );
+        assert_eq!(
+            combined_gets, 1,
+            "the merged pass opens the small segment exactly once"
+        );
+    }
+
+    /// #278 item 5: below the whole-object threshold the first GET reads the
+    /// entire object (one request, no footer probe) regardless of `suffix_len`;
+    /// above it the footer-suffix path runs and a tiny suffix forces the
+    /// `NeedRange` chase into more than one GET. Both decode identical data.
+    #[tokio::test]
+    async fn size_aware_first_get_reads_whole_small_object_else_footer_suffix() {
+        let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+        let bytes = mem
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get bytes")
+            .data;
+        let size = seg_ref.object_size;
+
+        // Below threshold: one whole-object GET even with a 16-byte suffix.
+        let whole_store = counting_store(bytes.clone(), &seg_ref.data_object_key).await;
+        let whole_backend: Arc<dyn ObjectStoreBackend> = whole_store.clone();
+        let whole = SegmentFetcher::new(whole_backend)
+            .with_whole_object_threshold(size + 1)
+            .with_suffix_len(16)
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("whole-object fetch");
+        assert_eq!(
+            whole_store.sequence_progress(0),
+            1,
+            "below threshold the fetch reads the whole object in one GET"
+        );
+
+        // Above threshold (whole-object disabled) with a tiny suffix: the
+        // footer NeedRange chase issues at least a second GET.
+        let suffix_store = counting_store(bytes, &seg_ref.data_object_key).await;
+        let suffix_backend: Arc<dyn ObjectStoreBackend> = suffix_store.clone();
+        let suffixed = SegmentFetcher::new(suffix_backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("footer-suffix fetch");
+        assert!(
+            suffix_store.sequence_progress(0) >= 2,
+            "above threshold the footer-suffix path issues a second probe, got {}",
+            suffix_store.sequence_progress(0)
+        );
+
+        let mut a = whole;
+        let mut b = suffixed;
+        a.sort_by_key(|s| s.series_id.0);
+        b.sort_by_key(|s| s.series_id.0);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.series_id, y.series_id);
+            assert_eq!(x.samples.len(), y.samples.len());
+            for (sx, sy) in x.samples.iter().zip(y.samples.iter()) {
+                assert_eq!(sx.ts_ns, sy.ts_ns);
+                assert_eq!(sx.value.to_bits(), sy.value.to_bits());
+            }
+        }
     }
 
     #[test]

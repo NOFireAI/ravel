@@ -556,7 +556,9 @@ async fn mid_scan_get_failure_is_typed_error_and_fault_fires() {
 
     // Fail the 2nd GET (Nth is 1-indexed): the footer suffix GET succeeds,
     // then a page/section GET fails mid-scan. A tiny suffix length forces
-    // more than one GET per segment.
+    // more than one GET per segment, and the whole-object threshold is
+    // disabled (#278 item 5) so this small segment stays on the footer-suffix
+    // path instead of being read in one whole-object GET.
     let plan = FaultPlan::empty().with_rule(
         Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
             .with_occurrence(Occurrence::Nth(2)),
@@ -571,7 +573,9 @@ async fn mid_scan_get_failure_is_typed_error_and_fault_fires() {
     };
 
     let backend: Arc<dyn ObjectStoreBackend> = store.clone();
-    let fetcher = SegmentFetcher::new(backend).with_suffix_len(64);
+    let fetcher = SegmentFetcher::new(backend)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(64);
     let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, Arc::new(TaskContext::default()))

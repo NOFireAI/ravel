@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::stream::{self, StreamExt};
 use ravel_commit::{keys, signal};
 use ravel_object_store::{GetRange, StoreError};
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead};
@@ -155,11 +156,19 @@ impl Catalog {
     /// if no snapshot is usable right now (absent, corrupt, or its parts
     /// unreadable). Never returns an error for index-only failures: the
     /// index is a pure optimization (docs/metric-index-plan.md 5.1 step 2).
+    ///
+    /// `want_postings` gates the postings GET (#278 item 3): the postings
+    /// object is only ever consulted to prune by an equality `__name__`
+    /// filter, so a resolve with no such filter passes `false` and never
+    /// fetches or decodes it. Passing `false` is equivalent to postings being
+    /// absent, which `extract_into` already handles by considering every
+    /// entry.
     pub(crate) async fn resolve_snapshot_window(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         now_ns: i64,
+        want_postings: bool,
     ) -> Result<Option<SnapshotWindow>, CatalogError> {
         let head_key = head_object_key(tenant, signal);
         let Some(head) = self
@@ -170,7 +179,11 @@ impl Catalog {
         };
         match self.load_snapshot_parts(tenant, &head).await {
             PartLoadOutcome::Loaded(parts) => {
-                let postings = self.load_snapshot_postings(tenant, &head, &parts).await;
+                let postings = if want_postings {
+                    self.load_snapshot_postings(tenant, &head, &parts).await
+                } else {
+                    None
+                };
                 Ok(Some(SnapshotWindow {
                     watermark_hour: head.watermark_hour,
                     parts,
@@ -190,9 +203,12 @@ impl Catalog {
                 };
                 match self.load_snapshot_parts(tenant, &fresh_head).await {
                     PartLoadOutcome::Loaded(parts) => {
-                        let postings = self
-                            .load_snapshot_postings(tenant, &fresh_head, &parts)
-                            .await;
+                        let postings = if want_postings {
+                            self.load_snapshot_postings(tenant, &fresh_head, &parts)
+                                .await
+                        } else {
+                            None
+                        };
                         Ok(Some(SnapshotWindow {
                             watermark_hour: fresh_head.watermark_hour,
                             parts,
@@ -230,7 +246,7 @@ impl Catalog {
             return Some(cached);
         }
 
-        let got = match self.store().get(&postings_ref.key, GetRange::Full).await {
+        let got = match self.guarded_get(&postings_ref.key, GetRange::Full).await {
             Ok(got) => got,
             Err(err) => {
                 tracing::warn!(error = %err, key = %postings_ref.key, "postings GET failed, pruning disabled");
@@ -298,7 +314,7 @@ impl Catalog {
             return Ok(Some(cached));
         }
 
-        let got = match self.store().get(head_key, GetRange::Full).await {
+        let got = match self.guarded_get(head_key, GetRange::Full).await {
             Ok(got) => got,
             Err(StoreError::NotFound) => return Ok(None),
             Err(err) => {
@@ -339,53 +355,91 @@ impl Catalog {
     /// Load and verify every part HEAD names, through the immutable part
     /// cache. Parts are content-addressed, so a cache hit needs no
     /// re-verification.
+    ///
+    /// The uncached part GETs run concurrently under the resolve-wide
+    /// semaphore (#278 item 2) rather than one await at a time. `buffered`
+    /// preserves HEAD's part order, and the fold returns the first
+    /// non-`Loaded` outcome in that order, so a multi-part snapshot yields
+    /// exactly the same `NotFoundRace`/`Unusable` decision the sequential
+    /// loop did.
     async fn load_snapshot_parts(
         &self,
         tenant: &TenantHash,
         head: &SnapshotHead,
     ) -> PartLoadOutcome {
-        let mut parts = Vec::with_capacity(head.parts.len());
-        for part_ref in &head.parts {
-            if let Some(cached) = self.part_cache().get(tenant, &part_ref.key) {
-                parts.push(cached);
-                continue;
+        // Owned part-ref clones, not borrowed `&SnapshotPartRef`s: a stream
+        // closure that borrows each item infers a non-higher-ranked lifetime
+        // for the future and fails to unify with axum's `Handler` blanket
+        // impl at the HTTP router (the "FnOnce is not general enough" wall).
+        let loaded: Vec<OnePartOutcome> = stream::iter(head.parts.iter().cloned())
+            .map(|part_ref| async move { self.load_one_part(tenant, &part_ref).await })
+            .buffered(crate::catalog::MAX_CONCURRENT_REQUESTS)
+            .collect()
+            .await;
+        let mut parts = Vec::with_capacity(loaded.len());
+        for outcome in loaded {
+            match outcome {
+                OnePartOutcome::Loaded(part) => parts.push(part),
+                OnePartOutcome::NotFoundRace => return PartLoadOutcome::NotFoundRace,
+                OnePartOutcome::Unusable => return PartLoadOutcome::Unusable,
             }
-            let got = match self.store().get(&part_ref.key, GetRange::Full).await {
-                Ok(got) => got,
-                Err(StoreError::NotFound) => {
-                    tracing::warn!(key = %part_ref.key, "snapshot part not found, will re-read HEAD once");
-                    return PartLoadOutcome::NotFoundRace;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, key = %part_ref.key, "snapshot part GET failed, falling back to listing");
-                    return PartLoadOutcome::Unusable;
-                }
-            };
-            let digest = blake3::hash(&got.data);
-            if digest.as_bytes().as_slice() != part_ref.blake3.as_slice() {
-                tracing::warn!(key = %part_ref.key, "snapshot part hash mismatch, falling back to listing");
-                return PartLoadOutcome::Unusable;
-            }
-            let limits = PartLimits {
-                max_snapshot_part_bytes: self.config().max_snapshot_part_bytes,
-            };
-            let decoded = match snapshot_format::decode_part(&got.data, &limits) {
-                Ok(decoded) => Arc::new(decoded),
-                Err(err) => {
-                    tracing::warn!(error = %err, key = %part_ref.key, "snapshot part failed to decode, falling back to listing");
-                    return PartLoadOutcome::Unusable;
-                }
-            };
-            self.part_cache().insert(
-                *tenant,
-                part_ref.key.clone(),
-                decoded.clone(),
-                self.config().snapshot_cache_parts,
-            );
-            parts.push(decoded);
         }
         PartLoadOutcome::Loaded(parts)
     }
+
+    /// Load, verify, and decode one snapshot part through the immutable part
+    /// cache. The per-part half of [`load_snapshot_parts`](Self::load_snapshot_parts),
+    /// factored out so the parts can be fetched concurrently (#278 item 2).
+    async fn load_one_part(
+        &self,
+        tenant: &TenantHash,
+        part_ref: &ravel_proto::catalog::v1::SnapshotPartRef,
+    ) -> OnePartOutcome {
+        if let Some(cached) = self.part_cache().get(tenant, &part_ref.key) {
+            return OnePartOutcome::Loaded(cached);
+        }
+        let got = match self.guarded_get(&part_ref.key, GetRange::Full).await {
+            Ok(got) => got,
+            Err(StoreError::NotFound) => {
+                tracing::warn!(key = %part_ref.key, "snapshot part not found, will re-read HEAD once");
+                return OnePartOutcome::NotFoundRace;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, key = %part_ref.key, "snapshot part GET failed, falling back to listing");
+                return OnePartOutcome::Unusable;
+            }
+        };
+        let digest = blake3::hash(&got.data);
+        if digest.as_bytes().as_slice() != part_ref.blake3.as_slice() {
+            tracing::warn!(key = %part_ref.key, "snapshot part hash mismatch, falling back to listing");
+            return OnePartOutcome::Unusable;
+        }
+        let limits = PartLimits {
+            max_snapshot_part_bytes: self.config().max_snapshot_part_bytes,
+        };
+        let decoded = match snapshot_format::decode_part(&got.data, &limits) {
+            Ok(decoded) => Arc::new(decoded),
+            Err(err) => {
+                tracing::warn!(error = %err, key = %part_ref.key, "snapshot part failed to decode, falling back to listing");
+                return OnePartOutcome::Unusable;
+            }
+        };
+        self.part_cache().insert(
+            *tenant,
+            part_ref.key.clone(),
+            decoded.clone(),
+            self.config().snapshot_cache_parts,
+        );
+        OnePartOutcome::Loaded(decoded)
+    }
+}
+
+/// One part's load result, folded back into a [`PartLoadOutcome`] over the
+/// whole part set in HEAD order.
+enum OnePartOutcome {
+    Loaded(Arc<DecodedPart>),
+    NotFoundRace,
+    Unusable,
 }
 
 fn build_segment_ref_from_entry(

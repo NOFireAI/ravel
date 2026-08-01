@@ -435,8 +435,13 @@ async fn label_equality_prunes_series_pages() {
     let want = oracle(Arc::clone(&backend), &snapshot).await;
 
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-    // Small suffix so page sections need their own ranged GETs.
-    let fetcher = SegmentFetcher::new(Arc::clone(&backend)).with_suffix_len(256);
+    // Small suffix so page sections need their own ranged GETs; the
+    // whole-object path is disabled (#278 item 5) so this small segment does
+    // not get read whole, which would fetch identical bytes with and without
+    // the label filter and defeat the byte-reduction assertion below.
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(256);
     let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
     ctx.register_udf(label_udf());
     ctx.register_table("samples", Arc::new(provider)).unwrap();
@@ -472,7 +477,9 @@ async fn label_equality_prunes_series_pages() {
     let (store2, log2) = CountingStore::new(Arc::new(MemoryStore::new()));
     let backend2: Arc<dyn ObjectStoreBackend> = store2;
     let snapshot2 = build_snapshot(backend2.as_ref(), &[spec()]).await;
-    let fetcher2 = SegmentFetcher::new(Arc::clone(&backend2)).with_suffix_len(256);
+    let fetcher2 = SegmentFetcher::new(Arc::clone(&backend2))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(256);
     let provider2 = RavelTableProvider::new(snapshot2, TENANT, fetcher2, EngineConfig::default());
     let plan = provider2.plan(1).expect("plan");
     let _ = collect(plan, Arc::new(TaskContext::default()))

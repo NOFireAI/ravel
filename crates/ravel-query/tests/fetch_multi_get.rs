@@ -182,6 +182,7 @@ async fn needrange_chase_issues_a_second_get_and_matches_full_suffix() {
     let multi_backend: Arc<dyn ObjectStoreBackend> = multi_store.clone();
     let multi_get = sort_series(
         SegmentFetcher::new(multi_backend)
+            .with_whole_object_threshold(0)
             .with_suffix_len(16)
             .fetch(tenant_hash, &seg_ref, &[])
             .await
@@ -209,6 +210,7 @@ async fn coalesce_gap_changes_get_count_but_not_data() {
     let no_coalesce_backend: Arc<dyn ObjectStoreBackend> = no_coalesce_store.clone();
     let no_coalesce = sort_series(
         SegmentFetcher::new(no_coalesce_backend)
+            .with_whole_object_threshold(0)
             .with_suffix_len(16)
             .with_coalesce_gap(0)
             .fetch(tenant_hash, &seg_ref, &[])
@@ -221,6 +223,7 @@ async fn coalesce_gap_changes_get_count_but_not_data() {
     let wide_backend: Arc<dyn ObjectStoreBackend> = wide_store.clone();
     let wide_coalesce = sort_series(
         SegmentFetcher::new(wide_backend)
+            .with_whole_object_threshold(0)
             .with_suffix_len(16)
             .with_coalesce_gap(1 << 20)
             .fetch(tenant_hash, &seg_ref, &[])
@@ -254,6 +257,7 @@ async fn etag_change_on_footer_chase_surfaces_etag_changed() {
     let control = memory_store_with_segment(bytes.clone()).await;
     let control_backend: Arc<dyn ObjectStoreBackend> = control;
     SegmentFetcher::new(control_backend)
+        .with_whole_object_threshold(0)
         .with_suffix_len(16)
         .fetch(tenant_hash, &seg_ref, &[])
         .await
@@ -276,6 +280,7 @@ async fn etag_change_on_footer_chase_surfaces_etag_changed() {
     let backend: Arc<dyn ObjectStoreBackend> = store.clone();
 
     let result = SegmentFetcher::new(backend)
+        .with_whole_object_threshold(0)
         .with_suffix_len(16)
         .fetch(tenant_hash, &seg_ref, &[])
         .await;
@@ -317,6 +322,7 @@ async fn etag_change_on_range_get_surfaces_etag_changed() {
     let backend: Arc<dyn ObjectStoreBackend> = store.clone();
 
     let result = SegmentFetcher::new(backend)
+        .with_whole_object_threshold(0)
         .with_suffix_len(16)
         .fetch(tenant_hash, &seg_ref, &[])
         .await;

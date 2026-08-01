@@ -4266,6 +4266,7 @@ dependencies = [
  "blake3",
  "bytes",
  "crc32c",
+ "futures",
  "parking_lot",
  "proptest",
  "prost",
