@@ -4211,6 +4211,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-alerting"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "proptest",
+ "ravel-logseg",
+ "ravel-types",
+ "thiserror",
+]
+
+[[package]]
 name = "ravel-analytics"
 version = "0.1.0"
 dependencies = [
