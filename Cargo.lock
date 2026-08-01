@@ -4685,6 +4685,7 @@ dependencies = [
  "proptest",
  "prost",
  "rand 0.10.2",
+ "ravel-alerting",
  "ravel-catalog",
  "ravel-commit",
  "ravel-logseg",

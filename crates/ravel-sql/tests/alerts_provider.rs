@@ -407,6 +407,94 @@ async fn attrs_map_exposes_labels_and_promoted_keys() {
     assert_eq!(map_get(&map, "label.team"), Some("sre".to_string()));
 }
 
+/// This table's fixtures elsewhere in this file (`alert_record`) hand-encode
+/// RLOG attrs matching the ADR-0040 convention this crate assumes -
+/// `ravel-alerting` was not available when this table was first built, so
+/// nothing here had actually been checked against its real writer. This test
+/// closes that gap: it builds a record through `ravel-alerting`'s own
+/// `build_transition_record`/`encode_record_object` (the real path a live
+/// evaluator would use), and confirms this table extracts identical values
+/// for every promoted column and every attrs-map entry. A future rename of an
+/// attr key or a change to `generation`'s stored type in `ravel-alerting`
+/// would silently break this table without ever failing a test in either
+/// crate alone; this is the one place that drift is checked.
+#[tokio::test]
+async fn real_ravel_alerting_record_decodes_identically() {
+    use ravel_alerting::{
+        AlertState, Rule, RuleCondition, RuleQuery, ThresholdOp, build_transition_record,
+        encode_record_object,
+    };
+
+    let rule = Rule {
+        rule_id: "disk-full".to_string(),
+        query: RuleQuery::Promql("disk_free_bytes < 1e9".to_string()),
+        condition: RuleCondition::Threshold {
+            op: ThresholdOp::Lt,
+            threshold: 1e9,
+        },
+        labels: vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "sre".to_string()),
+        ],
+        annotations: vec![],
+        for_duration: None,
+        max_alert_generation: None,
+    };
+    let record = build_transition_record(&rule, AlertState::Firing, 4, 5);
+    let object = encode_record_object(&record, small_blocks(), identity()).expect("encode");
+
+    let store = MemoryStore::new();
+    let key = "alerts/real.rlog";
+    let size = object.len() as u64;
+    store
+        .put(key, bytes::Bytes::from(object), PutOptions::default())
+        .await
+        .expect("put object");
+    let seg = SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: size,
+        min_event_ts_ns: 5,
+        max_event_ts_ns: 5,
+        ingest_hour_bucket: 0,
+        sample_count: 1,
+        series_count: 0,
+        shard: 0,
+        content_hash: [0u8; 32],
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+    };
+
+    let provider = provider(store, vec![seg]);
+    let plan = provider.plan(1).expect("build plan");
+    let batches = collect_plan(plan).await;
+    assert_eq!(batches[0].num_rows(), 1);
+
+    assert_eq!(
+        str_at(col_str(&batches[0], 1), 0),
+        Some(record.alert_id.to_hex()),
+        "alert_id column matches the real crate's hex encoding"
+    );
+    assert_eq!(
+        str_at(col_str(&batches[0], 2), 0),
+        Some("disk-full".to_string())
+    );
+    assert_eq!(
+        str_at(col_str(&batches[0], 3), 0),
+        Some("firing".to_string())
+    );
+
+    let map = attrs_map(&batches[0], 0);
+    assert_eq!(map_get(&map, "alert_id"), Some(record.alert_id.to_hex()));
+    assert_eq!(map_get(&map, "rule_id"), Some("disk-full".to_string()));
+    assert_eq!(map_get(&map, "state"), Some("firing".to_string()));
+    assert_eq!(map_get(&map, "generation"), Some("4".to_string()));
+    assert_eq!(map_get(&map, "label.env"), Some("prod".to_string()));
+    assert_eq!(map_get(&map, "label.team"), Some("sre".to_string()));
+}
+
 /// The `(key, value)` pairs of one row's `attrs` map cell.
 fn attrs_map(batch: &RecordBatch, row: usize) -> Vec<(String, String)> {
     let map = batch
