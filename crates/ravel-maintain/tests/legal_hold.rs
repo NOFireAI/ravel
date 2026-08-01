@@ -11,7 +11,7 @@ use common::*;
 use ravel_commit::keys;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, LeaseCheck, LegalHoldCheck, NoLeases,
-    SweepReport, compact_bucket, sweep_shard, write_hold_clear, write_hold_set,
+    SweepReport, compact_bucket, shard_hold_scopes, sweep_shard, write_hold_clear, write_hold_set,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
@@ -81,6 +81,17 @@ async fn l0_data_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize
         .len()
 }
 
+/// Count of live objects (commit records included) under the shard's commit
+/// prefix - this is what the superseded-input sweep rule actually deletes,
+/// distinct from `l0_data_count`'s raw data-object count. A hold scoped only
+/// to the L0 data prefix does NOT protect this prefix (that is the bug
+/// `shard_hold_scopes` exists to prevent callers from hitting).
+async fn commit_record_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize {
+    let prefix = keys::commit_shard_prefix(&bucket.tenant_hash, bucket.signal, bucket.shard)
+        .expect("commit prefix");
+    list_all(store, &prefix).await.unwrap().len()
+}
+
 /// Assert the compaction record and every L1 part it names are still present
 /// (HEAD, no decode).
 async fn assert_l1_intact(store: &dyn ObjectStoreBackend, bucket: &Bucket) {
@@ -129,36 +140,54 @@ async fn active_hold_blocks_delete_that_would_otherwise_happen() {
         "control: data gone"
     );
 
-    // With an active hold over the L0 data prefix, the same sweep leaves the
-    // held data objects in place (and the L1 output is untouched either way).
+    // With an active hold over ALL THREE of the shard's real key prefixes
+    // (shard_hold_scopes - a hold over only the L0 prefix would leave the
+    // shard's commit records unprotected, see commit_record_count below), the
+    // same sweep leaves the held data in place.
     let held = MemoryStore::new();
     let clock = FixedClock::new(created);
     let bucket = seed_and_compact(&held, &clock).await;
-    let before = l0_data_count(&held, &bucket).await;
-    assert!(before > 0);
+    let data_before = l0_data_count(&held, &bucket).await;
+    let records_before = commit_record_count(&held, &bucket).await;
+    assert!(data_before > 0);
+    assert!(records_before > 0);
 
-    write_hold_set(
-        &held,
-        &bucket.tenant_hash,
-        Uuid::from_u128(100),
-        created,
-        &l0_data_prefix(&bucket),
-        "litigation hold #42",
-    )
-    .await
-    .expect("set hold");
+    let scopes =
+        shard_hold_scopes(&bucket.tenant_hash, bucket.signal, bucket.shard).expect("shard scopes");
+    for (i, scope) in scopes.iter().enumerate() {
+        write_hold_set(
+            &held,
+            &bucket.tenant_hash,
+            Uuid::from_u128(100 + i as u128),
+            created,
+            scope,
+            "litigation hold #42",
+        )
+        .await
+        .expect("set hold");
+    }
 
     let lease = LegalHoldCheck::refresh(&held, &bucket.tenant_hash)
         .await
         .expect("refresh");
-    assert_eq!(lease.active_prefixes(), [l0_data_prefix(&bucket)]);
+    let mut active = lease.active_prefixes().to_vec();
+    active.sort();
+    let mut expected = scopes.to_vec();
+    expected.sort();
+    assert_eq!(active, expected);
 
     clock.set(past_horizon(created));
     run_sweep(&held, &clock, &lease, &bucket).await;
     assert_eq!(
         l0_data_count(&held, &bucket).await,
-        before,
+        data_before,
         "held data objects survive the sweep"
+    );
+    assert_eq!(
+        commit_record_count(&held, &bucket).await,
+        records_before,
+        "held commit records survive the sweep - the L0-only-scope bug this test now \
+         catches would have deleted these even with the hold active"
     );
     assert_l1_intact(&held, &bucket).await;
 }

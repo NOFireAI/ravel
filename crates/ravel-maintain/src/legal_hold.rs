@@ -25,9 +25,17 @@
 //! - `kind` = `legal_hold` (records without this attr are ordinary audit
 //!   records and are ignored);
 //! - `hold.op` = `set` or `clear`;
-//! - `hold.scope` = the object-key prefix the hold covers (e.g.
-//!   `t/<tenant_hex>/m/l0/0007/` for one metrics L0 shard, or `t/<tenant_hex>/`
-//!   for a whole tenant);
+//! - `hold.scope` = one object-key prefix the hold covers. A whole tenant is
+//!   `t/<tenant_hex>/`. Holding one shard is NOT a single prefix: L0 data,
+//!   commit records, and L1 parts for one `(tenant, signal, shard)` live under
+//!   three separate sibling prefixes (`.../l0/<shard>/`, `.../c/<shard>/`,
+//!   `.../l1/<shard>/`), each checked against `is_protected` independently by
+//!   the sweeper/retention. [`shard_hold_scopes`] returns all three; a
+//!   shard-level hold means calling [`write_hold_set`] once per prefix it
+//!   returns, not once with a single L0-only scope (that would leave the
+//!   shard's commit records and compacted L1 parts unprotected - the
+//!   sweeper's and retention's own delete rules never look at the L0 prefix
+//!   to gate an L1 or commit-record delete);
 //! - `hold.reason` (optional, on a set) = free-text justification.
 //!
 //! The record's `ts_ns` is the set-at / cleared-at timestamp. Current hold
@@ -52,7 +60,9 @@ use ravel_logseg::{
     AttrValue, LogRecord, LogStreamId, ObjectIdentity, Predicate, RlogConfig, RlogReader,
     RlogWriter, stream_attrs_bytes,
 };
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
+use ravel_object_store::{
+    GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
+};
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
@@ -89,6 +99,36 @@ const STREAM_RECORD_TYPE: &str = "legal_hold";
 /// Scope name of the shared legal-hold log stream.
 const STREAM_SCOPE_NAME: &str = "ravel.legal_hold";
 const STREAM_SCOPE_VERSION: &str = "1";
+
+/// The three real key prefixes one `(tenant, signal, shard)` spans: L0 data
+/// objects, commit records (which live under an hour-bucketed sub-prefix, so
+/// the commit prefix here is the hour-agnostic parent of all of them), and L1
+/// compacted parts (`docs/catalog-and-mvcc.md`'s key layout). A hold scoped to
+/// only one of these - e.g. just the L0 prefix - does NOT protect the other
+/// two: the sweeper deletes commit records once their data is superseded, and
+/// retention deletes L1 parts directly, both checked against `is_protected`
+/// independently of the L0 prefix. Callers wanting to hold everything under
+/// one shard MUST hold all three prefixes this returns, not just one of them;
+/// this function exists so that mistake is a documented, single call rather
+/// than three independently-reasoned string literals.
+pub fn shard_hold_scopes(tenant: &TenantHash, signal: Signal, shard: u32) -> Result<[String; 3]> {
+    if shard > 9999 {
+        return Err(MaintainError::Invariant(format!(
+            "shard {shard} out of range for a hold scope (max 9999)"
+        )));
+    }
+    let shard_str = format!("{shard:04}");
+    let tenant_hex = tenant.to_hex();
+    let signal_prefix = signal.key_prefix();
+    Ok([
+        format!("t/{tenant_hex}/{signal_prefix}/l0/{shard_str}/"),
+        keys::commit_shard_prefix(tenant, signal, shard)?,
+        format!(
+            "t/{tenant_hex}/{signal_prefix}/{}/{shard_str}/",
+            keys::L1_DIR
+        ),
+    ])
+}
 
 /// A hold set or clear, either direction of the fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,11 +442,51 @@ async fn write_hold_object(
         0,
         &content_hash,
     )?;
-    store.put(&data_key, object, PutOptions::default()).await?;
+    let data_checksum = UploadChecksum::Crc32c(crc32c::crc32c(&object));
+    match store
+        .put(
+            &data_key,
+            object,
+            PutOptions::create_if_absent().with_checksum(data_checksum),
+        )
+        .await
+    {
+        Ok(_) => {}
+        // A fresh `record_id` collides only if the caller reused one; the
+        // data object is content-addressed by `content_hash` in its key, so
+        // an identical object already present is a genuine no-op, not an
+        // error - the same idempotent-republish convergence every other L0
+        // write in this repo already relies on (ADR-0010 SS7).
+        Err(StoreError::AlreadyExists) => {}
+        Err(e) => return Err(e.into()),
+    }
     let commit_key = keys::commit_key_for_record(&commit)?;
-    store
-        .put(&commit_key, record::encode(&commit), PutOptions::default())
-        .await?;
+    let commit_bytes = record::encode(&commit);
+    let commit_checksum = UploadChecksum::Crc32c(crc32c::crc32c(&commit_bytes));
+    match store
+        .put(
+            &commit_key,
+            commit_bytes,
+            PutOptions::create_if_absent().with_checksum(commit_checksum),
+        )
+        .await
+    {
+        Ok(_) => {}
+        // Same record_id reused for a second, logically distinct hold
+        // operation (e.g. set then clear) would land here as a REAL
+        // conflict, since the two records differ in content but share a
+        // commit key - surfaced as an error rather than silently keeping
+        // whichever one happened to land first (which could silently drop a
+        // clear and leave data protected forever, or worse, silently drop a
+        // set and leave it unprotected).
+        Err(StoreError::AlreadyExists) => {
+            return Err(MaintainError::Invariant(format!(
+                "legal-hold commit record {commit_key} already exists with different content \
+                 - record_id {record_id} was reused for a different hold operation"
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
