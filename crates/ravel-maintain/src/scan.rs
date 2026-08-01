@@ -5,6 +5,8 @@
 //! cursor is advisory mutable state (the ADR-0003 HEAD-pointer precedent):
 //! losing or corrupting it costs a rescan, never correctness.
 
+use std::collections::{HashMap, HashSet};
+
 use ravel_commit::keys;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version};
 use ravel_types::{Signal, TenantHash};
@@ -12,7 +14,7 @@ use ravel_types::{Signal, TenantHash};
 use crate::bucket::Bucket;
 use crate::clock::Clock;
 use crate::compact::{CompactionOutcome, compact_bucket};
-use crate::config::{CompactorConfig, RetentionConfig};
+use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{RetentionOutcome, maintain_bucket};
 use crate::sweep::LeaseCheck;
@@ -111,6 +113,11 @@ pub struct MaintainReport {
     pub already_done: usize,
     /// Buckets skipped because not yet sealed.
     pub not_sealed: usize,
+    /// Buckets skipped this pass because the [`MaintainMemo`] already knows them
+    /// terminal (issue #280), so no per-bucket LIST/GET was issued for them.
+    /// Always zero on a cold pass and for the non-memoized
+    /// [`scan_and_maintain`] entry point.
+    pub skipped_terminal: usize,
 }
 
 /// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
@@ -140,6 +147,202 @@ async fn list_shard_hours(
     Ok(hours)
 }
 
+/// Default full re-verify interval for [`MaintainMemo`] (1 hour). A bucket the
+/// memo has marked terminal is re-listed and re-evaluated at least this often,
+/// bounding how long a memo entry may be stale -- a bucket that became
+/// retention-expired, or an entry corrupted in memory -- before the maintain
+/// loop acts on it. One hour is far below any retention window (days) and any
+/// protection horizon, so the deferred action is never a correctness problem,
+/// only a small bound on promptness (issue #280).
+pub const DEFAULT_MEMO_REVERIFY_INTERVAL_NS: i64 = NS_PER_HOUR;
+
+/// Memo key: `(tenant, signal, shard, ingest-hour)`, the full identity of one
+/// bucket. Tenant and signal are included so a single per-worker memo can span
+/// every `(signal, shard)` the worker maintains without cross-bucket aliasing.
+type BucketKey = (TenantHash, Signal, u32, u32);
+
+/// Why a bucket is terminal for the maintain loop: no retention or compaction
+/// action is due now, and none can become due until either a later retention
+/// expiry (caught by the memo's periodic re-verify) or never. Recorded for
+/// observability and tests; the skip decision itself needs only an entry's
+/// presence and freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalState {
+    /// A compaction record is present and retention left the bucket live
+    /// ("compacted-and-sweep-complete"): compaction is done, and only a later
+    /// retention expiry can change the bucket.
+    Compacted,
+    /// Sealed, below `min_compaction_inputs`, retention left it live: a sealed
+    /// bucket's input set is frozen, so it can never reach the threshold and
+    /// will never compact; only a later retention expiry can change it.
+    BelowThreshold,
+    /// Tombstoned and physically swept empty ("tombstone-swept-empty"): the
+    /// bucket holds nothing further to do. (It normally also vanishes from the
+    /// shard listing, so its entry is pruned on the next pass.)
+    SweptEmpty,
+}
+
+/// One memo entry: the terminal classification and the injected time the bucket
+/// was last verified against object storage.
+#[derive(Debug, Clone, Copy)]
+struct MemoEntry {
+    state: TerminalState,
+    verified_at_ns: i64,
+}
+
+/// Per-worker in-memory memo of terminal bucket states (issue #280).
+///
+/// The full-scan-every-tick maintain loop is correct but re-lists and re-reads
+/// every retained bucket on every tick, at roughly two LISTs plus a few GETs
+/// per sealed bucket, growing linearly with the retention window. Most of those
+/// buckets are terminal -- compacted-and-not-yet-expired, below-threshold, or
+/// already swept empty -- and re-evaluating them re-issues identical store
+/// reads for an identical no-op. This memo records the terminal ones per
+/// [`BucketKey`] so [`scan_and_maintain_with_memo`] skips re-listing them, until
+/// a periodic full re-verify (`reverify_interval_ns`) forces a fresh
+/// evaluation.
+///
+/// The memo is **ephemeral and never correctness-bearing**. It lives only in
+/// one worker's memory and is reconstructible from object storage at any time:
+/// on worker restart it is cold (empty), giving exactly one full rescan
+/// identical to the pre-memo behavior. If an entry is wrong, absent, or
+/// corrupted, the worst case is a bucket re-evaluated late (bounded by the
+/// re-verify interval) or redundant work -- never a missed retention or
+/// compaction action, and never an object deleted early. No durability,
+/// visibility, or query path reads it.
+#[derive(Debug, Clone)]
+pub struct MaintainMemo {
+    entries: HashMap<BucketKey, MemoEntry>,
+    reverify_interval_ns: i64,
+}
+
+impl MaintainMemo {
+    /// A cold memo that re-verifies each terminal bucket at least every
+    /// `reverify_interval_ns`. A non-positive interval disables skipping
+    /// entirely (every terminal entry is always treated as stale), reproducing
+    /// the pre-memo full-scan-every-tick behavior.
+    pub fn new(reverify_interval_ns: i64) -> Self {
+        MaintainMemo {
+            entries: HashMap::new(),
+            reverify_interval_ns,
+        }
+    }
+
+    /// A cold memo with the default re-verify interval
+    /// ([`DEFAULT_MEMO_REVERIFY_INTERVAL_NS`]).
+    pub fn with_default_interval() -> Self {
+        MaintainMemo::new(DEFAULT_MEMO_REVERIFY_INTERVAL_NS)
+    }
+
+    /// The re-verify interval in nanoseconds.
+    pub fn reverify_interval_ns(&self) -> i64 {
+        self.reverify_interval_ns
+    }
+
+    /// Number of memoized terminal buckets (introspection and tests).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the memo holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The memoized terminal state of one bucket, if any (introspection and
+    /// tests). Returns `None` when the bucket is not memoized, regardless of
+    /// freshness.
+    pub fn terminal_state(
+        &self,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+    ) -> Option<TerminalState> {
+        self.entries
+            .get(&(tenant_hash, signal, shard, hour))
+            .map(|entry| entry.state)
+    }
+
+    /// Whether `key` is memoized terminal and still fresh at `now_ns` (last
+    /// verified within the re-verify interval), so its bucket may be skipped
+    /// this tick. A non-positive interval is never fresh.
+    fn is_fresh_terminal(&self, key: &BucketKey, now_ns: i64) -> bool {
+        match self.entries.get(key) {
+            Some(entry) => {
+                self.reverify_interval_ns > 0
+                    && now_ns.saturating_sub(entry.verified_at_ns) < self.reverify_interval_ns
+            }
+            None => false,
+        }
+    }
+
+    /// Record `key` as terminal in `state`, verified at `now_ns`.
+    fn mark_terminal(&mut self, key: BucketKey, state: TerminalState, now_ns: i64) {
+        self.entries.insert(
+            key,
+            MemoEntry {
+                state,
+                verified_at_ns: now_ns,
+            },
+        );
+    }
+
+    /// Forget `key` (it is no longer terminal).
+    fn forget(&mut self, key: &BucketKey) {
+        self.entries.remove(key);
+    }
+
+    /// Drop entries for `(tenant, signal, shard)` whose hour is absent from
+    /// `present`, bounding memory to buckets that still exist. Entries for other
+    /// shards, signals, or tenants are untouched.
+    fn retain_present(
+        &mut self,
+        tenant: TenantHash,
+        signal: Signal,
+        shard: u32,
+        present: &HashSet<u32>,
+    ) {
+        self.entries.retain(|(t, s, sh, hour), _| {
+            *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+        });
+    }
+}
+
+/// Classify one bucket's maintain outcome as terminal (memoizable) or not.
+/// Terminal means this tick did no durable work and the next tick would repeat
+/// the identical no-op store reads until a later retention expiry, or forever.
+fn classify_terminal(
+    retention: &RetentionOutcome,
+    compaction: &Option<CompactionOutcome>,
+) -> Option<TerminalState> {
+    match retention {
+        // Physically swept empty: nothing remains in the bucket.
+        RetentionOutcome::Swept => Some(TerminalState::SweptEmpty),
+        // A tombstone is present but the horizon-gated sweep is still pending,
+        // or a sweep left residue: real work is due on a later tick.
+        RetentionOutcome::Tombstoned | RetentionOutcome::SweptPartial => None,
+        // Retention left the bucket live; the compaction outcome decides.
+        RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
+            match compaction {
+                Some(CompactionOutcome::AlreadyCompacted) => Some(TerminalState::Compacted),
+                Some(CompactionOutcome::BelowMinInputs { .. }) => {
+                    Some(TerminalState::BelowThreshold)
+                }
+                // Just compacted this tick: re-verify next tick to reach the stable
+                // AlreadyCompacted state before memoizing it.
+                Some(CompactionOutcome::Compacted { .. }) => None,
+                // Not sealed yet (the newest buckets): keep evaluating every tick
+                // until the seal margin passes.
+                Some(CompactionOutcome::NotSealed) | None => None,
+                // A tombstone appeared between the retention and compaction reads:
+                // not a steady state, let the next tick re-evaluate.
+                Some(CompactionOutcome::Tombstoned) => None,
+            }
+        }
+    }
+}
+
 /// Run retention-before-compaction over *every* sealed bucket of one
 /// `(tenant, signal, shard)`, via [`maintain_bucket`]. Unlike
 /// [`scan_and_compact`], this does NOT use the advisory compaction cursor: the
@@ -164,9 +367,64 @@ pub async fn scan_and_maintain(
     signal: Signal,
     shard: u32,
 ) -> Result<MaintainReport> {
+    // A cold, discarded memo skips nothing (it is empty for the whole call), so
+    // this is byte-for-byte the pre-memo full-scan-every-tick behavior. A driver
+    // that wants the steady-state skip persists one MaintainMemo per worker
+    // across ticks and calls scan_and_maintain_with_memo instead.
+    let mut memo = MaintainMemo::new(0);
+    scan_and_maintain_with_memo(
+        &mut memo,
+        store,
+        clock,
+        config,
+        retention,
+        lease,
+        tenant_hash,
+        signal,
+        shard,
+    )
+    .await
+}
+
+/// [`scan_and_maintain`] with a caller-owned [`MaintainMemo`] persisted across
+/// ticks (issue #280). Buckets the memo already knows terminal
+/// (compacted-and-not-expired, below-threshold, or swept empty) are skipped
+/// without any per-bucket LIST or GET, until the memo's periodic re-verify
+/// interval forces a fresh evaluation. On the first tick after a worker start
+/// the memo is empty, so this does exactly one full rescan identical to
+/// [`scan_and_maintain`].
+///
+/// The memo is advisory and never correctness-bearing (see [`MaintainMemo`]):
+/// the eventually-consistent full re-verify still re-evaluates every retained
+/// bucket, so no retention or compaction action is ever missed, only deferred
+/// by at most the re-verify interval.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_and_maintain_with_memo(
+    memo: &mut MaintainMemo,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    retention: &RetentionConfig,
+    lease: &dyn LeaseCheck,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<MaintainReport> {
+    let now = clock.now_ns();
     let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
+    let present: HashSet<u32> = hours.iter().copied().collect();
+
     let mut report = MaintainReport::default();
     for hour in hours {
+        let key: BucketKey = (tenant_hash, signal, shard, hour);
+
+        // Steady state: the memo already proved this bucket terminal and the
+        // entry is still fresh, so skip it without listing or reading anything.
+        if memo.is_fresh_terminal(&key, now) {
+            report.skipped_terminal += 1;
+            continue;
+        }
+
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
         let (retention_outcome, compaction) =
             maintain_bucket(store, clock, config, retention, lease, &bucket).await?;
@@ -192,7 +450,19 @@ pub async fn scan_and_maintain(
                 None => {}
             },
         }
+
+        // Update the memo from this fresh, authoritative evaluation: remember a
+        // newly terminal bucket, and forget one that transitioned away from a
+        // terminal state (e.g. a compacted bucket that just became expired).
+        match classify_terminal(&retention_outcome, &compaction) {
+            Some(state) => memo.mark_terminal(key, state, now),
+            None => memo.forget(&key),
+        }
     }
+
+    // Bound memory to buckets that still exist: a swept-empty bucket disappears
+    // from the shard listing entirely, and its stale memo entry can be dropped.
+    memo.retain_present(tenant_hash, signal, shard, &present);
     Ok(report)
 }
 
