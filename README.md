@@ -49,8 +49,11 @@ Ravel has these features today:
   `/api/v1/labels`, `/api/v1/label/{name}/values`, and `/api/v1/series`, with
   `/api/v1/status/buildinfo`, `/api/v1/metadata`, `/-/healthy`, and `/-/ready`
   for clients (Grafana's Prometheus datasource) that probe them.
-  Aggregation operators (`sum by (...)`, `topk`, ...) and subqueries do not work
-  yet.
+  Aggregation operators (`sum`, `avg`, `min`, `max`, `count`, `group`,
+  `stddev`, `stdvar`, `topk`, `bottomk`, `quantile`, `count_values`, with
+  `by`/`without`) and subqueries are implemented. The one remaining gap is
+  subqueries over native histograms: they return a typed error (issue #220),
+  not silent wrong data.
 - Native (exponential) histograms from end to end. Ravel ingests and stores
   them (RSEG v5), queries them, and reduces them to floats with the native-
   histogram PromQL functions: `histogram_count`, `histogram_sum`, and
@@ -73,12 +76,15 @@ Ravel has these features today:
 - Flight SQL: the same query path as `/api/v1/sql`, over Arrow Flight's gRPC
   surface, behind `ravel-server`'s `flight-sql` cargo feature (which implies
   `sql`).
+- Prometheus Remote Write ingest: `POST /api/v1/write`, both Remote Write 1.0
+  and 2.0 (version negotiated from request headers). Admission limits are at
+  parity with OTLP ingest.
+- Compatibility routes for Grafana and Prometheus tooling:
+  `/api/v1/status/buildinfo`, `/api/v1/metadata`, `/-/healthy`, and `/-/ready`.
 
 These features are planned, not built:
 
-- Remote Write 1.0/2.0, OTel logs/traces/profiles, and exemplars.
-- PromQL aggregation operators and subqueries, with a differential test
-  suite against Prometheus for every construct the evaluator supports.
+- OTel logs/traces/profiles, and exemplars.
 - Exact rollups (a second, aggregated level beyond L0/L1).
 - Catalog snapshots (an index object instead of per-query listing). These are
   necessary before listing-based discovery runs out of headroom.
@@ -172,8 +178,10 @@ resolution, so they agree on results.
 `/api/v1/query` (instant) and `/api/v1/query_range` (a grid of steps) support
 selectors, `offset`/`@`, binary operators, and most of the function library
 (`rate`, `histogram_quantile`, the `*_over_time` family, label and math
-functions). Aggregation operators (`sum by (...)`, `topk`, ...) and
-subqueries do not work yet.
+functions). Aggregation operators (`sum`, `avg`, `min`, `max`, `count`,
+`group`, `stddev`, `stdvar`, `topk`, `bottomk`, `quantile`, `count_values`,
+with `by`/`without`) and subqueries are supported. Subqueries over native
+histograms return a typed error (issue #220) rather than silent wrong data.
 
 You can query native (exponential) histograms: `histogram_count`,
 `histogram_sum`, `histogram_avg`, `histogram_quantile`, and
