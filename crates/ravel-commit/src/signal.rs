@@ -17,6 +17,8 @@ pub fn to_proto(signal: Signal) -> ravel_proto::commit::v1::Signal {
         Signal::Logs => ravel_proto::commit::v1::Signal::Logs,
         Signal::Spans => ravel_proto::commit::v1::Signal::Spans,
         Signal::Profiles => ravel_proto::commit::v1::Signal::Profiles,
+        Signal::Alerts => ravel_proto::commit::v1::Signal::Alerts,
+        Signal::Audit => ravel_proto::commit::v1::Signal::Audit,
     }
 }
 
@@ -27,6 +29,8 @@ pub fn from_proto(raw: i32) -> Result<Signal, UnknownSignal> {
         ravel_proto::commit::v1::Signal::Logs => Ok(Signal::Logs),
         ravel_proto::commit::v1::Signal::Spans => Ok(Signal::Spans),
         ravel_proto::commit::v1::Signal::Profiles => Ok(Signal::Profiles),
+        ravel_proto::commit::v1::Signal::Alerts => Ok(Signal::Alerts),
+        ravel_proto::commit::v1::Signal::Audit => Ok(Signal::Audit),
     }
 }
 
@@ -36,6 +40,8 @@ pub fn from_prefix(prefix: &str) -> Result<Signal, UnknownSignal> {
         "l" => Ok(Signal::Logs),
         "s" => Ok(Signal::Spans),
         "p" => Ok(Signal::Profiles),
+        "a" => Ok(Signal::Alerts),
+        "u" => Ok(Signal::Audit),
         _ => Err(UnknownSignal),
     }
 }
@@ -52,6 +58,8 @@ mod tests {
             Signal::Logs,
             Signal::Spans,
             Signal::Profiles,
+            Signal::Alerts,
+            Signal::Audit,
         ] {
             let proto = to_proto(signal);
             assert_eq!(from_proto(proto as i32).expect("known"), signal);

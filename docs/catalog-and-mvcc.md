@@ -43,6 +43,8 @@ their meaning are untouched.
 - `tenant_hash`: hex, 32 chars (ADR-0009). Unkeyed BLAKE3 by default; a
   deployment-keyed variant is available via config (ADR-0010 §13).
 - `m` = metrics signal. Logs `l`, spans `s`, profiles `p` reserved.
+  Alerts `a` and audit `u` (ADR-0040) share `l`'s RLOG segment format
+  verbatim - no new byte layout, only two new signal-keyspace prefixes.
 - `shard`: zero-padded 4-digit decimal. `shard_count` is immutable per
   (tenant, signal) in v1 (ADR-0010 §9); Phase 1 reads it from config and
   treats changing it as a data-loss operation (forbidden).

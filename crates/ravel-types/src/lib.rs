@@ -19,6 +19,8 @@ pub enum Signal {
     Logs,
     Spans,
     Profiles,
+    Alerts,
+    Audit,
 }
 
 impl Signal {
@@ -29,6 +31,8 @@ impl Signal {
             Signal::Logs => "l",
             Signal::Spans => "s",
             Signal::Profiles => "p",
+            Signal::Alerts => "a",
+            Signal::Audit => "u",
         }
     }
 }
