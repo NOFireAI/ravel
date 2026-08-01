@@ -70,6 +70,21 @@ pub const ATTR_EVENTS_RAW: &str = "_events_raw";
 /// [`ATTR_EVENTS_RAW`] but over `opentelemetry.proto.trace.v1.Span.Link`.
 pub const ATTR_LINKS_RAW: &str = "_links_raw";
 
+/// Every reserved `attrs` key, in one place so stripping a sender's own
+/// attribute of the same name (see [`normalize_span`]) cannot drift from the
+/// set [`reserved_attrs`] actually populates.
+const RESERVED_ATTR_KEYS: [&str; 5] = [
+    ATTR_SPAN_KIND,
+    ATTR_TRACE_STATE,
+    ATTR_SPAN_FLAGS,
+    ATTR_EVENTS_RAW,
+    ATTR_LINKS_RAW,
+];
+
+fn is_reserved_key(key: &str) -> bool {
+    RESERVED_ATTR_KEYS.contains(&key)
+}
+
 /// One admitted OTLP span, normalized to Ravel's canonical shape.
 ///
 /// Not yet a [`ravel_rspan::SpanRecord`]: that is the writer's type and is
@@ -316,7 +331,13 @@ fn normalize_span(
     };
 
     let span_attrs = convert_attrs_lossy(&span.attributes, limits, &mut dropped);
-    let merged = merge_attrs(resource_attrs, scope_attrs, &span_attrs);
+    let mut merged = merge_attrs(resource_attrs, scope_attrs, &span_attrs);
+    // A sender's own attribute under one of the reserved keys must never
+    // survive, whether or not the span's real field is present: leaving it
+    // when the real field is absent lets a sender spoof `_events_raw` etc, and
+    // RSPAN objects are immutable, so the provenance is unrecoverable once
+    // stored. Strip unconditionally before applying the real reserved values.
+    merged.retain(|(k, _)| !is_reserved_key(k));
     let reserved = reserved_attrs(span, limits, &mut dropped);
     // Reserved keys are applied as the highest-precedence set, so a sender's
     // own `_kind` cannot shadow the span's real kind.
@@ -835,6 +856,45 @@ mod tests {
         let out = normalize(request(vec![resource_spans(
             vec![],
             vec![scope_spans("lib", "1", vec![span("op", 1, 2, vec![])])],
+        )]));
+        let attrs = &out.spans[0].attrs;
+        assert_eq!(lookup(attrs, ATTR_SPAN_KIND), None);
+        assert_eq!(lookup(attrs, ATTR_TRACE_STATE), None);
+        assert_eq!(lookup(attrs, ATTR_SPAN_FLAGS), None);
+        assert_eq!(lookup(attrs, ATTR_EVENTS_RAW), None);
+        assert_eq!(lookup(attrs, ATTR_LINKS_RAW), None);
+    }
+
+    /// A sender's own attribute under a reserved key must be stripped even
+    /// when the span carries no real value for that field - not just
+    /// shadowed by a real value, which `reserved_keys_win_over_a_sender_
+    /// attribute_of_the_same_name` already covers with `kind = 3`. A span
+    /// with `kind = 0` (unspecified) sets no `_kind` of its own, so without
+    /// this a sender-supplied `_kind`/`_events_raw`/etc would land verbatim -
+    /// silently spoofing metadata a future reader trusts as real, in an
+    /// object that's immutable once written.
+    #[test]
+    fn sender_attribute_under_a_reserved_key_is_stripped_even_when_the_real_field_is_absent() {
+        let mut s = span(
+            "op",
+            1,
+            2,
+            vec![
+                string_kv(ATTR_SPAN_KIND, "spoofed-kind"),
+                string_kv(ATTR_TRACE_STATE, "spoofed-state"),
+                string_kv(ATTR_SPAN_FLAGS, "999"),
+                string_kv(ATTR_EVENTS_RAW, "deadbeef"),
+                string_kv(ATTR_LINKS_RAW, "cafebabe"),
+            ],
+        );
+        s.kind = 0; // unspecified: reserved_attrs() produces no _kind of its own
+        s.trace_state = String::new();
+        s.flags = 0;
+        s.events = vec![];
+        s.links = vec![];
+        let out = normalize(request(vec![resource_spans(
+            vec![],
+            vec![scope_spans("lib", "1", vec![s])],
         )]));
         let attrs = &out.spans[0].attrs;
         assert_eq!(lookup(attrs, ATTR_SPAN_KIND), None);

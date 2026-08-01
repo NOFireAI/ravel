@@ -43,10 +43,23 @@ use crate::span_shard::{SpanShardActor, SpanShardMsg};
 /// is the only thing provisional about it. The routing *rule* is frozen: it
 /// determines which shard's object keys a trace's spans land under, so changing
 /// it later is a format-change ADR event (ADR-0041 "Consequences").
+///
+/// Unlike [`ravel_types::shard_for`]'s `SeriesId` and [`ravel_types::
+/// shard_for_log`]'s `LogStreamId`, `trace_id` is not a derived identity: an
+/// OTel SDK assigns it directly (usually random, but not guaranteed to be -
+/// some ID generators are low-entropy in their leading bytes, and a hostile
+/// client can choose it outright). Routing on `trace_id`'s raw leading bytes
+/// the way the two siblings route on their already-hashed leading bytes would
+/// let a single low-entropy or adversarially-chosen byte pin all of a
+/// tenant's span traffic onto one shard. So this function blake3-hashes
+/// `trace_id` first and routes on the hash's leading bytes, giving it the
+/// same uniformly-distributed input the two siblings get for free from their
+/// id's own construction.
 pub fn shard_for_span(trace_id: &[u8; 16], shard_count: u32) -> u32 {
     debug_assert!(shard_count > 0);
+    let hash = blake3::hash(trace_id);
     let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&trace_id[..8]);
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
     (u64::from_le_bytes(prefix) % u64::from(shard_count.max(1))) as u32
 }
 
@@ -298,13 +311,25 @@ mod tests {
     }
 
     #[test]
-    fn shard_for_span_is_deterministic_and_ignores_the_trailing_bytes() {
-        let mut a = trace_id(42);
-        let mut b = a;
-        a[8..].copy_from_slice(&[1u8; 8]);
-        b[8..].copy_from_slice(&[2u8; 8]);
-        assert_eq!(shard_for_span(&a, 8), shard_for_span(&b, 8));
+    fn shard_for_span_is_deterministic_and_uses_every_byte() {
+        let a = trace_id(42);
         assert_eq!(shard_for_span(&a, 8), shard_for_span(&a, 8));
+
+        // The bug this routing exists to avoid: reinterpreting only the
+        // leading 8 raw bytes as the shard key ignores every byte after
+        // them, so a low-entropy or adversarially-fixed prefix pins all
+        // traffic sharing it onto one shard regardless of the rest of the
+        // id. Hashing the full 16 bytes means the trailing bytes are not
+        // ignored - changing them can and generally does change the shard.
+        let differs = (0u8..32).any(|tail| {
+            let mut b = a;
+            b[8..].copy_from_slice(&[tail; 8]);
+            shard_for_span(&b, 8) != shard_for_span(&a, 8)
+        });
+        assert!(
+            differs,
+            "trailing bytes must be able to change the shard (full-width hash), not be ignored"
+        );
     }
 
     #[test]
@@ -377,9 +402,15 @@ mod tests {
             store.clone(),
             Arc::new(SystemClock),
         );
-        // Leading values 0..4 land on shards 0..4 under the mod rule.
-        let spans: Vec<NormalizedSpan> = (0..shard_count)
-            .map(|i| norm_span(trace_id(u64::from(i)), 1, 1_000))
+        // Hashed routing does not guarantee a bijection over a handful of
+        // sequential trace ids the way the old raw-leading-bytes math
+        // happened to for small inputs, so this uses enough distinct traces
+        // that every shard is used with overwhelming probability
+        // ((3/4)^64 ~= 1e-8 chance any one shard is empty by pure luck) rather
+        // than asserting an exact one-trace-per-shard bijection.
+        let trace_count = 64u64;
+        let spans: Vec<NormalizedSpan> = (0..trace_count)
+            .map(|i| norm_span(trace_id(i), 1, 1_000))
             .collect();
         let receipt = router
             .write(
@@ -393,7 +424,12 @@ mod tests {
 
         let mut shards: Vec<u32> = receipt.tokens.iter().map(|t| t.shard).collect();
         shards.sort_unstable();
-        assert_eq!(shards, (0..shard_count).collect::<Vec<_>>());
+        shards.dedup();
+        assert_eq!(
+            shards,
+            (0..shard_count).collect::<Vec<_>>(),
+            "64 distinct traces should exercise every shard"
+        );
         router.shutdown().await;
     }
 
