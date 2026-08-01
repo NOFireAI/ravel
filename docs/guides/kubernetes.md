@@ -245,6 +245,10 @@ service and gets no probe.
 - `/readyz` (readiness): 200 after startup completes: config parsed, the store
   capability gate passed, listeners bound. 503 before that.
 
+`/-/healthy` and `/-/ready` are aliases for `/healthz` and `/readyz`, served by
+the same handlers for clients that probe Prometheus' own paths. Either
+spelling works in a probe.
+
 `/readyz` performs **no object-store call per probe**. This is deliberate. A
 store operation on every kubelet probe of every pod costs real money against
 real S3, and a transient S3 blip would eject every pod from its Service at the

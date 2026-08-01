@@ -46,7 +46,9 @@ Ravel has these features today:
   lookback), binary operators, and most of the function library (`rate`,
   `histogram_quantile`, the `*_over_time` family, label and math functions).
   These work over `/api/v1/query` and `/api/v1/query_range`, plus
-  `/api/v1/labels`, `/api/v1/label/{name}/values`, and `/api/v1/series`.
+  `/api/v1/labels`, `/api/v1/label/{name}/values`, and `/api/v1/series`, with
+  `/api/v1/status/buildinfo`, `/api/v1/metadata`, `/-/healthy`, and `/-/ready`
+  for clients (Grafana's Prometheus datasource) that probe them.
   Aggregation operators (`sum by (...)`, `topk`, ...) and subqueries do not work
   yet.
 - Native (exponential) histograms from end to end. Ravel ingests and stores
