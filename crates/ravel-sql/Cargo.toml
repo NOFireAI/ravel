@@ -114,3 +114,11 @@ bytes = { workspace = true }
 # The endpoint-level tests drive a real `Catalog`, so they publish real
 # commit records rather than hand-building `Snapshot`s.
 ravel-commit = { workspace = true }
+# Dev-only: the `alerts` table's own tests build fixtures by hand-encoding
+# RLOG attrs matching the assumed `ravel-alerting` convention, never checked
+# against that crate's actual writer. This dependency lets one test build a
+# fixture through the real `ravel_alerting::write_alert_record` path instead,
+# so a future drift between the two (a renamed attr key, a changed generation
+# type) is caught here rather than only discovered once both are wired
+# together at runtime.
+ravel-alerting = { workspace = true }
