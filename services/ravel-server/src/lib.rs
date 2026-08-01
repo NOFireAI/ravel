@@ -11,6 +11,8 @@ pub mod health;
 pub mod ingest;
 pub mod logs_ingest;
 pub mod maintain;
+#[cfg(feature = "otap")]
+pub mod otap_grpc;
 pub mod otlp_grpc;
 pub mod otlp_grpc_logs;
 pub mod otlp_http;
@@ -30,6 +32,8 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SystemClock};
 use ravel_object_store::ObjectStoreBackend;
+#[cfg(feature = "otap")]
+use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsServiceServer;
 use ravel_otlp::{IngestLimits, LogIngestLimits};
 use ravel_query::http::TenantResolver;
 use ravel_types::{Signal, TenantHash};
@@ -309,6 +313,15 @@ pub async fn start(
         .as_ref()
         .map(|state| LogsServiceServer::new(otlp_grpc_logs::GrpcLogsService::new(state.clone())));
 
+    // OTAP metrics ride the same gRPC listener and share the same
+    // `GatewayState` (tenant resolution, ingest router) as the OTLP metrics
+    // service. It is `Some` exactly when the OTLP metrics service is, so it
+    // never changes whether the listener binds.
+    #[cfg(feature = "otap")]
+    let arrow_metrics_service = otlp_grpc_state.as_ref().map(|state| {
+        ArrowMetricsServiceServer::new(otap_grpc::GrpcArrowMetricsService::new(state.clone()))
+    });
+
     // The gRPC listener carries OTLP ingest, so gateway modes always bind it.
     // With `flight-sql` on it also carries Flight SQL, which is a query
     // surface, so a query-only process binds it too.
@@ -325,6 +338,8 @@ pub async fn start(
             .add_optional_service(logs_service);
         #[cfg(feature = "flight-sql")]
         let grpc = grpc.add_optional_service(flight_service);
+        #[cfg(feature = "otap")]
+        let grpc = grpc.add_optional_service(arrow_metrics_service);
         let (tx, rx) = oneshot::channel::<()>();
         // Bound here rather than inside `serve_with_shutdown` so the reported
         // address is the one actually bound; with port 0 the configured value
