@@ -1,0 +1,23 @@
+total_size: 561
+version: 1
+signal: 3
+tenant_hash: abababababababababababababababab
+shard: 3
+writer_id: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+writer_epoch: 7
+writer_seq: 42
+min_start_ts_ns: 100
+max_end_ts_ns: 400
+record_count: 4
+block_count: 2
+min_trace_id: 01010101010101010101010101010101
+max_trace_id: 02020202020202020202020202020202
+level: 0
+input_set_hash: 
+part_index: 0
+sections:
+  kind=1 name=BLOCKS offset=0 len=365 comp=none uncompressed_len=365
+  kind=2 name=SKIP_IDX offset=365 len=47 comp=zstd uncompressed_len=93
+skip_index (2 block(s)):
+  block[0] offset=0 len=172 crc32c=78bfd55f record_count=2 trace_id_range=[01010101010101010101010101010101, 01010101010101010101010101010101] start_ts_min=100 end_ts_max=200
+  block[1] offset=172 len=193 crc32c=08ca507b record_count=2 trace_id_range=[02020202020202020202020202020202, 02020202020202020202020202020202] start_ts_min=150 end_ts_max=400

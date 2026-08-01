@@ -1,0 +1,68 @@
+// RSPAN v1 span-segment footer metadata. Persistent contract: field numbers
+// are frozen and only additive changes with new field numbers are permitted
+// (ADR-0041, docs/span-segment-format.md). Readers skip unknown fields and
+// unknown section kinds, so an object written by a newer writer still decodes.
+// Unknown fields are NOT preserved: the generated prost types have no
+// unknown-field storage, so decoding and re-encoding a message drops every
+// field this schema does not name. Any component that rewrites a footer must
+// build the new value explicitly, never by round-tripping a decoded one.
+//
+// This is a separate message from ravel.logseg.v1.LogFooter, not an extension
+// of it: a span object has no derived stream identity (trace_id is the sort and
+// lookup key) and its summary bounds are an interval (min_start_ts / max_end_ts)
+// rather than a single point range, so the two footers do not share a shape.
+syntax = "proto3";
+
+package ravel.rspan.v1;
+
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_ZSTD = 2;
+}
+
+// Section kinds; values are part of the format. See
+// docs/span-segment-format.md. Unknown kinds (any value not listed here) MUST
+// be skipped by readers.
+enum SectionKind {
+  SECTION_KIND_UNSPECIFIED = 0;
+  SECTION_KIND_BLOCKS = 1;
+  SECTION_KIND_SKIP_IDX = 2;
+}
+
+message Section {
+  uint32 kind = 1;            // SectionKind; unknown kinds skipped
+  uint64 offset = 2;          // from object start
+  uint64 len = 3;             // stored (possibly compressed) length
+  fixed32 crc32c = 4;         // over stored bytes
+  Compression comp = 5;
+  uint64 uncompressed_len = 6;
+}
+
+message SpanFooter {
+  bytes tenant_hash = 1;      // 16 bytes
+  uint32 shard = 2;
+  bytes writer_id = 3;        // 16 bytes
+  uint64 writer_epoch = 4;
+  uint64 writer_seq = 5;
+
+  // Summary (whole-object bounds and counts). The time bound is an interval:
+  // the smallest span start and the largest span end in the object.
+  sfixed64 min_start_ts_ns = 6;
+  sfixed64 max_end_ts_ns = 7;
+  uint64 record_count = 8;
+  uint64 block_count = 9;
+
+  // Whole-object trace_id bounds (16 bytes each). Records sort by
+  // (trace_id, start_ts), so these are the first and last record's trace_id.
+  bytes min_trace_id = 10;
+  bytes max_trace_id = 11;
+
+  repeated Section sections = 12;
+
+  // Compaction identity (mirrors ADR-0032's RLOG fields). An L0 flush object
+  // carries the defaults: level=0, input_set_hash empty, part_index=0. Field
+  // numbers 13-15 are frozen; never renumber or reuse 1-12.
+  uint32 level = 13;          // 0 = L0 flush object, 1 = L1 compacted part
+  bytes input_set_hash = 14;  // over the sorted input list, empty on L0
+  uint32 part_index = 15;     // part ordinal within one compaction output
+}

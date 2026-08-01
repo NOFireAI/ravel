@@ -1,0 +1,23 @@
+[package]
+name = "ravel-rspan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RSPAN v1: Ravel's columnar span segment format (ADR-0041)."
+
+[dependencies]
+thiserror = { workspace = true }
+zstd = { workspace = true }
+crc32c = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
