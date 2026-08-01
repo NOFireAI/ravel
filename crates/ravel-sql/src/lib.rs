@@ -38,6 +38,14 @@
 //! (review F18), and checking the metadata-resolved tenant against the
 //! ticket's own before redeeming it.
 
+mod alerts_provider;
+mod alerts_pushdown;
+mod alerts_scan;
+mod alerts_schema;
+mod audit_provider;
+mod audit_pushdown;
+mod audit_scan;
+mod audit_schema;
 mod avg;
 mod config;
 pub mod conformance;
@@ -59,6 +67,7 @@ mod minmax;
 mod output;
 mod provider;
 mod pushdown;
+mod rlog_attrs;
 mod scan;
 mod schema;
 mod session;
@@ -70,6 +79,17 @@ mod spans_schema;
 mod udf;
 mod validate;
 
+pub use alerts_provider::AlertsTableProvider;
+pub use alerts_pushdown::{AlertsPushdown, extract_alerts};
+pub use alerts_schema::{
+    ALERT_COL_ALERT_ID, ALERT_COL_ATTRS, ALERT_COL_GENERATION, ALERT_COL_RULE_ID, ALERT_COL_STATE,
+    ALERT_COL_TS, alerts_schema,
+};
+pub use audit_provider::AuditTableProvider;
+pub use audit_pushdown::{AuditPushdown, extract_audit};
+pub use audit_schema::{
+    AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
+};
 pub use config::{DEFAULT_MAX_QUERY_BYTES, SqlConfig};
 pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_UNAVAILABLE,
