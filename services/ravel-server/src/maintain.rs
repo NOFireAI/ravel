@@ -8,21 +8,30 @@
 //! Unlike fold (a pure query-cost optimization), this task deletes and rewrites
 //! durable objects, but it changes nothing about *what* any sweep, retention,
 //! or compaction rule decides: it is only the driver that calls
-//! [`ravel_maintain::scan_and_maintain`] (retention-before-compaction over
-//! every sealed bucket) and [`ravel_maintain::sweep_shard`] (the three GC
-//! rules) once per tick. Both are stateless and idempotent, so a missed or
-//! crashed tick is recovered on the next one. The clock is the real
-//! [`SystemClock`], matching everything else in this crate, and the only
-//! [`LeaseCheck`] that exists ([`NoLeases`]) is used.
+//! [`scan_and_maintain_with_memo`] (retention-before-compaction over every
+//! sealed bucket) and [`ravel_maintain::sweep_shard`] (the three GC rules) once
+//! per tick. Both are idempotent, so a missed or crashed tick is recovered on
+//! the next one. The clock is the real [`SystemClock`], matching everything
+//! else in this crate, and the only [`LeaseCheck`] that exists ([`NoLeases`])
+//! is used.
+//!
+//! [`run_loop`] holds one [`MaintainMemo`] across every tick until shutdown
+//! (issue #280, #330). The memo records buckets already known terminal so a
+//! steady-state tick skips re-listing and re-reading them, until a periodic
+//! full re-verify forces a fresh evaluation. It is ephemeral and never
+//! correctness-bearing: a fresh (cold) memo on the first tick after a worker
+//! start does exactly one full rescan identical to the pre-memo behavior, and a
+//! wrong or lost entry only defers work by at most the re-verify interval. The
+//! memo key is `(tenant, signal, shard, hour)`, so one memo per worker spans
+//! every `(signal, shard)` of the one tenant this loop maintains.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rand::RngExt as _;
 use ravel_ingest::{Clock as _, SystemClock};
-use ravel_maintain::{
-    Clock, CompactorConfig, NoLeases, RetentionConfig, scan_and_maintain, sweep_shard,
-};
+use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
+use ravel_maintain::{Clock, CompactorConfig, NoLeases, RetentionConfig, sweep_shard};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
@@ -159,32 +168,54 @@ async fn run_loop(
     interval: Duration,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    // One memo per worker, held across every tick until shutdown (issue #280,
+    // #330). Its key includes the tenant and signal, so this single instance
+    // safely spans every (signal, shard) this loop maintains. Cold on the first
+    // tick, so that tick is a full rescan identical to the pre-memo behavior.
+    let mut memo = MaintainMemo::with_default_interval();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(jittered(interval)) => {}
             _ = &mut shutdown => return,
         }
-        run_tick(store.as_ref(), &tenant, &compactor, &retention, shard_count).await;
+        run_tick(
+            store.as_ref(),
+            &tenant,
+            &compactor,
+            &retention,
+            shard_count,
+            &mut memo,
+        )
+        .await;
     }
 }
 
 /// One maintenance pass over every `(signal, shard)` of one tenant: retention
-/// before compaction (via [`scan_and_maintain`]) then the GC sweeper (via
-/// [`sweep_shard`]). Every error is logged and retried next tick; nothing here
-/// affects query correctness. Split out from [`run_loop`] so a test can drive a
-/// single deterministic tick without the timer.
+/// before compaction (via [`scan_and_maintain_with_memo`]) then the GC sweeper
+/// (via [`sweep_shard`]). Every error is logged and retried next tick; nothing
+/// here affects query correctness. Split out from [`run_loop`] so a test can
+/// drive a single deterministic tick without the timer.
+///
+/// `memo` is the caller's per-worker [`MaintainMemo`], threaded through every
+/// `(signal, shard)` and mutated in place: buckets it already knows terminal
+/// are skipped without a per-bucket LIST or GET (issue #280, #330). The
+/// returned [`MaintainReport`] sums the per-`(signal, shard)` reports of the
+/// retention-and-compaction passes (the sweep pass is logged, not summed);
+/// `skipped_terminal` is the count of buckets the memo let this tick skip.
 pub async fn run_tick(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     compactor: &CompactorConfig,
     retention: &RetentionConfig,
     shard_count: u32,
-) {
+    memo: &mut MaintainMemo,
+) -> MaintainReport {
     let clock = WallClock;
+    let mut total = MaintainReport::default();
     for signal in MAINTAINED_SIGNALS {
         for shard in 0..shard_count {
-            match scan_and_maintain(
-                store, &clock, compactor, retention, &NoLeases, *tenant, signal, shard,
+            match scan_and_maintain_with_memo(
+                memo, store, &clock, compactor, retention, &NoLeases, *tenant, signal, shard,
             )
             .await
             {
@@ -197,8 +228,14 @@ pub async fn run_tick(
                         compacted = report.compacted,
                         already_done = report.already_done,
                         not_sealed = report.not_sealed,
+                        skipped_terminal = report.skipped_terminal,
                         "maintenance: retention + compaction pass complete"
                     );
+                    total.retired += report.retired;
+                    total.compacted += report.compacted;
+                    total.already_done += report.already_done;
+                    total.not_sealed += report.not_sealed;
+                    total.skipped_terminal += report.skipped_terminal;
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -236,6 +273,7 @@ pub async fn run_tick(
             }
         }
     }
+    total
 }
 
 /// Up to 10% jitter over `base`, so co-started replicas' maintenance ticks do
@@ -253,8 +291,14 @@ fn jittered(base: Duration) -> Duration {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_types::TenantId;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
 
     /// The retention floor is validated against the catalog's max_ingest_lag,
     /// which must equal ravel-maintain's own DEFAULT_MAX_INGEST_LAG_NS: the two
@@ -283,6 +327,127 @@ mod tests {
         let tenant = TenantId::new("acme").hash();
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
-        run_tick(&store, &tenant, &compactor, &retention, 4).await;
+        let mut memo = MaintainMemo::with_default_interval();
+        let report = run_tick(&store, &tenant, &compactor, &retention, 4, &mut memo).await;
+        // Nothing to maintain, nothing memoized: a subsequent tick would still
+        // find nothing to skip.
+        assert_eq!(report, MaintainReport::default());
+        assert!(memo.is_empty());
+    }
+
+    /// Publish one real sealed segment plus its commit record into a past ingest
+    /// hour of `(tenant, Metrics, shard 0)`. One input is below the default
+    /// `min_compaction_inputs`, and with no retention policy the bucket stays
+    /// live, so maintenance classifies it terminal (below-threshold): exactly
+    /// the steady state the memo is meant to skip. The ingest hour is 0 (1970)
+    /// so the real [`WallClock`] `run_tick` uses always sees it as sealed.
+    async fn publish_terminal_bucket(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+        let tenant_hash = tenant.hash();
+        let metric = "up";
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, metric, &label_set).expect("series id"),
+            labels: label_set,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(7_000);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// A second `run_tick` with the same memo (a second tick) skips the buckets
+    /// the first tick proved terminal: `skipped_terminal` rises from 0 to the
+    /// bucket count, and the second tick issues strictly fewer GETs because the
+    /// skipped bucket's per-bucket LIST/GET reads are elided (issue #280, #330).
+    #[tokio::test]
+    async fn second_tick_with_shared_memo_skips_terminal_buckets() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Per-bucket object reads: the memo elides the per-bucket LIST and GET
+        // reads, so this is what shrinks between the cold and warm ticks. The
+        // shard-level `list_delimited` runs on every tick and is excluded.
+        let per_bucket_reads = |s: &StoreMetricsSnapshot| -> u64 { s.list.calls + s.get.calls };
+
+        // Tick 1 (cold memo): full evaluation, nothing skipped. The single-input
+        // bucket is below the compaction threshold, so it is already-done and
+        // gets memoized as terminal.
+        let before_first = store.metrics().snapshot();
+        let first = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        let first_reads =
+            per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_first);
+        assert_eq!(first.skipped_terminal, 0, "cold memo skips nothing");
+        assert_eq!(first.already_done, 1, "the below-threshold bucket is done");
+        assert_eq!(memo.len(), 1, "the terminal bucket is memoized");
+        assert!(first_reads > 0, "cold tick did per-bucket reads");
+
+        // Tick 2 (warm memo): the bucket is skipped straight from the memo.
+        let before_second = store.metrics().snapshot();
+        let second = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        let second_reads =
+            per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_second);
+        assert_eq!(second.skipped_terminal, 1, "warm memo skips the bucket");
+        assert_eq!(second.already_done, 0, "no per-bucket work redone");
+        assert!(
+            second_reads < first_reads,
+            "the skipped tick reads fewer objects (first={first_reads}, second={second_reads})"
+        );
     }
 }
