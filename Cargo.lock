@@ -4402,6 +4402,7 @@ dependencies = [
  "ravel-logseg",
  "ravel-object-store",
  "ravel-proto",
+ "ravel-rspan",
  "ravel-segment",
  "ravel-types",
  "thiserror",

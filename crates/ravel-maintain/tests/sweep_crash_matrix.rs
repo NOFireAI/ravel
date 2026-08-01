@@ -6,11 +6,12 @@
 //! conventions.
 //!
 //! The sweeper is signal-generic, so the shared suite runs once over an RSEG
-//! (metrics) fixture and once over an RLOG (logs) fixture via [`Sig`] and one
-//! seeding helper called twice, never two copies of every test (plan §3.7,
-//! issue text). L1 "still intact" is asserted signal-generically by HEADing
-//! the compaction record's parts, not by decoding samples, so one assertion
-//! serves both formats.
+//! (metrics) fixture, once over an RLOG (logs) fixture, and once over an RSPAN
+//! (spans) fixture via [`Sig`] and one seeding helper called three times,
+//! never three copies of every test (plan §3.7, issue text; ADR-0041 phase 4
+//! confirms the sweeper needs no spans-specific code). L1 "still intact" is
+//! asserted signal-generically by HEADing the compaction record's parts, not by
+//! decoding samples, so one assertion serves every format.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -35,6 +36,7 @@ use uuid::Uuid;
 enum Sig {
     Metrics,
     Logs,
+    Spans,
 }
 
 fn cfg() -> CompactorConfig {
@@ -72,6 +74,7 @@ async fn seed_two(store: &dyn ObjectStoreBackend, sig: Sig) -> Bucket {
             bucket()
         }
         Sig::Logs => seed_rlog_two_inputs(store).await,
+        Sig::Spans => seed_rspan_two_inputs(store).await,
     }
 }
 
@@ -217,6 +220,7 @@ async fn row7_partial_input_records_deleted_reswept_converges() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- Row 8: records deleted, data objects not (orphan GC converges) ---------
@@ -285,6 +289,7 @@ async fn row8_records_deleted_data_not_orphan_gc_converges() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- Row 9: pinned query outlives horizon, input deleted under it ----------
@@ -351,6 +356,7 @@ async fn row9_pinned_query_races_sweep_then_reresolves_against_l1() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- Row 12: token GET NotFound post-sweep, served via L1 -------------------
@@ -412,6 +418,7 @@ async fn row12_token_get_notfound_post_sweep_found_in_input_list() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- Convergence: crash mid-sweep, re-run to fully converged ---------------
@@ -471,6 +478,7 @@ async fn convergence_crash_mid_sweep_then_reruns_clean() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- Horizon boundary: no delete fires before its horizon ------------------
@@ -538,6 +546,7 @@ async fn no_delete_before_horizon_boundary_stepped() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- Unreferenced-part cleanup + its age gate ------------------------------
@@ -601,6 +610,7 @@ async fn unreferenced_part_swept_only_after_age_gate() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 async fn sweep_unreferenced(
@@ -821,6 +831,7 @@ async fn recovery_over_abandoned_parts_never_loses_a_named_part() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 /// The plain abandoned-then-retired bucket: once a retention tombstone is
@@ -881,6 +892,7 @@ async fn tombstoned_abandoned_parts_collected_reverify_proven() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 /// A record-less part in a tombstoned bucket younger than the age gate
@@ -910,6 +922,7 @@ async fn young_tombstoned_recordless_part_survives_age_gate() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 /// A record-less part in a bucket with NEITHER a compaction record NOR a
@@ -938,6 +951,7 @@ async fn recordless_untombstoned_part_is_never_swept() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 /// Orphan GC never touches a live input (one with a commit record), and a
@@ -1010,6 +1024,7 @@ async fn orphan_gc_respects_live_records_and_age_gate() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }
 
 // --- P8: dry-run reports the eligible set but deletes nothing ---------------
@@ -1054,4 +1069,5 @@ async fn dry_run_sweep_reports_eligible_set_but_deletes_nothing() {
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
+    run(Sig::Spans).await;
 }

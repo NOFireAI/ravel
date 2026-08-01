@@ -489,6 +489,135 @@ pub async fn seed_rlog_two_inputs(store: &dyn ObjectStoreBackend) -> Bucket {
     logs_bucket()
 }
 
+// --- RSPAN (spans) fixtures ------------------------------------------------
+//
+// The sweeper is signal-generic, so its crash-matrix suite runs once over an
+// RSEG (metrics) fixture, once over an RLOG (logs) fixture, and once over an
+// RSPAN (spans) fixture. These helpers seed real, compactable L0 `.rspan`
+// objects exactly as a span ingest shard would, so `compact_bucket` produces a
+// genuine compaction record and L1 parts for the spans bucket (mirroring
+// `rspan_codec.rs`'s own test seeding).
+
+/// The spans bucket for the shared `SHARD`/`HOUR` (Signal::Spans).
+pub fn spans_bucket() -> Bucket {
+    Bucket::new(tenant_hash(), Signal::Spans, SHARD, HOUR)
+}
+
+/// A synthetic span for trace `t`, span `s`, over `[start, end]`.
+pub fn span_record(t: u8, s: u8, start: i64, end: i64) -> ravel_rspan::SpanRecord {
+    ravel_rspan::SpanRecord {
+        trace_id: [t; 16],
+        span_id: [s; 8],
+        parent_span_id: if s == 0 { None } else { Some([s - 1; 8]) },
+        name: format!("op-{s}"),
+        start_ts_ns: start,
+        end_ts_ns: end,
+        status_code: ravel_rspan::StatusCode::Ok,
+        status_message: Some(format!("msg-{s}")),
+        attrs: vec![("svc".into(), format!("s{t}"))],
+    }
+}
+
+/// Seed one L0 `.rspan` input (data object + commit record) for the spans
+/// bucket, exactly as a span ingest shard would. Returns the commit key.
+pub async fn seed_rspan_input(
+    store: &dyn ObjectStoreBackend,
+    writer_id: Uuid,
+    epoch: u64,
+    seq: u64,
+    records: &[ravel_rspan::SpanRecord],
+) -> String {
+    use ravel_rspan::writer::ObjectIdentity;
+    use ravel_rspan::{RspanConfig, RspanWriter};
+    let th = tenant_hash();
+    let identity = ObjectIdentity {
+        tenant_hash: th.0,
+        shard: SHARD,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: epoch,
+        writer_seq: seq,
+    };
+    let mut w = RspanWriter::new(RspanConfig::default(), identity);
+    for r in records {
+        w.push(r.clone());
+    }
+    let bytes = Bytes::from(w.finish().expect("finish rspan L0"));
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+    let data_key = keys::data_key(
+        &th,
+        Signal::Spans,
+        SHARD,
+        writer_id,
+        epoch,
+        seq,
+        &content_hash,
+    )
+    .expect("data key");
+    store
+        .put(&data_key, bytes.clone(), PutOptions::default())
+        .await
+        .expect("put rspan data");
+
+    let mut min_start = i64::MAX;
+    let mut max_end = i64::MIN;
+    let mut traces = std::collections::BTreeSet::new();
+    for r in records {
+        min_start = min_start.min(r.start_ts_ns);
+        max_end = max_end.max(r.end_ts_ns);
+        traces.insert(r.trace_id);
+    }
+    let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+    let rec = record::build(NewCommitRecord {
+        tenant_hash: th,
+        signal: Signal::Spans,
+        shard: SHARD,
+        writer_id,
+        writer_epoch: epoch,
+        writer_seq: seq,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: traces.len() as u64,
+        min_event_ts_ns: min_start,
+        max_event_ts_ns: max_end,
+        min_ingest_ts_ns: created,
+        max_ingest_ts_ns: created,
+        // RSPAN trailer version 1 (ADR-0041).
+        segment_format_version: 1,
+        created_unix_ns: created,
+        ingest_hour_bucket: HOUR,
+    })
+    .expect("build spans commit record");
+    let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+    store
+        .put(&commit_key, record::encode(&rec), PutOptions::default())
+        .await
+        .expect("put spans commit record");
+    commit_key
+}
+
+/// Seed two compactable L0 `.rspan` inputs into the spans bucket, the RSPAN
+/// analogue of [`seed_rlog_two_inputs`]. Returns the spans bucket.
+pub async fn seed_rspan_two_inputs(store: &dyn ObjectStoreBackend) -> Bucket {
+    seed_rspan_input(
+        store,
+        Uuid::from_u128(1),
+        10,
+        1,
+        &[span_record(0, 0, 10, 20), span_record(1, 0, 5, 9)],
+    )
+    .await;
+    seed_rspan_input(
+        store,
+        Uuid::from_u128(2),
+        10,
+        2,
+        &[span_record(0, 1, 15, 18), span_record(2, 0, 1, 2)],
+    )
+    .await;
+    spans_bucket()
+}
+
 /// Convenience: full-object GET as `Bytes`.
 pub async fn get_full(store: &dyn ObjectStoreBackend, key: &str) -> Bytes {
     use ravel_object_store::GetRange;
