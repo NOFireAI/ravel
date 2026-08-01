@@ -15,6 +15,7 @@ prost = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }

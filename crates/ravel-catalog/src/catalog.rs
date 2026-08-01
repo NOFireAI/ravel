@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use prost::Message;
 use ravel_commit::keys::BucketEntry;
 use ravel_commit::{keys, record, signal};
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use uuid::Uuid;
@@ -20,6 +21,14 @@ use crate::error::CatalogError;
 use crate::snapshot::{SegmentLevel, SegmentRef, Snapshot};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
+/// Bound on the object-store requests one resolve keeps in flight at once
+/// (#278 item 2). A cold resolve issues one LIST per (shard, hour) plus one
+/// GET per uncached commit/compaction record and per snapshot part; these
+/// used to run strictly one await at a time. They now run concurrently up to
+/// this bound, held by [`Catalog::request_semaphore`] and acquired only
+/// around a single leaf request, so the fan-out collapses from k sequential
+/// round trips toward ceil(k / this) without ever exceeding it.
+pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 16;
 /// Delay before the single retry on an exact `min_token` GET
 /// (docs/catalog-and-mvcc.md step 4: "GET it directly ... with one retry").
 /// `MemoryStore` is strongly consistent so tests never observe this delay;
@@ -50,6 +59,10 @@ pub struct Catalog {
     /// sets plus all uncovered L0s are still included (harmless overlap);
     /// the counter surfaces the invariant breach for a human to investigate.
     compaction_input_set_conflicts: AtomicU64,
+    /// Bounds the object-store requests one resolve keeps in flight (#278
+    /// item 2). Ephemeral, process-local, correctness-free: it changes only
+    /// how many round trips overlap, never which segments a resolve returns.
+    request_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Catalog {
@@ -72,7 +85,51 @@ impl Catalog {
             postings_cache: PostingsCache::default(),
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
         })
+    }
+
+    /// One store GET bounded by the resolve-wide in-flight semaphore (#278
+    /// item 2). The permit is released the moment the GET resolves and is
+    /// never held across another guarded request, so a resolve fanning out
+    /// many records cannot wait on permits it already holds.
+    pub(crate) async fn guarded_get(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<GetOutcome, StoreError> {
+        let _permit =
+            self.request_semaphore.acquire().await.map_err(|_| {
+                StoreError::Transient("catalog request semaphore closed".to_string())
+            })?;
+        self.store.get(key, range).await
+    }
+
+    /// Prefix listing bounded by the same in-flight semaphore, draining every
+    /// page (the [`ravel_object_store::list_all`] contract) with a permit
+    /// acquired per page rather than one held across the whole listing.
+    async fn guarded_list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+        let mut out: Vec<ObjectMeta> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut page_token = None;
+        loop {
+            let page = {
+                let _permit = self.request_semaphore.acquire().await.map_err(|_| {
+                    StoreError::Transient("catalog request semaphore closed".to_string())
+                })?;
+                self.store.list(prefix, page_token).await?
+            };
+            for meta in page.objects {
+                if seen.insert(meta.key.clone()) {
+                    out.push(meta);
+                }
+            }
+            match page.next {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     pub fn config(&self) -> &CatalogConfig {
@@ -196,7 +253,14 @@ impl Catalog {
             // (docs/metric-index-plan.md 5.1 step 3). No usable snapshot,
             // or a watermark below the window's start, falls back to
             // listing the whole window, unchanged from Phase 1.
-            let window = self.resolve_snapshot_window(tenant, signal, now_ns).await?;
+            //
+            // `name_filter.is_some()` gates the postings GET (#278 item 3):
+            // the postings object is only ever consulted for an equality
+            // `__name__` filter, so a query without one never fetches or
+            // decodes it.
+            let window = self
+                .resolve_snapshot_window(tenant, signal, now_ns, name_filter.is_some())
+                .await?;
             let listing_start_hour = match &window {
                 Some(window) if window.watermark_hour >= window_start_hour => {
                     let snapshot_end_hour = window_end_hour.min(window.watermark_hour);
@@ -214,10 +278,31 @@ impl Catalog {
                 }
                 _ => window_start_hour,
             };
+            // The (shard, hour) listing pass used to issue its LISTs one
+            // await at a time; run them concurrently under the resolve-wide
+            // semaphore instead (#278 item 2). Each bucket resolves into its
+            // own map (bucket keys never collide across buckets), and the
+            // per-bucket maps are merged back in the buffered (input) order so
+            // the resulting segment set is byte-identical to the sequential
+            // pass before the final deterministic sort.
+            let mut bucket_coords = Vec::new();
             for shard in 0..self.config.shard_count {
                 for hour in listing_start_hour..=window_end_hour {
-                    self.list_hour_bucket(tenant, signal, shard, hour, &range, &mut segments)
-                        .await?;
+                    bucket_coords.push((shard, hour));
+                }
+            }
+            let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
+                stream::iter(bucket_coords)
+                    .map(|(shard, hour)| async move {
+                        self.list_hour_bucket(tenant, signal, shard, hour, range)
+                            .await
+                    })
+                    .buffered(MAX_CONCURRENT_REQUESTS)
+                    .collect()
+                    .await;
+            for bucket in bucket_maps {
+                for (key, segment_ref) in bucket? {
+                    segments.entry(key).or_insert(segment_ref);
                 }
             }
         }
@@ -277,11 +362,11 @@ impl Catalog {
         signal: Signal,
         shard: u32,
         hour: u32,
-        range: &TimeRange,
-        out: &mut HashMap<String, SegmentRef>,
-    ) -> Result<(), CatalogError> {
+        range: TimeRange,
+    ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+        let mut out: HashMap<String, SegmentRef> = HashMap::new();
         let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
-        let objects = list_all(self.store.as_ref(), &prefix).await?;
+        let objects = self.guarded_list_all(&prefix).await?;
 
         // Partition the listed keys by shape (docs/catalog-and-mvcc.md step
         // 2). An unrecognized shape is a fail-loud error, never a silent
@@ -304,16 +389,26 @@ impl Catalog {
         // cannot serve a record the retention sweep is about to remove.
         if has_tombstone {
             self.invalidate_bucket_cache(tenant, &prefix);
-            return Ok(());
+            return Ok(out);
         }
+
+        // Warm the record caches for this bucket concurrently before the
+        // sequential include logic runs (#278 item 2): the includes below
+        // then hit the cache instead of each paying a serial GET. A GET
+        // failure surfaces here, exactly as it would have from the first
+        // sequential load.
+        self.prewarm_commit_records(tenant, signal, shard, &l0_keys)
+            .await?;
+        self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys)
+            .await?;
 
         // No compaction record: Phase 1 behavior, every overlapping L0.
         if compaction_keys.is_empty() {
             for key in &l0_keys {
-                self.include_l0_if_overlaps(tenant, signal, shard, key, range, out)
+                self.include_l0_if_overlaps(tenant, signal, shard, key, &range, &mut out)
                     .await?;
             }
-            return Ok(());
+            return Ok(out);
         }
 
         // Compaction record(s) present (docs/catalog-and-mvcc.md step 3):
@@ -335,7 +430,7 @@ impl Catalog {
                     start_ns: segment_ref.min_event_ts_ns,
                     end_ns: segment_ref.max_event_ts_ns,
                 };
-                if event_range.overlaps(range) {
+                if event_range.overlaps(&range) {
                     out.entry(segment_ref.data_object_key.clone())
                         .or_insert(segment_ref);
                 }
@@ -390,11 +485,66 @@ impl Catalog {
                 start_ns: record.min_event_ts_ns,
                 end_ns: record.max_event_ts_ns,
             };
-            if event_range.overlaps(range) {
+            if event_range.overlaps(&range) {
                 let segment_ref = build_segment_ref(key, &record)?;
                 out.entry(segment_ref.data_object_key.clone())
                     .or_insert(segment_ref);
             }
+        }
+        Ok(out)
+    }
+
+    /// Concurrently load and cache every commit record in `keys` under the
+    /// resolve-wide semaphore (#278 item 2), so a later cache-first read of
+    /// each is a hit. Returns the first load error; the sequential include
+    /// logic never re-issues a GET a successful prewarm already cached.
+    async fn prewarm_commit_records(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        keys: &[String],
+    ) -> Result<(), CatalogError> {
+        // Owned key clones, not borrowed slice items: a stream closure that
+        // borrows each `&String` makes rustc infer a non-higher-ranked
+        // lifetime for the future, which then fails to unify with axum's
+        // `Handler` blanket impl at the HTTP router (the same "FnOnce is not
+        // general enough" wall the prefetch closure in `ravel-query` hit).
+        let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
+            .map(|key| async move {
+                self.load_and_validate(tenant, signal, shard, &key)
+                    .await
+                    .map(|_| ())
+            })
+            .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+            .collect()
+            .await;
+        for load in loads {
+            load?;
+        }
+        Ok(())
+    }
+
+    /// Compaction-record counterpart to
+    /// [`prewarm_commit_records`](Self::prewarm_commit_records) (#278 item 2).
+    async fn prewarm_compaction_records(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        keys: &[String],
+    ) -> Result<(), CatalogError> {
+        let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
+            .map(|key| async move {
+                self.load_and_validate_compaction(tenant, signal, shard, &key)
+                    .await
+                    .map(|_| ())
+            })
+            .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+            .collect()
+            .await;
+        for load in loads {
+            load?;
         }
         Ok(())
     }
@@ -441,7 +591,7 @@ impl Catalog {
             validate_compaction_expected_fields(&cached, tenant, signal, shard, key)?;
             return Ok(cached);
         }
-        let got = self.store.get(key, GetRange::Full).await?;
+        let got = self.guarded_get(key, GetRange::Full).await?;
         let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
             CatalogError::CompactionRecordDecode {
                 key: key.to_string(),
@@ -501,7 +651,7 @@ impl Catalog {
         let mut notfound_retries: u32 = 1;
         let mut transient_retries: u32 = 1;
         loop {
-            match self.store.get(&key, GetRange::Full).await {
+            match self.guarded_get(&key, GetRange::Full).await {
                 Ok(got) => {
                     let record = record::decode(&got.data)?;
                     validate_expected_fields(&record, tenant, signal, token.shard, &key)?;
@@ -563,7 +713,7 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         let prefix =
             keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)?;
-        let objects = list_all(self.store.as_ref(), &prefix).await?;
+        let objects = self.guarded_list_all(&prefix).await?;
         let mut compaction_keys: Vec<String> = Vec::new();
         for meta in objects {
             match keys::partition_bucket_entry(&meta.key)? {
@@ -618,7 +768,7 @@ impl Catalog {
             validate_expected_fields(&cached, tenant, signal, shard, key)?;
             return Ok(cached);
         }
-        let got = self.store.get(key, GetRange::Full).await?;
+        let got = self.guarded_get(key, GetRange::Full).await?;
         let record = record::decode(&got.data)?;
         validate_expected_fields(&record, tenant, signal, shard, key)?;
         let record = Arc::new(record);
@@ -856,7 +1006,7 @@ mod tests {
     use ravel_commit::record::NewCommitRecord;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence,
+        FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
 
@@ -1371,6 +1521,111 @@ mod tests {
         assert!(found.contains(&keys::reconstruct_data_key(&at_start_hour).expect("k1")));
         assert!(found.contains(&keys::reconstruct_data_key(&at_end_hour).expect("k2")));
         assert!(!found.contains(&keys::reconstruct_data_key(&just_outside).expect("k3")));
+    }
+
+    /// #278 item 2: the (shard, hour) listing pass and the per-bucket record
+    /// GETs now run concurrently under a semaphore. Concurrency must not drop,
+    /// duplicate, or reorder segments: the resolved set must be complete and
+    /// its total order deterministic across repeated resolves.
+    #[tokio::test]
+    async fn parallel_listing_returns_complete_deterministic_snapshot() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(3)).expect("catalog");
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        // Many segments across every shard and two in-window hours, each with
+        // a distinct created stamp so the ADR-0010 §5 total order is fully
+        // determined (no ties left to HashMap iteration order).
+        let mut published = Vec::new();
+        let mut seq = 1u64;
+        for shard in 0..3u32 {
+            for hour in [499_999u32, 500_000u32] {
+                for _ in 0..4 {
+                    let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000;
+                    let record =
+                        publish_segment(&store, shard, seq, hour, created, created, created + 500)
+                            .await;
+                    published.push(keys::reconstruct_data_key(&record).expect("key"));
+                    seq += 1;
+                }
+            }
+        }
+
+        let range = TimeRange {
+            start_ns: 499_999 * NS_PER_HOUR,
+            end_ns: now,
+        };
+        let first = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            first.segments.len(),
+            published.len(),
+            "every published segment must be listed exactly once"
+        );
+        let found: HashSet<String> = first
+            .segments
+            .iter()
+            .map(|s| s.data_object_key.clone())
+            .collect();
+        for key in &published {
+            assert!(found.contains(key), "missing segment {key}");
+        }
+
+        // A second resolve over the same concurrent pass must return the
+        // identical order, not a completion-order permutation.
+        let second = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect("resolve");
+        let order1: Vec<&str> = first
+            .segments
+            .iter()
+            .map(|s| s.data_object_key.as_str())
+            .collect();
+        let order2: Vec<&str> = second
+            .segments
+            .iter()
+            .map(|s| s.data_object_key.as_str())
+            .collect();
+        assert_eq!(
+            order1, order2,
+            "concurrent listing must yield a deterministic total order"
+        );
+    }
+
+    /// #278 item 2: a fault on a commit-record GET must still surface as an
+    /// error through the concurrent prewarm, never be swallowed into a
+    /// silently short snapshot. A permanent GET fault fires on the record read
+    /// (the absent HEAD GET degrades to listing as always), and the resolve
+    /// fails loudly.
+    #[tokio::test]
+    async fn a_commit_record_get_fault_surfaces_through_the_concurrent_prewarm() {
+        let inner = MemoryStore::new();
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        for seq in 1..=5u64 {
+            publish_segment(&inner, 0, seq, 500_000, now, now - 1_000, now).await;
+        }
+        let plan = FaultPlan::empty().with_rule(Rule::new(
+            Op::Get,
+            ScriptedFault::Permanent("record get down".into()),
+        ));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let range = TimeRange {
+            start_ns: now - NS_PER_HOUR,
+            end_ns: now,
+        };
+        let err = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect_err("a record GET fault must surface, not be swallowed");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the record GET fault must have actually fired"
+        );
     }
 
     /// a4-F02 regression: the exact-`min_token` GET must give transient

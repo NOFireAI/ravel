@@ -7,13 +7,19 @@
 //!    anything else, so a rejected statement costs no catalog LIST and
 //!    builds no plan.
 //! 2. Resolve the snapshot exactly once, through
-//!    `catalog.resolve(&tenant_hash, signal, window, min_tokens, now_ns)`,
-//!    with `now_ns` threaded in from the caller's injected clock (review F11;
-//!    no `SystemTime::now()` in library logic). `signal` is chosen from the
-//!    query's own `FROM` clause ([`SqlExecutor::target_signal`], ADR-0033):
-//!    `Signal::Logs` when the query references the `logs` table, otherwise
-//!    `Signal::Metrics`. A query referencing both tables is rejected here,
-//!    before the LIST, because v1 admits one signal per query (decision C).
+//!    `catalog.resolve_pruned(&tenant_hash, signal, window, min_tokens,
+//!    now_ns, name_filter)`, with `now_ns` threaded in from the caller's
+//!    injected clock (review F11; no `SystemTime::now()` in library logic).
+//!    `signal` is chosen from the query's own `FROM` clause
+//!    ([`SqlExecutor::target_signal`], ADR-0033): `Signal::Logs` when the
+//!    query references the `logs` table, otherwise `Signal::Metrics`. A query
+//!    referencing both tables is rejected here, before the LIST, because v1
+//!    admits one signal per query (decision C). `name_filter` is the equality
+//!    `__name__` value derived from the query's pushed-down predicates (#278
+//!    item 4, [`SqlExecutor::pushed_down_name_filter`]), so a metrics query
+//!    naming one metric prunes by postings exactly as PromQL does; a logs
+//!    query or one with no such predicate resolves unpruned, identical to the
+//!    former plain `resolve`.
 //! 3. Build the fresh single-tenant `SessionContext` around the owned
 //!    `Snapshot`, registering the one table the query targets (security
 //!    invariant 2, crate::session).
@@ -72,11 +78,13 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
+use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
-use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
+use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
 use crate::config::SqlConfig;
 use crate::error::SqlError;
@@ -84,7 +92,9 @@ use crate::logs_provider::LogsTableProvider;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
 use crate::provider::RavelTableProvider;
+use crate::pushdown::extract;
 use crate::session::{LOGS_TABLE, SAMPLES_TABLE, SessionTable, build_session};
+use crate::udf::{label_match_udf, label_udf};
 use crate::validate::{referenced_base_tables, validate};
 
 /// Which of the two v1 tables (and thus which `Signal`) a query targets.
@@ -335,15 +345,31 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         req: &SqlRequest,
     ) -> Result<Snapshot, SqlError> {
-        let signal = Self::target_signal(&req.sql)?.signal();
+        let target = Self::target_signal(&req.sql)?;
+        // Postings pruning by the equality `__name__` predicate pushed down
+        // from the query's WHERE clause (#278 item 4). Without this the SQL
+        // path called plain `Catalog::resolve`, so the measured 5.9-40.9x
+        // postings pruning was structurally unreachable from SQL even for a
+        // query whose `WHERE label(labels,'__name__') = '...'` names one
+        // metric. Only a metrics query has a `__name__` postings index; a
+        // logs query never prunes by it. Derivation is best-effort: any
+        // planning hiccup yields no filter and the resolve simply does not
+        // prune, exactly as before, and pruning itself already degrades
+        // safely when postings are absent or unusable
+        // (docs/metric-index-plan.md 5.4).
+        let name_filter = match target {
+            TargetSignal::Metrics => self.pushed_down_name_filter(tenant_hash, &req.sql).await,
+            TargetSignal::Logs => None,
+        };
         let snapshot = self
             .catalog
-            .resolve(
+            .resolve_pruned(
                 &tenant_hash,
-                signal,
+                target.signal(),
                 req.window,
                 &req.min_tokens,
                 req.now_ns,
+                name_filter.as_deref(),
             )
             .await?;
         if snapshot.segments.len() > self.config.engine.max_segments {
@@ -353,6 +379,41 @@ impl SqlExecutor {
             });
         }
         Ok(snapshot)
+    }
+
+    /// The equality `__name__` value a metrics query's pushed-down predicates
+    /// pin, or `None` if none can be soundly used for postings pruning (#278
+    /// item 4).
+    ///
+    /// This plans `sql` to a logical plan over a schema-only, empty-snapshot
+    /// `samples` table (no storage I/O, no execution) purely to recover its
+    /// WHERE predicates, then runs them through the same widen-only
+    /// [`crate::pushdown`] extractor the scan uses and keeps a lone equality
+    /// `__name__` matcher. The extractor already contributes nothing for an
+    /// `OR`, a regex, a negation, or a `__name__` matcher that is not a lone
+    /// `=`, so the returned name is always a predicate the query genuinely
+    /// requires at the top level: pruning to it drops only segments whose
+    /// rows the residual filter would drop anyway. Any planning error yields
+    /// `None` (no prune); the real plan surfaces such errors later through
+    /// [`Self::plan_pinned`].
+    async fn pushed_down_name_filter(&self, tenant_hash: TenantHash, sql: &str) -> Option<String> {
+        let ctx = SessionContext::new();
+        ctx.register_udf(label_udf());
+        ctx.register_udf(label_match_udf());
+        let provider = RavelTableProvider::new(
+            Snapshot {
+                segments: Vec::new(),
+                segments_pruned: 0,
+            },
+            tenant_hash,
+            self.fetcher.clone(),
+            self.config,
+        );
+        ctx.register_table(SAMPLES_TABLE, Arc::new(provider)).ok()?;
+        let plan = ctx.state().create_logical_plan(sql).await.ok()?;
+        let mut predicates = Vec::new();
+        collect_filter_predicates(&plan, &mut predicates);
+        equality_name_filter(&extract(&predicates).matchers)
     }
 
     /// The table (and thus the signal) a query resolves against, decided from
@@ -686,6 +747,39 @@ fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
         DataFusionError::ResourcesExhausted(msg) => Some(SqlError::ResourcesExhausted(msg.clone())),
         _ => None,
     }
+}
+
+/// Collect every `WHERE`/`HAVING` predicate in `plan` as a top-level AND
+/// conjunct for [`crate::pushdown::extract`] (#278 item 4). Recurses through
+/// the plan's inputs so a predicate under a projection or aggregate is still
+/// seen; the extractor treats each collected expression as an implicit
+/// top-level AND conjunct and splits nested `AND`s itself.
+fn collect_filter_predicates(plan: &LogicalPlan, out: &mut Vec<Expr>) {
+    if let LogicalPlan::Filter(filter) = plan {
+        out.push(filter.predicate.clone());
+    }
+    for input in plan.inputs() {
+        collect_filter_predicates(input, out);
+    }
+}
+
+/// The lone equality `__name__` value in `matchers`, or `None` if none can be
+/// soundly used to prune (#278 item 4). Mirrors the PromQL engine's
+/// `equality_name_filter`: a single `__name__ = value` matcher yields that
+/// value; a second `__name__` matcher of any kind, or a non-equality one,
+/// takes the conservative bypass so pruning never drops a segment the query
+/// could still match.
+fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<String> {
+    let mut found: Option<&str> = None;
+    for m in matchers {
+        if m.name == METRIC_NAME_LABEL {
+            match &m.op {
+                MatchOp::Eq if found.is_none() => found = Some(m.value.as_str()),
+                _ => return None,
+            }
+        }
+    }
+    found.map(str::to_string)
 }
 
 #[cfg(test)]

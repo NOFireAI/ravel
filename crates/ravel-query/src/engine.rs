@@ -434,14 +434,14 @@ impl QueryEngine {
                         // A selector's segments carry scalar and/or
                         // native-histogram series; fetch and merge both kinds
                         // (a series is one kind for its whole life, so the two
-                        // sets never overlap) and hand both to the source.
-                        let scalar_fetched = self
-                            .fetch_all_samples_soa(tenant_hash, snapshot, &plan.matchers)
+                        // sets never overlap) and hand both to the source. The
+                        // two kinds come off each segment in one open+decode
+                        // pass (#278 item 1), not two independent segment
+                        // opens.
+                        let (scalar_fetched, hist_fetched) = self
+                            .fetch_all_samples_and_histograms(tenant_hash, snapshot, &plan.matchers)
                             .await?;
                         let scalar = merge_soa_runs(scalar_fetched, max_series, max_samples)?;
-                        let hist_fetched = self
-                            .fetch_all_histograms(tenant_hash, snapshot, &plan.matchers)
-                            .await?;
                         let histograms =
                             merge_histogram_soa_runs(hist_fetched, max_series, max_samples)?;
                         Ok::<PerPlan, QueryError>((scalar, histograms))
@@ -555,73 +555,47 @@ impl QueryEngine {
         Ok(snapshot)
     }
 
-    /// Fetches every matched series' samples from each snapshot segment as
-    /// per-segment SoA runs (`fetch_soa`), one `Vec<FetchedSeriesSoa>` per
-    /// segment. The runs are handed to [`merge_soa_runs`] for the lazy
-    /// k-way merge; the per-segment `FetchStats` are not consumed on this
-    /// path (issue #25, X1).
-    async fn fetch_all_samples_soa(
+    /// Fetches every matched series from each snapshot segment in a single
+    /// open+decode pass per segment (#278 item 1), returning the scalar SoA
+    /// runs and the native-histogram runs as parallel per-segment vectors
+    /// (one entry per segment, same order). The scalar runs feed
+    /// [`merge_soa_runs`] and the histogram runs feed
+    /// [`merge_histogram_soa_runs`]; the per-segment `FetchStats` are not
+    /// consumed on this path (issue #25, X1). Replaces the former separate
+    /// `fetch_all_samples_soa` + `fetch_all_histograms` passes, which opened
+    /// and catalog-decoded every segment twice.
+    async fn fetch_all_samples_and_histograms(
         &self,
         tenant_hash: TenantHash,
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
-    ) -> Result<Vec<Vec<FetchedSeriesSoa>>, QueryError> {
+    ) -> Result<(Vec<Vec<FetchedSeriesSoa>>, Vec<Vec<FetchedHistogramSeries>>), QueryError> {
         let concurrency = self.config.fetch_concurrency.max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
-        let results: Vec<Result<Vec<FetchedSeriesSoa>, FetchError>> =
+        type PerSegment = (Vec<FetchedSeriesSoa>, Vec<FetchedHistogramSeries>);
+        let results: Vec<Result<PerSegment, FetchError>> =
             stream::iter(snapshot.segments.iter().cloned())
                 .map(|seg_ref| {
                     let fetcher = self.fetcher.clone();
                     let matchers = Arc::clone(&matchers);
                     async move {
                         fetcher
-                            .fetch_soa(tenant_hash, &seg_ref, matchers.as_slice())
+                            .fetch_soa_and_histograms(tenant_hash, &seg_ref, matchers.as_slice())
                             .await
-                            .map(|(runs, _stats)| runs)
+                            .map(|(scalar, _stats, histograms)| (scalar, histograms))
                     }
                 })
                 .buffer_unordered(concurrency)
                 .collect()
                 .await;
-        let mut out = Vec::with_capacity(results.len());
+        let mut scalar_out = Vec::with_capacity(results.len());
+        let mut histogram_out = Vec::with_capacity(results.len());
         for r in results {
-            out.push(r?);
+            let (scalar, histograms) = r?;
+            scalar_out.push(scalar);
+            histogram_out.push(histograms);
         }
-        Ok(out)
-    }
-
-    /// Histogram counterpart to [`fetch_all_samples_soa`](Self::fetch_all_samples_soa)
-    /// (#218): fetches every matched native-histogram series from each snapshot
-    /// segment as per-segment SoA runs (`fetch_histograms`), one
-    /// `Vec<FetchedHistogramSeries>` per segment, for
-    /// [`merge_histogram_soa_runs`].
-    async fn fetch_all_histograms(
-        &self,
-        tenant_hash: TenantHash,
-        snapshot: &Snapshot,
-        matchers: &[LabelMatcher],
-    ) -> Result<Vec<Vec<FetchedHistogramSeries>>, QueryError> {
-        let concurrency = self.config.fetch_concurrency.max(1);
-        let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
-        let results: Vec<Result<Vec<FetchedHistogramSeries>, FetchError>> =
-            stream::iter(snapshot.segments.iter().cloned())
-                .map(|seg_ref| {
-                    let fetcher = self.fetcher.clone();
-                    let matchers = Arc::clone(&matchers);
-                    async move {
-                        fetcher
-                            .fetch_histograms(tenant_hash, &seg_ref, matchers.as_slice())
-                            .await
-                    }
-                })
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
-        let mut out = Vec::with_capacity(results.len());
-        for r in results {
-            out.push(r?);
-        }
-        Ok(out)
+        Ok((scalar_out, histogram_out))
     }
 
     async fn fetch_all_series(
