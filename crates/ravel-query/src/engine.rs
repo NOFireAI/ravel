@@ -16,13 +16,16 @@ use ravel_promql::{
     SelectorPlan, SeriesData, SeriesSource, SourceError, Span, Value, from_ast_matchers,
     has_or_group, matches_series, ms_to_ns, plan_selectors,
 };
+use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
 };
 
 use crate::config::EngineConfig;
 use crate::error::QueryError;
-use crate::fetcher::{FetchError, FetchedHistogramSeries, FetchedSeriesSoa, SegmentFetcher};
+use crate::fetcher::{
+    FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, SegmentFetcher,
+};
 
 /// Which evaluation shape a prefetch is being computed for: an instant
 /// query has one lookup instant, a range query spans a step grid whose
@@ -48,21 +51,131 @@ enum EvalWindow {
 /// entirely by listing/`min_token` lookup, both structurally unprunable
 /// (docs/metric-index-plan.md P5b, `SnapshotWindow::extract_into`). This is
 /// an exact count, never an estimate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QueryStats {
     /// Segments actually fetched (the post-pruning snapshot size).
     pub segments_fetched: u64,
     /// Snapshot-sourced segments postings pruning excluded.
     pub segments_pruned: u64,
+    /// Page-fetch counters summed across every segment this query opened
+    /// (issue #25, X1's `FetchStats`), no longer discarded at the
+    /// `fetch_all_samples_and_histograms` call site (ADR-0044). Distinct
+    /// from `accounting.decompressed_bytes`: this counts only
+    /// `ValPageKind::RawF64` pages, `accounting` counts every decoded
+    /// sample's typed-output footprint regardless of encoding.
+    pub page_stats: FetchStats,
+    /// Actual per-query store/decode counters (ADR-0044 decision 1),
+    /// recorded at the fetcher's funnels.
+    pub accounting: QueryAccountingSnapshot,
+    /// Upper-envelope cost estimate computed after snapshot resolution and
+    /// before any page fetch (ADR-0044 decision 3).
+    pub estimate: CostEstimate,
 }
 
 impl QueryStats {
-    fn from_snapshot(snapshot: &Snapshot) -> Self {
+    fn new(
+        segments_fetched: u64,
+        segments_pruned: u64,
+        page_stats: FetchStats,
+        accounting: QueryAccountingSnapshot,
+        estimate: CostEstimate,
+    ) -> Self {
         QueryStats {
-            segments_fetched: snapshot.segments.len() as u64,
-            segments_pruned: snapshot.segments_pruned,
+            segments_fetched,
+            segments_pruned,
+            page_stats,
+            accounting,
+            estimate,
         }
     }
+}
+
+impl Default for QueryStats {
+    /// `CostEstimate` has no `Default` (ADR-0044: an estimate is only ever
+    /// computed from a real resolved snapshot, never assumed), so this is
+    /// spelled out by hand rather than derived.
+    fn default() -> Self {
+        QueryStats {
+            segments_fetched: 0,
+            segments_pruned: 0,
+            page_stats: FetchStats::default(),
+            accounting: QueryAccountingSnapshot::default(),
+            estimate: CostEstimate::new(0, 0, 0, 0, 0),
+        }
+    }
+}
+
+/// Requests one segment open (`fetcher.rs::open_segment`) can cost in the
+/// worst case: the initial suffix/full GET, plus exactly one more GET if the
+/// footer chase reports `NeedRange` (a second `NeedRange` there is treated
+/// as corrupt, so this never recurses further).
+const OPEN_REQUESTS_PER_SEGMENT: u64 = 2;
+
+/// Requests the sparse catalog-probe path can cost for one segment
+/// (`fetcher.rs::decode_sparse_catalog`): up to four named sections
+/// (LABEL_DICT, SERIES_IDS, SERIES_IDX, SERIES_META_CHUNKS). `ensure_ranges`
+/// coalesces sections that are contiguous or within its `coalesce_gap`, so
+/// the real request count is usually 1; taking the un-coalesced count keeps
+/// the estimate an upper bound regardless of section layout.
+const CATALOG_REQUESTS_PER_SEGMENT: u64 = 4;
+
+/// Requests one run's page fetch can cost (`fetcher.rs::fetch_scalar_pages` /
+/// `fetch_histogram_pages`): a TS range and a VAL/HIST range, worst case two
+/// separate GETs when `ensure_ranges` cannot coalesce them.
+const PAGE_REQUESTS_PER_RUN: u64 = 2;
+
+/// Safety factor applied to a segment's `object_size` for the store-bytes
+/// estimate. `open_segment`'s `NeedRange` chase issues its second GET
+/// without first checking `regions.covers()` (fetcher.rs), so in the worst
+/// case the initial suffix GET and the chase GET overlap and both get
+/// counted -- up to roughly the object read twice. `ensure_ranges` itself
+/// dedups via `covers()`, so page fetches alone would never exceed one
+/// object's worth of bytes; a factor of 2 covers both paths together
+/// without modeling their exact overlap.
+const STORE_BYTES_SAFETY_FACTOR: u64 = 2;
+
+/// Upper bound on decompressed bytes per sample used for the pre-execution
+/// estimate. A scalar sample decodes to exactly 16 bytes (`i64` timestamp +
+/// `f64` value; `decode_run`'s accounting). A native-histogram sample has no
+/// fixed size -- `HistogramCounts::{Int,Float}` carry `Vec`s whose length is
+/// not knowable before decode -- so this constant is a documented heuristic
+/// ceiling, not a proven bound: an unusually wide histogram (many spans or
+/// buckets) can exceed it, and the estimate would then under-shoot for that
+/// query. Flagged as an open question for ADR-0044 rather than silently
+/// assumed safe.
+const BYTES_PER_SAMPLE_UPPER_BOUND: u64 = 512;
+
+/// Computes the upper-envelope [`CostEstimate`] for a resolved snapshot
+/// (ADR-0044 decision 3), before any page fetch. `fetch_multiplier` scales
+/// for query shapes that re-open every segment in the snapshot more than
+/// once: `prefetch` fans out one independent fetch per selector
+/// (`plans.len()`), so an N-selector query's actual cost is up to Nx a
+/// single per-segment pass over the snapshot; `resolve_series_inner` fetches
+/// the snapshot once, so its multiplier is 1. Without this factor the
+/// estimate would not be a genuine upper bound for multi-selector queries.
+fn estimate_cost(snapshot: &Snapshot, fetch_multiplier: u64) -> CostEstimate {
+    let segments = snapshot.segments.len() as u64;
+    let series: u64 = snapshot.segments.iter().map(|s| s.series_count).sum();
+    let mut estimated_requests =
+        segments * (OPEN_REQUESTS_PER_SEGMENT + CATALOG_REQUESTS_PER_SEGMENT);
+    let mut estimated_store_bytes: u64 = 0;
+    let mut estimated_decompressed_bytes: u64 = 0;
+    for seg in &snapshot.segments {
+        estimated_requests += seg.series_count.saturating_mul(PAGE_REQUESTS_PER_RUN);
+        estimated_store_bytes = estimated_store_bytes
+            .saturating_add(seg.object_size.saturating_mul(STORE_BYTES_SAFETY_FACTOR));
+        estimated_decompressed_bytes = estimated_decompressed_bytes.saturating_add(
+            seg.sample_count
+                .saturating_mul(BYTES_PER_SAMPLE_UPPER_BOUND),
+        );
+    }
+    CostEstimate::new(
+        estimated_requests.saturating_mul(fetch_multiplier),
+        estimated_store_bytes.saturating_mul(fetch_multiplier),
+        estimated_decompressed_bytes.saturating_mul(fetch_multiplier),
+        segments,
+        series,
+    )
 }
 
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
@@ -165,7 +278,8 @@ impl QueryEngine {
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
             .with_deadline(eval_deadline);
-        let (value, annotations) = evaluator.eval_instant_annotated(&source, query, t_ms)?;
+        let (value, annotations) = tracing::debug_span!("evaluate", eval_kind = "instant")
+            .in_scope(|| evaluator.eval_instant_annotated(&source, query, t_ms))?;
         Ok((value, annotations, stats))
     }
 
@@ -294,7 +408,9 @@ impl QueryEngine {
             .with_default_step(self.config.default_evaluation_interval)?
             .with_deadline(eval_deadline);
         let (value, annotations) =
-            evaluator.eval_range_annotated(&source, query, start_ms, end_ms, step_ms)?;
+            tracing::debug_span!("evaluate", eval_kind = "range").in_scope(|| {
+                evaluator.eval_range_annotated(&source, query, start_ms, end_ms, step_ms)
+            })?;
         Ok((value, annotations, stats))
     }
 
@@ -345,9 +461,9 @@ impl QueryEngine {
         now_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         let name_filter = equality_name_filter(matchers);
-        let attempt = |snapshot: Snapshot| async move {
+        let attempt = |snapshot: Snapshot, accounting: QueryAccounting| async move {
             let fetched = self
-                .fetch_all_series(tenant_hash, &snapshot, matchers)
+                .fetch_all_series(tenant_hash, &snapshot, matchers, &accounting)
                 .await?;
             let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();
             for segment_entries in fetched {
@@ -361,15 +477,18 @@ impl QueryEngine {
                     max: self.config.max_series,
                 });
             }
-            Ok(by_id.into_iter().collect())
+            Ok((by_id.into_iter().collect(), FetchStats::default()))
         };
 
+        // resolve_series never re-opens the snapshot's segments more than
+        // once, unlike `prefetch`'s per-selector fan-out.
         self.resolve_snapshot_with_retry(
             tenant_hash,
             window,
             min_tokens,
             now_ns,
             name_filter,
+            1,
             attempt,
         )
         .await
@@ -418,7 +537,12 @@ impl QueryEngine {
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
         let concurrency = self.config.fetch_concurrency.max(1);
-        let attempt = |snapshot: Snapshot| async move {
+        // One independent fetch per selector against the same snapshot
+        // (below): an N-selector query re-opens every snapshot segment up to
+        // N times, so the pre-fetch cost estimate must scale by this same
+        // factor to stay a genuine upper bound.
+        let fetch_multiplier = plans.len() as u64;
+        let attempt = |snapshot: Snapshot, accounting: QueryAccounting| async move {
             // Owned clones, not borrowed slice items: a closure capturing a
             // reference into `plans` through this combinator chain makes
             // rustc infer a fixed (non-higher-ranked) lifetime for the
@@ -426,10 +550,11 @@ impl QueryEngine {
             // blanket impl ("implementation of FnOnce is not general
             // enough") at the router call site in `http/mod.rs`. Cloning
             // each `SelectorPlan` into the future sidesteps that entirely.
-            type PerPlan = (Vec<SeriesData>, Vec<HistogramSeriesData>);
+            type PerPlan = (Vec<SeriesData>, Vec<HistogramSeriesData>, FetchStats);
             let results: Vec<Result<PerPlan, QueryError>> = stream::iter(plans.to_vec())
                 .map(|plan| {
                     let snapshot = &snapshot;
+                    let accounting = &accounting;
                     async move {
                         // A selector's segments carry scalar and/or
                         // native-histogram series; fetch and merge both kinds
@@ -438,13 +563,18 @@ impl QueryEngine {
                         // two kinds come off each segment in one open+decode
                         // pass (#278 item 1), not two independent segment
                         // opens.
-                        let (scalar_fetched, hist_fetched) = self
-                            .fetch_all_samples_and_histograms(tenant_hash, snapshot, &plan.matchers)
+                        let (scalar_fetched, page_stats, hist_fetched) = self
+                            .fetch_all_samples_and_histograms(
+                                tenant_hash,
+                                snapshot,
+                                &plan.matchers,
+                                accounting,
+                            )
                             .await?;
                         let scalar = merge_soa_runs(scalar_fetched, max_series, max_samples)?;
                         let histograms =
                             merge_histogram_soa_runs(hist_fetched, max_series, max_samples)?;
-                        Ok::<PerPlan, QueryError>((scalar, histograms))
+                        Ok::<PerPlan, QueryError>((scalar, histograms, page_stats))
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -453,8 +583,9 @@ impl QueryEngine {
 
             let mut combined: HashMap<LabelSet, SeriesData> = HashMap::new();
             let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
+            let mut page_stats = FetchStats::default();
             for r in results {
-                let (scalar, histograms) = r?;
+                let (scalar, histograms, per_plan_stats) = r?;
                 for series in scalar {
                     combined.entry(series.labels.clone()).or_insert(series);
                 }
@@ -463,11 +594,16 @@ impl QueryEngine {
                         .entry(series.labels.clone())
                         .or_insert(series);
                 }
+                page_stats.raw_f64_pages += per_plan_stats.raw_f64_pages;
+                page_stats.raw_f64_bytes += per_plan_stats.raw_f64_bytes;
             }
-            Ok(MergedSource {
-                series: combined.into_values().collect(),
-                histogram_series: combined_histograms.into_values().collect(),
-            })
+            Ok((
+                MergedSource {
+                    series: combined.into_values().collect(),
+                    histogram_series: combined_histograms.into_values().collect(),
+                },
+                page_stats,
+            ))
         };
 
         self.resolve_snapshot_with_retry(
@@ -476,6 +612,7 @@ impl QueryEngine {
             min_tokens,
             now_ns,
             name_filter,
+            fetch_multiplier,
             attempt,
         )
         .await
@@ -494,17 +631,26 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        fetch_multiplier: u64,
         mut attempt: F,
     ) -> Result<(T, QueryStats), QueryError>
     where
-        F: FnMut(Snapshot) -> Fut,
-        Fut: std::future::Future<Output = Result<T, QueryError>>,
+        F: FnMut(Snapshot, QueryAccounting) -> Fut,
+        Fut: std::future::Future<Output = Result<(T, FetchStats), QueryError>>,
     {
         let first = self
             .resolve_bounded(tenant_hash, window, min_tokens, now_ns, name_filter)
             .await?;
-        let first_stats = QueryStats::from_snapshot(&first);
-        match attempt(first).await {
+        let first_estimate = estimate_cost(&first, fetch_multiplier);
+        let first_segments = first.segments.len() as u64;
+        let first_pruned = first.segments_pruned;
+        // Fresh handle per attempt: a retried attempt re-resolves and
+        // re-fetches from scratch, so the discarded first attempt's
+        // in-flight counts must not bleed into the attempt that actually
+        // produced the result (ADR-0044 decision 1: "created once per
+        // query" -- here, per the query attempt that wins).
+        let first_accounting = QueryAccounting::new();
+        match attempt(first, first_accounting.clone()).await {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
                 ..
@@ -512,21 +658,48 @@ impl QueryEngine {
                 let second = self
                     .resolve_bounded(tenant_hash, window, min_tokens, now_ns, name_filter)
                     .await?;
-                let second_stats = QueryStats::from_snapshot(&second);
-                match attempt(second).await {
+                let second_estimate = estimate_cost(&second, fetch_multiplier);
+                let second_segments = second.segments.len() as u64;
+                let second_pruned = second.segments_pruned;
+                let second_accounting = QueryAccounting::new();
+                match attempt(second, second_accounting.clone()).await {
                     Err(QueryError::Fetch(FetchError::Store {
                         source: StoreError::NotFound,
                         ..
                     })) => Err(QueryError::SnapshotInvalidated),
-                    Ok(t) => Ok((t, second_stats)),
+                    Ok((t, page_stats)) => Ok((
+                        t,
+                        QueryStats::new(
+                            second_segments,
+                            second_pruned,
+                            page_stats,
+                            second_accounting.snapshot(),
+                            second_estimate,
+                        ),
+                    )),
                     Err(other) => Err(other),
                 }
             }
-            Ok(t) => Ok((t, first_stats)),
+            Ok((t, page_stats)) => Ok((
+                t,
+                QueryStats::new(
+                    first_segments,
+                    first_pruned,
+                    page_stats,
+                    first_accounting.snapshot(),
+                    first_estimate,
+                ),
+            )),
             Err(other) => Err(other),
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        name = "catalog_resolve",
+        skip_all,
+        fields(tenant_hash = %tenant_hash.to_hex()),
+    )]
     async fn resolve_bounded(
         &self,
         tenant_hash: TenantHash,
@@ -535,6 +708,14 @@ impl QueryEngine {
         now_ns: i64,
         name_filter: Option<&str>,
     ) -> Result<Snapshot, QueryError> {
+        // Seam: `Catalog::resolve_pruned`'s own store reads (catalog
+        // listing/GETs through `Catalog::guarded_get`/`guarded_list_all`)
+        // are not yet accounted -- that funnel lives in `ravel-catalog`,
+        // owned by a parallel task threading `QueryAccounting` through
+        // `Catalog::resolve` (ADR-0044 decision 2). Once that lands, this
+        // call takes a `&QueryAccounting` parameter too; until then
+        // `segments_pruned` and any catalog-side request/byte counts in
+        // this query's `QueryAccountingSnapshot` stay at 0.
         let snapshot = self
             .catalog
             .resolve_pruned(
@@ -558,10 +739,9 @@ impl QueryEngine {
     /// Fetches every matched series from each snapshot segment in a single
     /// open+decode pass per segment (#278 item 1), returning the scalar SoA
     /// runs and the native-histogram runs as parallel per-segment vectors
-    /// (one entry per segment, same order). The scalar runs feed
-    /// [`merge_soa_runs`] and the histogram runs feed
-    /// [`merge_histogram_soa_runs`]; the per-segment `FetchStats` are not
-    /// consumed on this path (issue #25, X1). Replaces the former separate
+    /// (one entry per segment, same order), plus the per-segment
+    /// `FetchStats` summed across the snapshot (issue #25, X1; no longer
+    /// discarded, ADR-0044). Replaces the former separate
     /// `fetch_all_samples_soa` + `fetch_all_histograms` passes, which opened
     /// and catalog-decoded every segment twice.
     async fn fetch_all_samples_and_histograms(
@@ -569,20 +749,37 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
-    ) -> Result<(Vec<Vec<FetchedSeriesSoa>>, Vec<Vec<FetchedHistogramSeries>>), QueryError> {
+        accounting: &QueryAccounting,
+    ) -> Result<
+        (
+            Vec<Vec<FetchedSeriesSoa>>,
+            FetchStats,
+            Vec<Vec<FetchedHistogramSeries>>,
+        ),
+        QueryError,
+    > {
         let concurrency = self.config.fetch_concurrency.max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
-        type PerSegment = (Vec<FetchedSeriesSoa>, Vec<FetchedHistogramSeries>);
+        type PerSegment = (
+            Vec<FetchedSeriesSoa>,
+            FetchStats,
+            Vec<FetchedHistogramSeries>,
+        );
         let results: Vec<Result<PerSegment, FetchError>> =
             stream::iter(snapshot.segments.iter().cloned())
                 .map(|seg_ref| {
                     let fetcher = self.fetcher.clone();
                     let matchers = Arc::clone(&matchers);
+                    let accounting = accounting.clone();
                     async move {
                         fetcher
-                            .fetch_soa_and_histograms(tenant_hash, &seg_ref, matchers.as_slice())
+                            .fetch_soa_and_histograms_accounted(
+                                tenant_hash,
+                                &seg_ref,
+                                matchers.as_slice(),
+                                &accounting,
+                            )
                             .await
-                            .map(|(scalar, _stats, histograms)| (scalar, histograms))
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -590,12 +787,15 @@ impl QueryEngine {
                 .await;
         let mut scalar_out = Vec::with_capacity(results.len());
         let mut histogram_out = Vec::with_capacity(results.len());
+        let mut page_stats = FetchStats::default();
         for r in results {
-            let (scalar, histograms) = r?;
+            let (scalar, stats, histograms) = r?;
             scalar_out.push(scalar);
             histogram_out.push(histograms);
+            page_stats.raw_f64_pages += stats.raw_f64_pages;
+            page_stats.raw_f64_bytes += stats.raw_f64_bytes;
         }
-        Ok((scalar_out, histogram_out))
+        Ok((scalar_out, page_stats, histogram_out))
     }
 
     async fn fetch_all_series(
@@ -603,6 +803,7 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         snapshot: &Snapshot,
         matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
     ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
         let concurrency = self.config.fetch_concurrency.max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
@@ -611,9 +812,15 @@ impl QueryEngine {
                 .map(|seg_ref| {
                     let fetcher = self.fetcher.clone();
                     let matchers = Arc::clone(&matchers);
+                    let accounting = accounting.clone();
                     async move {
                         fetcher
-                            .fetch_series(tenant_hash, &seg_ref, matchers.as_slice())
+                            .fetch_series_accounted(
+                                tenant_hash,
+                                &seg_ref,
+                                matchers.as_slice(),
+                                &accounting,
+                            )
                             .await
                     }
                 })
@@ -2528,5 +2735,111 @@ mod prefetch_tests {
             sel_ts - ravel_promql::DEFAULT_LOOKBACK_NS,
             "the fetch window's left extent is the shared lookback delta"
         );
+    }
+
+    /// ADR-0044: `estimate_cost`'s output must be a genuine upper envelope,
+    /// never a prediction -- the actual accounting snapshot recorded by the
+    /// same query attempt must never exceed it in any dimension. `divergence`
+    /// is actual/estimated, so a value above 1.0 would mean the estimate
+    /// under-shot.
+    fn assert_estimate_covers_actual(shape: &str, stats: &QueryStats) {
+        let divergence = stats.estimate.divergence(&stats.accounting);
+        assert!(
+            divergence.requests <= 1.0,
+            "{shape}: requests diverged {divergence:?}, estimate {:?}, actual {:?}",
+            stats.estimate,
+            stats.accounting
+        );
+        assert!(
+            divergence.store_bytes <= 1.0,
+            "{shape}: store_bytes diverged {divergence:?}, estimate {:?}, actual {:?}",
+            stats.estimate,
+            stats.accounting
+        );
+        assert!(
+            divergence.decompressed_bytes <= 1.0,
+            "{shape}: decompressed_bytes diverged {divergence:?}, estimate {:?}, actual {:?}",
+            stats.estimate,
+            stats.accounting
+        );
+    }
+
+    /// Point lookup: one segment, one selector, one series.
+    #[tokio::test]
+    async fn cost_estimate_is_upper_bound_for_point_lookup() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let ts = BASE_NS - NS_PER_MIN;
+        publish_metric(&store, tenant_hash, 1, "point_metric", ts, 1.0).await;
+
+        let eng = engine(store);
+        let plans = vec![window_plan("point_metric")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch point lookup");
+
+        assert_estimate_covers_actual("point lookup", &stats);
+    }
+
+    /// Wide scan: several selectors fanned out against one shared snapshot
+    /// (`fetch_multiplier > 1`), so the estimate's per-selector scaling must
+    /// hold, not just its per-segment terms.
+    #[tokio::test]
+    async fn cost_estimate_is_upper_bound_for_wide_multi_selector_scan() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let ts = BASE_NS - NS_PER_MIN;
+        for (i, metric) in ["wide_a", "wide_b", "wide_c", "wide_d"]
+            .into_iter()
+            .enumerate()
+        {
+            publish_metric(&store, tenant_hash, i as u64 + 1, metric, ts, i as f64).await;
+        }
+
+        let eng = engine(store);
+        let plans = vec![
+            window_plan("wide_a"),
+            window_plan("wide_b"),
+            window_plan("wide_c"),
+            window_plan("wide_d"),
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch wide scan");
+
+        assert_estimate_covers_actual("wide multi-selector scan", &stats);
+    }
+
+    /// Multi-segment: one selector whose matcher spans several independently
+    /// published segments for the same metric, so `estimate_cost`'s
+    /// per-segment sum (not just its per-selector multiplier) must cover the
+    /// real per-segment fetch cost.
+    #[tokio::test]
+    async fn cost_estimate_is_upper_bound_for_multi_segment_query() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=5u64 {
+            let ts = BASE_NS - (6 - seq as i64) * NS_PER_MIN;
+            publish_metric(&store, tenant_hash, seq, "multi_seg_metric", ts, seq as f64).await;
+        }
+
+        let eng = engine(store);
+        let plans = vec![window_plan("multi_seg_metric")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch multi-segment");
+
+        assert!(
+            stats.estimate.segments >= 5,
+            "expected the snapshot to span at least the 5 published segments, got {}",
+            stats.estimate.segments
+        );
+        assert_estimate_covers_actual("multi-segment query", &stats);
     }
 }

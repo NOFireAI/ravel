@@ -13,6 +13,7 @@ use ravel_segment::{
     decode_catalog_v5_chunked, decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix,
     plan_ranges_v4,
 };
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 
 /// Section kinds from docs/segment-format.md (not exported by
@@ -304,12 +305,27 @@ impl SegmentFetcher {
     /// never hold the returned future's permit across another
     /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
     /// already fill the pool could wait on itself.
-    async fn guarded_get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+    ///
+    /// This is the funnel every ranged GET in this file passes through
+    /// (ADR-0044 "2. Accounting is recorded at existing funnels only"): a
+    /// completed GET records one `AccountedOp::Get` request and its
+    /// transferred bytes against `accounting` before returning. Only a
+    /// successful GET is recorded, matching `QueryAccounting`'s "completed
+    /// store request" wording; a failed GET propagates its error unrecorded.
+    async fn guarded_get(
+        &self,
+        key: &str,
+        range: GetRange,
+        accounting: &QueryAccounting,
+    ) -> Result<GetOutcome, StoreError> {
         let _permit =
             self.get_semaphore.acquire().await.map_err(|_| {
                 StoreError::Transient("fetch concurrency semaphore closed".to_string())
             })?;
-        self.store.get(key, range).await
+        let got = self.store.get(key, range).await?;
+        accounting.record_s3_request(AccountedOp::Get);
+        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+        Ok(got)
     }
 
     async fn ensure_ranges(
@@ -318,12 +334,24 @@ impl SegmentFetcher {
         suffix_etag: &Etag,
         needed: &[(u64, u64)],
         regions: &mut FetchedRegions,
+        accounting: &QueryAccounting,
     ) -> Result<(), FetchError> {
+        let mut reused_bytes: u64 = 0;
         let missing: Vec<(u64, u64)> = needed
             .iter()
             .copied()
-            .filter(|(start, end)| !regions.covers(*start, *end))
+            .filter(|(start, end)| {
+                if regions.covers(*start, *end) {
+                    reused_bytes = reused_bytes.saturating_add(end - start);
+                    false
+                } else {
+                    true
+                }
+            })
             .collect();
+        if reused_bytes > 0 {
+            accounting.add_bytes_reused(reused_bytes);
+        }
         if missing.is_empty() {
             return Ok(());
         }
@@ -336,7 +364,7 @@ impl SegmentFetcher {
         let gets = join_all(coalesce_ranges(missing, self.coalesce_gap).into_iter().map(
             |(start, end)| async move {
                 let got = self
-                    .guarded_get(key, GetRange::Range(start, end))
+                    .guarded_get(key, GetRange::Range(start, end), accounting)
                     .await
                     .map_err(|source| FetchError::Store {
                         key: key.to_string(),
@@ -370,10 +398,17 @@ impl SegmentFetcher {
     /// L1 part ref has no writer identity of its own, so the footer's
     /// tenant/shard/ingest_hour/input_set_hash/part_index (and `level == 1`)
     /// are verified against the compaction record's fields the ref carries.
+    #[tracing::instrument(
+        level = "debug",
+        name = "segment_open",
+        skip_all,
+        fields(tenant_hash = %tenant_hash.to_hex(), shard = seg_ref.shard, object_size = seg_ref.object_size),
+    )]
     async fn open_segment(
         &self,
         tenant_hash: TenantHash,
         seg_ref: &SegmentRef,
+        accounting: &QueryAccounting,
     ) -> Result<(Footer, u64, Etag, FetchedRegions), FetchError> {
         let key = &seg_ref.data_object_key;
         // Size-aware first GET (#278 item 5): the commit record already
@@ -388,13 +423,13 @@ impl SegmentFetcher {
             } else {
                 GetRange::Suffix(self.suffix_len)
             };
-        let first =
-            self.guarded_get(key, first_range)
-                .await
-                .map_err(|source| FetchError::Store {
-                    key: key.to_string(),
-                    source,
-                })?;
+        let first = self
+            .guarded_get(key, first_range, accounting)
+            .await
+            .map_err(|source| FetchError::Store {
+                key: key.to_string(),
+                source,
+            })?;
         let total_size = first.total_size;
         let suffix_etag = first.etag.clone();
         let mut regions = FetchedRegions::default();
@@ -407,7 +442,7 @@ impl SegmentFetcher {
             FooterOutcome::Ready(loc) => loc.footer,
             FooterOutcome::NeedRange { offset, len } => {
                 let got = self
-                    .guarded_get(key, GetRange::Range(offset, offset + len))
+                    .guarded_get(key, GetRange::Range(offset, offset + len), accounting)
                     .await
                     .map_err(|source| FetchError::Store {
                         key: key.to_string(),
@@ -443,6 +478,7 @@ impl SegmentFetcher {
                     .map_err(|source| corrupt(key, source))?;
             }
         }
+        accounting.add_segments_opened(1);
         Ok((footer, total_size, suffix_etag, regions))
     }
 
@@ -467,6 +503,13 @@ impl SegmentFetcher {
     /// Page bytes are fetched afterwards by the caller from `regions`; the run
     /// page ranges are absolute-in-object on every path, so that step is
     /// identical regardless of which catalog path ran here.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        level = "debug",
+        name = "catalog_decode",
+        skip_all,
+        fields(matcher_count = matchers.len(), total_size),
+    )]
     async fn decode_selected(
         &self,
         key: &str,
@@ -475,6 +518,7 @@ impl SegmentFetcher {
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntryV4>, FetchError> {
         let entries = if let Some((sm_off, sm_len)) = section_range(footer, SECTION_SERIES_META) {
             let (ld_off, ld_len) = section_range(footer, SECTION_LABEL_DICT).ok_or_else(|| {
@@ -498,6 +542,7 @@ impl SegmentFetcher {
                     (sm_off, sm_off + sm_len),
                 ],
                 regions,
+                accounting,
             )
             .await?;
             let dict = regions
@@ -512,10 +557,10 @@ impl SegmentFetcher {
             decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
                 .map_err(|source| corrupt(key, source))?
         } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
-            self.decode_sparse_catalog(key, footer, suffix_etag, regions, &sparse)
+            self.decode_sparse_catalog(key, footer, suffix_etag, regions, &sparse, accounting)
                 .await?
         } else {
-            self.ensure_ranges(key, suffix_etag, &[(0, total_size)], regions)
+            self.ensure_ranges(key, suffix_etag, &[(0, total_size)], regions, accounting)
                 .await?;
             let object = regions
                 .slice(0, total_size)
@@ -523,10 +568,12 @@ impl SegmentFetcher {
             decode_catalog_v5(footer, &object, self.limits)
                 .map_err(|source| corrupt(key, source))?
         };
-        Ok(entries
+        let matched: Vec<SeriesEntryV4> = entries
             .into_iter()
             .filter(|e| matches_series(matchers, &e.entry.labels))
-            .collect())
+            .collect();
+        accounting.add_series_matched(matched.len() as u64);
+        Ok(matched)
     }
 
     /// Decides whether a sparse (SERIES_META-absent) v5 object takes the
@@ -575,6 +622,7 @@ impl SegmentFetcher {
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         ranges: &SparseCatalogRanges,
+        accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntryV4>, FetchError> {
         let needed = [
             (
@@ -594,7 +642,7 @@ impl SegmentFetcher {
                 ranges.meta_chunks.0 + ranges.meta_chunks.1,
             ),
         ];
-        self.ensure_ranges(key, suffix_etag, &needed, regions)
+        self.ensure_ranges(key, suffix_etag, &needed, regions, accounting)
             .await?;
         let dict = regions
             .slice(ranges.label_dict.0, ranges.label_dict.1)
@@ -615,6 +663,12 @@ impl SegmentFetcher {
     /// Coalesced page ranges for the scalar runs of `selected` (histogram
     /// runs carry no scalar samples and are skipped), fetched into `regions`.
     /// Returns the plan for every run of every scalar series.
+    #[tracing::instrument(
+        level = "debug",
+        name = "page_fetch",
+        skip_all,
+        fields(page_kind = "scalar", series_count = scalar.len()),
+    )]
     async fn fetch_scalar_pages(
         &self,
         key: &str,
@@ -622,6 +676,7 @@ impl SegmentFetcher {
         scalar: &[&SeriesEntryV4],
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
+        accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
         let planned = plan_ranges_v4(footer, scalar).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
@@ -633,7 +688,7 @@ impl SegmentFetcher {
                 ]
             })
             .collect();
-        self.ensure_ranges(key, suffix_etag, &page_ranges, regions)
+        self.ensure_ranges(key, suffix_etag, &page_ranges, regions, accounting)
             .await?;
         Ok(planned)
     }
@@ -644,6 +699,12 @@ impl SegmentFetcher {
     /// histogram run's `hist_range` (and leaves `val_range` a `(0, 0)`
     /// sentinel), so this fetches the TS and HIST byte ranges the histogram
     /// decode path reads.
+    #[tracing::instrument(
+        level = "debug",
+        name = "page_fetch",
+        skip_all,
+        fields(page_kind = "histogram", series_count = histogram.len()),
+    )]
     async fn fetch_histogram_pages(
         &self,
         key: &str,
@@ -651,6 +712,7 @@ impl SegmentFetcher {
         histogram: &[&SeriesEntryV4],
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
+        accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
         let planned = plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
@@ -662,7 +724,7 @@ impl SegmentFetcher {
                 ]
             })
             .collect();
-        self.ensure_ranges(key, suffix_etag, &page_ranges, regions)
+        self.ensure_ranges(key, suffix_etag, &page_ranges, regions, accounting)
             .await?;
         Ok(planned)
     }
@@ -681,6 +743,7 @@ impl SegmentFetcher {
         scratch: &mut Vec<u8>,
         timestamps: &mut Vec<i64>,
         values: &mut Vec<f64>,
+        accounting: &QueryAccounting,
     ) -> Result<ValPageKind, FetchError> {
         let ts_bytes = regions
             .slice(plan.ts_range.0, plan.ts_range.1)
@@ -688,6 +751,7 @@ impl SegmentFetcher {
         let val_bytes = regions
             .slice(plan.val_range.0, plan.val_range.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+        let before = timestamps.len();
         let kind = decode_run_pages_soa(
             series_id,
             run,
@@ -699,6 +763,12 @@ impl SegmentFetcher {
             values,
         )
         .map_err(|source| corrupt(key, source))?;
+        // Typed-output footprint (i64 ts + f64 value per sample), not the
+        // intermediate decompression buffer size: `ravel-segment` does not
+        // expose the latter without an out-of-scope change (docs/query-engine.md
+        // "Cost accounting").
+        let added = (timestamps.len() - before) as u64;
+        accounting.add_decompressed_bytes(added * 16);
         Ok(kind)
     }
 
@@ -717,6 +787,7 @@ impl SegmentFetcher {
         regions: &FetchedRegions,
         timestamps: &mut Vec<i64>,
         values: &mut Vec<HistogramValue>,
+        accounting: &QueryAccounting,
     ) -> Result<(), FetchError> {
         let ts_bytes = regions
             .slice(plan.ts_range.0, plan.ts_range.1)
@@ -727,10 +798,13 @@ impl SegmentFetcher {
         let samples =
             decode_run_histogram_pages(series_id, run, &ts_bytes, &hist_bytes, self.limits)
                 .map_err(|source| corrupt(key, source))?;
+        let mut added_bytes: u64 = 0;
         for sample in samples {
+            added_bytes = added_bytes.saturating_add(8 + histogram_value_footprint(&sample.value));
             timestamps.push(sample.ts_ns);
             values.push(sample.value);
         }
+        accounting.add_decompressed_bytes(added_bytes);
         Ok(())
     }
 
@@ -758,10 +832,11 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
         count_stats: bool,
+        accounting: &QueryAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
         let key = &seg_ref.data_object_key;
         let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref).await?;
+            self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
                 key,
@@ -770,6 +845,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
+                accounting,
             )
             .await?;
         let scalar: Vec<&SeriesEntryV4> = selected
@@ -780,9 +856,24 @@ impl SegmentFetcher {
             return Ok((Vec::new(), FetchStats::default()));
         }
         let planned = self
-            .fetch_scalar_pages(key, &footer, &scalar, &suffix_etag, &mut regions)
+            .fetch_scalar_pages(
+                key,
+                &footer,
+                &scalar,
+                &suffix_etag,
+                &mut regions,
+                accounting,
+            )
             .await?;
-        self.build_scalar_decodes(key, seg_ref, &scalar, &planned, &regions, count_stats)
+        self.build_scalar_decodes(
+            key,
+            seg_ref,
+            &scalar,
+            &planned,
+            &regions,
+            count_stats,
+            accounting,
+        )
     }
 
     /// Decodes the already-fetched scalar page bytes of `scalar` into one
@@ -791,6 +882,13 @@ impl SegmentFetcher {
     /// [`fetch_runs`](Self::fetch_runs) and the combined
     /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) share
     /// one decode body rather than drifting apart (#278 item 1).
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        level = "debug",
+        name = "decode",
+        skip_all,
+        fields(page_kind = "scalar", series_count = scalar.len()),
+    )]
     fn build_scalar_decodes(
         &self,
         key: &str,
@@ -799,6 +897,7 @@ impl SegmentFetcher {
         planned: &[ravel_segment::PlannedRunRange],
         regions: &FetchedRegions,
         count_stats: bool,
+        accounting: &QueryAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
         let mut stats = FetchStats::default();
         let mut scratch = Vec::new();
@@ -831,6 +930,7 @@ impl SegmentFetcher {
                             &mut scratch,
                             &mut timestamps,
                             &mut values,
+                            accounting,
                         )?;
                         if count_stats {
                             stats.record_val_page(kind, plan.val_range.1 as usize);
@@ -866,6 +966,7 @@ impl SegmentFetcher {
                             &mut scratch,
                             &mut timestamps,
                             &mut values,
+                            accounting,
                         )?;
                         if count_stats {
                             stats.record_val_page(kind, plan.val_range.1 as usize);
@@ -898,10 +999,11 @@ impl SegmentFetcher {
         tenant_hash: TenantHash,
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
     ) -> Result<Vec<RunHistogramDecode>, FetchError> {
         let key = &seg_ref.data_object_key;
         let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref).await?;
+            self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
                 key,
@@ -910,6 +1012,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
+                accounting,
             )
             .await?;
         let histogram: Vec<&SeriesEntryV4> = selected
@@ -920,9 +1023,16 @@ impl SegmentFetcher {
             return Ok(Vec::new());
         }
         let planned = self
-            .fetch_histogram_pages(key, &footer, &histogram, &suffix_etag, &mut regions)
+            .fetch_histogram_pages(
+                key,
+                &footer,
+                &histogram,
+                &suffix_etag,
+                &mut regions,
+                accounting,
+            )
             .await?;
-        self.build_histogram_decodes(key, seg_ref, &histogram, &planned, &regions)
+        self.build_histogram_decodes(key, seg_ref, &histogram, &planned, &regions, accounting)
     }
 
     /// Histogram counterpart to
@@ -932,6 +1042,12 @@ impl SegmentFetcher {
     /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) and the combined
     /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) (#278
     /// item 1).
+    #[tracing::instrument(
+        level = "debug",
+        name = "decode",
+        skip_all,
+        fields(page_kind = "histogram", series_count = histogram.len()),
+    )]
     fn build_histogram_decodes(
         &self,
         key: &str,
@@ -939,6 +1055,7 @@ impl SegmentFetcher {
         histogram: &[&SeriesEntryV4],
         planned: &[ravel_segment::PlannedRunRange],
         regions: &FetchedRegions,
+        accounting: &QueryAccounting,
     ) -> Result<Vec<RunHistogramDecode>, FetchError> {
         let mut out = Vec::with_capacity(histogram.len());
         for entry in histogram {
@@ -961,6 +1078,7 @@ impl SegmentFetcher {
                             regions,
                             &mut timestamps,
                             &mut values,
+                            accounting,
                         )?;
                     }
                     out.push(RunHistogramDecode {
@@ -992,6 +1110,7 @@ impl SegmentFetcher {
                             regions,
                             &mut timestamps,
                             &mut values,
+                            accounting,
                         )?;
                         out.push(RunHistogramDecode {
                             series_id: entry.entry.series_id,
@@ -1025,10 +1144,11 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
         count_stats: bool,
+        accounting: &QueryAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats, Vec<RunHistogramDecode>), FetchError> {
         let key = &seg_ref.data_object_key;
         let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref).await?;
+            self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
                 key,
@@ -1037,6 +1157,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
+                accounting,
             )
             .await?;
         let scalar: Vec<&SeriesEntryV4> = selected
@@ -1051,14 +1172,28 @@ impl SegmentFetcher {
         let scalar_planned = if scalar.is_empty() {
             Vec::new()
         } else {
-            self.fetch_scalar_pages(key, &footer, &scalar, &suffix_etag, &mut regions)
-                .await?
+            self.fetch_scalar_pages(
+                key,
+                &footer,
+                &scalar,
+                &suffix_etag,
+                &mut regions,
+                accounting,
+            )
+            .await?
         };
         let histogram_planned = if histogram.is_empty() {
             Vec::new()
         } else {
-            self.fetch_histogram_pages(key, &footer, &histogram, &suffix_etag, &mut regions)
-                .await?
+            self.fetch_histogram_pages(
+                key,
+                &footer,
+                &histogram,
+                &suffix_etag,
+                &mut regions,
+                accounting,
+            )
+            .await?
         };
 
         let (scalar_out, stats) = if scalar.is_empty() {
@@ -1071,12 +1206,20 @@ impl SegmentFetcher {
                 &scalar_planned,
                 &regions,
                 count_stats,
+                accounting,
             )?
         };
         let histogram_out = if histogram.is_empty() {
             Vec::new()
         } else {
-            self.build_histogram_decodes(key, seg_ref, &histogram, &histogram_planned, &regions)?
+            self.build_histogram_decodes(
+                key,
+                seg_ref,
+                &histogram,
+                &histogram_planned,
+                &regions,
+                accounting,
+            )?
         };
         Ok((scalar_out, stats, histogram_out))
     }
@@ -1092,9 +1235,25 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<SeriesEntry>, FetchError> {
+        self.fetch_series_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch_series`](Self::fetch_series): same
+    /// behavior, plus every store GET and matched series is recorded against
+    /// `accounting` (ADR-0044). `engine.rs` calls this; `fetch_series` stays
+    /// the unaccounted entry point so `ravel-sql`'s direct calls need no
+    /// signature change.
+    pub async fn fetch_series_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<SeriesEntry>, FetchError> {
         let key = &seg_ref.data_object_key;
         let (footer, total_size, suffix_etag, mut regions) =
-            self.open_segment(tenant_hash, seg_ref).await?;
+            self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
                 key,
@@ -1103,6 +1262,7 @@ impl SegmentFetcher {
                 &suffix_etag,
                 &mut regions,
                 matchers,
+                accounting,
             )
             .await?;
         Ok(selected.into_iter().map(|e| e.entry).collect())
@@ -1120,8 +1280,22 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<FetchedSeries>, FetchError> {
+        self.fetch_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch`](Self::fetch); see
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) for why both
+    /// forms exist.
+    pub async fn fetch_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<FetchedSeries>, FetchError> {
         let (runs, _stats) = self
-            .fetch_runs(tenant_hash, seg_ref, matchers, false)
+            .fetch_runs(tenant_hash, seg_ref, matchers, false, accounting)
             .await?;
         Ok(runs.into_iter().map(RunDecode::into_aos).collect())
     }
@@ -1138,8 +1312,22 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
     ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
+        self.fetch_soa_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch_soa`](Self::fetch_soa); see
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) for why both
+    /// forms exist.
+    pub async fn fetch_soa_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
         let (runs, stats) = self
-            .fetch_runs(tenant_hash, seg_ref, matchers, true)
+            .fetch_runs(tenant_hash, seg_ref, matchers, true, accounting)
             .await?;
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
     }
@@ -1157,8 +1345,22 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<FetchedHistogramSeries>, FetchError> {
+        self.fetch_histograms_accounted(tenant_hash, seg_ref, matchers, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch_histograms`](Self::fetch_histograms);
+    /// see [`fetch_series_accounted`](Self::fetch_series_accounted) for why
+    /// both forms exist.
+    pub async fn fetch_histograms_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<FetchedHistogramSeries>, FetchError> {
         let runs = self
-            .fetch_histogram_runs(tenant_hash, seg_ref, matchers)
+            .fetch_histogram_runs(tenant_hash, seg_ref, matchers, accounting)
             .await?;
         Ok(runs
             .into_iter()
@@ -1186,8 +1388,35 @@ impl SegmentFetcher {
         ),
         FetchError,
     > {
+        self.fetch_soa_and_histograms_accounted(
+            tenant_hash,
+            seg_ref,
+            matchers,
+            &QueryAccounting::new(),
+        )
+        .await
+    }
+
+    /// Accounted counterpart of
+    /// [`fetch_soa_and_histograms`](Self::fetch_soa_and_histograms); see
+    /// [`fetch_series_accounted`](Self::fetch_series_accounted) for why both
+    /// forms exist.
+    pub async fn fetch_soa_and_histograms_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+    ) -> Result<
+        (
+            Vec<FetchedSeriesSoa>,
+            FetchStats,
+            Vec<FetchedHistogramSeries>,
+        ),
+        FetchError,
+    > {
         let (runs, stats, hist_runs) = self
-            .fetch_runs_and_histograms(tenant_hash, seg_ref, matchers, true)
+            .fetch_runs_and_histograms(tenant_hash, seg_ref, matchers, true, accounting)
             .await?;
         Ok((
             runs.into_iter().map(RunDecode::into_soa).collect(),
@@ -1338,6 +1567,30 @@ fn corrupt(key: &str, source: ravel_segment::SegmentError) -> FetchError {
     }
 }
 
+/// Exact typed-output byte footprint of one decoded `HistogramValue`, for
+/// `decompressed_bytes` accounting (docs/query-engine.md "Cost accounting").
+/// Mirrors the struct's own field layout rather than `size_of`, since
+/// `size_of` would not count the heap bytes of its `Vec`/`Option<Vec>` fields.
+fn histogram_value_footprint(v: &HistogramValue) -> u64 {
+    let spans_bytes = |spans: &[ravel_segment::HistogramSpan]| (spans.len() as u64) * 8;
+    let counts_bytes = match &v.counts {
+        ravel_segment::HistogramCounts::Int {
+            positive, negative, ..
+        } => 16 + (positive.len() as u64) * 8 + (negative.len() as u64) * 8,
+        ravel_segment::HistogramCounts::Float {
+            positive, negative, ..
+        } => 16 + (positive.len() as u64) * 8 + (negative.len() as u64) * 8,
+    };
+    4 // scale: i32
+        + 8 // zero_threshold: f64
+        + 8 // sum: Option<f64>, upper bound on the discriminant + payload
+        + v.custom_values.as_ref().map_or(0, |c| (c.len() as u64) * 8)
+        + spans_bytes(&v.positive_spans)
+        + spans_bytes(&v.negative_spans)
+        + counts_bytes
+        + 1 // reset_hint: fieldless enum
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -1484,6 +1737,96 @@ mod tests {
         // raw-f64 bytes (6-byte header + 2 * 8-byte values).
         assert_eq!(stats.raw_f64_pages, 1);
         assert_eq!(stats.raw_f64_bytes, 6 + 2 * 8);
+    }
+
+    /// ADR-0044: `guarded_get`'s counters must match what the store itself
+    /// recorded (cross-checked against `InstrumentedStore`, the object-store
+    /// metrics oracle), and `bytes_reused` must be non-zero for a segment
+    /// with more than one page served from an already-fetched region.
+    #[tokio::test]
+    async fn guarded_get_records_requests_bytes_and_reuse() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let bytes = store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+
+        let accounting = QueryAccounting::new();
+        let (soa, _stats) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &[], &accounting)
+            .await
+            .expect("fetch_soa_accounted");
+        assert_eq!(soa.len(), 2);
+
+        let snapshot = accounting.snapshot();
+        let store_get = metrics.snapshot().get;
+
+        assert_eq!(
+            snapshot.s3_requests(AccountedOp::Get),
+            store_get.calls,
+            "guarded_get's request count must match the store's own call count"
+        );
+        assert_eq!(
+            snapshot.s3_bytes(AccountedOp::Get),
+            store_get.bytes,
+            "guarded_get's byte count must match the store's own bytes-returned count"
+        );
+        assert!(store_get.calls >= 1, "fetch must issue at least one GET");
+        assert!(
+            snapshot.bytes_reused > 0,
+            "two series sharing one small whole-object fetch must reuse bytes \
+             across pages instead of re-fetching them"
+        );
+        assert_eq!(snapshot.segments_opened, 1);
+        assert_eq!(snapshot.series_matched, 2);
+    }
+
+    /// ADR-0044: accounting must be pure observation. The accounted and
+    /// unaccounted entry points must fetch identical bytes and decode
+    /// identical samples -- including the NaN bit pattern in
+    /// "chaotic_metric" -- with counting the only added work.
+    #[tokio::test]
+    async fn fetch_soa_accounted_matches_unaccounted_fetch_bit_for_bit() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        let (mut plain, plain_stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+        let accounting = QueryAccounting::new();
+        let (mut accounted, accounted_stats) = fetcher
+            .fetch_soa_accounted(tenant_hash, &seg_ref, &[], &accounting)
+            .await
+            .expect("fetch_soa_accounted");
+
+        plain.sort_by_key(|s| s.series_id.0);
+        accounted.sort_by_key(|s| s.series_id.0);
+
+        assert_eq!(plain_stats, accounted_stats);
+        assert_eq!(plain.len(), accounted.len());
+        for (p, a) in plain.iter().zip(accounted.iter()) {
+            assert_eq!(p.series_id, a.series_id);
+            assert_eq!(p.labels, a.labels);
+            assert_eq!(p.timestamps, a.timestamps);
+            assert_eq!(p.values.len(), a.values.len());
+            for (pv, av) in p.values.iter().zip(a.values.iter()) {
+                assert_eq!(
+                    pv.to_bits(),
+                    av.to_bits(),
+                    "sample bit patterns must match exactly, NaN included"
+                );
+            }
+        }
+
+        let snapshot = accounting.snapshot();
+        assert!(
+            snapshot.segments_opened > 0,
+            "the accounted path must have actually recorded counters"
+        );
     }
 
     /// A simple int-counts native histogram varying only by `count`/`sum`, so

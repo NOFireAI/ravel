@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use ravel_promql::{FloatHistogram, Value, ms_to_ns};
+use ravel_types::accounting::AccountedOp;
 use ravel_types::{LabelSet, SeriesId};
 use serde::{Serialize, Serializer};
 
@@ -68,6 +69,8 @@ pub struct QueryStatsJson {
     pub segments_fetched: u64,
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
+    pub accounting: QueryAccountingJson,
+    pub estimate: CostEstimateJson,
 }
 
 impl From<crate::QueryStats> for QueryStatsJson {
@@ -75,6 +78,108 @@ impl From<crate::QueryStats> for QueryStatsJson {
         QueryStatsJson {
             segments_fetched: stats.segments_fetched,
             segments_pruned: stats.segments_pruned,
+            accounting: QueryAccountingJson::from_snapshot(&stats.accounting, &stats.page_stats),
+            estimate: stats.estimate.into(),
+        }
+    }
+}
+
+/// Actual per-query counters (ADR-0044 decision 1), rendered under
+/// `stats.accounting`. Field names are ravel's own; Prometheus has no
+/// standard shape for this. `raw_f64_pages`/`raw_f64_bytes` are the
+/// pre-existing per-segment `FetchStats` (issue #25, X1): a narrower count
+/// of `ValPageKind::RawF64` pages specifically, kept distinct from
+/// `decompressed_bytes` (the typed-output footprint of every decoded
+/// sample, any encoding).
+#[derive(Debug, Serialize)]
+pub struct QueryAccountingJson {
+    #[serde(rename = "s3GetRequests")]
+    pub s3_get_requests: u64,
+    #[serde(rename = "s3GetBytes")]
+    pub s3_get_bytes: u64,
+    #[serde(rename = "s3ListRequests")]
+    pub s3_list_requests: u64,
+    #[serde(rename = "s3ListBytes")]
+    pub s3_list_bytes: u64,
+    #[serde(rename = "s3HeadRequests")]
+    pub s3_head_requests: u64,
+    #[serde(rename = "s3HeadBytes")]
+    pub s3_head_bytes: u64,
+    #[serde(rename = "cacheHits")]
+    pub cache_hits: u64,
+    #[serde(rename = "cacheMisses")]
+    pub cache_misses: u64,
+    #[serde(rename = "cacheBytes")]
+    pub cache_bytes: u64,
+    #[serde(rename = "decompressedBytes")]
+    pub decompressed_bytes: u64,
+    #[serde(rename = "segmentsOpened")]
+    pub segments_opened: u64,
+    #[serde(rename = "segmentsPruned")]
+    pub segments_pruned: u64,
+    #[serde(rename = "seriesMatched")]
+    pub series_matched: u64,
+    #[serde(rename = "bytesReused")]
+    pub bytes_reused: u64,
+    #[serde(rename = "peakIntermediateBytes")]
+    pub peak_intermediate_bytes: u64,
+    #[serde(rename = "rawF64Pages")]
+    pub raw_f64_pages: u64,
+    #[serde(rename = "rawF64Bytes")]
+    pub raw_f64_bytes: u64,
+}
+
+impl QueryAccountingJson {
+    fn from_snapshot(
+        snapshot: &ravel_types::accounting::QueryAccountingSnapshot,
+        page_stats: &crate::fetcher::FetchStats,
+    ) -> Self {
+        QueryAccountingJson {
+            s3_get_requests: snapshot.s3_requests(AccountedOp::Get),
+            s3_get_bytes: snapshot.s3_bytes(AccountedOp::Get),
+            s3_list_requests: snapshot.s3_requests(AccountedOp::List),
+            s3_list_bytes: snapshot.s3_bytes(AccountedOp::List),
+            s3_head_requests: snapshot.s3_requests(AccountedOp::Head),
+            s3_head_bytes: snapshot.s3_bytes(AccountedOp::Head),
+            cache_hits: snapshot.cache_hits,
+            cache_misses: snapshot.cache_misses,
+            cache_bytes: snapshot.cache_bytes,
+            decompressed_bytes: snapshot.decompressed_bytes,
+            segments_opened: snapshot.segments_opened,
+            segments_pruned: snapshot.segments_pruned,
+            series_matched: snapshot.series_matched,
+            bytes_reused: snapshot.bytes_reused,
+            peak_intermediate_bytes: snapshot.peak_intermediate_bytes,
+            raw_f64_pages: page_stats.raw_f64_pages,
+            raw_f64_bytes: page_stats.raw_f64_bytes,
+        }
+    }
+}
+
+/// Upper-envelope cost estimate (ADR-0044 decision 3), rendered under
+/// `stats.estimate`, computed after snapshot resolution and before any page
+/// fetch. Recorded alongside `stats.accounting`'s actuals so the estimate's
+/// accuracy is a measurable quantity from outside the process.
+#[derive(Debug, Serialize)]
+pub struct CostEstimateJson {
+    #[serde(rename = "estimatedRequests")]
+    pub estimated_requests: u64,
+    #[serde(rename = "estimatedStoreBytes")]
+    pub estimated_store_bytes: u64,
+    #[serde(rename = "estimatedDecompressedBytes")]
+    pub estimated_decompressed_bytes: u64,
+    pub segments: u64,
+    pub series: u64,
+}
+
+impl From<ravel_types::accounting::CostEstimate> for CostEstimateJson {
+    fn from(estimate: ravel_types::accounting::CostEstimate) -> Self {
+        CostEstimateJson {
+            estimated_requests: estimate.estimated_requests,
+            estimated_store_bytes: estimate.estimated_store_bytes,
+            estimated_decompressed_bytes: estimate.estimated_decompressed_bytes,
+            segments: estimate.segments,
+            series: estimate.series,
         }
     }
 }

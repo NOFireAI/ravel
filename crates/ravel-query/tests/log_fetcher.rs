@@ -29,6 +29,7 @@ use ravel_object_store::{
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_query::{LogQuery, LogSegmentFetcher, StreamAttrEquals};
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
 
 /// An [`ObjectStoreBackend`] wrapper that counts `get` calls, so a test can
@@ -249,6 +250,51 @@ async fn ts_range_pre_check_skips_object_without_get() {
         counting.get_count(),
         1,
         "exactly one GET: only the relevant object was fetched"
+    );
+}
+
+/// ADR-0044: the log fetch path must be accounted like the metric path,
+/// not silently free. `fetch_accounted` with an explicit `QueryAccounting`
+/// must record the GET the store itself performed.
+#[tokio::test]
+async fn fetch_accounted_records_log_segment_get() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = two_objects(&mem).await;
+    let counting = Arc::new(CountingStore::new(mem));
+    let fetcher = LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>);
+
+    // Range overlapping only object A: object B stays pruned by ts range
+    // before any GET, and accounting must reflect exactly the one real GET.
+    let query = LogQuery::new(90, 120);
+    let accounting = QueryAccounting::new();
+
+    let out_b = fetcher
+        .fetch_accounted(&ref_b, &query, &accounting)
+        .await
+        .expect("fetch b");
+    assert!(out_b.is_none(), "object B pruned by ts range, no GET");
+
+    let out_a = fetcher
+        .fetch_accounted(&ref_a, &query, &accounting)
+        .await
+        .expect("fetch a")
+        .expect("a in range");
+    assert!(!out_a.records.is_empty());
+
+    let snapshot = accounting.snapshot();
+    assert_eq!(
+        counting.get_count(),
+        1,
+        "only object A's fetch issued a real GET"
+    );
+    assert_eq!(
+        snapshot.s3_requests(AccountedOp::Get),
+        1,
+        "accounting must record exactly the one GET the store performed"
+    );
+    assert!(
+        snapshot.s3_bytes(AccountedOp::Get) > 0,
+        "accounting must record non-zero bytes for the fetched object"
     );
 }
 

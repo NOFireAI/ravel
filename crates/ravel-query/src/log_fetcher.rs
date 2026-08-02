@@ -40,6 +40,7 @@ use ravel_logseg::{
     read_section,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::logstream::canonical_attr_bytes;
 
 /// Upper bound on STREAM_DIR entries accepted when decoding the directory out
@@ -279,6 +280,22 @@ impl LogSegmentFetcher {
         seg_ref: &SegmentRef,
         query: &LogQuery,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        self.fetch_accounted(seg_ref, query, &QueryAccounting::new())
+            .await
+    }
+
+    /// Accounted counterpart of [`fetch`](Self::fetch): identical behavior,
+    /// plus the object GET is recorded against `accounting` (ADR-0044 "2.
+    /// Accounting is recorded at existing funnels only" -- this call is the
+    /// funnel `LogSegmentFetcher` did not have before). `engine.rs` calls
+    /// this; `fetch` stays the unaccounted entry point so existing callers
+    /// need no signature change.
+    pub async fn fetch_accounted(
+        &self,
+        seg_ref: &SegmentRef,
+        query: &LogQuery,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogFetchOutput>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
@@ -292,6 +309,8 @@ impl LogSegmentFetcher {
                 key: key.to_string(),
                 source,
             })?;
+        accounting.record_s3_request(AccountedOp::Get);
+        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
         let bytes = got.data;
 
         // Resolve stream-attribute equalities against STREAM_DIR before the
