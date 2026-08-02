@@ -329,6 +329,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver,
+        mtls_listener: None,
         fold_tenants: vec![tenant.hash()],
         fold: FoldTaskConfig {
             enabled: true,
@@ -442,6 +443,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver,
+        mtls_listener: None,
         fold_tenants: vec![tenant.hash()],
         fold: FoldTaskConfig {
             enabled: true,

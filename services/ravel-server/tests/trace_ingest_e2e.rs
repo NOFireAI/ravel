@@ -103,6 +103,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver,
+        mtls_listener: None,
         fold_tenants: Vec::new(),
         fold: FoldTaskConfig {
             enabled: false,
@@ -277,6 +278,7 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 4,
+        mtls_listener: None,
         tenant_resolver: ravel_server::tenant::build_resolver(tokens, false),
         fold_tenants: Vec::new(),
         fold: FoldTaskConfig {
