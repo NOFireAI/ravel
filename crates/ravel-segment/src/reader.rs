@@ -12,7 +12,7 @@ use ravel_types::{Label, LabelSet, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION_V5, compression, page_comp, page_enc,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION_V6, compression, page_comp, page_enc,
     section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
@@ -31,8 +31,8 @@ pub struct FooterLocation {
     /// Absolute offset of the 16-byte trailer within the object.
     pub trailer_offset: u64,
     pub total_size: u64,
-    /// Trailer format version. ADR-0027 leaves 5 the only supported value;
-    /// `parse_footer` rejects any other, so this is always 5 on a
+    /// Trailer format version. ADR-0027 leaves 6 the only supported value;
+    /// `parse_footer` rejects any other, so this is always 6 on a
     /// successfully parsed object. Retained in the trailer and here so a
     /// future version bump reuses the same dispatch point.
     pub version: u16,
@@ -79,10 +79,10 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     if magic != MAGIC {
         return Err(SegmentError::BadMagic);
     }
-    // ADR-0027: v5 is the only supported version. Versions 1-4 fail closed
+    // ADR-0027: v6 is the only supported version. Versions 1-5 fail closed
     // with the same typed error as any unknown future version; a stray
-    // pre-v5 object is rejected, never half-parsed.
-    if version != VERSION_V5 {
+    // pre-v6 object is rejected, never half-parsed.
+    if version != VERSION_V6 {
         return Err(SegmentError::UnsupportedVersion(version));
     }
     if signal != SIGNAL_METRICS {
@@ -155,23 +155,25 @@ pub fn validate_sections(
     limits: ReaderLimits,
 ) -> Result<(), SegmentError> {
     match version {
-        VERSION_V5 => validate_sections_v5(footer, page_region_end, limits),
+        VERSION_V6 => validate_sections_v6(footer, page_region_end, limits),
         other => Err(SegmentError::UnsupportedVersion(other)),
     }
 }
 
-/// v5 mandatory-kind validation: LABEL_DICT and SERIES_IDS always; exactly
+/// v6 mandatory-kind validation: LABEL_DICT and SERIES_IDS always; exactly
 /// one of the whole SERIES_META (below the sparse threshold) or the
 /// SERIES_IDX + SERIES_META_CHUNKS pair (at or above it); TS_PAGES/VAL_PAGES/
-/// HIST_PAGES conditional on the series present.
-fn validate_sections_v5(
+/// HIST_PAGES conditional on the series present; EXEMPLARS (ADR-0047)
+/// optional regardless of series count -- present only when at least one
+/// sample in the object carried an exemplar.
+fn validate_sections_v6(
     footer: &Footer,
     page_region_end: u64,
     limits: ReaderLimits,
 ) -> Result<(), SegmentError> {
     // 0 LABEL_DICT, 1 SERIES_IDS, 2 SERIES_META, 3 TS_PAGES, 4 VAL_PAGES,
-    // 5 HIST_PAGES, 6 SERIES_IDX, 7 SERIES_META_CHUNKS.
-    let mut seen = [false; 8];
+    // 5 HIST_PAGES, 6 SERIES_IDX, 7 SERIES_META_CHUNKS, 8 EXEMPLARS.
+    let mut seen = [false; 9];
     for section in &footer.sections {
         let end = section
             .offset
@@ -189,6 +191,7 @@ fn validate_sections_v5(
             section_kind::HIST_PAGES => 5,
             section_kind::SERIES_IDX => 6,
             section_kind::SERIES_META_CHUNKS => 7,
+            section_kind::EXEMPLARS => 8,
             _ => continue,
         };
         if seen[idx] {

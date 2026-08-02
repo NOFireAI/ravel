@@ -59,6 +59,16 @@ pub enum WriteError {
     // which is an internal invariant violation, never valid caller input. ---
     #[error("v5 sparse-section assembly failed re-reading the v4 base: {0}")]
     SparseAssembly(String),
+
+    // --- RSEG v6 only (ADR-0047, docs/segment-format.md "RSEG v6
+    // amendment"): EXEMPLARS section encode. v1-v5 objects never produce
+    // these. ---
+    #[error("exemplar references series id not present in this write batch")]
+    ExemplarUnknownSeries,
+    #[error("more than u32::MAX exemplars in one segment")]
+    TooManyExemplars,
+    #[error("exemplar has more than u32::MAX attributes")]
+    TooManyExemplarAttrs,
 }
 
 /// Errors that can occur while parsing or decoding a segment. All violations
@@ -232,4 +242,11 @@ pub enum SegmentError {
     SparseSectionsIncomplete,
     #[error("SERIES_IDX structural validation failed: {0}")]
     BadSparseIndex(&'static str),
+
+    // --- RSEG v6 only (ADR-0047, docs/segment-format.md "RSEG v6
+    // amendment"): EXEMPLARS decode. v1-v5 objects never produce these. ---
+    #[error("EXEMPLARS record series_index {0} out of range")]
+    ExemplarSeriesIndexOutOfRange(u64),
+    #[error("EXEMPLARS records are not sorted ascending by (series_index, ts_ns)")]
+    ExemplarRecordsUnsorted,
 }
