@@ -25,11 +25,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    if cli.dev_insecure_tenant_header && !cli.listen_http.ip().is_loopback() {
-        anyhow::bail!(
-            "--dev-insecure-tenant-header refuses to enable unless --listen-http binds a loopback address"
-        );
-    }
+    // Cross-flag startup invariants (ADR-0050 section 1): the dev-header
+    // loopback rule plus every --mtls-listener misconfiguration. Every case
+    // refuses startup outright; see `Cli::validate`.
+    cli.validate()?;
 
     ravel_server::warn_dev_insecure_tenant_header(cli.dev_insecure_tenant_header);
 
@@ -169,12 +168,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // `cli.validate()` above refused startup unless --mtls-listener and
+    // --mtls-enabled are set together, and `build_auth_resolver` fills
+    // `mtls_resolver` from that same --mtls-enabled flag, so this zip is
+    // Some exactly when both were configured, and never partially.
+    let mtls_listener = cli
+        .mtls_listener
+        .zip(resolver_bundle.mtls_resolver)
+        .map(|(addr, resolver)| ravel_server::MtlsListenerConfig { addr, resolver });
+
     let config = ServerConfig {
         mode: cli.mode,
         listen_http: cli.listen_http,
         listen_grpc: cli.listen_grpc,
         shard_count: cli.shards,
         tenant_resolver: resolver_bundle.resolver,
+        mtls_listener,
         fold_tenants,
         fold: FoldTaskConfig {
             enabled: !cli.disable_fold,
