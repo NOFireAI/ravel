@@ -270,6 +270,47 @@ mod tests {
         );
     }
 
+    /// Scan resistance must hold across repeated scans, not just the first.
+    ///
+    /// ADR-0046 decision 6 exists because the compactor and the folder scan
+    /// cold data *continuously*. An earlier version sized the ghost queue from
+    /// `max_entries` rather than from resident capacity, which made the ghost
+    /// many times wider than the cache: every key of a finished scan was still
+    /// remembered when the next began, so each was re-admitted straight to
+    /// main, bypassing probation, and the second pass evicted everything the
+    /// first pass protected. That version passes the single-pass test above
+    /// and fails this one at pass 1.
+    #[test]
+    fn s3_fifo_scan_resistance_survives_repeated_scans() {
+        let entry_size = 1024u64;
+        let working_set_len = 20u64;
+        let limits = CacheLimits::new(entry_size * 100, 1000, entry_size * 10);
+        let cache: Cache<&'static str> = Cache::new(limits);
+
+        let working_set: Vec<CacheKey> = (0..working_set_len).map(test_key).collect();
+        for key in &working_set {
+            cache.insert(*key, Bytes::from(vec![0xAAu8; entry_size as usize]));
+        }
+        for key in &working_set {
+            assert!(cache.get(key).is_some());
+        }
+
+        for pass in 0..3u64 {
+            let base = 1_000 + pass * 500;
+            for i in base..base + 500 {
+                cache.insert(test_key(i), Bytes::from(vec![0xEEu8; entry_size as usize]));
+            }
+            let resident = working_set
+                .iter()
+                .filter(|key| cache.get(key).is_some())
+                .count();
+            assert!(
+                resident as f64 >= working_set_len as f64 * 0.9,
+                "working set collapsed on scan pass {pass}: only {resident}/{working_set_len} resident"
+            );
+        }
+    }
+
     #[test]
     fn bounds_respected_under_insertion_pressure_and_oversized_entry_not_admitted() {
         let limits = CacheLimits::new(10 * 1024, 5, 4096);
@@ -324,9 +365,11 @@ mod tests {
         cache.insert(a, Bytes::from_static(b"aaa"));
         assert!(cache.get(&a).is_some()); // hit 1
 
-        // max_entries == 1, and `a` was never touched again after this
-        // admission-time insert, so it is evicted (freq == 0) rather than
-        // promoted when `b` arrives.
+        // max_entries == 1, so admitting `b` must make room. The `get` above
+        // bumped `a`'s freq to 1, so `a` is promoted out of the probation
+        // queue into main and then evicted from main in the same pass; it does
+        // not survive either way. (An earlier comment here claimed `a` was
+        // evicted from probation with freq == 0, which is not what happens.)
         cache.insert(b, Bytes::from_static(b"bb"));
 
         assert!(cache.get(&a).is_none()); // miss 2 (evicted)

@@ -61,6 +61,28 @@ impl S3Fifo {
         // skewed access patterns; at least 1 byte so a tiny configured
         // cache still has a probation queue to evict from.
         let small_quota_bytes = (limits.max_bytes / 10).max(1);
+        // The ghost window must approximate the RESIDENT capacity, not
+        // `max_entries`. Whichever of the two bounds binds first decides how
+        // many entries actually fit, and the byte bound is normally the
+        // binding one, so sizing the ghost from `max_entries` alone can make
+        // it many times larger than the cache.
+        //
+        // That is not a tuning detail. A ghost window wider than the cache
+        // means every key from a completed scan is still remembered when the
+        // next scan starts, so each one is admitted straight to `main`,
+        // bypassing probation, and the second pass evicts the working set the
+        // first pass survived. Scan resistance would then hold for exactly one
+        // pass, while ADR-0046 decision 6 exists because the compactor and the
+        // folder scan cold data continuously.
+        //
+        // `max_entry_bytes` is the smallest entry size we can be sure of, so
+        // `max_bytes / max_entry_bytes` is a lower bound on resident capacity;
+        // take the tighter of that and `max_entries`.
+        let capacity_from_bytes = limits
+            .max_bytes
+            .checked_div(limits.max_entry_bytes.max(1))
+            .unwrap_or(0) as usize;
+        let ghost_capacity = capacity_from_bytes.min(limits.max_entries).max(1);
         S3Fifo {
             entries: HashMap::new(),
             small: VecDeque::new(),
@@ -70,7 +92,7 @@ impl S3Fifo {
             small_bytes: 0,
             main_bytes: 0,
             small_quota_bytes,
-            ghost_capacity: limits.max_entries.max(1),
+            ghost_capacity,
             limits,
         }
     }

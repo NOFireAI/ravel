@@ -160,7 +160,15 @@ where
 
         let result = fetch().await.map_err(SingleFlightError::Upstream);
         guard.done = true;
-        let _ = guard.tx.send(Some(result.clone()));
+        // `send_replace`, never `send`. `watch::Sender::send` returns `Err`
+        // and stores nothing when the receiver count is zero, and the leader's
+        // own receiver was dropped when it released the mutex. A leader that
+        // finishes before any follower subscribes would therefore leave the
+        // channel holding `None`; a follower that subscribes in the window
+        // between this line and `remove_if_current` sees `None`, then sees
+        // every sender drop, and reports `LeaderLost` for a fetch that
+        // succeeded. `send_replace` stores the value regardless of receivers.
+        guard.tx.send_replace(Some(result.clone()));
         self.remove_if_current(&key, id);
 
         (result, Role::Leader)
@@ -202,8 +210,72 @@ where
 {
     fn drop(&mut self) {
         if !self.done {
-            let _ = self.tx.send(Some(Err(SingleFlightError::LeaderLost)));
+            // `send_replace` for the same reason as the success path. Here a
+            // discarded value would be benign, since a follower that missed it
+            // falls through to the sender-dropped branch and reports
+            // `LeaderLost` anyway, which is the correct answer. Kept identical
+            // so the two paths cannot drift.
+            self.tx
+                .send_replace(Some(Err(SingleFlightError::LeaderLost)));
             self.flight.remove_if_current(&self.key, self.id);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod send_replace_regression {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A successful fetch must never reach a follower as `LeaderLost`.
+    ///
+    /// `watch::Sender::send` returns `Err` and stores nothing when the receiver
+    /// count is zero. The leader drops its own receiver when it releases the
+    /// mutex, so a leader that finishes before any follower subscribes used to
+    /// leave the channel holding `None`. A follower subscribing in the window
+    /// between the send and the slot removal then saw `None`, saw every sender
+    /// drop, and reported `LeaderLost` for a fetch that had succeeded. That is
+    /// a store read turned into a query error by timing alone, which
+    /// ADR-0046 decision 4 forbids.
+    ///
+    /// This test must run on a multi-thread runtime: the `#[tokio::test]`
+    /// default is current-thread, where nothing can preempt between those two
+    /// statements, so the defect is invisible there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn successful_fetch_is_never_reported_as_leader_lost() {
+        let flight: Arc<SingleFlight<u64, u64, &'static str>> = Arc::new(SingleFlight::new());
+        let spurious = Arc::new(AtomicUsize::new(0));
+
+        for round in 0..2_000u64 {
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let flight = Arc::clone(&flight);
+                let spurious = Arc::clone(&spurious);
+                handles.push(tokio::spawn(async move {
+                    let (result, _role) = flight
+                        .run(round, || async move { Ok::<u64, &'static str>(round) })
+                        .await;
+                    match result {
+                        Ok(value) => assert_eq!(value, round),
+                        Err(SingleFlightError::LeaderLost) => {
+                            spurious.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(other) => panic!("unexpected error: {other:?}"),
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("waiter task joins");
+            }
+        }
+
+        assert_eq!(
+            spurious.load(Ordering::Relaxed),
+            0,
+            "a fetch that returned Ok was reported to a follower as LeaderLost"
+        );
     }
 }
