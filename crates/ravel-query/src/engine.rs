@@ -502,18 +502,13 @@ impl QueryEngine {
             let fetched = self
                 .fetch_all_series(tenant_hash, &snapshot, matchers, &accounting)
                 .await?;
-            let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();
-            for segment_entries in fetched {
-                for entry in segment_entries {
-                    by_id.entry(entry.series_id).or_insert(entry.labels);
-                }
-            }
-            if by_id.len() > self.config.max_series {
-                return Err(QueryError::TooManySeries {
-                    count: by_id.len(),
-                    max: self.config.max_series,
-                });
-            }
+            let by_id = build_series_by_id(
+                fetched
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| (entry.series_id, entry.labels)),
+                self.config.max_series,
+            )?;
             Ok((by_id.into_iter().collect(), FetchStats::default()))
         };
 
@@ -886,6 +881,46 @@ impl QueryEngine {
     }
 }
 
+/// Builds a `series_id -> labels` map incrementally, rejecting the moment a
+/// new id would push it past `max_series` (issue #470, ADR-0049 S7 / S4-07)
+/// instead of finishing the build and checking the total afterward. Peak map
+/// size is therefore bounded by `max_series`, so the cap protects the memory
+/// the construction itself consumes, not just the size of the result it
+/// would have returned.
+fn build_series_by_id(
+    entries: impl IntoIterator<Item = (SeriesId, LabelSet)>,
+    max_series: usize,
+) -> Result<HashMap<SeriesId, LabelSet>, SeriesCapExceeded> {
+    let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();
+    for (series_id, series_labels) in entries {
+        if !by_id.contains_key(&series_id) && by_id.len() >= max_series {
+            return Err(SeriesCapExceeded {
+                by_id,
+                max: max_series,
+            });
+        }
+        by_id.entry(series_id).or_insert(series_labels);
+    }
+    Ok(by_id)
+}
+
+/// The partial map at the moment `max_series` was exceeded, kept around
+/// (instead of dropped immediately) so a test can assert its length directly
+/// rather than trusting only the `count` the resulting [`QueryError`] reports.
+struct SeriesCapExceeded {
+    by_id: HashMap<SeriesId, LabelSet>,
+    max: usize,
+}
+
+impl From<SeriesCapExceeded> for QueryError {
+    fn from(e: SeriesCapExceeded) -> Self {
+        QueryError::TooManySeries {
+            count: e.by_id.len() + 1,
+            max: e.max,
+        }
+    }
+}
+
 /// Collapses the two ways a deadline can surface into the one
 /// `QueryError::DeadlineExceeded` callers already match on (issue #193).
 ///
@@ -1140,7 +1175,10 @@ impl YieldBudget {
 /// already sorted ascending by ts and the merge emits in ts order. The
 /// max-samples budget is enforced by counting yielded samples
 /// ([`YieldBudget`]); duplicate timestamps resolve under the full total
-/// order in [`is_greater`].
+/// order in [`is_greater`]. `max_series` is enforced incrementally, the
+/// moment a new series id would push the map past the cap (issue #470,
+/// ADR-0049 S7 / S4-07), so peak map size is bounded by the cap rather than
+/// by however many distinct series the fetch actually returned.
 fn merge_soa_runs(
     fetched: Vec<Vec<FetchedSeriesSoa>>,
     max_series: usize,
@@ -1149,6 +1187,12 @@ fn merge_soa_runs(
     let mut by_series: HashMap<SeriesId, (LabelSet, Vec<SeriesRun>)> = HashMap::new();
     for segment_series in fetched {
         for fs in segment_series {
+            if !by_series.contains_key(&fs.series_id) && by_series.len() >= max_series {
+                return Err(QueryError::TooManySeries {
+                    count: by_series.len() + 1,
+                    max: max_series,
+                });
+            }
             let entry = by_series
                 .entry(fs.series_id)
                 .or_insert_with(|| (fs.labels.clone(), Vec::new()));
@@ -1158,13 +1202,6 @@ fn merge_soa_runs(
                 prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
             });
         }
-    }
-
-    if by_series.len() > max_series {
-        return Err(QueryError::TooManySeries {
-            count: by_series.len(),
-            max: max_series,
-        });
     }
 
     let mut budget = YieldBudget {
@@ -1528,6 +1565,12 @@ fn merge_histogram_soa_runs(
     let mut by_series: HashMap<SeriesId, (LabelSet, Vec<HistogramSeriesRun>)> = HashMap::new();
     for segment_series in fetched {
         for fs in segment_series {
+            if !by_series.contains_key(&fs.series_id) && by_series.len() >= max_series {
+                return Err(QueryError::TooManySeries {
+                    count: by_series.len() + 1,
+                    max: max_series,
+                });
+            }
             let entry = by_series
                 .entry(fs.series_id)
                 .or_insert_with(|| (fs.labels.clone(), Vec::new()));
@@ -1537,13 +1580,6 @@ fn merge_histogram_soa_runs(
                 prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
             });
         }
-    }
-
-    if by_series.len() > max_series {
-        return Err(QueryError::TooManySeries {
-            count: by_series.len(),
-            max: max_series,
-        });
     }
 
     let mut budget = YieldBudget {
@@ -2120,6 +2156,70 @@ mod merge_tests {
             let want = values.iter().map(|v| v.to_bits()).max().expect("non-empty");
             prop_assert_eq!(winner_bits(segments), want);
         }
+    }
+}
+
+/// Covers `build_series_by_id` directly (issue #470, ADR-0049 S7 / S4-07):
+/// the `/series`, `/labels`, and `/label/{name}/values` endpoints' map
+/// construction, distinct from the PromQL evaluation path's own series maps
+/// exercised in `merge_tests`/`histogram_merge_tests`.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use ravel_types::{Label, LabelSet, SeriesId};
+
+    use super::*;
+
+    fn label_set() -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "metric".to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    /// Distinct series ids `0..n`, each carrying an otherwise-irrelevant
+    /// label set, for probing `build_series_by_id` at scale without
+    /// constructing full `ravel_segment::SeriesEntry` values.
+    fn series_ids(n: u32) -> Vec<(SeriesId, LabelSet)> {
+        (0..n)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[..4].copy_from_slice(&i.to_le_bytes());
+                (SeriesId(id), label_set())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn max_series_bounds_peak_map_size() {
+        // Far more distinct series than the cap: a build-then-check
+        // implementation would grow the map to 10_000 entries before
+        // rejecting. Asserting on the partial map itself (not just the
+        // error's `count` field) proves construction actually stopped at
+        // the cap instead of merely reporting a small number afterward.
+        let err = build_series_by_id(series_ids(10_000), 3).expect_err("cap exceeded");
+        assert_eq!(
+            err.by_id.len(),
+            3,
+            "map must never grow past max_series before rejecting"
+        );
+        assert_eq!(err.max, 3);
+
+        let query_err: QueryError = err.into();
+        match query_err {
+            QueryError::TooManySeries { count, max } => {
+                assert_eq!(count, 4);
+                assert_eq!(max, 3);
+            }
+            other => panic!("expected TooManySeries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_series_exactly_at_cap_succeeds() {
+        let by_id = build_series_by_id(series_ids(3), 3).expect("exactly at cap must succeed");
+        assert_eq!(by_id.len(), 3);
     }
 }
 
