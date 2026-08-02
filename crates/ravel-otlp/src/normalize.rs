@@ -55,15 +55,20 @@
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::exemplar::Value as OtlpExemplarValue;
 use opentelemetry_proto::tonic::metrics::v1::exponential_histogram_data_point::Buckets;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
-    AggregationTemporality, DataPointFlags, ExponentialHistogramDataPoint, HistogramDataPoint,
-    Metric, NumberDataPoint, ResourceMetrics, SummaryDataPoint, metric::Data as MetricData,
+    AggregationTemporality, DataPointFlags, Exemplar as OtlpExemplar,
+    ExponentialHistogramDataPoint, HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics,
+    SummaryDataPoint, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ravel_segment::{HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint};
-use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId, TypeError};
+use ravel_types::{
+    Exemplar, ExemplarCap, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId,
+    TypeError,
+};
 
 use crate::limits::{IngestLimits, Rejection};
 use crate::promcompat::format_float;
@@ -123,7 +128,41 @@ pub struct NormalizeOutput {
     pub rejected: Vec<Rejection>,
 }
 
-/// Decode and normalize gauge and sum data points from `req`.
+/// One exemplar admitted through the per-series cap (ADR-0047 decisions 1
+/// and 2), paired with the series it was attached to. A classic `Histogram`
+/// data point explodes into several series (`{name}_bucket{le=...}`,
+/// `{name}_sum`, `{name}_count`); an exemplar from it attaches to the bucket
+/// series whose `le` bound is the smallest one at or above the exemplar's
+/// value, matching Prometheus's own bucket-exemplar convention (falling
+/// back to the `+Inf` bucket when no explicit bound qualifies).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NormalizedExemplar {
+    pub series_id: SeriesId,
+    pub exemplar: Exemplar,
+}
+
+/// Result of normalizing one `ExportMetricsServiceRequest`, including the
+/// exemplars admitted through the caller's [`ExemplarCap`]. The sibling of
+/// [`NormalizeOutput`] that also threads exemplars through; kept as a
+/// separate type (rather than adding a field to `NormalizeOutput`) because
+/// `NormalizeOutput` is constructed via struct literal by other ingest
+/// paths (`ravel-otap`, `ravel-remote-write`) that this change must not
+/// break.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsNormalizeResult {
+    pub output: NormalizeOutput,
+    pub exemplars: Vec<NormalizedExemplar>,
+}
+
+/// Decode and normalize gauge and sum data points from `req`, discarding any
+/// exemplars they carried. Kept with its original signature and return type
+/// for existing callers; internally this is a thin wrapper around
+/// [`normalize_metrics_with_exemplars`] with a throwaway, request-scoped
+/// [`ExemplarCap`], so the reported [`Rejection::HistogramExemplarsDropped`]
+/// count is accurate (cap-based) rather than "every exemplar, always."
+/// Callers that have somewhere to put admitted exemplars (issue #474) should
+/// call [`normalize_metrics_with_exemplars`] instead, with a cap that
+/// outlives a single request so the per-series window means something.
 ///
 /// `ingest_ts_ns` is the receiver's clock reading at admission time, used to
 /// bound event-time skew (ADR-0010 §8). Nothing here panics or returns an
@@ -135,21 +174,46 @@ pub fn normalize_metrics(
     limits: &IngestLimits,
     ingest_ts_ns: i64,
 ) -> NormalizeOutput {
+    let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
+    normalize_metrics_with_exemplars(tenant, req, limits, ingest_ts_ns, &mut cap).output
+}
+
+/// Decode and normalize gauge and sum data points from `req`, admitting
+/// exemplars through `exemplar_cap` (ADR-0047 decisions 1 and 2). `cap` is
+/// `&mut` and caller-owned rather than built here: a per-series-per-window
+/// cap only means something across many requests over wall-clock time, so
+/// whoever holds the long-lived per-shard state (issue #474) must own one
+/// `ExemplarCap` and pass it into every call this shard makes, exactly like
+/// the existing `SeriesIdMemo` pattern but living longer than one request.
+///
+/// See [`normalize_metrics`] for the panic/error-handling contract, which is
+/// identical here.
+pub fn normalize_metrics_with_exemplars(
+    tenant: &TenantId,
+    req: ExportMetricsServiceRequest,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+) -> MetricsNormalizeResult {
     let total_points = count_data_points(&req);
     if total_points > limits.max_data_points_per_request {
-        return NormalizeOutput {
-            points: Vec::new(),
-            histogram_points: Vec::new(),
-            rejected: vec![Rejection::TooManyDataPoints {
-                count: total_points,
-                max: limits.max_data_points_per_request,
-            }],
+        return MetricsNormalizeResult {
+            output: NormalizeOutput {
+                points: Vec::new(),
+                histogram_points: Vec::new(),
+                rejected: vec![Rejection::TooManyDataPoints {
+                    count: total_points,
+                    max: limits.max_data_points_per_request,
+                }],
+            },
+            exemplars: Vec::new(),
         };
     }
 
     let mut points = Vec::new();
     let mut histogram_points = Vec::new();
     let mut rejected = Vec::new();
+    let mut exemplars = Vec::new();
 
     for rm in &req.resource_metrics {
         normalize_resource(
@@ -157,16 +221,21 @@ pub fn normalize_metrics(
             rm,
             limits,
             ingest_ts_ns,
+            exemplar_cap,
             &mut points,
             &mut histogram_points,
+            &mut exemplars,
             &mut rejected,
         );
     }
 
-    NormalizeOutput {
-        points,
-        histogram_points,
-        rejected,
+    MetricsNormalizeResult {
+        output: NormalizeOutput {
+            points,
+            histogram_points,
+            rejected,
+        },
+        exemplars,
     }
 }
 
@@ -196,13 +265,16 @@ fn metric_data_point_count(metric: &Metric) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_resource(
     tenant: &TenantId,
     rm: &ResourceMetrics,
     limits: &IngestLimits,
     ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
+    exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
 ) {
     let resource_point_count = resource_metrics_point_count(rm);
@@ -239,8 +311,10 @@ fn normalize_resource(
                 &resource_labels,
                 limits,
                 ingest_ts_ns,
+                exemplar_cap,
                 points,
                 histogram_points,
+                exemplars,
                 rejected,
             );
         }
@@ -254,8 +328,10 @@ fn normalize_metric(
     resource_labels: &[Label],
     limits: &IngestLimits,
     ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
+    exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
 ) {
     let point_count = metric_data_point_count(metric);
@@ -291,7 +367,7 @@ fn normalize_metric(
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &gauge.data_points {
-                match build_point(&ctx, dp, &mut memo) {
+                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((p, info)) => {
                         points.push(p);
                         rejected.extend(info);
@@ -320,7 +396,7 @@ fn normalize_metric(
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &sum.data_points {
-                match build_point(&ctx, dp, &mut memo) {
+                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((p, info)) => {
                         points.push(p);
                         rejected.extend(info);
@@ -347,7 +423,7 @@ fn normalize_metric(
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &h.data_points {
-                match explode_histogram(&ctx, dp, &mut memo) {
+                match explode_histogram(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((mut new_points, informational)) => {
                         points.append(&mut new_points);
                         rejected.extend(informational);
@@ -374,7 +450,7 @@ fn normalize_metric(
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &h.data_points {
-                match build_native_histogram_point(&ctx, dp, &mut memo) {
+                match build_native_histogram_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((p, informational)) => {
                         histogram_points.push(p);
                         rejected.extend(informational);
@@ -487,16 +563,125 @@ fn int_survives_f64(v: i64) -> bool {
     (v as f64) as i128 == v as i128
 }
 
-/// Build one point, and, when the point's `as_int` value did not survive the
-/// conversion to `f64`, an informational [`Rejection::IntegerValuePrecisionLoss`]
-/// to carry alongside it (`None` otherwise). The point is admitted either way;
-/// the rounding is unavoidable given `f64`-only storage, so it is surfaced, not
-/// rejected.
+/// Decode `dp_exemplars`, admit each through `cap` (ADR-0047 decision 2),
+/// and push admitted ones into `exemplars_out`, tagged with whatever series
+/// `series_id_for` resolves each candidate to (a fixed series for
+/// [`build_point`] and [`build_native_histogram_point`]; a bucket lookup for
+/// [`explode_histogram`]). Exemplars that are too malformed to carry (no
+/// recognized value in the oneof) or that lose the cap are counted into
+/// `informational` via the existing drop counter, so the count stays visible
+/// rather than becoming invisible now that some exemplars are kept.
+///
+/// Candidates are offered to `cap` newest-first: [`ExemplarCap::admit`] never
+/// retracts an earlier admission, so within one call (and therefore within
+/// one series' window, whichever series that turns out to be) this is what
+/// makes "keep the newest" hold even when a single data point carries
+/// several exemplars for the same window.
+fn admit_exemplars<F>(
+    dp_exemplars: &[OtlpExemplar],
+    limits: &IngestLimits,
+    cap: &mut ExemplarCap,
+    series_id_for: F,
+    exemplars_out: &mut Vec<NormalizedExemplar>,
+    informational: &mut Vec<Rejection>,
+) where
+    F: Fn(&Exemplar) -> SeriesId,
+{
+    if dp_exemplars.is_empty() {
+        return;
+    }
+
+    let mut candidates = Vec::with_capacity(dp_exemplars.len());
+    let mut dropped = 0usize;
+    for ex in dp_exemplars {
+        match decode_exemplar(ex, limits) {
+            Some(e) => candidates.push(e),
+            None => dropped += 1,
+        }
+    }
+    candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.ts_ns));
+
+    for candidate in candidates {
+        let series_id = series_id_for(&candidate);
+        if cap.admit(series_id, candidate.ts_ns) {
+            exemplars_out.push(NormalizedExemplar {
+                series_id,
+                exemplar: candidate,
+            });
+        } else {
+            dropped += 1;
+        }
+    }
+
+    if dropped > 0 {
+        informational.push(Rejection::HistogramExemplarsDropped { count: dropped });
+    }
+}
+
+/// Decode one OTLP exemplar into the shared canonical shape (ADR-0047
+/// decision 1), or `None` if it is too malformed to carry: OTLP itself calls
+/// an exemplar "invalid" when neither oneof value is set, and that is the
+/// only condition under which this returns `None` — a wrong-length trace or
+/// span id is treated as absent rather than as a reason to drop the whole
+/// exemplar (see [`parse_id`]), and an unparsable filtered-attribute value is
+/// skipped rather than failing the exemplar, since filtered attributes are
+/// informational context, not part of series identity.
+fn decode_exemplar(ex: &OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar> {
+    let value_bits = match ex.value {
+        Some(OtlpExemplarValue::AsDouble(v)) => v.to_bits(),
+        Some(OtlpExemplarValue::AsInt(v)) => (v as f64).to_bits(),
+        None => return None,
+    };
+    let ts_ns = i64::try_from(ex.time_unix_nano).unwrap_or(i64::MAX);
+
+    let mut filtered_attributes = Vec::with_capacity(
+        ex.filtered_attributes
+            .len()
+            .min(limits.max_attributes_per_point),
+    );
+    for attr in ex
+        .filtered_attributes
+        .iter()
+        .take(limits.max_attributes_per_point)
+    {
+        let name = sanitize_label_name(&attr.key);
+        let value = any_value_to_label_value(attr.value.as_ref()).unwrap_or_default();
+        filtered_attributes.push(Label { name, value });
+    }
+
+    Some(Exemplar {
+        ts_ns,
+        value_bits,
+        trace_id: parse_id::<16>(&ex.trace_id),
+        span_id: parse_id::<8>(&ex.span_id),
+        filtered_attributes,
+    })
+}
+
+/// Parse `bytes` into a fixed-size id, treating any length other than `N`
+/// (well-formed) as absent (all-zero) rather than rejecting the exemplar
+/// that carries it. This includes OTLP's own explicit "empty means absent"
+/// case (length 0) and a malformed length, identically: both collapse to
+/// the all-zero sentinel the RSEG layout and this module use for "no
+/// trace/span id" (see `ravel_types::exemplar`'s module doc).
+fn parse_id<const N: usize>(bytes: &[u8]) -> [u8; N] {
+    <[u8; N]>::try_from(bytes).unwrap_or([0u8; N])
+}
+
+/// Build one point, plus zero or more informational rejections alongside it:
+/// [`Rejection::IntegerValuePrecisionLoss`] when the point's `as_int` value
+/// did not survive the conversion to `f64`, and
+/// [`Rejection::HistogramExemplarsDropped`] for any of the point's exemplars
+/// that were malformed or lost the per-series admission cap. The point is
+/// admitted either way; the rounding is unavoidable given `f64`-only storage,
+/// so it is surfaced, not rejected.
 fn build_point(
     ctx: &PointContext,
     dp: &NumberDataPoint,
     memo: &mut SeriesIdMemo,
-) -> Result<(NormalizedPoint, Option<Rejection>), Rejection> {
+    exemplar_cap: &mut ExemplarCap,
+    exemplars_out: &mut Vec<NormalizedExemplar>,
+) -> Result<(NormalizedPoint, Vec<Rejection>), Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
             attribute_count: dp.attributes.len(),
@@ -549,6 +734,16 @@ fn build_point(
         .series_id(ctx.tenant, ctx.metric_name, &label_set)
         .map_err(|_| Rejection::OversizedSeriesComponent)?;
 
+    let mut informational: Vec<Rejection> = precision_loss.into_iter().collect();
+    admit_exemplars(
+        &dp.exemplars,
+        ctx.limits,
+        exemplar_cap,
+        |_| series_id,
+        exemplars_out,
+        &mut informational,
+    );
+
     Ok((
         NormalizedPoint {
             series_id,
@@ -559,19 +754,23 @@ fn build_point(
             },
             is_monotonic_sum: ctx.is_sum && ctx.is_monotonic,
         },
-        precision_loss,
+        informational,
     ))
 }
 
 /// Build one native-histogram point from an `ExponentialHistogramDataPoint`
 /// (ADR-0017). Rejection is atomic like [`build_point`]; `Ok` additionally
-/// carries informational drops for `min`/`max` and exemplars, since OTLP's
-/// native histogram has no place in the segment's native histogram sample to
-/// store them either.
+/// carries an informational drop for `min`/`max`, which the segment's
+/// native-histogram sample has no place to store (ADR-0047 decision 6:
+/// deliberately out of scope, unlike exemplars, which this function does
+/// carry, admitted through the same per-series cap as every other point
+/// type).
 fn build_native_histogram_point(
     ctx: &NativeHistogramContext,
     dp: &ExponentialHistogramDataPoint,
     memo: &mut SeriesIdMemo,
+    exemplar_cap: &mut ExemplarCap,
+    exemplars_out: &mut Vec<NormalizedExemplar>,
 ) -> Result<(NormalizedHistogramPoint, Vec<Rejection>), Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -604,11 +803,14 @@ fn build_native_histogram_point(
     if dp.min.is_some() || dp.max.is_some() {
         informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
     }
-    if !dp.exemplars.is_empty() {
-        informational.push(Rejection::HistogramExemplarsDropped {
-            count: dp.exemplars.len(),
-        });
-    }
+    admit_exemplars(
+        &dp.exemplars,
+        ctx.limits,
+        exemplar_cap,
+        |_| series_id,
+        exemplars_out,
+        &mut informational,
+    );
 
     Ok((
         NormalizedHistogramPoint {
@@ -839,12 +1041,18 @@ fn finish_point(
 /// `{name}_bucket{le="+Inf"}` (= the point's count), `{name}_sum` when `sum`
 /// is present, and `{name}_count`. Rejection is atomic: an `Err` means none
 /// of this point's series were admitted, never a partial set (ADR-0016).
-/// Ok also carries zero-weight informational rejections for dropped
-/// min/max/exemplar fields, since the point itself was admitted.
+/// Ok also carries a zero-weight informational rejection for a dropped
+/// min/max field, since the point itself was admitted. Exemplars are carried
+/// (not dropped): each attaches to the bucket series whose `le` bound is the
+/// smallest one at or above the exemplar's value (falling back to `+Inf`),
+/// matching Prometheus's own bucket-exemplar convention, then is admitted
+/// through the same per-series cap as every other point type.
 fn explode_histogram(
     ctx: &ExplodeContext,
     dp: &HistogramDataPoint,
     memo: &mut SeriesIdMemo,
+    exemplar_cap: &mut ExemplarCap,
+    exemplars_out: &mut Vec<NormalizedExemplar>,
 ) -> Result<(Vec<NormalizedPoint>, Vec<Rejection>), Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
@@ -931,13 +1139,39 @@ fn explode_histogram(
     if dp.min.is_some() || dp.max.is_some() {
         informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
     }
-    if !dp.exemplars.is_empty() {
-        informational.push(Rejection::HistogramExemplarsDropped {
-            count: dp.exemplars.len(),
-        });
-    }
+
+    // Bucket series occupy series[0..expected_buckets] regardless of whether
+    // `_sum` was pushed after them, since it and `_count` are always
+    // appended last.
+    let bucket_series = &series[0..expected_buckets];
+    let explicit_bounds = &dp.explicit_bounds;
+    admit_exemplars(
+        &dp.exemplars,
+        ctx.limits,
+        exemplar_cap,
+        |candidate| {
+            let value = f64::from_bits(candidate.value_bits);
+            let idx = exemplar_bucket_index(explicit_bounds, value);
+            bucket_series[idx].series_id
+        },
+        exemplars_out,
+        &mut informational,
+    );
 
     Ok((series, informational))
+}
+
+/// The index into a histogram's ordered bucket series (explicit bounds, then
+/// `+Inf`) that `value` falls into: the first bound at or above `value`, or
+/// the `+Inf` bucket (index `explicit_bounds.len()`) if none qualifies. `<=`
+/// is an ordering comparison against already-validated finite bounds, not an
+/// equality test on a stored sample, so it does not conflict with the
+/// bit-pattern comparison rule for exemplar values.
+fn exemplar_bucket_index(explicit_bounds: &[f64], value: f64) -> usize {
+    explicit_bounds
+        .iter()
+        .position(|&bound| value <= bound)
+        .unwrap_or(explicit_bounds.len())
 }
 
 /// Explode one `SummaryDataPoint` into its Prometheus-convention series:
