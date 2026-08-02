@@ -458,7 +458,7 @@ fn to_i64_ns(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-/// Bound a span's resolved interval at admission (ADR-0049 §4), mirroring
+/// Bound a span's resolved interval at admission (ADR-0051 §4), mirroring
 /// the metrics path's `checked_event_ts`: `end_ts_ns` may lead ingest time
 /// by at most `max_future_skew_ns` and `start_ts_ns` may lag it by at most
 /// `max_ingest_lag_ns`, because the commit record advertises
@@ -472,7 +472,7 @@ fn to_i64_ns(value: u64) -> i64 {
 ///
 /// Rejecting, never clamping: rewriting a sender's timestamps is silent
 /// corruption of the plausible-wrong-result class; a typed rejection is
-/// visible and countable. Consequence, stated in ADR-0049: a span longer
+/// visible and countable. Consequence, stated in ADR-0051: a span longer
 /// than `max_ingest_lag_ns`, or reported later than that after it started,
 /// is rejected at admission.
 fn checked_span_interval(
@@ -791,7 +791,7 @@ mod tests {
         );
     }
 
-    // --- event-time skew bounds (ADR-0049 §4) ---
+    // --- event-time skew bounds (ADR-0051 §4) ---
     // Convention, shared with the metrics and log paths: the bound itself
     // passes; one ns past it fails. `end_ts_ns` carries the future bound and
     // `start_ts_ns` the lag bound, because the commit record advertises

@@ -1,11 +1,11 @@
-//! Per-tenant admission control (ADR-0049 sections 1, 2, 6), implementing
+//! Per-tenant admission control (ADR-0051 sections 1, 2, 6), implementing
 //! the quota decision ADR-0009 left unenforced ("per-tenant quotas … hard
 //! limits precede allocation").
 //!
 //! [`AdmissionController`] is a self-contained accounting unit: it holds no
 //! reference to a shard, router, or gateway and enforces nothing by itself.
 //! A later wiring task is expected to call it in this order, once per
-//! ingest request, before any shard-buffer allocation (ADR-0049 section 1):
+//! ingest request, before any shard-buffer allocation (ADR-0051 section 1):
 //!
 //! 1. [`AdmissionController::check_byte_rate`] on the wire body size,
 //!    before decode. Whole-request rejection.
@@ -20,15 +20,15 @@
 //!    while already-active ones keep flowing (per-series partial success).
 //!
 //! Spans have no stable series identity (`trace_id` is sender-chosen and
-//! naturally unbounded, ADR-0049 section 1) and so get neither a creation
+//! naturally unbounded, ADR-0051 section 1) and so get neither a creation
 //! rate nor an active cap here. There is deliberately no `admit_spans`
 //! method or span variant of [`AdmissionLimits`]'s count caps: span ingest
 //! is bounded only by [`AdmissionController::check_byte_rate`], and that
-//! absence is the documented answer ADR-0049 requires, not a gap.
+//! absence is the documented answer ADR-0051 requires, not a gap.
 //!
-//! Enforcement state is per process (ADR-0049 section 2): with N ingest
+//! Enforcement state is per process (ADR-0051 section 2): with N ingest
 //! replicas the fleet-wide effective bound is N times each configured
-//! limit. This is a deliberate trade (see ADR-0049 "Rejected alternatives"
+//! limit. This is a deliberate trade (see ADR-0051 "Rejected alternatives"
 //! 1), not an oversight.
 
 use std::collections::{HashMap, HashSet};
@@ -40,14 +40,14 @@ use ravel_types::{SeriesId, Signal, TenantHash, TenantId};
 
 use crate::Clock;
 
-/// Width of the rotating active-identity epoch (ADR-0049 section 2). Fixed,
+/// Width of the rotating active-identity epoch (ADR-0051 section 2). Fixed,
 /// not a configuration knob: an active series/stream is one seen in the
 /// current or previous epoch.
 const ACTIVE_EPOCH_NS: i64 = 3_600 * 1_000_000_000;
 
 /// A per-tenant count cap, or an explicit opt-in to no cap at all.
 ///
-/// ADR-0049 section 3: enforcement is on by default with finite shipped
+/// ADR-0051 section 3: enforcement is on by default with finite shipped
 /// defaults; a tenant needing no limit sets `unlimited = true` explicitly,
 /// visible in config review rather than silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +72,7 @@ pub enum RateLimit {
     Unlimited,
 }
 
-/// Per-tenant admission limits (ADR-0049 section 3).
+/// Per-tenant admission limits (ADR-0051 section 3).
 ///
 /// The `--limits-file` TOML config task (landing separately) is expected to
 /// deserialize a `[defaults]` table into one `AdmissionLimits`, then for
@@ -98,7 +98,7 @@ impl AdmissionLimits {
     pub const DEFAULT_SERIES_CREATION_BURST: u64 = 100_000;
 }
 
-/// ADR-0049 section 3 shipped defaults.
+/// ADR-0051 section 3 shipped defaults.
 impl Default for AdmissionLimits {
     fn default() -> Self {
         AdmissionLimits {
@@ -117,7 +117,7 @@ impl Default for AdmissionLimits {
 }
 
 /// Why a whole request was rejected. Both variants are whole-request,
-/// retryable-later rejections (ADR-0049 section 1), unlike the per-series
+/// retryable-later rejections (ADR-0051 section 1), unlike the per-series
 /// active-cap outcome carried by [`IdentityAdmission`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RequestRejectionReason {
@@ -129,7 +129,7 @@ pub enum RequestRejectionReason {
 
 /// A whole-request rejection. `retry_after_ns` is the time until the
 /// request's own cost would fit in the bucket, for the gateway to surface
-/// as `Retry-After` / the gRPC retry-info equivalent (ADR-0049 section 1's
+/// as `Retry-After` / the gRPC retry-info equivalent (ADR-0051 section 1's
 /// status-code table); mapping it to a header is the wiring task's job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestRejection {
@@ -139,7 +139,7 @@ pub struct RequestRejection {
 
 /// Outcome of admitting a batch of series or log-stream identities: an
 /// already-active identity is always admitted; a new one is admitted only
-/// while the tenant's active cap has room (ADR-0049 section 1, per-series
+/// while the tenant's active cap has room (ADR-0051 section 1, per-series
 /// partial success — never a whole-batch rejection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityAdmission<T> {
@@ -159,7 +159,7 @@ impl<T> Default for IdentityAdmission<T> {
 }
 
 /// Token bucket over an injected clock. Never partially drains on a
-/// rejected request (ADR-0049 section 1: an over-budget request must not
+/// rejected request (ADR-0051 section 1: an over-budget request must not
 /// pay for the part of itself that didn't fit).
 #[derive(Debug, Clone, Copy)]
 struct TokenBucket {
@@ -214,7 +214,7 @@ impl TokenBucket {
 }
 
 /// Exact active-identity tracker over two rotating one-hour epochs
-/// (ADR-0049 section 2). An identity is active if seen in the current or
+/// (ADR-0051 section 2). An identity is active if seen in the current or
 /// previous epoch; the tracked count is bounded by `cap` because a genuinely
 /// new identity is refused once `cap` distinct identities are active, which
 /// is the whole point: the set never grows past the limit it enforces.
@@ -300,7 +300,7 @@ struct SignalUsage {
     series_rejected_cap_total: u64,
 }
 
-/// One (tenant, signal) row of the usage snapshot (ADR-0049 section 6).
+/// One (tenant, signal) row of the usage snapshot (ADR-0051 section 6).
 /// `tenant_hash` rather than the raw [`TenantId`] so a caller building
 /// Prometheus labels never has an unbounded tenant-supplied string to
 /// bound itself: hashing to a fixed 16 bytes happens here, at the source
@@ -319,7 +319,7 @@ struct SignalUsage {
 /// [`AdmissionController::check_byte_rate`] (layer 2); `series_admitted_total`
 /// counts individual series/stream ids admitted by
 /// [`AdmissionController::admit_series`] / `admit_streams` (layer 4). A
-/// caller rendering ADR-0049 section 6's `ravel_admission_admitted_total`
+/// caller rendering ADR-0051 section 6's `ravel_admission_admitted_total`
 /// family picks whichever of these matches the exported unit it wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TenantUsage {
@@ -365,7 +365,7 @@ impl TenantState {
 
     /// Replaces this tenant's limits. Both rate buckets are rebuilt at full
     /// burst capacity under the new rate: limits load once at startup
-    /// (ADR-0049 section 3, "changing limits is a restart"), so there is no
+    /// (ADR-0051 section 3, "changing limits is a restart"), so there is no
     /// live-traffic case where preserving a bucket's partial fill across a
     /// limit change matters.
     fn set_limits(&mut self, limits: AdmissionLimits, now_ns: i64) {
@@ -410,7 +410,7 @@ impl AdmissionController {
         self.clock.now_ns()
     }
 
-    /// Installs or replaces a tenant's limits (ADR-0049 section 3: loaded
+    /// Installs or replaces a tenant's limits (ADR-0051 section 3: loaded
     /// once at startup from the limits file; changing limits is a
     /// restart). Existing active-series/stream state is preserved; only a
     /// changed rate's bucket is reset to the new rate at full burst capacity.
@@ -438,7 +438,7 @@ impl AdmissionController {
 
     /// Charges `request_bytes` against the tenant's ingest byte-rate
     /// bucket. Whole-request: on rejection no tokens are consumed
-    /// (ADR-0049 section 1, layer 2). Applies uniformly to every signal,
+    /// (ADR-0051 section 1, layer 2). Applies uniformly to every signal,
     /// including spans, since it is a per-tenant, not per-signal, budget.
     pub fn check_byte_rate(
         &self,
@@ -474,7 +474,7 @@ impl AdmissionController {
     }
 
     /// Charges the batch's distinct new-series demand against the tenant's
-    /// shared series-creation-rate bucket (ADR-0049 section 1, layer 4).
+    /// shared series-creation-rate bucket (ADR-0051 section 1, layer 4).
     /// `candidate_series` may repeat ids and may include already-active
     /// ones; only ids not currently active count toward the charge.
     /// Whole-request: on rejection nothing is admitted and no tokens are
@@ -494,7 +494,7 @@ impl AdmissionController {
     }
 
     /// Log-stream analogue of [`Self::check_series_creation_rate`], sharing
-    /// the same per-tenant creation-rate bucket (ADR-0049 section 3 lists
+    /// the same per-tenant creation-rate bucket (ADR-0051 section 3 lists
     /// one `series_creation_rate_per_sec` knob, not one per signal).
     pub fn check_stream_creation_rate(
         &self,
@@ -510,7 +510,7 @@ impl AdmissionController {
     }
 
     /// Admits a batch of metrics series ids against the tenant's active-
-    /// series cap (ADR-0049 section 1, layer 4 / section 2). Per-series:
+    /// series cap (ADR-0051 section 1, layer 4 / section 2). Per-series:
     /// already-active ids are always admitted, a new id is rejected only
     /// once the cap is full. Call only after a prior
     /// [`Self::check_series_creation_rate`] on the same batch succeeded.
@@ -544,7 +544,7 @@ impl AdmissionController {
         })
     }
 
-    /// Bounded per-tenant usage snapshot for export (ADR-0049 section 6):
+    /// Bounded per-tenant usage snapshot for export (ADR-0051 section 6):
     /// one row per (tenant, signal) pair that has recorded any activity.
     /// Cardinality is bounded by (observed tenants) × (`Signal` variants,
     /// a closed 6-member enum); it is never keyed by a raw tenant-supplied

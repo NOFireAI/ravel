@@ -291,7 +291,7 @@ fn to_i64_ns(value: u64) -> i64 {
 }
 
 /// Bound a record's resolved event time to `[ingest_ts_ns -
-/// max_ingest_lag_ns, ingest_ts_ns + max_future_skew_ns]` (ADR-0049 §4),
+/// max_ingest_lag_ns, ingest_ts_ns + max_future_skew_ns]` (ADR-0051 §4),
 /// mirroring the metrics path's `checked_event_ts`. The bound itself passes;
 /// only strictly exceeding it rejects: `ts == ingest_ts + max_future_skew`
 /// is accepted, `ts == ingest_ts + max_future_skew + 1` is not. Applied to
@@ -1075,7 +1075,7 @@ mod tests {
         );
     }
 
-    // --- event-time skew bounds (ADR-0049 §4) ---
+    // --- event-time skew bounds (ADR-0051 §4) ---
     // Convention, shared with the metrics path: the bound itself passes; one
     // ns past it fails.
 
