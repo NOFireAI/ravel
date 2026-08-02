@@ -1,11 +1,11 @@
-//! ADR-0046's read cache, RAM tier only (docs/adrs/0046-read-cache-tier.md,
-//! decisions 1-6; the disk tier is a later task in the same epic).
+//! ADR-0046's read cache: a RAM tier and a local-disk tier
+//! (docs/adrs/0046-read-cache-tier.md, decisions 1-7). This crate is not
+//! wired into anything yet: it does not depend on `ravel-types`, does not
+//! touch `ravel-catalog` or `ravel-query`, and does not reference
+//! `QueryAccounting`. Later tasks in this epic connect it to those.
 //!
 //! This crate is consulted at a read funnel; it is never a store
-//! decorator (decision 1). It is not wired into anything yet: it does not
-//! depend on `ravel-types`, does not touch `ravel-catalog` or
-//! `ravel-query`, and does not reference `QueryAccounting`. Three later
-//! tasks in this epic connect it to those.
+//! decorator (decision 1).
 //!
 //! [`CacheKey`] is content-addressed (decision 2): `(tenant_hash,
 //! content_hash, offset, len)`, with no constructor from an object key
@@ -13,17 +13,27 @@
 //! catalog HEAD, the maintenance cursor) have no content hash and must
 //! stay unrepresentable rather than merely un-cached-by-convention.
 //!
-//! [`Cache`] bounds total bytes, entry count, and maximum single-entry
-//! size (deliverable 4); evicts with S3-FIFO, not LRU, because the
-//! compactor and the folder scan cold data in the same process as
-//! queries and a single scan must not evict the query working set
-//! (decision 6, see [`s3fifo`]); collapses concurrent misses on one key
-//! into a single upstream call (decision 5, see [`single_flight`]); and
-//! has a constructor, [`Cache::with_corruption`], that makes every hit
-//! return deliberately corrupted bytes -- the supported acceptance-gate
-//! mode for the whole epic (decision 4), not a test fixture.
+//! [`Cache`] is the RAM tier. It bounds total bytes, entry count, and
+//! maximum single-entry size (deliverable 4); evicts with S3-FIFO, not
+//! LRU, because the compactor and the folder scan cold data in the same
+//! process as queries and a single scan must not evict the query working
+//! set (decision 6, see [`s3fifo`]); collapses concurrent misses on one
+//! key into a single upstream call (decision 5, see [`single_flight`]);
+//! and has a constructor, [`Cache::with_corruption`], that makes every
+//! hit return deliberately corrupted bytes -- the supported
+//! acceptance-gate mode for the whole epic (decision 4), not a test
+//! fixture.
+//!
+//! [`disk::DiskCache`] is the local-disk tier: content-addressed raw byte
+//! ranges under a configured directory, opt-in (no directory, no disk
+//! tier, behavior unchanged), plaintext (decision 7 -- **with SSE-KMS
+//! configured, cached bytes on local disk are not protected by that
+//! key**), and built so every failure degrades to a miss rather than an
+//! error (see the [`disk`] module docs for the crash-safety mechanism and
+//! why blake3 is verified once on admission but never on a hit).
 
 mod cache;
+pub mod disk;
 mod key;
 mod limits;
 mod metrics;
@@ -31,6 +41,7 @@ mod s3fifo;
 mod single_flight;
 
 pub use cache::Cache;
+pub use disk::DiskCache;
 pub use key::CacheKey;
 pub use limits::CacheLimits;
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
