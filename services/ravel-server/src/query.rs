@@ -69,13 +69,16 @@ pub fn build_sql_state(
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(store.clone()),
-        LogSegmentFetcher::new(store),
+        LogSegmentFetcher::new(store.clone()),
         config,
         DEFAULT_MAX_TENANT_BYTES,
     );
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
+        // The audit writer (ADR-0042 decision 4) writes to the same store the
+        // executor reads from.
+        store,
         clock: Arc::new(ravel_ingest::SystemClock),
         max_deadline,
     })

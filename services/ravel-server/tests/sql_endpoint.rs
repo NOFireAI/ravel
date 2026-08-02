@@ -26,10 +26,13 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_logseg::{
+    AttrValue, LogRecord, Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
+};
+use ravel_maintain::AUDIT_HOLD_SHARD;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_query::http::StaticBearerTokenResolver;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
@@ -236,13 +239,14 @@ fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, Tena
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(store.clone()),
-        LogSegmentFetcher::new(store),
+        LogSegmentFetcher::new(store.clone()),
         SqlConfig::default(),
         1 << 30,
     );
     router(SqlState {
         executor: Arc::new(executor),
         tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+        store,
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
     })
@@ -929,4 +933,169 @@ impl ObjectStoreBackend for LogsCommitListSpy {
             ..self.inner.capabilities()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Query-audit records (ADR-0042 decision 4, issue #391)
+// ---------------------------------------------------------------------------
+
+/// Read back every query-audit record (`kind=query`) the server has written to
+/// the tenant's `Signal::Audit` shard, so a test can assert the record the
+/// handler produced for a request.
+async fn query_audit_records(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> Vec<LogRecord> {
+    let tenant_hash = tenant.hash();
+    let prefix = keys::commit_shard_prefix(&tenant_hash, Signal::Audit, AUDIT_HOLD_SHARD)
+        .expect("audit commit prefix");
+    let metas = list_all(store, &prefix).await.expect("list audit commits");
+    let cfg = RlogConfig::default();
+    let mut out = Vec::new();
+    for meta in metas {
+        let got = store
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get commit");
+        let commit = record::decode(&got.data).expect("decode commit");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        let object = store
+            .get(&data_key, GetRange::Full)
+            .await
+            .expect("get data");
+        let reader = RlogReader::new(object.data.as_ref(), &cfg).expect("rlog reader");
+        let (rows, _stats) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        for row in rows {
+            if attr(&row, "kind") == Some("query") {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
+/// The value of a string `attrs` entry, or `None` if absent or non-string.
+fn attr<'a>(row: &'a LogRecord, key: &str) -> Option<&'a str> {
+    row.attrs
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            AttrValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+}
+
+/// (a) A successful SQL query produces exactly one `Signal::Audit` record with
+/// `kind=query` and `query.status=ok`, attributed to the resolved tenant and
+/// carrying the verbatim query text.
+#[tokio::test]
+async fn a_successful_query_writes_one_ok_audit_record() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let app = build_router(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+
+    let sql = "SELECT ts, value FROM samples ORDER BY ts";
+    let (status, value) = post_json(&app, "acme-token", sql).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert_eq!(records.len(), 1, "exactly one query-audit record");
+    let row = &records[0];
+    assert_eq!(attr(row, "kind"), Some("query"));
+    assert_eq!(attr(row, "query.language"), Some("sql"));
+    assert_eq!(attr(row, "query.status"), Some("ok"));
+    assert_eq!(
+        attr(row, "query.tenant"),
+        Some(tenant.hash().to_hex().as_str())
+    );
+    assert_eq!(attr(row, "query.text"), Some(sql));
+    assert_eq!(row.severity_text, "INFO");
+    assert_eq!(row.ts_ns, NOW_NS);
+}
+
+/// (b) A query that fails still produces exactly one audit record, with
+/// `query.status=error` and `ERROR` severity. The audit trail records the
+/// attempt, not only successful queries.
+#[tokio::test]
+async fn a_failed_query_writes_one_error_audit_record() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(1, 1.0)]).await;
+    let app = build_router(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+
+    // An unknown column reaches the executor and fails to plan.
+    let sql = "SELECT no_such_column FROM samples";
+    let (status, value) = post_json(&app, "acme-token", sql).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a failed query is still audited exactly once"
+    );
+    let row = &records[0];
+    assert_eq!(attr(row, "query.status"), Some("error"));
+    assert_eq!(attr(row, "query.text"), Some(sql));
+    assert_eq!(row.severity_text, "ERROR");
+}
+
+/// A request rejected before it reaches the executor for a resolved tenant is
+/// not audited: there is no executed query to attribute. A malformed body is
+/// rejected at parse time, so it writes no audit record.
+#[tokio::test]
+async fn a_request_rejected_before_execution_is_not_audited() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(1, 1.0)]).await;
+    let app = build_router(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+
+    let (status, _bytes) = post(&app, Some("acme-token"), None, "{ not json".to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert!(
+        records.is_empty(),
+        "a body rejected before execution writes no audit record"
+    );
+}
+
+/// (c) An audit-write failure must not fail the client response. Every PUT to
+/// the `Signal::Audit` keyspace is faulted, so the audit record cannot be
+/// written; the query still succeeds and the client still gets its rows.
+#[tokio::test]
+async fn an_audit_write_failure_does_not_fail_the_query_response() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("audit store down".to_string()),
+        )
+        .with_key_contains("/u/"),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let tenant = TenantId::new("acme".to_string());
+    // Metric segments live under "/m/", so setup is unaffected by the audit fault.
+    publish_segment(backend.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let app = build_router(Arc::clone(&backend), tokens(&[("acme-token", "acme")]));
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts, value FROM samples ORDER BY ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+
+    // The audit PUT was faulted, so no record persisted: the failure was
+    // swallowed (and logged), never turned into a 5xx.
+    let records = query_audit_records(backend.as_ref(), &tenant).await;
+    assert!(
+        records.is_empty(),
+        "the audit PUT was faulted, so nothing persisted, yet the query still succeeded"
+    );
+    // The fault really fired, proving the assertion above is not vacuous.
+    assert!(
+        store.fault_count(Op::Put, ravel_object_store::fault::FaultKind::Permanent) > 0,
+        "the audit PUT fault must have fired"
+    );
 }

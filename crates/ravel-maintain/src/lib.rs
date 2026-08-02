@@ -35,6 +35,7 @@
 //!
 //! [`CompactionRecord`]: ravel_proto::commit::v1::CompactionRecord
 
+mod audit_write;
 pub mod bucket;
 pub mod build;
 pub mod clock;
@@ -44,6 +45,7 @@ pub mod config;
 pub mod error;
 pub mod legal_hold;
 pub mod publish;
+pub mod query_audit;
 pub mod read;
 pub mod retention;
 pub mod rlog;
@@ -61,6 +63,7 @@ pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };
 pub use publish::PublishOutcome;
+pub use query_audit::{QueryStatus, write_query_audit};
 pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
