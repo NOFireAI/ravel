@@ -15,10 +15,14 @@
 //! Rejections are typed rather than bare errors: the OTLP partial-success
 //! response reports a rejected-span count, and [`SpanRejection::rejected_count`]
 //! gives the multiplier for a rejection that covers more than one span. A
-//! rejection that applies identically to every span under one `ResourceSpans`
-//! or `ScopeSpans` uses [`SpanRejection::Grouped`] to carry the shared reason
-//! plus the span count it covers, instead of materializing one clone per span.
-//! This mirrors [`crate::logs_limits::LogRejection::Grouped`].
+//! rejection that drops one attribute of an otherwise-stored span returns 0
+//! from [`SpanRejection::rejected_count`], because no span was lost (#364); it
+//! is still reported to the sender through the partial-success `error_message`,
+//! just not counted toward `rejected_spans`. A rejection that applies
+//! identically to every span under one `ResourceSpans` or `ScopeSpans` uses
+//! [`SpanRejection::Grouped`] to carry the shared reason plus the span count it
+//! covers, instead of materializing one clone per span. This mirrors
+//! [`crate::logs_limits::LogRejection::Grouped`].
 
 /// Admission limits checked at OTLP trace ingest, before allocating per-span
 /// attribute structures.
@@ -193,11 +197,31 @@ impl SpanRejection {
     /// this over [`crate::traces_normalize::SpanNormalizeOutput::rejected`]
     /// gives the count to report in an OTLP `rejected_spans` field. Mirrors
     /// [`crate::logs_limits::LogRejection::rejected_count`].
+    ///
+    /// Attribute-level rejections return 0: they drop one attribute (or the
+    /// events/links blob, or a malformed `parent_span_id` edge) of a span that
+    /// is still stored, so counting them as a rejected *span* over-reports how
+    /// many spans a sender's export lost (#364). They remain visible to the
+    /// sender through the partial-success `error_message`; only their
+    /// contribution to `rejected_spans` is zero. This mirrors the metrics
+    /// path's [`crate::limits::Rejection::rejected_count`], where an admitted
+    /// data point that dropped an informational field also returns 0.
     pub fn rejected_count(&self) -> usize {
         match self {
             SpanRejection::TooManySpans { count, .. } | SpanRejection::Grouped { count, .. } => {
                 *count
             }
+            // The span still lands; only one attribute (or blob, or the parent
+            // edge) was dropped. These must never inflate `rejected_spans`.
+            SpanRejection::AttributeKeyTooLong { .. }
+            | SpanRejection::AttributeValueTooLong { .. }
+            | SpanRejection::InvalidParentSpanId { .. }
+            | SpanRejection::EventsBlobTooLong { .. }
+            | SpanRejection::LinksBlobTooLong { .. }
+            | SpanRejection::MissingAttributeValue { .. }
+            | SpanRejection::UnsupportedAttributeValue { .. }
+            | SpanRejection::UnsupportedAttributeKind { .. } => 0,
+            // Whole-span rejections: the span never reached storage.
             _ => 1,
         }
     }
@@ -255,17 +279,14 @@ mod tests {
         assert_eq!(r.rejected_count(), 250_000);
     }
 
+    /// Whole-span rejections each account for exactly one lost span. The span
+    /// never reached storage, so it counts toward `rejected_spans`.
     #[test]
-    fn rejected_count_defaults_to_one_for_span_scoped_reasons() {
+    fn rejected_count_defaults_to_one_for_whole_span_reasons() {
         for r in [
             SpanRejection::TooManyAttributes {
                 count: 200,
                 max: 128,
-            },
-            SpanRejection::AttributeKeyTooLong { len: 300, max: 256 },
-            SpanRejection::AttributeValueTooLong {
-                len: 9000,
-                max: 8192,
             },
             SpanRejection::NameTooLong {
                 len: 2000,
@@ -285,11 +306,28 @@ mod tests {
             },
             SpanRejection::InvalidTraceId { len: 3 },
             SpanRejection::InvalidSpanId { len: 7 },
-            SpanRejection::InvalidParentSpanId { len: 5 },
             SpanRejection::InvalidTimeRange {
                 start_ts_ns: 20,
                 end_ts_ns: 10,
             },
+        ] {
+            assert_eq!(r.rejected_count(), 1, "{r}");
+        }
+    }
+
+    /// Attribute-level rejections drop one attribute (or blob, or the parent
+    /// edge) of a span that is still stored, so they contribute zero to
+    /// `rejected_spans` (#364). Pinned so a future edit that reintroduces the
+    /// old catch-all `_ => 1` has to argue with a failing test.
+    #[test]
+    fn rejected_count_is_zero_for_attribute_level_reasons() {
+        for r in [
+            SpanRejection::AttributeKeyTooLong { len: 300, max: 256 },
+            SpanRejection::AttributeValueTooLong {
+                len: 9000,
+                max: 8192,
+            },
+            SpanRejection::InvalidParentSpanId { len: 5 },
             SpanRejection::EventsBlobTooLong {
                 len: 70_000,
                 max: 65_536,
@@ -302,7 +340,7 @@ mod tests {
             SpanRejection::UnsupportedAttributeValue { key: "k".into() },
             SpanRejection::UnsupportedAttributeKind { key: "k".into() },
         ] {
-            assert_eq!(r.rejected_count(), 1, "{r}");
+            assert_eq!(r.rejected_count(), 0, "{r}");
         }
     }
 
