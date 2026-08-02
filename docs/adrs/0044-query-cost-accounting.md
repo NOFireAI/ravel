@@ -81,19 +81,44 @@ accounted like the metric path rather than being silently free.
 Recording at funnels rather than at call sites means a new call site
 cannot forget to account for itself, and it keeps the change small.
 
-### 3. A pre-execution cost estimate
-
-After `Catalog::resolve` returns a pinned snapshot and before any page
-fetch, the planner computes a `CostEstimate`. Every input is already
-present: `SegmentRef` carries `object_size`, `sample_count`, and
-`series_count` (crates/ravel-catalog/src/snapshot.rs:39), and the fetch
-plan is deterministic given the matchers.
+### 3. A pre-execution cost estimate, in two parts
 
 The estimate is an upper envelope, never a prediction. Where the planner
 cannot bound a quantity it takes the worst case. Under-estimating is the
 failure that matters, because a later ADR will reject queries on this
 number, and a query admitted on a low estimate is exactly the runaway the
 limiter exists to stop.
+
+It has two parts, computed at two different moments, because one moment
+cannot cover both.
+
+**The catalog term, computed before `Catalog::resolve` runs.** Resolve is
+itself expensive: it LISTs one prefix per (shard, ingest-hour bucket) in
+the window, and GETs the records it finds. With no snapshot HEAD, because
+folding is disabled or has not run yet, the listing start is the window
+start, so a 24 h window at `shard_count = 16` is several hundred LISTs.
+Those requests are bounded before resolve by inputs the planner already
+has: `shard_count` and the number of hour buckets the padded window spans.
+
+**The segment term, computed after resolve returns a pinned snapshot.**
+`SegmentRef` carries `object_size`, `sample_count`, and `series_count`,
+and the fetch plan is deterministic given the matchers.
+
+The original form of this decision specified only the second part, which
+was wrong and unbuildable: an estimate computed after resolve structurally
+cannot bound resolve's own spend, so wiring the catalog's accounting in
+would make actual exceed estimate on exactly the queries a limiter most
+needs to catch. Amended 2026-08-02 after a checkpoint review found the
+contradiction.
+
+**Per-sample cost is per value kind, not one constant.** A single
+bytes-per-sample bound cannot hold: a scalar sample decodes to 16 bytes
+while one native-histogram sample decodes to roughly
+`45 + 8 * (buckets + spans + custom_values)`, and no reader limit caps the
+bucket count. A constant loose enough for a wide histogram is orders of
+magnitude too loose for scalars, and one tight enough for scalars
+under-shoots histograms without bound. The estimate therefore derives its
+per-sample term from the segment's own value kinds.
 
 Each query records the estimate and the actual side by side, so the
 estimate's accuracy is itself a measurable quantity before anything
