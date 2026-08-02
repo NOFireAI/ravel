@@ -160,7 +160,7 @@ pub struct LogSegmentFetcher {
     /// its presence: the one production `LogSegmentFetcher` is shared across
     /// all tenants (`services/ravel-server/src/query.rs`), so caching cannot
     /// be wired into a method with no per-call tenant identity.
-    cache: Option<Arc<Cache<Arc<StoreError>>>>,
+    cache: Option<Arc<Cache<crate::fetcher::CacheFetchError>>>,
 }
 
 impl LogSegmentFetcher {
@@ -182,7 +182,7 @@ impl LogSegmentFetcher {
     /// Wires ADR-0046's read cache into
     /// [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant).
     #[must_use]
-    pub fn with_cache(mut self, cache: Arc<Cache<Arc<StoreError>>>) -> Self {
+    pub fn with_cache(mut self, cache: Arc<Cache<crate::fetcher::CacheFetchError>>) -> Self {
         self.cache = Some(cache);
         self
     }
@@ -403,9 +403,21 @@ impl LogSegmentFetcher {
                 .map_err(|err| LogFetchError::Store {
                     key: key.to_string(),
                     source: match err {
-                        SingleFlightError::Upstream(source) => {
-                            crate::fetcher::clone_store_error(&source)
-                        }
+                        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Store(
+                            source,
+                        )) => crate::fetcher::clone_store_error(&source),
+                        // Unreachable in practice: this funnel never sets an
+                        // `expected_etag` (module doc, no suffix/range-chase
+                        // read exists to compare against), so its closure
+                        // never constructs `EtagChanged`. Handled explicitly
+                        // rather than a wildcard so a future etag check added
+                        // here can't silently fall through this arm.
+                        SingleFlightError::Upstream(
+                            crate::fetcher::CacheFetchError::EtagChanged { .. },
+                        ) => StoreError::Transient(
+                            "cache single-flight closure reported an etag change, which this funnel never produces"
+                                .to_string(),
+                        ),
                         SingleFlightError::LeaderLost => StoreError::Transient(
                             "cache single-flight leader lost before producing a result".to_string(),
                         ),

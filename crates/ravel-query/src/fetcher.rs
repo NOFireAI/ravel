@@ -101,6 +101,31 @@ pub enum FetchError {
     EtagChanged { key: String },
 }
 
+/// The error channel for a cache-routed GET's `get_or_fetch` closure
+/// (`cached_get`, below). A store failure and an etag change on a cache
+/// miss are both real failures but mean different things downstream: a
+/// store error is opaque backend trouble, while an etag change means the
+/// live GET caught the object being replaced mid-open, which is a
+/// snapshot-invalidation signal (ADR-0046 decision 4's amendment) and must
+/// surface as `FetchError::EtagChanged`, not get folded into `Store`.
+/// `Cache<E>`/`SingleFlightError<E>` require `E: Clone`, hence the `Arc`
+/// around `StoreError`, same as the pre-existing single-variant channel.
+#[derive(Debug, Clone)]
+pub enum CacheFetchError {
+    Store(std::sync::Arc<StoreError>),
+    EtagChanged { key: String },
+}
+
+/// Lets a `get_or_fetch` closure use `?` directly on a `store.get(..)` call
+/// (as `log_fetcher.rs`'s does) without an explicit `.map_err`, the same way
+/// the blanket `From<T> for Arc<T>` let the pre-existing `Cache<Arc<StoreError>>`
+/// channel do.
+impl From<StoreError> for CacheFetchError {
+    fn from(err: StoreError) -> Self {
+        CacheFetchError::Store(std::sync::Arc::new(err))
+    }
+}
+
 /// One matched series' decoded samples plus the provenance fields needed for
 /// cross-segment duplicate-sample resolution (docs/catalog-and-mvcc.md).
 #[derive(Debug, Clone)]
@@ -259,7 +284,7 @@ pub struct SegmentFetcher {
     /// to the store. Shared across clones, and safe to share across
     /// tenants: the cache key is derived per call from the caller-supplied
     /// `tenant_hash`, never fixed on the fetcher itself.
-    cache: Option<std::sync::Arc<Cache<std::sync::Arc<StoreError>>>>,
+    cache: Option<std::sync::Arc<Cache<CacheFetchError>>>,
 }
 
 impl SegmentFetcher {
@@ -281,7 +306,7 @@ impl SegmentFetcher {
     /// (decision 1). A `SegmentFetcher` built with plain `new` and never
     /// given a cache behaves exactly as it did before this cache existed.
     #[must_use]
-    pub fn with_cache(mut self, cache: std::sync::Arc<Cache<std::sync::Arc<StoreError>>>) -> Self {
+    pub fn with_cache(mut self, cache: std::sync::Arc<Cache<CacheFetchError>>) -> Self {
         self.cache = Some(cache);
         self
     }
@@ -364,16 +389,18 @@ impl SegmentFetcher {
     /// object's total size a suffix hit would need to fabricate, and total
     /// size is not otherwise recoverable from a suffix's own byte length.
     ///
-    /// A cache-routed GET does not re-check `expected_etag`. That check
-    /// exists to catch two live store reads of a supposedly immutable
-    /// object returning different bytes; a cache entry is addressed by
-    /// content hash, not by a live read, so there is nothing to compare it
-    /// against. Its correctness instead rests on the key/payload pairing
-    /// above and on the crc32c hierarchy every reader runs on every byte
-    /// range it decodes, regardless of whether those bytes came from the
-    /// store or the cache (decision 4) -- no separate re-verification is
-    /// added here because that hierarchy already runs unconditionally
-    /// downstream.
+    /// A cache-routed GET's `expected_etag` check runs, or does not, by
+    /// whether the call is a hit or a miss -- these are not the same case.
+    /// On a **hit**, no check runs: the check exists to catch two live store
+    /// reads of a supposedly immutable object returning different bytes, a
+    /// cache entry is addressed by content hash rather than by a live read,
+    /// and there is nothing to compare it against. On a **miss**,
+    /// `cached_get` performs a real live store GET exactly like the
+    /// uncached path, and that GET's etag is checked against
+    /// `expected_etag` exactly as it would be uncached: skipping it there
+    /// would silently disable the check for bytes that came straight from
+    /// the store in this same call, purely because a cache happened to be
+    /// attached. See `cached_get` for where that check runs.
     async fn guarded_get(
         &self,
         seg_ref: &SegmentRef,
@@ -391,7 +418,16 @@ impl SegmentFetcher {
         };
         if let (Some((start, end)), Some(cache)) = (cacheable_range, &self.cache) {
             return self
-                .cached_get(cache, seg_ref, tenant_hash, range, start, end, accounting)
+                .cached_get(
+                    cache,
+                    seg_ref,
+                    tenant_hash,
+                    range,
+                    start,
+                    end,
+                    expected_etag,
+                    accounting,
+                )
                 .await;
         }
 
@@ -428,15 +464,25 @@ impl SegmentFetcher {
     /// (see the crate-level test module for the resulting corruption-gate
     /// reach) turns on. Only bytes resident *before* this call asked
     /// count as a hit.
+    ///
+    /// On a miss, the store GET inside the `get_or_fetch` closure is
+    /// checked against `expected_etag` exactly like the uncached path in
+    /// `guarded_get` does -- see that function's doc comment for why a hit
+    /// skips this and a miss must not. `CacheFetchError` carries the two
+    /// outcomes (`Store` vs `EtagChanged`) separately through
+    /// `get_or_fetch`'s single error channel so this can still report
+    /// `FetchError::EtagChanged` distinctly rather than folding it into a
+    /// generic store error.
     #[allow(clippy::too_many_arguments)]
     async fn cached_get(
         &self,
-        cache: &std::sync::Arc<Cache<std::sync::Arc<StoreError>>>,
+        cache: &std::sync::Arc<Cache<CacheFetchError>>,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         range: GetRange,
         start: u64,
         end: u64,
+        expected_etag: Option<&Etag>,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, FetchError> {
         let key = seg_ref.data_object_key.as_str();
@@ -451,17 +497,31 @@ impl SegmentFetcher {
 
         let bytes = cache
             .get_or_fetch(cache_key, || async move {
-                self.store_get(key, range, accounting)
+                let got = self
+                    .store_get(key, range, accounting)
                     .await
-                    .map(|got| got.data)
-                    .map_err(std::sync::Arc::new)
+                    .map_err(|source| CacheFetchError::Store(std::sync::Arc::new(source)))?;
+                if let Some(expected) = expected_etag
+                    && &got.etag != expected
+                {
+                    return Err(CacheFetchError::EtagChanged {
+                        key: key.to_string(),
+                    });
+                }
+                Ok(got.data)
             })
             .await
-            .map_err(|err| FetchError::Store {
-                key: key.to_string(),
-                source: match err {
-                    SingleFlightError::Upstream(source) => clone_store_error(&source),
-                    SingleFlightError::LeaderLost => StoreError::Transient(
+            .map_err(|err| match err {
+                SingleFlightError::Upstream(CacheFetchError::Store(source)) => FetchError::Store {
+                    key: key.to_string(),
+                    source: clone_store_error(&source),
+                },
+                SingleFlightError::Upstream(CacheFetchError::EtagChanged { key }) => {
+                    FetchError::EtagChanged { key }
+                }
+                SingleFlightError::LeaderLost => FetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
                         "cache single-flight leader lost before producing a result".to_string(),
                     ),
                 },

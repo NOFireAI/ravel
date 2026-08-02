@@ -26,15 +26,16 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ravel_cache::{Cache, CacheLimits};
+use ravel_cache::{Cache, CacheKey, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_segment::{
-    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
-    SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
+    FooterOutcome, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds,
+    ReaderLimits, ResetHint, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
+    ValueKind, decode_catalog_v4, open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::logstream::log_stream_id;
@@ -49,6 +50,25 @@ use crate::{
 
 const RSEG_TENANT: TenantHash = TenantHash([13u8; 16]);
 const RLOG_TENANT: TenantHash = TenantHash([21u8; 16]);
+
+/// Mirrors `fetcher::coalesce_ranges` (module-private there): merges ranges
+/// whose gap is at most `max_gap`, so a test can predict exactly which
+/// merged range `ensure_ranges` fetched (and therefore cached) a target byte
+/// range under.
+fn coalesce_ranges(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+    ranges.sort_by_key(|r| r.0);
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = out.last_mut()
+            && start <= last.1.saturating_add(max_gap)
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        out.push((start, end));
+    }
+    out
+}
 
 // ---- RSEG test segment ------------------------------------------------
 
@@ -438,7 +458,8 @@ async fn corrupted_cache_hits_never_produce_wrong_results() {
         .expect("segment overlaps the query range");
 
     let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
-    let cache: Arc<Cache<Arc<StoreError>>> = Arc::new(Cache::with_corruption(limits));
+    let cache: Arc<Cache<crate::fetcher::CacheFetchError>> =
+        Arc::new(Cache::with_corruption(limits));
 
     let seg_fetcher = SegmentFetcher::new(rseg_backend).with_cache(cache.clone());
     let log_fetcher = LogSegmentFetcher::new(rlog_backend).with_cache(cache);
@@ -624,4 +645,161 @@ async fn cache_accounting_counts_hits_misses_and_bytes_without_double_counting_s
         s3_requests_after_miss,
         "a cache hit must not also record an S3 request"
     );
+}
+
+/// Same gate as [`corrupted_cache_hits_never_produce_wrong_results`], but
+/// forced onto the ranged (footer-suffix + `NeedRange` chase + coalesced
+/// page GETs) path instead of the whole-object path this test segment's
+/// size (499 bytes) would otherwise take. The reviewer that flagged this gap
+/// ran this exact shape and it failed closed correctly, but only at the
+/// footer fetch -- nothing before this test exercised a *ranged* page GET
+/// landing on corrupted bytes.
+#[tokio::test]
+async fn corrupted_cache_hits_never_produce_wrong_results_ranged_path() {
+    let (rseg_store, rseg_ref) = write_rseg_segment().await;
+    let rseg_backend: Arc<dyn ObjectStoreBackend> = rseg_store;
+    let uncached_seg_fetcher = SegmentFetcher::new(rseg_backend.clone())
+        .with_whole_object_threshold(0)
+        .with_suffix_len(64);
+    let (truth_soa, _truth_stats, truth_hist) = uncached_seg_fetcher
+        .fetch_soa_and_histograms(RSEG_TENANT, &rseg_ref, &[])
+        .await
+        .expect("uncached baseline fetch must succeed");
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache: Arc<Cache<crate::fetcher::CacheFetchError>> =
+        Arc::new(Cache::with_corruption(limits));
+    let seg_fetcher = SegmentFetcher::new(rseg_backend)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(64)
+        .with_cache(cache);
+
+    let accounting = QueryAccounting::new();
+    let miss_result = seg_fetcher
+        .fetch_soa_and_histograms_accounted(RSEG_TENANT, &rseg_ref, &[], &accounting)
+        .await;
+    assert_soa_hist_matches_or_errors(miss_result, &truth_soa, &truth_hist);
+
+    let hit_result = seg_fetcher
+        .fetch_soa_and_histograms_accounted(RSEG_TENANT, &rseg_ref, &[], &accounting)
+        .await;
+    assert_soa_hist_matches_or_errors(hit_result, &truth_soa, &truth_hist);
+}
+
+/// Isolates the one shape [`corrupted_cache_hits_never_produce_wrong_results`]
+/// cannot reach: a corrupted VAL_PAGES page behind an otherwise-clean footer
+/// and catalog. `Cache::with_corruption` corrupts every hit alike, so with a
+/// global corrupting cache the footer/catalog reads (fetched first) always
+/// fail closed before a page read is ever attempted -- the reviewer's report
+/// noted this exact gap. `Cache::insert` is deliberately a no-op on a key
+/// that already holds an entry (content-addressed: same key means same
+/// bytes, so nothing later is ever allowed to overwrite it), which rules out
+/// "warm the cache clean, then overwrite one entry" as a way to simulate a
+/// corrupted resident entry. Instead this pre-seeds the VAL page's `CacheKey`
+/// with corrupted bytes *before* any fetch ever touches it, so the real fetch
+/// gets a genuine cache hit on already-wrong bytes -- the same shape a
+/// real bit-rotted disk-tier entry would produce -- while the footer and
+/// catalog are fetched fresh from the store and cached clean.
+#[tokio::test]
+async fn corrupted_page_hit_behind_clean_footer_fails_closed() {
+    let (store, seg_ref) = write_rseg_segment().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+
+    let uncached = SegmentFetcher::new(backend.clone());
+    let (mut truth, _stats) = uncached
+        .fetch_soa(RSEG_TENANT, &seg_ref, &[])
+        .await
+        .expect("uncached fetch");
+    truth.sort_by_key(|s| s.series_id.0);
+
+    // Recompute the exact byte range `fetch_scalar_pages` will plan for the
+    // scalar run's VAL page, by decoding the catalog and re-running
+    // `plan_ranges_v4` and `coalesce_ranges` the same way the fetcher itself
+    // does (reading the object directly from the store, bypassing the
+    // fetcher/cache entirely for this calculation). The VAL_PAGES *section*
+    // the footer describes can span more than one run's page, and
+    // `ensure_ranges` coalesces the TS and VAL ranges together on an object
+    // this small, so only this exact recomputed range is the one `cached_get`
+    // will use as a `CacheKey` -- corrupting anything else would test
+    // nothing.
+    let limits = ReaderLimits::default();
+    let object = store
+        .get(&seg_ref.data_object_key, GetRange::Full)
+        .await
+        .expect("read whole object directly from the store");
+    let footer =
+        match open_from_suffix(&object.data, object.total_size, limits).expect("parse footer") {
+            FooterOutcome::Ready(loc) => loc.footer,
+            FooterOutcome::NeedRange { .. } => {
+                panic!("a whole-object suffix must resolve the footer directly")
+            }
+        };
+    const SECTION_LABEL_DICT: u32 = 1;
+    const SECTION_SERIES_IDS: u32 = 5;
+    const SECTION_SERIES_META: u32 = 6;
+    let section = |kind: u32| {
+        footer
+            .sections
+            .iter()
+            .find(|s| s.kind == kind)
+            .unwrap_or_else(|| panic!("segment has a section of kind {kind}"))
+    };
+    let dict = &object.data[section(SECTION_LABEL_DICT).offset as usize
+        ..(section(SECTION_LABEL_DICT).offset + section(SECTION_LABEL_DICT).len) as usize];
+    let ids = &object.data[section(SECTION_SERIES_IDS).offset as usize
+        ..(section(SECTION_SERIES_IDS).offset + section(SECTION_SERIES_IDS).len) as usize];
+    let meta = &object.data[section(SECTION_SERIES_META).offset as usize
+        ..(section(SECTION_SERIES_META).offset + section(SECTION_SERIES_META).len) as usize];
+    let entries = decode_catalog_v4(&footer, dict, ids, meta, limits).expect("decode catalog");
+    let scalar: Vec<_> = entries
+        .iter()
+        .filter(|e| e.entry.value_kind == ValueKind::Scalar)
+        .collect();
+    let planned = plan_ranges_v4(&footer, &scalar).expect("plan ranges");
+    let plan = planned
+        .first()
+        .expect("the scalar series has exactly one planned run");
+    let page_ranges = [
+        (plan.ts_range.0, plan.ts_range.0 + plan.ts_range.1),
+        (plan.val_range.0, plan.val_range.0 + plan.val_range.1),
+    ];
+    let coalesced = coalesce_ranges(page_ranges.to_vec(), crate::fetcher::DEFAULT_COALESCE_GAP);
+    let (start, end) = *coalesced
+        .iter()
+        .find(|(s, e)| *s <= plan.val_range.0 && plan.val_range.0 + plan.val_range.1 <= *e)
+        .expect("one coalesced group must cover the VAL range");
+    let cache_key = CacheKey::new(RSEG_TENANT.0, seg_ref.content_hash, start, end - start);
+    let clean = object.data.slice(start as usize..end as usize);
+    let corrupted: Bytes = clean.iter().map(|b| b ^ 0xA5).collect::<Vec<u8>>().into();
+
+    // Force every section onto the ranged path, so the VAL page is a
+    // cache-routed range GET under its own `CacheKey`, distinct from the
+    // footer/catalog keys -- then seed that key with corrupted bytes before
+    // the fetcher ever runs.
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache = Arc::new(Cache::new(limits));
+    cache.insert(cache_key, corrupted);
+    let fetcher = SegmentFetcher::new(backend)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(64)
+        .with_cache(cache);
+
+    match fetcher.fetch_soa(RSEG_TENANT, &seg_ref, &[]).await {
+        Err(err) => assert!(
+            matches!(err, FetchError::Corrupt { .. }),
+            "expected a page-level Corrupt error with the footer/catalog clean, got: {err:?}"
+        ),
+        Ok((mut result, _stats)) => {
+            result.sort_by_key(|s| s.series_id.0);
+            for (a, b) in result.iter().zip(truth.iter()) {
+                assert!(
+                    !soa_bits_eq(a, b),
+                    "corrupted VAL bytes must not silently decode to the correct result"
+                );
+            }
+            panic!(
+                "corrupted VAL_PAGES bytes decoded without a typed error instead of failing closed: {result:?}"
+            );
+        }
+    }
 }

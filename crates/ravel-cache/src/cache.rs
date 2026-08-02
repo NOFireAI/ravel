@@ -114,10 +114,18 @@ where
         )
     }
 
-    /// Fetch `key`, consulting the cache first and collapsing concurrent
-    /// misses on the same key into one call to `fetch` (ADR-0046 decision
-    /// 5). On a leader miss that succeeds, the result is admitted to the
-    /// cache before being returned.
+    /// Collapses concurrent misses on the same key into one call to `fetch`
+    /// (ADR-0046 decision 5) and, on a leader miss that succeeds, admits the
+    /// result before returning it.
+    ///
+    /// Does not consult the cache itself first: both call sites in
+    /// `ravel-query` already call `get` to decide their own hit/miss
+    /// accounting (ADR-0044's `QueryAccounting` needs that branch either
+    /// way) and call this only on that miss. An earlier version re-checked
+    /// here too, so the *same* logical miss recorded two `CacheMetrics`
+    /// misses -- one from the caller's `get`, one from this method's own --
+    /// corrupting the request-hit-rate SLI ADR-0046 lists. Call `get`
+    /// yourself first if you need the hit path; this is the miss-only half.
     pub async fn get_or_fetch<F, Fut>(
         &self,
         key: CacheKey,
@@ -127,10 +135,6 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
     {
-        if let Some(bytes) = self.get(&key) {
-            return Ok(bytes);
-        }
-
         let (result, role) = self.single_flight.run(key, fetch).await;
         match (&result, role) {
             (Ok(bytes), Role::Leader) => self.insert(key, bytes.clone()),
