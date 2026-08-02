@@ -118,8 +118,10 @@ async fn age_triggered_flush_lands_below_size_threshold() {
 }
 
 fn norm_log_record(ts_ns: i64) -> NormalizedLogRecord {
-    let resource: Vec<(String, AttrValue)> =
-        vec![("service.name".to_string(), AttrValue::Str("api".to_string()))];
+    let resource: Vec<(String, AttrValue)> = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
     let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
     let stream_id = log_stream_id(&resource, "scope", "", &scope_attrs);
     let stream_attrs = stream_attrs_bytes(&resource, "scope", "", &scope_attrs);
@@ -175,7 +177,13 @@ async fn nonpositive_flush_clock_fails_loud() {
         };
         let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
         let tenant = tenant("acme");
-        let points = vec![make_point(&tenant, "cpu_usage", &[("host", "a")], 1_000, 1.0)];
+        let points = vec![make_point(
+            &tenant,
+            "cpu_usage",
+            &[("host", "a")],
+            1_000,
+            1.0,
+        )];
 
         let err = router
             .write(tenant, points, WriteMode::Strict, Duration::from_secs(5))

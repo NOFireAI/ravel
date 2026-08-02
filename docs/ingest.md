@@ -64,8 +64,14 @@ Loop over `select!`:
   (hash collision) rejects the point with a typed error and increments
   the series_id_collisions counter instead of silently merging
   (ADR-0005 fail-loud rule; issue #63).
-- flush tick (interval default 200 ms): flush if `oldest_ns` older than
-  `max_flush_delay` (default 500 ms) and buffer non-empty.
+- flush tick (interval default 200 ms): flush if `oldest_ns` older than an
+  age threshold, and buffer non-empty. The threshold is `max_flush_delay`
+  (default 500 ms) when the buffer has a strict-mode waiter or already holds
+  at least `min_flush_bytes` (default 64 KiB); otherwise the buffer is idle
+  and the threshold is `max_flush_delay_idle` (default 10 s) instead
+  (ADR-0051 section 7). Strict-mode ack latency is unaffected, since a
+  strict write always leaves a waiter in the buffer for its whole flush
+  window; only a low-volume buffered-mode tenant's PUT cadence changes.
 - channel closed (router dropped): flush the remaining buffer before
   exiting rather than discarding it; points that still fail to flush are
   counted, never silently lost (issue #64).
@@ -86,6 +92,14 @@ Flush (still inside the actor; ingest-ordering per shard is the point):
 4. Send token to all waiters; clear buffer; seq += 1.
 5. On permanent failure: error to all waiters (client retries; nothing was
    acknowledged), drop the buffer (documented at-least-once), count it.
+
+The commit record's `ingest_hour_bucket` is derived from the flush-open
+clock reading at step 1, before the segment is built. A non-positive or
+non-representable reading fails the flush the same way a segment-build
+error does (typed `SegmentBuild` error, every waiter acked with it, no
+object written) rather than defaulting to bucket 0 (ADR-0051 section 7,
+issue #494): a fallback bucket would make the data undiscoverable by hour
+with no trace of the failure.
 
 The PUTs run inline in the actor for Phase 1: simple, and per-shard flush
 ordering falls out. If PUT latency limits per-shard throughput, Phase 2 can
@@ -231,6 +245,8 @@ carries max token per shard).
 | channel depth | 256 msgs |
 | target_bytes | 8 MiB |
 | max_flush_delay | 500 ms |
+| max_flush_delay_idle | 10 s |
+| min_flush_bytes | 64 KiB |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight strict requests per conn | transport-level (tonic/axum concurrency limits) |
 
