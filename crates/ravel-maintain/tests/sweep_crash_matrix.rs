@@ -977,7 +977,8 @@ async fn orphan_gc_respects_live_records_and_age_gate() {
             bucket.shard,
         )
         .await
-        .expect("orphan sweep");
+        .expect("orphan sweep")
+        .deleted;
         assert_eq!(n, 0, "live inputs are never orphaned");
         assert_eq!(l0_data_count(&store, &bucket).await, 2);
 
@@ -998,7 +999,8 @@ async fn orphan_gc_respects_live_records_and_age_gate() {
             bucket.shard,
         )
         .await
-        .expect("orphan sweep");
+        .expect("orphan sweep")
+        .deleted;
         assert_eq!(n, 0, "orphan younger than the gate survives");
 
         // Past the gate: the orphan is collected; the still-committed object
@@ -1014,7 +1016,8 @@ async fn orphan_gc_respects_live_records_and_age_gate() {
             bucket.shard,
         )
         .await
-        .expect("orphan sweep");
+        .expect("orphan sweep")
+        .deleted;
         assert_eq!(n, 1, "orphan collected past the gate");
         assert_eq!(
             l0_data_count(&store, &bucket).await,

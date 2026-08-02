@@ -596,3 +596,218 @@ fn format_shard(shard: u32) -> Result<String> {
     }
     Ok(format!("{shard:04}"))
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use bytes::Bytes;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+    use crate::clock::FixedClock;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0u8; 16])
+    }
+
+    /// A record-less `l0/` data object at a unique identity: no commit record
+    /// is ever written for it, so it is an orphan candidate as soon as it
+    /// clears the age gate.
+    async fn put_orphan(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        seq: u64,
+    ) {
+        let writer_id = Uuid::from_u128(u128::from(seq) + 1);
+        let content_hash = [7u8; 32];
+        let key = keys::data_key(tenant, signal, shard, writer_id, 1, seq, &content_hash)
+            .expect("valid data key");
+        store
+            .put(&key, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed put");
+    }
+
+    /// `MemoryStore`'s fake clock defaults to `0`, so every seeded object's
+    /// `last_modified` is `0`; setting the injected clock just past the
+    /// orphan age gate makes every seeded object old enough without touching
+    /// the store's clock at all.
+    fn aged_clock(config: &CompactorConfig) -> FixedClock {
+        FixedClock::new(config.orphan_age_gate_ns() + 1)
+    }
+
+    #[tokio::test]
+    async fn mass_orphan_trips_breaker_and_deletes_nothing() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 1;
+        let store = MemoryStore::new();
+        for seq in 0..60u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let err = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect_err("60 orphans out of 60 listed objects trips the breaker");
+        match err {
+            MaintainError::OrphanBreakerTripped {
+                candidates,
+                l0_objects_listed,
+                min_count,
+                max_ratio,
+                ..
+            } => {
+                assert_eq!(candidates, 60);
+                assert_eq!(l0_objects_listed, 60);
+                assert_eq!(min_count, config.orphan_breaker_min_count);
+                assert_eq!(max_ratio, config.orphan_breaker_max_ratio);
+            }
+            other => panic!("expected OrphanBreakerTripped, got {other:?}"),
+        }
+
+        let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            60,
+            "a tripped breaker deletes nothing at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn below_threshold_pass_still_deletes_normally() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 2;
+        let store = MemoryStore::new();
+        for seq in 0..3u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("3 candidates is below orphan_breaker_min_count: no trip");
+        assert_eq!(outcome.deleted, 3);
+        assert!(!outcome.breaker_overridden);
+
+        let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "all orphans deleted normally");
+    }
+
+    #[tokio::test]
+    async fn forced_pass_deletes_and_reports_override() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 4;
+        let store = MemoryStore::new();
+        for seq in 0..60u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig {
+            force_orphan_gc: true,
+            ..CompactorConfig::default()
+        };
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("force_orphan_gc overrides a would-have-tripped breaker");
+        assert_eq!(outcome.deleted, 60);
+        assert!(
+            outcome.breaker_overridden,
+            "reports that it deleted under override"
+        );
+
+        let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "forced pass deletes everything");
+    }
+
+    #[tokio::test]
+    async fn batched_reverify_lists_commit_prefix_once_per_pass() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 3;
+        // Four candidates, comfortably below orphan_breaker_min_count, so the
+        // breaker never interferes with either half of this test.
+        let config = CompactorConfig::default();
+
+        // The second commit-prefix LIST is the batched re-verify (ADR-0048
+        // decision 5): faulting it aborts the pass before any delete, which
+        // proves it happens exactly once, not zero times.
+        {
+            let mem = MemoryStore::new();
+            for seq in 0..4u64 {
+                put_orphan(&mem, &tenant, signal, shard, seq).await;
+            }
+            let clock = aged_clock(&config);
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains("/c/")
+                    .with_occurrence(Occurrence::Nth(2)),
+            );
+            let store = FaultStore::new(mem, plan);
+
+            let err = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+                .await
+                .expect_err("the batched re-verify LIST faults the pass");
+            assert!(matches!(err, MaintainError::Store(_)));
+            assert_eq!(
+                store.fault_count(Op::List, FaultKind::Timeout),
+                1,
+                "exactly the batched re-verify LIST faulted"
+            );
+
+            let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                remaining.len(),
+                4,
+                "nothing deleted when the re-verify faults"
+            );
+        }
+
+        // A third commit-prefix LIST never happens, no matter how many
+        // candidates survived to the delete phase: the re-verify is batched
+        // once per pass, not once per candidate.
+        {
+            let mem = MemoryStore::new();
+            for seq in 0..4u64 {
+                put_orphan(&mem, &tenant, signal, shard, seq).await;
+            }
+            let clock = aged_clock(&config);
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains("/c/")
+                    .with_occurrence(Occurrence::Nth(3)),
+            );
+            let store = FaultStore::new(mem, plan);
+
+            let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+                .await
+                .expect("no third commit-prefix LIST: the pass completes");
+            assert_eq!(outcome.deleted, 4);
+            assert_eq!(
+                store.fault_count(Op::List, FaultKind::Timeout),
+                0,
+                "batched: only two commit-prefix LISTs per pass, regardless of candidate count"
+            );
+        }
+    }
+}
