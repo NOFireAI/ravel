@@ -37,6 +37,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver,
+        mtls_listener: None,
         fold_tenants: Vec::new(),
         fold: FoldTaskConfig {
             enabled: false,
