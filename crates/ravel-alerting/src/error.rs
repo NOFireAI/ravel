@@ -23,6 +23,16 @@ pub enum AlertError {
         result: &'static str,
     },
 
+    /// A [`crate::Rule`] failed a structural validation check
+    /// ([`crate::Rule::validate`]) and cannot be evaluated safely: an empty
+    /// `rule_id` or query text, or a condition whose result shape cannot apply
+    /// to the rule's query language. `reason` names the specific invariant.
+    #[error("invalid rule {rule_id:?}: {reason}")]
+    InvalidRule {
+        rule_id: String,
+        reason: &'static str,
+    },
+
     /// A stored alert record could not be decoded back into an [`AlertRecord`]:
     /// a required attr was missing or carried the wrong value type. The message
     /// names the offending field.

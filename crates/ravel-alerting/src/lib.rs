@@ -70,4 +70,4 @@ pub use record::{
     write_alert_record,
 };
 pub use rule::{Rule, RuleCondition, RuleQuery, ThresholdOp};
-pub use state::{AlertState, StateTransition, evaluate_transition};
+pub use state::{AlertState, StateTransition, evaluate_suppression, evaluate_transition};

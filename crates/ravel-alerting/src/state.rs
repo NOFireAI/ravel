@@ -174,6 +174,43 @@ pub fn evaluate_transition(
     }
 }
 
+/// Explicitly enters or leaves the suppressed state in response to an external
+/// silence request, independent of any query result.
+///
+/// This is the entry/exit API for [`AlertState::Suppressed`] that
+/// [`evaluate_transition`] deliberately never drives on its own: that function
+/// only *preserves* the suppressed state via `keep`, because a silence is an
+/// operator action, not a condition-driven one. Suppression is orthogonal to
+/// the condition machine, so it is a separate function rather than an extra
+/// input to `evaluate_transition`; the condition-driven transitions are left
+/// exactly as they were.
+///
+/// - `suppress == true`: enter `Suppressed`. Writes a record unless the alert
+///   is already suppressed (a repeated suppress is a no-op).
+/// - `suppress == false`: leave `Suppressed`, writing a `Resolved` record. The
+///   alert re-enters the condition-driven machine as if freshly resolved, so
+///   the next [`evaluate_transition`] tick re-arms it normally if the condition
+///   still holds. A prior state that is not `Suppressed` is left untouched (an
+///   unsuppress of an alert that is not suppressed is a no-op).
+///
+/// A request that would not change the state writes no record (`keep`), so both
+/// a repeated suppress and a redundant unsuppress are idempotent, mirroring how
+/// `evaluate_transition` writes only on a genuine transition (ADR-0043
+/// decision 4).
+pub fn evaluate_suppression(prior: Option<&AlertRecord>, suppress: bool) -> StateTransition {
+    let prior_state = prior.map(|r| r.state);
+    match (suppress, prior_state) {
+        // Already suppressed: nothing to write.
+        (true, Some(AlertState::Suppressed)) => StateTransition::keep(AlertState::Suppressed),
+        // Enter suppression from any other state, or for a never-seen alert.
+        (true, _) => StateTransition::write(AlertState::Suppressed),
+        // Leave suppression: resolve so the condition machine re-arms cleanly.
+        (false, Some(AlertState::Suppressed)) => StateTransition::write(AlertState::Resolved),
+        // Not suppressed: unsuppress is a no-op, state left as it was.
+        (false, other) => StateTransition::keep(other.unwrap_or(AlertState::Resolved)),
+    }
+}
+
 /// True when `for_duration` has elapsed since the pending record's timestamp.
 /// Clock skew (a `now_ns` earlier than the pending record) counts as zero
 /// elapsed, never negative.
@@ -391,6 +428,83 @@ mod tests {
         let t = evaluate_transition(&r, Some(&p), true, 90 * SEC);
         assert_eq!(t.next_state, AlertState::Pending);
         assert!(!t.write_record);
+    }
+
+    #[test]
+    fn suppress_writes_a_suppressed_record_from_firing() {
+        let p = prior(AlertState::Firing, 100 * SEC);
+        let t = evaluate_suppression(Some(&p), true);
+        assert_eq!(
+            t,
+            StateTransition {
+                next_state: AlertState::Suppressed,
+                write_record: true,
+            }
+        );
+    }
+
+    #[test]
+    fn suppress_of_a_never_seen_alert_writes_suppressed() {
+        let t = evaluate_suppression(None, true);
+        assert_eq!(
+            t,
+            StateTransition {
+                next_state: AlertState::Suppressed,
+                write_record: true,
+            }
+        );
+    }
+
+    #[test]
+    fn suppress_is_idempotent_when_already_suppressed() {
+        let p = prior(AlertState::Suppressed, 100 * SEC);
+        let t = evaluate_suppression(Some(&p), true);
+        assert_eq!(
+            t,
+            StateTransition {
+                next_state: AlertState::Suppressed,
+                write_record: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unsuppress_resolves_and_writes() {
+        let p = prior(AlertState::Suppressed, 100 * SEC);
+        let t = evaluate_suppression(Some(&p), false);
+        assert_eq!(
+            t,
+            StateTransition {
+                next_state: AlertState::Resolved,
+                write_record: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unsuppress_of_a_non_suppressed_alert_is_a_noop() {
+        // Unsuppressing a firing alert changes nothing and writes no record.
+        let p = prior(AlertState::Firing, 100 * SEC);
+        let t = evaluate_suppression(Some(&p), false);
+        assert_eq!(
+            t,
+            StateTransition {
+                next_state: AlertState::Firing,
+                write_record: false,
+            }
+        );
+    }
+
+    #[test]
+    fn suppress_api_does_not_change_evaluate_transitions_preserve_behavior() {
+        // The new API adds entry/exit, but the existing "preserve on keep"
+        // behavior of evaluate_transition for a suppressed alert is unchanged:
+        // condition-driven ticks still neither write nor leave Suppressed.
+        let p = prior(AlertState::Suppressed, 100 * SEC);
+        let met = evaluate_transition(&rule(None), Some(&p), true, 200 * SEC);
+        assert_eq!(met, StateTransition::keep(AlertState::Suppressed));
+        let cleared = evaluate_transition(&rule(None), Some(&p), false, 200 * SEC);
+        assert_eq!(cleared, StateTransition::keep(AlertState::Suppressed));
     }
 
     #[test]
