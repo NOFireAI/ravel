@@ -35,6 +35,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
+        otap: false,
     };
     ravel_server::start(config, store, Arc::new(StoreMetrics::default()))
         .await

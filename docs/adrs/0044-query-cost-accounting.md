@@ -169,9 +169,17 @@ today, so a slow query cannot be attributed to a phase.
 - Every component that reads the store on a query's behalf takes a
   `QueryAccounting` parameter. This is a wide but mechanical signature
   change across `ravel-catalog`, `ravel-query`, and `ravel-sql`.
-- `/metrics` is a new public surface. It exposes no tenant-identifying
-  string beyond the tenant hash that already appears in object keys, and
-  it is subject to the same authentication as any other route.
+- `/metrics` is a new public surface, and it is **unauthenticated**, like
+  `/healthz` and `/readyz`. Ravel has no global auth layer: every other
+  route authenticates inside its own handler through the tenant resolver,
+  and a scrape has no tenant to resolve. Operators must not expose the
+  listener to untrusted networks.
+
+  This is safe only while no sample carries a `tenant_hash`. The moment
+  per-tenant series exist, an unauthenticated scrape discloses one
+  tenant's volumes and error rates to anyone who can reach the port.
+  Per-tenant series are therefore blocked on an authentication decision
+  for this route, recorded on the issue that adds them.
 - The estimate is recorded but never enforced. Nothing in this change can
   reject a query that runs today.
 - The cost model's weights are not fixed here. Recording requests, bytes,

@@ -62,6 +62,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
 use prost::Message;
+use ravel_object_store::instrument::StoreMetrics;
 use ravel_object_store::memory::MemoryStore;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
@@ -107,7 +108,7 @@ async fn start_test_server() -> ravel_server::Running {
         // would be UNIMPLEMENTED.
         otap: true,
     };
-    ravel_server::start(config, store)
+    ravel_server::start(config, store, Arc::new(StoreMetrics::default()))
         .await
         .expect("server starts")
 }

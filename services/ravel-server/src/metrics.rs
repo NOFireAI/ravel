@@ -378,11 +378,18 @@ fn render_store_family(out: &mut String, mode: Mode, snapshot: &StoreMetricsSnap
             &[Label::Mode(mode), Label::Op(op)],
             op_snapshot.latency_nanos_total as f64 / 1_000_000_000.0,
         );
+        // `_count` must equal the `+Inf` bucket, so it is read from the same
+        // cumulative array rather than from `op_snapshot.calls`. `snapshot()`
+        // is a scrape, not a consistent cut: `OpMetrics::record` increments
+        // `calls` before the latency bucket, and `snapshot()` loads the
+        // buckets before `calls`, so a scrape concurrent with a call would
+        // otherwise report `_count` greater than `+Inf` and violate the
+        // exposition format.
         write_sample(
             out,
             "ravel_store_latency_seconds_count",
             &[Label::Mode(mode), Label::Op(op)],
-            op_snapshot.calls,
+            cumulative[LATENCY_BUCKET_COUNT - 1],
         );
     }
 }
@@ -922,6 +929,8 @@ mod tests {
         let mut declared_types: HashSet<String> = HashSet::new();
         let mut bucket_state: std::collections::HashMap<String, (Vec<u64>, u64)> =
             std::collections::HashMap::new();
+        let mut count_state: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
 
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("# TYPE ") {
@@ -962,11 +971,21 @@ mod tests {
             );
 
             let mut le = None;
+            // The series key for a histogram is its label set with `le`
+            // removed, so every bucket of one series lands in one entry. It is
+            // built from the parsed pairs, never by string-replacing a Debug
+            // rendering of them: an earlier version did that, never matched,
+            // gave every bucket its own entry, and made the non-decreasing
+            // assertion below unreachable.
+            let mut series_key_pairs: Vec<&str> = Vec::new();
             if let Some(labels) = labels {
                 assert!(!labels.is_empty(), "empty label block: {line}");
                 for pair in labels.split(',') {
                     let (key, quoted) = pair.split_once('=').expect("label is key=value");
                     assert!(!key.is_empty(), "empty label key: {line}");
+                    if key != "le" {
+                        series_key_pairs.push(pair);
+                    }
                     assert!(
                         quoted.starts_with('"') && quoted.ends_with('"') && quoted.len() >= 2,
                         "label value not quoted: {line}"
@@ -980,11 +999,7 @@ mod tests {
             if name.ends_with("_bucket") {
                 let le = le.expect("a _bucket sample carries le");
                 let entry = bucket_state
-                    .entry(
-                        format!("{name}{labels:?}")
-                            .replace("le=\\\"", "")
-                            .replace(&format!(",le=\"{le}\""), ""),
-                    )
+                    .entry(format!("{name}{{{}}}", series_key_pairs.join(",")))
                     .or_insert_with(|| (Vec::new(), 0));
                 let value: u64 = value.parse().expect("bucket value is an integer");
                 if let Some(last) = entry.0.last() {
@@ -998,12 +1013,46 @@ mod tests {
                     entry.1 = value;
                 }
             }
+
+            if name.ends_with("_count") {
+                let key = format!(
+                    "{}_bucket{{{}}}",
+                    name.trim_end_matches("_count"),
+                    series_key_pairs.join(",")
+                );
+                count_state.insert(key, value.parse::<u64>().expect("count is an integer"));
+            }
         }
 
         assert!(
             declared_types.contains("ravel_store_latency_seconds"),
             "histogram TYPE line missing"
         );
+
+        // Every histogram series must have been seen, and its `+Inf` bucket
+        // must equal its `_count`. Prometheus requires this, and reading
+        // `_count` from a different field than the bucket array is how it
+        // gets violated under a concurrent scrape.
+        assert!(
+            !bucket_state.is_empty(),
+            "no histogram series parsed; the series key is wrong and every \
+             assertion below it is unreachable"
+        );
+        for (series, (values, inf)) in &bucket_state {
+            assert!(
+                values.len() > 1,
+                "series {series} has {} bucket(s): the series key is not \
+                 grouping buckets, so the non-decreasing check is vacuous",
+                values.len()
+            );
+            let count = count_state
+                .get(series)
+                .unwrap_or_else(|| panic!("no _count sample for histogram series {series}"));
+            assert_eq!(
+                *inf, *count,
+                "+Inf bucket must equal _count for series {series}"
+            );
+        }
     }
 
     #[test]
