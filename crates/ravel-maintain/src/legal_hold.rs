@@ -281,9 +281,24 @@ async fn load_hold_records(
 /// legal-hold record. A record marked `legal_hold` but missing `hold.scope` or
 /// carrying an unknown `hold.op` is an invariant breach.
 fn parse_hold_record(row: &LogRecord) -> Result<Option<HoldRecord>> {
-    match str_attr(row, ATTR_KIND) {
-        Some(KIND_LEGAL_HOLD) => {}
-        _ => return Ok(None),
+    // Look up the raw `kind` value, not through `str_attr`: `str_attr` returns
+    // `None` both when the attr is absent and when it is present with a
+    // non-string type, collapsing two cases that must stay distinct. Absent (or
+    // a different string, e.g. `query` from a query-audit record) legitimately
+    // means "not a legal-hold record". But a `kind` present with a non-string
+    // type is a malformed record masquerading near the legal-hold keyspace;
+    // treating it as "not a hold" would silently drop a real hold from the fold
+    // and un-protect held data with no error anywhere, so it is an invariant
+    // breach.
+    match raw_attr(row, ATTR_KIND) {
+        None => return Ok(None),
+        Some(AttrValue::Str(s)) if s == KIND_LEGAL_HOLD => {}
+        Some(AttrValue::Str(_)) => return Ok(None),
+        Some(other) => {
+            return Err(MaintainError::Invariant(format!(
+                "legal-hold record has non-string kind attr {other:?}"
+            )));
+        }
     }
     let scope = str_attr(row, ATTR_SCOPE)
         .ok_or_else(|| MaintainError::Invariant("legal-hold record missing hold.scope".into()))?;
@@ -301,6 +316,13 @@ fn parse_hold_record(row: &LogRecord) -> Result<Option<HoldRecord>> {
         op,
         ts_ns: row.ts_ns,
     }))
+}
+
+/// The raw [`AttrValue`] of an `attrs` entry, or `None` if the key is absent.
+/// Unlike [`str_attr`], this preserves the value's type so a present-but-wrong
+/// type can be told apart from an absent key.
+fn raw_attr<'a>(row: &'a LogRecord, key: &str) -> Option<&'a AttrValue> {
+    row.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
 /// The value of a string `attrs` entry, or `None` if absent or non-string.
@@ -326,6 +348,14 @@ pub async fn write_hold_set(
     scope: &str,
     reason: &str,
 ) -> Result<()> {
+    // An empty scope is a prefix of every key (every match here is
+    // `key.starts_with(scope)`), so it would silently hold the entire tenant.
+    // Reject before writing anything.
+    if scope.is_empty() {
+        return Err(MaintainError::Invariant(
+            "legal-hold set scope must not be empty".into(),
+        ));
+    }
     let mut attrs = vec![
         (
             ATTR_KIND.to_string(),
@@ -351,6 +381,13 @@ pub async fn write_hold_clear(
     now_ns: i64,
     scope: &str,
 ) -> Result<()> {
+    // Empty scope would match every key; reject before writing anything (see
+    // `write_hold_set`).
+    if scope.is_empty() {
+        return Err(MaintainError::Invariant(
+            "legal-hold clear scope must not be empty".into(),
+        ));
+    }
     let attrs = vec![
         (
             ATTR_KIND.to_string(),
@@ -446,6 +483,56 @@ mod tests {
         // set and clear at the exact same ts: the object stays protected.
         let active = fold_active_holds(vec![clear("t/a/", 100), set("t/a/", 100)]);
         assert_eq!(active, vec!["t/a/".to_string()]);
+    }
+
+    /// Build a bare [`LogRecord`] carrying only the given attrs, enough to drive
+    /// [`parse_hold_record`] directly.
+    fn record_with_attrs(attrs: Vec<(String, AttrValue)>) -> LogRecord {
+        LogRecord {
+            stream_id: LogStreamId([0u8; 16]),
+            stream_attrs: Vec::new(),
+            ts_ns: 42,
+            observed_ts_ns: 42,
+            severity_num: 9,
+            severity_text: "INFO".to_string(),
+            body: String::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs,
+        }
+    }
+
+    #[test]
+    fn parse_kind_non_string_is_invariant_error() {
+        // A `kind` attr present with a non-Str value is a malformed record near
+        // the legal-hold keyspace: it must be an error, never a silent skip that
+        // could drop a real hold from the fold.
+        let row = record_with_attrs(vec![(ATTR_KIND.to_string(), AttrValue::I64(1))]);
+        let err = parse_hold_record(&row).expect_err("non-string kind must error");
+        assert!(matches!(err, MaintainError::Invariant(_)));
+    }
+
+    #[test]
+    fn parse_kind_absent_or_other_string_is_none() {
+        // Absent kind, and a different string value, both legitimately mean "not
+        // a legal-hold record" and must fold away as Ok(None), not error.
+        let absent = record_with_attrs(vec![(ATTR_OP.to_string(), AttrValue::Str(OP_SET.into()))]);
+        assert!(
+            parse_hold_record(&absent)
+                .expect("absent kind is Ok(None)")
+                .is_none()
+        );
+
+        let other = record_with_attrs(vec![(
+            ATTR_KIND.to_string(),
+            AttrValue::Str("query".into()),
+        )]);
+        assert!(
+            parse_hold_record(&other)
+                .expect("other-string kind is Ok(None)")
+                .is_none()
+        );
     }
 
     #[test]
