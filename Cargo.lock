@@ -4347,6 +4347,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-codec"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "ravel-commit"
 version = "0.1.0"
 dependencies = [
@@ -4421,6 +4431,7 @@ dependencies = [
  "criterion",
  "proptest",
  "prost",
+ "ravel-codec",
  "ravel-proto",
  "ravel-types",
  "thiserror",

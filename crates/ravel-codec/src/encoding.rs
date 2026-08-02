@@ -3,9 +3,9 @@
 //! applicable codec and keeps the smallest; the tag makes the choice
 //! self-describing. Every decoder is untrusted: it validates against the
 //! caller-supplied element count, consumes exactly its bytes, and returns a
-//! typed [`LogSegError`] on any violation, never panicking.
+//! typed [`CodecError`] on any violation, never panicking.
 
-use crate::error::LogSegError;
+use crate::error::CodecError;
 use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
 
 /// Encoding tag registry (frozen contract, docs/log-segment-format.md).
@@ -25,7 +25,7 @@ pub enum Enc {
 
 impl Enc {
     /// Maps a stored tag byte to an [`Enc`]; an unknown byte is `Corrupted`.
-    pub fn from_u8(v: u8) -> Result<Enc, LogSegError> {
+    pub fn from_u8(v: u8) -> Result<Enc, CodecError> {
         Ok(match v {
             1 => Enc::Plain,
             2 => Enc::Constant,
@@ -36,7 +36,7 @@ impl Enc {
             7 => Enc::Dict,
             8 => Enc::Bitmap,
             9 => Enc::FixedWidth,
-            other => return Err(LogSegError::Corrupted(format!("unknown enc tag {other}"))),
+            other => return Err(CodecError::Corrupted(format!("unknown enc tag {other}"))),
         })
     }
 
@@ -53,11 +53,11 @@ fn cap(count: usize) -> usize {
 }
 
 /// Asserts a decoder consumed exactly the bytes it was given.
-fn expect_consumed(pos: usize, len: usize) -> Result<(), LogSegError> {
+fn expect_consumed(pos: usize, len: usize) -> Result<(), CodecError> {
     if pos == len {
         Ok(())
     } else {
-        Err(LogSegError::Corrupted(format!(
+        Err(CodecError::Corrupted(format!(
             "codec left {} of {len} bytes unconsumed",
             len.saturating_sub(pos)
         )))
@@ -102,24 +102,22 @@ pub(crate) fn unpack_bits(
     buf: &[u8],
     count: usize,
     bit_width: u32,
-) -> Result<Vec<u64>, LogSegError> {
+) -> Result<Vec<u64>, CodecError> {
     if bit_width > 64 {
-        return Err(LogSegError::Corrupted(format!(
-            "bit_width {bit_width} > 64"
-        )));
+        return Err(CodecError::Corrupted(format!("bit_width {bit_width} > 64")));
     }
     if bit_width == 0 {
         if !buf.is_empty() {
-            return Err(LogSegError::Corrupted("bit_width 0 with payload".into()));
+            return Err(CodecError::Corrupted("bit_width 0 with payload".into()));
         }
         return Ok(vec![0u64; count]);
     }
     let need_bits = (count as u64)
         .checked_mul(u64::from(bit_width))
-        .ok_or_else(|| LogSegError::Corrupted("packed length overflow".into()))?;
+        .ok_or_else(|| CodecError::Corrupted("packed length overflow".into()))?;
     let need = need_bits.div_ceil(8);
     if buf.len() as u64 != need {
-        return Err(LogSegError::Corrupted(format!(
+        return Err(CodecError::Corrupted(format!(
             "packed length {} != {need}",
             buf.len()
         )));
@@ -271,7 +269,7 @@ pub fn encode_i64(values: &[i64]) -> (Enc, Vec<u8>) {
 }
 
 /// Decodes `count` i64 values encoded with `enc`.
-pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, LogSegError> {
+pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, CodecError> {
     let mut pos = 0usize;
     let out = match enc {
         Enc::Plain => {
@@ -294,16 +292,16 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, LogS
                 let run = get_uvarint(bytes, &mut pos)?;
                 total = total
                     .checked_add(run)
-                    .ok_or_else(|| LogSegError::Corrupted("rle run overflow".into()))?;
+                    .ok_or_else(|| CodecError::Corrupted("rle run overflow".into()))?;
                 if total > count as u64 {
-                    return Err(LogSegError::Corrupted("rle exceeds count".into()));
+                    return Err(CodecError::Corrupted("rle exceeds count".into()));
                 }
                 for _ in 0..run {
                     out.push(v);
                 }
             }
             if total != count as u64 {
-                return Err(LogSegError::Corrupted("rle short of count".into()));
+                return Err(CodecError::Corrupted("rle short of count".into()));
             }
             out
         }
@@ -316,7 +314,7 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, LogS
                     let delta = get_ivarint(bytes, &mut pos)?;
                     acc = acc
                         .checked_add(delta)
-                        .ok_or_else(|| LogSegError::Corrupted("delta overflow".into()))?;
+                        .ok_or_else(|| CodecError::Corrupted("delta overflow".into()))?;
                     out.push(acc);
                 }
             }
@@ -331,16 +329,16 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, LogS
                     let mut prev_delta = get_ivarint(bytes, &mut pos)?;
                     value = value
                         .checked_add(prev_delta)
-                        .ok_or_else(|| LogSegError::Corrupted("double-delta overflow".into()))?;
+                        .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
                     out.push(value);
                     for _ in 2..count {
                         let dod = get_ivarint(bytes, &mut pos)?;
-                        prev_delta = prev_delta.checked_add(dod).ok_or_else(|| {
-                            LogSegError::Corrupted("double-delta overflow".into())
-                        })?;
-                        value = value.checked_add(prev_delta).ok_or_else(|| {
-                            LogSegError::Corrupted("double-delta overflow".into())
-                        })?;
+                        prev_delta = prev_delta
+                            .checked_add(dod)
+                            .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
+                        value = value
+                            .checked_add(prev_delta)
+                            .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
                         out.push(value);
                     }
                 }
@@ -352,7 +350,7 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, LogS
             let bit_width = u32::from(
                 *bytes
                     .get(pos)
-                    .ok_or_else(|| LogSegError::Corrupted("for truncated".into()))?,
+                    .ok_or_else(|| CodecError::Corrupted("for truncated".into()))?,
             );
             pos += 1;
             let offsets = unpack_bits(&bytes[pos..], count, bit_width)?;
@@ -363,7 +361,7 @@ pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, LogS
                 .collect()
         }
         other => {
-            return Err(LogSegError::Corrupted(format!(
+            return Err(CodecError::Corrupted(format!(
                 "enc {other:?} is not an integer codec"
             )));
         }
@@ -389,9 +387,9 @@ pub fn encode_bitmap(bits: &[bool]) -> Vec<u8> {
 
 /// Decodes `count` bools from a bitmap page. The payload length must be
 /// exactly `ceil(count / 8)`.
-pub fn decode_bitmap(bytes: &[u8], count: usize) -> Result<Vec<bool>, LogSegError> {
+pub fn decode_bitmap(bytes: &[u8], count: usize) -> Result<Vec<bool>, CodecError> {
     if bytes.len() != count.div_ceil(8) {
-        return Err(LogSegError::Corrupted(format!(
+        return Err(CodecError::Corrupted(format!(
             "bitmap length {} != {}",
             bytes.len(),
             count.div_ceil(8)
@@ -423,17 +421,17 @@ fn decode_dict_ids(
     pos: &mut usize,
     count: usize,
     dict_count: usize,
-) -> Result<Vec<u64>, LogSegError> {
+) -> Result<Vec<u64>, CodecError> {
     let bit_width = u32::from(
         *buf.get(*pos)
-            .ok_or_else(|| LogSegError::Corrupted("dict ids truncated".into()))?,
+            .ok_or_else(|| CodecError::Corrupted("dict ids truncated".into()))?,
     );
     *pos += 1;
     let ids = unpack_bits(&buf[*pos..], count, bit_width)?;
     *pos = buf.len();
     for &id in &ids {
         if id >= dict_count as u64 {
-            return Err(LogSegError::Corrupted(format!(
+            return Err(CodecError::Corrupted(format!(
                 "dict id {id} >= dict_count {dict_count}"
             )));
         }
@@ -494,7 +492,7 @@ pub fn encode_strings(values: &[&[u8]]) -> (Enc, Vec<u8>) {
 }
 
 /// Decodes `count` byte-string values encoded with `enc`.
-pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, LogSegError> {
+pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, CodecError> {
     let mut pos = 0usize;
     let out = match enc {
         Enc::Plain => {
@@ -504,12 +502,12 @@ pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8
                 let len = get_uvarint(bytes, &mut pos)?;
                 total = total
                     .checked_add(len)
-                    .ok_or_else(|| LogSegError::Corrupted("string length overflow".into()))?;
+                    .ok_or_else(|| CodecError::Corrupted("string length overflow".into()))?;
                 lens.push(len);
             }
             let blob = &bytes[pos..];
             if blob.len() as u64 != total {
-                return Err(LogSegError::Corrupted(format!(
+                return Err(CodecError::Corrupted(format!(
                     "string blob {} != declared {total}",
                     blob.len()
                 )));
@@ -527,14 +525,14 @@ pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8
         Enc::Dict => {
             let dict_count = get_uvarint(bytes, &mut pos)? as usize;
             if dict_count > cap(bytes.len() + 1) {
-                return Err(LogSegError::Corrupted("dict_count too large".into()));
+                return Err(CodecError::Corrupted("dict_count too large".into()));
             }
             let mut dict: Vec<Vec<u8>> = Vec::with_capacity(dict_count);
             for _ in 0..dict_count {
                 let len = get_uvarint(bytes, &mut pos)? as usize;
                 let entry = bytes
                     .get(pos..pos + len)
-                    .ok_or_else(|| LogSegError::Corrupted("dict entry truncated".into()))?;
+                    .ok_or_else(|| CodecError::Corrupted("dict entry truncated".into()))?;
                 dict.push(entry.to_vec());
                 pos += len;
             }
@@ -544,7 +542,7 @@ pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8
                 .collect()
         }
         other => {
-            return Err(LogSegError::Corrupted(format!(
+            return Err(CodecError::Corrupted(format!(
                 "enc {other:?} is not a string codec"
             )));
         }
@@ -591,10 +589,10 @@ pub fn encode_f64(values: &[u64]) -> (Enc, Vec<u8>) {
     }
 }
 
-fn read_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64, LogSegError> {
+fn read_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64, CodecError> {
     let slice = bytes
         .get(*pos..*pos + 8)
-        .ok_or_else(|| LogSegError::Corrupted("f64 bits truncated".into()))?;
+        .ok_or_else(|| CodecError::Corrupted("f64 bits truncated".into()))?;
     let mut a = [0u8; 8];
     a.copy_from_slice(slice);
     *pos += 8;
@@ -602,7 +600,7 @@ fn read_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64, LogSegError> {
 }
 
 /// Decodes `count` f64 bit patterns encoded with `enc`.
-pub fn decode_f64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<u64>, LogSegError> {
+pub fn decode_f64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<u64>, CodecError> {
     let mut pos = 0usize;
     let out = match enc {
         Enc::Plain => {
@@ -619,7 +617,7 @@ pub fn decode_f64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<u64>, LogS
         Enc::Dict => {
             let dict_count = get_uvarint(bytes, &mut pos)? as usize;
             if dict_count > cap(bytes.len() + 1) {
-                return Err(LogSegError::Corrupted("dict_count too large".into()));
+                return Err(CodecError::Corrupted("dict_count too large".into()));
             }
             let mut dict = Vec::with_capacity(dict_count);
             for _ in 0..dict_count {
@@ -629,7 +627,7 @@ pub fn decode_f64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<u64>, LogS
             ids.into_iter().map(|id| dict[id as usize]).collect()
         }
         other => {
-            return Err(LogSegError::Corrupted(format!(
+            return Err(CodecError::Corrupted(format!(
                 "enc {other:?} is not an f64 codec"
             )));
         }
@@ -679,15 +677,15 @@ pub fn decode_fixed(
     bytes: &[u8],
     count: usize,
     width: usize,
-) -> Result<Vec<Vec<u8>>, LogSegError> {
+) -> Result<Vec<Vec<u8>>, CodecError> {
     let mut pos = 0usize;
     let out = match enc {
         Enc::FixedWidth => {
             let need = count
                 .checked_mul(width)
-                .ok_or_else(|| LogSegError::Corrupted("fixed length overflow".into()))?;
+                .ok_or_else(|| CodecError::Corrupted("fixed length overflow".into()))?;
             if bytes.len() != need {
-                return Err(LogSegError::Corrupted(format!(
+                return Err(CodecError::Corrupted(format!(
                     "fixed length {} != {need}",
                     bytes.len()
                 )));
@@ -702,13 +700,13 @@ pub fn decode_fixed(
         Enc::Dict => {
             let dict_count = get_uvarint(bytes, &mut pos)? as usize;
             if dict_count > cap(bytes.len() + 1) {
-                return Err(LogSegError::Corrupted("dict_count too large".into()));
+                return Err(CodecError::Corrupted("dict_count too large".into()));
             }
             let mut dict: Vec<Vec<u8>> = Vec::with_capacity(dict_count);
             for _ in 0..dict_count {
                 let entry = bytes
                     .get(pos..pos + width)
-                    .ok_or_else(|| LogSegError::Corrupted("fixed dict entry truncated".into()))?;
+                    .ok_or_else(|| CodecError::Corrupted("fixed dict entry truncated".into()))?;
                 dict.push(entry.to_vec());
                 pos += width;
             }
@@ -718,7 +716,7 @@ pub fn decode_fixed(
                 .collect()
         }
         other => {
-            return Err(LogSegError::Corrupted(format!(
+            return Err(CodecError::Corrupted(format!(
                 "enc {other:?} is not a fixed-width codec"
             )));
         }
@@ -737,8 +735,8 @@ mod tests {
         for tag in 1u8..=9 {
             assert_eq!(Enc::from_u8(tag).expect("known").to_u8(), tag);
         }
-        assert!(matches!(Enc::from_u8(0), Err(LogSegError::Corrupted(_))));
-        assert!(matches!(Enc::from_u8(10), Err(LogSegError::Corrupted(_))));
+        assert!(matches!(Enc::from_u8(0), Err(CodecError::Corrupted(_))));
+        assert!(matches!(Enc::from_u8(10), Err(CodecError::Corrupted(_))));
     }
 
     #[test]
@@ -848,19 +846,19 @@ mod tests {
         // Plain with an extra trailing byte.
         assert!(matches!(
             decode_i64(Enc::Plain, &[0x00, 0x00], 1),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
         // Rle claiming more than count.
         let bytes = enc_rle_i64(&[5, 5, 5, 9]);
         assert!(matches!(
             decode_i64(Enc::Rle, &bytes, 2),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
         // FOR with bit_width > 64.
         let bad = vec![0x00, 65];
         assert!(matches!(
             decode_i64(Enc::ForBitpack, &bad, 1),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
     }
 }
@@ -990,7 +988,7 @@ mod string_dict_tests {
         let bytes = vec![0x02, 0x01, 0x61, 0x01, 0x62, 0x02, 0x03];
         assert!(matches!(
             decode_strings(Enc::Dict, &bytes, 1),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
     }
 
@@ -1000,7 +998,7 @@ mod string_dict_tests {
         let bytes = vec![0x05, 0x01, 0x61];
         assert!(matches!(
             decode_strings(Enc::Dict, &bytes, 1),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
     }
 
@@ -1010,7 +1008,7 @@ mod string_dict_tests {
         let bytes = vec![0x05, 0x61, 0x62];
         assert!(matches!(
             decode_strings(Enc::Plain, &bytes, 1),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
     }
 }

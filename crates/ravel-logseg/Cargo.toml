@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ravel-codec = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-types = { workspace = true }
 thiserror = { workspace = true }

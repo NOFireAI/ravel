@@ -103,6 +103,50 @@ mod tests {
         // A single uppercase multi-byte word lowercases and stays one token.
         assert_eq!(toks("STRASSE"), vec![b"strasse".to_vec()]);
     }
+
+    /// Acceptance test (issue #429): pins the four normative rules from
+    /// docs/log-segment-format.md "Tokenizer" in one place, independent of
+    /// the smaller unit tests above.
+    #[test]
+    fn tokens_match_the_rlog_normative_definition() {
+        // Rule 1 (split on any non-alphanumeric char, Unicode-aware) and
+        // rule 4 (drop empty tokens, keep duplicates).
+        assert_eq!(
+            toks("GET /api/v1?x=1, timeout timeout"),
+            vec![
+                b"get".to_vec(),
+                b"api".to_vec(),
+                b"v1".to_vec(),
+                b"x".to_vec(),
+                b"1".to_vec(),
+                b"timeout".to_vec(),
+                b"timeout".to_vec(),
+            ]
+        );
+        assert_eq!(toks("   ,,..  "), Vec::<Vec<u8>>::new());
+
+        // Rule 2: lowercase each token, Unicode-aware (`char::to_lowercase`,
+        // not an ASCII-only lowercasing). Greek and Cyrillic letters
+        // lowercase to their own multi-byte lowercase codepoints.
+        assert_eq!(toks("ΑΒΓ"), vec!["αβγ".as_bytes().to_vec()]);
+        assert_eq!(toks("МОСКВА"), vec!["москва".as_bytes().to_vec()]);
+
+        // Rule 3: truncate to the longest character-boundary prefix of at
+        // most 64 bytes. '世' is 3 bytes in UTF-8, so 64 is not a multiple
+        // of its width: naive truncation at raw byte offset 64 would land 1
+        // byte into the 22nd character (21 * 3 = 63, 22 * 3 = 66) and split
+        // it. The tokenizer must instead stop at the last whole character,
+        // 21 of them (63 bytes), never producing invalid UTF-8.
+        let long = "世".repeat(30);
+        let toks = toks(&long);
+        assert_eq!(toks.len(), 1);
+        assert!(toks[0].len() <= 64);
+        assert_eq!(toks[0].len(), 63);
+        let s = std::str::from_utf8(&toks[0])
+            .expect("truncation must stay on a char boundary, never splitting a codepoint");
+        assert_eq!(s.chars().count(), 21);
+        assert_eq!(s, "世".repeat(21));
+    }
 }
 
 /// Every token is at most 64 bytes, valid UTF-8, and contains no

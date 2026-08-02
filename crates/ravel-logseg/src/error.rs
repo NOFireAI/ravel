@@ -31,3 +31,16 @@ pub enum LogSegError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// `ravel-codec`'s moved encoding/bloom/tokenizer code returns its own
+/// `CodecError` (it must not depend on `ravel-logseg`, see the crate's
+/// `lib.rs`). This conversion is the crate boundary: every existing `?`
+/// call site in this crate that decodes a page or a bloom entry keeps
+/// propagating the same `Corrupted` message unchanged.
+impl From<ravel_codec::error::CodecError> for LogSegError {
+    fn from(e: ravel_codec::error::CodecError) -> Self {
+        match e {
+            ravel_codec::error::CodecError::Corrupted(s) => LogSegError::Corrupted(s),
+        }
+    }
+}

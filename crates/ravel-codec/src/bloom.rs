@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use crate::error::LogSegError;
+use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
 
 /// Hash count per probe, sized for a ~1% false-positive rate.
@@ -139,31 +139,31 @@ impl<'a> BloomView<'a> {
     /// Parses an entry. Rejects a truncated buffer, an `m_bits` that is not a
     /// power of two or is below 512, a `k` of 0, a bit array whose length is
     /// not `m_bits / 8`, and trailing bytes.
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, LogSegError> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, CodecError> {
         let mut pos = 0;
         let m_bits = get_uvarint(bytes, &mut pos)?;
         if m_bits < BLOCK_BITS || !m_bits.is_power_of_two() {
-            return Err(LogSegError::Corrupted(format!("bloom m_bits {m_bits}")));
+            return Err(CodecError::Corrupted(format!("bloom m_bits {m_bits}")));
         }
         let k = *bytes
             .get(pos)
-            .ok_or_else(|| LogSegError::Corrupted("bloom truncated at k".into()))?;
+            .ok_or_else(|| CodecError::Corrupted("bloom truncated at k".into()))?;
         pos += 1;
         if k == 0 {
-            return Err(LogSegError::Corrupted("bloom k is zero".into()));
+            return Err(CodecError::Corrupted("bloom k is zero".into()));
         }
         let seed_bytes = bytes
             .get(pos..pos + 8)
-            .ok_or_else(|| LogSegError::Corrupted("bloom truncated at seed".into()))?;
+            .ok_or_else(|| CodecError::Corrupted("bloom truncated at seed".into()))?;
         let mut seed_arr = [0u8; 8];
         seed_arr.copy_from_slice(seed_bytes);
         let seed = u64::from_le_bytes(seed_arr);
         pos += 8;
         let bits = bytes
             .get(pos..)
-            .ok_or_else(|| LogSegError::Corrupted("bloom truncated at bits".into()))?;
+            .ok_or_else(|| CodecError::Corrupted("bloom truncated at bits".into()))?;
         if bits.len() as u64 != m_bits / 8 {
-            return Err(LogSegError::Corrupted(format!(
+            return Err(CodecError::Corrupted(format!(
                 "bloom bits length {} != {}",
                 bits.len(),
                 m_bits / 8
@@ -236,7 +236,7 @@ mod tests {
         // Truncated: empty buffer.
         assert!(matches!(
             BloomView::parse(&[]),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
         // m_bits not a power of two.
         let mut bad = Vec::new();
@@ -245,7 +245,7 @@ mod tests {
         bad.extend_from_slice(&0u64.to_le_bytes());
         assert!(matches!(
             BloomView::parse(&bad),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
         // k = 0.
         let mut bad = Vec::new();
@@ -255,7 +255,7 @@ mod tests {
         bad.extend_from_slice(&[0u8; 64]);
         assert!(matches!(
             BloomView::parse(&bad),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
         // Wrong bit-array length (512 bits needs 64 bytes; give 10).
         let mut bad = Vec::new();
@@ -265,7 +265,7 @@ mod tests {
         bad.extend_from_slice(&[0u8; 10]);
         assert!(matches!(
             BloomView::parse(&bad),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
     }
 }

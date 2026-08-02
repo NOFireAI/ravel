@@ -5,7 +5,7 @@
 //! entry carries its own crc32c, verified before the entry is probed.
 
 use crate::bloom::BloomView;
-use crate::error::LogSegError;
+use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
 
 /// Serializes the BLOOM container: `count` u32, then per entry
@@ -32,10 +32,10 @@ impl<'a> BloomSection<'a> {
     /// Parses the container framing. Rejects truncation, an entry length that
     /// runs past the section, and trailing bytes. The per-entry crc is checked
     /// lazily in [`BloomSection::entry`].
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, LogSegError> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, CodecError> {
         let count_bytes = bytes
             .get(0..4)
-            .ok_or_else(|| LogSegError::Corrupted("bloom section truncated at count".into()))?;
+            .ok_or_else(|| CodecError::Corrupted("bloom section truncated at count".into()))?;
         let count = u32::from_le_bytes([
             count_bytes[0],
             count_bytes[1],
@@ -47,25 +47,23 @@ impl<'a> BloomSection<'a> {
         for _ in 0..count {
             let entry_len = get_uvarint(bytes, &mut pos)?;
             let entry_len = usize::try_from(entry_len)
-                .map_err(|_| LogSegError::Corrupted("bloom entry len range".into()))?;
+                .map_err(|_| CodecError::Corrupted("bloom entry len range".into()))?;
             let crc = bytes
                 .get(pos..pos + 4)
-                .ok_or_else(|| LogSegError::Corrupted("bloom entry truncated at crc".into()))?;
+                .ok_or_else(|| CodecError::Corrupted("bloom entry truncated at crc".into()))?;
             let crc = u32::from_le_bytes([crc[0], crc[1], crc[2], crc[3]]);
             pos += 4;
             let end = pos
                 .checked_add(entry_len)
-                .ok_or_else(|| LogSegError::Corrupted("bloom entry overflow".into()))?;
+                .ok_or_else(|| CodecError::Corrupted("bloom entry overflow".into()))?;
             if end > bytes.len() {
-                return Err(LogSegError::Corrupted("bloom entry past section".into()));
+                return Err(CodecError::Corrupted("bloom entry past section".into()));
             }
             ranges.push((crc, pos..end));
             pos = end;
         }
         if pos != bytes.len() {
-            return Err(LogSegError::Corrupted(
-                "bloom section trailing bytes".into(),
-            ));
+            return Err(CodecError::Corrupted("bloom section trailing bytes".into()));
         }
         Ok(BloomSection { bytes, ranges })
     }
@@ -81,14 +79,14 @@ impl<'a> BloomSection<'a> {
 
     /// The bloom view for entry `index`, verifying its crc first. An index out
     /// of range or a crc mismatch is `Corrupted`.
-    pub fn entry(&self, index: usize) -> Result<BloomView<'a>, LogSegError> {
+    pub fn entry(&self, index: usize) -> Result<BloomView<'a>, CodecError> {
         let (crc, range) = self
             .ranges
             .get(index)
-            .ok_or_else(|| LogSegError::Corrupted(format!("bloom index {index} out of range")))?;
+            .ok_or_else(|| CodecError::Corrupted(format!("bloom index {index} out of range")))?;
         let entry = &self.bytes[range.clone()];
         if crc32c::crc32c(entry) != *crc {
-            return Err(LogSegError::Corrupted(format!(
+            return Err(CodecError::Corrupted(format!(
                 "bloom entry {index} crc mismatch"
             )));
         }
@@ -97,7 +95,7 @@ impl<'a> BloomSection<'a> {
 }
 
 /// Convenience: parse the container and return entry `index`'s view.
-pub fn bloom_entry(bytes: &[u8], index: usize) -> Result<BloomView<'_>, LogSegError> {
+pub fn bloom_entry(bytes: &[u8], index: usize) -> Result<BloomView<'_>, CodecError> {
     BloomSection::parse(bytes)?.entry(index)
 }
 
@@ -136,7 +134,7 @@ mod tests {
         let entries = build_entries();
         let mut section = encode_bloom_section(&entries);
         let parsed = BloomSection::parse(&section).expect("parse");
-        assert!(matches!(parsed.entry(2), Err(LogSegError::Corrupted(_))));
+        assert!(matches!(parsed.entry(2), Err(CodecError::Corrupted(_))));
         drop(parsed);
         // Flip a byte inside the first entry payload; its crc must catch it.
         // Layout: count(4) len(varint) crc(4) entry... The entry byte sits well
@@ -144,7 +142,7 @@ mod tests {
         let flip = section.len() - 1;
         section[flip] ^= 0xff;
         let parsed = BloomSection::parse(&section).expect("parse");
-        assert!(matches!(parsed.entry(1), Err(LogSegError::Corrupted(_))));
+        assert!(matches!(parsed.entry(1), Err(CodecError::Corrupted(_))));
     }
 
     #[test]
@@ -153,11 +151,11 @@ mod tests {
         let section = encode_bloom_section(&entries);
         assert!(matches!(
             BloomSection::parse(&section[..section.len() - 2]),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
         assert!(matches!(
             BloomSection::parse(&[]),
-            Err(LogSegError::Corrupted(_))
+            Err(CodecError::Corrupted(_))
         ));
     }
 }
