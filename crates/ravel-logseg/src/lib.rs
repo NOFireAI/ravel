@@ -13,9 +13,6 @@
 //! panicking.
 
 pub mod block;
-pub mod bloom;
-pub mod bloom_section;
-pub mod encoding;
 pub mod error;
 pub mod field_dir;
 pub mod footer;
@@ -25,9 +22,13 @@ pub mod reader;
 pub mod record;
 pub mod skip_index;
 pub mod stream_dir;
-pub mod tokenizer;
 pub mod varint;
 pub mod writer;
+
+// encoding, bloom, bloom_section, and tokenizer moved to `ravel-codec`
+// (issue #429, docs/adrs/0045-rspan-v2-trace-investigation.md decision 1).
+// Re-exported here so no other crate's imports or Cargo.toml need to change.
+pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
 
 pub use error::LogSegError;
 pub use footer::{SuffixOutcome, open_from_suffix};
