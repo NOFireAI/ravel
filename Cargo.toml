@@ -65,11 +65,16 @@ reqwest = { version = "0.13", features = ["json"] }
 # (a claim sent with the wrong JSON type is treated as absent rather than
 # malformed unless it is also in required_spec_claims); 10.3.0 is the first patched
 # release. 10.x drops the bundled default crypto backend, so a backend is now
-# selected explicitly: rust_crypto (pure Rust) is chosen over aws_lc_rs to avoid a
-# C toolchain. use_pem (from_ec_pem, on by default) and the `jwk` module are both
-# retained. Signature verification, issuer/audience/expiry checks, and the
-# algorithm allow-list all come from this crate rather than any hand-rolled JWT code.
-jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
+# selected explicitly: aws_lc_rs, not rust_crypto. rust_crypto pulls in the `rsa`
+# crate, which carries an unpatched timing side-channel (RUSTSEC-2023-0071, the
+# Marvin Attack) in its RSA signature verification - exactly the RS256 path most
+# real-world OIDC issuers use. aws_lc_rs avoids `rsa` entirely and adds no new
+# toolchain burden: aws-lc-sys is already in this workspace's dependency tree via
+# rustls's own TLS backend. use_pem (from_ec_pem, on by default) and the `jwk`
+# module are both retained. Signature verification, issuer/audience/expiry
+# checks, and the algorithm allow-list all come from this crate rather than any
+# hand-rolled JWT code.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 # telemetry protocol types
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }
