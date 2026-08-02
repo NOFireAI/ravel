@@ -223,7 +223,12 @@ mod tests {
     /// A record on the stream identified by `resource`, carrying per-record
     /// dynamic `attrs` (which win over resource/scope attributes on a key
     /// collision in the merged `attrs` column).
-    fn record(resource: &[(String, AttrValue)], attrs: &[(String, AttrValue)], ts: i64, body: &str) -> LogRecord {
+    fn record(
+        resource: &[(String, AttrValue)],
+        attrs: &[(String, AttrValue)],
+        ts: i64,
+        body: &str,
+    ) -> LogRecord {
         LogRecord {
             stream_id: ravel_types::logstream::log_stream_id(resource, "scope", "1.0", &[]),
             stream_attrs: stream_attrs_bytes(resource, "scope", "1.0", &[]),
