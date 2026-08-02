@@ -5,6 +5,7 @@
 //! docs/catalog-and-mvcc.md, ADR-0001, ADR-0002, ADR-0010. Bounded mpsc
 //! everywhere; no task-per-sample; backpressure to the gateway.
 
+mod admission;
 mod clock;
 mod config;
 mod error;
@@ -21,6 +22,10 @@ mod span_router;
 mod span_shard;
 mod value;
 
+pub use admission::{
+    AdmissionController, AdmissionLimits, CountLimit, IdentityAdmission, RateLimit,
+    RequestRejection, RequestRejectionReason, TenantUsage,
+};
 pub use clock::{Clock, SystemClock};
 pub use config::{
     IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
