@@ -281,7 +281,10 @@ async fn probe_consistent_read_after_write(
     for i in 0..CONSISTENCY_CYCLES {
         let key = format!("{prefix}raw/{i}");
         let payload = Bytes::from(format!("payload-{i}"));
-        if let Err(err) = store.put(&key, payload.clone(), PutOptions::default()).await {
+        if let Err(err) = store
+            .put(&key, payload.clone(), PutOptions::default())
+            .await
+        {
             return ProbeResult::fail(property, format!("put {key} failed: {err}"));
         }
         match store.get(&key, GetRange::Full).await {
@@ -323,7 +326,10 @@ async fn probe_consistent_list_after_write(
 
     for i in 0..CONSISTENCY_CYCLES {
         let key = format!("{list_prefix}{i}");
-        if let Err(err) = store.put(&key, Bytes::from_static(b"x"), PutOptions::default()).await {
+        if let Err(err) = store
+            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+        {
             return ProbeResult::fail(property, format!("put {key} failed: {err}"));
         }
         match list_all(store, &list_prefix).await {
@@ -421,9 +427,7 @@ mod tests {
         ) -> Result<ListPage, StoreError> {
             let mut page_result = self.inner.list(prefix, page).await?;
             let mut hidden = self.hidden_from_next_list.lock();
-            page_result
-                .objects
-                .retain(|meta| !hidden.remove(&meta.key));
+            page_result.objects.retain(|meta| !hidden.remove(&meta.key));
             Ok(page_result)
         }
 
@@ -533,8 +537,7 @@ mod tests {
         let store = NoCasStore::new();
         let report = run_conformance_suite(&store, "sys/qualify/test-3/").await;
         assert!(!report.passed());
-        let failed: HashSet<&'static str> =
-            report.failures().map(|r| r.property.name()).collect();
+        let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
         assert!(failed.contains(Property::ConditionalWriteCreateIfAbsent.name()));
         assert!(failed.contains(Property::ConditionalWriteCasVersion.name()));
         // Listing and read-after-write are untouched by this backend.

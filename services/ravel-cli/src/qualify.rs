@@ -50,10 +50,7 @@ pub async fn qualify(
     }
 
     if !report.passed() {
-        let failed_names: Vec<&str> = report
-            .failures()
-            .map(|r| r.property.name())
-            .collect();
+        let failed_names: Vec<&str> = report.failures().map(|r| r.property.name()).collect();
         anyhow::bail!(
             "store qualification failed: {} does not satisfy the object store contract \
              (docs/object-store-contract.md); failing propert{}: {}",
@@ -95,7 +92,9 @@ pub async fn qualify(
             let existing = store
                 .get(QUALIFICATION_KEY, GetRange::Full)
                 .await
-                .map_err(|err| anyhow::anyhow!("failed to read existing {QUALIFICATION_KEY}: {err}"))?;
+                .map_err(|err| {
+                    anyhow::anyhow!("failed to read existing {QUALIFICATION_KEY}: {err}")
+                })?;
             let existing: QualificationRecord = serde_json::from_slice(&existing.data)
                 .map_err(|err| anyhow::anyhow!("{QUALIFICATION_KEY} is corrupt: {err}"))?;
             println!(
