@@ -170,17 +170,41 @@ grace` and `grace` (default 24 h) are shared across all four rules.
 
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
-| orphan (first implementation, ADR-0010 §11) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified immediately before delete | object last_modified |
+| orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden) | object last_modified |
 | superseded input (ADR-0018) | L0 commit records + data objects named in a compaction record's input list | now >= record.created_unix_ns + protection_horizon | compaction record created_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced; issue #273); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
 
 - Orphan GC (data objects with no commit record) considers only objects
-  with last_modified age > grace + max_flush_lifetime, and re-verifies
-  commit-record absence immediately before each delete, relying on
-  strongly consistent listing. Writers abandon any flush older than
-  max_flush_lifetime and never publish it afterward; the interlock is what
-  makes orphan deletion safe (ADR-0010 §11).
+  with last_modified age > grace + max_flush_lifetime. Writers abandon any
+  flush older than max_flush_lifetime and never publish it afterward; the
+  interlock is what makes orphan deletion safe (ADR-0010 §11). A pass runs
+  in three phases: candidate selection over one listing of the shard's
+  data objects, checked against the shard's commit-record identities from
+  one initial commit-prefix LIST; one fresh, strongly consistent LIST of
+  that same commit prefix, shared by every surviving candidate, dropping
+  any whose identity now appears (the batched re-verify, ADR-0048 decision
+  5 -- one extra LIST per pass, not one per candidate); then the
+  mass-orphan circuit breaker gate below. Deletes are all-or-nothing: a
+  tripped, non-overridden breaker deletes zero candidates that pass.
+- The mass-orphan circuit breaker (ADR-0048 decision 4) trips when a
+  pass's surviving candidate count is at least `orphan_breaker_min_count`
+  (default 50) AND exceeds `orphan_breaker_max_ratio` (default 0.10) of
+  the shard's listed data objects -- both conditions must hold, so a tiny
+  shard's small orphan count never trips on ratio alone, and a genuinely
+  mass orphan population trips regardless of shard size. This shape (many
+  record-less objects appearing at once) is the signature of commit
+  records lost out-of-band, not routine cleanup: the same physical delete
+  that is safe for a handful of true orphans would be permanent data loss
+  if applied to a shard whose commit records vanished by accident. A
+  tripped pass deletes nothing and halts; the halt is sticky, with no
+  auto-resume -- every subsequent pass re-evaluates the same shard and
+  trips again until either the candidate count falls back below threshold
+  (the commit records are restored) or an operator deliberately overrides
+  it via `CompactorConfig::force_orphan_gc`, a one-shot flag the server
+  itself never sets. The other two sweep rules are unaffected by a tripped
+  orphan breaker and still run, since they are anchored on durable records
+  an operator or compactor deliberately wrote, never on record absence.
 - Superseded-input and unreferenced-part deletion never depend on reader
   leases or on removing an input before its compaction record is durable;
   the horizon alone bounds how long a pinned query can still need an
