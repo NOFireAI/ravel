@@ -24,9 +24,14 @@
 //! records left it.
 //!
 //! The one piece of state that is deliberately in-memory is the undelivered
-//! notification set ([`AlertEvaluator::run_tick`]): losing it re-delivers the
-//! latest transition once, which is inside the at-least-once contract the ADR
-//! chose for sinks.
+//! notification set ([`AlertEvaluator::run_tick`]). Losing it on a crash would
+//! silently downgrade delivery to at-most-once across a restart, since nothing
+//! would ever re-enter it for an alert that is still firing but was not the
+//! reason for this tick's read. [`AlertEvaluator::bootstrap_undelivered`]
+//! closes that gap: the first tick after a (re)start that successfully reads
+//! history re-queues every non-terminal alert for one delivery attempt, which
+//! is what keeps sinks inside the ADR-0043 decision 6 at-least-once contract
+//! across a restart, not just within one process's uptime.
 //!
 //! # Reading alert history
 //!
@@ -52,8 +57,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use rand::RngExt as _;
 use ravel_alerting::{
-    AlertId, AlertRecord, QueryResultSummary, Rule, RuleCondition, RuleQuery, ThresholdOp,
-    compute_alert_id, condition_met, evaluate_transition, write_alert_record,
+    AlertId, AlertRecord, AlertState, QueryResultSummary, Rule, RuleCondition, RuleQuery,
+    ThresholdOp, compute_alert_id, condition_met, evaluate_transition, write_alert_record,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -305,6 +310,16 @@ pub struct AlertEvaluator {
     /// `alert_id` so a newer transition supersedes an older undelivered one.
     /// Bounded by the rule count.
     undelivered: HashMap<AlertId, AlertNotification>,
+    /// Set after the first tick that successfully reads alert history.
+    /// `undelivered` is process-local, so a restart loses whatever was
+    /// in flight; without this, that loss is permanent (a still-firing alert
+    /// that was mid-retry when the process died is never notified again,
+    /// since nothing re-enters `undelivered` for it). On the first successful
+    /// tick, every alert whose folded state is not terminal is seeded into
+    /// `undelivered` once, which is what keeps sink delivery inside the
+    /// at-least-once contract ADR-0043 decision 6 actually states, rather
+    /// than at-most-once across a restart.
+    bootstrapped: bool,
 }
 
 impl AlertEvaluator {
@@ -333,6 +348,7 @@ impl AlertEvaluator {
             writer_id: Uuid::new_v4(),
             next_seq: 1,
             undelivered: HashMap::new(),
+            bootstrapped: false,
         })
     }
 
@@ -367,6 +383,11 @@ impl AlertEvaluator {
             }
         };
 
+        if !self.bootstrapped {
+            self.bootstrap_undelivered(&latest);
+            self.bootstrapped = true;
+        }
+
         // `rules` is moved out for the loop so `self` stays mutably borrowable
         // for the write path; it is put back before returning.
         let rules = std::mem::take(&mut self.rules);
@@ -393,6 +414,32 @@ impl AlertEvaluator {
 
         self.flush_sinks(&mut report).await;
         report
+    }
+
+    /// Seeds `undelivered` from durable history, once, on the first tick that
+    /// successfully reads it. Every alert whose folded state is `Pending` or
+    /// `Firing` (a live, unresolved episode) is queued for one delivery
+    /// attempt this tick; `Resolved` needs no notification restart (nothing
+    /// is pending on it), and `Suppressed` is an intentional silence that a
+    /// restart must not undo by notifying on it.
+    ///
+    /// Without this, `undelivered` is empty on every fresh process, so a
+    /// notification stuck in flight when the process died before this fix is
+    /// never retried: the record it names is durable and correct, but the
+    /// sink call for it is gone forever, silently downgrading the ADR-0043
+    /// decision 6 at-least-once contract to at-most-once across a restart.
+    /// `previous_state: None` here is a known approximation (this evaluator
+    /// has no prior record to pair the seeded one with, only the latest),
+    /// the same approximation `AlertNotification::new` already documents for
+    /// a pending-then-firing episode longer than one transition.
+    fn bootstrap_undelivered(&mut self, latest: &HashMap<AlertId, AlertRecord>) {
+        for (alert_id, record) in latest {
+            if matches!(record.state, AlertState::Pending | AlertState::Firing) {
+                self.undelivered
+                    .entry(*alert_id)
+                    .or_insert_with(|| AlertNotification::new(record.clone(), None));
+            }
+        }
     }
 
     /// Evaluate one rule: run its query, decide the condition, fold to the
@@ -893,7 +940,6 @@ fn sorted_pairs(map: HashMap<String, String>) -> Vec<(String, String)> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ravel_alerting::AlertState;
 
     fn rules_for(text: &str, tenant: &str) -> Vec<Rule> {
         let parsed = parse_rules(text).expect("valid rules");

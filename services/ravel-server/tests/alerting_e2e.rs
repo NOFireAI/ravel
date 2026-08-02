@@ -725,3 +725,104 @@ async fn a_condition_that_never_holds_writes_nothing() {
     assert_eq!(report.records_written, 0);
     assert_eq!(alert_object_count(store.as_ref(), tenant).await, 0);
 }
+
+/// A restarted evaluator (a fresh `AlertEvaluator` over the same store, no
+/// shared in-process state) must fold to the durable latest record and not
+/// re-write anything already reflected in history - this is what "Ravel's
+/// compute processes are disposable" (ADR-0043 decision 3) actually requires,
+/// pinned end to end through pending, firing, and resolved.
+#[tokio::test]
+async fn a_restarted_evaluator_resumes_from_durable_state_and_writes_nothing_new() {
+    let store = seeded_store().await;
+    let tenant = TenantId::new(TENANT).hash();
+    let clock = TestClock::at(NOW_NS);
+
+    {
+        let mut a = evaluator(
+            Arc::clone(&store),
+            clock.clone(),
+            vec![threshold_rule(Some(Duration::from_secs(60)))],
+            Vec::new(),
+        );
+        assert_eq!(a.run_tick().await.records_written, 1, "pending");
+        clock.advance(Duration::from_secs(61));
+        assert_eq!(a.run_tick().await.records_written, 1, "firing");
+        clock.advance(Duration::from_secs(3600));
+        assert_eq!(a.run_tick().await.records_written, 1, "resolved (stale)");
+    }
+    let history = read_alert_records(store.as_ref(), tenant).await;
+    assert_eq!(history.len(), 3, "pending, firing, resolved");
+    assert_eq!(history[0].state, AlertState::Pending);
+    assert_eq!(history[1].state, AlertState::Firing);
+    assert_eq!(history[2].state, AlertState::Resolved);
+    let one_id = history[0].alert_id;
+    assert!(history.iter().all(|r| r.alert_id == one_id));
+
+    // A brand new evaluator instance, no shared state with `a` beyond the
+    // store: the fold must land on Resolved (the greatest ts), not re-fire.
+    clock.advance(Duration::from_secs(60));
+    let mut b = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        vec![threshold_rule(Some(Duration::from_secs(60)))],
+        Vec::new(),
+    );
+    let tick = b.run_tick().await;
+    assert!(!tick.history_unavailable);
+    assert_eq!(
+        tick.records_written, 0,
+        "a restarted evaluator that folds to Resolved must not re-write anything"
+    );
+    assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 3);
+}
+
+/// The regression this fix targets: before `AlertEvaluator::bootstrap_
+/// undelivered`, a notification stuck in the in-memory `undelivered` set when
+/// the process died was never retried by a fresh evaluator, silently
+/// downgrading sink delivery to at-most-once across a restart despite the
+/// durable alert record itself being correct. Proves the fix: a fresh
+/// evaluator's first tick re-delivers it once the sink is healthy again.
+#[tokio::test]
+async fn a_restarted_evaluator_redelivers_a_notification_stuck_at_the_old_process() {
+    let server = SinkServer::start(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let store = seeded_store().await;
+    let tenant = TenantId::new(TENANT).hash();
+    let clock = TestClock::at(NOW_NS);
+    let url = format!("{}/hook", server.base_url());
+
+    {
+        let mut a = evaluator(
+            Arc::clone(&store),
+            clock.clone(),
+            vec![threshold_rule(None)],
+            vec![AlertSink::webhook(url.clone())],
+        );
+        let first = a.run_tick().await;
+        assert_eq!(first.records_written, 1);
+        assert_eq!(first.notifications_failed, 1, "sink is 500ing");
+    }
+    assert_eq!(server.capture.calls().len(), 1);
+    assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 1);
+
+    // Process "restarts" (fresh evaluator instance); the sink is healthy now.
+    server.capture.set_status(StatusCode::OK);
+    clock.advance(Duration::from_secs(60));
+    let mut b = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        vec![threshold_rule(None)],
+        vec![AlertSink::webhook(url)],
+    );
+    let second = b.run_tick().await;
+    assert_eq!(second.records_written, 0, "still firing, no new record");
+    assert_eq!(
+        second.notifications_delivered, 1,
+        "bootstrap_undelivered re-queued the still-firing alert on the first tick"
+    );
+    assert_eq!(
+        server.capture.calls().len(),
+        2,
+        "at-least-once across a restart: the stuck notification is now delivered"
+    );
+    server.stop().await;
+}
