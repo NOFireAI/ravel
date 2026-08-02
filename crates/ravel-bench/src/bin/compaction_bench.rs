@@ -42,7 +42,9 @@ use ravel_object_store::{
 };
 use ravel_proto::commit::v1::CompactionRecord;
 use ravel_query::{EngineConfig, QueryEngine};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment};
+use ravel_segment::{
+    IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V6, WrittenSegment,
+};
 use ravel_types::{
     Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange,
 };
@@ -230,7 +232,7 @@ async fn publish_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
         created_unix_ns,
         ingest_hour_bucket: hour,
     };

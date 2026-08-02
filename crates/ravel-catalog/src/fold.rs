@@ -1076,16 +1076,19 @@ impl Catalog {
         };
         ravel_segment::check_identity(&location.footer, &expected)?;
 
-        // ADR-0027: v5 is the only supported version (`open_from_full` above
-        // has already rejected anything else). The chunked v5 catalog spans
-        // sections, so it is decoded over the whole object -- already in hand
-        // here via the `GetRange::Full` GET -- and folded to the per-series
-        // `SeriesEntry` view the postings build consumes.
+        // ADR-0027: v6 is the only supported version (`open_from_full` above
+        // has already rejected anything else). The chunked v5-shaped catalog
+        // (unchanged by the v6 EXEMPLARS addition) spans sections, so it is
+        // decoded over the whole object -- already in hand here via the
+        // `GetRange::Full` GET -- and folded to the per-series `SeriesEntry`
+        // view the postings build consumes.
         let series: Vec<ravel_segment::SeriesEntry> = match location.version {
-            5 => ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
-                .into_iter()
-                .map(|e| e.entry)
-                .collect(),
+            ravel_segment::VERSION_V6 => {
+                ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
+                    .into_iter()
+                    .map(|e| e.entry)
+                    .collect()
+            }
             other => return Err(PostingsBuildError::UnsupportedSegmentVersion(other)),
         };
 

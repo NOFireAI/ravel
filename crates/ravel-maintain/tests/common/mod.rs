@@ -1,6 +1,6 @@
 //! Shared test fixtures for the compactor's integration tests.
 //!
-//! Seeds a `MemoryStore` (or a `FaultStore` wrapping one) with L0 RSEG v5
+//! Seeds a `MemoryStore` (or a `FaultStore` wrapping one) with L0 RSEG v6
 //! objects and their commit records, exactly as a post-#179 ingest tier
 //! would, then reads compaction output back down to samples for equivalence
 //! checks.
@@ -19,8 +19,8 @@ use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_segment::{
     CompactionMetaV4, ReaderLimits, RunInputV4, RunValuePageV4, SegmentIdentity, SegmentWriter,
-    SeriesEntryV4, SeriesInput, SeriesInputV4, ValueKind, decode_catalog_v5, decode_run_pages_soa,
-    open_from_full, plan_ranges_v4,
+    SeriesEntryV4, SeriesInput, SeriesInputV4, VERSION_V6, ValueKind, decode_catalog_v5,
+    decode_run_pages_soa, open_from_full, plan_ranges_v4,
 };
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use uuid::Uuid;
@@ -172,12 +172,12 @@ pub fn build_v5_l0(
             max_ingest_ts_ns: provenance.0,
         },
     )
-    .expect("write v5 bootstrap");
+    .expect("write bootstrap segment");
     let obj = l0.bytes.as_ref();
     let limits = ReaderLimits::default();
-    let loc = open_from_full(obj, limits).expect("open v5");
+    let loc = open_from_full(obj, limits).expect("open segment");
     let footer = &loc.footer;
-    let entries = decode_catalog_v5(footer, obj, limits).expect("decode v5 catalog");
+    let entries = decode_catalog_v5(footer, obj, limits).expect("decode catalog");
     let ts_sec = footer.sections.iter().find(|s| s.kind == TS_PAGES).unwrap();
     let val_sec = footer
         .sections
@@ -260,7 +260,7 @@ pub async fn seed_input(store: &dyn ObjectStoreBackend, spec: &InputSpec) -> Str
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: spec.created_unix_ns,
         max_ingest_ts_ns: spec.created_unix_ns,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
         created_unix_ns: spec.created_unix_ns,
         ingest_hour_bucket: spec.hour,
     })
@@ -273,13 +273,13 @@ pub async fn seed_input(store: &dyn ObjectStoreBackend, spec: &InputSpec) -> Str
     commit_key
 }
 
-/// Decode every scalar sample of every series in an RSEG v5 object, keyed by
+/// Decode every scalar sample of every series in an RSEG v6 object, keyed by
 /// series id, samples concatenated across runs in catalog order.
 pub fn read_scalar_samples(obj: &[u8]) -> BTreeMap<[u8; 16], Vec<(i64, u64)>> {
     let limits = ReaderLimits::default();
-    let loc = open_from_full(obj, limits).expect("open v5");
+    let loc = open_from_full(obj, limits).expect("open segment");
     let footer = &loc.footer;
-    let entries = decode_catalog_v5(footer, obj, limits).expect("decode v5 catalog");
+    let entries = decode_catalog_v5(footer, obj, limits).expect("decode catalog");
     let refs: Vec<&SeriesEntryV4> = entries.iter().collect();
     let planned = plan_ranges_v4(footer, &refs).expect("plan ranges");
 

@@ -10,6 +10,7 @@ use ravel_maintain::{
     CompactionOutcome, CompactorConfig, FixedClock, PublishOutcome, compact_bucket,
 };
 use ravel_object_store::memory::MemoryStore;
+use ravel_segment::VERSION_V6;
 use uuid::Uuid;
 
 fn cfg() -> CompactorConfig {
@@ -91,7 +92,11 @@ async fn compacts_bucket_and_preserves_all_samples() {
     sorted.sort();
     assert_eq!(ids, sorted, "inputs must be canonically ordered");
     for p in &record.parts {
-        assert_eq!(p.segment_format_version, 5, "v5 output (ADR-0026/0027)");
+        assert_eq!(
+            p.segment_format_version,
+            u32::from(VERSION_V6),
+            "v6 output (ADR-0026/0027)"
+        );
     }
 
     // Every input sample survives, byte-for-byte (union view; dedup is a

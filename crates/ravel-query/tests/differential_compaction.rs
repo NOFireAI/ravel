@@ -1,11 +1,11 @@
 //! Differential proof for P5 of docs/compaction-retention-plan.md (issue
 //! #112): query-over-inputs must equal query-over-L1 bit-for-bit, and also
 //! equal query-over-(L1 + any input subset). Drives P4's real compactor
-//! (`ravel_maintain::compact_bucket`) to produce RSEG v5 L1 parts from
+//! (`ravel_maintain::compact_bucket`) to produce RSEG v6 L1 parts from
 //! adversarial L0 populations, then compares the deduped sample streams the
 //! fetcher + engine order would produce.
 //!
-//! ADR-0027 leaves v5 the only RSEG version: L0 and L1 are both v5 objects,
+//! ADR-0027 leaves v6 the only RSEG version: L0 and L1 are both v6 objects,
 //! distinguished only by `SegmentRef::level`. The fetcher emits one
 //! `FetchedSeriesSoa` per series for an L0 (segment-level provenance) and one
 //! per (series, run) for an L1 part (per-run provenance copied from each
@@ -37,7 +37,7 @@ use ravel_maintain::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{FetchedSeriesSoa, SegmentFetcher};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V6};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 use uuid::Uuid;
 
@@ -144,8 +144,8 @@ async fn build_l0(store: &dyn ObjectStoreBackend, spec: &WriterSpec) -> L0Handle
         min_ingest_ts_ns: hour_start(),
         max_ingest_ts_ns: hour_start() + 10,
     };
-    // ADR-0027: the L0 flush path writes a v5 object unconditionally.
-    let written = SegmentWriter::write(series, identity, bounds).expect("write v5 L0");
+    // ADR-0027: the L0 flush path writes a v6 object unconditionally.
+    let written = SegmentWriter::write(series, identity, bounds).expect("write v6 L0");
 
     let record = record::build(NewCommitRecord {
         tenant_hash: tenant_hash(),
@@ -162,7 +162,7 @@ async fn build_l0(store: &dyn ObjectStoreBackend, spec: &WriterSpec) -> L0Handle
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: hour_start(),
         max_ingest_ts_ns: hour_start() + 10,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
         created_unix_ns: hour_start() + spec.created_offset_ns,
         ingest_hour_bucket: HOUR,
     })

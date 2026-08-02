@@ -15,8 +15,8 @@ use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    FooterOutcome, ReaderLimits, ValueKind, decode_catalog_v4, decode_catalog_v5, open_from_suffix,
-    plan_ranges_v4,
+    FooterOutcome, ReaderLimits, VERSION_V6, ValueKind, decode_catalog_v4, decode_catalog_v5,
+    open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::{LabelSet, SeriesId, Signal};
 
@@ -264,7 +264,8 @@ pub async fn load_input_catalog(
     };
     let footer = &loc.footer;
 
-    let sparse = loc.version == 5 && footer.series_count >= ravel_segment::V5_SPARSE_THRESHOLD;
+    let sparse =
+        loc.version == VERSION_V6 && footer.series_count >= ravel_segment::V5_SPARSE_THRESHOLD;
     let entries = if sparse {
         // Sparse decode needs the whole object; L0 inputs rarely reach here.
         let whole = store.get(&object_key, GetRange::Full).await?;

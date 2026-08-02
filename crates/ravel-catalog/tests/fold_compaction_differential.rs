@@ -37,6 +37,7 @@ use ravel_object_store::{
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
 };
+use ravel_segment::VERSION_V6;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
@@ -92,7 +93,7 @@ fn l0_record(
         max_event_ts_ns: event + 100,
         min_ingest_ts_ns: event,
         max_ingest_ts_ns: event + 100,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
         created_unix_ns,
         ingest_hour_bucket: hour,
     })
@@ -120,7 +121,7 @@ fn part(part_index: u32, hour: u32, seed: u8) -> CompactionPart {
         run_count: 3,
         min_event_ts_ns: event,
         max_event_ts_ns: event + 100,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
     }
 }
 
