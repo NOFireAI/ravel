@@ -848,4 +848,51 @@ mod tests {
         assert_eq!(out.min_trace_id, [1u8; 16]);
         assert_eq!(out.max_trace_id, [3u8; 16]);
     }
+
+    #[test]
+    fn duration_and_status_mask_track_rows() {
+        let mut ok = span(1, 0, 100, 150); // duration 50, Ok
+        ok.status_code = StatusCode::Ok;
+        let mut err = span(1, 1, 100, 105); // duration 5, Error
+        err.status_code = StatusCode::Error;
+        let unset = span(1, 2, 100, 1100); // duration 1000, Unset
+        let out = write_block(&[ok, err, unset], 3).expect("write");
+        assert_eq!(out.min_duration_ns, 5);
+        assert_eq!(out.max_duration_ns, 1000);
+        assert_eq!(
+            out.status_mask,
+            STATUS_BIT_UNSET | STATUS_BIT_OK | STATUS_BIT_ERROR
+        );
+    }
+
+    #[test]
+    fn zero_length_span_round_trips() {
+        // start == end: a zero-length span is not rejected or clamped, it
+        // round-trips with duration 0.
+        let rows = vec![span(1, 0, 500, 500)];
+        let out = write_block(&rows, 3).expect("write");
+        assert_eq!(out.min_duration_ns, 0);
+        assert_eq!(out.max_duration_ns, 0);
+        let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
+        assert_eq!(dec.record(0).expect("record"), rows[0]);
+    }
+
+    #[test]
+    fn end_before_start_yields_negative_duration_not_an_error() {
+        // The writer does not reject or clamp end < start: end - start is a
+        // valid (negative) i64 that ivarint encodes natively.
+        let rows = vec![span(1, 0, 500, 400)];
+        let out = write_block(&rows, 3).expect("write");
+        assert_eq!(out.min_duration_ns, -100);
+        assert_eq!(out.max_duration_ns, -100);
+    }
+
+    #[test]
+    fn duration_overflow_is_corrupted() {
+        let rows = vec![span(1, 0, i64::MIN, i64::MAX)];
+        assert!(matches!(
+            write_block(&rows, 3),
+            Err(SpanSegError::Corrupted(_))
+        ));
+    }
 }

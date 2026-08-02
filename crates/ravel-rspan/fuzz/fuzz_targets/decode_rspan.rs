@@ -16,10 +16,20 @@
 //! under coverage feedback.
 
 use libfuzzer_sys::fuzz_target;
+use ravel_rspan::skip_index::SkipIndex;
 use ravel_rspan::{RspanConfig, RspanReader, SpanQuery, open, open_from_suffix};
 
 fuzz_target!(|data: &[u8]| {
     let cfg = RspanConfig::default();
+
+    // Direct SKIP_IDX decode: the whole-object path above only reaches
+    // BlockEntry's v2 duration/status_mask fields (ADR-0045) when a section
+    // table happens to parse far enough to hand the section bytes to
+    // `SkipIndex::decode`, which is rare with unstructured input. Decoding
+    // fuzz bytes as a raw skip-index section directly exercises the new
+    // fields' truncation and reserved-status-bit rejection paths without
+    // needing a well-formed trailer/footer/section table around them.
+    let _ = SkipIndex::decode(data, 1 << 16);
 
     // Whole-object open + scan: `RspanReader::new` validates the trailer,
     // footer crc, section table, and decodes the skip index; `scan` then reads,
