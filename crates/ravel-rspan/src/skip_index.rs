@@ -1,19 +1,34 @@
 //! SKIP_IDX section (docs/span-segment-format.md "SKIP_IDX").
 //!
 //! One entry per block, carrying its byte range and crc, record count, trace_id
-//! bounds, and time-interval bounds. Two departures from RLOG's SKIP_IDX
-//! (ADR-0041): the time bound is an interval `(min_start_ts, max_end_ts)` pruned
-//! by overlap, not a single point range; and the identity bound is the block's
-//! `(min_trace_id, max_trace_id)`, since records sort by `(trace_id, start_ts)`
-//! and trace_id is the primary lookup key rather than a derived stream ref. The
-//! index is a single level: RSPAN keeps this leaner than RLOG's two-level index
-//! because a span object is a single sorted run and there is no separate
-//! stream-ref dimension to summarize. Pruning is sound: a block is dropped only
-//! when its bounds prove no record in it can match.
+//! bounds, time-interval bounds, duration bounds, and a status mask. Two
+//! departures from RLOG's SKIP_IDX (ADR-0041): the time bound is an interval
+//! `(min_start_ts, max_end_ts)` pruned by overlap, not a single point range;
+//! and the identity bound is the block's `(min_trace_id, max_trace_id)`, since
+//! records sort by `(trace_id, start_ts)` and trace_id is the primary lookup
+//! key rather than a derived stream ref. v2 (ADR-0045 decision 2) adds
+//! `(min_duration_ns, max_duration_ns)`, derived at write time from
+//! `end_ts - start_ts` per row, and `status_mask`, a 3-bit summary of which
+//! OTLP status codes appear in the block, so a trace-investigation query on
+//! duration or status can prune. The index is a single level: RSPAN keeps this
+//! leaner than RLOG's two-level index because a span object is a single sorted
+//! run and there is no separate stream-ref dimension to summarize. Pruning is
+//! sound: a block is dropped only when its bounds prove no record in it can
+//! match.
 
 use crate::error::SpanSegError;
 use crate::record::TRACE_ID_WIDTH;
 use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
+
+/// `status_mask` bit: the block has at least one record with `StatusCode::Unset`.
+pub const STATUS_BIT_UNSET: u8 = 0b0000_0001;
+/// `status_mask` bit: the block has at least one record with `StatusCode::Ok`.
+pub const STATUS_BIT_OK: u8 = 0b0000_0010;
+/// `status_mask` bit: the block has at least one record with `StatusCode::Error`.
+pub const STATUS_BIT_ERROR: u8 = 0b0000_0100;
+/// The only bits a `status_mask` byte may set. Bits 3-7 are reserved: the
+/// writer emits 0 for them and the reader rejects a nonzero value (ADR-0045).
+const STATUS_MASK_VALID: u8 = STATUS_BIT_UNSET | STATUS_BIT_OK | STATUS_BIT_ERROR;
 
 /// One per-block skip entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +41,13 @@ pub struct BlockEntry {
     pub max_trace_id: [u8; 16],
     pub min_start_ts: i64,
     pub max_end_ts: i64,
+    /// `min(end_ts_ns - start_ts_ns)` over the block's records.
+    pub min_duration_ns: i64,
+    /// `max(end_ts_ns - start_ts_ns)` over the block's records.
+    pub max_duration_ns: i64,
+    /// Bits 0/1/2 set when the block has any Unset/Ok/Error record,
+    /// respectively; bits 3-7 always 0.
+    pub status_mask: u8,
 }
 
 /// The decoded skip index: one entry per block, in block order.
@@ -43,16 +65,22 @@ impl SkipIndex {
     /// included unless its bounds prove no record matches. `trace_id`, when
     /// given, restricts to blocks whose `[min, max]` trace_id range contains it;
     /// the time window `[ts_min, ts_max]` restricts to blocks whose
-    /// `[min_start_ts, max_end_ts]` interval overlaps it.
+    /// `[min_start_ts, max_end_ts]` interval overlaps it. `duration_ns`, when
+    /// given, is an inclusive `[min, max]` duration window restricting to
+    /// blocks whose `[min_duration_ns, max_duration_ns]` bound overlaps it.
+    /// `status_mask`, when given, restricts to blocks whose `status_mask` has
+    /// at least one bit in common with it.
     pub fn candidate_blocks(
         &self,
         trace_id: Option<&[u8; 16]>,
         ts_min: i64,
         ts_max: i64,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
     ) -> Vec<usize> {
         let mut out = Vec::new();
         for (i, e) in self.blocks.iter().enumerate() {
-            if block_pruned(e, trace_id, ts_min, ts_max) {
+            if block_pruned(e, trace_id, ts_min, ts_max, duration_ns, status_mask) {
                 continue;
             }
             out.push(i);
@@ -73,12 +101,16 @@ impl SkipIndex {
             out.extend_from_slice(&e.max_trace_id);
             put_ivarint(&mut out, e.min_start_ts);
             put_ivarint(&mut out, e.max_end_ts);
+            put_ivarint(&mut out, e.min_duration_ns);
+            put_ivarint(&mut out, e.max_duration_ns);
+            out.push(e.status_mask);
         }
         out
     }
 
     /// Decodes the uncompressed section form. Rejects a block count over
-    /// `max_blocks`, truncation, and trailing bytes.
+    /// `max_blocks`, truncation, trailing bytes, and a `status_mask` with any
+    /// reserved bit (3-7) set.
     pub fn decode(bytes: &[u8], max_blocks: u64) -> Result<Self, SpanSegError> {
         let mut pos = 0usize;
         let count = read_u32(bytes, &mut pos)?;
@@ -98,6 +130,17 @@ impl SkipIndex {
             let max_trace_id = read_trace_id(bytes, &mut pos)?;
             let min_start_ts = get_ivarint(bytes, &mut pos)?;
             let max_end_ts = get_ivarint(bytes, &mut pos)?;
+            let min_duration_ns = get_ivarint(bytes, &mut pos)?;
+            let max_duration_ns = get_ivarint(bytes, &mut pos)?;
+            let status_mask = *bytes
+                .get(pos)
+                .ok_or_else(|| SpanSegError::Corrupted("skip truncated status_mask".into()))?;
+            pos += 1;
+            if status_mask & !STATUS_MASK_VALID != 0 {
+                return Err(SpanSegError::Corrupted(format!(
+                    "skip status_mask {status_mask:#04x} sets a reserved bit"
+                )));
+            }
             blocks.push(BlockEntry {
                 block_offset,
                 block_len,
@@ -107,6 +150,9 @@ impl SkipIndex {
                 max_trace_id,
                 min_start_ts,
                 max_end_ts,
+                min_duration_ns,
+                max_duration_ns,
+                status_mask,
             });
         }
         if pos != bytes.len() {
@@ -118,13 +164,18 @@ impl SkipIndex {
 
 /// True when `entry`'s bounds prove no record in the block can match the
 /// predicate (docs/span-segment-format.md "Pruning soundness"). A block is
-/// pruned when its time interval is disjoint from the query window, or (when a
-/// trace_id is given) the trace_id falls outside the block's trace_id range.
+/// pruned when its time interval is disjoint from the query window, when (a
+/// trace_id is given and) the trace_id falls outside the block's trace_id
+/// range, when (a duration window is given and) the block's duration bound is
+/// disjoint from it, or when (a status mask is given and) the block's
+/// `status_mask` shares no bit with it.
 pub fn block_pruned(
     entry: &BlockEntry,
     trace_id: Option<&[u8; 16]>,
     ts_min: i64,
     ts_max: i64,
+    duration_ns: Option<(i64, i64)>,
+    status_mask: Option<u8>,
 ) -> bool {
     // Interval-overlap test: prune when the block's [min_start, max_end] does
     // not overlap the query [ts_min, ts_max].
@@ -133,6 +184,16 @@ pub fn block_pruned(
     }
     if let Some(tid) = trace_id
         && (*tid < entry.min_trace_id || *tid > entry.max_trace_id)
+    {
+        return true;
+    }
+    if let Some((dmin, dmax)) = duration_ns
+        && (entry.max_duration_ns < dmin || entry.min_duration_ns > dmax)
+    {
+        return true;
+    }
+    if let Some(mask) = status_mask
+        && (entry.status_mask & mask) == 0
     {
         return true;
     }
@@ -175,6 +236,9 @@ mod tests {
             max_trace_id: [trace; 16],
             min_start_ts: min_start,
             max_end_ts: max_end,
+            min_duration_ns: 0,
+            max_duration_ns: 0,
+            status_mask: STATUS_MASK_VALID,
         }
     }
 
@@ -186,25 +250,38 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_with_duration_and_status() {
+        let e = BlockEntry {
+            min_duration_ns: -5,
+            max_duration_ns: 1_000_000,
+            status_mask: STATUS_BIT_OK | STATUS_BIT_ERROR,
+            ..entry(1, 0, 100)
+        };
+        let idx = SkipIndex::new(vec![e]);
+        let got = SkipIndex::decode(&idx.encode(), 1000).expect("decode");
+        assert_eq!(got, idx);
+    }
+
+    #[test]
     fn interval_overlap_boundary_cases() {
         // Block interval [100, 200].
         let e = entry(1, 100, 200);
         // Window fully before the block: [0, 99] -> pruned.
-        assert!(block_pruned(&e, None, 0, 99));
+        assert!(block_pruned(&e, None, 0, 99, None, None));
         // Window fully after the block: [201, 300] -> pruned.
-        assert!(block_pruned(&e, None, 201, 300));
+        assert!(block_pruned(&e, None, 201, 300, None, None));
         // Touch at the left edge: [0, 100] -> kept (max_end 200 >= 0, min_start
         // 100 <= 100).
-        assert!(!block_pruned(&e, None, 0, 100));
+        assert!(!block_pruned(&e, None, 0, 100, None, None));
         // Touch at the right edge: [200, 300] -> kept.
-        assert!(!block_pruned(&e, None, 200, 300));
+        assert!(!block_pruned(&e, None, 200, 300, None, None));
         // Partial overlap at each edge.
-        assert!(!block_pruned(&e, None, 50, 150));
-        assert!(!block_pruned(&e, None, 150, 250));
+        assert!(!block_pruned(&e, None, 50, 150, None, None));
+        assert!(!block_pruned(&e, None, 150, 250, None, None));
         // Window fully containing the block.
-        assert!(!block_pruned(&e, None, 0, 1000));
+        assert!(!block_pruned(&e, None, 0, 1000, None, None));
         // Block fully containing the window.
-        assert!(!block_pruned(&e, None, 120, 130));
+        assert!(!block_pruned(&e, None, 120, 130, None, None));
     }
 
     #[test]
@@ -215,13 +292,13 @@ mod tests {
             max_trace_id: [4u8; 16],
             ..entry(0, 0, 1000)
         };
-        assert!(block_pruned(&e, Some(&[1u8; 16]), 0, 1000));
-        assert!(!block_pruned(&e, Some(&[2u8; 16]), 0, 1000));
-        assert!(!block_pruned(&e, Some(&[3u8; 16]), 0, 1000));
-        assert!(!block_pruned(&e, Some(&[4u8; 16]), 0, 1000));
-        assert!(block_pruned(&e, Some(&[5u8; 16]), 0, 1000));
+        assert!(block_pruned(&e, Some(&[1u8; 16]), 0, 1000, None, None));
+        assert!(!block_pruned(&e, Some(&[2u8; 16]), 0, 1000, None, None));
+        assert!(!block_pruned(&e, Some(&[3u8; 16]), 0, 1000, None, None));
+        assert!(!block_pruned(&e, Some(&[4u8; 16]), 0, 1000, None, None));
+        assert!(block_pruned(&e, Some(&[5u8; 16]), 0, 1000, None, None));
         // A matching trace_id in a disjoint time window is still pruned.
-        assert!(block_pruned(&e, Some(&[3u8; 16]), 2000, 3000));
+        assert!(block_pruned(&e, Some(&[3u8; 16]), 2000, 3000, None, None));
     }
 
     #[test]
@@ -231,10 +308,72 @@ mod tests {
             entry(2, 100, 200),
             entry(3, 200, 300),
         ]);
-        assert_eq!(idx.candidate_blocks(None, 120, 130), vec![1]);
-        assert_eq!(idx.candidate_blocks(Some(&[3u8; 16]), 0, 1000), vec![2]);
+        assert_eq!(idx.candidate_blocks(None, 120, 130, None, None), vec![1]);
+        assert_eq!(
+            idx.candidate_blocks(Some(&[3u8; 16]), 0, 1000, None, None),
+            vec![2]
+        );
         // No overlap at all.
-        assert!(idx.candidate_blocks(None, 400, 500).is_empty());
+        assert!(idx.candidate_blocks(None, 400, 500, None, None).is_empty());
+    }
+
+    /// The acceptance test for ADR-0045 decision 2's duration/status half:
+    /// proves BOTH halves of pruning soundness. A duration-and-status
+    /// predicate must actually reduce the candidate set (pruning happens), and
+    /// every block whose own bounds cannot rule out a match must still survive
+    /// (pruning is sound).
+    #[test]
+    fn v2_prunes_on_duration_and_status() {
+        // Four blocks, all with a wide-open, identical time interval so only
+        // the duration/status predicate can distinguish them.
+        let wide_open = |duration: (i64, i64), status_mask: u8| BlockEntry {
+            min_duration_ns: duration.0,
+            max_duration_ns: duration.1,
+            status_mask,
+            ..entry(0, 0, 1000)
+        };
+        let blocks = vec![
+            wide_open((10, 20), STATUS_BIT_OK), // A: short, no error
+            wide_open((100, 200), STATUS_BIT_ERROR), // B: long, error
+            wide_open((10, 20), STATUS_BIT_ERROR), // C: short, error -- must survive
+            wide_open((500, 600), STATUS_BIT_OK | STATUS_BIT_ERROR), // D: long, error
+        ];
+        let idx = SkipIndex::new(blocks.clone());
+
+        // Query: short-duration (<= 50ns) error spans.
+        let duration_query = Some((0i64, 50i64));
+        let status_query = Some(STATUS_BIT_ERROR);
+        let cands = idx.candidate_blocks(None, 0, 1000, duration_query, status_query);
+
+        // Pruning happens: candidates are a strict subset of all blocks.
+        assert!(
+            cands.len() < blocks.len(),
+            "duration+status predicate must drop at least one block"
+        );
+        // Pruning is sound: block C (index 2) contains a possible match (its
+        // duration bound overlaps the query window and its status_mask shares
+        // the Error bit) and must survive.
+        assert!(cands.contains(&2), "block C must survive: it can match");
+        // Blocks A, B, D each fail on duration or status alone and must be
+        // dropped.
+        assert_eq!(cands, vec![2]);
+
+        // Soundness holds generally, not just for this hand-picked case: any
+        // block whose bounds do not disjoint-prove absence on EITHER axis
+        // survives even when only one predicate is given.
+        let duration_only = idx.candidate_blocks(None, 0, 1000, duration_query, None);
+        for (i, e) in blocks.iter().enumerate() {
+            let overlaps = e.max_duration_ns >= 0 && e.min_duration_ns <= 50;
+            if overlaps {
+                assert!(duration_only.contains(&i), "block {i} must survive");
+            }
+        }
+        let status_only = idx.candidate_blocks(None, 0, 1000, None, status_query);
+        for (i, e) in blocks.iter().enumerate() {
+            if e.status_mask & STATUS_BIT_ERROR != 0 {
+                assert!(status_only.contains(&i), "block {i} must survive");
+            }
+        }
     }
 
     #[test]
@@ -249,6 +388,33 @@ mod tests {
         extra.push(0);
         assert!(matches!(
             SkipIndex::decode(&extra, 100),
+            Err(SpanSegError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_reserved_status_bit() {
+        let idx = SkipIndex::new(vec![entry(1, 0, 9)]);
+        let mut bytes = idx.encode();
+        // The status_mask byte is the last byte of the single entry.
+        let last = bytes.len() - 1;
+        assert_eq!(bytes[last], STATUS_MASK_VALID);
+        bytes[last] = 0b1000_0000; // set reserved bit 7
+        assert!(matches!(
+            SkipIndex::decode(&bytes, 100),
+            Err(SpanSegError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_entry() {
+        // Truncate mid-way through the new duration/status fields: keep the
+        // header plus everything up to (but not including) status_mask.
+        let idx = SkipIndex::new(vec![entry(1, 0, 9)]);
+        let bytes = idx.encode();
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            SkipIndex::decode(truncated, 100),
             Err(SpanSegError::Corrupted(_))
         ));
     }
@@ -286,11 +452,49 @@ mod tests {
             let idx = SkipIndex::new(blocks.clone());
             let qmax = qmin.saturating_add(qspan);
             let tid = [qtrace; 16];
-            let cands = idx.candidate_blocks(Some(&tid), qmin, qmax);
+            let cands = idx.candidate_blocks(Some(&tid), qmin, qmax, None, None);
             for (i, e) in blocks.iter().enumerate() {
                 let time_overlaps = e.max_end_ts >= qmin && e.min_start_ts <= qmax;
                 let trace_hit = tid >= e.min_trace_id && tid <= e.max_trace_id;
                 if time_overlaps && trace_hit {
+                    prop_assert!(cands.contains(&i));
+                }
+            }
+        });
+    }
+
+    /// Pruning soundness over random duration/status predicates: any block
+    /// whose duration bound overlaps the query window AND whose status_mask
+    /// shares a bit with the query mask must survive `candidate_blocks`,
+    /// regardless of what random values the other blocks take.
+    #[test]
+    fn pruning_is_sound_over_random_duration_and_status() {
+        use proptest::prelude::*;
+        proptest!(|(entries in proptest::collection::vec(
+            (any::<i64>(), 0i64..2000, 0u8..8u8), 1..200),
+            qmin in any::<i64>(), qspan in 0i64..2000, qmask in 0u8..8u8)| {
+            let blocks: Vec<BlockEntry> = entries
+                .iter()
+                .map(|(base, span, mask)| {
+                    let min_duration_ns = *base;
+                    let max_duration_ns = base.saturating_add(*span);
+                    BlockEntry {
+                        min_duration_ns,
+                        max_duration_ns,
+                        status_mask: *mask,
+                        ..entry(0, i64::MIN, i64::MAX)
+                    }
+                })
+                .collect();
+            let idx = SkipIndex::new(blocks.clone());
+            let qmax = qmin.saturating_add(qspan);
+            let cands = idx.candidate_blocks(
+                None, i64::MIN, i64::MAX, Some((qmin, qmax)), Some(qmask),
+            );
+            for (i, e) in blocks.iter().enumerate() {
+                let duration_overlaps = e.max_duration_ns >= qmin && e.min_duration_ns <= qmax;
+                let status_hit = (e.status_mask & qmask) != 0;
+                if duration_overlaps && status_hit {
                     prop_assert!(cands.contains(&i));
                 }
             }

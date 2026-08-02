@@ -92,9 +92,13 @@ impl<'a> RspanReader<'a> {
             return Ok((Vec::new(), stats));
         }
 
-        let candidates =
-            self.skip
-                .candidate_blocks(query.trace_id.as_ref(), query.ts_min, query.ts_max);
+        let candidates = self.skip.candidate_blocks(
+            query.trace_id.as_ref(),
+            query.ts_min,
+            query.ts_max,
+            None,
+            None,
+        );
         stats.blocks_after_skip = candidates.len() as u32;
 
         let mut out = Vec::new();
@@ -311,6 +315,9 @@ mod tests {
             max_trace_id: [0xffu8; 16],
             min_start_ts: i64::MIN,
             max_end_ts: i64::MAX,
+            min_duration_ns: i64::MIN,
+            max_duration_ns: i64::MAX,
+            status_mask: 0,
         };
         let skip_raw = SkipIndex::new(vec![entry]).encode();
 
