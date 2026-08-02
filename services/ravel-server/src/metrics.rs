@@ -770,6 +770,121 @@ fn render_maintain_family(out: &mut String, mode: Mode, snapshot: &MaintenanceDi
     );
 }
 
+/// One signal's maintenance-safety counters for one scrape (ADR-0048
+/// decisions 4 and 6; issue #517).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceSafetySignalSnapshot {
+    pub signal: Signal,
+    /// Compaction publishes aborted by the record-count conservation gate
+    /// (ADR-0048 decision 6): inputs and built parts disagreed on record
+    /// count, so nothing was written.
+    pub conservation_aborts: u64,
+    /// Orphan-GC mass-orphan circuit breaker trips (ADR-0048 decision 4).
+    /// Monotonic: a later pass that no longer trips (dilution or partial
+    /// restoration, issue #500) does not decrement this. An operator's alert
+    /// rule must fire on the first trip (`increase(...) > 0`), never on a
+    /// sustained "currently tripped" condition, because the condition can
+    /// clear itself while the withheld data loss persists.
+    pub orphan_breaker_trips: u64,
+    /// Orphan candidates withheld by the most recent sweep pass. Drops to
+    /// `0` the moment a pass no longer trips, even though
+    /// `orphan_breaker_trips` still records that an earlier one did; this
+    /// gauge alone must never be read as "the breaker cleared, so the data
+    /// loss is resolved."
+    pub orphans_withheld: u64,
+}
+
+/// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6;
+/// issue #517): the three safety controls that, before this issue, reached
+/// an operator only through a `tracing` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceSafetySnapshot {
+    /// Legal-hold refresh failures (ADR-0048 decision 1). Not signal-scoped:
+    /// one refresh gates an entire tenant tick, so a failure skips every
+    /// signal and shard of that tick at once.
+    pub legal_hold_refresh_failures: u64,
+    pub signals: Vec<MaintenanceSafetySignalSnapshot>,
+}
+
+/// No `tenant_hash` label on any series here. ADR-0048 decision 4 names
+/// `tenant_hash` for the breaker-trip counter, but ADR-0044 section 4 blocks
+/// any per-tenant series on this unauthenticated route pending an
+/// authentication decision, and ADR-0051's resolution of that block (an
+/// opt-in `--metrics-tenant-labels` flag, default off) is not implemented
+/// anywhere in this codebase. Adding a raw tenant hash here would violate
+/// ADR-0044's safety precondition; see [`crate::maintain::MaintenanceSafetyMetrics`]
+/// and the issue #517 report for the full contradiction.
+fn render_maintain_safety_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: &MaintenanceSafetySnapshot,
+) {
+    write_header(
+        out,
+        "ravel_maintain_legal_hold_refresh_failures_total",
+        "Legal-hold refresh failures; each one skips that tenant's whole maintenance tick.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_legal_hold_refresh_failures_total",
+        &[Label::Mode(mode)],
+        snapshot.legal_hold_refresh_failures,
+    );
+
+    fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
+        [Label::Mode(mode), Label::Signal(signal)]
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_conservation_aborts_total",
+        "Compaction publishes aborted by the record-count conservation gate, by signal.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_conservation_aborts_total",
+            &labels(mode, signal.signal),
+            signal.conservation_aborts,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_orphan_breaker_tripped_total",
+        "Orphan-GC mass-orphan circuit breaker trips, by signal. Alert on increase() > 0, not \
+         on sustained state: the condition can clear itself while the withheld data loss \
+         persists (issue #500).",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_orphan_breaker_tripped_total",
+            &labels(mode, signal.signal),
+            signal.orphan_breaker_trips,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_orphans_withheld",
+        "Orphan candidates withheld by the most recent sweep pass, by signal. 0 does not mean \
+         a prior trip was resolved; see ravel_maintain_orphan_breaker_tripped_total.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_orphans_withheld",
+            &labels(mode, signal.signal),
+            signal.orphans_withheld,
+        );
+    }
+}
+
 /// Render every source this module knows about into one Prometheus text
 /// exposition document. `ingest` is empty in a mode that builds no ingest
 /// router (`Mode::Query`, `Mode::Maintain`): those families are omitted
@@ -784,6 +899,7 @@ pub fn render(
     ingest: &[IngestPipelineSnapshot],
     catalog: &CatalogCountersSnapshot,
     maintain: Option<&MaintenanceDiscoverySnapshot>,
+    maintain_safety: Option<&MaintenanceSafetySnapshot>,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -793,6 +909,9 @@ pub fn render(
     render_catalog_family(&mut out, mode, catalog);
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
+    }
+    if let Some(snapshot) = maintain_safety {
+        render_maintain_safety_family(&mut out, mode, snapshot);
     }
     out
 }
@@ -812,6 +931,9 @@ pub struct MetricsState {
     /// [`crate::maintain::spawn`] and therefore has tenant discovery counters
     /// to render (ADR-0048 decision 3, issue #504).
     pub tenant_discovery: Option<Arc<crate::tenant_discovery::TenantDiscoveryMetrics>>,
+    /// `Some` only in [`Mode::Maintain`], alongside `tenant_discovery` above
+    /// (ADR-0048 decisions 1, 4, 6; issue #517).
+    pub maintenance_safety: Option<Arc<crate::maintain::MaintenanceSafetyMetrics>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -853,12 +975,30 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 tenant_discovery_failures: metrics.discovery_failures(),
             });
 
+    let maintain_safety_snapshot =
+        state
+            .maintenance_safety
+            .as_ref()
+            .map(|metrics| MaintenanceSafetySnapshot {
+                legal_hold_refresh_failures: metrics.legal_hold_refresh_failures(),
+                signals: crate::maintain::MAINTAINED_SIGNALS
+                    .iter()
+                    .map(|&signal| MaintenanceSafetySignalSnapshot {
+                        signal,
+                        conservation_aborts: metrics.conservation_aborts(signal),
+                        orphan_breaker_trips: metrics.orphan_breaker_trips(signal),
+                        orphans_withheld: metrics.orphans_withheld(signal),
+                    })
+                    .collect(),
+            });
+
     let body = render(
         state.mode,
         &store_snapshot,
         &pipelines,
         &catalog_snapshot,
         maintain_snapshot.as_ref(),
+        maintain_safety_snapshot.as_ref(),
     );
     (
         StatusCode::OK,
@@ -917,6 +1057,7 @@ mod tests {
             &snapshot,
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
         );
 
@@ -1019,7 +1160,7 @@ mod tests {
             interlock_violations: 1,
             compaction_input_set_conflicts: 2,
         };
-        let body = render(Mode::Gateway, &store, &ingest, &catalog, None);
+        let body = render(Mode::Gateway, &store, &ingest, &catalog, None, None);
 
         let mut declared_types: HashSet<String> = HashSet::new();
         let mut bucket_state: std::collections::HashMap<String, (Vec<u64>, u64)> =
@@ -1158,6 +1299,7 @@ mod tests {
             &[],
             &CatalogCountersSnapshot::default(),
             None,
+            None,
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -1180,6 +1322,10 @@ mod tests {
             "the maintain family must be omitted entirely when no snapshot is passed, \
              not rendered with zeroes: a mode without tenant discovery has no counters to zero"
         );
+        assert!(
+            !body.contains("ravel_maintain_conservation_aborts_total"),
+            "the maintain safety family must be omitted entirely when no snapshot is passed"
+        );
     }
 
     /// ADR-0048 decision 3 / issue #504: the tenant discovery gauges and
@@ -1198,6 +1344,7 @@ mod tests {
             &[],
             &CatalogCountersSnapshot::default(),
             Some(&snapshot),
+            None,
         );
 
         assert!(
@@ -1232,6 +1379,7 @@ mod tests {
             &ingest,
             &CatalogCountersSnapshot::default(),
             None,
+            None,
         );
 
         assert!(
@@ -1244,5 +1392,122 @@ mod tests {
         // present in `ingest` still yields no `signal="spans"` collisions
         // sample; not exercised further here since no span pipeline was
         // constructed in this test.
+    }
+
+    /// Issue #517: the three maintenance safety controls (ADR-0048 decisions
+    /// 1, 4, 6) render on this same closed-label endpoint, no second
+    /// registry, exactly like every other family here.
+    #[test]
+    fn render_includes_maintain_safety_counters() {
+        let snapshot = MaintenanceSafetySnapshot {
+            legal_hold_refresh_failures: 3,
+            signals: vec![
+                MaintenanceSafetySignalSnapshot {
+                    signal: Signal::Metrics,
+                    conservation_aborts: 1,
+                    orphan_breaker_trips: 2,
+                    orphans_withheld: 7,
+                },
+                MaintenanceSafetySignalSnapshot {
+                    signal: Signal::Logs,
+                    conservation_aborts: 0,
+                    orphan_breaker_trips: 0,
+                    orphans_withheld: 0,
+                },
+            ],
+        };
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+        );
+
+        assert!(
+            body.contains("ravel_maintain_legal_hold_refresh_failures_total{mode=\"maintain\"} 3"),
+            "missing legal_hold_refresh_failures sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_conservation_aborts_total{mode=\"maintain\",signal=\"metrics\"} 1"
+            ),
+            "missing conservation_aborts sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_orphan_breaker_tripped_total{mode=\"maintain\",signal=\"metrics\"} 2"
+            ),
+            "missing orphan_breaker_tripped sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_orphans_withheld{mode=\"maintain\",signal=\"metrics\"} 7"
+            ),
+            "missing orphans_withheld sample:\n{body}"
+        );
+        // The zero-valued signal (logs) still renders, not omitted, matching
+        // every other family's zero-is-not-absence discipline.
+        assert!(
+            body.contains(
+                "ravel_maintain_orphan_breaker_tripped_total{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+    }
+
+    /// ADR-0044 section 4's allowlist is closed at the `Label` type (see
+    /// `exposition_renders_store_metrics_and_rejects_unlisted_labels`), but
+    /// that only proves a label *could* be constructed safely, not that this
+    /// family declines to construct the unsafe one. ADR-0048 names
+    /// `tenant_hash` for these counters; ADR-0044 blocks any per-tenant
+    /// series on this unauthenticated route until ADR-0051's opt-in flag
+    /// exists, and it does not exist in this codebase today (see
+    /// `crate::maintain::MaintenanceSafetyMetrics`'s doc comment). This test
+    /// pins the resulting decision -- `mode` and `signal` only, never
+    /// `tenant_hash` -- so a later change cannot reintroduce it silently.
+    #[test]
+    fn maintain_safety_family_never_renders_a_tenant_hash_label() {
+        let snapshot = MaintenanceSafetySnapshot {
+            legal_hold_refresh_failures: 1,
+            signals: vec![MaintenanceSafetySignalSnapshot {
+                signal: Signal::Metrics,
+                conservation_aborts: 1,
+                orphan_breaker_trips: 1,
+                orphans_withheld: 1,
+            }],
+        };
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+        );
+
+        for line in body.lines() {
+            let expected_keys = if line.starts_with("ravel_maintain_legal_hold_refresh_failures_total") {
+                vec!["mode"]
+            } else if line.starts_with("ravel_maintain_conservation_aborts_total")
+                || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
+                || line.starts_with("ravel_maintain_orphans_withheld")
+            {
+                vec!["mode", "signal"]
+            } else {
+                continue;
+            };
+            let brace = line.find('{').expect("sample line carries labels");
+            let labels = &line[brace + 1..line.find('}').expect("closed label block")];
+            let keys: Vec<&str> = labels
+                .split(',')
+                .map(|pair| pair.split_once('=').expect("label is key=value").0)
+                .collect();
+            assert_eq!(
+                keys, expected_keys,
+                "maintain-safety sample carries an unexpected label set: {line}"
+            );
+        }
     }
 }

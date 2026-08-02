@@ -46,12 +46,15 @@
 //! across ticks.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rand::RngExt as _;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
-use ravel_maintain::{Clock, CompactorConfig, LegalHoldCheck, RetentionConfig, sweep_shard};
+use ravel_maintain::{
+    Clock, CompactorConfig, LegalHoldCheck, MaintainError, RetentionConfig, sweep_shard,
+};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
@@ -79,7 +82,94 @@ impl Clock for WallClock {
 /// The signals this server ingests, and therefore maintains, today. Metrics
 /// (RSEG) and logs (RLOG) both flow through the same signal-generic
 /// compaction/retention/sweep code (ADR-0032).
-const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+pub(crate) const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
+/// Position of `signal` within [`MAINTAINED_SIGNALS`], and therefore within
+/// [`MaintenanceSafetyMetrics`]'s per-signal arrays. Exhaustive over the
+/// signals this driver actually loops over (`run_tick`'s `for signal in
+/// MAINTAINED_SIGNALS`), so a signal from outside that set is a caller bug,
+/// not a case to fold into an "other" bucket.
+fn signal_index(signal: Signal) -> usize {
+    match signal {
+        Signal::Metrics => 0,
+        Signal::Logs => 1,
+        Signal::Spans => 2,
+        other => unreachable!(
+            "maintenance safety metrics only track MAINTAINED_SIGNALS, got {other:?}"
+        ),
+    }
+}
+
+/// Process-global counters for the three maintenance safety controls that,
+/// before issue #517, only reached an operator through a `tracing` line: a
+/// legal-hold refresh failure (ADR-0048 decision 1), a compaction
+/// conservation-gate abort (decision 6), and an orphan-GC circuit breaker
+/// trip (decision 4). Rendered on the existing `GET /metrics` endpoint by
+/// [`crate::metrics::render_maintain_safety_family`], no second registry.
+///
+/// Indexed by [`signal_index`] because each event is signal-scoped; there is
+/// deliberately no `tenant_hash` dimension here. ADR-0048's decision 4 names
+/// `tenant_hash` as a label for the breaker-trip counter, but ADR-0044
+/// section 4 blocks any per-tenant `/metrics` series on this unauthenticated
+/// route pending an authentication decision, and ADR-0051's resolution of
+/// that block (an opt-in `--metrics-tenant-labels` flag) is not implemented
+/// anywhere in this codebase. Adding a raw `tenant_hash` label here would
+/// violate ADR-0044's safety precondition; see the issue #517 report for the
+/// full contradiction.
+#[derive(Debug, Default)]
+pub struct MaintenanceSafetyMetrics {
+    legal_hold_refresh_failures: AtomicU64,
+    conservation_aborts: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphan_breaker_trips: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_withheld: [AtomicU64; MAINTAINED_SIGNALS.len()],
+}
+
+impl MaintenanceSafetyMetrics {
+    pub fn legal_hold_refresh_failures(&self) -> u64 {
+        self.legal_hold_refresh_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn conservation_aborts(&self, signal: Signal) -> u64 {
+        self.conservation_aborts[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    pub fn orphan_breaker_trips(&self, signal: Signal) -> u64 {
+        self.orphan_breaker_trips[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Orphan candidates withheld by the most recent sweep pass for `signal`.
+    /// Always `0` when that pass did not trip the breaker -- including a
+    /// pass after a previous trip, when dilution or partial restoration let
+    /// the breaker clear. That drop to `0` is the un-trip: `orphan_breaker_trips`
+    /// above is the durable record that a trip (and its withheld data) ever
+    /// happened; this gauge alone must never be read as "resolved."
+    pub fn orphans_withheld(&self, signal: Signal) -> u64 {
+        self.orphans_withheld[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    pub fn record_legal_hold_refresh_failure(&self) {
+        self.legal_hold_refresh_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_conservation_abort(&self, signal: Signal) {
+        self.conservation_aborts[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `sweep_shard` result for `signal`: increments the trip counter
+    /// when `tripped`, and always overwrites the withheld gauge with this
+    /// pass's count (`0` when not tripped), matching [`orphans_withheld`]'s
+    /// doc on why that gauge alone cannot be read as "resolved".
+    ///
+    /// [`orphans_withheld`]: Self::orphans_withheld
+    pub fn record_sweep(&self, signal: Signal, tripped: bool, withheld: usize) {
+        let index = signal_index(signal);
+        if tripped {
+            self.orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
+        }
+        self.orphans_withheld[index].store(withheld as u64, Ordering::Relaxed);
+    }
+}
 
 /// Everything the maintenance task needs beyond the store and the tenant list.
 #[derive(Debug, Clone)]
@@ -140,11 +230,13 @@ impl MaintenanceTasks {
 /// discovered tenant is maintained), non-empty narrows the discovered set to
 /// exactly those tenants. Returns immediately; the task runs until
 /// [`MaintenanceTasks::shutdown`].
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
     restrict: Vec<TenantHash>,
     config: MaintenanceTaskConfig,
     metrics: Arc<TenantDiscoveryMetrics>,
+    safety: Arc<MaintenanceSafetyMetrics>,
 ) -> MaintenanceTasks {
     if !config.enabled {
         return MaintenanceTasks::none();
@@ -175,6 +267,7 @@ pub fn spawn(
             shard_count,
             interval,
             metrics,
+            safety,
             rx,
         )
         .await;
@@ -194,6 +287,7 @@ async fn run_loop(
     shard_count: u32,
     interval: Duration,
     metrics: Arc<TenantDiscoveryMetrics>,
+    safety: Arc<MaintenanceSafetyMetrics>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     // One memo for the whole process, held across every tick and every
@@ -215,6 +309,7 @@ async fn run_loop(
             shard_count,
             &mut memo,
             metrics.as_ref(),
+            safety.as_ref(),
         )
         .await;
     }
@@ -237,6 +332,7 @@ pub async fn run_discovery_cycle(
     shard_count: u32,
     memo: &mut MaintainMemo,
     metrics: &TenantDiscoveryMetrics,
+    safety: &MaintenanceSafetyMetrics,
 ) -> MaintainReport {
     let outcome = match discover_and_restrict(store, restrict).await {
         Ok(outcome) => outcome,
@@ -260,7 +356,8 @@ pub async fn run_discovery_cycle(
 
     let mut total = MaintainReport::default();
     for tenant in &outcome.maintained {
-        let report = run_tick(store, tenant, compactor, retention, shard_count, memo).await;
+        let report =
+            run_tick(store, tenant, compactor, retention, shard_count, memo, safety).await;
         total.retired += report.retired;
         total.compacted += report.compacted;
         total.already_done += report.already_done;
@@ -300,6 +397,7 @@ pub async fn run_tick(
     retention: &RetentionConfig,
     shard_count: u32,
     memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
 ) -> MaintainReport {
     let clock = WallClock;
 
@@ -311,6 +409,7 @@ pub async fn run_tick(
                 error = %err,
                 "maintenance: legal hold refresh failed; skipping this tenant's tick entirely, retried next tick"
             );
+            safety.record_legal_hold_refresh_failure();
             return MaintainReport::default();
         }
     };
@@ -341,6 +440,25 @@ pub async fn run_tick(
                     total.not_sealed += report.not_sealed;
                     total.skipped_terminal += report.skipped_terminal;
                 }
+                Err(MaintainError::ConservationViolation {
+                    input_sample_count,
+                    part_sample_count,
+                    ingest_hour_bucket,
+                    ..
+                }) => {
+                    tracing::error!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        ingest_hour_bucket,
+                        input_sample_count,
+                        part_sample_count,
+                        "maintenance: compaction conservation gate aborted a publish; \
+                         inputs and built parts disagree on record count, nothing written, \
+                         retried next tick"
+                    );
+                    safety.record_conservation_abort(signal);
+                }
                 Err(err) => {
                     tracing::warn!(
                         tenant = %tenant.to_hex(),
@@ -364,6 +482,18 @@ pub async fn run_tick(
                         unreferenced_parts = report.unreferenced_parts_deleted,
                         "maintenance: sweep pass complete"
                     );
+                    if report.orphan_breaker_tripped {
+                        tracing::error!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            withheld = report.orphans_withheld,
+                            "maintenance: orphan GC mass-orphan circuit breaker tripped; \
+                             deletions withheld this pass, not self-clearing in the sense an \
+                             operator expects, see the breaker runbook"
+                        );
+                    }
+                    safety.record_sweep(signal, report.orphan_breaker_tripped, report.orphans_withheld);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -435,7 +565,9 @@ mod tests {
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
-        let report = run_tick(&store, &tenant, &compactor, &retention, 4, &mut memo).await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let report =
+            run_tick(&store, &tenant, &compactor, &retention, 4, &mut memo, &safety).await;
         // Nothing to maintain, nothing memoized: a subsequent tick would still
         // find nothing to skip.
         assert_eq!(report, MaintainReport::default());
@@ -527,6 +659,7 @@ mod tests {
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
 
         // Per-bucket object reads: the memo elides the per-bucket LIST and GET
         // reads, so this is what shrinks between the cold and warm ticks. The
@@ -537,7 +670,8 @@ mod tests {
         // bucket is below the compaction threshold, so it is already-done and
         // gets memoized as terminal.
         let before_first = store.metrics().snapshot();
-        let first = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        let first =
+            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
         let first_reads =
             per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_first);
         assert_eq!(first.skipped_terminal, 0, "cold memo skips nothing");
@@ -547,7 +681,8 @@ mod tests {
 
         // Tick 2 (warm memo): the bucket is skipped straight from the memo.
         let before_second = store.metrics().snapshot();
-        let second = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        let second =
+            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
         let second_reads =
             per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_second);
         assert_eq!(second.skipped_terminal, 1, "warm memo skips the bucket");
@@ -608,18 +743,21 @@ mod tests {
         )
         .expect("valid retention policy");
         let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
 
         // Tick 1: the bucket's one sample is from ingest hour 0 (1970), so any
         // valid retention window is already expired against the real wall
         // clock. Not memoized terminal (Tombstoned isn't a terminal state),
         // so tick 2 re-evaluates it for real rather than skipping it.
-        let first = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        let first =
+            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
         assert_eq!(first.retired, 1, "the expired bucket is tombstoned");
 
         // Tick 2: the tombstone's horizon has elapsed (zero protection
         // horizon), so this tick attempts the physical sweep. The hold must
         // block it entirely.
-        let second = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        let second =
+            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
         assert_eq!(
             second.retired, 1,
             "still counted retired (tombstoned), never actually swept"
@@ -689,8 +827,10 @@ mod tests {
         )
         .expect("valid retention policy");
         let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
 
-        let report = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        let report =
+            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
 
         assert_eq!(
             report,
@@ -703,6 +843,11 @@ mod tests {
             "the injected refresh fault must actually have fired"
         );
         assert!(memo.is_empty(), "a skipped tick memoizes nothing");
+        assert_eq!(
+            safety.legal_hold_refresh_failures(),
+            1,
+            "the refresh failure must be visible on the metrics endpoint, not just as a log line"
+        );
 
         let commit_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
             .expect("valid commit shard prefix");
@@ -731,9 +876,12 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
 
-        let report =
-            run_discovery_cycle(&store, None, &compactor, &retention, 1, &mut memo, &metrics).await;
+        let report = run_discovery_cycle(
+            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety,
+        )
+        .await;
 
         assert_eq!(
             report.already_done, 1,
@@ -761,6 +909,7 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
         let restrict = [acme.hash()];
 
         let report = run_discovery_cycle(
@@ -771,6 +920,7 @@ mod tests {
             1,
             &mut memo,
             &metrics,
+            &safety,
         )
         .await;
 
@@ -816,9 +966,12 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
 
-        let report =
-            run_discovery_cycle(&store, None, &compactor, &retention, 1, &mut memo, &metrics).await;
+        let report = run_discovery_cycle(
+            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety,
+        )
+        .await;
 
         assert_eq!(
             report,
@@ -837,5 +990,35 @@ mod tests {
             "gauges stay at their last known-good value, never reporting this failed cycle"
         );
         assert!(memo.is_empty(), "a skipped cycle memoizes nothing");
+    }
+
+    /// The un-trip an operator must not read as "resolved" (ADR-0048 decision
+    /// 4, issue #500): a second, non-tripped sweep pass for the same signal
+    /// drops `orphans_withheld` back to `0`, but `orphan_breaker_trips` -- the
+    /// counter a first-trip alert fires on -- keeps the earlier trip on the
+    /// record.
+    #[test]
+    fn orphan_breaker_withheld_gauge_drops_but_trip_counter_does_not() {
+        let safety = MaintenanceSafetyMetrics::default();
+        safety.record_sweep(Signal::Metrics, true, 42);
+        assert_eq!(safety.orphan_breaker_trips(Signal::Metrics), 1);
+        assert_eq!(safety.orphans_withheld(Signal::Metrics), 42);
+
+        safety.record_sweep(Signal::Metrics, false, 0);
+        assert_eq!(
+            safety.orphan_breaker_trips(Signal::Metrics),
+            1,
+            "a cleared pass must never erase that a trip happened"
+        );
+        assert_eq!(
+            safety.orphans_withheld(Signal::Metrics),
+            0,
+            "the withheld gauge reflects only the most recent pass"
+        );
+
+        // A different signal's counters are untouched.
+        assert_eq!(safety.orphan_breaker_trips(Signal::Logs), 0);
+        assert_eq!(safety.conservation_aborts(Signal::Logs), 0);
+        assert_eq!(safety.legal_hold_refresh_failures(), 0);
     }
 }
