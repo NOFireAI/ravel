@@ -239,7 +239,7 @@ pub async fn audit_versions(
     let mut anomalies = 0usize;
     for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
         let supported: u32 = match signal {
-            Signal::Metrics => u32::from(ravel_segment::VERSION_V5),
+            Signal::Metrics => u32::from(ravel_segment::VERSION_V6),
             Signal::Logs => u32::from(ravel_logseg::footer::VERSION),
             Signal::Spans => u32::from(ravel_rspan::footer::VERSION),
             other => {

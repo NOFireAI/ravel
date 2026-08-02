@@ -69,7 +69,7 @@ const COALESCE_GAP: u64 = 64 * 1024;
 
 /// The current RSEG output version (ADR-0026, made the only version by
 /// ADR-0027). Recorded in each part's `CompactionPart.segment_format_version`.
-pub const OUTPUT_FORMAT_VERSION: u32 = 5;
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::VERSION_V6 as u32;
 
 /// One built (not yet published) L1 part: its content-addressed key, its
 /// bytes, and the [`CompactionPart`] describing it for the record.

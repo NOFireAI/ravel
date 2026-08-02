@@ -370,8 +370,7 @@ impl SegmentWriter {
 
         let dict = build_dictionary_v4(&series, &exemplars)?;
 
-        let mut series_index_by_id: HashMap<[u8; 16], u32> =
-            HashMap::with_capacity(series.len());
+        let mut series_index_by_id: HashMap<[u8; 16], u32> = HashMap::with_capacity(series.len());
         for (i, s) in series.iter().enumerate() {
             series_index_by_id.insert(s.series_id.0, i as u32);
         }
@@ -409,11 +408,12 @@ impl SegmentWriter {
         let mut deduped_exemplars: Vec<ResolvedExemplar> =
             Vec::with_capacity(resolved_exemplars.len());
         for r in resolved_exemplars {
-            if let Some(last) = deduped_exemplars.last_mut() {
-                if last.series_index == r.series_index && last.ts_ns == r.ts_ns {
-                    *last = r;
-                    continue;
-                }
+            if let Some(last) = deduped_exemplars.last_mut()
+                && last.series_index == r.series_index
+                && last.ts_ns == r.ts_ns
+            {
+                *last = r;
+                continue;
             }
             deduped_exemplars.push(r);
         }
@@ -2079,9 +2079,14 @@ mod v4_tests {
             ],
         }];
         let meta = test_compaction_meta();
-        let written =
-            SegmentWriter::write_v4(series, test_identity(), test_bounds(), meta.clone(), Vec::new())
-                .expect("writes");
+        let written = SegmentWriter::write_v4(
+            series,
+            test_identity(),
+            test_bounds(),
+            meta.clone(),
+            Vec::new(),
+        )
+        .expect("writes");
         let footer = decode_footer(written.bytes.as_ref(), VERSION_V4);
 
         assert_eq!(
