@@ -162,8 +162,10 @@ pub struct Cli {
     #[arg(long, value_name = "URL")]
     pub oidc_jwks_url: Option<String>,
 
-    /// Acceptable JWT `aud` value (repeatable). When none is set audience is not
-    /// checked. Setting it without OIDC enabled fails startup.
+    /// Acceptable JWT `aud` value (repeatable). At least one is required when
+    /// OIDC is enabled: without an audience, any correctly-signed unexpired
+    /// token from the issuer authenticates regardless of which relying party it
+    /// was minted for. Setting it without OIDC enabled fails startup.
     #[arg(long = "oidc-audience", value_name = "AUD")]
     pub oidc_audiences: Vec<String>,
 
@@ -309,6 +311,25 @@ impl Cli {
                     anyhow::bail!(
                         "invalid --oidc-jwks-url '{jwks_url}', expected an http:// or https:// URL"
                     );
+                }
+                // Require an audience. With none configured, jsonwebtoken's
+                // `validate_aud` would be turned off in `OidcResolver`, so any
+                // correctly-signed, unexpired token from this issuer would
+                // authenticate regardless of which relying party
+                // (client_id/audience) it was minted for. A token issued for a
+                // completely different application at the same IdP would be
+                // accepted. Fail fast rather than run a deployment that trusts
+                // every token the issuer ever mints.
+                if self.oidc_audiences.is_empty() {
+                    anyhow::bail!(
+                        "OIDC is enabled but no --oidc-audience is set: without an audience \
+                         any correctly-signed, unexpired token from this issuer authenticates, \
+                         for any relying party it was minted for. Set at least one \
+                         --oidc-audience naming this deployment."
+                    );
+                }
+                if self.oidc_audiences.iter().any(|a| a.is_empty()) {
+                    anyhow::bail!("--oidc-audience must be non-empty");
                 }
                 Some(OidcSettings {
                     issuer: issuer.to_string(),
@@ -490,6 +511,75 @@ mod tests {
     fn merge_of_two_empty_lists_is_empty() {
         let none: [TenantId; 0] = [];
         assert!(merge_fold_tenants(&none, &none).is_empty());
+    }
+
+    #[test]
+    fn oidc_without_audience_fails_startup() {
+        // #397: OIDC enabled (issuer + jwks) but no --oidc-audience must fail
+        // fast. Otherwise `OidcResolver` disables audience validation and any
+        // correctly-signed token from the issuer, for any relying party,
+        // authenticates.
+        let err = cli(&[
+            "--oidc-issuer",
+            "https://issuer.example.com",
+            "--oidc-jwks-url",
+            "https://issuer.example.com/jwks",
+        ])
+        .parse_auth_resolvers()
+        .expect_err("OIDC with no audience fails startup");
+        assert!(
+            err.to_string().contains("--oidc-audience"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn oidc_with_audience_parses() {
+        let settings = cli(&[
+            "--oidc-issuer",
+            "https://issuer.example.com",
+            "--oidc-jwks-url",
+            "https://issuer.example.com/jwks",
+            "--oidc-audience",
+            "ravel",
+            "--oidc-audience",
+            "ravel-query",
+        ])
+        .parse_auth_resolvers()
+        .expect("OIDC with an audience parses");
+        let oidc = settings.oidc.expect("OIDC is enabled");
+        assert_eq!(oidc.issuer, "https://issuer.example.com");
+        assert_eq!(oidc.audiences, vec!["ravel", "ravel-query"]);
+        assert_eq!(oidc.tenant_claim, "tenant");
+    }
+
+    #[test]
+    fn oidc_with_empty_audience_is_rejected() {
+        let err = cli(&[
+            "--oidc-issuer",
+            "https://issuer.example.com",
+            "--oidc-jwks-url",
+            "https://issuer.example.com/jwks",
+            "--oidc-audience",
+            "",
+        ])
+        .parse_auth_resolvers()
+        .expect_err("an empty audience value fails startup");
+        assert!(
+            err.to_string().contains("--oidc-audience"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn audience_without_oidc_still_fails() {
+        let err = cli(&["--oidc-audience", "ravel"])
+            .parse_auth_resolvers()
+            .expect_err("audience with no OIDC fails startup");
+        assert!(
+            err.to_string().contains("--oidc-audience"),
+            "error names the flag: {err}"
+        );
     }
 
     #[test]
