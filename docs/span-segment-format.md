@@ -1,7 +1,11 @@
 # RSPAN: Ravel Span Segment Format
 
 Persistent contract (ADR-0041). Any change bumps the trailer version. The
-current trailer version is 1 (the format-only initial release).
+current trailer version is 2 (ADR-0045 decision 2 added per-block duration
+bounds and a status mask to SKIP_IDX for trace-investigation pruning).
+Ravel is pre-release: one supported version at a time, earlier versions
+rejected with the same typed `Corrupted` error as an unknown future version,
+never carried by a dual reader (ADR-0045 decision 4, ADR-0027 precedent).
 Parsers treat every offset, length, count, and tag read from stored bytes as
 untrusted input: bounds-check everything, overflow-check every accumulation,
 fuzz all decoders. No `unsafe`. Every violation is a typed `Corrupted` error,
@@ -51,7 +55,7 @@ second (stream-ref) dimension to summarize.
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 1)                       |
+|   version:      u16   (= 2)                       |
 |   signal:       u8    (3 = spans)                 |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RSP1"                   |
@@ -186,7 +190,23 @@ skip_idx:
     [16]     max_trace_id
     ivarint  min_start_ts
     ivarint  max_end_ts
+    ivarint  min_duration_ns    (v2, ADR-0045)
+    ivarint  max_duration_ns    (v2, ADR-0045)
+    u8       status_mask       (v2, ADR-0045)
 ```
+
+`min_duration_ns`/`max_duration_ns` bound `end_ts_ns - start_ts_ns` over the
+block's rows. They are derived at write time from the same endpoint scan that
+already computes `min_start_ts`/`max_end_ts`, never stored per row. A negative
+duration (a row whose `end_ts_ns` precedes its `start_ts_ns`) is a valid signed
+value and ivarint encodes it natively; only true `i64` overflow of the
+subtraction is rejected, as a typed `Corrupted` error at write time.
+
+`status_mask` is one byte summarizing which OTLP status codes appear in the
+block: bit 0 set when any row has `Unset`, bit 1 when any row has `Ok`, bit 2
+when any row has `Error`. Bits 3-7 are reserved: the writer MUST emit them as
+0, and the reader MUST reject a `status_mask` with any of them set as
+`Corrupted`, the same as any other malformed field.
 
 ### Pruning soundness
 
@@ -199,12 +219,21 @@ A block is dropped only when its bounds prove no record in it can match:
 - **Trace id.** When a trace-id predicate is present, prune when the id falls
   outside the block's `[min_trace_id, max_trace_id]` range. Because records sort
   by trace_id first, a single trace's spans occupy a contiguous run of blocks.
+- **Duration (v2).** When a duration window `[D1, D2]` predicate is present,
+  prune when the block's duration bound is disjoint from it: `max_duration_ns
+  < D1 || min_duration_ns > D2`. Same overlap test as the time interval, over
+  the derived `end_ts_ns - start_ts_ns` range instead of the raw timestamps.
+- **Status (v2).** When a status-mask predicate is present, prune when the
+  block's `status_mask` shares no bit with it: `(entry.status_mask & query_mask)
+  == 0`. A block that might contain a matching status code is never pruned; a
+  positive is not proof of a match, only the absence of a bit is proof of no
+  match.
 
 Survivors are read, crc-verified, decoded, and re-evaluated exactly per row
-(interval overlap `start <= T2 && end >= T1`, plus trace_id equality when
-predicated). A corrupt SKIP_IDX is a loud `Corrupted` error, not a degrade: its
-bytes carry the block framing and per-block checksums, so without it no block
-can be located or verified.
+(interval overlap `start <= T2 && end >= T1`, trace_id equality, duration
+range, and status equality, each only when predicated). A corrupt SKIP_IDX is
+a loud `Corrupted` error, not a degrade: its bytes carry the block framing and
+per-block checksums, so without it no block can be located or verified.
 
 ## Checksum coverage
 
@@ -212,7 +241,10 @@ Same per-section/per-block crc32c discipline as RLOG/RSEG. Each section's
 `crc32c` covers its stored bytes; each block's `crc32c` (in its SKIP_IDX entry)
 covers the whole block; `footer_crc32c` covers the footer and trailer as defined
 above. There is no separate BLOOM checksum surface because there is no BLOOM
-section.
+section. The v2 `min_duration_ns`/`max_duration_ns`/`status_mask` fields add no
+new checksum surface of their own: SKIP_IDX is read and verified as one
+whole-section zstd blob under its `Section.crc32c`, so the new fields inherit
+that existing coverage exactly as the v1 fields did.
 
 ## Compaction (L0 → L1)
 
