@@ -118,7 +118,7 @@ pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
 pub use schema::{internal_schema, public_schema};
 pub use session::{
-    EmptyObjectStoreRegistry, LOGS_TABLE, SAMPLES_TABLE, SessionTable, build_session,
+    EmptyObjectStoreRegistry, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session,
     session_config,
 };
 pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanSegmentFetcher};
@@ -126,9 +126,9 @@ pub use spans_provider::SpansTableProvider;
 pub use spans_pushdown::{SpansPushdown, extract_spans};
 pub use spans_scan::SpansScanExec;
 pub use spans_schema::{
-    SPAN_COL_ATTRS, SPAN_COL_END_TS, SPAN_COL_NAME, SPAN_COL_PARENT_SPAN_ID, SPAN_COL_SPAN_ID,
-    SPAN_COL_START_TS, SPAN_COL_STATUS_CODE, SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID,
-    spans_schema,
+    SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_NAME, SPAN_COL_PARENT_SPAN_ID,
+    SPAN_COL_SERVICE_NAME, SPAN_COL_SPAN_ID, SPAN_COL_START_TS, SPAN_COL_STATUS_CODE,
+    SPAN_COL_STATUS_MESSAGE, SPAN_COL_TRACE_ID, spans_schema,
 };
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{ValidationError, validate};

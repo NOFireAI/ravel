@@ -275,8 +275,7 @@ mod tests {
     /// registration and planning only, not execution over real data.
     #[tokio::test]
     async fn spans_table_is_registered_and_a_select_star_plans() {
-        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> =
-            Arc::new(MemoryStore::new());
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let fetcher = SpanSegmentFetcher::new(store);
         let snapshot = Snapshot {
             segments: Vec::new(),
