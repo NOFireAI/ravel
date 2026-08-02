@@ -52,6 +52,21 @@ pub enum MaintainError {
         ours: String,
         theirs: String,
     },
+    #[error(
+        "compaction record-count conservation violated for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: inputs carry {input_sample_count} records, built parts carry {part_sample_count}; the merge dropped or invented records, publish aborted (fatal invariant breach, ADR-0048)"
+    )]
+    ConservationViolation {
+        /// Hex tenant hash of the bucket (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        /// Sum of `sample_count` over the compaction input set.
+        input_sample_count: u64,
+        /// Sum of `sample_count` over the built output parts.
+        part_sample_count: u64,
+    },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
 }

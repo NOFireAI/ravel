@@ -101,6 +101,18 @@ rejected point counts and reasons.
   collapses the duplicate candidates. Concretely this means: no dedup runs
   at compaction time, and a reader may transiently see an L0 input and its
   L1 replacement together and still get exact answers.
+- Record-count conservation is enforced, not assumed (ADR-0048): before the
+  record PUT, the run checks that the sum of `sample_count` over its input
+  set exactly equals the sum of `sample_count` over its built parts.
+  Compaction is a verbatim page copy for every signal and never dedups, so
+  any inequality means the merge dropped or invented records; the run then
+  aborts with a typed error and publishes nothing. The L0 inputs remain
+  live and queryable, and the abandoned parts age out under the
+  unreferenced-part rule. The check runs pre-publish because publish is the
+  point of no return: once the record is visible the resolver excludes the
+  inputs, and after the protection horizon the sweep removes them
+  physically. The gate also runs under dry-run, so a dry run of a bucket
+  that would trip it reports the violation.
 - Racing compactors over the same sealed bucket are resolved by
   `CreateIfAbsent` picking one record as the winner; a losing compactor's
   parts are simply unreferenced objects that age out under the
