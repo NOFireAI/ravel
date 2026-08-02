@@ -61,6 +61,13 @@ pub struct IngestLimits {
     /// which resource semantic conventions they rely on for routing and
     /// alerting.
     pub resource_attribute_allowlist: Vec<String>,
+    /// Width of the per-series exemplar admission window (ADR-0047 decision
+    /// 2): at most one exemplar per series is kept per window of this many
+    /// nanoseconds, the newest one. A security control, not a tuning knob —
+    /// a trace id is high-entropy, so an uncapped exemplar path lets a
+    /// client multiply object size at will. Default 10 seconds, matching
+    /// [`ravel_types::ExemplarCap::DEFAULT_WINDOW_NS`].
+    pub exemplar_cap_window_ns: i64,
 }
 
 const SECOND_NANOS: i64 = 1_000_000_000;
@@ -79,6 +86,7 @@ impl Default for IngestLimits {
             max_future_skew_ns: 10 * MINUTE_NANOS,
             max_ingest_lag_ns: 2 * HOUR_NANOS,
             resource_attribute_allowlist: default_resource_attribute_allowlist(),
+            exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
         }
     }
 }
@@ -217,10 +225,15 @@ pub enum Rejection {
     #[error("histogram min/max field(s) dropped: no Prometheus-convention representation")]
     HistogramMinMaxDropped { count: usize },
 
-    /// Informational, not an admission failure: same as
-    /// [`Rejection::HistogramMinMaxDropped`] but for exemplars, pending
-    /// ADR-0017's exemplar decision.
-    #[error("histogram exemplar(s) dropped: no Prometheus-convention representation")]
+    /// Informational, not an admission failure: the data point was admitted,
+    /// but `count` of its exemplars were not carried (ADR-0047 decision 2).
+    /// Despite the name (kept for compatibility with existing callers that
+    /// match on this variant), this covers exemplars dropped from any
+    /// metric type, not only histograms: a malformed exemplar (no
+    /// recognized value in its oneof) or one that lost the per-series,
+    /// per-window admission cap. Exemplars that survive normalization are
+    /// not reflected here; see [`crate::normalize::NormalizedExemplar`].
+    #[error("exemplar(s) dropped: malformed, or beyond the per-series admission cap")]
     HistogramExemplarsDropped { count: usize },
 
     /// Informational, not an admission failure: the data point was admitted
@@ -299,6 +312,7 @@ mod tests {
                 "cloud.region",
             ]
         );
+        assert_eq!(limits.exemplar_cap_window_ns, 10_000_000_000);
     }
 
     #[test]
