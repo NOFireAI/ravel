@@ -48,6 +48,7 @@ use tokio::task::JoinHandle;
 
 pub use alerting::AlertEvalConfig;
 pub use config::{Cli, Mode, StoreKind};
+pub use config::limits::LimitsConfig;
 pub use fold::FoldTaskConfig;
 pub use maintain::MaintenanceTaskConfig;
 

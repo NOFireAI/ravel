@@ -143,6 +143,24 @@ async fn main() -> anyhow::Result<()> {
     let alert_sinks = cli
         .parse_alert_sinks()
         .context("failed to parse alert sink flags")?;
+    // Admission limits (ADR-0051 section 3): --limits-file is parsed and
+    // validated at startup regardless of mode, so an unparseable file, an
+    // unknown key, or a nonsensical limit fails startup rather than silently
+    // keeping the shipped defaults. No `AdmissionController` reads `limits`
+    // yet - wiring one into an ingest path is a separate change - so this
+    // only logs what was resolved.
+    let limits = cli
+        .parse_limits_file()
+        .context("failed to parse --limits-file")?;
+    tracing::info!(
+        tenant_overrides = limits.tenants.len(),
+        max_active_series = ?limits.defaults.max_active_series,
+        max_active_streams = ?limits.defaults.max_active_streams,
+        "admission limits resolved from {}",
+        cli.limits_file
+            .as_deref()
+            .map_or_else(|| "shipped defaults".to_string(), |p| p.display().to_string())
+    );
     if !alert_rules.is_empty() && alert_sinks.is_empty() {
         tracing::info!(
             "alert rules are configured but no sink is: transitions will be written as durable \
