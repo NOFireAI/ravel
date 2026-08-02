@@ -229,9 +229,23 @@ A block is dropped only when its bounds prove no record in it can match:
   positive is not proof of a match, only the absence of a bit is proof of no
   match.
 
-Survivors are read, crc-verified, decoded, and re-evaluated exactly per row
-(interval overlap `start <= T2 && end >= T1`, trace_id equality, duration
-range, and status equality, each only when predicated). A corrupt SKIP_IDX is
+Survivors are read, crc-verified, decoded, and re-evaluated exactly per row:
+interval overlap `start <= T2 && end >= T1`, and trace_id equality when
+predicated.
+
+Duration and status prune at block level only. `SpanQuery` carries no
+duration or status field, so no per-row re-evaluation of either exists yet:
+a caller that prunes on them must apply its own exact filter to the rows the
+scan returns. The reader gains those fields when the query path that needs
+them lands.
+
+The block-level predicates are also sound only for a conjunctive query. Each
+axis is an independent disjointness proof and a block is dropped when any one
+of them proves no match, which is the correct AND-of-proofs for `a AND b`.
+Under a disjunctive pushdown the same test would drop blocks that satisfy the
+other branch. A future caller pushing `OR` must intersect differently.
+
+A corrupt SKIP_IDX is
 a loud `Corrupted` error, not a degrade: its bytes carry the block framing and
 per-block checksums, so without it no block can be located or verified.
 
