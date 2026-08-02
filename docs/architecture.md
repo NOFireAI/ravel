@@ -121,6 +121,19 @@ alarm on is a prefix that holds data but receives no maintenance:
 flag restriction configured, or `tenants_maintained` at zero while
 `tenants_discovered` is not, in a mode that should be maintaining.
 
+`--mode maintain` also renders four maintenance-safety samples through
+the same renderer (ADR-0048 decisions 4 and 6, issue #517):
+`ravel_maintain_legal_hold_refresh_failures_total`,
+`ravel_maintain_conservation_aborts_total` and
+`ravel_maintain_orphan_breaker_tripped_total` (both labeled by
+`signal`), and the gauge `ravel_maintain_orphans_withheld` (also
+labeled by `signal`). These use only the existing `mode` and `signal`
+labels; ADR-0048 names `tenant_hash` on the orphan-breaker-trip counter,
+but ADR-0044's per-tenant label ban on this unauthenticated route holds
+until ADR-0051's `--metrics-tenant-labels` flag is actually implemented,
+which it is not yet. See docs/guides/operations.md for the default
+alert rules and the breaker runbook.
+
 Remote Write (ADR-0015) reuses this same gateway/router/shard pipeline: RW1
 and RW2 payloads decode and normalize to the same `NormalizedPoint` shape
 OTLP produces, in `ravel-remote-write`, then flow through the identical
