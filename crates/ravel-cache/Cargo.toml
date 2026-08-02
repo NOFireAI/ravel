@@ -4,11 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Content-addressed, single-flighted, S3-FIFO read cache RAM tier (ADR-0046)."
+description = "Content-addressed, single-flighted, S3-FIFO read cache: RAM and local-disk tiers (ADR-0046)."
 
 [dependencies]
 bytes = { workspace = true }
-blake3 = { workspace = true }
 crc32c = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }

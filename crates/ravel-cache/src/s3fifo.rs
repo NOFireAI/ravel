@@ -1,6 +1,16 @@
-//! S3-FIFO eviction (ADR-0046 decision 6): a small FIFO probation queue, a
-//! main FIFO for entries that proved themselves, and a ghost queue of
-//! keys evicted from probation before they got a second chance.
+//! S3-FIFO eviction (ADR-0046 decision 6, amended 2026-08-02): a small FIFO
+//! probation queue, a main FIFO for entries that proved themselves, and a
+//! ghost queue of keys evicted from probation before they got a second
+//! chance.
+//!
+//! Shared by both tiers. The amended decision 6 scopes scan resistance to
+//! disk *more* than RAM, not less: a disk miss costs an S3 fetch, the most
+//! expensive thing a query does, and the disk tier is the large one that
+//! actually holds the working set. [`crate::disk::DiskCache`] and
+//! [`crate::Cache`] both use this same policy rather than each carrying its
+//! own; the disk tier instantiates it with `V = ()` since its payload lives
+//! on disk, not in this structure, and passes the entry size in explicitly
+//! at [`S3Fifo::insert`] rather than deriving it from the stored value.
 //!
 //! Plain LRU is wrong for this cache: the compactor and the folder scan
 //! cold, content-addressed data in the same process as queries in every
@@ -29,21 +39,31 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use bytes::Bytes;
-
 use crate::key::CacheKey;
 use crate::limits::CacheLimits;
 use crate::metrics::CacheMetrics;
 
 const MAX_FREQ: u8 = 3;
 
-struct Entry {
-    value: Bytes,
+struct Entry<V> {
+    value: V,
+    size: u64,
     freq: u8,
 }
 
-pub(crate) struct S3Fifo {
-    entries: HashMap<CacheKey, Entry>,
+/// Outcome of processing one candidate at the front of a queue during
+/// eviction: nothing left to look at, something happened but nothing left
+/// this structure's accounting (a promotion, or a stale queue entry whose
+/// value was already gone), or a key was actually evicted and its resident
+/// bytes freed.
+enum Step {
+    Empty,
+    Skipped,
+    Evicted(CacheKey),
+}
+
+pub(crate) struct S3Fifo<V> {
+    entries: HashMap<CacheKey, Entry<V>>,
     small: VecDeque<CacheKey>,
     main: VecDeque<CacheKey>,
     ghost: VecDeque<CacheKey>,
@@ -55,7 +75,7 @@ pub(crate) struct S3Fifo {
     limits: CacheLimits,
 }
 
-impl S3Fifo {
+impl<V: Clone> S3Fifo<V> {
     pub(crate) fn new(limits: CacheLimits) -> Self {
         // 10% probation / 90% main, the split the S3-FIFO paper uses for
         // skewed access patterns; at least 1 byte so a tiny configured
@@ -105,25 +125,37 @@ impl S3Fifo {
         self.small_bytes + self.main_bytes
     }
 
-    pub(crate) fn get(&mut self, key: &CacheKey) -> Option<Bytes> {
+    pub(crate) fn contains(&self, key: &CacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub(crate) fn get(&mut self, key: &CacheKey) -> Option<V> {
         let entry = self.entries.get_mut(key)?;
         entry.freq = entry.freq.saturating_add(1).min(MAX_FREQ);
         Some(entry.value.clone())
     }
 
-    /// Admit `value` under `key`. Returns `false` without touching any
-    /// queue if `value` is larger than `max_entry_bytes`: that is not an
-    /// error, the entry is simply not cached.
-    pub(crate) fn insert(&mut self, key: CacheKey, value: Bytes, metrics: &CacheMetrics) -> bool {
-        let size = value.len() as u64;
+    /// Admit `value` (of `size` bytes) under `key`. Returns whether it was
+    /// admitted (`false` only if `size` exceeds `max_entry_bytes`, which is
+    /// not an error, just a decline to cache) and the keys, if any, evicted
+    /// to make or keep room -- the caller owns whatever those keys' values
+    /// referenced (an in-memory `Bytes` just drops; the disk tier deletes
+    /// the corresponding file).
+    pub(crate) fn insert(
+        &mut self,
+        key: CacheKey,
+        value: V,
+        size: u64,
+        metrics: &CacheMetrics,
+    ) -> (bool, Vec<CacheKey>) {
         if size > self.limits.max_entry_bytes {
             metrics.record_rejected_size();
-            return false;
+            return (false, Vec::new());
         }
         if self.entries.contains_key(&key) {
             // Content-addressed: an existing entry for this key is
             // already these exact bytes. Leave its queue position alone.
-            return true;
+            return (true, Vec::new());
         }
 
         let promote_to_main = self.ghost_set.remove(&key);
@@ -131,7 +163,7 @@ impl S3Fifo {
             self.ghost.remove(pos);
         }
 
-        self.entries.insert(key, Entry { value, freq: 0 });
+        self.entries.insert(key, Entry { value, size, freq: 0 });
         if promote_to_main {
             self.main.push_back(key);
             self.main_bytes += size;
@@ -141,52 +173,91 @@ impl S3Fifo {
         }
         metrics.record_admission(size);
 
-        self.evict_to_bounds(metrics);
+        let evicted = self.evict_to_bounds(metrics);
+        (true, evicted)
+    }
+
+    /// Seeds an entry directly into the small (probation) queue with no
+    /// admission check, no eviction pass, and no metrics -- for populating
+    /// accounting from files a startup scan already found on disk, which
+    /// exist regardless of whether they would pass today's admission rules
+    /// (e.g. a limit that shrank since they were written). A later
+    /// [`S3Fifo::insert`] enforces bounds and will evict them like any
+    /// other entry if the tier is over budget.
+    pub(crate) fn seed(&mut self, key: CacheKey, value: V, size: u64) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key, Entry { value, size, freq: 0 });
+        self.small.push_back(key);
+        self.small_bytes += size;
+    }
+
+    /// Drops `key` from this structure's accounting regardless of which
+    /// queue holds it, without evicting anything else or touching metrics:
+    /// for a caller that has independently decided an entry is gone (e.g.
+    /// the backing file failed to open or verify), not for ordinary
+    /// capacity-driven eviction.
+    pub(crate) fn remove(&mut self, key: &CacheKey) -> bool {
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
+        };
+        if let Some(pos) = self.small.iter().position(|k| k == key) {
+            self.small.remove(pos);
+            self.small_bytes -= entry.size;
+        } else if let Some(pos) = self.main.iter().position(|k| k == key) {
+            self.main.remove(pos);
+            self.main_bytes -= entry.size;
+        }
         true
     }
 
-    fn evict_to_bounds(&mut self, metrics: &CacheMetrics) {
-        while self.total_bytes() > self.limits.max_bytes
-            || self.entries.len() > self.limits.max_entries
+    fn evict_to_bounds(&mut self, metrics: &CacheMetrics) -> Vec<CacheKey> {
+        let mut evicted_keys = Vec::new();
+        while self.total_bytes() > self.limits.max_bytes || self.entries.len() > self.limits.max_entries
         {
-            let evicted = if self.small_bytes > self.small_quota_bytes && !self.small.is_empty() {
+            let step = if self.small_bytes > self.small_quota_bytes && !self.small.is_empty() {
                 self.evict_from_small(metrics)
             } else if !self.main.is_empty() {
                 self.evict_from_main(metrics)
             } else if !self.small.is_empty() {
                 self.evict_from_small(metrics)
             } else {
-                false
+                Step::Empty
             };
-            if !evicted {
-                break;
+            match step {
+                Step::Empty => break,
+                Step::Skipped => {}
+                Step::Evicted(key) => evicted_keys.push(key),
             }
         }
+        evicted_keys
     }
 
     /// Pop the front of the small queue. Promotes it to main if it was
     /// touched again after admission (`freq > 0`); otherwise evicts it and
-    /// remembers the key in the ghost queue. Returns whether anything was
-    /// in the small queue to process at all.
-    fn evict_from_small(&mut self, metrics: &CacheMetrics) -> bool {
+    /// remembers the key in the ghost queue.
+    fn evict_from_small(&mut self, metrics: &CacheMetrics) -> Step {
         let Some(key) = self.small.pop_front() else {
-            return false;
+            return Step::Empty;
         };
         let Some(entry) = self.entries.remove(&key) else {
-            return true;
+            return Step::Skipped;
         };
-        let size = entry.value.len() as u64;
+        let size = entry.size;
         self.small_bytes -= size;
         if entry.freq > 0 {
             self.entries.insert(
                 key,
                 Entry {
                     value: entry.value,
+                    size,
                     freq: 0,
                 },
             );
             self.main.push_back(key);
             self.main_bytes += size;
+            Step::Skipped
         } else {
             metrics.record_eviction();
             self.ghost.push_back(key);
@@ -196,19 +267,19 @@ impl S3Fifo {
                     self.ghost_set.remove(&oldest);
                 }
             }
+            Step::Evicted(key)
         }
-        true
     }
 
     /// CLOCK sweep over the main queue: an entry with `freq > 0` gets one
     /// more lap with `freq` decremented; the first with `freq == 0` is
     /// evicted permanently (no ghost entry; ghost exists to give
     /// probation entries a fair second chance, not to remember main
-    /// evictions). Returns whether anything was evicted.
-    fn evict_from_main(&mut self, metrics: &CacheMetrics) -> bool {
+    /// evictions).
+    fn evict_from_main(&mut self, metrics: &CacheMetrics) -> Step {
         loop {
             let Some(key) = self.main.pop_front() else {
-                return false;
+                return Step::Empty;
             };
             let Some(mut entry) = self.entries.remove(&key) else {
                 continue;
@@ -219,9 +290,9 @@ impl S3Fifo {
                 self.main.push_back(key);
                 continue;
             }
-            self.main_bytes -= entry.value.len() as u64;
+            self.main_bytes -= entry.size;
             metrics.record_eviction();
-            return true;
+            return Step::Evicted(key);
         }
     }
 }

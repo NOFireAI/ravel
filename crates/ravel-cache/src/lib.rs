@@ -28,9 +28,14 @@
 //! ranges under a configured directory, opt-in (no directory, no disk
 //! tier, behavior unchanged), plaintext (decision 7 -- **with SSE-KMS
 //! configured, cached bytes on local disk are not protected by that
-//! key**), and built so every failure degrades to a miss rather than an
-//! error (see the [`disk`] module docs for the crash-safety mechanism and
-//! why blake3 is verified once on admission but never on a hit).
+//! key**), evicted with the same [`s3fifo`] policy as [`Cache`] rather than
+//! a second implementation (decision 6, amended 2026-08-02 -- scan
+//! resistance matters more on disk than in RAM, since a disk miss costs an
+//! S3 fetch and disk is the tier that holds the working set), and built so
+//! every failure degrades to a miss rather than an error (see the
+//! [`disk`] module docs for the crash-safety mechanism and what crc32c and
+//! the header actually prove on a hit, per decision 4 as amended
+//! 2026-08-02).
 
 mod cache;
 pub mod disk;
