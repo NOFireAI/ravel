@@ -69,6 +69,25 @@ pub enum MaintainError {
     },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
+    #[error(
+        "orphan GC mass-orphan breaker tripped for tenant {tenant_hash} signal {signal} shard {shard}: {candidates} orphan candidates out of {l0_objects_listed} listed L0 objects, at or above the breaker threshold (>= {min_count} candidates and > {max_ratio} of listed objects); halted with zero deletions, sticky until commit records are restored or force_orphan_gc overrides (ADR-0048 decision 4)"
+    )]
+    OrphanBreakerTripped {
+        /// Hex tenant hash of the shard (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        /// Orphan candidates left after the batched re-verify: what this
+        /// pass would have deleted.
+        candidates: usize,
+        /// L0 data objects listed this pass, the breaker ratio's denominator.
+        l0_objects_listed: usize,
+        /// The configured [`crate::config::CompactorConfig::orphan_breaker_min_count`].
+        min_count: usize,
+        /// The configured [`crate::config::CompactorConfig::orphan_breaker_max_ratio`].
+        max_ratio: f64,
+    },
 }
 
 impl From<ravel_segment::WriteError> for MaintainError {
