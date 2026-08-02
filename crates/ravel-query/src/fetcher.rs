@@ -1776,7 +1776,7 @@ fn placeholder_outcome(data: Bytes, total_size: u64) -> GetOutcome {
 /// `StoreError` to build a `FetchError::Store`). Exhaustive over every
 /// `StoreError` variant on purpose: a new variant must fail to compile here
 /// rather than silently falling back to a generic one.
-fn clone_store_error(err: &StoreError) -> StoreError {
+pub(crate) fn clone_store_error(err: &StoreError) -> StoreError {
     match err {
         StoreError::NotFound => StoreError::NotFound,
         StoreError::AlreadyExists => StoreError::AlreadyExists,

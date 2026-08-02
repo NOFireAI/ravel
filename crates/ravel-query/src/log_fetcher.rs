@@ -32,6 +32,8 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+use ravel_cache::{Cache, CacheKey, SingleFlightError};
 use ravel_catalog::SegmentRef;
 use ravel_logseg::footer::{self, kind};
 use ravel_logseg::stream_dir::StreamDir;
@@ -40,6 +42,7 @@ use ravel_logseg::{
     read_section,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::logstream::canonical_attr_bytes;
 
@@ -150,6 +153,14 @@ pub enum LogFetchError {
 pub struct LogSegmentFetcher {
     store: Arc<dyn ObjectStoreBackend>,
     cfg: RlogConfig,
+    /// ADR-0046's read cache, consulted by
+    /// [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant) --
+    /// the only funnel here that can supply the `tenant_hash` a cache key
+    /// needs. `fetch`/`fetch_accounted` never consult it and are unchanged by
+    /// its presence: the one production `LogSegmentFetcher` is shared across
+    /// all tenants (`services/ravel-server/src/query.rs`), so caching cannot
+    /// be wired into a method with no per-call tenant identity.
+    cache: Option<Arc<Cache<Arc<StoreError>>>>,
 }
 
 impl LogSegmentFetcher {
@@ -157,6 +168,7 @@ impl LogSegmentFetcher {
         LogSegmentFetcher {
             store,
             cfg: RlogConfig::default(),
+            cache: None,
         }
     }
 
@@ -164,6 +176,14 @@ impl LogSegmentFetcher {
     #[must_use]
     pub fn with_config(mut self, cfg: RlogConfig) -> Self {
         self.cfg = cfg;
+        self
+    }
+
+    /// Wires ADR-0046's read cache into
+    /// [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<Cache<Arc<StoreError>>>) -> Self {
+        self.cache = Some(cache);
         self
     }
 
@@ -303,7 +323,6 @@ impl LogSegmentFetcher {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
-
         let key = &seg_ref.data_object_key;
         let got = self
             .store
@@ -315,16 +334,105 @@ impl LogSegmentFetcher {
             })?;
         accounting.record_s3_request(AccountedOp::Get);
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-        let bytes = got.data;
+        self.scan_bytes(key, &got.data, query)
+    }
 
-        // Resolve stream-attribute equalities against STREAM_DIR before the
-        // scan, so they become a StreamIn arm the reader prunes on. The
-        // resolution over-approximates; see `matching_streams`.
+    /// Cache-aware counterpart of [`fetch_accounted`](Self::fetch_accounted):
+    /// identical scan behavior, but the object's bytes are served through
+    /// ADR-0046's read cache (via [`with_cache`](Self::with_cache)) rather
+    /// than an unconditional store GET. This is RLOG's sole read funnel
+    /// (`RlogFetcher::fetch` in ADR-0046 decision 1), and its only GET is
+    /// always [`GetRange::Full`], so the whole object keys as `(0,
+    /// seg_ref.object_size)` -- the same convention
+    /// `SegmentFetcher::guarded_get` uses for a whole-object GET.
+    ///
+    /// `tenant_hash` is an explicit parameter, not a field on
+    /// `LogSegmentFetcher`, because the one production instance
+    /// (`services/ravel-server/src/query.rs`) is shared across every tenant;
+    /// a per-instance tenant would make that instance usable by exactly one
+    /// tenant. Wiring production callers (`ravel-sql`'s `logs_provider`,
+    /// `alerts_scan`, `audit_scan`, `audit_provider`) onto this method
+    /// instead of [`fetch_accounted`](Self::fetch_accounted) is out of
+    /// scope here: it is a `ravel-sql` change, and issue #424 already tracks
+    /// moving those callers onto the accounted funnel in the first place.
+    ///
+    /// With no cache configured (`with_cache` never called), this fetches
+    /// exactly like [`fetch_accounted`](Self::fetch_accounted): every GET
+    /// goes to the store, and no cache accounting is recorded.
+    pub async fn fetch_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
+            return Ok(None);
+        }
+        let key = &seg_ref.data_object_key;
+
+        let Some(cache) = &self.cache else {
+            let got = self
+                .store
+                .get(key, GetRange::Full)
+                .await
+                .map_err(|source| LogFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })?;
+            accounting.record_s3_request(AccountedOp::Get);
+            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            return self.scan_bytes(key, &got.data, query);
+        };
+
+        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
+        let bytes = if let Some(bytes) = cache.get(&cache_key) {
+            accounting.record_cache_hit();
+            accounting.add_cache_bytes(bytes.len() as u64);
+            bytes
+        } else {
+            accounting.record_cache_miss();
+            cache
+                .get_or_fetch(cache_key, || async move {
+                    let got = self.store.get(key, GetRange::Full).await?;
+                    accounting.record_s3_request(AccountedOp::Get);
+                    accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                    Ok(got.data)
+                })
+                .await
+                .map_err(|err| LogFetchError::Store {
+                    key: key.to_string(),
+                    source: match err {
+                        SingleFlightError::Upstream(source) => {
+                            crate::fetcher::clone_store_error(&source)
+                        }
+                        SingleFlightError::LeaderLost => StoreError::Transient(
+                            "cache single-flight leader lost before producing a result".to_string(),
+                        ),
+                    },
+                })?
+        };
+        self.scan_bytes(key, &bytes, query)
+    }
+
+    /// Shared tail of both fetch entry points: resolve stream-attribute
+    /// equalities against STREAM_DIR (over-approximating, see
+    /// [`matching_streams`](Self::matching_streams)), build the combined
+    /// predicate, and scan. Identical regardless of whether `bytes` came from
+    /// the store or the cache -- `RlogReader::scan`'s block-level skip-index
+    /// and bloom verification run unconditionally either way, so a corrupt
+    /// cache entry fails exactly like a corrupt store read.
+    fn scan_bytes(
+        &self,
+        key: &str,
+        bytes: &Bytes,
+        query: &LogQuery,
+    ) -> Result<Option<LogFetchOutput>, LogFetchError> {
         let stream_ids = if query.stream_attrs.is_empty() {
             None
         } else {
             Some(
-                self.matching_streams(&bytes, &query.stream_attrs)
+                self.matching_streams(bytes, &query.stream_attrs)
                     .map_err(|source| corrupt(key, source))?,
             )
         };
@@ -343,7 +451,7 @@ impl LogSegmentFetcher {
         arms.extend(query.content.iter().cloned());
         let pred = Predicate::And(arms);
 
-        let reader = RlogReader::new(&bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         let (records, stats) = reader.scan(&pred).map_err(|source| corrupt(key, source))?;
         Ok(Some(LogFetchOutput { records, stats }))
     }
