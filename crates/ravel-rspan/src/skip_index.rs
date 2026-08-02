@@ -333,9 +333,9 @@ mod tests {
             ..entry(0, 0, 1000)
         };
         let blocks = vec![
-            wide_open((10, 20), STATUS_BIT_OK), // A: short, no error
+            wide_open((10, 20), STATUS_BIT_OK),      // A: short, no error
             wide_open((100, 200), STATUS_BIT_ERROR), // B: long, error
-            wide_open((10, 20), STATUS_BIT_ERROR), // C: short, error -- must survive
+            wide_open((10, 20), STATUS_BIT_ERROR),   // C: short, error -- must survive
             wide_open((500, 600), STATUS_BIT_OK | STATUS_BIT_ERROR), // D: long, error
         ];
         let idx = SkipIndex::new(blocks.clone());
