@@ -175,7 +175,7 @@ fn segment_decompressed_bytes_upper_bound(seg: &SegmentRef, limits: &ReaderLimit
 
 /// Computes the upper-envelope [`CostEstimate`] for a resolved snapshot
 /// (ADR-0044 decision 3), before any page fetch. `catalog_requests` is the
-/// separately-computed catalog term (`Catalog::estimated_list_requests`),
+/// separately-computed catalog term (`Catalog::estimated_catalog_requests`),
 /// bounded before `Catalog::resolve` runs; folded in here unconditionally so
 /// a window that resolves to zero segments (e.g. an all-pruned window with
 /// no snapshot HEAD) still carries a non-zero estimate for the LISTs
@@ -678,7 +678,7 @@ impl QueryEngine {
         // The catalog term (ADR-0044 decision 3) is the same for both
         // attempts: `window` and `now_ns` do not change on retry, only the
         // snapshot resolve's outcome does.
-        let catalog_requests = self.catalog.estimated_list_requests(window, now_ns);
+        let catalog_requests = self.catalog.estimated_catalog_requests(window, now_ns);
         // Fresh handle per attempt, created before `resolve_bounded` runs so
         // the same handle that goes on to fetch segments also receives
         // resolve's own catalog-side counters (ADR-0044 decision 1: "created
@@ -2535,7 +2535,8 @@ mod prefetch_tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_promql::MatchOp;
     use ravel_segment::{
-        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment,
+        HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
+        SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues, WrittenSegment,
     };
     use ravel_types::{Label, TenantId};
     use uuid::Uuid;
@@ -2606,6 +2607,89 @@ mod prefetch_tests {
         };
         let written: WrittenSegment =
             SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: BASE_NS,
+            ingest_hour_bucket: hour_bucket,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// Writes one real RSEG segment containing a single native-histogram
+    /// series with `bucket_count` positive buckets, mirroring
+    /// `publish_metric` but through `SegmentWriter::write_histograms`
+    /// (ADR-0044 finding 2 test fixture: proves `estimate_cost`'s
+    /// per-sample bound against a real wide-histogram footprint, not just
+    /// scalar samples).
+    async fn publish_histogram_metric(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        metric: &str,
+        ts_ns: i64,
+        bucket_count: usize,
+    ) {
+        let series_id =
+            SeriesId::compute(&TenantId::new("acme"), metric, &labels(metric)).expect("series id");
+        let value = HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: Some(1.0),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: bucket_count as u32,
+            }],
+            negative_spans: Vec::new(),
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: bucket_count as u64,
+                positive: vec![1u64; bucket_count],
+                negative: Vec::new(),
+            },
+            reset_hint: ResetHint::Unknown,
+        };
+        let series = vec![SeriesInputV3 {
+            series_id,
+            labels: labels(metric),
+            values: SeriesValues::Histogram(vec![HistogramSample { ts_ns, value }]),
+        }];
+        let writer_id = Uuid::new_v4();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written: WrittenSegment = SegmentWriter::write_histograms(series, identity, bounds)
+            .expect("write histogram segment");
         let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
         let new_record = NewCommitRecord {
             tenant_hash,
@@ -2892,5 +2976,77 @@ mod prefetch_tests {
             stats.estimate.segments
         );
         assert_estimate_covers_actual("multi-segment query", &stats);
+    }
+
+    /// Native-histogram fixture (ADR-0044 finding 2): a 200-bucket sample's
+    /// real decompressed footprint (`histogram_value_footprint`, fetcher.rs:
+    /// `16 + 200*8` = 1616 bytes of counts alone, before spans/scale/sum)
+    /// is already more than 3x the old flat `BYTES_PER_SAMPLE_UPPER_BOUND =
+    /// 512` constant. This test fails against that constant and passes only
+    /// once the bound is derived from the segment's own value kinds
+    /// (`segment_decompressed_bytes_upper_bound`).
+    #[tokio::test]
+    async fn cost_estimate_is_upper_bound_for_wide_histogram_segment() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let ts = BASE_NS - NS_PER_MIN;
+        publish_histogram_metric(&store, tenant_hash, 1, "wide_hist_metric", ts, 200).await;
+
+        let eng = engine(store);
+        let plans = vec![window_plan("wide_hist_metric")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch wide histogram");
+
+        assert_estimate_covers_actual("wide histogram segment", &stats);
+    }
+
+    /// Catalog-term fixture (ADR-0044 finding 3): a wide window with no
+    /// segment published for the queried metric still makes `resolve`
+    /// LIST every `(shard, hour)` pair the padded window spans, plus attempt
+    /// one snapshot-window HEAD GET before any LIST runs (the window is
+    /// non-empty, so `resolve_impl` always tries it first). Pre-fix,
+    /// `estimate_cost` had no catalog term at all, so a zero-segment
+    /// snapshot always estimated zero requests against this nonzero request
+    /// count -- `CostEstimate::divergence`'s `f64::INFINITY` case. A second
+    /// gap surfaced once the LIST-only catalog term was added: it missed the
+    /// snapshot-window HEAD GET, under-estimating by exactly one request.
+    /// This test fails against either gap and passes once
+    /// `Catalog::estimated_catalog_requests` (LISTs plus
+    /// `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`) is folded into the estimate.
+    #[tokio::test]
+    async fn cost_estimate_is_upper_bound_for_wide_window_multi_shard_query() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog = Catalog::new(
+            Arc::clone(&backend),
+            CatalogConfig {
+                shard_count: 16,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        let eng = QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default());
+
+        let plans = vec![SelectorPlan {
+            matchers: vec![name_matcher("nonexistent_metric")],
+            range_ns: 24 * 60 * NS_PER_MIN,
+            offset_ns: 0,
+            anchor: PlanAnchor::Window,
+        }];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch wide window");
+
+        assert_eq!(
+            stats.estimate.segments, 0,
+            "no segment published for this metric"
+        );
+        assert_estimate_covers_actual("wide window multi-shard query", &stats);
     }
 }

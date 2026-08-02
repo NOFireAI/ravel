@@ -35,6 +35,24 @@ pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 16;
 /// `MemoryStore` is strongly consistent so tests never observe this delay;
 /// it exists for real backends with brief propagation lag.
 const MIN_TOKEN_RETRY_DELAY: Duration = Duration::from_millis(20);
+/// Upper bound on store requests `Catalog::resolve_snapshot_window` issues
+/// before any LIST runs, folded into `Catalog::estimated_catalog_requests`
+/// (ADR-0044 decision 3): one HEAD GET, always attempted whenever the window
+/// is non-empty (`resolve_impl` calls it unconditionally); plus one GET per
+/// part a usable HEAD names, capped here at 1 part because every writer
+/// today emits exactly one (metric-index-plan.md 3.1, "v1 writes exactly
+/// one part; readers accept N parts" as an unused sharding escape hatch);
+/// plus one postings GET, worst case, when the query has an equality
+/// `__name__` filter (metric-index-plan.md 5.4).
+///
+/// This is not a structural bound: `SnapshotHead.parts` is `repeated` in the
+/// wire format, and `resolve_snapshot_window` issues one GET per named part
+/// regardless of how many there are. Part count is only knowable after the
+/// HEAD GET this constant is trying to avoid, so a future multi-part writer
+/// (the escape hatch metric-index-plan.md 3.2 reserves) would silently make
+/// `estimated_catalog_requests` an under-estimate again. Flagged as an open
+/// gap in ADR-0044 decision 3, not resolved here.
+const SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND: u64 = 3;
 
 /// Listing-based catalog over an object store backend (Phase 1, ADR-0003).
 /// A future compaction phase folds commit records into immutable snapshot
@@ -424,26 +442,38 @@ impl Catalog {
         })
     }
 
-    /// Upper bound on the LIST requests a `resolve`/`resolve_pruned` call for
-    /// this `(range, now_ns)` window will issue, computed without running any
-    /// part of resolve itself (ADR-0044 decision 3, "catalog term": computed
-    /// before `Catalog::resolve` runs, from `shard_count` and the number of
-    /// hour buckets the padded window spans -- both inputs the planner
-    /// already holds).
+    /// Upper bound on the store requests a `resolve`/`resolve_pruned` call
+    /// for this `(range, now_ns)` window will issue before it has listed
+    /// anything, computed without running any part of resolve itself
+    /// (ADR-0044 decision 3, "catalog term": computed before
+    /// `Catalog::resolve` runs, from `shard_count` and the number of hour
+    /// buckets the padded window spans -- both inputs the planner already
+    /// holds).
     ///
-    /// Worst case is one LIST per `(shard, hour)` pair, i.e. what
-    /// `resolve_impl` issues with no snapshot watermark to shorten the
-    /// listed suffix (a watermark can only narrow the listed range, never
-    /// widen it, so this bound holds whether or not folding has run). The
-    /// record GETs `resolve` also issues for whatever those LISTs turn up
+    /// Two parts:
+    ///
+    /// - LIST requests: one per `(shard, hour)` pair, i.e. what
+    ///   `resolve_impl` issues with no snapshot watermark to shorten the
+    ///   listed suffix (a watermark can only narrow the listed range, never
+    ///   widen it, so this bound holds whether or not folding has run).
+    /// - `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`: the snapshot-window path
+    ///   (`Catalog::resolve_snapshot_window`, docs/metric-index-plan.md
+    ///   5.1/5.3) that `resolve_impl` tries first, whenever the window is
+    ///   non-empty, before any LIST runs. This is not derivable from
+    ///   `shard_count`/hour buckets and is folded in as a documented
+    ///   constant instead -- see that constant's doc comment for the open
+    ///   gap this leaves (ADR-0044 decision 3 does not account for it).
+    ///
+    /// The record GETs `resolve` also issues for whatever those LISTs turn up
     /// are not included here: which records exist, and how many, is only
     /// knowable after a LIST actually runs, so they cannot be bounded before
     /// resolve starts.
-    pub fn estimated_list_requests(&self, range: TimeRange, now_ns: i64) -> u64 {
+    pub fn estimated_catalog_requests(&self, range: TimeRange, now_ns: i64) -> u64 {
         match self.window_hour_bounds(range, now_ns) {
             Some((start_hour, end_hour)) => {
                 let hours = u64::from(end_hour - start_hour) + 1;
-                u64::from(self.config.shard_count).saturating_mul(hours)
+                let list_requests = u64::from(self.config.shard_count).saturating_mul(hours);
+                list_requests.saturating_add(SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND)
             }
             None => 0,
         }
