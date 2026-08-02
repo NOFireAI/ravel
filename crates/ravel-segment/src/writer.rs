@@ -14,8 +14,9 @@ use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId};
 
 use crate::crc::{footer_crc, page_crc};
 use crate::error::WriteError;
+use crate::exemplars::{ExemplarInput, ResolvedExemplar, encode_exemplars_section};
 use crate::format::{
-    MAGIC, RESERVED, SIGNAL_METRICS, V5_SPARSE_THRESHOLD, VERSION_V4, VERSION_V5, ZSTD_LEVEL,
+    MAGIC, RESERVED, SIGNAL_METRICS, V5_SPARSE_THRESHOLD, VERSION_V4, VERSION_V6, ZSTD_LEVEL,
     compression, page_comp, page_enc, section_kind,
 };
 use crate::gorilla::encode_gorilla_into;
@@ -303,6 +304,7 @@ impl SegmentWriter {
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
         meta: CompactionMetaV4,
+        exemplars: Vec<ExemplarInput>,
     ) -> Result<WrittenSegment, WriteError> {
         for s in &mut series {
             s.runs.retain(|r| r.sample_count != 0);
@@ -366,7 +368,55 @@ impl SegmentWriter {
             base_created_unix_ns = 0;
         }
 
-        let dict = build_dictionary_v4(&series)?;
+        let dict = build_dictionary_v4(&series, &exemplars)?;
+
+        let mut series_index_by_id: HashMap<[u8; 16], u32> =
+            HashMap::with_capacity(series.len());
+        for (i, s) in series.iter().enumerate() {
+            series_index_by_id.insert(s.series_id.0, i as u32);
+        }
+        let mut resolved_exemplars = Vec::with_capacity(exemplars.len());
+        let mut exemplar_attr_cursor = 0usize;
+        for e in &exemplars {
+            let series_index = *series_index_by_id
+                .get(&e.series_id.0)
+                .ok_or(WriteError::ExemplarUnknownSeries)?;
+            let mut attr_ords = Vec::with_capacity(e.attrs.len());
+            for _ in &e.attrs {
+                let name_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor];
+                let value_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor + 1];
+                exemplar_attr_cursor += 2;
+                attr_ords.push((name_ord, value_ord));
+            }
+            resolved_exemplars.push(ResolvedExemplar {
+                series_index,
+                ts_ns: e.ts_ns,
+                value: e.value,
+                trace_id: e.trace_id,
+                span_id: e.span_id,
+                attr_ords,
+            });
+        }
+        // Sort by (series_index, ts_ns) per the EXEMPLARS grammar, then
+        // dedup keeping the LAST of any run of exact-duplicate keys: two
+        // caller-supplied exemplars for the same series at the same
+        // timestamp would otherwise violate the reader's strict-ascending
+        // invariant. `sort_by_key` is stable, so "last" here means last in
+        // the caller's original order. Admission-time capping/deduplication
+        // is ADR-0047 decision 2 (issue #472, out of scope); this is only
+        // the writer's own guarantee that whatever it emits is decodable.
+        resolved_exemplars.sort_by_key(|r| (r.series_index, r.ts_ns));
+        let mut deduped_exemplars: Vec<ResolvedExemplar> =
+            Vec::with_capacity(resolved_exemplars.len());
+        for r in resolved_exemplars {
+            if let Some(last) = deduped_exemplars.last_mut() {
+                if last.series_index == r.series_index && last.ts_ns == r.ts_ns {
+                    *last = r;
+                    continue;
+                }
+            }
+            deduped_exemplars.push(r);
+        }
 
         let total_samples =
             usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
@@ -489,6 +539,23 @@ impl SegmentWriter {
             });
         }
 
+        // EXEMPLARS (kind 10, ADR-0047), RSEG v6 only: present only when at
+        // least one sample carried an exemplar (docs/segment-format.md).
+        // Physical section order 1, 5, 6, 3, 4, 7, 10.
+        if !deduped_exemplars.is_empty() {
+            let exemplars_raw = encode_exemplars_section(&deduped_exemplars, min_event_ts_ns)?;
+            let exemplars_offset = object.len() as u64;
+            object.extend_from_slice(&exemplars_raw);
+            sections.push(Section {
+                kind: section_kind::EXEMPLARS,
+                offset: exemplars_offset,
+                len: exemplars_raw.len() as u64,
+                crc32c: crc32c::crc32c(&exemplars_raw),
+                comp: compression::NONE,
+                uncompressed_len: exemplars_raw.len() as u64,
+            });
+        }
+
         let footer = Footer {
             tenant_hash: identity.tenant_hash.to_vec(),
             shard: identity.shard,
@@ -567,22 +634,39 @@ impl SegmentWriter {
         ingest_bounds: IngestBounds,
         meta: CompactionMetaV4,
     ) -> Result<WrittenSegment, WriteError> {
-        let base = Self::write_v4(series, identity, ingest_bounds, meta)?;
+        Self::write_v5_with_exemplars(series, identity, ingest_bounds, meta, Vec::new())
+    }
+
+    /// Same as [`SegmentWriter::write_v5`], additionally emitting the
+    /// EXEMPLARS section (kind 10, ADR-0047) when `exemplars` is non-empty.
+    /// Each [`ExemplarInput::series_id`] must match a series in `series`
+    /// (`WriteError::ExemplarUnknownSeries` otherwise); the batch is
+    /// otherwise independent of run/sample framing.
+    pub fn write_v5_with_exemplars(
+        series: Vec<SeriesInputV4>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
+        let base = Self::write_v4(series, identity, ingest_bounds, meta, exemplars)?;
         if base.summary.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(retrailer_v4_to_v5(base));
+            return Ok(retrailer_v4_to_v6(base));
         }
         crate::sparse::build_sparse_object(&base)
     }
 }
 
-/// Rewrites a freshly built v4 object's trailer to declare version 5,
+/// Rewrites a freshly built v4 object's trailer to declare version 6,
 /// recomputing the footer_crc (which covers the version) and the whole-object
-/// blake3. Everything before the trailer -- every section byte and the footer
-/// protobuf -- is copied verbatim, so a below-threshold v5 object differs from
-/// the v4 object only in the trailer's version field and the two derived
-/// values. This is the byte-level proof of ADR-0026's "below the threshold, a
-/// v5 object is the v4 object plus a version bump".
-fn retrailer_v4_to_v5(base: WrittenSegment) -> WrittenSegment {
+/// blake3. Everything before the trailer -- every section byte (including an
+/// EXEMPLARS section, when present) and the footer protobuf -- is copied
+/// verbatim, so a below-threshold v6 object differs from the v4 object only
+/// in the trailer's version field and the two derived values. This is the
+/// byte-level proof of ADR-0026's "below the threshold, a v5-grammar object
+/// is the v4 object plus a version bump", carried forward unchanged by
+/// ADR-0047's v6 bump.
+fn retrailer_v4_to_v6(base: WrittenSegment) -> WrittenSegment {
     let obj = base.bytes.as_ref();
     let total = obj.len();
     // A `write_v4` result always carries the full 16-byte trailer.
@@ -599,7 +683,7 @@ fn retrailer_v4_to_v5(base: WrittenSegment) -> WrittenSegment {
     let crc = footer_crc(
         footer_bytes,
         footer_len,
-        VERSION_V5,
+        VERSION_V6,
         SIGNAL_METRICS,
         RESERVED,
     );
@@ -608,7 +692,7 @@ fn retrailer_v4_to_v5(base: WrittenSegment) -> WrittenSegment {
     out.extend_from_slice(&obj[..footer_end]);
     out.extend_from_slice(&footer_len.to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&VERSION_V5.to_le_bytes());
+    out.extend_from_slice(&VERSION_V6.to_le_bytes());
     out.push(SIGNAL_METRICS);
     out.push(RESERVED);
     out.extend_from_slice(&MAGIC);
@@ -818,30 +902,54 @@ struct DictionaryV4<'a> {
     /// Distinct non-`__name__` strings in sorted order (ordinals 1..).
     order: Vec<&'a str>,
     occurrence_ordinals: Vec<u32>,
+    /// Flattened `(name_ord, value_ord)` pairs for every EXEMPLARS attr, in
+    /// the same exemplar-then-attr iteration order `write_v4` resolves
+    /// exemplars in, so both sides can walk it with one shared cursor
+    /// (ADR-0047; ordinals already resolved into the same sorted dictionary
+    /// as series labels).
+    exemplar_attr_ordinals: Vec<u32>,
     count: u32,
 }
 
-/// Interns every occurrence to a pre-rank distinct index in series-then-label
-/// iteration order, then assigns sorted ordinals via the shared
-/// `sort_and_rank_dict` pass (`__name__` pinned to 0), the same scheme as
-/// `build_dictionary_v2` / `build_dictionary_v3`. LABEL_DICT is "as v2/v3"
-/// (section 4), so this inherits the issue #146 sort (issue #155): v4 is the
-/// L1 compaction output, whose objects are larger and longer-lived than L0
-/// segments, so the compression win the sort buys is worth more here. The
-/// order rule stays relaxed (readers locate strings by ordinal), so this is a
-/// writer-side change: no version bump, no ADR.
-fn build_dictionary_v4(series: &[SeriesInputV4]) -> Result<DictionaryV4<'_>, WriteError> {
-    let total_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
+/// Interns every occurrence to a pre-rank distinct index in
+/// series-then-label, then exemplar-then-attr iteration order, then assigns
+/// sorted ordinals via the shared `sort_and_rank_dict` pass (`__name__`
+/// pinned to 0), the same scheme as `build_dictionary_v2` / `build_dictionary_v3`.
+/// LABEL_DICT is "as v2/v3" (section 4), so this inherits the issue #146 sort
+/// (issue #155): v4 is the L1 compaction output, whose objects are larger and
+/// longer-lived than L0 segments, so the compression win the sort buys is
+/// worth more here. The order rule stays relaxed (readers locate strings by
+/// ordinal), so this is a writer-side change: no version bump, no ADR.
+/// EXEMPLARS attrs (ADR-0047) intern into this same dictionary rather than a
+/// separate one, so a name/value repeated between a series label and an
+/// exemplar attr (or between two exemplars) costs one dictionary entry, not
+/// two.
+fn build_dictionary_v4<'a>(
+    series: &'a [SeriesInputV4],
+    exemplars: &'a [ExemplarInput],
+) -> Result<DictionaryV4<'a>, WriteError> {
+    let series_strings: usize = series.iter().map(|s| s.labels.len() * 2).sum();
+    let exemplar_strings: usize = exemplars.iter().map(|e| e.attrs.len() * 2).sum();
     let mut interner: HashMap<&str, u32, BuildHasherDefault<FnvHasher>> =
-        HashMap::with_capacity_and_hasher(total_strings, BuildHasherDefault::default());
+        HashMap::with_capacity_and_hasher(
+            series_strings + exemplar_strings,
+            BuildHasherDefault::default(),
+        );
     let mut distinct: Vec<&str> = Vec::new();
-    let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(total_strings);
+    let mut occurrence_ordinals: Vec<u32> = Vec::with_capacity(series_strings);
+    let mut exemplar_ordinals: Vec<u32> = Vec::with_capacity(exemplar_strings);
 
     for s in series {
         for label in s.labels.iter() {
             for text in [label.name.as_str(), label.value.as_str()] {
                 occurrence_ordinals.push(intern_dict(&mut interner, &mut distinct, text)?);
             }
+        }
+    }
+    for e in exemplars {
+        for (name, value) in &e.attrs {
+            exemplar_ordinals.push(intern_dict(&mut interner, &mut distinct, name.as_str())?);
+            exemplar_ordinals.push(intern_dict(&mut interner, &mut distinct, value.as_str())?);
         }
     }
 
@@ -851,10 +959,15 @@ fn build_dictionary_v4(series: &[SeriesInputV4]) -> Result<DictionaryV4<'_>, Wri
         .into_iter()
         .map(|id| rank[id as usize])
         .collect();
+    let exemplar_attr_ordinals = exemplar_ordinals
+        .into_iter()
+        .map(|id| rank[id as usize])
+        .collect();
 
     Ok(DictionaryV4 {
         order,
         occurrence_ordinals,
+        exemplar_attr_ordinals,
         count,
     })
 }
@@ -1474,6 +1587,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let object = written.bytes.as_ref();
@@ -1518,6 +1632,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let footer = decode_footer(written.bytes.as_ref(), VERSION_V4);
@@ -1545,6 +1660,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let footer = decode_footer(written.bytes.as_ref(), VERSION_V4);
@@ -1576,6 +1692,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let footer = decode_footer(written.bytes.as_ref(), VERSION_V4);
@@ -1606,6 +1723,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let object = written.bytes.as_ref();
@@ -1653,6 +1771,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let object = written.bytes.as_ref();
@@ -1702,6 +1821,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let object = written.bytes.as_ref();
@@ -1772,7 +1892,7 @@ mod v4_tests {
         let v3_written = SegmentWriter::write_histograms(v3_series, test_identity(), test_bounds())
             .expect("writes");
         let v3_object = v3_written.bytes.as_ref();
-        let v3_footer = decode_footer(v3_object, VERSION_V5);
+        let v3_footer = decode_footer(v3_object, VERSION_V6);
         let v3_ts_page = section(v3_object, &v3_footer, section_kind::TS_PAGES).to_vec();
         let v3_hist_page = section(v3_object, &v3_footer, section_kind::HIST_PAGES).to_vec();
 
@@ -1796,6 +1916,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let object = written.bytes.as_ref();
@@ -1849,6 +1970,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         )
         .expect("writes");
         let object = written.bytes.as_ref();
@@ -1892,6 +2014,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         );
         assert!(matches!(result, Err(WriteError::MixedValueKindInSeries)));
     }
@@ -1912,6 +2035,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         );
         assert!(matches!(result, Err(WriteError::RunPageTooShort)));
     }
@@ -1936,6 +2060,7 @@ mod v4_tests {
             test_identity(),
             test_bounds(),
             test_compaction_meta(),
+            Vec::new(),
         );
         assert!(matches!(result, Err(WriteError::DuplicateSeriesId)));
     }
@@ -1954,8 +2079,9 @@ mod v4_tests {
             ],
         }];
         let meta = test_compaction_meta();
-        let written = SegmentWriter::write_v4(series, test_identity(), test_bounds(), meta.clone())
-            .expect("writes");
+        let written =
+            SegmentWriter::write_v4(series, test_identity(), test_bounds(), meta.clone(), Vec::new())
+                .expect("writes");
         let footer = decode_footer(written.bytes.as_ref(), VERSION_V4);
 
         assert_eq!(
@@ -2029,6 +2155,7 @@ mod v4_tests {
                 test_identity(),
                 test_bounds(),
                 test_compaction_meta(),
+                Vec::new(),
             )
             .expect("writes");
             let object = written.bytes.as_ref();
@@ -2142,7 +2269,7 @@ mod v4_tests {
         .expect("write v5");
         let object = written.bytes.as_ref();
         let loc = crate::open_from_full(object, ReaderLimits::default()).expect("open v5");
-        assert_eq!(loc.version, 5);
+        assert_eq!(loc.version, 6);
         assert!(
             section_desc(&loc.footer, section_kind::SERIES_META).is_some(),
             "below-threshold v5 must carry whole SERIES_META"
