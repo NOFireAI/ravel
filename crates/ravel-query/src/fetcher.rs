@@ -4,8 +4,9 @@
 
 use bytes::Bytes;
 use futures::future::join_all;
+use ravel_cache::{Cache, CacheKey, SingleFlightError};
 use ravel_catalog::{SegmentLevel, SegmentRef};
-use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
+use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
 use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
     ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry, SeriesEntry,
@@ -252,6 +253,13 @@ pub struct SegmentFetcher {
     /// `store.get`, never across a scope that acquires another permit, so no
     /// fetch can deadlock waiting on permits it already holds.
     get_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// ADR-0046's read cache, consulted by `guarded_get` for every
+    /// byte-range (and whole-object) GET. `None` -- the default from
+    /// `new` -- reproduces exactly the pre-cache behavior: every GET goes
+    /// to the store. Shared across clones, and safe to share across
+    /// tenants: the cache key is derived per call from the caller-supplied
+    /// `tenant_hash`, never fixed on the fetcher itself.
+    cache: Option<std::sync::Arc<Cache<std::sync::Arc<StoreError>>>>,
 }
 
 impl SegmentFetcher {
@@ -265,7 +273,17 @@ impl SegmentFetcher {
             get_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_GETS,
             )),
+            cache: None,
         }
+    }
+
+    /// Wires ADR-0046's read cache into every GET `guarded_get` issues
+    /// (decision 1). A `SegmentFetcher` built with plain `new` and never
+    /// given a cache behaves exactly as it did before this cache existed.
+    #[must_use]
+    pub fn with_cache(mut self, cache: std::sync::Arc<Cache<std::sync::Arc<StoreError>>>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     #[must_use]
@@ -306,13 +324,10 @@ impl SegmentFetcher {
     /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
     /// already fill the pool could wait on itself.
     ///
-    /// This is the funnel every ranged GET in this file passes through
-    /// (ADR-0044 "2. Accounting is recorded at existing funnels only"): a
-    /// completed GET records one `AccountedOp::Get` request and its
-    /// transferred bytes against `accounting` before returning. Only a
-    /// successful GET is recorded, matching `QueryAccounting`'s "completed
-    /// store request" wording; a failed GET propagates its error unrecorded.
-    async fn guarded_get(
+    /// Only a successful GET is recorded, matching `QueryAccounting`'s
+    /// "completed store request" wording; a failed GET propagates its error
+    /// unrecorded.
+    async fn store_get(
         &self,
         key: &str,
         range: GetRange,
@@ -328,9 +343,136 @@ impl SegmentFetcher {
         Ok(got)
     }
 
+    /// This is the funnel every ranged GET in this file passes through
+    /// (ADR-0044 "2. Accounting is recorded at existing funnels only", and
+    /// ADR-0046 decision 1). A GET that goes to the store records one
+    /// `AccountedOp::Get` request and its transferred bytes (via
+    /// `store_get`); a cache hit records a cache hit and its served bytes
+    /// instead (ADR-0046 decision 4's test needs the two distinguishable),
+    /// and never also records an `AccountedOp::Get`, since no store round
+    /// trip happened.
+    ///
+    /// A `GetRange::Range` or `GetRange::Full` request is cache-eligible
+    /// when a cache is configured: the cache key is built here, from the
+    /// same `seg_ref`/`tenant_hash`/`range` values driving this call and
+    /// nowhere else, so a payload can never be admitted under a key that
+    /// does not describe it (ADR-0046 decision 4's amendment). `Full` maps
+    /// to the range `(0, seg_ref.object_size)`; the whole object is a valid
+    /// sub-range of itself, and its `total_size` is trivially its own
+    /// length, unlike `GetRange::Suffix`. A suffix GET always bypasses the
+    /// cache: `Cache`'s value is bare `Bytes`, with nowhere to carry the
+    /// object's total size a suffix hit would need to fabricate, and total
+    /// size is not otherwise recoverable from a suffix's own byte length.
+    ///
+    /// A cache-routed GET does not re-check `expected_etag`. That check
+    /// exists to catch two live store reads of a supposedly immutable
+    /// object returning different bytes; a cache entry is addressed by
+    /// content hash, not by a live read, so there is nothing to compare it
+    /// against. Its correctness instead rests on the key/payload pairing
+    /// above and on the crc32c hierarchy every reader runs on every byte
+    /// range it decodes, regardless of whether those bytes came from the
+    /// store or the cache (decision 4) -- no separate re-verification is
+    /// added here because that hierarchy already runs unconditionally
+    /// downstream.
+    async fn guarded_get(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        range: GetRange,
+        expected_etag: Option<&Etag>,
+        accounting: &QueryAccounting,
+    ) -> Result<GetOutcome, FetchError> {
+        let key = seg_ref.data_object_key.as_str();
+
+        let cacheable_range = match range {
+            GetRange::Range(start, end) => Some((start, end)),
+            GetRange::Full => Some((0, seg_ref.object_size)),
+            GetRange::Suffix(_) => None,
+        };
+        if let (Some((start, end)), Some(cache)) = (cacheable_range, &self.cache) {
+            return self
+                .cached_get(cache, seg_ref, tenant_hash, range, start, end, accounting)
+                .await;
+        }
+
+        let got = self
+            .store_get(key, range, accounting)
+            .await
+            .map_err(|source| FetchError::Store {
+                key: key.to_string(),
+                source,
+            })?;
+        if let Some(expected) = expected_etag
+            && &got.etag != expected
+        {
+            return Err(FetchError::EtagChanged {
+                key: key.to_string(),
+            });
+        }
+        Ok(got)
+    }
+
+    /// The cache-routed half of `guarded_get`. `range` is the exact
+    /// `GetRange` the store call uses on a miss (so a `Full` request still
+    /// issues one whole-object GET rather than a synthesized
+    /// `Range(0, object_size)`); `(start, end)` is `range` restated as the
+    /// absolute byte bounds the `CacheKey` and the fabricated hit
+    /// `GetOutcome` use.
+    ///
+    /// Hit/miss is decided by an explicit `cache.get` before touching
+    /// `get_or_fetch`, rather than inferring it from whether `get_or_fetch`
+    /// ran its fetch closure: a single-flight follower's closure never
+    /// runs either, but a follower is not a "hit" in the accounting sense
+    /// used here (a store round trip still happened, just not this
+    /// caller's own) -- it is what ADR-0046 amendment's documented gap
+    /// (see the crate-level test module for the resulting corruption-gate
+    /// reach) turns on. Only bytes resident *before* this call asked
+    /// count as a hit.
+    #[allow(clippy::too_many_arguments)]
+    async fn cached_get(
+        &self,
+        cache: &std::sync::Arc<Cache<std::sync::Arc<StoreError>>>,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        range: GetRange,
+        start: u64,
+        end: u64,
+        accounting: &QueryAccounting,
+    ) -> Result<GetOutcome, FetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, end - start);
+
+        if let Some(bytes) = cache.get(&cache_key) {
+            accounting.record_cache_hit();
+            accounting.add_cache_bytes(bytes.len() as u64);
+            return Ok(placeholder_outcome(bytes, seg_ref.object_size));
+        }
+        accounting.record_cache_miss();
+
+        let bytes = cache
+            .get_or_fetch(cache_key, || async move {
+                self.store_get(key, range, accounting)
+                    .await
+                    .map(|got| got.data)
+                    .map_err(std::sync::Arc::new)
+            })
+            .await
+            .map_err(|err| FetchError::Store {
+                key: key.to_string(),
+                source: match err {
+                    SingleFlightError::Upstream(source) => clone_store_error(&source),
+                    SingleFlightError::LeaderLost => StoreError::Transient(
+                        "cache single-flight leader lost before producing a result".to_string(),
+                    ),
+                },
+            })?;
+        Ok(placeholder_outcome(bytes, seg_ref.object_size))
+    }
+
     async fn ensure_ranges(
         &self,
-        key: &str,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
         suffix_etag: &Etag,
         needed: &[(u64, u64)],
         regions: &mut FetchedRegions,
@@ -364,17 +506,14 @@ impl SegmentFetcher {
         let gets = join_all(coalesce_ranges(missing, self.coalesce_gap).into_iter().map(
             |(start, end)| async move {
                 let got = self
-                    .guarded_get(key, GetRange::Range(start, end), accounting)
-                    .await
-                    .map_err(|source| FetchError::Store {
-                        key: key.to_string(),
-                        source,
-                    })?;
-                if &got.etag != suffix_etag {
-                    return Err(FetchError::EtagChanged {
-                        key: key.to_string(),
-                    });
-                }
+                    .guarded_get(
+                        seg_ref,
+                        tenant_hash,
+                        GetRange::Range(start, end),
+                        Some(suffix_etag),
+                        accounting,
+                    )
+                    .await?;
                 Ok::<(u64, Bytes), FetchError>((start, got.data))
             },
         ))
@@ -424,12 +563,8 @@ impl SegmentFetcher {
                 GetRange::Suffix(self.suffix_len)
             };
         let first = self
-            .guarded_get(key, first_range, accounting)
-            .await
-            .map_err(|source| FetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
+            .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
+            .await?;
         let total_size = first.total_size;
         let suffix_etag = first.etag.clone();
         let mut regions = FetchedRegions::default();
@@ -442,17 +577,14 @@ impl SegmentFetcher {
             FooterOutcome::Ready(loc) => loc.footer,
             FooterOutcome::NeedRange { offset, len } => {
                 let got = self
-                    .guarded_get(key, GetRange::Range(offset, offset + len), accounting)
-                    .await
-                    .map_err(|source| FetchError::Store {
-                        key: key.to_string(),
-                        source,
-                    })?;
-                if got.etag != suffix_etag {
-                    return Err(FetchError::EtagChanged {
-                        key: key.to_string(),
-                    });
-                }
+                    .guarded_get(
+                        seg_ref,
+                        tenant_hash,
+                        GetRange::Range(offset, offset + len),
+                        Some(&suffix_etag),
+                        accounting,
+                    )
+                    .await?;
                 regions.insert(offset, got.data.clone());
                 match open_from_suffix(&got.data, total_size, self.limits)
                     .map_err(|source| corrupt(key, source))?
@@ -512,7 +644,8 @@ impl SegmentFetcher {
     )]
     async fn decode_selected(
         &self,
-        key: &str,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
         footer: &Footer,
         total_size: u64,
         suffix_etag: &Etag,
@@ -520,6 +653,7 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+        let key = seg_ref.data_object_key.as_str();
         let entries = if let Some((sm_off, sm_len)) = section_range(footer, SECTION_SERIES_META) {
             let (ld_off, ld_len) = section_range(footer, SECTION_LABEL_DICT).ok_or_else(|| {
                 corrupt(
@@ -534,7 +668,8 @@ impl SegmentFetcher {
                 )
             })?;
             self.ensure_ranges(
-                key,
+                seg_ref,
+                tenant_hash,
                 suffix_etag,
                 &[
                     (ld_off, ld_off + ld_len),
@@ -557,11 +692,26 @@ impl SegmentFetcher {
             decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
                 .map_err(|source| corrupt(key, source))?
         } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
-            self.decode_sparse_catalog(key, footer, suffix_etag, regions, &sparse, accounting)
-                .await?
+            self.decode_sparse_catalog(
+                seg_ref,
+                tenant_hash,
+                footer,
+                suffix_etag,
+                regions,
+                &sparse,
+                accounting,
+            )
+            .await?
         } else {
-            self.ensure_ranges(key, suffix_etag, &[(0, total_size)], regions, accounting)
-                .await?;
+            self.ensure_ranges(
+                seg_ref,
+                tenant_hash,
+                suffix_etag,
+                &[(0, total_size)],
+                regions,
+                accounting,
+            )
+            .await?;
             let object = regions
                 .slice(0, total_size)
                 .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
@@ -615,15 +765,18 @@ impl SegmentFetcher {
     /// from them, without the page sections. Each section is crc-verified by
     /// [`decode_catalog_v5_chunked`], so a mis-ranged or corrupt fetch is a
     /// typed error, never wrong data.
+    #[allow(clippy::too_many_arguments)]
     async fn decode_sparse_catalog(
         &self,
-        key: &str,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
         footer: &Footer,
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         ranges: &SparseCatalogRanges,
         accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+        let key = seg_ref.data_object_key.as_str();
         let needed = [
             (
                 ranges.label_dict.0,
@@ -642,8 +795,15 @@ impl SegmentFetcher {
                 ranges.meta_chunks.0 + ranges.meta_chunks.1,
             ),
         ];
-        self.ensure_ranges(key, suffix_etag, &needed, regions, accounting)
-            .await?;
+        self.ensure_ranges(
+            seg_ref,
+            tenant_hash,
+            suffix_etag,
+            &needed,
+            regions,
+            accounting,
+        )
+        .await?;
         let dict = regions
             .slice(ranges.label_dict.0, ranges.label_dict.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
@@ -669,15 +829,18 @@ impl SegmentFetcher {
         skip_all,
         fields(page_kind = "scalar", series_count = scalar.len()),
     )]
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_scalar_pages(
         &self,
-        key: &str,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
         footer: &Footer,
         scalar: &[&SeriesEntryV4],
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
+        let key = seg_ref.data_object_key.as_str();
         let planned = plan_ranges_v4(footer, scalar).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
             .iter()
@@ -688,8 +851,15 @@ impl SegmentFetcher {
                 ]
             })
             .collect();
-        self.ensure_ranges(key, suffix_etag, &page_ranges, regions, accounting)
-            .await?;
+        self.ensure_ranges(
+            seg_ref,
+            tenant_hash,
+            suffix_etag,
+            &page_ranges,
+            regions,
+            accounting,
+        )
+        .await?;
         Ok(planned)
     }
 
@@ -705,15 +875,18 @@ impl SegmentFetcher {
         skip_all,
         fields(page_kind = "histogram", series_count = histogram.len()),
     )]
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_histogram_pages(
         &self,
-        key: &str,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
         footer: &Footer,
         histogram: &[&SeriesEntryV4],
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
+        let key = seg_ref.data_object_key.as_str();
         let planned = plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
             .iter()
@@ -724,8 +897,15 @@ impl SegmentFetcher {
                 ]
             })
             .collect();
-        self.ensure_ranges(key, suffix_etag, &page_ranges, regions, accounting)
-            .await?;
+        self.ensure_ranges(
+            seg_ref,
+            tenant_hash,
+            suffix_etag,
+            &page_ranges,
+            regions,
+            accounting,
+        )
+        .await?;
         Ok(planned)
     }
 
@@ -839,7 +1019,8 @@ impl SegmentFetcher {
             self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 total_size,
                 &suffix_etag,
@@ -857,7 +1038,8 @@ impl SegmentFetcher {
         }
         let planned = self
             .fetch_scalar_pages(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 &scalar,
                 &suffix_etag,
@@ -1006,7 +1188,8 @@ impl SegmentFetcher {
             self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 total_size,
                 &suffix_etag,
@@ -1024,7 +1207,8 @@ impl SegmentFetcher {
         }
         let planned = self
             .fetch_histogram_pages(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 &histogram,
                 &suffix_etag,
@@ -1151,7 +1335,8 @@ impl SegmentFetcher {
             self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 total_size,
                 &suffix_etag,
@@ -1173,7 +1358,8 @@ impl SegmentFetcher {
             Vec::new()
         } else {
             self.fetch_scalar_pages(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 &scalar,
                 &suffix_etag,
@@ -1186,7 +1372,8 @@ impl SegmentFetcher {
             Vec::new()
         } else {
             self.fetch_histogram_pages(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 &histogram,
                 &suffix_etag,
@@ -1251,12 +1438,12 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntry>, FetchError> {
-        let key = &seg_ref.data_object_key;
         let (footer, total_size, suffix_etag, mut regions) =
             self.open_segment(tenant_hash, seg_ref, accounting).await?;
         let selected = self
             .decode_selected(
-                key,
+                seg_ref,
+                tenant_hash,
                 &footer,
                 total_size,
                 &suffix_etag,
@@ -1564,6 +1751,45 @@ fn corrupt(key: &str, source: ravel_segment::SegmentError) -> FetchError {
     FetchError::Corrupt {
         key: key.to_string(),
         source,
+    }
+}
+
+/// Builds the `GetOutcome` a cache-routed `guarded_get` returns, whether the
+/// bytes came from a cache hit or from the store call inside
+/// `Cache::get_or_fetch`. `etag`/`version` are placeholders: nothing
+/// downstream of a cache-routed get compares them (see `guarded_get`'s doc
+/// comment on why the etag check is skipped for that path), so there is no
+/// live value to put there.
+fn placeholder_outcome(data: Bytes, total_size: u64) -> GetOutcome {
+    GetOutcome {
+        data,
+        etag: Etag(String::new()),
+        version: Version(String::new()),
+        total_size,
+    }
+}
+
+/// Reconstructs an owned `StoreError` from a shared `&StoreError` after a
+/// cache single-flight resolves (`Cache<E>` requires `E: Clone`, which
+/// `StoreError` itself is not; the cache is built over `Arc<StoreError>`
+/// instead, and this un-shares it for the one caller that needs a plain
+/// `StoreError` to build a `FetchError::Store`). Exhaustive over every
+/// `StoreError` variant on purpose: a new variant must fail to compile here
+/// rather than silently falling back to a generic one.
+fn clone_store_error(err: &StoreError) -> StoreError {
+    match err {
+        StoreError::NotFound => StoreError::NotFound,
+        StoreError::AlreadyExists => StoreError::AlreadyExists,
+        StoreError::PreconditionFailed => StoreError::PreconditionFailed,
+        StoreError::AccessDenied(msg) => StoreError::AccessDenied(msg.clone()),
+        StoreError::Throttled { retry_after_ms } => StoreError::Throttled {
+            retry_after_ms: *retry_after_ms,
+        },
+        StoreError::Timeout => StoreError::Timeout,
+        StoreError::Corrupted(msg) => StoreError::Corrupted(msg.clone()),
+        StoreError::InvalidRange(msg) => StoreError::InvalidRange(msg.clone()),
+        StoreError::Transient(msg) => StoreError::Transient(msg.clone()),
+        StoreError::Permanent(msg) => StoreError::Permanent(msg.clone()),
     }
 }
 

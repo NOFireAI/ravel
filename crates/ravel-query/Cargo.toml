@@ -12,6 +12,11 @@ ravel-logseg = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
+# Not in [workspace.dependencies]: ravel-cache (ADR-0046) has no
+# workspace-registered entry yet. Path dependency instead, the same
+# pattern already used below for ravel-maintain, pinned with a version to
+# satisfy cargo-deny's no-wildcard-paths check.
+ravel-cache = { path = "../ravel-cache", version = "0.1.0" }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
