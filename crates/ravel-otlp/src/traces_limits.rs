@@ -71,7 +71,26 @@ pub struct SpanIngestLimits {
     /// Bytes in the serialized events or links blob, measured before hex
     /// encoding. Applied to each blob independently.
     pub max_raw_blob_len: usize,
+    /// Nanoseconds a span's resolved `end_ts_ns` may lead ingest time
+    /// (ADR-0049 §4). Default 10 minutes, the same value the metrics and
+    /// log paths use: the catalog listing window is one shared
+    /// `max_ingest_lag_ns`, not per-signal, so the admission bounds that
+    /// make it sound are shared too. The end timestamp is the bounded one
+    /// because the commit record advertises `max end_ts`.
+    pub max_future_skew_ns: i64,
+    /// Nanoseconds a span's resolved `start_ts_ns` may lag ingest time
+    /// (ADR-0049 §4). Default 2 hours, shared with metrics and logs; the
+    /// start timestamp is the bounded one because the commit record
+    /// advertises `min start_ts`. Consequence: a span longer than this, or
+    /// reported later than this after it started, is rejected at admission.
+    /// Raising it for a tenant is legal only together with the catalog-side
+    /// window config.
+    pub max_ingest_lag_ns: i64,
 }
+
+const SECOND_NANOS: i64 = 1_000_000_000;
+const MINUTE_NANOS: i64 = 60 * SECOND_NANOS;
+const HOUR_NANOS: i64 = 60 * MINUTE_NANOS;
 
 impl Default for SpanIngestLimits {
     fn default() -> Self {
@@ -85,6 +104,8 @@ impl Default for SpanIngestLimits {
             max_resource_attributes: 128,
             max_scope_attributes: 64,
             max_raw_blob_len: 65_536,
+            max_future_skew_ns: 10 * MINUTE_NANOS,
+            max_ingest_lag_ns: 2 * HOUR_NANOS,
         }
     }
 }
@@ -147,6 +168,28 @@ pub enum SpanRejection {
     /// an inverted interval cannot be pruned soundly.
     #[error("span ends at {end_ts_ns} before it starts at {start_ts_ns}")]
     InvalidTimeRange { start_ts_ns: i64, end_ts_ns: i64 },
+
+    /// The span's resolved `end_ts_ns` leads ingest time by more than the
+    /// admission bound (ADR-0049 §4). Rejected rather than clamped:
+    /// rewriting a sender's timestamps would be silent data corruption, and
+    /// a span past this bound would be stored but invisible to every
+    /// listing-window query and its hour bucket unexpirable. The end
+    /// timestamp is the checked one because the commit record advertises
+    /// `max end_ts`. Mirrors [`crate::limits::Rejection::FutureSkew`].
+    #[error(
+        "span end timestamp is {skew_ns} ns ahead of ingest time, more than the max future skew of {max_ns} ns"
+    )]
+    FutureSkew { skew_ns: i64, max_ns: i64 },
+
+    /// The span's resolved `start_ts_ns` lags ingest time by more than the
+    /// admission bound (ADR-0049 §4). The start timestamp is the checked one
+    /// because the commit record advertises `min start_ts`; a span longer
+    /// than the bound, or reported later than that after it started, lands
+    /// here. Mirrors [`crate::limits::Rejection::TooOld`].
+    #[error(
+        "span start timestamp is {lag_ns} ns behind ingest time, more than the max ingest lag of {max_ns} ns"
+    )]
+    TooOld { lag_ns: i64, max_ns: i64 },
 
     /// The serialized span-events blob exceeded `max_raw_blob_len`. The span
     /// itself is admitted without the blob; the loss is reported rather than
@@ -244,6 +287,20 @@ mod tests {
         assert_eq!(limits.max_resource_attributes, 128);
         assert_eq!(limits.max_scope_attributes, 64);
         assert_eq!(limits.max_raw_blob_len, 65_536);
+        assert_eq!(limits.max_future_skew_ns, 600_000_000_000);
+        assert_eq!(limits.max_ingest_lag_ns, 7_200_000_000_000);
+    }
+
+    /// The skew bounds are the metrics ones verbatim (ADR-0049 §4): the
+    /// catalog listing window is one shared value, so the admission bounds
+    /// that make it sound cannot differ per signal. Pinned so a per-signal
+    /// "tuning" edit has to argue with a failing test.
+    #[test]
+    fn skew_bounds_equal_the_metric_ones() {
+        let spans = SpanIngestLimits::default();
+        let metrics = crate::IngestLimits::default();
+        assert_eq!(spans.max_future_skew_ns, metrics.max_future_skew_ns);
+        assert_eq!(spans.max_ingest_lag_ns, metrics.max_ingest_lag_ns);
     }
 
     /// The shared ceilings are the log ones verbatim, and the span-specific
@@ -309,6 +366,14 @@ mod tests {
             SpanRejection::InvalidTimeRange {
                 start_ts_ns: 20,
                 end_ts_ns: 10,
+            },
+            SpanRejection::FutureSkew {
+                skew_ns: 700_000_000_000,
+                max_ns: 600_000_000_000,
+            },
+            SpanRejection::TooOld {
+                lag_ns: 8_000_000_000_000,
+                max_ns: 7_200_000_000_000,
             },
         ] {
             assert_eq!(r.rejected_count(), 1, "{r}");

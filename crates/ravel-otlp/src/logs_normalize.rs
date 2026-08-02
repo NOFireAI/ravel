@@ -240,10 +240,14 @@ fn normalize_record(
     };
     // An OTLP record with neither timestamp set is legal. Fall back to the
     // observed time, then to ingest time, rather than storing a bare zero.
-    let ts_ns = match to_i64_ns(record.time_unix_nano) {
-        0 => observed_ts_ns,
-        v => v,
-    };
+    let ts_ns = checked_record_ts(
+        match to_i64_ns(record.time_unix_nano) {
+            0 => observed_ts_ns,
+            v => v,
+        },
+        ingest_ts_ns,
+        limits,
+    )?;
 
     let mut attrs = Vec::with_capacity(record.attributes.len());
     let mut dropped = Vec::new();
@@ -284,6 +288,45 @@ fn normalize_record(
 /// saturates rather than wrapping negative.
 fn to_i64_ns(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Bound a record's resolved event time to `[ingest_ts_ns -
+/// max_ingest_lag_ns, ingest_ts_ns + max_future_skew_ns]` (ADR-0049 §4),
+/// mirroring the metrics path's `checked_event_ts`. The bound itself passes;
+/// only strictly exceeding it rejects: `ts == ingest_ts + max_future_skew`
+/// is accepted, `ts == ingest_ts + max_future_skew + 1` is not. Applied to
+/// the *resolved* timestamp, after the observed-time and ingest-time
+/// fallbacks, so a record whose only timestamp is a skewed observed time is
+/// bounded too; the metrics path's zero-rejection arm has no counterpart
+/// here because a zero already fell back to an in-bounds ingest time.
+///
+/// The catalog listing window is provably complete only under these bounds
+/// (docs/consistency-model.md "Late and skewed data"): an out-of-window
+/// record would be stored and acked but invisible to every listing-window
+/// query, and retention anchors expiry on max event time, so one far-future
+/// record would make its hour bucket unexpirable. Rejecting, never clamping:
+/// rewriting a sender's event time is silent corruption of the
+/// plausible-wrong-result class; a typed rejection is visible and countable.
+fn checked_record_ts(
+    ts_ns: i64,
+    ingest_ts_ns: i64,
+    limits: &LogIngestLimits,
+) -> Result<i64, LogRejection> {
+    let skew_ns = ts_ns.saturating_sub(ingest_ts_ns);
+    if skew_ns > limits.max_future_skew_ns {
+        return Err(LogRejection::FutureSkew {
+            skew_ns,
+            max_ns: limits.max_future_skew_ns,
+        });
+    }
+    let lag_ns = ingest_ts_ns.saturating_sub(ts_ns);
+    if lag_ns > limits.max_ingest_lag_ns {
+        return Err(LogRejection::TooOld {
+            lag_ns,
+            max_ns: limits.max_ingest_lag_ns,
+        });
+    }
+    Ok(ts_ns)
 }
 
 /// Normalize a record body to the string RLOG stores. A string body maps
@@ -1030,6 +1073,153 @@ mod tests {
             out.rejected,
             vec![LogRejection::TooManyAttributes { count: 2, max: 1 }]
         );
+    }
+
+    // --- event-time skew bounds (ADR-0049 §4) ---
+    // Convention, shared with the metrics path: the bound itself passes; one
+    // ns past it fails.
+
+    /// A realistic ingest clock reading, so the skew arithmetic runs on
+    /// full-size nanosecond timestamps rather than tiny test integers.
+    const INGEST_TS: i64 = 1_754_000_000_000_000_000;
+
+    fn one_record_at(ts_ns: u64) -> ExportLogsServiceRequest {
+        request(vec![resource_logs(
+            vec![string_kv("service.name", "api")],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("x".into()))),
+                    vec![],
+                    ts_ns,
+                )],
+            )],
+        )])
+    }
+
+    #[test]
+    fn rejects_future_skewed_record() {
+        let limits = LogIngestLimits::default();
+        let ts = INGEST_TS + limits.max_future_skew_ns + 1;
+        let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+        assert!(out.records.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::FutureSkew {
+                skew_ns: limits.max_future_skew_ns + 1,
+                max_ns: limits.max_future_skew_ns,
+            }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 1);
+    }
+
+    #[test]
+    fn rejects_record_older_than_max_ingest_lag() {
+        let limits = LogIngestLimits::default();
+        let ts = INGEST_TS - limits.max_ingest_lag_ns - 1;
+        let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+        assert!(out.records.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::TooOld {
+                lag_ns: limits.max_ingest_lag_ns + 1,
+                max_ns: limits.max_ingest_lag_ns,
+            }]
+        );
+    }
+
+    #[test]
+    fn record_exactly_at_either_bound_is_accepted() {
+        let limits = LogIngestLimits::default();
+        for ts in [
+            INGEST_TS + limits.max_future_skew_ns,
+            INGEST_TS - limits.max_ingest_lag_ns,
+        ] {
+            let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+            assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+            assert_eq!(out.records.len(), 1);
+            assert_eq!(out.records[0].ts_ns, ts);
+        }
+    }
+
+    /// The bound applies to the *resolved* timestamp: a record with no event
+    /// time falls back to its observed time, and a skewed observed time must
+    /// not smuggle an out-of-window timestamp past the check.
+    #[test]
+    fn skewed_observed_time_fallback_is_rejected_too() {
+        let limits = LogIngestLimits::default();
+        let mut rec = record(
+            Some(any(AnyValueVariant::StringValue("x".into()))),
+            vec![],
+            0,
+        );
+        rec.observed_time_unix_nano = (INGEST_TS + limits.max_future_skew_ns + 1) as u64;
+        let out = normalize_logs(
+            request(vec![resource_logs(
+                vec![],
+                vec![scope_logs("lib", "1", vec![rec])],
+            )]),
+            &limits,
+            INGEST_TS,
+        );
+        assert!(out.records.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::FutureSkew {
+                skew_ns: limits.max_future_skew_ns + 1,
+                max_ns: limits.max_future_skew_ns,
+            }]
+        );
+    }
+
+    /// A u64 timestamp past i64::MAX saturates and is rejected as future
+    /// skew rather than wrapping negative into the admissible window.
+    #[test]
+    fn timestamp_past_i64_max_is_rejected_not_wrapped() {
+        let out = normalize_logs(
+            one_record_at(u64::MAX),
+            &LogIngestLimits::default(),
+            INGEST_TS,
+        );
+        assert!(out.records.is_empty());
+        assert!(
+            matches!(out.rejected.as_slice(), [LogRejection::FutureSkew { .. }]),
+            "{:?}",
+            out.rejected
+        );
+    }
+
+    proptest::proptest! {
+        /// Over arbitrary timestamps, a record is admitted exactly when its
+        /// resolved event time lies in
+        /// `[ingest - max_ingest_lag, ingest + max_future_skew]`; nothing is
+        /// ever both admitted and rejected, and nothing panics.
+        #[test]
+        fn skew_bounds_partition_admission(
+            ts_ns in 1u64..=u64::MAX,
+            offset_ns in -4_000_000_000_000i64..=4_000_000_000_000i64,
+        ) {
+            let limits = LogIngestLimits::default();
+            let ingest_ts = INGEST_TS + offset_ns;
+            let out = normalize_logs(one_record_at(ts_ns), &limits, ingest_ts);
+            let resolved = i64::try_from(ts_ns).unwrap_or(i64::MAX);
+            let in_bounds = resolved >= ingest_ts - limits.max_ingest_lag_ns
+                && resolved <= ingest_ts + limits.max_future_skew_ns;
+            if in_bounds {
+                proptest::prop_assert_eq!(out.records.len(), 1);
+                proptest::prop_assert!(out.rejected.is_empty());
+                proptest::prop_assert_eq!(out.records[0].ts_ns, resolved);
+            } else {
+                proptest::prop_assert!(out.records.is_empty());
+                proptest::prop_assert_eq!(out.rejected.len(), 1);
+                let is_skew_rejection = matches!(
+                    out.rejected[0],
+                    LogRejection::FutureSkew { .. } | LogRejection::TooOld { .. }
+                );
+                proptest::prop_assert!(is_skew_rejection, "{:?}", out.rejected);
+            }
+        }
     }
 
     #[test]

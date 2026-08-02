@@ -52,7 +52,22 @@ pub struct LogIngestLimits {
     pub max_resource_attributes: usize,
     /// Attributes on an instrumentation scope. Also part of stream identity.
     pub max_scope_attributes: usize,
+    /// Nanoseconds a record's resolved event time may lead ingest time
+    /// (ADR-0049 §4). Default 10 minutes, the same value the metrics path
+    /// uses ([`crate::IngestLimits::max_future_skew_ns`]): the catalog
+    /// listing window is one shared `max_ingest_lag_ns`, not per-signal, so
+    /// the admission bounds that make it sound are shared too.
+    pub max_future_skew_ns: i64,
+    /// Nanoseconds a record's resolved event time may lag ingest time
+    /// (ADR-0049 §4). Default 2 hours, shared with metrics for the same
+    /// reason as [`LogIngestLimits::max_future_skew_ns`]. Raising it for a
+    /// tenant is legal only together with the catalog-side window config.
+    pub max_ingest_lag_ns: i64,
 }
+
+const SECOND_NANOS: i64 = 1_000_000_000;
+const MINUTE_NANOS: i64 = 60 * SECOND_NANOS;
+const HOUR_NANOS: i64 = 60 * MINUTE_NANOS;
 
 impl Default for LogIngestLimits {
     fn default() -> Self {
@@ -64,6 +79,8 @@ impl Default for LogIngestLimits {
             max_body_len: 65_536,
             max_resource_attributes: 128,
             max_scope_attributes: 64,
+            max_future_skew_ns: 10 * MINUTE_NANOS,
+            max_ingest_lag_ns: 2 * HOUR_NANOS,
         }
     }
 }
@@ -103,6 +120,26 @@ pub enum LogRejection {
 
     #[error("record body is not a supported AnyValue kind")]
     UnsupportedBodyKind,
+
+    /// The record's resolved event time (`ts_ns`, after the observed-time and
+    /// ingest-time fallbacks) leads ingest time by more than the admission
+    /// bound (ADR-0049 §4). Rejected rather than clamped: rewriting a
+    /// sender's event time would be silent data corruption, and a record
+    /// past this bound would be stored but invisible to every listing-window
+    /// query and its hour bucket unexpirable. Mirrors
+    /// [`crate::limits::Rejection::FutureSkew`].
+    #[error(
+        "record timestamp is {skew_ns} ns ahead of ingest time, more than the max future skew of {max_ns} ns"
+    )]
+    FutureSkew { skew_ns: i64, max_ns: i64 },
+
+    /// The record's resolved event time lags ingest time by more than the
+    /// admission bound (ADR-0049 §4). Mirrors
+    /// [`crate::limits::Rejection::TooOld`].
+    #[error(
+        "record timestamp is {lag_ns} ns behind ingest time, more than the max ingest lag of {max_ns} ns"
+    )]
+    TooOld { lag_ns: i64, max_ns: i64 },
 
     /// An attribute arrived with its `value` field unset. Dropped as a single
     /// attribute, not as the whole record, and reported rather than silently
@@ -160,6 +197,20 @@ mod tests {
         assert_eq!(limits.max_body_len, 65_536);
         assert_eq!(limits.max_resource_attributes, 128);
         assert_eq!(limits.max_scope_attributes, 64);
+        assert_eq!(limits.max_future_skew_ns, 600_000_000_000);
+        assert_eq!(limits.max_ingest_lag_ns, 7_200_000_000_000);
+    }
+
+    /// The skew bounds are the metrics ones verbatim (ADR-0049 §4): the
+    /// catalog listing window is one shared value, so the admission bounds
+    /// that make it sound cannot differ per signal. Pinned so a per-signal
+    /// "tuning" edit has to argue with a failing test.
+    #[test]
+    fn skew_bounds_equal_the_metric_ones() {
+        let logs = LogIngestLimits::default();
+        let metrics = crate::IngestLimits::default();
+        assert_eq!(logs.max_future_skew_ns, metrics.max_future_skew_ns);
+        assert_eq!(logs.max_ingest_lag_ns, metrics.max_ingest_lag_ns);
     }
 
     #[test]
@@ -235,6 +286,22 @@ mod tests {
         );
         assert_eq!(
             LogRejection::UnsupportedAttributeValue { key: "k".into() }.rejected_count(),
+            1
+        );
+        assert_eq!(
+            LogRejection::FutureSkew {
+                skew_ns: 700_000_000_000,
+                max_ns: 600_000_000_000,
+            }
+            .rejected_count(),
+            1
+        );
+        assert_eq!(
+            LogRejection::TooOld {
+                lag_ns: 8_000_000_000_000,
+                max_ns: 7_200_000_000_000,
+            }
+            .rejected_count(),
             1
         );
     }
