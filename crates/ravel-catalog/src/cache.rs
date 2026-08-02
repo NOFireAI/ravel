@@ -431,7 +431,18 @@ impl PostingsCache {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use bytes::Bytes;
+    use ravel_cache::CacheKey;
+    use ravel_commit::keys;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{GetRange, ObjectStoreBackend};
+    use ravel_types::TimeRange;
+    use ravel_types::accounting::AccountedOp;
+
     use super::*;
+    use crate::{Catalog, CatalogConfig};
 
     fn record(tenant_hash: [u8; 16], shard: u32) -> CommitRecord {
         CommitRecord {
@@ -748,5 +759,348 @@ mod tests {
         cache.insert(a, "k".to_string(), Arc::new(decoded_postings()), 1, 10);
         assert!(cache.get(&a, "k", &accounting).is_some());
         assert!(cache.get(&b, "k", &accounting).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Byte cache (ADR-0046, issue #443): Catalog::fetch_content_addressed,
+    // consulted from load_one_part/load_snapshot_postings ahead of the
+    // decoded PartCache/PostingsCache above.
+    // -----------------------------------------------------------------
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    const FOLD_MARGIN_NS: i64 = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+        + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+    fn byte_cache_tenant() -> TenantHash {
+        TenantHash([0x42; 16])
+    }
+
+    fn byte_cache_catalog_config(shard_count: u32) -> CatalogConfig {
+        CatalogConfig {
+            shard_count,
+            ..Default::default()
+        }
+    }
+
+    /// `now_ns` at which ingest hour `hour` has just sealed under default
+    /// margins (mirrors `fold.rs`'s own `now_at_seal`, not reachable from
+    /// here since it is private to that module's test mod).
+    fn now_at_seal(hour: u32) -> i64 {
+        (i64::from(hour) + 1) * NS_PER_HOUR + FOLD_MARGIN_NS
+    }
+
+    /// Build, PUT the data object, and publish a fully self-consistent
+    /// commit record for one L0 segment, so `Catalog::fold` has something
+    /// to compact into a real, content-addressed snapshot part.
+    async fn publish_one_segment(
+        store: &MemoryStore,
+        hour: u32,
+        created_unix_ns: i64,
+    ) -> CommitRecord {
+        let writer_id = uuid::Uuid::new_v4();
+        let payload = format!("byte-cache-seg-{writer_id}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: byte_cache_tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// Find the one snapshot part object a fold produced, by its key
+    /// convention (`fold::part_object_key`'s `/snap/` segment; not
+    /// reachable directly since it is private to that module).
+    async fn find_part_key(store: &MemoryStore) -> String {
+        ravel_object_store::list_all(store, "t/")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|meta| meta.key)
+            .find(|key| key.contains("/snap/"))
+            .expect("fold produced a snapshot part")
+    }
+
+    #[tokio::test]
+    async fn resolve_is_byte_identical_with_and_without_the_byte_cache() {
+        let store = Arc::new(MemoryStore::new());
+        let hour = 900_000u32;
+        let now_ns = now_at_seal(hour);
+        publish_one_segment(&store, hour, now_ns - NS_PER_HOUR).await;
+
+        let fold_catalog =
+            Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        fold_catalog
+            .fold(
+                &byte_cache_tenant(),
+                Signal::Metrics,
+                uuid::Uuid::new_v4(),
+                now_ns,
+                &[],
+            )
+            .await
+            .expect("fold produces a snapshot part");
+
+        let catalog = Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        let range = TimeRange {
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+
+        let cold = catalog
+            .resolve(&byte_cache_tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("cold resolve");
+        assert_eq!(cold.segments.len(), 1);
+        assert!(
+            !catalog.byte_cache().is_empty(),
+            "cold resolve must have admitted the part into the byte cache"
+        );
+
+        let warm = catalog
+            .resolve(&byte_cache_tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("warm resolve");
+
+        assert_eq!(
+            cold, warm,
+            "resolve's contract is unchanged: byte-identical, including segment ordering, \
+             cached or not"
+        );
+    }
+
+    /// ADR-0046: the catalog HEAD is CAS-written and must never be admitted
+    /// to the byte cache. Structurally, `read_head` never has a
+    /// `content_hash` to pass `Catalog::fetch_content_addressed` (see that
+    /// method's doc comment) so it cannot reach the byte cache at all; this
+    /// is the runtime regression backstop for that argument. Every resolve
+    /// below re-reads (or TTL-revalidates) HEAD through the same
+    /// `guarded_get` funnel the byte cache sits behind; if HEAD bytes ever
+    /// reached the byte cache, its entry count would grow past the single
+    /// content-addressed part across repeated resolves.
+    #[tokio::test]
+    async fn head_reads_never_populate_the_byte_cache() {
+        let store = Arc::new(MemoryStore::new());
+        let hour = 900_001u32;
+        let now_ns = now_at_seal(hour);
+        publish_one_segment(&store, hour, now_ns - NS_PER_HOUR).await;
+
+        let fold_catalog =
+            Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        fold_catalog
+            .fold(
+                &byte_cache_tenant(),
+                Signal::Metrics,
+                uuid::Uuid::new_v4(),
+                now_ns,
+                &[],
+            )
+            .await
+            .expect("fold produces a snapshot part");
+
+        let catalog = Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        let range = TimeRange {
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+
+        for _ in 0..3 {
+            catalog
+                .resolve(&byte_cache_tenant(), Signal::Metrics, range, &[], now_ns)
+                .await
+                .expect("resolve");
+        }
+
+        assert_eq!(
+            catalog.byte_cache().len(),
+            1,
+            "only the content-addressed part may ever be admitted; HEAD is fetched on the \
+             path above but must never appear in the byte cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_byte_cache_entry_falls_back_to_listing_like_a_corrupt_store_read() {
+        let store = Arc::new(MemoryStore::new());
+        let hour = 900_002u32;
+        let now_ns = now_at_seal(hour);
+        let record = publish_one_segment(&store, hour, now_ns - NS_PER_HOUR).await;
+
+        let fold_catalog =
+            Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        fold_catalog
+            .fold(
+                &byte_cache_tenant(),
+                Signal::Metrics,
+                uuid::Uuid::new_v4(),
+                now_ns,
+                &[],
+            )
+            .await
+            .expect("fold produces a snapshot part");
+
+        let part_key = find_part_key(&store).await;
+        let good_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data;
+        let content_hash = *blake3::hash(&good_bytes).as_bytes();
+        let cache_key = CacheKey::new(
+            byte_cache_tenant().0,
+            content_hash,
+            0,
+            good_bytes.len() as u64,
+        );
+        let mut corrupted = good_bytes.to_vec();
+        corrupted[0] ^= 0xFF;
+
+        // A fresh catalog: empty decoded PartCache, so load_one_part must
+        // consult the byte cache; seeded directly with a corrupt entry at
+        // the part's real cache key, bypassing a real store GET entirely.
+        let catalog = Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        catalog
+            .byte_cache()
+            .insert(cache_key, Bytes::from(corrupted));
+
+        let range = TimeRange {
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let snapshot = catalog
+            .resolve(&byte_cache_tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("resolve degrades to listing rather than failing or returning wrong data");
+
+        assert_eq!(
+            snapshot.segments.len(),
+            1,
+            "listing fallback must still find the one published segment"
+        );
+        assert_eq!(
+            snapshot.segments[0].data_object_key,
+            keys::reconstruct_data_key(&record).expect("data key")
+        );
+        assert!(
+            catalog
+                .part_cache()
+                .get(&byte_cache_tenant(), &part_key, &QueryAccounting::new())
+                .is_none(),
+            "corrupted bytes must never be promoted into the decoded part cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_cache_hit_is_counted_and_does_not_also_count_an_s3_request() {
+        let store = Arc::new(MemoryStore::new());
+        let hour = 900_003u32;
+        let now_ns = now_at_seal(hour);
+        publish_one_segment(&store, hour, now_ns - NS_PER_HOUR).await;
+
+        let fold_catalog =
+            Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        fold_catalog
+            .fold(
+                &byte_cache_tenant(),
+                Signal::Metrics,
+                uuid::Uuid::new_v4(),
+                now_ns,
+                &[],
+            )
+            .await
+            .expect("fold produces a snapshot part");
+
+        let part_key = find_part_key(&store).await;
+        let part_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data;
+        let content_hash = *blake3::hash(&part_bytes).as_bytes();
+        let cache_key = CacheKey::new(
+            byte_cache_tenant().0,
+            content_hash,
+            0,
+            part_bytes.len() as u64,
+        );
+
+        let range = TimeRange {
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+
+        // Cold: fresh catalog, byte cache empty. HEAD and the part both
+        // come from the store.
+        let cold_catalog =
+            Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        let cold_accounting = QueryAccounting::new();
+        cold_catalog
+            .resolve_with_accounting(
+                &byte_cache_tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now_ns,
+                &cold_accounting,
+            )
+            .await
+            .expect("cold resolve");
+        let cold_snap = cold_accounting.snapshot();
+
+        // Warm: another fresh catalog (empty decoded caches too, so this
+        // exercises the byte cache specifically, not PartCache), with the
+        // byte cache pre-seeded with the part's real bytes under its real
+        // key.
+        let warm_catalog =
+            Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        warm_catalog.byte_cache().insert(cache_key, part_bytes);
+        let warm_accounting = QueryAccounting::new();
+        let warm_snapshot = warm_catalog
+            .resolve_with_accounting(
+                &byte_cache_tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now_ns,
+                &warm_accounting,
+            )
+            .await
+            .expect("warm resolve");
+        let warm_snap = warm_accounting.snapshot();
+
+        assert_eq!(warm_snapshot.segments.len(), 1);
+        assert_eq!(
+            warm_snap.cache_hits,
+            cold_snap.cache_hits + 1,
+            "the byte cache hit must be counted"
+        );
+        assert_eq!(
+            warm_snap.s3_requests(AccountedOp::Get),
+            cold_snap.s3_requests(AccountedOp::Get) - 1,
+            "a byte cache hit must skip the store GET the cold path made for the part"
+        );
     }
 }

@@ -183,7 +183,10 @@ impl Catalog {
         accounting: &QueryAccounting,
     ) -> Result<Bytes, StoreError> {
         let Ok(content_hash) = <[u8; 32]>::try_from(content_hash) else {
-            return Ok(self.guarded_get(key, GetRange::Full, accounting).await?.data);
+            return Ok(self
+                .guarded_get(key, GetRange::Full, accounting)
+                .await?
+                .data);
         };
         let cache_key = CacheKey::new(tenant.0, content_hash, 0, size);
         if let Some(bytes) = self.byte_cache.get(&cache_key) {
@@ -282,7 +285,9 @@ impl Catalog {
     /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the
     /// byte cache directly (ADR-0046). Not used by `snapshot_resolve`, which
     /// only ever reaches the byte cache through
-    /// [`Catalog::fetch_content_addressed`].
+    /// [`Catalog::fetch_content_addressed`] -- hence `cfg(test)`, since no
+    /// production code path needs this accessor.
+    #[cfg(test)]
     pub(crate) fn byte_cache(&self) -> &Cache<std::convert::Infallible> {
         &self.byte_cache
     }
