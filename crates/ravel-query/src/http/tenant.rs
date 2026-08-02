@@ -700,4 +700,106 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
             TenantId::new("beta")
         );
     }
+
+    // A real 2048-bit RSA keypair (openssl genrsa 2048), used to sign and
+    // verify RS256 tokens. Real OIDC issuers overwhelmingly sign with RS256
+    // (RSA), which exercises a different `DecodingKey::from_jwk` branch and a
+    // different key-family check in `jsonwebtoken::decode` than the ES256/EC
+    // keypair above. Signed via `EncodingKey::from_rsa_pem` under the
+    // `aws_lc_rs` backend (issue #405); no extra dependency is pulled in for
+    // RSA key generation.
+    const RSA_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCu7ZpSqycgiMDi\n\
+kxGgRGL3F+xF2uhh6OgeOEmqvcqyicDeOcZoFxcczrg3ZgT58hr9iVDcbVh4I962\n\
+vY2N0XcRoHzcR3N9VGch6u76tSLtRNSNLfh6ja6ziDSVssVYTyBf+e+T1QvT5sUF\n\
+8/XlMm0FkTKfHdb6lb1PhXLx9l2WPOdd2bK3YbpWFUkIIv5oXtuFaU+3ikZrco4i\n\
+77Xb/mfHago49cD89sbKHjJ9jW0K50KUF3jntUm/M/TTN5ztcnJBagl/kkR7O+ld\n\
+XGdmRom4h7KapIGG7sCVNH00Uu9nqpkVSlPmCdoNXlDaxq4ZRc4iTZls8tIRra16\n\
+BIZOEN+PAgMBAAECggEAER4FBOPkn0VigolbpzAp8v3vS+Kg7LvKwvJFGyUZSaE7\n\
+M0O6C4N+6n27/wfHouGzDG48cGVuy8rOx1kDGgaOPTZUIYYIYhI5SVNg8T16Xndm\n\
+yS3fa7ajisPgSWnF799GTr35WKD3WFPzoaJ+xF/L1UihCHr2B21Rqg9n8Q9nlwTT\n\
+C1pZ7rncqOM1S78IJJcVxjz1IpzWcLhu5j0e4Z32qdhnTF1FiDBD8Yxi9tJEf2bK\n\
+8FSI5Mm0KmGzzX7GO/DoqX8VxKBBMrtONvVIO9i1wH+R0jacHq5xv7CcIRE9j0v2\n\
+YJ2KIU7KiRyn3QOzKdAkXDzzrKZKLbXnOou/WYkd+QKBgQDp83Nky96jQfQwI+6e\n\
+TQiR9hNuRtDweK6tEhQ8Ye9p4UaHWbJYmM3777JZqLr5mzlvDYtmDdpMzrMf/csu\n\
+ShIBNSoJSObIrkrDIclvknDapm9dSNULTnqQoPogqXAN9zJih0xsm0DCuqPUuior\n\
+4pIfCzPufePw0sCLG7pLxDc2nQKBgQC/ahq5+jXfH0/Vv+e8S24k8Pzi7zpkN4zt\n\
+Dft8FP10yP7Hs5vzutTWb+eJBm6Z2fizWJTjA+f2qzWTrZnzVwvKFzzgaOMOyFTK\n\
+Am4nuZw3dx3y99DitWCmWSDwvAL9hVOKZrcEhNSsgQbZylL4jYNqQT3/Vpv1zdUv\n\
+cZyV5s2BGwKBgDCpsxcEUQskbOaWksvaui2iQehuUoeykqLtX8gvlt0vPrxoq/BB\n\
+2JbPBQohTsMcxpWS+6v+tanEVP4SjHDUd2pI5LWJtHeJyYNNQ9kxXMgeVovQ2n+/\n\
+kz8CPQUOOYCuKozUF9F/ebkHmYxmLN90AXDzo5m4FfHB5MsKuXWJGvMBAoGAXopY\n\
+cvzK+M3tT4R+P3j+CM7iCG/h5jetqjPavzlaygCwHhBu+V2Q2+zfbcU4gVKwTFx3\n\
+BP0b57A+QRdgT1jx4LnDfo8vflCh2DiFEafSKW7y4ttVV3QALYkeBOjHjVH5pgT/\n\
+ZgL5S85ahN0yR8MVYjihF2k+lJQ6NDmn/j3FyHsCgYEAseHN0zEs0790JV7nK+G4\n\
+HlpT5YAV5RMbK3HYayhebZ060wRNpl412J6sOAJktrYTNRJpGyn5MMfMVPWgmqb4\n\
+iZ6SUslXxIqalyqaBs18wn8keaQfGPrJDRlOPFDuBUvCxUeLV7UuZc/IkEntN4gy\n\
+JGhDLd2EhXX5RDhGuladnj8=\n\
+-----END PRIVATE KEY-----\n";
+    // The public modulus (`n`) and exponent (`e`) of RSA_PRIV_PEM, base64url
+    // encoded, as an RS256 JWKS carries them.
+    const RSA_N: &str = "ru2aUqsnIIjA4pMRoERi9xfsRdroYejoHjhJqr3KsonA3jnGaBcXHM64N2YE-fIa_YlQ3G1YeCPetr2NjdF3EaB83EdzfVRnIeru-rUi7UTUjS34eo2us4g0lbLFWE8gX_nvk9UL0-bFBfP15TJtBZEynx3W-pW9T4Vy8fZdljznXdmyt2G6VhVJCCL-aF7bhWlPt4pGa3KOIu-12_5nx2oKOPXA_PbGyh4yfY1tCudClBd457VJvzP00zec7XJyQWoJf5JEezvpXVxnZkaJuIeymqSBhu7AlTR9NFLvZ6qZFUpT5gnaDV5Q2sauGUXOIk2ZbPLSEa2tegSGThDfjw";
+    const RSA_E: &str = "AQAB";
+    const RSA_KID: &str = "test-rsa-1";
+
+    /// An RSA JWK set carrying the real public key above under key id `kid`,
+    /// declaring `RS256`.
+    fn jwks_rsa_with(kid: &str) -> JwkSet {
+        let doc = serde_json::json!({
+            "keys": [{
+                "kty": "RSA", "kid": kid, "alg": "RS256", "use": "sig",
+                "n": RSA_N, "e": RSA_E,
+            }]
+        });
+        serde_json::from_value(doc).expect("valid JWKS")
+    }
+
+    /// Sign a claims object as an RS256 JWT with `kid`, using the RSA PEM
+    /// private key.
+    fn sign_rs256(claims: &serde_json::Value, kid: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        let key = EncodingKey::from_rsa_pem(RSA_PRIV_PEM.as_bytes()).expect("valid RSA PEM");
+        encode(&header, claims, &key).expect("token encodes")
+    }
+
+    /// The RSA algorithm-confusion shape, mirroring `sign_hs256_confused` for
+    /// RSA: an HS256 token whose HMAC secret is the RSA public key's own
+    /// modulus bytes (base64url-decoded from `RSA_N`). An RSA public key is by
+    /// definition published in the JWKS, so reusing it as a symmetric secret is
+    /// exactly the forge-any-token attack the resolver must reject.
+    fn sign_hs256_confused_rsa(claims: &serde_json::Value, kid: &str) -> String {
+        use base64::Engine;
+        let modulus = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(RSA_N)
+            .expect("RSA_N is valid base64url");
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(kid.to_string());
+        encode(&header, claims, &EncodingKey::from_secret(&modulus)).expect("token encodes")
+    }
+
+    #[test]
+    fn valid_rs256_token_resolves_claimed_tenant() {
+        // #399: real-world OIDC issuers overwhelmingly use RS256. A validly
+        // RS256-signed token must resolve the claimed tenant just like ES256.
+        let cache = cache_with(&jwks_rsa_with(RSA_KID));
+        let token = sign_rs256(&claims(Some("acme"), 3600), RSA_KID);
+        let tenant = resolver(cache)
+            .resolve(&bearer(&token))
+            .expect("valid RS256 token resolves");
+        assert_eq!(tenant, TenantId::new("acme"));
+    }
+
+    #[test]
+    fn rsa_algorithm_confusion_reusing_the_modulus_as_an_hmac_secret_is_auth_error() {
+        // The JWKS declares RS256 for this key, so the resolver only admits
+        // RS256 for it. A token whose header claims HS256, signed with the RSA
+        // public key's own (published) modulus bytes reused as an HMAC secret -
+        // the classic RSA/HMAC algorithm-confusion attack - must be rejected,
+        // caught by either the ES256-style allow-list pinning (which excludes
+        // HS256) or the key-family mismatch (RSA key vs HMAC family).
+        let cache = cache_with(&jwks_rsa_with(RSA_KID));
+        let token = sign_hs256_confused_rsa(&claims(Some("acme"), 3600), RSA_KID);
+        assert!(resolver(cache).resolve(&bearer(&token)).is_err());
+    }
 }
