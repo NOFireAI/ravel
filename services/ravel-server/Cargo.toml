@@ -34,6 +34,12 @@ opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The `--limits-file` admission-limits config (ADR-0051 section 3) is TOML,
+# matching the ADR's chosen format; not in `[workspace.dependencies]` (the
+# workspace root Cargo.toml is outside this task's scope), so pinned directly
+# here with a version, the same convention `ravel-alerting` and `ravel-sql`
+# below use for their path dependencies.
+toml = "1"
 humantime = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
