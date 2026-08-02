@@ -150,6 +150,24 @@ async fn main() -> anyhow::Result<()> {
              Signal::Alerts records and nothing will be notified"
         );
     }
+    // #388: the alert evaluator only spawns in the modes that build a query
+    // engine (Mode::All and Mode::Query; see `ravel_server::start`), because a
+    // rule is a query. In any other mode a rules file is still parsed and
+    // validated above, but no evaluator ever runs it, so the whole alerting
+    // feature silently does nothing. Warn loudly, naming the mode. This is
+    // warn! rather than the info! above because that path only means "no
+    // notification channel" (records are still written), whereas this means the
+    // rules are never evaluated at all.
+    if rules_ignored_by_mode(cli.mode, !alert_rules.is_empty()) {
+        tracing::warn!(
+            mode = ?cli.mode,
+            rule_count = alert_rules.values().map(Vec::len).sum::<usize>(),
+            "alert rules are configured but --mode {:?} does not run the alert evaluator (only \
+             --mode all and --mode query do): these rules will not be evaluated and no alert will \
+             ever fire. Run this process in --mode all or --mode query to evaluate them.",
+            cli.mode
+        );
+    }
 
     let config = ServerConfig {
         mode: cli.mode,
@@ -198,6 +216,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a loaded rules file will never be evaluated because the process mode
+/// does not run the alert evaluator (#388). The evaluator spawns only in the
+/// modes that build a query engine ([`Mode::All`] and [`Mode::Query`]; see
+/// `ravel_server::start`). Factored out of `main` so the gate that drives the
+/// startup warning is unit-testable without standing up a whole process.
+fn rules_ignored_by_mode(mode: Mode, has_rules: bool) -> bool {
+    has_rules && !matches!(mode, Mode::All | Mode::Query)
+}
+
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -219,5 +246,28 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #388: the modes that build a query engine (and therefore spawn the alert
+    /// evaluator) must not warn; the modes that do not, must warn when rules are
+    /// present. With no rules there is nothing to warn about in any mode.
+    #[test]
+    fn only_non_evaluating_modes_warn_about_loaded_rules() {
+        // Modes that run the evaluator: never warn, rules or not.
+        assert!(!rules_ignored_by_mode(Mode::All, true));
+        assert!(!rules_ignored_by_mode(Mode::Query, true));
+        assert!(!rules_ignored_by_mode(Mode::All, false));
+        assert!(!rules_ignored_by_mode(Mode::Query, false));
+
+        // Modes that do not run the evaluator: warn only when rules are loaded.
+        assert!(rules_ignored_by_mode(Mode::Gateway, true));
+        assert!(rules_ignored_by_mode(Mode::Maintain, true));
+        assert!(!rules_ignored_by_mode(Mode::Gateway, false));
+        assert!(!rules_ignored_by_mode(Mode::Maintain, false));
     }
 }

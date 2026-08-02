@@ -65,11 +65,11 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
 use ravel_logseg::{ObjectIdentity, Predicate, RlogConfig, RlogReader};
-use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
 use ravel_promql::Value as PromqlValue;
 use ravel_query::QueryEngine;
 use ravel_types::{Signal, TenantHash, TenantId};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -110,6 +110,39 @@ const ALERT_WRITER_EPOCH: u64 = 1;
 
 const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
 const NS_PER_MS: i64 = 1_000_000;
+
+/// Lease lifetime as a multiple of the evaluation interval (#387). A holder
+/// renews the lease at the start of every tick, so the lease must outlive a
+/// couple of missed ticks (a slow query, jitter, a brief GC pause) or a healthy
+/// holder would keep losing it to a standby. Three intervals lets a holder miss
+/// two consecutive ticks before a standby may take over, while still bounding
+/// how long a genuinely dead holder blocks failover to roughly three intervals.
+const LEASE_TTL_TICKS: u32 = 3;
+
+/// The per-tenant alert lease object body (#387): who holds it and until when.
+/// Small JSON, mirroring how the rules file is already JSON; the value is
+/// advisory coordination state, not a frozen persistent format.
+#[derive(Debug, Serialize, Deserialize)]
+struct AlertLease {
+    /// The holding evaluator's `writer_id`, hex-encoded. Minted fresh per task,
+    /// so a replica can distinguish its own lease from a peer's.
+    holder: String,
+    /// Wall-clock nanosecond at or after which any replica may take the lease
+    /// over, even one held by a different `holder`.
+    expiry_ns: i64,
+}
+
+/// The lease object key for a tenant's alert evaluation (#387).
+///
+/// Lives under the tenant's alert keyspace (`Signal::Alerts` prefix `a`) but
+/// deliberately outside the `c/<shard>/` commit prefix that
+/// [`AlertEvaluator::load_latest_records`] folds, so the fold never lists it and
+/// never mistakes it for a commit record. It is mutable coordination state, not
+/// an immutable data/commit object, so the object-key immutability rule does not
+/// apply to it.
+fn alert_lease_key(tenant: &TenantHash) -> String {
+    format!("t/{}/a/alert-lease", tenant.to_hex())
+}
 
 /// The query engines an evaluator runs rules against: the very instances the
 /// query endpoints serve from, not a second construction of them.
@@ -286,6 +319,15 @@ pub struct AlertEvalReport {
     /// evaluated at all. Never acts on a partial history: doing so would
     /// re-fire an alert that is already firing.
     pub history_unavailable: bool,
+    /// `true` when another replica held the tenant's alert lease this tick, so
+    /// this replica skipped rule evaluation (#387). Expected steady state in a
+    /// multi-replica deployment, not an error.
+    pub lease_not_held: bool,
+    /// `true` when the lease could not be acquired or renewed because the
+    /// object store failed (#387). Distinct from `lease_not_held`: this is a
+    /// store error, not a peer holding the lease. Rule evaluation is skipped and
+    /// retried next tick.
+    pub lease_unavailable: bool,
 }
 
 /// The evaluator for one tenant.
@@ -298,6 +340,10 @@ pub struct AlertEvaluator {
     sinks: Arc<Vec<AlertSink>>,
     http: reqwest::Client,
     query_deadline: Duration,
+    /// How long a lease this evaluator writes stays valid before any replica may
+    /// take it over (#387). Derived from the evaluation interval at construction
+    /// ([`LEASE_TTL_TICKS`] times it).
+    lease_ttl: Duration,
     /// Only read by the `sql` feature's [`AlertEvaluator::run_sql`]; a build
     /// without that feature rejects SQL rules before it would be needed.
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
@@ -344,6 +390,7 @@ impl AlertEvaluator {
             sinks: config.sinks.clone(),
             http,
             query_deadline: config.query_deadline,
+            lease_ttl: config.interval * LEASE_TTL_TICKS,
             sql_lookback: config.sql_lookback,
             writer_id: Uuid::new_v4(),
             next_seq: 1,
@@ -388,32 +435,138 @@ impl AlertEvaluator {
             self.bootstrapped = true;
         }
 
-        // `rules` is moved out for the loop so `self` stays mutably borrowable
-        // for the write path; it is put back before returning.
-        let rules = std::mem::take(&mut self.rules);
-        for rule in &rules {
-            match self.evaluate_rule(rule, &mut latest, now_ns).await {
-                Ok(written) => {
-                    report.rules_evaluated += 1;
-                    if written {
-                        report.records_written += 1;
+        // #387: only the lease holder for this tenant evaluates rules and writes
+        // transition records this tick, so two `--mode all`/`--mode query`
+        // replicas configured with the same rules do not both fire and notify
+        // every transition. History reading and bootstrap above are unguarded on
+        // purpose (they are read-only and idempotent, and bootstrap must still
+        // recover this process's own in-flight notifications after a restart);
+        // only the write path is gated. `flush_sinks` below always runs, so a
+        // notification already queued at this replica is still retried even on a
+        // tick where a peer holds the lease.
+        let hold_lease = match self.acquire_lease(now_ns).await {
+            Ok(held) => held,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %self.tenant.to_hex(),
+                    error = %err,
+                    "alert evaluation: could not acquire the tenant lease; skipping rule \
+                     evaluation this tick"
+                );
+                report.lease_unavailable = true;
+                false
+            }
+        };
+
+        if hold_lease {
+            // `rules` is moved out for the loop so `self` stays mutably
+            // borrowable for the write path; it is put back before returning.
+            let rules = std::mem::take(&mut self.rules);
+            for rule in &rules {
+                match self.evaluate_rule(rule, &mut latest, now_ns).await {
+                    Ok(written) => {
+                        report.rules_evaluated += 1;
+                        if written {
+                            report.records_written += 1;
+                        }
+                    }
+                    Err(err) => {
+                        report.rules_failed += 1;
+                        tracing::warn!(
+                            tenant = %self.tenant.to_hex(),
+                            rule_id = %rule.rule_id,
+                            error = %err,
+                            "alert evaluation: rule failed; retried next tick"
+                        );
                     }
                 }
-                Err(err) => {
-                    report.rules_failed += 1;
-                    tracing::warn!(
-                        tenant = %self.tenant.to_hex(),
-                        rule_id = %rule.rule_id,
-                        error = %err,
-                        "alert evaluation: rule failed; retried next tick"
-                    );
-                }
             }
+            self.rules = rules;
+        } else if !report.lease_unavailable {
+            report.lease_not_held = true;
+            tracing::debug!(
+                tenant = %self.tenant.to_hex(),
+                "alert evaluation: another replica holds the tenant lease; skipping rule \
+                 evaluation this tick"
+            );
         }
-        self.rules = rules;
 
         self.flush_sinks(&mut report).await;
         report
+    }
+
+    /// Try to own this tenant's alert lease for this tick (#387).
+    ///
+    /// Two replicas can be configured with the same rules for the same tenant.
+    /// Their folds are independent, so without coordination both evaluate every
+    /// tick, both write a transition record, and both notify it. This is a
+    /// lightweight object-store lease, not a general leader election: the
+    /// evaluator tries to own a small lease object under the tenant's alert
+    /// keyspace before it writes anything.
+    ///
+    /// Returns `Ok(true)` when this replica now holds the lease (it created it,
+    /// renewed its own, or took over an expired one), `Ok(false)` when a live
+    /// lease is held by a different replica or a takeover race was lost, and
+    /// `Err` only on an object-store failure.
+    ///
+    /// The lease is not a fencing token and does not make the record write
+    /// mutually exclusive at the store layer: alert records are still unique by
+    /// `(writer_id, epoch, seq)`, so a brief two-owner overlap during a handover
+    /// at worst duplicates a transition record and its at-least-once
+    /// notification, which the fold's `(ts_ns, epoch, seq)` tie-break already
+    /// tolerates and ADR-0043 decision 6 already permits. What it removes is the
+    /// steady-state case of two healthy replicas both firing every rule every
+    /// tick.
+    async fn acquire_lease(&self, now_ns: i64) -> anyhow::Result<bool> {
+        let key = alert_lease_key(&self.tenant);
+        let identity = self.writer_id.to_string();
+        let ttl_ns = i64::try_from(self.lease_ttl.as_nanos()).unwrap_or(i64::MAX);
+        let lease = AlertLease {
+            holder: identity.clone(),
+            expiry_ns: now_ns.saturating_add(ttl_ns),
+        };
+        let body = Bytes::from(serde_json::to_vec(&lease)?);
+
+        // Fast path: no lease object yet. `CreateIfAbsent` is atomic (ADR-0002),
+        // so at most one racing replica wins the create.
+        match self
+            .store
+            .put(&key, body.clone(), PutOptions::create_if_absent())
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(StoreError::AlreadyExists) => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        // A lease already exists. Read it: we may renew our own or take over one
+        // that has expired, but never displace a live lease held by a peer.
+        let current = self.store.get(&key, GetRange::Full).await?;
+        let existing: AlertLease = serde_json::from_slice(&current.data)?;
+        let held_by_other = existing.holder != identity;
+        if held_by_other && existing.expiry_ns > now_ns {
+            return Ok(false);
+        }
+
+        // Ours to renew, or expired and up for grabs. Version-guard the write so
+        // two replicas that both observe the same expired lease cannot both take
+        // it: exactly one CAS succeeds, the loser skips this tick.
+        match self
+            .store
+            .put(
+                &key,
+                body,
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(StoreError::PreconditionFailed) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Seeds `undelivered` from durable history, once, on the first tick that
@@ -461,6 +614,22 @@ impl AlertEvaluator {
             return Ok(false);
         }
 
+        // #385: guard against a backward wall-clock step (an NTP correction can
+        // move `now_ns` behind the prior record's `ts_ns`).
+        // `load_latest_records` orders records by `(ts_ns, epoch, seq)` with
+        // `ts_ns` first, so a record stamped at or before its predecessor sorts
+        // behind it and never becomes the folded "latest" -- the evaluator would
+        // then re-transition from the same stale state every tick instead of
+        // converging. Stamp the new record strictly after the prior one so the
+        // per-alert sequence is monotonic regardless of clock jitter. The
+        // transition decision above still uses the true `now_ns`; pending-
+        // duration elapse already clamps a backward step to zero, so only the
+        // durable stamp needs correcting here.
+        let stamp_ns = match prior.as_ref() {
+            Some(p) => now_ns.max(p.ts_ns.saturating_add(1)),
+            None => now_ns,
+        };
+
         let seq = self.next_seq;
         self.next_seq += 1;
         let identity = ObjectIdentity {
@@ -482,7 +651,7 @@ impl AlertEvaluator {
             &transition,
             prior.as_ref(),
             &[],
-            now_ns,
+            stamp_ns,
             RlogConfig::default(),
             identity,
         )?
@@ -494,7 +663,9 @@ impl AlertEvaluator {
         // then carries exactly the record that is about to become durable,
         // generation included, with no second computation to drift.
         let written = decode_single_record(&bytes)?;
-        self.publish(bytes, seq, now_ns).await?;
+        // Publish with the same corrected stamp so the commit record's event
+        // time matches the record's `ts_ns` (#385).
+        self.publish(bytes, seq, stamp_ns).await?;
 
         tracing::info!(
             tenant = %self.tenant.to_hex(),
@@ -624,14 +795,29 @@ impl AlertEvaluator {
         for meta in entries {
             let parsed = match keys::partition_bucket_entry(&meta.key)? {
                 keys::BucketEntry::CommitRecord(parsed) => parsed,
-                // Alerts are not a maintained signal today (see
-                // `maintain::MAINTAINED_SIGNALS`), so nothing writes a
-                // compaction record or a retention tombstone under this
-                // prefix. If something starts to, folding only the L0 records
-                // would silently lose history, so refuse rather than guess.
+                // #386: tolerate (skip) a compaction record rather than
+                // hard-erroring. Alerts are not a maintained signal today
+                // (`Signal::Alerts` is absent from `maintain::MAINTAINED_SIGNALS`),
+                // so nothing writes a `CompactionRecord` under this prefix yet.
+                // But the moment compaction is enabled for this signal, one will
+                // appear here, and a fold that bailed on it would hard-error
+                // every tick. Skip it so the fold keeps working from whatever L0
+                // `CommitRecord`s remain reachable.
+                //
+                // Scope note: this is only "does not crash". Once compaction is
+                // actually enabled for `Signal::Alerts`, the records folded into
+                // the L1 part this `CompactionRecord` names must be read from
+                // that part for full correctness. Reading L1 alert parts is out
+                // of scope here (no producer exists yet) and is deliberately left
+                // to the change that turns compaction on for this signal. See
+                // issue #386.
+                keys::BucketEntry::CompactionRecord(_) => continue,
+                // A retention tombstone (or any other shape) under the alerts
+                // commit prefix is still unexpected and a real signal of layout
+                // drift; refuse rather than guess.
                 other => anyhow::bail!(
                     "unexpected {other:?} under the alerts commit prefix; the evaluator folds \
-                     only L0 alert commit records"
+                     only L0 alert commit records and skips L1 compaction records"
                 ),
             };
             let commit = record::decode(&self.store.get(&meta.key, GetRange::Full).await?.data)?;
@@ -1179,5 +1365,395 @@ mod tests {
         let tasks = AlertEvalTasks::none();
         assert!(tasks.shutdown.is_empty());
         assert!(tasks.handles.is_empty());
+    }
+}
+
+/// Tick-level tests that need a real store, catalog, and `QueryEngine`: the
+/// backward-clock monotonic stamp (#385), the compaction-record tolerance in
+/// the fold (#386), and the cross-replica lease (#387). Kept apart from the
+/// pure parsing tests above because they pull in the ingest/segment/query
+/// stack; the seeding here mirrors `tests/alerting_e2e.rs`'s harness.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tick_tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId};
+
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    /// Half an hour past the epoch, inside the first ingest hour, exactly as the
+    /// e2e harness uses so `Catalog::resolve`'s listing window covers the seed.
+    const NOW_NS: i64 = 30 * 60 * NS_PER_SEC;
+    const METRIC: &str = "cpu_usage";
+    const TENANT: &str = "acme";
+
+    /// A clock a test moves by hand, forward or backward, to drive clock-skew
+    /// paths with no wall-clock sleep.
+    struct TestClock(AtomicI64);
+
+    impl TestClock {
+        fn at(now_ns: i64) -> Arc<TestClock> {
+            Arc::new(TestClock(AtomicI64::new(now_ns)))
+        }
+
+        fn set(&self, now_ns: i64) {
+            self.0.store(now_ns, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn label_set(metric: &str) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    /// Publish one real RSEG segment holding `metric` at `samples`, plus its
+    /// commit record, for `tenant`. Mirrors the e2e harness.
+    async fn publish_metric(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        samples: &[(i64, f64)],
+    ) {
+        let tenant_hash = tenant.hash();
+        let labels = label_set(METRIC);
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, METRIC, &labels).expect("series id"),
+            labels,
+            samples: samples
+                .iter()
+                .map(|(ts_ns, value)| Sample {
+                    ts_ns: *ts_ns,
+                    value: *value,
+                })
+                .collect(),
+        }];
+        let writer_id = Uuid::from_u128(9_001);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// A store seeded with one series at 1.0 (above the rule threshold 0.9)
+    /// shortly before `NOW_NS`.
+    async fn seeded_store() -> Arc<dyn ObjectStoreBackend> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        publish_metric(store.as_ref(), &tenant, &[(NOW_NS - 30 * NS_PER_SEC, 1.0)]).await;
+        store
+    }
+
+    fn threshold_rule() -> Rule {
+        Rule {
+            rule_id: "high-cpu".to_string(),
+            query: RuleQuery::Promql(METRIC.to_string()),
+            condition: RuleCondition::Threshold {
+                op: ThresholdOp::Gt,
+                threshold: 0.9,
+            },
+            labels: vec![("severity".to_string(), "page".to_string())],
+            annotations: vec![("summary".to_string(), "cpu is hot".to_string())],
+            for_duration: None,
+            max_alert_generation: None,
+        }
+    }
+
+    /// Build an evaluator over `store`, sharing `clock` so a test can move time.
+    /// Each call mints a fresh `writer_id`, so two evaluators over one store are
+    /// two distinct "replicas" for the lease test.
+    fn evaluator(store: Arc<dyn ObjectStoreBackend>, clock: Arc<TestClock>) -> AlertEvaluator {
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
+        let config = AlertEvalConfig {
+            enabled: true,
+            ..AlertEvalConfig::default()
+        };
+        AlertEvaluator::new(
+            store,
+            AlertQueryEngines {
+                promql: Arc::new(engine),
+                #[cfg(feature = "sql")]
+                sql: None,
+            },
+            clock,
+            TenantId::new(TENANT).hash(),
+            vec![threshold_rule()],
+            &config,
+        )
+        .expect("build evaluator")
+    }
+
+    /// Every alert record this tenant has, read through its commit records and
+    /// sorted by `ts_ns`, exactly as any reader would.
+    async fn read_alert_records(
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+    ) -> Vec<AlertRecord> {
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let cfg = RlogConfig::default();
+        let mut out = Vec::new();
+        for meta in list_all(store, &prefix).await.expect("list") {
+            // Skip anything that is not an L0 commit record (e.g. the #386
+            // compaction-record test injects one under this prefix).
+            if !matches!(
+                keys::partition_bucket_entry(&meta.key).expect("classify"),
+                keys::BucketEntry::CommitRecord(_)
+            ) {
+                continue;
+            }
+            let commit = record::decode(
+                &store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get commit")
+                    .data,
+            )
+            .expect("decode commit");
+            let data_key = keys::verify_object_key(&commit).expect("object key");
+            let object = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data");
+            let reader = RlogReader::new(&object.data, &cfg).expect("open rlog");
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            for row in &rows {
+                out.push(AlertRecord::from_log_record(row).expect("decode alert record"));
+            }
+        }
+        out.sort_by_key(|r| r.ts_ns);
+        out
+    }
+
+    /// #385: a backward wall-clock step between ticks must still produce a
+    /// strictly-increasing `ts_ns`, and the evaluator must converge rather than
+    /// re-transition from stale state every tick. The instant query sees the
+    /// seed at `NOW`, then a clock stepped behind the seed empties the vector so
+    /// the condition clears and the alert resolves -- and that resolve must be
+    /// stamped after the firing record it supersedes, or the fold would keep
+    /// picking the firing record and re-resolve forever.
+    #[tokio::test]
+    async fn a_backward_clock_step_keeps_ts_ns_monotonic_and_converges() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        // Tick 1 at NOW: fires.
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "onset fires");
+        let firing = &read_alert_records(store.as_ref(), tenant).await[0];
+        assert_eq!(firing.state, AlertState::Firing);
+        assert_eq!(firing.ts_ns, NOW_NS);
+        let firing_ts = firing.ts_ns;
+
+        // Clock steps 100s behind NOW. The only sample now sits in the future
+        // relative to the query instant, so the instant vector empties and the
+        // condition clears: this tick resolves.
+        let stepped_back = NOW_NS - 100 * NS_PER_SEC;
+        clock.set(stepped_back);
+        assert_eq!(
+            evaluator.run_tick().await.records_written,
+            1,
+            "the cleared condition resolves even under a backward clock step"
+        );
+
+        let records = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(records.len(), 2, "firing then resolved");
+        let resolved = records
+            .iter()
+            .find(|r| r.state == AlertState::Resolved)
+            .expect("a resolved record");
+        assert!(
+            resolved.ts_ns > firing_ts,
+            "the resolved record must be stamped strictly after the firing record it \
+             supersedes (got resolved ts {} vs firing ts {}), even though the wall clock \
+             stepped back to {}",
+            resolved.ts_ns,
+            firing_ts,
+            stepped_back
+        );
+        assert_eq!(
+            resolved.ts_ns,
+            firing_ts + 1,
+            "the corrected stamp is exactly prior.ts_ns + 1 when now_ns is behind it"
+        );
+
+        // Tick 3, clock still behind: the fold must land on the resolved record
+        // (greatest ts), so the still-cleared condition writes nothing. Without
+        // the fix the fold would keep picking the firing record and resolve
+        // again every tick -- an infinite re-transition loop.
+        assert_eq!(
+            evaluator.run_tick().await.records_written,
+            0,
+            "the evaluator converges: no re-transition once resolved is the folded latest"
+        );
+        assert_eq!(
+            read_alert_records(store.as_ref(), tenant).await.len(),
+            2,
+            "history is unchanged; no runaway resolve records"
+        );
+    }
+
+    /// #386: `load_latest_records` must skip a `CompactionRecord` under the
+    /// alerts commit prefix instead of erroring. Constructed directly in the
+    /// store: today nothing produces one, so this is forward-compatible
+    /// groundwork for when compaction is enabled for `Signal::Alerts`.
+    #[tokio::test]
+    async fn load_latest_records_skips_a_compaction_record() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        // A validly-shaped L1 compaction record key under the alerts commit
+        // prefix. The fold classifies it by key shape and skips before ever
+        // reading the object, so the body is irrelevant.
+        let key = keys::compaction_record_key(
+            &tenant,
+            Signal::Alerts,
+            ALERT_SHARD,
+            0,
+            "0123456789abcdef",
+        )
+        .expect("compaction record key");
+        store
+            .put(&key, Bytes::from_static(b"unused"), PutOptions::default())
+            .await
+            .expect("put compaction record");
+
+        let evaluator = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let latest = evaluator
+            .load_latest_records()
+            .await
+            .expect("a compaction record is skipped, not an error");
+        assert!(
+            latest.is_empty(),
+            "no commit records remain once the compaction record is skipped"
+        );
+    }
+
+    /// #387: two evaluator instances (two "replicas") over the same store,
+    /// evaluating the same tick, must not both fire and write. The lease holder
+    /// writes the transition; the other finds a live lease held by a different
+    /// identity and skips evaluation entirely.
+    #[tokio::test]
+    async fn only_the_lease_holder_writes_when_two_replicas_evaluate_one_tick() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+
+        let mut a = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        let mut b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        let a_report = a.run_tick().await;
+        let b_report = b.run_tick().await;
+
+        assert_eq!(
+            a_report.records_written, 1,
+            "the lease holder fires the transition"
+        );
+        assert!(!a_report.lease_not_held, "replica a holds the lease");
+
+        assert_eq!(
+            b_report.records_written, 0,
+            "the replica without the lease does not write"
+        );
+        assert!(
+            b_report.lease_not_held,
+            "replica b saw a live lease held by replica a and skipped evaluation"
+        );
+
+        assert_eq!(
+            read_alert_records(store.as_ref(), tenant).await.len(),
+            1,
+            "exactly one transition record exists across both replicas"
+        );
+    }
+
+    /// #387: once the holder's lease expires, a second replica takes it over and
+    /// then evaluates. Proves the lease is a lease, not a permanent lock: a dead
+    /// holder does not block a tenant forever.
+    #[tokio::test]
+    async fn a_second_replica_takes_over_an_expired_lease() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+
+        let a = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        let b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        // a acquires; b is blocked while a's lease is live.
+        assert!(a.acquire_lease(NOW_NS).await.expect("a acquires"));
+        assert!(
+            !b.acquire_lease(NOW_NS).await.expect("b blocked"),
+            "b cannot take a live lease held by a"
+        );
+
+        // Past a's lease lifetime (LEASE_TTL_TICKS * default interval), b takes
+        // over; a, now the non-holder, is in turn blocked by b's fresh lease.
+        let past_expiry = NOW_NS
+            + (LEASE_TTL_TICKS as i64) * DEFAULT_ALERT_EVAL_INTERVAL.as_nanos() as i64
+            + NS_PER_SEC;
+        assert!(
+            b.acquire_lease(past_expiry).await.expect("b takes over"),
+            "b takes over once a's lease has expired"
+        );
+        assert!(
+            !a.acquire_lease(past_expiry).await.expect("a now blocked"),
+            "a no longer holds the lease after b took it over"
+        );
     }
 }
