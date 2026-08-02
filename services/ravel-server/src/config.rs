@@ -745,7 +745,9 @@ pub mod limits {
     fn to_count_limit(v: LimitValue, field: &str, context: &str) -> anyhow::Result<CountLimit> {
         match v {
             LimitValue::Unlimited => Ok(CountLimit::Unlimited),
-            LimitValue::Bounded(n) => Ok(CountLimit::Bounded(validate_positive(n, field, context)?)),
+            LimitValue::Bounded(n) => {
+                Ok(CountLimit::Bounded(validate_positive(n, field, context)?))
+            }
         }
     }
 
@@ -893,8 +895,8 @@ pub mod limits {
                 [defaults]
                 max_active_series = 0
             "#;
-            let err = parse_limits_file(text)
-                .expect_err("a zero count cap is not a meaningful limit");
+            let err =
+                parse_limits_file(text).expect_err("a zero count cap is not a meaningful limit");
             assert!(err.to_string().contains("max_active_series"));
         }
 
