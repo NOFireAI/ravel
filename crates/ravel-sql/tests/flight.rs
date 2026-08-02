@@ -38,7 +38,7 @@ use datafusion::arrow::array::RecordBatch;
 use futures::StreamExt;
 use prost::Message;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::fault::{FaultPlan, Occurrence, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{FlightClock, FlightSqlConfig, FlightTicket, RavelFlightSqlService};
 use tonic::Request;
@@ -206,6 +206,7 @@ async fn the_ticket_deadline_is_bounded_by_the_gc_protection_horizon() {
             gc_protection_horizon: Duration::from_secs(5),
             ..FlightSqlConfig::default()
         },
+        Arc::clone(&harness.store),
     );
 
     let ticket = harness
@@ -299,6 +300,7 @@ async fn do_get_bounds_a_stalled_read_to_the_gc_horizon_not_the_tickets_own_dead
             gc_protection_horizon: Duration::from_millis(50),
             ..FlightSqlConfig::default()
         },
+        Arc::clone(&harness.store),
     );
 
     let ticket = harness
@@ -612,5 +614,191 @@ async fn a_write_statement_is_rejected_before_any_catalog_work() {
         store.total_ops(),
         before,
         "a rejected statement must cost no store operation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Query audit (ADR-0042 decision 4, issue #395)
+// ---------------------------------------------------------------------------
+//
+// A statement executed over Flight SQL must leave the same durable, unforgeable
+// query-audit trail an HTTP `POST /api/v1/sql` request leaves. These mirror the
+// `a_successful_query_writes_one_ok_audit_record` family in
+// services/ravel-server/tests/sql_endpoint.rs: read the written record straight
+// back off the store and assert its tenant, text, and status.
+
+/// Read back every query-audit record written to `tenant`'s audit shard, the
+/// same round trip the writer's own tests in ravel-maintain use.
+async fn read_query_audit(
+    store: &dyn ObjectStoreBackend,
+    tenant: &ravel_types::TenantHash,
+) -> Vec<ravel_logseg::LogRecord> {
+    use ravel_commit::{keys, record};
+    use ravel_logseg::{Predicate, RlogConfig, RlogReader};
+    use ravel_object_store::{GetRange, list_all};
+    use ravel_types::Signal;
+
+    let prefix =
+        keys::commit_shard_prefix(tenant, Signal::Audit, ravel_maintain::QUERY_AUDIT_SHARD)
+            .expect("audit shard prefix");
+    let metas = list_all(store, &prefix).await.expect("list audit shard");
+    let cfg = RlogConfig::default();
+    let mut out = Vec::new();
+    for meta in metas {
+        let got = store
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get commit record");
+        let commit = record::decode(&got.data).expect("decode commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("reconstruct data key");
+        let object = store
+            .get(&data_key, GetRange::Full)
+            .await
+            .expect("get audit object");
+        let reader = RlogReader::new(object.data.as_ref(), &cfg).expect("rlog reader");
+        let (rows, _stats) = reader
+            .scan(&Predicate::And(Vec::new()))
+            .expect("scan audit object");
+        out.extend(rows);
+    }
+    out
+}
+
+/// One string-valued attr off a decoded audit record, or `None`.
+fn str_attr<'a>(row: &'a ravel_logseg::LogRecord, key: &str) -> Option<&'a str> {
+    row.attrs.iter().find(|(k, _)| k == key).and_then(|(_, v)| {
+        if let ravel_logseg::AttrValue::Str(s) = v {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    })
+}
+
+/// A successful Flight statement execution writes exactly one `ok` query-audit
+/// record, attributed to the resolved tenant, carrying the statement text
+/// verbatim. This is the transport-level analogue of
+/// `a_successful_query_writes_one_ok_audit_record` on the HTTP endpoint.
+#[tokio::test]
+async fn a_successful_flight_statement_writes_one_ok_audit_record() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    let batches = harness.do_get("acme", &ticket).await.expect("do get");
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert!(rows > 0, "the fixture must produce rows");
+
+    // Exactly one record: `GetFlightInfo` only plans (it writes no audit), and
+    // the single `DoGet` executes the statement once.
+    let audit = read_query_audit(harness.store.as_ref(), &tenant.hash()).await;
+    assert_eq!(
+        audit.len(),
+        1,
+        "one executed statement writes exactly one audit record"
+    );
+    let row = &audit[0];
+    assert_eq!(str_attr(row, "kind"), Some("query"));
+    assert_eq!(str_attr(row, "query.language"), Some("sql"));
+    assert_eq!(
+        str_attr(row, "query.tenant"),
+        Some(tenant.hash().to_hex().as_str()),
+        "the record is attributed to the resolved tenant"
+    );
+    assert_eq!(str_attr(row, "query.status"), Some("ok"));
+    assert_eq!(str_attr(row, "query.text"), Some(QUERY));
+    assert_eq!(row.severity_text, "INFO");
+}
+
+/// A statement that plans cleanly at `GetFlightInfo` but fails at `DoGet` (its
+/// pinned segments have vanished) still writes exactly one audit record, with
+/// `status = error`. The fault targets only metric L0 segment reads (`/m/l0/`),
+/// so snapshot resolution and the audit read-back both work: only the scan
+/// fails, which is what turns a planned statement into a failed execution.
+#[tokio::test]
+async fn a_failed_flight_statement_writes_a_status_error_audit_record() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+            .with_key_contains("/m/l0/")
+            .with_occurrence(Occurrence::Always),
+    );
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(ravel_object_store::fault::FaultStore::new(
+        MemoryStore::new(),
+        plan,
+    ));
+    let harness = Harness::build(store, &[(&tenant, &seg_specs)]).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info plans without touching segments");
+    let status = harness
+        .do_get("acme", &ticket)
+        .await
+        .expect_err("a permanently missing segment fails execution");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+
+    let audit = read_query_audit(harness.store.as_ref(), &tenant.hash()).await;
+    assert_eq!(audit.len(), 1, "a failed statement is audited too");
+    assert_eq!(str_attr(&audit[0], "query.status"), Some("error"));
+    assert_eq!(str_attr(&audit[0], "query.text"), Some(QUERY));
+    assert_eq!(audit[0].severity_text, "ERROR");
+}
+
+/// An audit-write failure never turns a successful Flight query into an error
+/// response. The fault fails every PUT under the audit signal path (`/u/`), so
+/// the audit record cannot be written, but the query itself (all reads) still
+/// streams its rows back to the client unaffected. This is the transport-level
+/// analogue of the HTTP endpoint's failure-isolation discipline.
+#[tokio::test]
+async fn an_audit_write_failure_does_not_fail_the_flight_response() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("audit store unavailable".to_string()),
+        )
+        .with_key_contains("/u/")
+        .with_occurrence(Occurrence::Always),
+    );
+    let store = Arc::new(ravel_object_store::fault::FaultStore::new(
+        MemoryStore::new(),
+        plan,
+    ));
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let harness = Harness::build(backend, &[(&tenant, &seg_specs)]).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    // The client's query succeeds and returns its rows, even though the audit
+    // write below it cannot land.
+    let batches = harness
+        .do_get("acme", &ticket)
+        .await
+        .expect("the query response is unaffected by the audit-write failure");
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert!(rows > 0, "the client still receives its result rows");
+
+    // Prove the fault actually fired against the audit write, not that the path
+    // was simply never taken.
+    assert!(
+        store.fault_count(Op::Put, FaultKind::Permanent) >= 1,
+        "the audit write must have attempted a PUT and been faulted"
+    );
+    // And the record genuinely did not land: the trail is incomplete for this
+    // request, which is the loudly-logged, swallowed outcome.
+    let audit = read_query_audit(harness.store.as_ref(), &tenant.hash()).await;
+    assert!(
+        audit.is_empty(),
+        "the faulted audit write leaves no record behind"
     );
 }

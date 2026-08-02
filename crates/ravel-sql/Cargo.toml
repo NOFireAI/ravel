@@ -16,6 +16,15 @@ ravel-catalog = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
+# The query-audit writer (ADR-0042 decision 4, issue #395). The Flight SQL
+# statement path writes one `Signal::Audit` record per executed statement
+# through `ravel_maintain::write_query_audit`, the same writer the HTTP
+# `POST /api/v1/sql` endpoint uses, so a tenant's Flight query activity is
+# durably logged and cannot be forged or suppressed. Optional, pulled in only
+# with `flight-sql`: the audit hook lives in the `flight` module, which that
+# feature gates. ravel-maintain does not depend on ravel-sql, so this adds no
+# dependency cycle.
+ravel-maintain = { workspace = true, optional = true }
 # The `logs` table (issue #239) uses the RLOG record/predicate/tokenizer types
 # directly (Predicate, FieldSel, LogRecord, AttrValue, tokenizer::tokens);
 # ravel-query re-exports the LogSegmentFetcher surface but not these logseg
@@ -105,6 +114,7 @@ flight-sql = [
     "dep:tracing",
     "dep:blake3",
     "dep:rand",
+    "dep:ravel-maintain",
 ]
 
 [dev-dependencies]
