@@ -37,21 +37,31 @@ pub async fn handle_export_traces(
     ingest_ts_ns: i64,
 ) -> Result<SpanIngestOutcome, SpanWriteError> {
     let normalized = normalize_traces(request, &state.limits, ingest_ts_ns);
-    let rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    // `rejected_spans` counts only spans that never reached storage. An
+    // attribute-level rejection (one oversized/malformed attribute, an
+    // over-long events/links blob, a bad parent_span_id) drops a single field
+    // of a span that still lands, and `SpanRejection::rejected_count` returns 0
+    // for it, so it does not inflate this total (#364).
+    let rejected_spans: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
     let receipt = state
         .router
         .write(tenant, normalized.spans, mode, state.ack_deadline)
         .await?;
 
-    let partial_success = if rejected_count > 0 {
+    // Emit partial-success whenever anything was rejected, not only when a
+    // whole span was lost: an attribute-only drop must still be surfaced to the
+    // sender through `error_message`, with `rejected_spans` reported as 0 (the
+    // OTLP-sanctioned warning channel). Gating on the span count instead would
+    // silently swallow attribute drops on an otherwise clean request.
+    let partial_success = if normalized.rejected.is_empty() {
+        None
+    } else {
         let error_message = build_error_message(&normalized.rejected);
         Some(ExportTracePartialSuccess {
-            rejected_spans: rejected_count as i64,
+            rejected_spans: rejected_spans as i64,
             error_message,
         })
-    } else {
-        None
     };
 
     Ok(SpanIngestOutcome {
@@ -204,16 +214,105 @@ mod tests {
             .response
             .partial_success
             .expect("one attribute rejected");
-        assert_eq!(partial_success.rejected_spans, 1);
+        assert_eq!(
+            partial_success.rejected_spans, 0,
+            "the span landed; only one attribute was dropped, so no span was rejected (#364)"
+        );
         assert!(
             partial_success.error_message.contains("attribute value is"),
-            "got: {}",
+            "the attribute drop is still surfaced through error_message: {}",
             partial_success.error_message
         );
         assert_eq!(
             outcome.tokens.len(),
             1,
             "the span itself is admitted, so one shard commits"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_bad_attribute_among_several_spans_rejects_zero_spans() {
+        // N spans exported, exactly one attribute on one of them oversized: the
+        // reported rejected_spans must be 0 because every span still lands, while
+        // the attribute drop is still surfaced through error_message (#364).
+        let state = state();
+        let oversized = SpanIngestLimits::default().max_attribute_value_len + 1;
+        let request = request(vec![
+            span("GET /checkout", vec![string_kv("ok", "v")]),
+            span("GET /cart", vec![string_kv("huge", &"x".repeat(oversized))]),
+            span("GET /pay", vec![string_kv("ok", "v")]),
+        ]);
+
+        let outcome = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request,
+            1_000,
+        )
+        .await
+        .expect("strict write publishes");
+
+        assert_eq!(
+            outcome.tokens.len(),
+            1,
+            "all three spans are admitted, so one shard commits"
+        );
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the dropped attribute is reported");
+        assert_eq!(
+            partial_success.rejected_spans, 0,
+            "no span was lost, only one attribute"
+        );
+        assert!(
+            partial_success.error_message.contains("attribute value is"),
+            "got: {}",
+            partial_success.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_span_rejection_among_clean_spans_still_counts_one() {
+        // Guard against undercounting: a genuine whole-span rejection (inverted
+        // time range) mixed with clean spans must still report rejected_spans == 1.
+        let state = state();
+        let mut inverted = span("inverted", Vec::new());
+        inverted.start_time_unix_nano = 5_000;
+        inverted.end_time_unix_nano = 1_000;
+        let request = request(vec![
+            span("GET /checkout", vec![string_kv("k", "v")]),
+            inverted,
+        ]);
+
+        let outcome = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request,
+            1_000,
+        )
+        .await
+        .expect("strict write publishes");
+
+        assert_eq!(
+            outcome.tokens.len(),
+            1,
+            "the one valid span still commits on its shard"
+        );
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the inverted span is rejected");
+        assert_eq!(
+            partial_success.rejected_spans, 1,
+            "the whole-span rejection still counts as one lost span"
+        );
+        assert!(
+            partial_success.error_message.contains("before it starts"),
+            "got: {}",
+            partial_success.error_message
         );
     }
 
@@ -287,13 +386,20 @@ mod tests {
                 .await
                 .expect("strict write publishes");
         assert_eq!(outcome.tokens.len(), 1, "the span still commits");
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the dropped attribute is reported");
         assert_eq!(
-            outcome
-                .response
-                .partial_success
-                .expect("the attribute is reported")
-                .rejected_spans,
-            1
+            partial_success.rejected_spans, 0,
+            "the array-valued resource attribute costs one attribute, not the span (#364)"
+        );
+        assert!(
+            partial_success
+                .error_message
+                .contains("nested array or map"),
+            "the attribute drop is still surfaced through error_message: {}",
+            partial_success.error_message
         );
     }
 
