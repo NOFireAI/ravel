@@ -197,12 +197,37 @@ grace` and `grace` (default 24 h) are shared across all four rules.
   records lost out-of-band, not routine cleanup: the same physical delete
   that is safe for a handful of true orphans would be permanent data loss
   if applied to a shard whose commit records vanished by accident. A
-  tripped pass deletes nothing and halts; the halt is sticky, with no
-  auto-resume -- every subsequent pass re-evaluates the same shard and
-  trips again until either the candidate count falls back below threshold
-  (the commit records are restored) or an operator deliberately overrides
-  it via `CompactorConfig::force_orphan_gc`, a one-shot flag the server
-  itself never sets. The other two sweep rules are unaffected by a tripped
+  tripped pass deletes nothing and halts, but the halt is not a latch on
+  the underlying loss: the predicate is recomputed from live counts on
+  every pass, with no memory of a prior trip, so a shard can stop tripping
+  while the missing commit records are still missing. Two distinct
+  mechanisms produce this: dilution, where new well-recorded writes to the
+  same shard lower the orphan ratio below `orphan_breaker_max_ratio` even
+  though the orphan count itself hasn't changed (55 orphans among 500
+  objects trips at 11%; 200 further writes with no data loss give 55/700 =
+  7.9%, which does not trip, and the 55 still-orphaned objects are
+  deleted); and partial restoration, where an operator restores some but
+  not all of the missing records and the remaining candidate count crosses
+  below `orphan_breaker_min_count` (55 orphans trips; restoring 6 leaves
+  49 candidates, under the default floor of 50, so the pass stops tripping
+  and deletes the other 49 before they were restored). An operator relying
+  on the breaker to hold a shard open until every missing record is back
+  is relying on a guarantee the code does not provide: the only durable
+  way to stop deletion is to restore records (or use
+  `CompactorConfig::force_orphan_gc` deliberately in the other direction,
+  see below) before the next pass runs, not to assume the trip persists.
+  The breaker also has three scope limits, tracked as open gaps in issue
+  #500 rather than fixed by design: it evaluates one (tenant, signal,
+  shard) in isolation, with no cross-shard or cross-tenant aggregation, so
+  loss spread thin across many shards can stay under every shard's
+  threshold; it never trips below `orphan_breaker_min_count` regardless of
+  ratio, so small-shard total loss is always deletable; and because it
+  only trips once the ratio exceeds `orphan_breaker_max_ratio` (10%), up
+  to that fraction of a large shard's objects is deletable in a single
+  pass without ever tripping. An operator can still deliberately force a
+  pass through a trip via
+  `CompactorConfig::force_orphan_gc`, a one-shot flag the server itself
+  never sets. The other two sweep rules are unaffected by a tripped
   orphan breaker and still run, since they are anchored on durable records
   an operator or compactor deliberately wrote, never on record absence.
 - Superseded-input and unreferenced-part deletion never depend on reader
