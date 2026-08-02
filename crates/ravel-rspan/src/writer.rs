@@ -316,8 +316,18 @@ mod tests {
         assert_eq!(footer.max_trace_id, [3u8; 16]);
     }
 
+    /// `finish_compacted` stamps the caller's compaction identity, shares its
+    /// section bodies byte-for-byte with a plain `finish` of the same records,
+    /// and -- the property RSPAN compaction crash-recovery convergence depends
+    /// on (rspan_codec.rs, plan Section 3.4) -- reproduces byte-identical
+    /// *whole-object* bytes when the same inputs and identity are compacted
+    /// again from scratch. That last property is what a crashed run does on
+    /// retry: it rebuilds the L1 part and republishes it under a
+    /// content-addressed CreateIfAbsent key computed over the whole part, so
+    /// the retry converges only if every byte (footer and trailer included, not
+    /// just the shared section bodies) reproduces exactly.
     #[test]
-    fn finish_compacted_stamps_identity_and_shares_body_with_finish() {
+    fn finish_compacted_stamps_identity_shares_body_and_is_rebuild_stable() {
         let build = |records: &[SpanRecord]| {
             let mut w = RspanWriter::new(RspanConfig::default(), identity());
             for r in records {
@@ -349,5 +359,21 @@ mod tests {
             let range = |o: u64, l: u64| (o as usize)..((o + l) as usize);
             assert_eq!(&l0[range(s.offset, s.len)], &l1[range(s.offset, s.len)]);
         }
+
+        // Crash-recovery convergence: an independent rebuild from the same
+        // records and the same compaction identity -- exactly what a crashed
+        // compaction does when it is retried from scratch -- must yield
+        // byte-identical whole-object bytes, footer and trailer included, so the
+        // retry's content-addressed part key matches the original and the
+        // republish converges instead of forking a divergent part. The
+        // section-body checks above stop short of this: they never compare the
+        // trailing footer/trailer bytes across a second finish_compacted call.
+        let l1_rebuild = build(&records)
+            .finish_compacted(1, hash.clone(), 2)
+            .expect("finish_compacted rebuild");
+        assert_eq!(
+            l1, l1_rebuild,
+            "finish_compacted must reproduce byte-identical whole-object bytes on rebuild"
+        );
     }
 }
