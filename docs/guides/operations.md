@@ -30,6 +30,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--maintain-interval-secs <n>` | | `300` | Used only in `--mode maintain`. How often each tenant's maintenance task wakes to run retention, compaction, and the sweeper over every shard of both signals. |
 | `--retention-default <duration>` | | none | Used only in `--mode maintain`. The default age-based retention window applied to every tenant with no explicit override, as a humantime duration (`30d`, `720h`). Omitted means no default retention: nothing is age-deleted unless a per-tenant window is set. It is validated at startup against the ADR-0019 floor; a window below the floor fails startup rather than being clamped. |
 | `--retention-tenant TENANT=DURATION` | | none, repeatable | Used only in `--mode maintain`. The per-tenant retention window; it overrides `--retention-default` for that tenant. Parsed with `humantime::parse_duration`. Same below-floor validation. |
+| `--limits-file <path>` | | none (shipped defaults) | TOML admission-limits file (ADR-0051 section 3): `[defaults]` plus per-tenant `[tenants.<id>]` overrides. Parsed and validated at startup; an unparseable file, an unknown key, or a nonsensical limit (zero, or a burst set with no rate to pair it with) fails startup rather than falling back to defaults. See "Admission limits file" below. |
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (through
 flag or env) fails at startup with an explicit error that names the missing
@@ -41,6 +42,72 @@ are `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY`, above; use those.
 `allow_http` and `force_path_style` are not configurable at all. The code
 derives `allow_http` from whether `--s3-endpoint` is set, and it always passes
 `force_path_style: true`.
+
+## Admission limits file
+
+`--limits-file` (ADR-0051 section 3) points at a TOML file with a
+`[defaults]` table and zero or more `[tenants.<id>]` override tables. Every
+field is optional and independently overridable; a `[tenants.<id>]` table
+only needs to name the fields that differ from `[defaults]`, which itself
+only needs to name the fields that differ from the shipped defaults below.
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `max_active_series` | Exact cap on concurrently active metric series for the tenant. |
+| `max_active_streams` | Exact cap on concurrently active log streams for the tenant. |
+| `ingest_bytes_per_sec` / `ingest_byte_burst` | Token-bucket rate and burst for ingested bytes. |
+| `series_creation_rate_per_sec` / `series_creation_burst` | Token-bucket rate and burst for new-series/new-stream creation. |
+
+Any of the four count/rate fields (not the two burst-only fields) accepts
+the literal string `"unlimited"` instead of a number, to opt a tenant out of
+that cap entirely. With no `--limits-file` at all, every tenant gets the
+shipped defaults with no override.
+
+Validation is fail-closed: the process refuses to start, rather than
+silently keeping shipped defaults, on any of:
+
+- a file that is not valid TOML;
+- an unknown key in `[defaults]` or any `[tenants.<id>]` table;
+- an empty tenant id (`[tenants.""]`);
+- a count or rate of zero, or a negative number;
+- a burst set without the rate it belongs to (or vice versa), when the
+  underlying rate is `unlimited` and there is nothing to pair the burst
+  with;
+- a burst set alongside `unlimited` for the same rate in the same table.
+
+### Shipped defaults and their memory cost
+
+```
+max_active_series            = 200000
+max_active_streams           = 200000
+ingest_bytes_per_sec         = 33554432   (32 MiB/s)
+ingest_byte_burst            = 67108864   (64 MiB)
+series_creation_rate_per_sec = 10000
+series_creation_burst        = 100000
+```
+
+The rate defaults match ADR-0051 section 3. The two active-count caps do
+not: the ADR sets both at 1,000,000, sized against an assumed ~16 bytes per
+tracked entry. Issue #491 measured the actual `HashSet` entry cost (hashbrown
+slot overhead, power-of-two table sizing at 7/8 load, allocator headroom) at
+35-56 bytes, a 2-4x underestimate. `AdmissionController` tracks each of
+active series and active streams in a two-epoch rotating set
+(`ACTIVE_EPOCH_NS`), so both epochs' sets can be live at once. Worst-case
+resident memory for one fully active tenant is:
+
+```
+cap × bytes_per_entry × 2 epochs × 2 signals (series + streams)
+```
+
+At the ADR's original 1,000,000/1,000,000 caps this is 1,000,000 × 35-56 ×
+2 × 2 = 140-224 MiB per fully active tenant. At the 200,000/200,000 caps
+shipped here it is 200,000 × 35-56 × 2 × 2 = 28-45 MiB per fully active
+tenant, roughly a fifth. Ten simultaneously fully active tenants at the
+shipped defaults is therefore 280-450 MiB worst case; at the ADR's original
+caps it would have been 1.4-2.2 GiB. Operators who need a higher per-tenant
+active-series ceiling can still set it explicitly in `[tenants.<id>]`
+(or `unlimited`), sized against this same formula.
 
 ## `ravel-cli` flags
 
