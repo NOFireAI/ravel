@@ -336,6 +336,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
     };
     let running = ravel_server::start(config, store_dyn)
         .await
@@ -443,6 +444,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
     };
     let running = ravel_server::start(config, store_dyn)
         .await

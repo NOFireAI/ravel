@@ -90,6 +90,11 @@ pub struct ServerConfig {
     /// of `fold_tenants`. Spawned only in the modes that build a query engine
     /// ([`Mode::All`] and [`Mode::Query`]); `enabled` gates it.
     pub alerting: AlertEvalConfig,
+    /// JWKS refresh inputs for the OIDC tenant resolver (ADR-0042 decision 6),
+    /// `Some` only when `--oidc-issuer`/`--oidc-jwks-url` are configured. When
+    /// present, [`start`] does one blocking refresh (failing startup if it
+    /// fails) before marking the server ready, then spawns the periodic task.
+    pub oidc_refresh: Option<tenant::OidcRefreshParams>,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -107,6 +112,7 @@ pub struct Running {
     fold_tasks: fold::FoldTasks,
     maintenance_tasks: maintain::MaintenanceTasks,
     alert_tasks: alerting::AlertEvalTasks,
+    jwks_refresh_task: tenant::JwksRefreshTask,
 }
 
 impl Running {
@@ -162,6 +168,7 @@ impl Running {
         self.fold_tasks.shutdown().await;
         self.maintenance_tasks.shutdown().await;
         self.alert_tasks.shutdown().await;
+        self.jwks_refresh_task.shutdown().await;
 
         Ok(())
     }
@@ -456,6 +463,27 @@ pub async fn start(
         (None, None, None)
     };
 
+    // OIDC readiness gate (ADR-0042 decision 6): when OIDC is enabled, do one
+    // blocking JWKS fetch here and refuse to start if it fails, rather than
+    // serving with an empty key cache that would reject every OIDC request with
+    // no explanation. This is cheap within the existing readiness pattern: one
+    // await before `mark_ready`, then the periodic refresh runs in the
+    // background. A gateway/query/maintain process alike honors it; the resolver
+    // chain is shared across every mode.
+    let jwks_refresh_task = match config.oidc_refresh {
+        Some(params) => {
+            params.cache.refresh(&params.jwks_url).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "initial JWKS fetch from {} failed; refusing to start: {e}",
+                    params.jwks_url
+                )
+            })?;
+            tracing::info!(jwks_url = %params.jwks_url, "OIDC JWKS loaded; starting refresh task");
+            tenant::spawn_jwks_refresh(params)
+        }
+        None => tenant::JwksRefreshTask::none(),
+    };
+
     // Startup is complete: config was parsed and the capability gate passed
     // before `start` was entered (see `store::build_store`), and both
     // listeners this mode binds are now bound (HTTP above; gRPC just above
@@ -478,5 +506,6 @@ pub async fn start(
         fold_tasks,
         maintenance_tasks,
         alert_tasks,
+        jwks_refresh_task,
     })
 }

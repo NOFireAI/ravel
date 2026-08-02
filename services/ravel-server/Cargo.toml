@@ -116,6 +116,11 @@ ravel-segment = { workspace = true }
 # keeps cargo-deny from counting it as a wildcard).
 ravel-rspan = { path = "../../crates/ravel-rspan", version = "0.1.0" }
 uuid = { workspace = true }
+# Real-authn end-to-end test (tests/real_authn_e2e.rs): mint a JWT and build a
+# local oct (HMAC) JWKS so the OIDC resolver runs through a real HTTP request
+# with no network. base64url-encodes the signing secret into the JWK.
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
 # Test-only: decodes the Arrow IPC response. This is the workspace arrow pin
 # (59), not the arrow 58 datafusion carries, so the assertion doubles as a
 # check that the IPC bytes the endpoint emits are readable by an independent

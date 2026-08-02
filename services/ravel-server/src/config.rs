@@ -141,6 +141,70 @@ pub struct Cli {
     /// applies above the scan.
     #[arg(long, value_name = "DURATION", default_value = "5m")]
     pub alert_sql_lookback: String,
+
+    /// OIDC issuer URL (the exact `iss` every JWT must carry). Setting this and
+    /// `--oidc-jwks-url` enables the OIDC tenant resolver (ADR-0042 decision 6).
+    /// Both must be set together.
+    #[arg(long, value_name = "URL")]
+    pub oidc_issuer: Option<String>,
+
+    /// URL of the issuer's JWKS document (its signing keys), fetched directly
+    /// rather than via OIDC discovery. Enables OIDC together with
+    /// `--oidc-issuer`; both must be set together.
+    #[arg(long, value_name = "URL")]
+    pub oidc_jwks_url: Option<String>,
+
+    /// Acceptable JWT `aud` value (repeatable). When none is set audience is not
+    /// checked. Setting it without OIDC enabled fails startup.
+    #[arg(long = "oidc-audience", value_name = "AUD")]
+    pub oidc_audiences: Vec<String>,
+
+    /// String claim the tenant id is read from (ADR-0042 decision 6). Defaults
+    /// to `tenant` when OIDC is enabled. Setting it without OIDC enabled fails
+    /// startup rather than silently doing nothing.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_tenant_claim: Option<String>,
+
+    /// How often the JWKS document is refetched, in seconds (ADR-0042
+    /// decision 6). Only used when OIDC is enabled.
+    #[arg(long, default_value_t = 300)]
+    pub oidc_jwks_refresh_interval_secs: u64,
+
+    /// Enable the mTLS tenant resolver, which maps a trusted, proxy-forwarded
+    /// client-certificate identity header to a tenant. Opt-in: a header-based
+    /// resolver is a client-forgeable trust boundary unless a verifying proxy
+    /// sets and sanitizes the header (see `MtlsResolver`), so it is never active
+    /// unless this flag is passed.
+    #[arg(long)]
+    pub mtls_enabled: bool,
+
+    /// Header the reverse proxy forwards the verified client-certificate
+    /// identity in. Defaults to `x-ravel-client-cert-cn` when `--mtls-enabled`.
+    /// Setting it without `--mtls-enabled` fails startup.
+    #[arg(long, value_name = "HEADER")]
+    pub mtls_header: Option<String>,
+}
+
+/// Validated OIDC settings, present only when `--oidc-issuer`/`--oidc-jwks-url`
+/// are configured.
+#[derive(Debug, Clone)]
+pub struct OidcSettings {
+    pub issuer: String,
+    pub jwks_url: String,
+    pub audiences: Vec<String>,
+    pub tenant_claim: String,
+    pub refresh_interval: Duration,
+}
+
+/// The real-authn resolver settings parsed from the CLI: which of the OIDC and
+/// mTLS resolvers to add to the `FallbackResolver` chain, and how to configure
+/// them (ADR-0042 decision 6). Both are absent by default, leaving only the
+/// static bearer (and optional dev-header) resolvers.
+#[derive(Debug, Clone, Default)]
+pub struct AuthResolverSettings {
+    pub oidc: Option<OidcSettings>,
+    /// The trusted client-cert header, `Some` only when `--mtls-enabled`.
+    pub mtls_header: Option<String>,
 }
 
 impl Cli {
@@ -203,6 +267,75 @@ impl Cli {
             )?));
         }
         Ok(sinks)
+    }
+
+    /// Validate and collect the real-authn resolver settings (ADR-0042
+    /// decision 6). OIDC is enabled only when both `--oidc-issuer` and
+    /// `--oidc-jwks-url` are present; mTLS only when `--mtls-enabled`. A
+    /// dependent flag set without its resolver enabled (an `--oidc-tenant-claim`
+    /// or `--oidc-audience` with no OIDC, an `--mtls-header` with no
+    /// `--mtls-enabled`) fails startup here rather than being silently ignored,
+    /// mirroring the fail-fast style of `parse_tenant_tokens`.
+    pub fn parse_auth_resolvers(&self) -> anyhow::Result<AuthResolverSettings> {
+        let oidc = match (self.oidc_issuer.as_deref(), self.oidc_jwks_url.as_deref()) {
+            (Some(issuer), Some(jwks_url)) => {
+                if issuer.is_empty() || jwks_url.is_empty() {
+                    anyhow::bail!("--oidc-issuer and --oidc-jwks-url must be non-empty");
+                }
+                if !(jwks_url.starts_with("http://") || jwks_url.starts_with("https://")) {
+                    anyhow::bail!(
+                        "invalid --oidc-jwks-url '{jwks_url}', expected an http:// or https:// URL"
+                    );
+                }
+                Some(OidcSettings {
+                    issuer: issuer.to_string(),
+                    jwks_url: jwks_url.to_string(),
+                    audiences: self.oidc_audiences.clone(),
+                    tenant_claim: self
+                        .oidc_tenant_claim
+                        .clone()
+                        .unwrap_or_else(|| "tenant".to_string()),
+                    refresh_interval: Duration::from_secs(self.oidc_jwks_refresh_interval_secs),
+                })
+            }
+            (None, None) => None,
+            _ => anyhow::bail!(
+                "--oidc-issuer and --oidc-jwks-url must be set together to enable OIDC auth"
+            ),
+        };
+
+        if oidc.is_none() {
+            if self.oidc_tenant_claim.is_some() {
+                anyhow::bail!(
+                    "--oidc-tenant-claim was set but OIDC is not enabled (set --oidc-issuer and \
+                     --oidc-jwks-url)"
+                );
+            }
+            if !self.oidc_audiences.is_empty() {
+                anyhow::bail!(
+                    "--oidc-audience was set but OIDC is not enabled (set --oidc-issuer and \
+                     --oidc-jwks-url)"
+                );
+            }
+        }
+
+        let mtls_header = if self.mtls_enabled {
+            let header = self
+                .mtls_header
+                .clone()
+                .unwrap_or_else(|| "x-ravel-client-cert-cn".to_string());
+            if header.is_empty() {
+                anyhow::bail!("--mtls-header must be non-empty");
+            }
+            Some(header)
+        } else {
+            if self.mtls_header.is_some() {
+                anyhow::bail!("--mtls-header was set but --mtls-enabled was not");
+            }
+            None
+        };
+
+        Ok(AuthResolverSettings { oidc, mtls_header })
     }
 
     /// Parse `--alert-sql-lookback` into a duration.

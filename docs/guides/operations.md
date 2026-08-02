@@ -13,6 +13,13 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--shards <n>` | | `4` | Ingest shard count. It sets both the ingest router's shard count and the query-side catalog's shard count, so they must agree. There is no separate query-side flag. |
 | `--tenant-token TOKEN=TENANT` | | none, repeatable | Registers one bearer token for the static resolver. Pass it once per tenant. With no `--tenant-token` at all, every request is unauthenticated and rejected. |
 | `--dev-insecure-tenant-header` | | off | Adds tenant resolution through the `x-ravel-tenant` request header, tried only when bearer lookup fails. If `--listen-http` does not bind a loopback address, the process refuses to start with this set. |
+| `--oidc-issuer <url>` | | none | OIDC issuer, the exact `iss` every JWT must carry. Set together with `--oidc-jwks-url` to enable the OIDC resolver (ADR-0042 decision 6). Setting only one of the pair refuses to start. |
+| `--oidc-jwks-url <url>` | | none | URL of the issuer's JWKS document (its public signing keys), fetched directly (no OIDC discovery). Enables OIDC together with `--oidc-issuer`. |
+| `--oidc-audience <aud>` | | none, repeatable | Acceptable JWT `aud` value. With none set, audience is not checked. Set without OIDC enabled refuses to start. |
+| `--oidc-tenant-claim <claim>` | | `tenant` (when OIDC on) | String claim the tenant id is read from. A token missing it, or whose value is not a non-empty string, is rejected with no fallback to `sub`. Set without OIDC enabled refuses to start. |
+| `--oidc-jwks-refresh-interval-secs <n>` | | `300` | How often the JWKS document is refetched. The first fetch is awaited before the server reports ready; if it fails, an OIDC-enabled server refuses to start rather than serve with an empty key cache. |
+| `--mtls-enabled` | | off | Enables the mTLS resolver, which maps a trusted, proxy-forwarded client-certificate identity header to a tenant. Opt-in because the header is a client-forgeable trust boundary unless a verifying proxy sets and sanitizes it (see Tenancy setup). |
+| `--mtls-header <name>` | | `x-ravel-client-cert-cn` (when `--mtls-enabled`) | Header the reverse proxy forwards the verified client-certificate CN/SAN in. Set without `--mtls-enabled` refuses to start. |
 | `--s3-endpoint <url>` | `RAVEL_S3_ENDPOINT` | none | Custom S3 endpoint (MinIO, or any S3-compatible store). Unset means real AWS S3. It also turns on `allow_http` for that endpoint. |
 | `--s3-bucket <name>` | `RAVEL_S3_BUCKET` | none | Required when `--store s3`. |
 | `--s3-region <region>` | `RAVEL_S3_REGION` | `us-east-1` | |
@@ -152,6 +159,38 @@ has no data migration to do. Tenant identity affects only key prefixing
 (`t/<tenant_hash>/...`, where `tenant_hash` is a BLAKE3 hash of the tenant
 name) and query and ingest authorization. It carries no other per-tenant
 configuration today (no per-tenant quotas, no per-tenant storage backend).
+
+### Real authn: OIDC and mTLS (ADR-0042 decision 6)
+
+The static `--tenant-token` bearer resolver stays the local/dev path and is
+unchanged. For production, two additive resolvers join the same first-success
+chain; enabling them does not disable the bearer resolver.
+
+- **OIDC (JWT).** Set `--oidc-issuer` and `--oidc-jwks-url` together. Every
+  request's `Authorization: Bearer <jwt>` is verified against the issuer's
+  JWKS: signature, `iss`, and `exp` (and `aud` if any `--oidc-audience` is
+  set). The signature algorithm is pinned from the JWKS key that verifies the
+  token, never from the token's own `alg` header, so `alg: none` and
+  algorithm-confusion tokens are rejected. The tenant is read from
+  `--oidc-tenant-claim` (default `tenant`) as a string, with no fallback to
+  any other claim. The JWKS is cached in memory and refreshed on
+  `--oidc-jwks-refresh-interval-secs`; the request path never makes a network
+  call. The first fetch must succeed before the server reports ready.
+
+- **mTLS (proxy-forwarded).** Ravel does **not** terminate TLS or verify
+  client certificates itself. `--mtls-enabled` reads a header (default
+  `x-ravel-client-cert-cn`, override with `--mtls-header`) that a
+  TLS-terminating reverse proxy is expected to set to the already-verified
+  certificate CN or SAN. This is an `X-Forwarded-For`-class trust boundary: it
+  is authoritative only because a trusted hop set it, and forgeable by anyone
+  if that hop is absent. Enable it **only** behind a proxy that (a) actually
+  performs mTLS client-certificate verification and (b) strips or overwrites
+  any client-supplied value of the header before forwarding. It is off by
+  default and opt-in for exactly this reason.
+
+Dependent flags fail fast at startup: OIDC needs both its issuer and JWKS URL;
+`--oidc-tenant-claim`/`--oidc-audience` without OIDC, or `--mtls-header`
+without `--mtls-enabled`, refuse to start rather than silently do nothing.
 
 ## Disposability
 
