@@ -1,25 +1,45 @@
 //! Query-audit records (ADR-0042 decision 4, issue #391).
 //!
 //! `ravel-server` writes one immutable [`Signal::Audit`] record every time it
-//! executes a tenant's SQL request, so a tenant's own query activity is
-//! durably logged and cannot be forged or suppressed by the tenant: the record
-//! is written by the server itself, from the interception point in the SQL
-//! handler, never derived from a client-supplied request body.
+//! executes a tenant's SQL request through `POST /api/v1/sql`, so that
+//! transport's query activity is durably logged and cannot be forged or
+//! suppressed by the tenant: the record is written by the server itself, from
+//! the interception point in the SQL handler, never derived from a
+//! client-supplied request body.
+//!
+//! This does not yet cover every way a tenant can run SQL: the Flight SQL
+//! transport (`services/ravel-server/src/flight.rs`) executes tenant queries
+//! against the same `SqlExecutor` with no audit hook, so a tenant using that
+//! transport today leaves no query-audit trail (tracked as a fast-follow).
+//! The "cannot be forged or suppressed" property holds only for the
+//! transport this module instruments.
 //!
 //! # Record shape
 //!
 //! A query-audit record rides RLOG v1 exactly like a legal-hold record
-//! ([`crate::legal_hold`]) and lands on the same control-plane audit shard
-//! ([`crate::legal_hold::AUDIT_HOLD_SHARD`]), so the generic `audit` SQL table
-//! (crates/ravel-sql/src/audit_schema.rs) surfaces it with no schema change -
-//! only new attrs. Every record carries:
+//! ([`crate::legal_hold`]), on its own [`QUERY_AUDIT_SHARD`] rather than
+//! [`crate::legal_hold::AUDIT_HOLD_SHARD`]: `Signal::Audit` is not in
+//! `services/ravel-server/src/maintain.rs`'s `MAINTAINED_SIGNALS`, so nothing
+//! compacts or retention-sweeps it today, and one query-audit record per SQL
+//! request is unbounded, permanent growth - collocating it with the
+//! legal-hold control plane would mean every future legal-hold refresh (a
+//! full shard listing) reads and discards an ever-growing pile of query
+//! records. A distinct shard costs nothing today (no `Signal::Audit`
+//! resolution exists yet for either shard - the generic `audit` SQL table,
+//! crates/ravel-sql/src/audit_schema.rs, is not yet registered in any
+//! session) and is unfixable later, once records are immutable and keyed.
 //!
-//! - `kind` = `query` (distinguishes it from a `legal_hold` record on the same
-//!   shard; the audit table's predicates select on this attr);
+//! Every record carries:
+//!
+//! - `kind` = `query` (distinguishes it from a `legal_hold` record; the audit
+//!   table's predicates select on this attr);
 //! - `query.language` = the query language, `sql` today;
 //! - `query.tenant` = the tenant's hex hash (the record is attributed to the
 //!   resolved tenant, never to a client-supplied identity);
 //! - `query.status` = `ok` or `error`, the request's outcome;
+//! - `query.window_start_ns` / `query.window_end_ns` = the request's resolved
+//!   time range (ADR-0042 decision 4 names time range as part of the record,
+//!   alongside tenant, query text, and result status);
 //! - `query.text` = the query text, verbatim. It is not truncated here; the
 //!   SQL handler has already bounded the whole request body before this record
 //!   is written.
@@ -36,7 +56,10 @@ use uuid::Uuid;
 
 use crate::audit_write::{AuditWrite, write_audit_object};
 use crate::error::Result;
-use crate::legal_hold::AUDIT_HOLD_SHARD;
+
+/// The [`Signal::Audit`] shard query-audit records are written to. Deliberately
+/// distinct from [`crate::legal_hold::AUDIT_HOLD_SHARD`] - see the module doc.
+pub const QUERY_AUDIT_SHARD: u32 = 1;
 
 /// `attrs` key marking an audit record's kind. A query-audit record carries
 /// [`KIND_QUERY`]; a legal-hold record carries `legal_hold`.
@@ -49,6 +72,10 @@ const ATTR_LANGUAGE: &str = "query.language";
 const ATTR_TENANT: &str = "query.tenant";
 /// `attrs` key holding the request outcome, [`QueryStatus::as_str`].
 const ATTR_STATUS: &str = "query.status";
+/// `attrs` key holding the resolved query window's start, in nanoseconds.
+const ATTR_WINDOW_START: &str = "query.window_start_ns";
+/// `attrs` key holding the resolved query window's end, in nanoseconds.
+const ATTR_WINDOW_END: &str = "query.window_end_ns";
 /// `attrs` key holding the verbatim query text.
 const ATTR_TEXT: &str = "query.text";
 
@@ -96,6 +123,7 @@ impl QueryStatus {
 /// the object identity; the record is otherwise a pure function of its inputs.
 /// The write is idempotent on the data object (content-addressed) exactly like
 /// every other L0 audit write.
+#[allow(clippy::too_many_arguments)]
 pub async fn write_query_audit(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -103,6 +131,8 @@ pub async fn write_query_audit(
     query_text: &str,
     language: &str,
     status: QueryStatus,
+    window_start_ns: i64,
+    window_end_ns: i64,
 ) -> Result<()> {
     let (stream_id, stream_attrs) = query_stream();
     let (severity_num, severity_text) = status.severity();
@@ -114,6 +144,14 @@ pub async fn write_query_audit(
             ATTR_STATUS.to_string(),
             AttrValue::Str(status.as_str().into()),
         ),
+        (
+            ATTR_WINDOW_START.to_string(),
+            AttrValue::Str(window_start_ns.to_string()),
+        ),
+        (
+            ATTR_WINDOW_END.to_string(),
+            AttrValue::Str(window_end_ns.to_string()),
+        ),
         (ATTR_TEXT.to_string(), AttrValue::Str(query_text.into())),
     ];
     let body = format!("{language} query {}", status.as_str());
@@ -121,7 +159,7 @@ pub async fn write_query_audit(
         store,
         tenant,
         AuditWrite {
-            shard: AUDIT_HOLD_SHARD,
+            shard: QUERY_AUDIT_SHARD,
             record_id: Uuid::new_v4(),
             now_ns,
             stream_id,
@@ -170,12 +208,12 @@ mod tests {
         })
     }
 
-    /// Read back every RLOG record written to the tenant's audit shard.
+    /// Read back every RLOG record written to the tenant's query-audit shard.
     async fn read_audit_records(
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
     ) -> Vec<LogRecord> {
-        let prefix = keys::commit_shard_prefix(tenant, Signal::Audit, AUDIT_HOLD_SHARD).unwrap();
+        let prefix = keys::commit_shard_prefix(tenant, Signal::Audit, QUERY_AUDIT_SHARD).unwrap();
         let metas = list_all(store, &prefix).await.unwrap();
         let cfg = RlogConfig::default();
         let mut out = Vec::new();
@@ -204,6 +242,8 @@ mod tests {
             "SELECT value FROM samples LIMIT 1",
             "sql",
             QueryStatus::Ok,
+            now_ns - 3_600_000_000_000,
+            now_ns,
         )
         .await
         .expect("write ok record");
@@ -220,6 +260,14 @@ mod tests {
             Some(tenant.to_hex().as_str())
         );
         assert_eq!(str_attr(row, "query.status"), Some("ok"));
+        assert_eq!(
+            str_attr(row, "query.window_start_ns"),
+            Some((now_ns - 3_600_000_000_000).to_string().as_str())
+        );
+        assert_eq!(
+            str_attr(row, "query.window_end_ns"),
+            Some(now_ns.to_string().as_str())
+        );
         assert_eq!(
             str_attr(row, "query.text"),
             Some("SELECT value FROM samples LIMIT 1")
@@ -239,6 +287,8 @@ mod tests {
             "SELECT nope",
             "sql",
             QueryStatus::Error,
+            now_ns - 3_600_000_000_000,
+            now_ns,
         )
         .await
         .expect("write error record");
@@ -248,5 +298,38 @@ mod tests {
         assert_eq!(rows[0].severity_text, "ERROR");
         assert_eq!(str_attr(&rows[0], "query.status"), Some("error"));
         assert_eq!(str_attr(&rows[0], "query.text"), Some("SELECT nope"));
+    }
+
+    #[tokio::test]
+    async fn a_query_audit_record_never_registers_as_a_legal_hold() {
+        use crate::legal_hold::LegalHoldCheck;
+
+        let store = MemoryStore::new();
+        let tenant = TenantHash([11u8; 16]);
+        let now_ns = 7 * 3_600_000_000_000;
+
+        write_query_audit(
+            &store,
+            &tenant,
+            now_ns,
+            "SELECT 1",
+            "sql",
+            QueryStatus::Ok,
+            now_ns,
+            now_ns,
+        )
+        .await
+        .expect("write ok record");
+
+        // Query-audit records live on a distinct shard from legal-hold's, so a
+        // hold refresh (which only ever lists AUDIT_HOLD_SHARD) never even
+        // observes them; this pins that isolation, not just the kind tag.
+        let check = LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+        assert!(
+            check.is_empty(),
+            "a query-audit record must never be mistaken for an active hold"
+        );
     }
 }

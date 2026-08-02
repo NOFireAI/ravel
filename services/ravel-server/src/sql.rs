@@ -149,7 +149,16 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         Ok(_) => QueryStatus::Ok,
         Err(_) => QueryStatus::Error,
     };
-    write_audit(state, tenant_hash, now_ns, &request.sql, status).await;
+    write_audit(
+        state,
+        tenant_hash,
+        now_ns,
+        &request.sql,
+        status,
+        request.window.start_ns,
+        request.window.end_ns,
+    )
+    .await;
 
     let outcome = result.map_err(|err| ApiError::from_sql(err, tenant_hash))?;
     encode(&headers, &outcome, tenant_hash)
@@ -160,12 +169,15 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
 /// write it must never change the client's response: it is logged loudly
 /// (`tracing::error!`) - a silently dropped audit record would defeat the whole
 /// feature - and then swallowed, so a successful query stays a success.
+#[allow(clippy::too_many_arguments)]
 async fn write_audit(
     state: &SqlState,
     tenant_hash: TenantHash,
     now_ns: i64,
     query_text: &str,
     status: QueryStatus,
+    window_start_ns: i64,
+    window_end_ns: i64,
 ) {
     if let Err(err) = write_query_audit(
         state.store.as_ref(),
@@ -174,6 +186,8 @@ async fn write_audit(
         query_text,
         "sql",
         status,
+        window_start_ns,
+        window_end_ns,
     )
     .await
     {

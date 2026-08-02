@@ -63,7 +63,7 @@ pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };
 pub use publish::PublishOutcome;
-pub use query_audit::{QueryStatus, write_query_audit};
+pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, write_query_audit};
 pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;

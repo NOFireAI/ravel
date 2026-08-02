@@ -29,7 +29,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
     AttrValue, LogRecord, Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
 };
-use ravel_maintain::AUDIT_HOLD_SHARD;
+use ravel_maintain::QUERY_AUDIT_SHARD;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
@@ -944,7 +944,7 @@ impl ObjectStoreBackend for LogsCommitListSpy {
 /// handler produced for a request.
 async fn query_audit_records(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> Vec<LogRecord> {
     let tenant_hash = tenant.hash();
-    let prefix = keys::commit_shard_prefix(&tenant_hash, Signal::Audit, AUDIT_HOLD_SHARD)
+    let prefix = keys::commit_shard_prefix(&tenant_hash, Signal::Audit, QUERY_AUDIT_SHARD)
         .expect("audit commit prefix");
     let metas = list_all(store, &prefix).await.expect("list audit commits");
     let cfg = RlogConfig::default();
@@ -1005,6 +1005,13 @@ async fn a_successful_query_writes_one_ok_audit_record() {
     assert_eq!(
         attr(row, "query.tenant"),
         Some(tenant.hash().to_hex().as_str())
+    );
+    // `body()` sends an explicit `start: 0.0, end: NOW_NS`, so the resolved
+    // window is exactly that, not the absent-window default.
+    assert_eq!(attr(row, "query.window_start_ns"), Some("0"));
+    assert_eq!(
+        attr(row, "query.window_end_ns"),
+        Some(NOW_NS.to_string().as_str())
     );
     assert_eq!(attr(row, "query.text"), Some(sql));
     assert_eq!(row.severity_text, "INFO");
