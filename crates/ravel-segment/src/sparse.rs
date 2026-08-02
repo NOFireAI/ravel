@@ -33,7 +33,7 @@ use ravel_proto::segment::v1::{Footer, Section};
 use crate::crc::footer_crc;
 use crate::error::{SegmentError, WriteError};
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, V5_STRIDE, VERSION_V5, ZSTD_LEVEL, compression,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, V5_STRIDE, VERSION_V6, ZSTD_LEVEL, compression,
     section_kind,
 };
 use crate::reader::{
@@ -1350,6 +1350,12 @@ pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegmen
     let hist_pages = find_section(footer, section_kind::HIST_PAGES)
         .map(|_| locate(obj, footer, section_kind::HIST_PAGES))
         .transpose()?;
+    // EXEMPLARS (kind 10, ADR-0047) carries series_index values that refer
+    // into SERIES_IDS, which build_sparse_object copies verbatim and does
+    // not reorder -- so the section is copied byte-for-byte with no remap.
+    let exemplars = find_section(footer, section_kind::EXEMPLARS)
+        .map(|_| locate(obj, footer, section_kind::EXEMPLARS))
+        .transpose()?;
 
     let count = u32::try_from(footer.series_count).map_err(|_| WriteError::TooManySeries)?;
 
@@ -1379,7 +1385,7 @@ pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegmen
     // its VAL_RAW_F64 payload alignment (recorded relative to the section
     // start by write_v4) is preserved verbatim.
     let mut object = Vec::with_capacity(obj.len() + series_idx_bytes.len() + 512);
-    let mut sections: Vec<Section> = Vec::with_capacity(7);
+    let mut sections: Vec<Section> = Vec::with_capacity(8);
 
     push_located(&mut object, &mut sections, &label_dict);
     push_located(&mut object, &mut sections, &series_ids);
@@ -1403,6 +1409,9 @@ pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegmen
     if let Some(hp) = &hist_pages {
         push_located(&mut object, &mut sections, hp);
     }
+    if let Some(ep) = &exemplars {
+        push_located(&mut object, &mut sections, ep);
+    }
 
     let mut new_footer: Footer = footer.clone();
     new_footer.sections = sections;
@@ -1413,13 +1422,13 @@ pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegmen
     let crc = footer_crc(
         &footer_bytes,
         footer_len,
-        VERSION_V5,
+        VERSION_V6,
         SIGNAL_METRICS,
         RESERVED,
     );
     object.extend_from_slice(&footer_len.to_le_bytes());
     object.extend_from_slice(&crc.to_le_bytes());
-    object.extend_from_slice(&VERSION_V5.to_le_bytes());
+    object.extend_from_slice(&VERSION_V6.to_le_bytes());
     object.push(SIGNAL_METRICS);
     object.push(RESERVED);
     object.extend_from_slice(&MAGIC);
