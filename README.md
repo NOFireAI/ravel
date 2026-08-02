@@ -240,7 +240,9 @@ ravel-server --mode all \
 
 Every transition is written as an immutable record before any sink is
 contacted, so a sink that is down loses notifications, never alert history;
-delivery is at-least-once and retried on later ticks. Sinks are optional: with
+delivery is at-least-once and retried on later ticks, including across a
+process restart (the evaluator re-queues every still-open alert for one
+delivery attempt the first tick after it starts). Sinks are optional: with
 none configured, transitions are still recorded durably.
 
 ## Container images
