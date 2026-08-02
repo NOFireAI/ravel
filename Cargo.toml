@@ -61,13 +61,15 @@ async-trait = "0.1"
 reqwest = { version = "0.13", features = ["json"] }
 
 # JWT validation for OIDC tenant resolution (ADR-0042 decision 6, issue #392).
-# 9.x is pinned rather than 10/11: 9.x keeps ring (already built in this
-# workspace) as its default crypto backend and carries a stable `jwk` module,
-# whereas 10/11 drop the default backend and force an explicit aws-lc-rs (heavier
-# C toolchain) or rust_crypto selection. Signature verification, issuer/audience/
-# expiry checks, and the algorithm allow-list all come from this crate rather
-# than any hand-rolled JWT code.
-jsonwebtoken = "9.3"
+# Pinned to >= 10.3.0: 9.3.1 is vulnerable to CVE-2026-25537 / GHSA-h395-gr6q-cpjc
+# (a claim sent with the wrong JSON type is treated as absent rather than
+# malformed unless it is also in required_spec_claims); 10.3.0 is the first patched
+# release. 10.x drops the bundled default crypto backend, so a backend is now
+# selected explicitly: rust_crypto (pure Rust) is chosen over aws_lc_rs to avoid a
+# C toolchain. use_pem (from_ec_pem, on by default) and the `jwk` module are both
+# retained. Signature verification, issuer/audience/expiry checks, and the
+# algorithm allow-list all come from this crate rather than any hand-rolled JWT code.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
 
 # telemetry protocol types
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }

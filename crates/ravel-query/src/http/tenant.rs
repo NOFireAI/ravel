@@ -271,6 +271,11 @@ fn signing_algorithm(alg: KeyAlgorithm) -> Option<Algorithm> {
         // Encryption / key-agreement algorithms: never used to verify a JWT
         // signature.
         KeyAlgorithm::RSA1_5 | KeyAlgorithm::RSA_OAEP | KeyAlgorithm::RSA_OAEP_256 => return None,
+        // jsonwebtoken 10.x surfaces an unrecognized `alg` as this variant
+        // instead of failing to parse the JWK. An algorithm we do not recognize
+        // is one we cannot pin a Validation to, so it is skipped exactly like a
+        // key that omits `alg`: never verified against, never silently trusted.
+        KeyAlgorithm::UNKNOWN_ALGORITHM => return None,
     })
 }
 
@@ -555,6 +560,23 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
         let cache = cache_with(&jwks_with(KID));
         // Past the default 60s leeway.
         let token = sign_es256(&claims(Some("acme"), -3600), KID, EC_PRIV_PEM);
+        assert!(resolver(cache).resolve(&bearer(&token)).is_err());
+    }
+
+    #[test]
+    fn exp_claim_as_json_string_is_auth_error() {
+        // CVE-2026-25537 / GHSA-h395-gr6q-cpjc regression: `exp` sent as a JSON
+        // string ("99999999999") instead of a number is the CVE's exact PoC
+        // shape. Under the type-confusion bug a wrong-typed claim was treated as
+        // absent rather than malformed, so a far-future string `exp` could slip
+        // past expiry checking. Our `required_spec_claims` requires `exp`, and
+        // the patched crate only counts a correctly-typed (parsed) claim as
+        // present, so the malformed string must produce a hard rejection here,
+        // not a silent pass.
+        let cache = cache_with(&jwks_with(KID));
+        let mut c = claims(Some("acme"), 3600);
+        c["exp"] = serde_json::json!("99999999999");
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
     }
 
