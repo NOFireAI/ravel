@@ -1,4 +1,4 @@
-# ADR-0048: RLOG POSTINGS: exact block-level attribute pruning, opt-in per field
+# ADR-0049: RLOG POSTINGS: exact block-level attribute pruning, opt-in per field
 
 Status: Accepted (2026-08-02)
 
