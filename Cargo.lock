@@ -4299,6 +4299,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-cache"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
 name = "ravel-catalog"
 version = "0.1.0"
 dependencies = [
