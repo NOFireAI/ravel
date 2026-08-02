@@ -33,6 +33,12 @@ async fn main() -> anyhow::Result<()> {
 
     ravel_server::warn_dev_insecure_tenant_header(cli.dev_insecure_tenant_header);
 
+    // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
+    // feature links the arrow decode stack, `--otap` decides whether this
+    // process registers the ArrowMetricsService. Set before `start` reads it.
+    #[cfg(feature = "otap")]
+    ravel_server::set_otap_enabled(cli.otap);
+
     let tenant_tokens = cli.parse_tenant_tokens()?;
     // Fold and maintenance run for the union of the statically mapped bearer
     // tenants and whatever `--maintain-tenant` names (issue #398). A tenant
