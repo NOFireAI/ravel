@@ -131,6 +131,12 @@ piece, see [docs/adrs/](docs/adrs/).
   deployments. See [docs/guides/kubernetes.md](docs/guides/kubernetes.md).
 - **Published container images**: `ravel-server` and `ravel-operator`,
   built in CI and pushed to GHCR on tag.
+- **Prometheus metrics about Ravel itself**, on `GET /metrics` in every
+  mode, including maintain. Object-store calls, bytes, errors by kind and
+  latency; ingest flushes, acks, and buffered volume per signal; catalog
+  anomaly counters. Labels come from a closed allowlist, so Ravel's own
+  telemetry cannot grow unbounded. The route is unauthenticated, like the
+  health routes: do not expose the listener to untrusted networks.
 
 Two gaps worth knowing about: PromQL subqueries over native histograms
 return a typed error rather than a wrong answer (issue #220), and native
