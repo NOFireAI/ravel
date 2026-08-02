@@ -86,7 +86,8 @@ pinned `object_store` version cannot close:
    change; reuses the existing store-agnostic backend abstraction.
 6. **Real authn (OIDC/mTLS)**: a new `TenantResolver` impl (`OidcResolver`
    validating a JWT against a configured issuer/JWKS, or `MtlsResolver`
-   mapping a client certificate's SAN/CN to a tenant) added to the
+   mapping a trusted, reverse-proxy-forwarded header carrying an
+   already-verified client certificate's CN/SAN to a tenant) added to the
    `FallbackResolver` chain alongside `StaticBearerTokenResolver`, which
    stays available for local/dev use. No changes needed to any caller
    of `Arc<dyn TenantResolver>` - the trait boundary means every
