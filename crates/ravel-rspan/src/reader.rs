@@ -415,10 +415,16 @@ mod proptests {
         fn arb_span()(
             trace in 0u8..6,
             span in any::<u8>(),
-            has_parent in any::<bool>(),
+            // parent_span_id ranges over its whole domain: None (a root span)
+            // and Some over arbitrary 8-byte ids (ADR-0041's span-id width),
+            // generated independently of span_id rather than derived from it, so
+            // the round trip exercises the parent column's full value space.
+            parent_span_id in proptest::option::of(any::<[u8; 8]>()),
             name in "[a-zA-Z0-9/._-]{0,24}",
             start in any::<i64>(),
             dur in 0i64..1_000_000,
+            // status_code ranges over every StatusCode variant this crate
+            // defines (Unset/Ok/Error), not one fixed value.
             code in arb_status(),
             has_msg in any::<bool>(),
             msg in "[a-z ]{0,20}",
@@ -427,7 +433,7 @@ mod proptests {
             SpanRecord {
                 trace_id: [trace; 16],
                 span_id: [span; 8],
-                parent_span_id: if has_parent { Some([span.wrapping_add(1); 8]) } else { None },
+                parent_span_id,
                 name,
                 start_ts_ns: start,
                 end_ts_ns: start.saturating_add(dur),
