@@ -157,3 +157,78 @@ async fn a_tick_below_max_flush_delay_does_not_flush() {
 
     router.shutdown().await;
 }
+
+/// ADR-0051 section 7 (S2-06): a buffered-mode buffer with no strict-mode
+/// waiter and fewer than `min_flush_bytes` is idle, so the fast
+/// `max_flush_delay` age trigger must not fire for it -- only the slower
+/// `max_flush_delay_idle` does. This pins the idle side of the predicate;
+/// `advancing_the_injected_clock_drives_an_age_flush` above already pins the
+/// non-idle (strict-waiter) side.
+#[tokio::test]
+async fn idle_buffer_defers_age_trigger() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(BASE_NS);
+    let config = IngestConfig {
+        shard_count: 1,
+        // Only the age trigger can fire: the buffer never reaches target_bytes.
+        target_bytes: 8 * 1024 * 1024,
+        max_flush_delay: Duration::from_millis(50),
+        max_flush_delay_idle: Duration::from_millis(300),
+        // Comfortably above one point's estimated buffered size, so the
+        // buffer stays "idle" for the whole test.
+        min_flush_bytes: 1_000_000,
+        flush_tick: Duration::from_millis(10),
+        ..IngestConfig::default()
+    };
+    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+
+    let tenant = tenant("acme");
+    let points = vec![make_point(
+        &tenant,
+        "cpu_usage",
+        &[("host", "a")],
+        1_000,
+        1.0,
+    )];
+
+    // Buffered mode: no strict waiter, so `waiters` stays empty and the
+    // buffer's idleness is decided purely by `min_flush_bytes`.
+    router
+        .write(
+            tenant.clone(),
+            points,
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write is acknowledged at enqueue");
+
+    while router.metrics().snapshot().buffered_points_total < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    // Past max_flush_delay (50ms) but below max_flush_delay_idle (300ms): an
+    // idle buffer must not flush yet.
+    for _ in 0..10 {
+        clock.advance_ns(10_000_000); // 10ms, total 100ms
+        tokio::task::yield_now().await;
+    }
+    let snapshot = router.metrics().snapshot();
+    assert_eq!(
+        snapshot.flushes_by_age, 0,
+        "an idle buffer must defer past max_flush_delay to max_flush_delay_idle"
+    );
+
+    // Past max_flush_delay_idle (300ms total): the deferred flush must fire.
+    for _ in 0..25 {
+        clock.advance_ns(10_000_000); // 10ms, total 350ms
+        tokio::task::yield_now().await;
+    }
+    let snapshot = router.metrics().snapshot();
+    assert_eq!(
+        snapshot.flushes_by_age, 1,
+        "the deferred age flush must fire once max_flush_delay_idle elapses"
+    );
+
+    router.shutdown().await;
+}
