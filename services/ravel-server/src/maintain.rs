@@ -94,9 +94,9 @@ fn signal_index(signal: Signal) -> usize {
         Signal::Metrics => 0,
         Signal::Logs => 1,
         Signal::Spans => 2,
-        other => unreachable!(
-            "maintenance safety metrics only track MAINTAINED_SIGNALS, got {other:?}"
-        ),
+        other => {
+            unreachable!("maintenance safety metrics only track MAINTAINED_SIGNALS, got {other:?}")
+        }
     }
 }
 
@@ -356,8 +356,16 @@ pub async fn run_discovery_cycle(
 
     let mut total = MaintainReport::default();
     for tenant in &outcome.maintained {
-        let report =
-            run_tick(store, tenant, compactor, retention, shard_count, memo, safety).await;
+        let report = run_tick(
+            store,
+            tenant,
+            compactor,
+            retention,
+            shard_count,
+            memo,
+            safety,
+        )
+        .await;
         total.retired += report.retired;
         total.compacted += report.compacted;
         total.already_done += report.already_done;
@@ -493,7 +501,11 @@ pub async fn run_tick(
                              operator expects, see the breaker runbook"
                         );
                     }
-                    safety.record_sweep(signal, report.orphan_breaker_tripped, report.orphans_withheld);
+                    safety.record_sweep(
+                        signal,
+                        report.orphan_breaker_tripped,
+                        report.orphans_withheld,
+                    );
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -566,8 +578,10 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
-        let report =
-            run_tick(&store, &tenant, &compactor, &retention, 4, &mut memo, &safety).await;
+        let report = run_tick(
+            &store, &tenant, &compactor, &retention, 4, &mut memo, &safety,
+        )
+        .await;
         // Nothing to maintain, nothing memoized: a subsequent tick would still
         // find nothing to skip.
         assert_eq!(report, MaintainReport::default());
@@ -670,8 +684,10 @@ mod tests {
         // bucket is below the compaction threshold, so it is already-done and
         // gets memoized as terminal.
         let before_first = store.metrics().snapshot();
-        let first =
-            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
+        let first = run_tick(
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+        )
+        .await;
         let first_reads =
             per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_first);
         assert_eq!(first.skipped_terminal, 0, "cold memo skips nothing");
@@ -681,8 +697,10 @@ mod tests {
 
         // Tick 2 (warm memo): the bucket is skipped straight from the memo.
         let before_second = store.metrics().snapshot();
-        let second =
-            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
+        let second = run_tick(
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+        )
+        .await;
         let second_reads =
             per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_second);
         assert_eq!(second.skipped_terminal, 1, "warm memo skips the bucket");
@@ -749,15 +767,19 @@ mod tests {
         // valid retention window is already expired against the real wall
         // clock. Not memoized terminal (Tombstoned isn't a terminal state),
         // so tick 2 re-evaluates it for real rather than skipping it.
-        let first =
-            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
+        let first = run_tick(
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+        )
+        .await;
         assert_eq!(first.retired, 1, "the expired bucket is tombstoned");
 
         // Tick 2: the tombstone's horizon has elapsed (zero protection
         // horizon), so this tick attempts the physical sweep. The hold must
         // block it entirely.
-        let second =
-            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
+        let second = run_tick(
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+        )
+        .await;
         assert_eq!(
             second.retired, 1,
             "still counted retired (tombstoned), never actually swept"
@@ -829,8 +851,10 @@ mod tests {
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
 
-        let report =
-            run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo, &safety).await;
+        let report = run_tick(
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+        )
+        .await;
 
         assert_eq!(
             report,
