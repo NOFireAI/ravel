@@ -42,6 +42,7 @@ pub mod clock;
 pub mod codec;
 pub mod compact;
 pub mod config;
+pub mod discover;
 pub mod error;
 pub mod legal_hold;
 pub mod publish;
@@ -58,6 +59,7 @@ pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{CompactionOutcome, compact_bucket};
 pub use config::{CompactorConfig, RetentionConfig, RetentionConfigError, RetentionPolicy};
+pub use discover::discover_tenants;
 pub use error::{MaintainError, Result};
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
