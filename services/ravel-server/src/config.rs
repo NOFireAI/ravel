@@ -480,6 +480,7 @@ impl Cli {
         }
 
         Ok(())
+    }
 
     /// Load and validate `--limits-file` (ADR-0051 section 3). Absent flag
     /// means the shipped defaults apply to every tenant with no override at
