@@ -43,11 +43,14 @@ async fn main() -> anyhow::Result<()> {
     let otap = false;
 
     let tenant_tokens = cli.parse_tenant_tokens()?;
-    // Fold and maintenance run for the union of the statically mapped bearer
-    // tenants and whatever `--maintain-tenant` names (issue #398). A tenant
-    // that authenticates through OIDC or mTLS has no `--tenant-token` entry, so
-    // without the second flag this list was empty and every background task
-    // silently had nothing to do.
+    // Fold and maintenance derive their tenant set from storage each cycle
+    // (ADR-0048 decision 3, issue #504), not from these flags. This is now
+    // only an optional restriction: the union of the statically mapped bearer
+    // tenants and whatever `--maintain-tenant` names. Empty (the default, and
+    // the common case for a deployment authenticating tenants through OIDC or
+    // mTLS, which has no `--tenant-token` entries) means no restriction is
+    // configured, so every tenant storage discovers data for is maintained --
+    // not, as before issue #504, that nothing is.
     let maintain_tenants = cli.parse_maintain_tenants()?;
     let fold_tenants =
         ravel_server::config::merge_fold_tenants(tenant_tokens.values(), &maintain_tenants);
@@ -84,25 +87,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     ravel_server::warn_mtls_trusted_header(auth.mtls_header.as_deref());
-
-    // A process that would run fold or maintenance, for a deployment whose
-    // tenants can authenticate through a resolver that names no tenant up
-    // front, with nothing to run them for. Not fatal: a query-only or
-    // deliberately idle maintenance process is a legitimate configuration. It
-    // is a warning rather than the info! used for "alert rules but no sink"
-    // because what stops here is durability-adjacent (compaction, retention,
-    // the GC sweeper) and has no visible symptom: ingest and query keep working.
-    let maintenance_would_run = !cli.disable_fold || matches!(cli.mode, Mode::Maintain);
-    let resolver_without_static_tenants = cli.oidc_issuer.is_some() || cli.mtls_enabled;
-    if fold_tenants.is_empty() && maintenance_would_run && resolver_without_static_tenants {
-        tracing::warn!(
-            "no maintenance tenants are configured, but OIDC or mTLS authentication is: fold, \
-             compaction, retention, and the GC sweeper will run for no tenant while ingest and \
-             query keep working. Tenants that authenticate through OIDC or mTLS are only known \
-             once a request arrives, so list each one this process maintains with \
-             --maintain-tenant <TENANT>"
-        );
-    }
 
     let resolver_bundle = ravel_server::tenant::build_auth_resolver(
         tenant_tokens,
