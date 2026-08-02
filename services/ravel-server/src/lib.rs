@@ -52,33 +52,6 @@ pub use maintain::MaintenanceTaskConfig;
 
 const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Runtime opt-in for the `otap` gRPC `ArrowMetricsService` (ADR-0011). The
-/// `otap` cargo feature links the arrow decode stack; this flag decides whether
-/// a given process registers the service, so an operator opts in with `--otap`
-/// even in a build that has the feature compiled in.
-///
-/// It defaults to enabled because the in-process test servers construct
-/// [`ServerConfig`] directly and expect the service present without extra
-/// wiring, and because `ServerConfig` is a plain public struct many callers
-/// build with a struct literal (adding a field would be a breaking change to
-/// every one). The binary is still opt-in: `main` calls [`set_otap_enabled`]
-/// with `--otap` before [`start`] reads it, so a process launched without the
-/// flag does not register the service.
-#[cfg(feature = "otap")]
-static OTAP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Set whether [`start`] registers the OTAP `ArrowMetricsService`. Call once at
-/// startup, before [`start`], from the `--otap` flag (see `config::Cli::otap`).
-#[cfg(feature = "otap")]
-pub fn set_otap_enabled(enabled: bool) {
-    OTAP_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(feature = "otap")]
-fn otap_enabled() -> bool {
-    OTAP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Emits a prominent startup warning when the dev-only insecure tenant header
 /// is enabled. The `--dev-insecure-tenant-header` flag lets a client name its
 /// own tenant via `x-ravel-tenant`, bypassing authenticated tenant resolution.
@@ -147,6 +120,12 @@ pub struct ServerConfig {
     /// present, [`start`] does one blocking refresh (failing startup if it
     /// fails) before marking the server ready, then spawns the periodic task.
     pub oidc_refresh: Option<tenant::OidcRefreshParams>,
+    /// Runtime opt-in for the OTAP gRPC `ArrowMetricsService` (ADR-0011). The
+    /// `otap` cargo feature links the arrow decode stack; this field is the
+    /// separate runtime toggle that decides whether *this* process registers
+    /// the service. Has no effect at all when built without the `otap`
+    /// feature. `main` sets it from the `--otap` flag (`config::Cli::otap`).
+    pub otap: bool,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -469,15 +448,15 @@ pub async fn start(
     // OTAP metrics ride the same gRPC listener and share the same
     // `GatewayState` (tenant resolution, ingest router) as the OTLP metrics
     // service. Gated twice: the `otap` cargo feature links the service at all,
-    // and the `--otap` runtime flag (via `set_otap_enabled`) decides whether
-    // this process registers it (ADR-0011). When enabled it is `Some` exactly
-    // when the OTLP metrics service is, so it never changes whether the
-    // listener binds; when the flag is off it is `None` and the service is not
-    // added below.
+    // and `config.otap` (the `--otap` runtime flag) decides whether this
+    // process registers it (ADR-0011). When enabled it is `Some` exactly when
+    // the OTLP metrics service is, so it never changes whether the listener
+    // binds; when the flag is off it is `None` and the service is not added
+    // below.
     #[cfg(feature = "otap")]
     let arrow_metrics_service = otlp_grpc_state
         .as_ref()
-        .filter(|_| otap_enabled())
+        .filter(|_| config.otap)
         .map(|state| {
             ArrowMetricsServiceServer::new(otap_grpc::GrpcArrowMetricsService::new(state.clone()))
         });

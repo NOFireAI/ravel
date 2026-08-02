@@ -452,6 +452,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
+        otap: false,
     };
     let running = ravel_server::start(config, store).await.expect("starts");
     let grpc_addr = running

@@ -334,6 +334,7 @@ async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
+        otap: false,
     };
     let running = ravel_server::start(config, store)
         .await
