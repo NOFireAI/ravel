@@ -28,14 +28,23 @@ pub const VERSION_V3: u16 = 3;
 /// to `VERSION_V5`.
 pub const VERSION_V4: u16 = 4;
 
-/// RSEG v5 trailer version (docs/segment-format.md). ADR-0027 leaves this the
-/// only readable and writable version: the run-major grammar plus two
-/// optional sparse-catalog sections, SERIES_IDX (kind 8) and chunked
-/// SERIES_META (kind 9, replacing the kind 6 whole-section form when
-/// present). The sparse sections are emitted only when the output object
-/// carries [`V5_SPARSE_THRESHOLD`] or more series; below that the object omits
-/// them and uses the whole SERIES_META. Written by every writer.
+/// Retired RSEG v5 trailer version (ADR-0026, retired by ADR-0047). Rejected
+/// by the reader; reserved, never reused. The v5 grammar itself lives on
+/// unchanged as the v6 grammar plus the optional EXEMPLARS section.
+#[allow(dead_code)]
 pub const VERSION_V5: u16 = 5;
+
+/// RSEG v6 trailer version (docs/segment-format.md, ADR-0047). ADR-0027's
+/// single-supported-version rule leaves this the only readable and writable
+/// version: the v5 run-major grammar plus two optional sparse-catalog
+/// sections, SERIES_IDX (kind 8) and chunked SERIES_META (kind 9, replacing
+/// the kind 6 whole-section form when present), plus the optional EXEMPLARS
+/// section (kind 10, present only when at least one sample in the object
+/// carried an exemplar). The sparse sections are emitted only when the
+/// output object carries [`V5_SPARSE_THRESHOLD`] or more series; below that
+/// the object omits them and uses the whole SERIES_META. Written by every
+/// writer.
+pub const VERSION_V6: u16 = 6;
 
 /// Series-count threshold at or above which `SegmentWriter::write_v5` emits
 /// the sparse SERIES_IDX + chunked SERIES_META sections (ADR-0026 decision
@@ -94,6 +103,11 @@ pub mod section_kind {
     /// when present (docs/segment-format.md). Present only alongside
     /// SERIES_IDX.
     pub const SERIES_META_CHUNKS: u32 = 9;
+    /// Per-sample exemplars (ADR-0047), RSEG v6 only: run-major, sorted by
+    /// `(series_index, ts_ns)` so a per-series lookup is a scan that can
+    /// stop early on the sort invariant. Present only when at least one
+    /// sample in the object carried an exemplar; absent is always legal.
+    pub const EXEMPLARS: u32 = 10;
 }
 
 /// Section-level compression tags, matching `ravel.segment.v1.Compression`.
@@ -155,6 +169,7 @@ mod tests {
         assert_eq!(VERSION_V3, 3);
         assert_eq!(VERSION_V4, 4);
         assert_eq!(VERSION_V5, 5);
+        assert_eq!(VERSION_V6, 6);
         assert_eq!(MAGIC, *b"RSG1");
         assert_eq!(section_kind::LABEL_DICT, 1);
         assert_eq!(section_kind::SERIES_TABLE, 2);
@@ -165,6 +180,7 @@ mod tests {
         assert_eq!(section_kind::HIST_PAGES, 7);
         assert_eq!(section_kind::SERIES_IDX, 8);
         assert_eq!(section_kind::SERIES_META_CHUNKS, 9);
+        assert_eq!(section_kind::EXEMPLARS, 10);
         assert_eq!(page_enc::HIST_SPANS, 32);
         assert_eq!(V5_SPARSE_THRESHOLD, 4096);
         assert_eq!(V5_STRIDE, 512);
