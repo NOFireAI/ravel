@@ -37,12 +37,10 @@ use tokio::time::Duration;
 use uuid::Uuid;
 
 use crate::clock::Clock;
-use crate::config::{IngestConfig, SPAN_SEGMENT_FORMAT_VERSION};
+use crate::config::{IngestConfig, SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
 use crate::metrics::FlushTrigger;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
-
-const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 pub(crate) type SpanAck = oneshot::Sender<Result<CommitToken, SpanWriteError>>;
 
@@ -251,15 +249,29 @@ impl SpanShardActor {
         }
     }
 
+    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
+    /// already justifies a PUT on the fast `max_flush_delay` clock; anything
+    /// else is idle and waits for the slower `max_flush_delay_idle` instead
+    /// (ADR-0051 section 7, S3-05). Strict-mode ack latency is unaffected:
+    /// a strict write always leaves `waiters` non-empty for its whole flush
+    /// window.
+    fn age_threshold_ns(&self, buf: &SpanTenantBuf) -> i64 {
+        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        if has_priority {
+            self.config.max_flush_delay.as_nanos() as i64
+        } else {
+            self.config.max_flush_delay_idle.as_nanos() as i64
+        }
+    }
+
     async fn flush_aged(&mut self) {
         let now = self.clock.now_ns();
-        let max_delay_ns = self.config.max_flush_delay.as_nanos() as i64;
         let due: Vec<TenantId> = self
             .tenants
             .iter()
             .filter(|(_, buf)| {
                 buf.oldest_arrival_ns
-                    .map(|t| now.saturating_sub(t) >= max_delay_ns)
+                    .map(|t| now.saturating_sub(t) >= self.age_threshold_ns(buf))
                     .unwrap_or(false)
             })
             .map(|(t, _)| t.clone())
@@ -314,7 +326,14 @@ impl SpanShardActor {
         let seq = self.next_seq;
         self.next_seq += 1;
         let flush_open_ns = self.clock.now_ns();
-        let ingest_hour_bucket = u32::try_from(flush_open_ns.div_euclid(NS_PER_HOUR)).unwrap_or(0);
+        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
+            Ok(bucket) => bucket,
+            Err(msg) => {
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(msg)));
+                return;
+            }
+        };
         let deadline_ns =
             flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
 
