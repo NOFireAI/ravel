@@ -34,6 +34,8 @@ const SECTION_KIND_HIST_PAGES: u32 = 7;
 // v5 sparse-catalog kinds (docs/segment-format.md).
 const SECTION_KIND_SERIES_IDX: u32 = 8;
 const SECTION_KIND_SERIES_META_CHUNKS: u32 = 9;
+// v6 addition (ADR-0047): optional per-object exemplar records.
+const SECTION_KIND_EXEMPLARS: u32 = 10;
 
 #[derive(Debug, Parser)]
 #[command(name = "ravel-cli", about = "Ravel dev inspection CLI")]
@@ -347,6 +349,7 @@ fn section_kind_name(kind: u32) -> &'static str {
         SECTION_KIND_HIST_PAGES => "HIST_PAGES",
         SECTION_KIND_SERIES_IDX => "SERIES_IDX",
         SECTION_KIND_SERIES_META_CHUNKS => "SERIES_META_CHUNKS",
+        SECTION_KIND_EXEMPLARS => "EXEMPLARS",
         _ => "UNKNOWN",
     }
 }
@@ -511,18 +514,19 @@ fn segment_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         );
     }
 
-    segment_inspect_v5(bytes, footer, limits)
+    segment_inspect_v6(bytes, footer, limits)
 }
 
-/// v5 catalog decode and print (docs/segment-format.md). ADR-0027 leaves v5
+/// v6 catalog decode and print (docs/segment-format.md). ADR-0047 leaves v6
 /// the only version; the run-major catalog is decoded over the whole object
 /// (folding the chunked SERIES_META, or the whole SERIES_META below the
 /// sparse threshold), and each series prints its per-run provenance and page
 /// ranges. `schema_count` is derived from the decoded label sets (distinct
 /// name-only tuples, first-appearance order), the same "(derived)" caveat the
 /// pre-v5 inspector carried. Histogram runs decode their HIST/TS pages and
-/// print every record's full field detail.
-fn segment_inspect_v5(
+/// print every record's full field detail. EXEMPLARS (ADR-0047) is optional
+/// and printed last, since it is object-wide rather than per series.
+fn segment_inspect_v6(
     bytes: &[u8],
     footer: &Footer,
     limits: ravel_segment::ReaderLimits,
@@ -619,6 +623,58 @@ fn segment_inspect_v5(
         }
     }
 
+    print_exemplars(bytes, footer, limits)?;
+
+    Ok(())
+}
+
+/// EXEMPLARS is optional (ADR-0047): absent means no exemplars were attached
+/// to this object, not an empty section, so `decode_exemplars_section`
+/// returns an empty list either way and there is nothing else to
+/// distinguish here.
+fn print_exemplars(
+    bytes: &[u8],
+    footer: &Footer,
+    limits: ravel_segment::ReaderLimits,
+) -> anyhow::Result<()> {
+    let Some(exemplars_section) = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SECTION_KIND_EXEMPLARS)
+    else {
+        println!("exemplar_count: 0");
+        return Ok(());
+    };
+    let label_dict_section = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SECTION_KIND_LABEL_DICT)
+        .ok_or_else(|| anyhow::anyhow!("EXEMPLARS present without LABEL_DICT"))?;
+    let label_dict_bytes =
+        absolute_range(bytes, (label_dict_section.offset, label_dict_section.len))?;
+    let exemplars_bytes = absolute_range(bytes, (exemplars_section.offset, exemplars_section.len))?;
+    let exemplars =
+        ravel_segment::decode_exemplars_section(footer, label_dict_bytes, exemplars_bytes, limits)
+            .map_err(|err| anyhow::anyhow!("failed to decode exemplars: {err}"))?;
+
+    println!("exemplar_count: {}", exemplars.len());
+    for (i, ex) in exemplars.iter().enumerate() {
+        let attrs = ex
+            .attrs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "  exemplar[{i}]: series_index={} ts_ns={} value={} trace_id={} span_id={} attrs={}",
+            ex.series_index,
+            ex.ts_ns,
+            ex.value,
+            hex::encode(ex.trace_id),
+            hex::encode(ex.span_id),
+            attrs
+        );
+    }
     Ok(())
 }
 
