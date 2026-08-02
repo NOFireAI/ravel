@@ -39,3 +39,8 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0037](0037-container-image-ci-registry.md) | CI-built container images published to GHCR, tag-push/dispatch only, public after a manual visibility flip | Proposed |
 | [0038](0038-empty-value-label-drop-otlp-otap.md) | Drop empty-valued labels at OTLP and OTAP admission, matching remote-write | Accepted |
 | [0048](0048-maintenance-safety-and-coverage.md) | Maintenance safety and coverage: legal hold wired, storage-derived tenant set, mass-orphan circuit breaker, compaction conservation gate | Accepted |
+| [0044](0044-query-cost-accounting.md) | Per-query cost accounting, a bounded metrics endpoint, and a two-part pre-execution cost estimate | Accepted |
+| [0045](0045-rspan-v2-trace-investigation.md) | RSPAN v2 and v3: pruning columns, a shared codec crate, and a reachable spans table | Accepted |
+| [0046](0046-read-cache-tier.md) | A content-addressed read cache at the read funnels, not a store decorator | Accepted |
+| [0047](0047-exemplars.md) | Exemplars: an RSEG section, a capped admission, and a correlation surface | Accepted |
+| [0049](0049-rlog-postings.md) | RLOG POSTINGS: exact block-level attribute pruning, opt-in per field | Accepted |
