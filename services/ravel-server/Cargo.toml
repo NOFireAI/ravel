@@ -9,8 +9,10 @@ rust-version.workspace = true
 ravel-types = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-catalog = { workspace = true }
+ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }
 ravel-ingest = { workspace = true }
+ravel-logseg = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
@@ -40,6 +42,23 @@ tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
+# The alert evaluator hashes the RLOG object it writes to build the commit
+# record's content_hash, the same hash log ingest computes (ravel-ingest
+# log_shard).
+blake3 = { workspace = true }
+# The webhook and Alertmanager alert sinks POST JSON (ADR-0043 decision 6).
+# Already present in the build graph as this crate's test HTTP client; this
+# promotes the same pinned version to a normal dependency so the sinks can use
+# it, rather than hand-rolling an HTTP/1.1 client with no TLS over
+# `tokio::net::TcpStream`.
+reqwest = { version = "0.13", features = ["json"] }
+
+# ravel-alerting is declared here as a version-pinned path dependency rather
+# than through `[workspace.dependencies]` for the same reason ravel-sql and
+# ravel-rspan below are: the workspace root Cargo.toml is outside this task's
+# scope. The pin keeps cargo-deny from counting it as a wildcard path
+# dependency.
+ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.1.0" }
 
 # ravel-sql is declared here as a path dependency rather than through
 # `[workspace.dependencies]` because the workspace root Cargo.toml is outside
@@ -76,6 +95,8 @@ sql = ["dep:ravel-sql"]
 flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
 
 [dev-dependencies]
+# `query` on top of the normal dependency's `json`: the test client builds
+# query strings the server binary itself never needs to.
 reqwest = { version = "0.13", features = ["json", "query"] }
 # Test-only: `channel` is not in tonic's default feature set, and the Flight
 # startup test needs a gRPC client to call the server it just started. The
@@ -87,16 +108,7 @@ tower = { workspace = true }
 # Test-only: the Flight SQL tests adapt a `tonic::Streaming` into the stream
 # `arrow_flight::decode` consumes, which needs the `TryStreamExt` combinators.
 futures = { workspace = true }
-ravel-commit = { workspace = true }
 ravel-segment = { workspace = true }
-# Test-only: the SQL `logs` endpoint test writes real RLOG objects and their
-# commit records; the commit record's content hash is blake3 over the object
-# bytes, the same hash log ingest computes (ravel-ingest log_shard).
-blake3 = { workspace = true }
-# Test-only: the log ingest end-to-end test decodes the RLOG object the write
-# flushed, straight out of the object store. The server binary never reads a
-# log object back; only the test does.
-ravel-logseg = { workspace = true }
 # Test-only, same reason for spans: the trace ingest end-to-end test decodes the
 # RSPAN object the write flushed. ravel-rspan (ADR-0041) is new and not yet
 # listed in the workspace [workspace.dependencies]; the root Cargo.toml is out

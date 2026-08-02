@@ -1,6 +1,8 @@
 //! ravel-server: gateway + ingest + query in one binary for development
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
+pub mod alert_sink;
+pub mod alerting;
 pub mod analytics;
 pub mod config;
 #[cfg(feature = "flight-sql")]
@@ -43,6 +45,7 @@ use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+pub use alerting::AlertEvalConfig;
 pub use config::{Cli, Mode, StoreKind};
 pub use fold::FoldTaskConfig;
 pub use maintain::MaintenanceTaskConfig;
@@ -82,6 +85,11 @@ pub struct ServerConfig {
     /// tenant list is `fold_tenants` (both derive from the same tenant-token
     /// config). Only spawned in [`Mode::Maintain`]; `enabled` gates it.
     pub maintain: MaintenanceTaskConfig,
+    /// Background alert-rule evaluation (ADR-0043). Its tenant list is the key
+    /// set of its own rule map, loaded from `--alert-rules-file`, independent
+    /// of `fold_tenants`. Spawned only in the modes that build a query engine
+    /// ([`Mode::All`] and [`Mode::Query`]); `enabled` gates it.
+    pub alerting: AlertEvalConfig,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -98,6 +106,7 @@ pub struct Running {
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
     fold_tasks: fold::FoldTasks,
     maintenance_tasks: maintain::MaintenanceTasks,
+    alert_tasks: alerting::AlertEvalTasks,
 }
 
 impl Running {
@@ -152,6 +161,7 @@ impl Running {
 
         self.fold_tasks.shutdown().await;
         self.maintenance_tasks.shutdown().await;
+        self.alert_tasks.shutdown().await;
 
         Ok(())
     }
@@ -282,12 +292,25 @@ pub async fn start(
     #[cfg(feature = "flight-sql")]
     let mut sql_state: Option<sql::SqlState> = None;
 
+    // The alert evaluator runs in exactly the modes that build a query engine:
+    // a rule is a query, and a gateway-only or maintain-only process has
+    // nothing to evaluate it with. Filled in below so it can borrow the same
+    // engine instances the query endpoints serve from (ADR-0043 consequence 2)
+    // rather than constructing a second `QueryEngine`/`SqlExecutor` over the
+    // same store.
+    let mut alert_tasks = alerting::AlertEvalTasks::none();
+
     if matches!(config.mode, Mode::All | Mode::Query) {
         let app_state = query::build_app_state(
             catalog.clone(),
             store.clone(),
             config.tenant_resolver.clone(),
         );
+        // Bound without an initializer and assigned exactly once inside the
+        // block below, which always runs under this feature: a `None` default
+        // would be an assignment no reader ever sees.
+        #[cfg(feature = "sql")]
+        let alert_sql_executor: Option<Arc<ravel_sql::SqlExecutor>>;
         #[cfg(feature = "sql")]
         {
             // Mounted alongside the Prometheus-shaped routes on the same
@@ -298,6 +321,7 @@ pub async fn start(
                 config.shard_count,
                 config.tenant_resolver.clone(),
             )?;
+            alert_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));
             #[cfg(feature = "flight-sql")]
             {
@@ -314,6 +338,20 @@ pub async fn start(
             clock: Arc::new(SystemClock),
         };
         http_router = http_router.merge(analytics::router(analytics_state));
+
+        // Same `QueryEngine` (and, under the `sql` feature, the same
+        // `SqlExecutor`) the routes just mounted serve from.
+        alert_tasks = alerting::spawn(
+            store.clone(),
+            alerting::AlertQueryEngines {
+                promql: app_state.engine.clone(),
+                #[cfg(feature = "sql")]
+                sql: alert_sql_executor,
+            },
+            Arc::new(SystemClock),
+            config.alerting.clone(),
+        )?;
+
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }
 
@@ -439,5 +477,6 @@ pub async fn start(
         span_ingest_router,
         fold_tasks,
         maintenance_tasks,
+        alert_tasks,
     })
 }

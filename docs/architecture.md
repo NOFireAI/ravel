@@ -47,6 +47,8 @@ ravel-types
   <- ravel-maintain     (commit, object-store, segment, logseg; the L0->L1
                           compactor, GC sweeper, and age-based retention)
   <- ravel-analytics    (types only; pure post-evaluation compute stage)
+  <- ravel-alerting     (types, logseg; pure rule/condition/state/record
+                          logic, no I/O and no scheduler)
   <- ravel-sql          (query, catalog, types; arrow + datafusion, in
                           progress -- see below)
   <- services/ravel-server, services/ravel-cli
@@ -114,3 +116,34 @@ applies the requested op to each series of the matrix, capping a call at 1000
 series and each `change_point` series at 2000 points (approximation via
 `downsample` is opt-in and visible). Unlike the SQL path it needs no cargo
 feature, since it links no Arrow or DataFusion.
+
+## Alert evaluation
+
+`ravel-alerting` (ADR-0043) holds the rule shape, the condition test, the alert
+state machine, and the `Signal::Alerts` record encoding as pure logic. The
+driver lives in `ravel-server` (`alerting.rs`, `alert_sink.rs`): one background
+tokio task per tenant, shaped exactly like the maintenance task
+(`spawn`/`run_loop`, a jittered `--alert-eval-interval-secs`, a `oneshot`
+shutdown per task). It runs in the modes that build a query engine, `--mode
+all` and `--mode query`, because a rule is a query and it evaluates rules
+against the very `QueryEngine` and `SqlExecutor` instances `/api/v1/query` and
+`/api/v1/sql` serve from, in process.
+
+Rules are static per-tenant config loaded once at startup from the JSON file
+`--alert-rules-file` names; a rules-management API is deferred (ADR-0043
+decision 2). Each tick folds the tenant's durable alert history to the latest
+record per `alert_id`, evaluates every rule, and writes a record only on a
+state transition -- pending, firing, resolved -- never per tick. No alert state
+is held in process memory, so a restarted evaluator resumes from the records.
+
+An alert record is an ordinary RLOG object under the `a` keyspace, published
+with the same data-PUT-then-commit-PUT protocol as any other signal
+(create-if-absent, CRC32C upload checksum), which is what makes an abandoned
+write invisible: the fold reads commit records, never data objects directly.
+
+Two notification sinks ship: a webhook (the transition as JSON) and an
+Alertmanager-compatible sink (`POST /api/v2/alerts` in Alertmanager's own
+payload shape). Both fire only after the record is durable, and a sink failure
+is logged and retried on a later tick from the latest record -- delivery is
+at-least-once and never blocks, delays, or alters the write (ADR-0043 decision
+6).

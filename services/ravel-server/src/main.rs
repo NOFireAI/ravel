@@ -1,12 +1,18 @@
 //! ravel-server: gateway + ingest + query in one binary for development
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
 use ravel_maintain::{CompactorConfig, RetentionConfig};
-use ravel_server::{Cli, FoldTaskConfig, MaintenanceTaskConfig, Mode, ServerConfig};
+use ravel_server::alert_sink::DEFAULT_SINK_TIMEOUT;
+use ravel_server::alerting::{DEFAULT_QUERY_DEADLINE, load_rules_file};
+use ravel_server::{
+    AlertEvalConfig, Cli, FoldTaskConfig, MaintenanceTaskConfig, Mode, ServerConfig,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -54,6 +60,24 @@ async fn main() -> anyhow::Result<()> {
         RetentionConfig::from_policy(retention_policy, &compactor, catalog_max_ingest_lag_ns)
             .map_err(|e| anyhow::anyhow!("invalid retention configuration: {e}"))?;
 
+    // Alert rules are static per-tenant config loaded once at startup
+    // (ADR-0043 decision 2), and every validation the rules can fail happens
+    // here rather than once per evaluation tick. Alerting stays off unless a
+    // rules file was named and it holds at least one rule.
+    let alert_rules = match cli.alert_rules_file.as_deref() {
+        Some(path) => load_rules_file(path)?,
+        None => HashMap::new(),
+    };
+    let alert_sinks = cli
+        .parse_alert_sinks()
+        .context("failed to parse alert sink flags")?;
+    if !alert_rules.is_empty() && alert_sinks.is_empty() {
+        tracing::info!(
+            "alert rules are configured but no sink is: transitions will be written as durable \
+             Signal::Alerts records and nothing will be notified"
+        );
+    }
+
     let config = ServerConfig {
         mode: cli.mode,
         listen_http: cli.listen_http,
@@ -71,6 +95,15 @@ async fn main() -> anyhow::Result<()> {
             shard_count: cli.shards,
             compactor,
             retention,
+        },
+        alerting: AlertEvalConfig {
+            enabled: !alert_rules.is_empty(),
+            interval: Duration::from_secs(cli.alert_eval_interval_secs),
+            rules: Arc::new(alert_rules),
+            sinks: Arc::new(alert_sinks),
+            query_deadline: DEFAULT_QUERY_DEADLINE,
+            sink_timeout: DEFAULT_SINK_TIMEOUT,
+            sql_lookback: cli.parse_alert_sql_lookback()?,
         },
     };
 
