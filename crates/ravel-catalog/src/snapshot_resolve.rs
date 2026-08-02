@@ -15,6 +15,7 @@ use futures::stream::{self, StreamExt};
 use ravel_commit::{keys, signal};
 use ravel_object_store::{GetRange, StoreError};
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead};
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
@@ -169,18 +170,20 @@ impl Catalog {
         signal: Signal,
         now_ns: i64,
         want_postings: bool,
+        accounting: &QueryAccounting,
     ) -> Result<Option<SnapshotWindow>, CatalogError> {
         let head_key = head_object_key(tenant, signal);
         let Some(head) = self
-            .read_head(tenant, signal, &head_key, now_ns, false)
+            .read_head(tenant, signal, &head_key, now_ns, false, accounting)
             .await?
         else {
             return Ok(None);
         };
-        match self.load_snapshot_parts(tenant, &head).await {
+        match self.load_snapshot_parts(tenant, &head, accounting).await {
             PartLoadOutcome::Loaded(parts) => {
                 let postings = if want_postings {
-                    self.load_snapshot_postings(tenant, &head, &parts).await
+                    self.load_snapshot_postings(tenant, &head, &parts, accounting)
+                        .await
                 } else {
                     None
                 };
@@ -196,15 +199,18 @@ impl Catalog {
                 // step 2): bypass the TTL cache so a part GC'd since the
                 // cached HEAD was read is not raced again.
                 let Some(fresh_head) = self
-                    .read_head(tenant, signal, &head_key, now_ns, true)
+                    .read_head(tenant, signal, &head_key, now_ns, true, accounting)
                     .await?
                 else {
                     return Ok(None);
                 };
-                match self.load_snapshot_parts(tenant, &fresh_head).await {
+                match self
+                    .load_snapshot_parts(tenant, &fresh_head, accounting)
+                    .await
+                {
                     PartLoadOutcome::Loaded(parts) => {
                         let postings = if want_postings {
-                            self.load_snapshot_postings(tenant, &fresh_head, &parts)
+                            self.load_snapshot_postings(tenant, &fresh_head, &parts, accounting)
                                 .await
                         } else {
                             None
@@ -233,6 +239,7 @@ impl Catalog {
         tenant: &TenantHash,
         head: &SnapshotHead,
         parts: &[Arc<DecodedPart>],
+        accounting: &QueryAccounting,
     ) -> Option<Arc<DecodedPostings>> {
         let postings_ref = head.postings.as_ref()?;
         let expected_part_blake3: Vec<[u8; 32]> = head
@@ -242,11 +249,17 @@ impl Catalog {
             .collect::<Result<_, _>>()
             .ok()?;
 
-        if let Some(cached) = self.postings_cache().get(tenant, &postings_ref.key) {
+        if let Some(cached) = self
+            .postings_cache()
+            .get(tenant, &postings_ref.key, accounting)
+        {
             return Some(cached);
         }
 
-        let got = match self.guarded_get(&postings_ref.key, GetRange::Full).await {
+        let got = match self
+            .guarded_get(&postings_ref.key, GetRange::Full, accounting)
+            .await
+        {
             Ok(got) => got,
             Err(err) => {
                 tracing::warn!(error = %err, key = %postings_ref.key, "postings GET failed, pruning disabled");
@@ -287,6 +300,7 @@ impl Catalog {
             *tenant,
             postings_ref.key.clone(),
             decoded.clone(),
+            got.data.len() as u64,
             self.config().postings_cache_entries,
         );
         Some(decoded)
@@ -298,6 +312,7 @@ impl Catalog {
     /// error (docs/metric-index-plan.md 5.1 step 1: "shard_count mismatch
     /// is a loud/hard error"), since it means this catalog's own config
     /// disagrees with the index it is about to trust.
+    #[allow(clippy::too_many_arguments)]
     async fn read_head(
         &self,
         tenant: &TenantHash,
@@ -305,16 +320,21 @@ impl Catalog {
         head_key: &str,
         now_ns: i64,
         bypass_cache: bool,
+        accounting: &QueryAccounting,
     ) -> Result<Option<Arc<SnapshotHead>>, CatalogError> {
         if !bypass_cache
-            && let Some(cached) =
-                self.head_cache()
-                    .get(tenant, signal, now_ns, self.config().head_cache_ttl_ns)
+            && let Some(cached) = self.head_cache().get(
+                tenant,
+                signal,
+                now_ns,
+                self.config().head_cache_ttl_ns,
+                accounting,
+            )
         {
             return Ok(Some(cached));
         }
 
-        let got = match self.guarded_get(head_key, GetRange::Full).await {
+        let got = match self.guarded_get(head_key, GetRange::Full, accounting).await {
             Ok(got) => got,
             Err(StoreError::NotFound) => return Ok(None),
             Err(err) => {
@@ -346,9 +366,16 @@ impl Catalog {
             });
         }
 
+        let bytes = got.data.len() as u64;
         let head = Arc::new(head);
-        self.head_cache()
-            .insert(*tenant, signal, head.clone(), now_ns);
+        self.head_cache().insert(
+            *tenant,
+            signal,
+            head.clone(),
+            bytes,
+            now_ns,
+            self.config().head_cache_capacity,
+        );
         Ok(Some(head))
     }
 
@@ -366,13 +393,14 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         head: &SnapshotHead,
+        accounting: &QueryAccounting,
     ) -> PartLoadOutcome {
         // Owned part-ref clones, not borrowed `&SnapshotPartRef`s: a stream
         // closure that borrows each item infers a non-higher-ranked lifetime
         // for the future and fails to unify with axum's `Handler` blanket
         // impl at the HTTP router (the "FnOnce is not general enough" wall).
         let loaded: Vec<OnePartOutcome> = stream::iter(head.parts.iter().cloned())
-            .map(|part_ref| async move { self.load_one_part(tenant, &part_ref).await })
+            .map(|part_ref| async move { self.load_one_part(tenant, &part_ref, accounting).await })
             .buffered(crate::catalog::MAX_CONCURRENT_REQUESTS)
             .collect()
             .await;
@@ -394,11 +422,15 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         part_ref: &ravel_proto::catalog::v1::SnapshotPartRef,
+        accounting: &QueryAccounting,
     ) -> OnePartOutcome {
-        if let Some(cached) = self.part_cache().get(tenant, &part_ref.key) {
+        if let Some(cached) = self.part_cache().get(tenant, &part_ref.key, accounting) {
             return OnePartOutcome::Loaded(cached);
         }
-        let got = match self.guarded_get(&part_ref.key, GetRange::Full).await {
+        let got = match self
+            .guarded_get(&part_ref.key, GetRange::Full, accounting)
+            .await
+        {
             Ok(got) => got,
             Err(StoreError::NotFound) => {
                 tracing::warn!(key = %part_ref.key, "snapshot part not found, will re-read HEAD once");
@@ -428,6 +460,7 @@ impl Catalog {
             *tenant,
             part_ref.key.clone(),
             decoded.clone(),
+            got.data.len() as u64,
             self.config().snapshot_cache_parts,
         );
         OnePartOutcome::Loaded(decoded)

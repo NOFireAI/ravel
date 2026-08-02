@@ -30,6 +30,13 @@ pub const DEFAULT_SNAPSHOT_CACHE_PARTS: usize = 32;
 /// Postings objects are content-addressed and immutable, same eviction
 /// rationale as [`DEFAULT_SNAPSHOT_CACHE_PARTS`].
 pub const DEFAULT_POSTINGS_CACHE_ENTRIES: usize = 32;
+/// Default bound on the total number of (tenant, signal) entries
+/// [`crate::cache::HeadCache`] holds at once, process-wide (issue #421: the
+/// cache had a TTL but no capacity bound, so it grew one entry per (tenant,
+/// signal) with no limit on the number of tenants). `Signal` has at most a
+/// handful of variants, so this bound admits thousands of actively-queried
+/// tenants per process before the oldest (tenant, signal) pair is evicted.
+pub const DEFAULT_HEAD_CACHE_CAPACITY: usize = 10_000;
 
 /// Catalog configuration.
 ///
@@ -83,6 +90,10 @@ pub struct CatalogConfig {
     /// Bound on decoded name-postings objects cached per tenant (P5b).
     /// Default [`DEFAULT_POSTINGS_CACHE_ENTRIES`].
     pub postings_cache_entries: usize,
+    /// Bound on the total number of (tenant, signal) entries
+    /// [`crate::cache::HeadCache`] holds at once, process-wide. Default
+    /// [`DEFAULT_HEAD_CACHE_CAPACITY`].
+    pub head_cache_capacity: usize,
 }
 
 impl Default for CatalogConfig {
@@ -99,6 +110,7 @@ impl Default for CatalogConfig {
             max_snapshot_part_bytes: snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
             max_postings_bytes: snapshot_format::DEFAULT_MAX_POSTINGS_BYTES,
             postings_cache_entries: DEFAULT_POSTINGS_CACHE_ENTRIES,
+            head_cache_capacity: DEFAULT_HEAD_CACHE_CAPACITY,
         }
     }
 }

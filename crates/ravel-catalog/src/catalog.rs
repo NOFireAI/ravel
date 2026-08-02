@@ -12,6 +12,7 @@ use ravel_commit::keys::BucketEntry;
 use ravel_commit::{keys, record, signal};
 use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
@@ -93,22 +94,43 @@ impl Catalog {
     /// item 2). The permit is released the moment the GET resolves and is
     /// never held across another guarded request, so a resolve fanning out
     /// many records cannot wait on permits it already holds.
+    ///
+    /// The sole funnel for every GET a query issues (ADR-0044 decision 2,
+    /// issue #421): `accounting` is credited one [`AccountedOp::Get`] request
+    /// unconditionally, and its bytes only on success (`got.data.len()`,
+    /// mirroring `InstrumentedStore`'s convention that a failed GET moves no
+    /// bytes). Call sites never account for themselves.
     pub(crate) async fn guarded_get(
         &self,
         key: &str,
         range: GetRange,
+        accounting: &QueryAccounting,
     ) -> Result<GetOutcome, StoreError> {
         let _permit =
             self.request_semaphore.acquire().await.map_err(|_| {
                 StoreError::Transient("catalog request semaphore closed".to_string())
             })?;
-        self.store.get(key, range).await
+        let result = self.store.get(key, range).await;
+        accounting.record_s3_request(AccountedOp::Get);
+        if let Ok(got) = &result {
+            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+        }
+        result
     }
 
     /// Prefix listing bounded by the same in-flight semaphore, draining every
     /// page (the [`ravel_object_store::list_all`] contract) with a permit
     /// acquired per page rather than one held across the whole listing.
-    async fn guarded_list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+    ///
+    /// The sole funnel for every LIST a query issues (ADR-0044 decision 2):
+    /// `accounting` is credited one [`AccountedOp::List`] request per page,
+    /// unconditionally, mirroring `InstrumentedStore`'s convention that a
+    /// LIST never moves bytes.
+    async fn guarded_list_all(
+        &self,
+        prefix: &str,
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<ObjectMeta>, StoreError> {
         let mut out: Vec<ObjectMeta> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut page_token = None;
@@ -117,7 +139,9 @@ impl Catalog {
                 let _permit = self.request_semaphore.acquire().await.map_err(|_| {
                     StoreError::Transient("catalog request semaphore closed".to_string())
                 })?;
-                self.store.list(prefix, page_token).await?
+                let page = self.store.list(prefix, page_token).await;
+                accounting.record_s3_request(AccountedOp::List);
+                page?
             };
             for meta in page.objects {
                 if seen.insert(meta.key.clone()) {
@@ -201,7 +225,34 @@ impl Catalog {
         min_tokens: &[CommitToken],
         now_ns: i64,
     ) -> Result<Snapshot, CatalogError> {
-        self.resolve_impl(tenant, signal, range, min_tokens, now_ns, None)
+        self.resolve_with_accounting(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            &QueryAccounting::new(),
+        )
+        .await
+    }
+
+    /// Like [`Catalog::resolve`], but records every S3 request and cache
+    /// access this resolve makes into `accounting` (ADR-0044, issue #421).
+    /// A separate method rather than an added `resolve` parameter: `resolve`
+    /// is called from `ravel-query`, `ravel-sql`, and `services/ravel-server`
+    /// (out of this task's scope), so its signature and every existing call
+    /// site stay exactly as they were; only callers that want accounting
+    /// need to switch to this entry point.
+    pub async fn resolve_with_accounting(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        accounting: &QueryAccounting,
+    ) -> Result<Snapshot, CatalogError> {
+        self.resolve_impl(tenant, signal, range, min_tokens, now_ns, None, accounting)
             .await
     }
 
@@ -231,10 +282,46 @@ impl Catalog {
         now_ns: i64,
         name_filter: Option<&str>,
     ) -> Result<Snapshot, CatalogError> {
-        self.resolve_impl(tenant, signal, range, min_tokens, now_ns, name_filter)
-            .await
+        self.resolve_pruned_with_accounting(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            name_filter,
+            &QueryAccounting::new(),
+        )
+        .await
     }
 
+    /// Like [`Catalog::resolve_pruned`], but records every S3 request and
+    /// cache access this resolve makes into `accounting` (ADR-0044, issue
+    /// #421). See [`Catalog::resolve_with_accounting`] for why this is a
+    /// separate method rather than a `resolve_pruned` parameter.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_pruned_with_accounting(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<Snapshot, CatalogError> {
+        self.resolve_impl(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            name_filter,
+            accounting,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_impl(
         &self,
         tenant: &TenantHash,
@@ -243,6 +330,7 @@ impl Catalog {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        accounting: &QueryAccounting,
     ) -> Result<Snapshot, CatalogError> {
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
         let mut segments_pruned = 0u64;
@@ -259,7 +347,7 @@ impl Catalog {
             // `__name__` filter, so a query without one never fetches or
             // decodes it.
             let window = self
-                .resolve_snapshot_window(tenant, signal, now_ns, name_filter.is_some())
+                .resolve_snapshot_window(tenant, signal, now_ns, name_filter.is_some(), accounting)
                 .await?;
             let listing_start_hour = match &window {
                 Some(window) if window.watermark_hour >= window_start_hour => {
@@ -294,7 +382,7 @@ impl Catalog {
             let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
                 stream::iter(bucket_coords)
                     .map(|(shard, hour)| async move {
-                        self.list_hour_bucket(tenant, signal, shard, hour, range)
+                        self.list_hour_bucket(tenant, signal, shard, hour, range, accounting)
                             .await
                     })
                     .buffered(MAX_CONCURRENT_REQUESTS)
@@ -308,7 +396,7 @@ impl Catalog {
         }
 
         for token in min_tokens {
-            self.resolve_min_token(tenant, signal, token, &mut segments)
+            self.resolve_min_token(tenant, signal, token, &mut segments, accounting)
                 .await?;
         }
 
@@ -356,6 +444,7 @@ impl Catalog {
         Some((start_hour, end_hour))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn list_hour_bucket(
         &self,
         tenant: &TenantHash,
@@ -363,10 +452,11 @@ impl Catalog {
         shard: u32,
         hour: u32,
         range: TimeRange,
+        accounting: &QueryAccounting,
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
         let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
-        let objects = self.guarded_list_all(&prefix).await?;
+        let objects = self.guarded_list_all(&prefix, accounting).await?;
 
         // Partition the listed keys by shape (docs/catalog-and-mvcc.md step
         // 2). An unrecognized shape is a fail-loud error, never a silent
@@ -397,16 +487,18 @@ impl Catalog {
         // then hit the cache instead of each paying a serial GET. A GET
         // failure surfaces here, exactly as it would have from the first
         // sequential load.
-        self.prewarm_commit_records(tenant, signal, shard, &l0_keys)
+        self.prewarm_commit_records(tenant, signal, shard, &l0_keys, accounting)
             .await?;
-        self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys)
+        self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys, accounting)
             .await?;
 
         // No compaction record: Phase 1 behavior, every overlapping L0.
         if compaction_keys.is_empty() {
             for key in &l0_keys {
-                self.include_l0_if_overlaps(tenant, signal, shard, key, &range, &mut out)
-                    .await?;
+                self.include_l0_if_overlaps(
+                    tenant, signal, shard, key, &range, &mut out, accounting,
+                )
+                .await?;
             }
             return Ok(out);
         }
@@ -420,7 +512,7 @@ impl Catalog {
         let mut input_set_hashes: HashSet<Vec<u8>> = HashSet::new();
         for ckey in &compaction_keys {
             let record = self
-                .load_and_validate_compaction(tenant, signal, shard, ckey)
+                .load_and_validate_compaction(tenant, signal, shard, ckey, accounting)
                 .await?;
             input_set_hashes.insert(record.input_set_hash.clone());
             newest_record_created_ns = newest_record_created_ns.max(record.created_unix_ns);
@@ -463,7 +555,9 @@ impl Catalog {
         // postdates the newest compaction record (docs/catalog-and-mvcc.md
         // step 3).
         for key in &l0_keys {
-            let record = self.load_and_validate(tenant, signal, shard, key).await?;
+            let record = self
+                .load_and_validate(tenant, signal, shard, key, accounting)
+                .await?;
             let identity = (
                 record.writer_id.clone(),
                 record.writer_epoch,
@@ -504,6 +598,7 @@ impl Catalog {
         signal: Signal,
         shard: u32,
         keys: &[String],
+        accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         // Owned key clones, not borrowed slice items: a stream closure that
         // borrows each `&String` makes rustc infer a non-higher-ranked
@@ -512,7 +607,7 @@ impl Catalog {
         // general enough" wall the prefetch closure in `ravel-query` hit).
         let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
             .map(|key| async move {
-                self.load_and_validate(tenant, signal, shard, &key)
+                self.load_and_validate(tenant, signal, shard, &key, accounting)
                     .await
                     .map(|_| ())
             })
@@ -533,10 +628,11 @@ impl Catalog {
         signal: Signal,
         shard: u32,
         keys: &[String],
+        accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
             .map(|key| async move {
-                self.load_and_validate_compaction(tenant, signal, shard, &key)
+                self.load_and_validate_compaction(tenant, signal, shard, &key, accounting)
                     .await
                     .map(|_| ())
             })
@@ -552,6 +648,7 @@ impl Catalog {
     /// Load one L0 commit record and, if its event range overlaps `range`,
     /// add its segment ref to `out`. The plain Phase 1 include path, shared
     /// by the no-compaction fast path.
+    #[allow(clippy::too_many_arguments)]
     async fn include_l0_if_overlaps(
         &self,
         tenant: &TenantHash,
@@ -560,8 +657,11 @@ impl Catalog {
         key: &str,
         range: &TimeRange,
         out: &mut HashMap<String, SegmentRef>,
+        accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
-        let record = self.load_and_validate(tenant, signal, shard, key).await?;
+        let record = self
+            .load_and_validate(tenant, signal, shard, key, accounting)
+            .await?;
         let event_range = TimeRange {
             start_ns: record.min_event_ts_ns,
             end_ns: record.max_event_ts_ns,
@@ -586,12 +686,14 @@ impl Catalog {
         signal: Signal,
         shard: u32,
         key: &str,
+        accounting: &QueryAccounting,
     ) -> Result<Arc<CompactionRecord>, CatalogError> {
-        if let Some(cached) = self.compaction_cache.get(tenant, key) {
+        if let Some(cached) = self.compaction_cache.get(tenant, key, accounting) {
             validate_compaction_expected_fields(&cached, tenant, signal, shard, key)?;
             return Ok(cached);
         }
-        let got = self.guarded_get(key, GetRange::Full).await?;
+        let got = self.guarded_get(key, GetRange::Full, accounting).await?;
+        let bytes = got.data.len() as u64;
         let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
             CatalogError::CompactionRecordDecode {
                 key: key.to_string(),
@@ -604,6 +706,7 @@ impl Catalog {
             *tenant,
             key.to_string(),
             record.clone(),
+            bytes,
             self.config.cache_capacity_per_tenant,
         );
         Ok(record)
@@ -627,9 +730,10 @@ impl Catalog {
         signal: Signal,
         token: &CommitToken,
         out: &mut HashMap<String, SegmentRef>,
+        accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         let key = keys::commit_key_for_token(tenant, signal, token)?;
-        if let Some(cached) = self.cache.get(tenant, &key)
+        if let Some(cached) = self.cache.get(tenant, &key, accounting)
             && validate_expected_fields(&cached, tenant, signal, token.shard, &key).is_ok()
         {
             let segment_ref = build_segment_ref(&key, &cached)?;
@@ -651,8 +755,9 @@ impl Catalog {
         let mut notfound_retries: u32 = 1;
         let mut transient_retries: u32 = 1;
         loop {
-            match self.guarded_get(&key, GetRange::Full).await {
+            match self.guarded_get(&key, GetRange::Full, accounting).await {
                 Ok(got) => {
+                    let bytes = got.data.len() as u64;
                     let record = record::decode(&got.data)?;
                     validate_expected_fields(&record, tenant, signal, token.shard, &key)?;
                     let record = Arc::new(record);
@@ -660,6 +765,7 @@ impl Catalog {
                         *tenant,
                         key.clone(),
                         record.clone(),
+                        bytes,
                         self.config.cache_capacity_per_tenant,
                     );
                     let segment_ref = build_segment_ref(&key, &record)?;
@@ -679,7 +785,7 @@ impl Catalog {
                     // L1 parts, a tombstoned bucket is satisfied with zero
                     // segments.
                     return self
-                        .resolve_min_token_fallback(tenant, signal, token, out)
+                        .resolve_min_token_fallback(tenant, signal, token, out, accounting)
                         .await;
                 }
                 Err(e) if e.is_retryable() && transient_retries > 0 => {
@@ -710,10 +816,11 @@ impl Catalog {
         signal: Signal,
         token: &CommitToken,
         out: &mut HashMap<String, SegmentRef>,
+        accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         let prefix =
             keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)?;
-        let objects = self.guarded_list_all(&prefix).await?;
+        let objects = self.guarded_list_all(&prefix, accounting).await?;
         let mut compaction_keys: Vec<String> = Vec::new();
         for meta in objects {
             match keys::partition_bucket_entry(&meta.key)? {
@@ -732,7 +839,7 @@ impl Catalog {
         let token_identity = (token.writer_id.to_string(), token.epoch, token.seq);
         for ckey in &compaction_keys {
             let record = self
-                .load_and_validate_compaction(tenant, signal, token.shard, ckey)
+                .load_and_validate_compaction(tenant, signal, token.shard, ckey, accounting)
                 .await?;
             let covers = record.inputs.iter().any(|input| {
                 (
@@ -763,12 +870,14 @@ impl Catalog {
         signal: Signal,
         shard: u32,
         key: &str,
+        accounting: &QueryAccounting,
     ) -> Result<Arc<CommitRecord>, CatalogError> {
-        if let Some(cached) = self.cache.get(tenant, key) {
+        if let Some(cached) = self.cache.get(tenant, key, accounting) {
             validate_expected_fields(&cached, tenant, signal, shard, key)?;
             return Ok(cached);
         }
-        let got = self.guarded_get(key, GetRange::Full).await?;
+        let got = self.guarded_get(key, GetRange::Full, accounting).await?;
+        let bytes = got.data.len() as u64;
         let record = record::decode(&got.data)?;
         validate_expected_fields(&record, tenant, signal, shard, key)?;
         let record = Arc::new(record);
@@ -776,6 +885,7 @@ impl Catalog {
             *tenant,
             key.to_string(),
             record.clone(),
+            bytes,
             self.config.cache_capacity_per_tenant,
         );
         Ok(record)
@@ -1004,6 +1114,7 @@ mod tests {
     use bytes::Bytes;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::NewCommitRecord;
+    use ravel_object_store::InstrumentedStore;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
@@ -1094,6 +1205,115 @@ mod tests {
         );
         assert_eq!(seg.shard, 0);
         assert_eq!(seg.content_hash.to_vec(), record.content_hash);
+    }
+
+    #[tokio::test]
+    async fn resolve_records_list_and_get_requests_into_accounting() {
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let writer_id = Uuid::new_v4();
+        let payload = format!("segment-0-1-{writer_id}").into_bytes();
+        let content_hash = content_hash_for(&payload);
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: now - 1_000,
+            max_event_ts_ns: now,
+            min_ingest_ts_ns: now - 1_000,
+            max_ingest_ts_ns: now,
+            segment_format_version: 1,
+            created_unix_ns: now,
+            ingest_hour_bucket: 500_000,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+
+        // A separate, uninstrumented catalog over identical data gives the
+        // no-accounting baseline: accounting must be pure observation, never
+        // a behavior change, so its resolved snapshot must match exactly.
+        let plain_store = Arc::new(MemoryStore::new());
+        publish::put_data_object(
+            plain_store.as_ref(),
+            &data_key,
+            Bytes::from(payload.clone()),
+        )
+        .await
+        .expect("put data object");
+        publish::publish(plain_store.as_ref(), &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        let plain_catalog = Catalog::new(plain_store, config(1)).expect("catalog");
+        let baseline = plain_catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect("baseline resolve");
+
+        // A fresh catalog and a fresh instrumented backend, seeded with the
+        // exact same commit record and data object, isolates the resolve
+        // under test from the baseline catalog's own caches.
+        let instrumented_inner = MemoryStore::new();
+        publish::put_data_object(&instrumented_inner, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(&instrumented_inner, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        let store = Arc::new(InstrumentedStore::new(instrumented_inner));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let before = store.metrics().snapshot();
+        let accounting = QueryAccounting::new();
+        let snapshot = catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now, &accounting)
+            .await
+            .expect("accounted resolve");
+        let after = store.metrics().snapshot();
+
+        assert_eq!(snapshot.segments, baseline.segments);
+        assert_eq!(snapshot.segments_pruned, baseline.segments_pruned);
+
+        let acc = accounting.snapshot();
+        let get_calls_diff = after.get.calls - before.get.calls;
+        let list_calls_diff = after.list.calls - before.list.calls;
+        let get_bytes_diff = after.get.bytes - before.get.bytes;
+        let head_calls_diff = after.head.calls - before.head.calls;
+        let list_delimited_calls_diff = after.list_delimited.calls - before.list_delimited.calls;
+        let delete_calls_diff = after.delete.calls - before.delete.calls;
+
+        // Catalog's two funnels only ever issue GET and LIST: no HEAD,
+        // list_delimited, or DELETE call is on the resolve path.
+        assert_eq!(head_calls_diff, 0);
+        assert_eq!(list_delimited_calls_diff, 0);
+        assert_eq!(delete_calls_diff, 0);
+
+        assert_eq!(acc.s3_requests(AccountedOp::Get), get_calls_diff);
+        assert_eq!(acc.s3_requests(AccountedOp::List), list_calls_diff);
+        assert_eq!(acc.s3_requests(AccountedOp::Head), 0);
+        assert_eq!(acc.s3_bytes(AccountedOp::Get), get_bytes_diff);
+        assert_eq!(acc.s3_bytes(AccountedOp::List), 0);
+        assert_eq!(
+            acc.total_s3_requests(),
+            get_calls_diff + list_calls_diff + head_calls_diff
+        );
+        assert_eq!(acc.total_s3_bytes(), get_bytes_diff);
+
+        // At least one LIST (the hour bucket) and one GET (the commit
+        // record, or the head probe) actually happened -- otherwise the
+        // assertions above would be vacuously true.
+        assert!(list_calls_diff >= 1);
+        assert!(get_calls_diff >= 1);
     }
 
     #[tokio::test]

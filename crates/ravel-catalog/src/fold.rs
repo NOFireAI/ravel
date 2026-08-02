@@ -24,6 +24,7 @@ use ravel_object_store::{
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
 use uuid::Uuid;
 
@@ -409,6 +410,11 @@ impl Catalog {
         let shard_count = self.config().shard_count;
         let mut counters = RequestCounters::default();
         let mut attempt: u32 = 0;
+        // Fold never runs on the query path (module docs above) and keeps
+        // its own `RequestCounters`; this handle exists only to satisfy the
+        // shared cache/load API's new `QueryAccounting` parameter (issue
+        // #421) and is discarded.
+        let accounting = QueryAccounting::new();
 
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
@@ -525,7 +531,7 @@ impl Catalog {
                 let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
                 for ckey in &compaction_keys {
                     let record = self
-                        .load_and_validate_compaction(tenant, signal, *shard, ckey)
+                        .load_and_validate_compaction(tenant, signal, *shard, ckey, &accounting)
                         .await?;
                     counters.get_requests += 1;
                     for part in &record.parts {
@@ -552,7 +558,9 @@ impl Catalog {
                 // 2). An unlisted L0 is included exactly as the resolver
                 // includes it.
                 for key in &l0_keys {
-                    let record = self.load_and_validate(tenant, signal, *shard, key).await?;
+                    let record = self
+                        .load_and_validate(tenant, signal, *shard, key, &accounting)
+                        .await?;
                     counters.get_requests += 1;
                     if excluded.contains(&(
                         record.writer_id.clone(),
@@ -648,6 +656,7 @@ impl Catalog {
                                 head,
                                 previous_entries_len as u64,
                                 &mut counters,
+                                &accounting,
                             )
                             .await
                         {
@@ -886,6 +895,7 @@ impl Catalog {
         head: &SnapshotHead,
         previous_entry_count: u64,
         counters: &mut RequestCounters,
+        accounting: &QueryAccounting,
     ) -> Option<Vec<NamePostings>> {
         let postings_ref = head.postings.as_ref()?;
         let expected_part_blake3: Vec<[u8; 32]> = head
@@ -895,7 +905,10 @@ impl Catalog {
             .collect::<Result<_, _>>()
             .ok()?;
 
-        if let Some(cached) = self.postings_cache().get(tenant, &postings_ref.key) {
+        if let Some(cached) = self
+            .postings_cache()
+            .get(tenant, &postings_ref.key, accounting)
+        {
             if cached.header.entry_count == previous_entry_count {
                 return Some(cached.names.clone());
             }
@@ -957,6 +970,7 @@ impl Catalog {
             *tenant,
             postings_ref.key.clone(),
             decoded.clone(),
+            got.data.len() as u64,
             self.config().postings_cache_entries,
         );
         Some(decoded.names.clone())
