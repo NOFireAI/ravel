@@ -7,7 +7,10 @@
 //! string, never an in-place edit.
 
 pub mod accounting;
+pub mod exemplar;
 pub mod logstream;
+
+pub use exemplar::{Exemplar, ExemplarCap};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
