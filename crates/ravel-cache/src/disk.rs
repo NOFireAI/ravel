@@ -444,7 +444,8 @@ impl DiskCache {
     }
 
     fn evict_to_bounds(&self, state: &mut DiskState) {
-        while state.total_bytes > self.limits.max_bytes || state.order.len() > self.limits.max_entries
+        while state.total_bytes > self.limits.max_bytes
+            || state.order.len() > self.limits.max_entries
         {
             let Some(oldest) = state.order.pop_front() else {
                 break;
@@ -504,10 +505,7 @@ mod tests {
 
         let key_normal = test_key_with_len(1, 5);
         cache.insert(key_normal, b"hello");
-        assert_eq!(
-            cache.get(&key_normal).as_deref(),
-            Some(b"hello".as_slice())
-        );
+        assert_eq!(cache.get(&key_normal).as_deref(), Some(b"hello".as_slice()));
 
         let key_zero_len = test_key_with_len(2, 0);
         cache.insert(key_zero_len, b"");
@@ -516,7 +514,10 @@ mod tests {
         let all_zero = vec![0u8; 4096];
         let key_all_zero = test_key_with_len(3, all_zero.len() as u64);
         cache.insert(key_all_zero, &all_zero);
-        assert_eq!(cache.get(&key_all_zero).as_deref(), Some(all_zero.as_slice()));
+        assert_eq!(
+            cache.get(&key_all_zero).as_deref(),
+            Some(all_zero.as_slice())
+        );
     }
 
     #[test]
@@ -536,9 +537,10 @@ mod tests {
             {
                 make_readonly(&readonly_parent);
                 let cache = DiskCache::new(missing_dir, generous_limits());
-                let key = test_key(1);
+                let payload: &[u8] = b"payload";
+                let key = test_key_with_len(1, payload.len() as u64);
                 assert!(cache.get(&key).is_none());
-                cache.insert(key, b"payload"); // must not panic
+                cache.insert(key, payload); // must not panic
                 assert!(cache.get(&key).is_none());
                 make_writable(&readonly_parent);
             }
@@ -551,8 +553,9 @@ mod tests {
             let dir = base.join("readonly-dir");
             fs::create_dir_all(&dir).unwrap();
             let cache = DiskCache::new(dir.clone(), generous_limits());
-            let already_cached = test_key(10);
-            cache.insert(already_cached, b"cached before lockdown");
+            let cached_before_payload: &[u8] = b"cached before lockdown";
+            let already_cached = test_key_with_len(10, cached_before_payload.len() as u64);
+            cache.insert(already_cached, cached_before_payload);
             assert!(cache.get(&already_cached).is_some());
 
             #[cfg(unix)]
@@ -560,8 +563,9 @@ mod tests {
                 make_readonly(&dir);
                 // Any existing shard subdirectory it would need to write
                 // into is also read-only, since it was created before lockdown.
-                let never_cached = test_key(11);
-                cache.insert(never_cached, b"should not persist");
+                let never_cached_payload: &[u8] = b"should not persist";
+                let never_cached = test_key_with_len(11, never_cached_payload.len() as u64);
+                cache.insert(never_cached, never_cached_payload);
                 assert!(cache.get(&never_cached).is_none());
                 make_writable(&dir);
             }
