@@ -109,6 +109,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
             ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
     };
     let running = ravel_server::start(config, store.clone())
         .await
@@ -277,6 +278,7 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
             ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
     };
     let running = ravel_server::start(config, store.clone())
         .await

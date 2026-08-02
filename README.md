@@ -107,6 +107,17 @@ piece, see [docs/adrs/](docs/adrs/).
 - **Analytics**: `POST /api/v1/analytics` runs a range query, then applies
   change point detection (PELT) or exact summary statistics (median, MAD,
   percentiles, standard deviation, variance) to each series.
+- **Alerting and detection rules** (`ravel-alerting`, [ADR-0043](docs/adrs/0043-unified-alerting-engine.md)):
+  one generic rule shape covers both a PromQL query with a threshold and a
+  SQL query with a nonempty-result condition, so observability alerts and
+  security detections share one engine. `ravel-server --mode all` (or
+  `query`) evaluates every tenant's rules on `--alert-eval-interval-secs`
+  and writes each state transition -- pending, firing, resolved -- as an
+  immutable `Signal::Alerts` record, so alert history is queryable data
+  rather than process memory. Rules are loaded at startup from
+  `--alert-rules-file`; transitions notify `--alert-webhook-url` and
+  `--alertmanager-url` sinks after the record is durable. See
+  [Alerting](#alerting) below.
 - **Compaction, retention, and garbage collection** (`ravel-maintain`):
   L0-to-L1 compaction, age-based retention, and a sweeper that removes
   orphaned objects, superseded inputs, and unreferenced parts. Signal-
@@ -184,6 +195,53 @@ error body, never raw backend or DataFusion plan text. For the full `logs`
 table reference and every analytics op's request/response schema, see
 [docs/guides/query.md](docs/guides/query.md) and
 [docs/analytics.md](docs/analytics.md).
+
+## Alerting
+
+Rules are a JSON file, loaded at startup. Each rule names a tenant, one query
+(`promql` or `sql`), and the condition that makes it fire:
+
+```json
+{
+  "rules": [
+    {
+      "tenant": "acme",
+      "rule_id": "high-error-rate",
+      "promql": "sum by (job) (rate(http_errors_total[5m]))",
+      "condition": {"type": "threshold", "op": "gt", "value": 10},
+      "labels": {"severity": "page"},
+      "annotations": {"summary": "error rate is high"},
+      "for": "5m"
+    },
+    {
+      "tenant": "acme",
+      "rule_id": "root-login",
+      "sql": "select * from logs where has_word(body, 'root') and severity_num >= 17",
+      "condition": {"type": "non_empty_result"}
+    }
+  ]
+}
+```
+
+A PromQL rule takes a `threshold` condition (`op` is one of `gt`, `ge`, `lt`,
+`le`, `eq`, `ne`) and fires when any series in the instant vector satisfies it.
+A SQL rule takes `non_empty_result` and fires when the query returns any row;
+SQL rules need the `sql` cargo feature. `for` is optional and delays firing
+until the condition has held that long, exactly as in Prometheus alerting.
+
+```sh
+ravel-server --mode all \
+  --tenant-token devtoken=acme \
+  --alert-rules-file rules.json \
+  --alert-eval-interval-secs 60 \
+  --alert-webhook-url https://example.invalid/ravel-alerts \
+  --alertmanager-url http://alertmanager:9093
+```
+
+Every transition is written as an immutable record before any sink is
+contacted, so a sink that is down loses notifications, never alert history;
+delivery is at-least-once and retried on later ticks. Sinks are optional: with
+none configured, transitions are still recorded durably.
 
 ## Container images
 

@@ -4643,6 +4643,7 @@ dependencies = [
  "opentelemetry-proto",
  "prost",
  "rand 0.10.2",
+ "ravel-alerting",
  "ravel-analytics",
  "ravel-catalog",
  "ravel-commit",

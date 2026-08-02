@@ -2,10 +2,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use ravel_maintain::RetentionPolicy;
 use ravel_types::TenantId;
+
+use crate::alert_sink::AlertSink;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
@@ -106,6 +110,37 @@ pub struct Cli {
     /// existing duration-string convention in this crate.
     #[arg(long = "retention-tenant", value_name = "TENANT=DURATION")]
     pub retention_tenants: Vec<String>,
+
+    /// Path to the JSON alert-rules file (ADR-0043 decision 2). Alert
+    /// evaluation is off unless this names a file with at least one rule. A
+    /// file rather than a repeatable flag because a rule carries free-form
+    /// query text plus label and annotation maps; see the module comment in
+    /// `alerting.rs`.
+    #[arg(long, value_name = "PATH")]
+    pub alert_rules_file: Option<PathBuf>,
+
+    /// How often each tenant's alert evaluator wakes up to evaluate every rule
+    /// configured for that tenant, in seconds (ADR-0043 decision 3).
+    #[arg(long, default_value_t = 60)]
+    pub alert_eval_interval_secs: u64,
+
+    /// Repeatable webhook sink URL. Each alert transition is POSTed to every
+    /// one as JSON, after the record is durably written (ADR-0043 decision 6).
+    #[arg(long = "alert-webhook-url", value_name = "URL")]
+    pub alert_webhook_urls: Vec<String>,
+
+    /// Repeatable Alertmanager sink. Either an Alertmanager base URL
+    /// (`http://alertmanager:9093`) or its full `/api/v2/alerts` endpoint;
+    /// the well-known path is appended when it is missing.
+    #[arg(long = "alertmanager-url", value_name = "URL")]
+    pub alertmanager_urls: Vec<String>,
+
+    /// Event-time window a SQL detection rule's query resolves over, ending at
+    /// the tick's clock reading, as a humantime duration (e.g. `5m`). Only
+    /// bounds which segments are listed; the statement's own `WHERE` still
+    /// applies above the scan.
+    #[arg(long, value_name = "DURATION", default_value = "5m")]
+    pub alert_sql_lookback: String,
 }
 
 impl Cli {
@@ -148,6 +183,46 @@ impl Cli {
         }
         Ok(RetentionPolicy { default, tenants })
     }
+
+    /// Build the alert sink list from `--alert-webhook-url` and
+    /// `--alertmanager-url`. Webhooks first, then Alertmanager, so delivery
+    /// order is the flag order within each kind and stable across runs.
+    pub fn parse_alert_sinks(&self) -> anyhow::Result<Vec<AlertSink>> {
+        let mut sinks =
+            Vec::with_capacity(self.alert_webhook_urls.len() + self.alertmanager_urls.len());
+        for url in &self.alert_webhook_urls {
+            sinks.push(AlertSink::webhook(validated_sink_url(
+                "--alert-webhook-url",
+                url,
+            )?));
+        }
+        for url in &self.alertmanager_urls {
+            sinks.push(AlertSink::alertmanager(validated_sink_url(
+                "--alertmanager-url",
+                url,
+            )?));
+        }
+        Ok(sinks)
+    }
+
+    /// Parse `--alert-sql-lookback` into a duration.
+    pub fn parse_alert_sql_lookback(&self) -> anyhow::Result<Duration> {
+        humantime::parse_duration(&self.alert_sql_lookback).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid --alert-sql-lookback '{}': {e}",
+                self.alert_sql_lookback
+            )
+        })
+    }
+}
+
+/// Reject a sink URL that is empty or not HTTP(S) at startup rather than
+/// logging a delivery failure once a minute forever.
+fn validated_sink_url<'a>(flag: &str, url: &'a str) -> anyhow::Result<&'a str> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        anyhow::bail!("invalid {flag} '{url}', expected an http:// or https:// URL");
+    }
+    Ok(url)
 }
 
 /// Parse a humantime duration string into a nanosecond window, rejecting
