@@ -1,13 +1,13 @@
 //! CLI configuration: flags plus `RAVEL_S3_*` env fallbacks (clap `env`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use ravel_maintain::RetentionPolicy;
-use ravel_types::TenantId;
+use ravel_types::{TenantHash, TenantId};
 
 use crate::alert_sink::AlertSink;
 
@@ -56,6 +56,14 @@ pub struct Cli {
     /// Repeatable `token=tenant` pair for the static bearer map.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
+
+    /// Repeatable tenant name this process runs background maintenance for
+    /// (catalog fold, compaction, retention, the GC sweeper), in addition to
+    /// every tenant named by `--tenant-token`. Required for a deployment that
+    /// authenticates through OIDC or mTLS: those tenants are only known once a
+    /// request arrives, so maintenance has no other way to learn about them.
+    #[arg(long = "maintain-tenant", value_name = "TENANT")]
+    pub maintain_tenants: Vec<String>,
 
     /// Dev-only tenant resolution via the `x-ravel-tenant` header. Refuses to
     /// enable unless `--listen-http` binds a loopback address.
@@ -222,6 +230,21 @@ impl Cli {
         Ok(map)
     }
 
+    /// Tenants named by the repeatable `--maintain-tenant TENANT`. These are
+    /// plain tenant names, not `KEY=VALUE` pairs: there is no second value to
+    /// carry. An empty name is rejected here, fail-fast at startup, the same
+    /// way `parse_tenant_tokens` rejects a malformed pair.
+    pub fn parse_maintain_tenants(&self) -> anyhow::Result<Vec<TenantId>> {
+        let mut tenants = Vec::with_capacity(self.maintain_tenants.len());
+        for name in &self.maintain_tenants {
+            if name.is_empty() {
+                anyhow::bail!("invalid --maintain-tenant '', expected a non-empty tenant name");
+            }
+            tenants.push(TenantId::new(name));
+        }
+        Ok(tenants)
+    }
+
     /// Build the raw [`RetentionPolicy`] from `--retention-default` and the
     /// repeatable `--retention-tenant TENANT=DURATION`. Durations are parsed
     /// with `humantime::parse_duration` (the existing duration convention in
@@ -349,6 +372,31 @@ impl Cli {
     }
 }
 
+/// The tenant set background fold and maintenance run for: every tenant named
+/// by `--tenant-token` plus every tenant named by `--maintain-tenant`, hashed
+/// and deduplicated. A tenant listed by both flags appears once. Order is
+/// first-seen, so a caller that passes a deterministic iterator gets a
+/// deterministic list.
+///
+/// Kept separate from the two parse methods because it is what a deployment
+/// authenticating only through OIDC or mTLS depends on: those tenants have no
+/// `--tenant-token` entry, and before this merge existed the fold and
+/// maintenance tenant list was silently empty for them (issue #398).
+pub fn merge_fold_tenants<'a>(
+    token_tenants: impl IntoIterator<Item = &'a TenantId>,
+    maintain_tenants: impl IntoIterator<Item = &'a TenantId>,
+) -> Vec<TenantHash> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for id in token_tenants.into_iter().chain(maintain_tenants) {
+        let hash = id.hash();
+        if seen.insert(hash) {
+            out.push(hash);
+        }
+    }
+    out
+}
+
 /// Reject a sink URL that is empty or not HTTP(S) at startup rather than
 /// logging a delivery failure once a minute forever.
 fn validated_sink_url<'a>(flag: &str, url: &'a str) -> anyhow::Result<&'a str> {
@@ -366,4 +414,93 @@ fn parse_window_ns(s: &str) -> anyhow::Result<i64> {
         .map_err(|e| anyhow::anyhow!("invalid retention duration '{s}': {e}"))?;
     i64::try_from(dur.as_nanos())
         .map_err(|_| anyhow::anyhow!("retention duration '{s}' is too large"))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        let mut argv = vec!["ravel-server"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("flags parse")
+    }
+
+    #[test]
+    fn maintain_tenants_parse_to_tenant_ids() {
+        let parsed = cli(&["--maintain-tenant", "acme", "--maintain-tenant", "globex"])
+            .parse_maintain_tenants()
+            .expect("valid tenant names parse");
+        assert_eq!(
+            parsed,
+            vec![TenantId::new("acme"), TenantId::new("globex")],
+            "flag order is preserved"
+        );
+    }
+
+    #[test]
+    fn no_maintain_tenant_flag_parses_to_empty() {
+        assert!(
+            cli(&[])
+                .parse_maintain_tenants()
+                .expect("absent flag is not an error")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_maintain_tenant_name_is_rejected() {
+        let err = cli(&["--maintain-tenant", ""])
+            .parse_maintain_tenants()
+            .expect_err("an empty tenant name fails startup");
+        assert!(
+            err.to_string().contains("--maintain-tenant"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_unions_disjoint_token_and_maintain_tenants() {
+        let from_tokens = [TenantId::new("acme")];
+        let from_maintain = [TenantId::new("globex")];
+        let merged = merge_fold_tenants(&from_tokens, &from_maintain);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains(&TenantId::new("acme").hash()));
+        assert!(merged.contains(&TenantId::new("globex").hash()));
+    }
+
+    #[test]
+    fn merge_deduplicates_a_tenant_named_by_both_flags() {
+        let from_tokens = [TenantId::new("acme"), TenantId::new("globex")];
+        let from_maintain = [TenantId::new("acme"), TenantId::new("initech")];
+        let merged = merge_fold_tenants(&from_tokens, &from_maintain);
+        assert_eq!(
+            merged,
+            vec![
+                TenantId::new("acme").hash(),
+                TenantId::new("globex").hash(),
+                TenantId::new("initech").hash(),
+            ],
+            "each tenant appears once, in first-seen order"
+        );
+    }
+
+    #[test]
+    fn merge_of_two_empty_lists_is_empty() {
+        let none: [TenantId; 0] = [];
+        assert!(merge_fold_tenants(&none, &none).is_empty());
+    }
+
+    #[test]
+    fn merge_with_no_tenant_tokens_still_folds_maintain_tenants() {
+        // The issue #398 shape: an OIDC/mTLS-only deployment has no
+        // --tenant-token entries at all.
+        let none: [TenantId; 0] = [];
+        let from_maintain = [TenantId::new("acme")];
+        assert_eq!(
+            merge_fold_tenants(&none, &from_maintain),
+            vec![TenantId::new("acme").hash()]
+        );
+    }
 }
