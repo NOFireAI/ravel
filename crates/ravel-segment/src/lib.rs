@@ -7,6 +7,7 @@
 
 mod crc;
 mod error;
+mod exemplars;
 mod format;
 mod gorilla;
 mod histogram;
@@ -18,7 +19,8 @@ mod varint;
 mod writer;
 
 pub use error::{SegmentError, WriteError};
-pub use format::{ReaderLimits, V5_SPARSE_THRESHOLD, V5_STRIDE, VERSION_V5};
+pub use exemplars::{ExemplarInput, ExemplarRecord, decode_exemplars_section, probe_exemplars_by_series};
+pub use format::{ReaderLimits, V5_SPARSE_THRESHOLD, V5_STRIDE, VERSION_V6};
 
 pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};
