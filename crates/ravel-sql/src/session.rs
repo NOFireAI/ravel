@@ -270,11 +270,30 @@ mod tests {
         Arc::new(TenantDelegatingPool::new(1 << 30, tenant, breach))
     }
 
-    /// A trivial `SELECT * FROM spans` plans once `SessionTable::Spans` is
-    /// registered (ADR-0045 decision 5). An empty snapshot, so this proves
-    /// registration and planning only, not execution over real data.
+    /// Collect every `WHERE`/`HAVING` predicate in `plan` as a top-level AND
+    /// conjunct, mirroring `executor::collect_filter_predicates`: recurses
+    /// through the plan's inputs so the filter is found regardless of which
+    /// operators DataFusion places above it.
+    fn collect_filter_predicates(
+        plan: &datafusion::logical_expr::LogicalPlan,
+        out: &mut Vec<datafusion::logical_expr::Expr>,
+    ) {
+        if let datafusion::logical_expr::LogicalPlan::Filter(filter) = plan {
+            out.push(filter.predicate.clone());
+        }
+        for input in plan.inputs() {
+            collect_filter_predicates(input, out);
+        }
+    }
+
+    /// The ADR-0045 decision 5 acceptance test: `spans` plans through
+    /// `build_session` (registration), and a real `WHERE` clause conjoining
+    /// `duration_ns`, `status_code`, and `service_name` -- parsed and
+    /// type-coerced by DataFusion itself, not hand-built through the fluent
+    /// `col()`/`lit()` API `spans_pushdown`'s own unit tests use -- extracts
+    /// into exactly the `SpansPushdown` bounds those predicates prove.
     #[tokio::test]
-    async fn spans_table_is_registered_and_a_select_star_plans() {
+    async fn spans_table_is_registered_and_prunes_duration_status_service() {
         let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let fetcher = SpanSegmentFetcher::new(store);
         let snapshot = Snapshot {
@@ -290,12 +309,34 @@ mod tests {
         )
         .expect("spans session builds");
 
+        // Registration and planning proof: a trivial SELECT * still executes
+        // over the empty snapshot.
         let df = ctx
             .sql("SELECT * FROM spans")
             .await
             .expect("SELECT * FROM spans plans");
         let batches = df.collect().await.expect("empty snapshot scan executes");
         assert!(batches.iter().all(|b| b.num_rows() == 0));
+
+        // The pruning proof: extract_spans over the real, SQL-parsed filter.
+        let sql = "SELECT * FROM spans WHERE duration_ns > 500000000 \
+                   AND status_code = 2 AND service_name = 'checkout'";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("filtered query plans");
+        let mut predicates = Vec::new();
+        collect_filter_predicates(&plan, &mut predicates);
+        let pushdown = crate::spans_pushdown::extract_spans(&predicates);
+
+        assert_eq!(pushdown.duration_lo, Some(500_000_001));
+        assert_eq!(pushdown.duration_hi, None);
+        assert_eq!(
+            pushdown.status_mask,
+            Some(ravel_rspan::skip_index::STATUS_BIT_ERROR)
+        );
+        assert_eq!(pushdown.service_name, Some("checkout".to_string()));
     }
 
     #[test]
