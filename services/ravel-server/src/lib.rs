@@ -381,6 +381,11 @@ pub async fn start(
     let tenant_discovery_metrics = matches!(config.mode, Mode::Maintain)
         .then(|| Arc::new(tenant_discovery::TenantDiscoveryMetrics::default()));
 
+    // Same sharing rationale as `tenant_discovery_metrics` above, for the
+    // maintenance safety counters (ADR-0048 decisions 1, 4, 6; issue #517).
+    let maintenance_safety_metrics = matches!(config.mode, Mode::Maintain)
+        .then(|| Arc::new(maintain::MaintenanceSafetyMetrics::default()));
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
@@ -393,6 +398,7 @@ pub async fn start(
         span_ingest_router: span_ingest_router.clone(),
         catalog: catalog.clone(),
         tenant_discovery: tenant_discovery_metrics.clone(),
+        maintenance_safety: maintenance_safety_metrics.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 
@@ -502,11 +508,15 @@ pub async fn start(
         let discovery_metrics = tenant_discovery_metrics
             .clone()
             .unwrap_or_else(|| Arc::new(tenant_discovery::TenantDiscoveryMetrics::default()));
+        let safety_metrics = maintenance_safety_metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(maintain::MaintenanceSafetyMetrics::default()));
         let maintenance_tasks = maintain::spawn(
             store.clone(),
             config.fold_tenants.clone(),
             config.maintain.clone(),
             discovery_metrics,
+            safety_metrics,
         );
         (fold::FoldTasks::none(), maintenance_tasks)
     } else {
