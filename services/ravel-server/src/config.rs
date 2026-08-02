@@ -203,6 +203,19 @@ pub struct Cli {
     #[arg(long, value_name = "ADDR")]
     pub mtls_listener: Option<SocketAddr>,
 
+    /// Path to a TOML admission-limits file (ADR-0051 section 3): a
+    /// `[defaults]` table plus repeatable `[tenants.<id>]` override tables,
+    /// deserialized into `ravel_ingest::AdmissionLimits`. Absent
+    /// means every tenant gets the shipped defaults
+    /// ([`crate::config::limits::shipped_defaults`]) with no override file at
+    /// all. Loaded once and validated at startup; changing limits is a
+    /// restart, like every other per-tenant flag (`--retention-tenant`,
+    /// `--tenant-token`). An unparseable file, an unknown key, or a
+    /// nonsensical limit (zero, or a burst set without its rate or vice
+    /// versa) fails startup rather than silently falling back to defaults.
+    #[arg(long = "limits-file", value_name = "PATH")]
+    pub limits_file: Option<PathBuf>,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -467,6 +480,20 @@ impl Cli {
         }
 
         Ok(())
+
+    /// Load and validate `--limits-file` (ADR-0051 section 3). Absent flag
+    /// means the shipped defaults apply to every tenant with no override at
+    /// all. See [`limits::parse_limits_file`] for the format and validation
+    /// rules; every failure here fails startup rather than falling back to
+    /// defaults.
+    pub fn parse_limits_file(&self) -> anyhow::Result<limits::LimitsConfig> {
+        let Some(path) = self.limits_file.as_deref() else {
+            return Ok(limits::LimitsConfig::default());
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read --limits-file {path:?}: {e}"))?;
+        limits::parse_limits_file(&text)
+            .map_err(|e| anyhow::anyhow!("invalid --limits-file {}: {e}", path.display()))
     }
 }
 
@@ -514,10 +541,462 @@ fn parse_window_ns(s: &str) -> anyhow::Result<i64> {
         .map_err(|_| anyhow::anyhow!("retention duration '{s}' is too large"))
 }
 
+/// The `--limits-file` TOML format (ADR-0051 section 3): a `[defaults]`
+/// table plus per-tenant `[tenants.<id>]` override tables, each deserialized
+/// into a `ravel_ingest::AdmissionLimits` by overlaying its set
+/// fields on this service's shipped defaults ([`shipped_defaults`]).
+pub mod limits {
+    use std::collections::HashMap;
+    use std::fmt;
+
+    use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
+    use ravel_types::TenantId;
+    use serde::Deserialize;
+    use serde::de::{self, Visitor};
+
+    /// This service's shipped `AdmissionLimits` defaults, applied to every
+    /// tenant with no `--limits-file` at all, and as the base a `[defaults]`
+    /// table's fields overlay onto.
+    ///
+    /// `max_active_series` and `max_active_streams` are lower than ADR-0051
+    /// section 2's proposed `1,000,000`. That figure assumed roughly 16
+    /// bytes per tracked identity in `AdmissionController`'s two-epoch
+    /// `HashSet<SeriesId>` / `HashSet<LogStreamId>` tracker; issue #491
+    /// measured the actual cost at 35-56 bytes per live entry once
+    /// hashbrown's power-of-two table sizing at 7/8 load and allocator
+    /// headroom are counted, 2-4x the ADR's assumption. At `1,000,000` that
+    /// is roughly 140-224 MiB per fully active tenant (cap x bytes-per-entry
+    /// x 2 rotating epochs x 2 tracked signals), before multiplying across
+    /// tenants and replicas. `200,000` keeps the same shape of guarantee
+    /// (a generous, finite, overridable per-tenant cap) at a worst case of
+    /// roughly 27-43 MiB per fully active tenant instead - see
+    /// docs/guides/admission-limits.md for the arithmetic and per-tenant-count
+    /// examples. This is a deliberate change from the ADR's proposed number,
+    /// not the ADR's own 16-byte figure being corrected in place: that
+    /// correction is issue #491 and belongs in ADR-0051 section 2 itself.
+    ///
+    /// `ingest_bytes_per_sec` / `ingest_byte_burst` and
+    /// `series_creation_rate_per_sec` / `series_creation_burst` are
+    /// unchanged from the ADR: a token bucket's memory is two `u64`s
+    /// regardless of the configured rate, so the corrected per-entry cost
+    /// has no bearing on those two knobs.
+    pub fn shipped_defaults() -> AdmissionLimits {
+        AdmissionLimits {
+            max_active_series: CountLimit::Bounded(200_000),
+            max_active_streams: CountLimit::Bounded(200_000),
+            ingest_byte_rate: RateLimit::Bounded {
+                per_sec: AdmissionLimits::DEFAULT_INGEST_BYTES_PER_SEC,
+                burst: AdmissionLimits::DEFAULT_INGEST_BYTE_BURST,
+            },
+            series_creation_rate: RateLimit::Bounded {
+                per_sec: AdmissionLimits::DEFAULT_SERIES_CREATION_RATE_PER_SEC,
+                burst: AdmissionLimits::DEFAULT_SERIES_CREATION_BURST,
+            },
+        }
+    }
+
+    /// The result of loading `--limits-file`: the resolved defaults (the
+    /// shipped defaults when no file, or no `[defaults]` table, sets a given
+    /// field) plus one resolved `AdmissionLimits` per configured tenant,
+    /// already overlaid on those defaults. A later wiring task feeds
+    /// `defaults` to `AdmissionController::new` and each `tenants` entry to
+    /// `AdmissionController::set_tenant_limits`; this crate does neither.
+    #[derive(Debug, Clone)]
+    pub struct LimitsConfig {
+        pub defaults: AdmissionLimits,
+        pub tenants: HashMap<TenantId, AdmissionLimits>,
+    }
+
+    impl Default for LimitsConfig {
+        fn default() -> Self {
+            LimitsConfig {
+                defaults: shipped_defaults(),
+                tenants: HashMap::new(),
+            }
+        }
+    }
+
+    /// One leaf value in the TOML file: a bounded numeric cap, or the
+    /// literal string `"unlimited"` (ADR-0051 section 3: a tenant needing no
+    /// limit sets this explicitly, visible in config review rather than a
+    /// silent default).
+    #[derive(Debug, Clone, Copy)]
+    enum LimitValue {
+        Bounded(u64),
+        Unlimited,
+    }
+
+    impl<'de> Deserialize<'de> for LimitValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct LimitValueVisitor;
+
+            impl Visitor<'_> for LimitValueVisitor {
+                type Value = LimitValue;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a non-negative integer, or the string \"unlimited\"")
+                }
+
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                    Ok(LimitValue::Bounded(v))
+                }
+
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                    u64::try_from(v)
+                        .map(LimitValue::Bounded)
+                        .map_err(|_| E::custom("limit must not be negative"))
+                }
+
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                    if v == "unlimited" {
+                        Ok(LimitValue::Unlimited)
+                    } else {
+                        Err(E::custom(format!(
+                            "expected an integer or the string \"unlimited\", got {v:?}"
+                        )))
+                    }
+                }
+            }
+
+            deserializer.deserialize_any(LimitValueVisitor)
+        }
+    }
+
+    /// One `[defaults]` or `[tenants.<id>]` table. Every field is optional:
+    /// an absent field inherits from the base the table is overlaid on
+    /// (`shipped_defaults()` for `[defaults]`, the resolved defaults for a
+    /// tenant table). `deny_unknown_fields` so a mistyped or retired knob
+    /// fails startup instead of being silently ignored.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LimitsTableToml {
+        max_active_series: Option<LimitValue>,
+        max_active_streams: Option<LimitValue>,
+        ingest_bytes_per_sec: Option<LimitValue>,
+        ingest_byte_burst: Option<u64>,
+        series_creation_rate_per_sec: Option<LimitValue>,
+        series_creation_burst: Option<u64>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LimitsFileToml {
+        #[serde(default)]
+        defaults: LimitsTableToml,
+        #[serde(default)]
+        tenants: HashMap<String, LimitsTableToml>,
+    }
+
+    /// Parse and validate a `--limits-file` document's text (already read
+    /// from disk by the caller). Every failure - unparseable TOML, an
+    /// unknown key, an empty tenant id, or a nonsensical limit - is a typed
+    /// `anyhow::Error` naming the offending table and field, meant to fail
+    /// startup rather than fall back to defaults.
+    pub fn parse_limits_file(text: &str) -> anyhow::Result<LimitsConfig> {
+        let file: LimitsFileToml = toml::from_str(text)?;
+        let defaults = merge_limits(shipped_defaults(), &file.defaults, "[defaults]")?;
+        let mut tenants = HashMap::new();
+        for (id, overrides) in &file.tenants {
+            if id.is_empty() {
+                anyhow::bail!("[tenants] has an entry with an empty tenant id");
+            }
+            let context = format!("[tenants.{id}]");
+            let limits = merge_limits(defaults, overrides, &context)?;
+            tenants.insert(TenantId::new(id), limits);
+        }
+        Ok(LimitsConfig { defaults, tenants })
+    }
+
+    /// Overlay `overrides`'s set fields onto `base`, validating each one.
+    fn merge_limits(
+        base: AdmissionLimits,
+        overrides: &LimitsTableToml,
+        context: &str,
+    ) -> anyhow::Result<AdmissionLimits> {
+        let mut limits = base;
+        if let Some(v) = overrides.max_active_series {
+            limits.max_active_series = to_count_limit(v, "max_active_series", context)?;
+        }
+        if let Some(v) = overrides.max_active_streams {
+            limits.max_active_streams = to_count_limit(v, "max_active_streams", context)?;
+        }
+        limits.ingest_byte_rate = merge_rate_limit(
+            limits.ingest_byte_rate,
+            overrides.ingest_bytes_per_sec,
+            overrides.ingest_byte_burst,
+            "ingest_bytes_per_sec",
+            "ingest_byte_burst",
+            context,
+        )?;
+        limits.series_creation_rate = merge_rate_limit(
+            limits.series_creation_rate,
+            overrides.series_creation_rate_per_sec,
+            overrides.series_creation_burst,
+            "series_creation_rate_per_sec",
+            "series_creation_burst",
+            context,
+        )?;
+        Ok(limits)
+    }
+
+    fn to_count_limit(v: LimitValue, field: &str, context: &str) -> anyhow::Result<CountLimit> {
+        match v {
+            LimitValue::Unlimited => Ok(CountLimit::Unlimited),
+            LimitValue::Bounded(n) => Ok(CountLimit::Bounded(validate_positive(n, field, context)?)),
+        }
+    }
+
+    /// Merge one rate knob's `per_sec` / `burst` pair. Both fields are
+    /// independently optional, but only three combinations are meaningful:
+    /// neither set (inherit `current` unchanged), `per_sec = "unlimited"`
+    /// with no burst (switch to [`RateLimit::Unlimited`]), or a bounded
+    /// `per_sec` and/or `burst` overlaid on `current`'s existing bounded
+    /// values. A burst set together with `per_sec = "unlimited"`, or either
+    /// field set while `current` is unlimited and the other field is
+    /// missing, has no sensible resolution and fails rather than guessing.
+    fn merge_rate_limit(
+        current: RateLimit,
+        per_sec_override: Option<LimitValue>,
+        burst_override: Option<u64>,
+        per_sec_field: &str,
+        burst_field: &str,
+        context: &str,
+    ) -> anyhow::Result<RateLimit> {
+        match (per_sec_override, burst_override) {
+            (None, None) => Ok(current),
+            (Some(LimitValue::Unlimited), None) => Ok(RateLimit::Unlimited),
+            (Some(LimitValue::Unlimited), Some(_)) => anyhow::bail!(
+                "{context}: {burst_field} is set together with {per_sec_field} = \"unlimited\", \
+                 which is contradictory"
+            ),
+            (Some(LimitValue::Bounded(per_sec)), burst_override) => {
+                let per_sec = validate_positive(per_sec, per_sec_field, context)?;
+                let burst = match burst_override {
+                    Some(b) => validate_positive(b, burst_field, context)?,
+                    None => match current {
+                        RateLimit::Bounded { burst, .. } => burst,
+                        RateLimit::Unlimited => anyhow::bail!(
+                            "{context}: {per_sec_field} is set but {burst_field} is not, and the \
+                             base rate is unlimited with no burst to inherit; set both together"
+                        ),
+                    },
+                };
+                Ok(RateLimit::Bounded { per_sec, burst })
+            }
+            (None, Some(burst)) => {
+                let burst = validate_positive(burst, burst_field, context)?;
+                match current {
+                    RateLimit::Bounded { per_sec, .. } => Ok(RateLimit::Bounded { per_sec, burst }),
+                    RateLimit::Unlimited => anyhow::bail!(
+                        "{context}: {burst_field} is set but {per_sec_field} is not, and the base \
+                         rate is unlimited with no rate to inherit; set both together"
+                    ),
+                }
+            }
+        }
+    }
+
+    fn validate_positive(v: u64, field: &str, context: &str) -> anyhow::Result<u64> {
+        if v == 0 {
+            anyhow::bail!("{context}: {field} = 0 is not a meaningful limit; set a positive value");
+        }
+        Ok(v)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tenant_with_no_override_gets_the_resolved_defaults() {
+            let text = r#"
+                [defaults]
+                max_active_series = 42
+
+                [tenants.quiet]
+            "#;
+            let parsed = parse_limits_file(text).expect("valid limits file parses");
+            let quiet = parsed
+                .tenants
+                .get(&TenantId::new("quiet"))
+                .expect("quiet tenant is present with no fields set");
+            assert_eq!(quiet, &parsed.defaults);
+            assert_eq!(quiet.max_active_series, CountLimit::Bounded(42));
+        }
+
+        #[test]
+        fn absent_limits_file_yields_shipped_defaults_and_no_tenant_overrides() {
+            let config = LimitsConfig::default();
+            assert_eq!(config.defaults, shipped_defaults());
+            assert!(config.tenants.is_empty());
+        }
+
+        #[test]
+        fn unlimited_opts_a_tenant_out_of_a_count_cap() {
+            let text = r#"
+                [tenants.trusted]
+                max_active_series = "unlimited"
+            "#;
+            let parsed = parse_limits_file(text).expect("valid limits file parses");
+            let trusted = parsed
+                .tenants
+                .get(&TenantId::new("trusted"))
+                .expect("trusted tenant is present");
+            assert_eq!(trusted.max_active_series, CountLimit::Unlimited);
+        }
+
+        #[test]
+        fn unparseable_toml_fails_startup() {
+            let err = parse_limits_file("this is not valid toml [[[")
+                .expect_err("malformed TOML must fail rather than fall back to defaults");
+            // Not asserting exact text (that's `toml`'s error message, not
+            // ours to pin), just that a distinct error surfaced.
+            assert!(!err.to_string().is_empty());
+        }
+
+        #[test]
+        fn unknown_key_in_defaults_is_rejected() {
+            let text = r#"
+                [defaults]
+                max_active_seriess = 100
+            "#;
+            let err = parse_limits_file(text)
+                .expect_err("an unknown key must fail rather than be silently ignored");
+            assert!(
+                err.to_string().contains("max_active_seriess")
+                    || err.to_string().to_lowercase().contains("unknown"),
+                "error should point at the unrecognized key: {err}"
+            );
+        }
+
+        #[test]
+        fn unknown_key_in_tenant_table_is_rejected() {
+            let text = r#"
+                [tenants.acme]
+                mystery_knob = 1
+            "#;
+            let err = parse_limits_file(text)
+                .expect_err("an unknown per-tenant key must fail rather than be silently ignored");
+            assert!(
+                err.to_string().contains("mystery_knob")
+                    || err.to_string().to_lowercase().contains("unknown")
+            );
+        }
+
+        #[test]
+        fn zero_active_series_cap_is_rejected() {
+            let text = r#"
+                [defaults]
+                max_active_series = 0
+            "#;
+            let err = parse_limits_file(text)
+                .expect_err("a zero count cap is not a meaningful limit");
+            assert!(err.to_string().contains("max_active_series"));
+        }
+
+        #[test]
+        fn negative_limit_is_rejected() {
+            let text = r#"
+                [defaults]
+                max_active_series = -5
+            "#;
+            parse_limits_file(text).expect_err("a negative limit must fail startup");
+        }
+
+        #[test]
+        fn zero_ingest_byte_rate_is_rejected() {
+            let text = r#"
+                [defaults]
+                ingest_bytes_per_sec = 0
+                ingest_byte_burst = 1024
+            "#;
+            let err = parse_limits_file(text).expect_err("a zero rate is not meaningful");
+            assert!(err.to_string().contains("ingest_bytes_per_sec"));
+        }
+
+        #[test]
+        fn burst_without_rate_against_an_unlimited_base_is_rejected() {
+            let text = r#"
+                [defaults]
+                ingest_bytes_per_sec = "unlimited"
+
+                [tenants.acme]
+                ingest_byte_burst = 1024
+            "#;
+            let err = parse_limits_file(text)
+                .expect_err("a burst with no rate to pair it with must fail, not guess one");
+            assert!(err.to_string().contains("ingest_byte_burst"));
+        }
+
+        #[test]
+        fn burst_set_alongside_unlimited_rate_in_same_table_is_rejected() {
+            let text = r#"
+                [defaults]
+                ingest_bytes_per_sec = "unlimited"
+                ingest_byte_burst = 1024
+            "#;
+            let err = parse_limits_file(text)
+                .expect_err("burst alongside unlimited in the same table is contradictory");
+            assert!(err.to_string().contains("ingest_byte_burst"));
+        }
+
+        #[test]
+        fn empty_tenant_id_is_rejected() {
+            let text = r#"
+                [tenants.""]
+                max_active_series = 100
+            "#;
+            parse_limits_file(text).expect_err("an empty tenant id must fail startup");
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_ingest::{CountLimit, RateLimit};
+
+    #[test]
+    fn limits_file_tenant_override_parses() {
+        let text = r#"
+            [defaults]
+            max_active_series = 200000
+            max_active_streams = 200000
+
+            [tenants.acme]
+            max_active_series = 500000
+            ingest_bytes_per_sec = 8388608
+            ingest_byte_burst = 16777216
+        "#;
+        let parsed = limits::parse_limits_file(text).expect("valid limits file parses");
+        assert_eq!(
+            parsed.defaults.max_active_series,
+            CountLimit::Bounded(200_000)
+        );
+        let acme = parsed
+            .tenants
+            .get(&TenantId::new("acme"))
+            .expect("acme override is present");
+        assert_eq!(acme.max_active_series, CountLimit::Bounded(500_000));
+        // Inherited unchanged from defaults, not overridden.
+        assert_eq!(acme.max_active_streams, CountLimit::Bounded(200_000));
+        assert_eq!(
+            acme.ingest_byte_rate,
+            RateLimit::Bounded {
+                per_sec: 8_388_608,
+                burst: 16_777_216,
+            }
+        );
+        assert_eq!(
+            acme.series_creation_rate,
+            parsed.defaults.series_creation_rate
+        );
+    }
 
     fn cli(args: &[&str]) -> Cli {
         let mut argv = vec!["ravel-server"];
