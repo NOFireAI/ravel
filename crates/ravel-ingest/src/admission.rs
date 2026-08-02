@@ -186,7 +186,12 @@ impl TokenBucket {
             .tokens
             .saturating_add(u64::try_from(refilled).unwrap_or(u64::MAX))
             .min(self.capacity);
-        self.last_refill_ns = now_ns;
+        // A caller-supplied `now_ns` can move backward (an adversarial
+        // caller, or two honest concurrent callers reaching this bucket's
+        // lock in reverse clock order): never let the anchor regress, or a
+        // later forward call measures elapsed time from that stale earlier
+        // point and double-credits the reordered interval.
+        self.last_refill_ns = self.last_refill_ns.max(now_ns);
     }
 
     /// Attempts to take `amount` tokens; on failure nothing is taken, and
@@ -815,6 +820,26 @@ mod tests {
                 .check_byte_rate(&tenant, Signal::Metrics, 1, clock.now())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn token_bucket_does_not_double_credit_on_backward_clock() {
+        // Rate 100/s, burst 100, starting drained at real t=2s.
+        let mut bucket = TokenBucket::new(100, 100, 2_000_000_000);
+
+        // try_take(100, now=2s): refills 100, takes them, anchor = 2s.
+        assert!(bucket.try_take(100, 2_000_000_000).is_ok());
+
+        // try_take(100, now=1s): credits nothing (backward clock), and must
+        // not regress the anchor to 1s either.
+        assert!(bucket.try_take(100, 1_000_000_000).is_err());
+
+        // try_take(100, now=2s) again: an honest monotonic clock has
+        // elapsed zero time since the drain, so this must still fail. Were
+        // the anchor allowed to regress to 1s, this would see 1s of
+        // elapsed time and wrongly credit (then take) 100 more tokens,
+        // yielding 200 total at real t=2s instead of 100.
+        assert!(bucket.try_take(100, 2_000_000_000).is_err());
     }
 
     #[test]
