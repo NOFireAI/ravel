@@ -102,9 +102,13 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
         oidc_refresh: None,
         otap: false,
     };
-    ravel_server::start(config, store)
-        .await
-        .expect("server starts")
+    ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts")
 }
 
 /// issue #60 / a7-F03: a `/series` request carrying many `match[]` selectors

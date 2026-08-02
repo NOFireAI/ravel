@@ -336,9 +336,13 @@ async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
         oidc_refresh: None,
         otap: false,
     };
-    let running = ravel_server::start(config, store)
-        .await
-        .expect("server starts");
+    let running = ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts");
     let grpc = running
         .grpc_addr
         .expect("query mode binds gRPC when flight-sql is on");

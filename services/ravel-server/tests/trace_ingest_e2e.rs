@@ -113,9 +113,13 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         oidc_refresh: None,
         otap: false,
     };
-    let running = ravel_server::start(config, store.clone())
-        .await
-        .expect("server starts");
+    let running = ravel_server::start(
+        config,
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts");
     (running, store)
 }
 
@@ -284,9 +288,13 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
         oidc_refresh: None,
         otap: false,
     };
-    let running = ravel_server::start(config, store.clone())
-        .await
-        .expect("server starts");
+    let running = ravel_server::start(
+        config,
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts");
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 

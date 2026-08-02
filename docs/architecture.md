@@ -62,8 +62,8 @@ ingest or query surface: it is a disposable background worker that drives
 `ravel-maintain`'s compaction, age-based retention, and GC sweeper per
 tenant over every shard (docs/compaction-retention-plan.md P8). It requires
 a `multipart`-capable object store (compaction is the only writer of
-multipart objects) and still binds `--listen-http`, serving the `/healthz`
-and `/readyz` routes only (no ingest or query surface).
+multipart objects) and still binds `--listen-http`, serving the `/healthz`,
+`/readyz`, and `/metrics` routes only (no ingest or query surface).
 
 Every mode, maintain included, serves two health routes on `--listen-http`
 (ADR-0034 decision 4). `/healthz` (liveness) returns 200 whenever the HTTP
@@ -72,9 +72,21 @@ listener is serving, so a routed 200 proves the axum event loop is alive.
 parsed, the object-store capability gate passed, both listeners bound) and
 200 thereafter; it performs no object-store call per probe, deliberately, to
 avoid adding S3 cost on every kubelet probe and to avoid a transient S3 blip
-ejecting every pod from its Service at once. In maintain mode these two
+ejecting every pod from its Service at once. In maintain mode these three
 routes are the entire HTTP surface: liveness there means the routes answer,
 not merely that a TCP connection is accepted.
+
+Every mode also serves `GET /metrics` on `--listen-http` (ADR-0044 section 4,
+issue #423): a hand-written Prometheus text exposition of counters Ravel
+already computes (object-store calls/errors/bytes/latency, ingest flush and
+ack counters by signal, catalog anomaly counters), rendered by
+`services/ravel-server/src/metrics.rs` rather than pulled from the
+`prometheus` crate, so the label set stays exactly what Ravel decides. Labels
+are restricted to a fixed, exhaustively-matched set (`tenant_hash`, `signal`,
+`mode`, `op`, `error_kind`, `workload_class`, `level`); `shard` is deliberately
+excluded because Ravel's own telemetry must not be able to explode. Like
+`/readyz`, this endpoint performs no object-store call: every sample comes
+from an in-memory counter already held by a running process.
 
 Remote Write (ADR-0015) reuses this same gateway/router/shard pipeline: RW1
 and RW2 payloads decode and normalize to the same `NormalizedPoint` shape
