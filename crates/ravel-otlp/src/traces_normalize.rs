@@ -311,6 +311,7 @@ fn normalize_span(
             end_ts_ns,
         });
     }
+    checked_span_interval(start_ts_ns, end_ts_ns, ingest_ts_ns, limits)?;
 
     let (status_code, status_message) = match span.status.as_ref() {
         None => (StatusCode::Unset, None),
@@ -455,6 +456,46 @@ fn status_code_from_i32(code: i32) -> StatusCode {
 /// saturates rather than wrapping negative.
 fn to_i64_ns(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Bound a span's resolved interval at admission (ADR-0049 §4), mirroring
+/// the metrics path's `checked_event_ts`: `end_ts_ns` may lead ingest time
+/// by at most `max_future_skew_ns` and `start_ts_ns` may lag it by at most
+/// `max_ingest_lag_ns`, because the commit record advertises
+/// `[min start_ts, max end_ts]` and the catalog listing window is sound only
+/// if both advertised bounds are admission-bounded. The other side of each
+/// timestamp is implied: `start <= end` is already enforced, so `start`
+/// cannot out-lead `end` and `end` cannot out-lag `start`. The bound itself
+/// passes; only strictly exceeding it rejects. Checked after the zero
+/// fallbacks, so a span whose only timestamps came from the ingest clock is
+/// trivially in bounds.
+///
+/// Rejecting, never clamping: rewriting a sender's timestamps is silent
+/// corruption of the plausible-wrong-result class; a typed rejection is
+/// visible and countable. Consequence, stated in ADR-0049: a span longer
+/// than `max_ingest_lag_ns`, or reported later than that after it started,
+/// is rejected at admission.
+fn checked_span_interval(
+    start_ts_ns: i64,
+    end_ts_ns: i64,
+    ingest_ts_ns: i64,
+    limits: &SpanIngestLimits,
+) -> Result<(), SpanRejection> {
+    let skew_ns = end_ts_ns.saturating_sub(ingest_ts_ns);
+    if skew_ns > limits.max_future_skew_ns {
+        return Err(SpanRejection::FutureSkew {
+            skew_ns,
+            max_ns: limits.max_future_skew_ns,
+        });
+    }
+    let lag_ns = ingest_ts_ns.saturating_sub(start_ts_ns);
+    if lag_ns > limits.max_ingest_lag_ns {
+        return Err(SpanRejection::TooOld {
+            lag_ns,
+            max_ns: limits.max_ingest_lag_ns,
+        });
+    }
+    Ok(())
 }
 
 /// Convert an attribute set, dropping and reporting the ones that cannot be
@@ -748,6 +789,161 @@ mod tests {
                 end_ts_ns: 1_000,
             }]
         );
+    }
+
+    // --- event-time skew bounds (ADR-0049 §4) ---
+    // Convention, shared with the metrics and log paths: the bound itself
+    // passes; one ns past it fails. `end_ts_ns` carries the future bound and
+    // `start_ts_ns` the lag bound, because the commit record advertises
+    // `[min start_ts, max end_ts]`.
+
+    /// A realistic ingest clock reading, so the skew arithmetic runs on
+    /// full-size nanosecond timestamps rather than tiny test integers.
+    const INGEST_TS: i64 = 1_754_000_000_000_000_000;
+
+    fn one_span_over(start_ns: u64, end_ns: u64) -> ExportTraceServiceRequest {
+        request(vec![resource_spans(
+            vec![string_kv("service.name", "api")],
+            vec![scope_spans(
+                "lib",
+                "1",
+                vec![span("op", start_ns, end_ns, vec![])],
+            )],
+        )])
+    }
+
+    #[test]
+    fn rejects_future_skewed_span() {
+        let limits = SpanIngestLimits::default();
+        let end = INGEST_TS + limits.max_future_skew_ns + 1;
+        let out = normalize_traces(
+            one_span_over(INGEST_TS as u64, end as u64),
+            &limits,
+            INGEST_TS,
+        );
+        assert!(out.spans.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![SpanRejection::FutureSkew {
+                skew_ns: limits.max_future_skew_ns + 1,
+                max_ns: limits.max_future_skew_ns,
+            }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 1);
+    }
+
+    #[test]
+    fn rejects_span_starting_older_than_max_ingest_lag() {
+        let limits = SpanIngestLimits::default();
+        let start = INGEST_TS - limits.max_ingest_lag_ns - 1;
+        let out = normalize_traces(
+            one_span_over(start as u64, INGEST_TS as u64),
+            &limits,
+            INGEST_TS,
+        );
+        assert!(out.spans.is_empty());
+        assert_eq!(
+            out.rejected,
+            vec![SpanRejection::TooOld {
+                lag_ns: limits.max_ingest_lag_ns + 1,
+                max_ns: limits.max_ingest_lag_ns,
+            }]
+        );
+    }
+
+    /// A span whose interval touches both bounds at once (start at the lag
+    /// bound, end at the skew bound) is accepted; the bounds themselves pass.
+    #[test]
+    fn span_exactly_at_both_bounds_is_accepted() {
+        let limits = SpanIngestLimits::default();
+        let start = INGEST_TS - limits.max_ingest_lag_ns;
+        let end = INGEST_TS + limits.max_future_skew_ns;
+        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.spans.len(), 1);
+        assert_eq!(out.spans[0].start_ts_ns, start);
+        assert_eq!(out.spans[0].end_ts_ns, end);
+    }
+
+    /// The end-timestamp fallback (a zero end resolves to the start) feeds
+    /// the same check: a span whose only timestamp is a future-skewed start
+    /// is rejected through its resolved end.
+    #[test]
+    fn future_skewed_start_with_zero_end_is_rejected_through_the_fallback() {
+        let limits = SpanIngestLimits::default();
+        let start = INGEST_TS + limits.max_future_skew_ns + 1;
+        let out = normalize_traces(one_span_over(start as u64, 0), &limits, INGEST_TS);
+        assert!(out.spans.is_empty());
+        assert!(
+            matches!(out.rejected.as_slice(), [SpanRejection::FutureSkew { .. }]),
+            "{:?}",
+            out.rejected
+        );
+    }
+
+    /// An inverted interval is rejected as such, before the skew bounds see
+    /// it, even when one endpoint is also out of bounds.
+    #[test]
+    fn inverted_interval_rejects_before_the_skew_bounds() {
+        let limits = SpanIngestLimits::default();
+        let start = INGEST_TS + limits.max_future_skew_ns + 100;
+        let out = normalize_traces(
+            one_span_over(start as u64, (start - 1) as u64),
+            &limits,
+            INGEST_TS,
+        );
+        assert!(out.spans.is_empty());
+        assert!(
+            matches!(
+                out.rejected.as_slice(),
+                [SpanRejection::InvalidTimeRange { .. }]
+            ),
+            "{:?}",
+            out.rejected
+        );
+    }
+
+    proptest::proptest! {
+        /// Over arbitrary span intervals, a span is admitted exactly when its
+        /// resolved interval is well-ordered, its end lies at or below
+        /// `ingest + max_future_skew`, and its start at or above
+        /// `ingest - max_ingest_lag`; nothing is ever both admitted and
+        /// rejected, and nothing panics.
+        #[test]
+        fn skew_bounds_partition_admission(
+            start_ns in 1u64..=u64::MAX,
+            end_ns in 1u64..=u64::MAX,
+            offset_ns in -4_000_000_000_000i64..=4_000_000_000_000i64,
+        ) {
+            let limits = SpanIngestLimits::default();
+            let ingest_ts = INGEST_TS + offset_ns;
+            let out = normalize_traces(one_span_over(start_ns, end_ns), &limits, ingest_ts);
+            let start = i64::try_from(start_ns).unwrap_or(i64::MAX);
+            let end = i64::try_from(end_ns).unwrap_or(i64::MAX);
+            if end < start {
+                proptest::prop_assert!(out.spans.is_empty());
+                let is_inverted_rejection = matches!(
+                    out.rejected.as_slice(),
+                    [SpanRejection::InvalidTimeRange { .. }]
+                );
+                proptest::prop_assert!(is_inverted_rejection, "{:?}", out.rejected);
+            } else if end <= ingest_ts + limits.max_future_skew_ns
+                && start >= ingest_ts - limits.max_ingest_lag_ns
+            {
+                proptest::prop_assert_eq!(out.spans.len(), 1);
+                proptest::prop_assert!(out.rejected.is_empty());
+                proptest::prop_assert_eq!(out.spans[0].start_ts_ns, start);
+                proptest::prop_assert_eq!(out.spans[0].end_ts_ns, end);
+            } else {
+                proptest::prop_assert!(out.spans.is_empty());
+                proptest::prop_assert_eq!(out.rejected.len(), 1);
+                let is_skew_rejection = matches!(
+                    out.rejected[0],
+                    SpanRejection::FutureSkew { .. } | SpanRejection::TooOld { .. }
+                );
+                proptest::prop_assert!(is_skew_rejection, "{:?}", out.rejected);
+            }
+        }
     }
 
     #[test]

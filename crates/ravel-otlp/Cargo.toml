@@ -27,6 +27,7 @@ hex = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 blake3 = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

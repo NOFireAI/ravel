@@ -4541,6 +4541,7 @@ dependencies = [
  "blake3",
  "hex",
  "opentelemetry-proto",
+ "proptest",
  "prost",
  "ravel-logseg",
  "ravel-rspan",
