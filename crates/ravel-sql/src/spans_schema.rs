@@ -170,10 +170,7 @@ mod tests {
         assert!(!s.field(SPAN_COL_ATTRS).is_nullable());
 
         assert_eq!(s.field(SPAN_COL_SERVICE_NAME).name(), "service_name");
-        assert_eq!(
-            s.field(SPAN_COL_SERVICE_NAME).data_type(),
-            &DataType::Utf8
-        );
+        assert_eq!(s.field(SPAN_COL_SERVICE_NAME).data_type(), &DataType::Utf8);
         assert!(s.field(SPAN_COL_SERVICE_NAME).is_nullable());
 
         assert_eq!(s.field(SPAN_COL_DURATION_NS).name(), "duration_ns");
