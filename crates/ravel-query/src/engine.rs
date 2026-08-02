@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
-use ravel_catalog::{Catalog, Snapshot};
+use ravel_catalog::{Catalog, SegmentRef, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
     Annotations, Evaluator, FloatHistogram, HistogramSeriesData, LabelMatcher, MatchOp, PlanAnchor,
     SelectorPlan, SeriesData, SeriesSource, SourceError, Span, Value, from_ast_matchers,
     has_or_group, matches_series, ms_to_ns, plan_selectors,
 };
+use ravel_segment::ReaderLimits;
 use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
@@ -134,40 +135,76 @@ const PAGE_REQUESTS_PER_RUN: u64 = 2;
 /// without modeling their exact overlap.
 const STORE_BYTES_SAFETY_FACTOR: u64 = 2;
 
-/// Upper bound on decompressed bytes per sample used for the pre-execution
-/// estimate. A scalar sample decodes to exactly 16 bytes (`i64` timestamp +
-/// `f64` value; `decode_run`'s accounting). A native-histogram sample has no
-/// fixed size -- `HistogramCounts::{Int,Float}` carry `Vec`s whose length is
-/// not knowable before decode -- so this constant is a documented heuristic
-/// ceiling, not a proven bound: an unusually wide histogram (many spans or
-/// buckets) can exceed it, and the estimate would then under-shoot for that
-/// query. Flagged as an open question for ADR-0044 rather than silently
-/// assumed safe.
-const BYTES_PER_SAMPLE_UPPER_BOUND: u64 = 512;
+/// Upper bound on one segment's total decompressed sample bytes, derived
+/// from the segment's own value kinds rather than one constant (ADR-0044
+/// decision 3, amended). `SegmentRef::sample_count` aggregates scalar and
+/// native-histogram samples with no split by kind (neither the catalog's
+/// `SegmentRef` nor the persisted `CommitRecord`/`CompactionPart` it is
+/// built from records one -- proto/ravel/commit.proto), so which samples in
+/// a given segment are histograms is not knowable before the segment is
+/// opened and its catalog decoded, which is exactly the work this estimate
+/// exists to run ahead of. A scalar sample decodes to exactly 16 bytes
+/// (`i64` timestamp + `f64` value, `decode_run`'s accounting); a
+/// native-histogram sample decodes to roughly
+/// `45 + 8 * (buckets + spans + custom_values)` (`histogram_value_footprint`,
+/// fetcher.rs) with no reader-enforced cap on the bucket count, so no
+/// per-sample constant loose enough for a wide histogram and tight enough
+/// for scalars exists.
+///
+/// Absent a persisted per-kind split, this bounds every sample at the one
+/// per-sample ceiling every decoded sample is structurally guaranteed not
+/// to exceed regardless of kind: the page containing it
+/// (`ReaderLimits::max_page_uncompressed_bytes`, docs/segment-format.md). A
+/// segment carries at most one VAL_PAGES and one HIST_PAGES section
+/// (`section_kind`), each independently capped at
+/// `max_section_uncompressed_bytes`, so the segment's total decompressed
+/// sample bytes cannot exceed twice that either -- taking the smaller of
+/// the two keeps the bound tight for segments large enough that the
+/// per-sample scaling alone would be absurd, without ever under-shooting.
+/// This never under-shoots, which is the one hard requirement; it is
+/// deliberately loose for scalar-only segments, which is the still-open gap
+/// recorded on issue #418 (closing it needs a persisted per-kind sample
+/// count, a frozen-format change out of this fix's scope).
+fn segment_decompressed_bytes_upper_bound(seg: &SegmentRef, limits: &ReaderLimits) -> u64 {
+    let per_sample_scaled = seg
+        .sample_count
+        .saturating_mul(limits.max_page_uncompressed_bytes);
+    let section_capped = limits.max_section_uncompressed_bytes.saturating_mul(2);
+    per_sample_scaled.min(section_capped)
+}
 
 /// Computes the upper-envelope [`CostEstimate`] for a resolved snapshot
-/// (ADR-0044 decision 3), before any page fetch. `fetch_multiplier` scales
-/// for query shapes that re-open every segment in the snapshot more than
-/// once: `prefetch` fans out one independent fetch per selector
+/// (ADR-0044 decision 3), before any page fetch. `catalog_requests` is the
+/// separately-computed catalog term (`Catalog::estimated_list_requests`),
+/// bounded before `Catalog::resolve` runs; folded in here unconditionally so
+/// a window that resolves to zero segments (e.g. an all-pruned window with
+/// no snapshot HEAD) still carries a non-zero estimate for the LISTs
+/// `resolve` actually issued, instead of a zero estimate against a non-zero
+/// actual (`CostEstimate::divergence`'s `f64::INFINITY` case). `fetch_multiplier`
+/// scales for query shapes that re-open every segment in the snapshot more
+/// than once: `prefetch` fans out one independent fetch per selector
 /// (`plans.len()`), so an N-selector query's actual cost is up to Nx a
 /// single per-segment pass over the snapshot; `resolve_series_inner` fetches
 /// the snapshot once, so its multiplier is 1. Without this factor the
 /// estimate would not be a genuine upper bound for multi-selector queries.
-fn estimate_cost(snapshot: &Snapshot, fetch_multiplier: u64) -> CostEstimate {
+fn estimate_cost(
+    snapshot: &Snapshot,
+    fetch_multiplier: u64,
+    catalog_requests: u64,
+) -> CostEstimate {
     let segments = snapshot.segments.len() as u64;
     let series: u64 = snapshot.segments.iter().map(|s| s.series_count).sum();
+    let limits = ReaderLimits::default();
     let mut estimated_requests =
-        segments * (OPEN_REQUESTS_PER_SEGMENT + CATALOG_REQUESTS_PER_SEGMENT);
+        catalog_requests + segments * (OPEN_REQUESTS_PER_SEGMENT + CATALOG_REQUESTS_PER_SEGMENT);
     let mut estimated_store_bytes: u64 = 0;
     let mut estimated_decompressed_bytes: u64 = 0;
     for seg in &snapshot.segments {
         estimated_requests += seg.series_count.saturating_mul(PAGE_REQUESTS_PER_RUN);
         estimated_store_bytes = estimated_store_bytes
             .saturating_add(seg.object_size.saturating_mul(STORE_BYTES_SAFETY_FACTOR));
-        estimated_decompressed_bytes = estimated_decompressed_bytes.saturating_add(
-            seg.sample_count
-                .saturating_mul(BYTES_PER_SAMPLE_UPPER_BOUND),
-        );
+        estimated_decompressed_bytes = estimated_decompressed_bytes
+            .saturating_add(segment_decompressed_bytes_upper_bound(seg, &limits));
     }
     CostEstimate::new(
         estimated_requests.saturating_mul(fetch_multiplier),
@@ -638,30 +675,50 @@ impl QueryEngine {
         F: FnMut(Snapshot, QueryAccounting) -> Fut,
         Fut: std::future::Future<Output = Result<(T, FetchStats), QueryError>>,
     {
+        // The catalog term (ADR-0044 decision 3) is the same for both
+        // attempts: `window` and `now_ns` do not change on retry, only the
+        // snapshot resolve's outcome does.
+        let catalog_requests = self.catalog.estimated_list_requests(window, now_ns);
+        // Fresh handle per attempt, created before `resolve_bounded` runs so
+        // the same handle that goes on to fetch segments also receives
+        // resolve's own catalog-side counters (ADR-0044 decision 1: "created
+        // once per query" -- here, per the query attempt that wins). A
+        // retried attempt re-resolves and re-fetches from scratch, so the
+        // discarded first attempt's in-flight counts must not bleed into the
+        // attempt that actually produced the result.
+        let first_accounting = QueryAccounting::new();
         let first = self
-            .resolve_bounded(tenant_hash, window, min_tokens, now_ns, name_filter)
+            .resolve_bounded(
+                tenant_hash,
+                window,
+                min_tokens,
+                now_ns,
+                name_filter,
+                &first_accounting,
+            )
             .await?;
-        let first_estimate = estimate_cost(&first, fetch_multiplier);
+        let first_estimate = estimate_cost(&first, fetch_multiplier, catalog_requests);
         let first_segments = first.segments.len() as u64;
         let first_pruned = first.segments_pruned;
-        // Fresh handle per attempt: a retried attempt re-resolves and
-        // re-fetches from scratch, so the discarded first attempt's
-        // in-flight counts must not bleed into the attempt that actually
-        // produced the result (ADR-0044 decision 1: "created once per
-        // query" -- here, per the query attempt that wins).
-        let first_accounting = QueryAccounting::new();
         match attempt(first, first_accounting.clone()).await {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
                 ..
             })) => {
+                let second_accounting = QueryAccounting::new();
                 let second = self
-                    .resolve_bounded(tenant_hash, window, min_tokens, now_ns, name_filter)
+                    .resolve_bounded(
+                        tenant_hash,
+                        window,
+                        min_tokens,
+                        now_ns,
+                        name_filter,
+                        &second_accounting,
+                    )
                     .await?;
-                let second_estimate = estimate_cost(&second, fetch_multiplier);
+                let second_estimate = estimate_cost(&second, fetch_multiplier, catalog_requests);
                 let second_segments = second.segments.len() as u64;
                 let second_pruned = second.segments_pruned;
-                let second_accounting = QueryAccounting::new();
                 match attempt(second, second_accounting.clone()).await {
                     Err(QueryError::Fetch(FetchError::Store {
                         source: StoreError::NotFound,
@@ -707,24 +764,18 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        accounting: &QueryAccounting,
     ) -> Result<Snapshot, QueryError> {
-        // Seam: `Catalog::resolve_pruned`'s own store reads (catalog
-        // listing/GETs through `Catalog::guarded_get`/`guarded_list_all`)
-        // are not yet accounted -- that funnel lives in `ravel-catalog`,
-        // owned by a parallel task threading `QueryAccounting` through
-        // `Catalog::resolve` (ADR-0044 decision 2). Once that lands, this
-        // call takes a `&QueryAccounting` parameter too; until then
-        // `segments_pruned` and any catalog-side request/byte counts in
-        // this query's `QueryAccountingSnapshot` stay at 0.
         let snapshot = self
             .catalog
-            .resolve_pruned(
+            .resolve_pruned_with_accounting(
                 &tenant_hash,
                 Signal::Metrics,
                 window,
                 min_tokens,
                 now_ns,
                 name_filter,
+                accounting,
             )
             .await?;
         if snapshot.segments.len() > self.config.max_segments {
