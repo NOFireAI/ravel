@@ -37,6 +37,22 @@ pub const DEFAULT_POSTINGS_CACHE_ENTRIES: usize = 32;
 /// handful of variants, so this bound admits thousands of actively-queried
 /// tenants per process before the oldest (tenant, signal) pair is evicted.
 pub const DEFAULT_HEAD_CACHE_CAPACITY: usize = 10_000;
+/// Default total byte budget for the byte cache (ADR-0046 decisions 1-2): the
+/// RAM tier of raw, content-addressed bytes consulted at `guarded_get`-adjacent
+/// call sites before a store GET, ahead of decode into a [`crate::cache::PartCache`]
+/// or [`crate::cache::PostingsCache`] entry. 512 MiB, twice
+/// [`DEFAULT_MAX_SNAPSHOT_PART_BYTES`](snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES),
+/// enough headroom for a handful of hot parts and postings objects at once.
+pub const DEFAULT_BYTE_CACHE_MAX_BYTES: u64 = 512 << 20;
+/// Default entry-count bound for the byte cache. Modest: entries are whole
+/// parts/postings objects, not small pages, so a large count is never needed
+/// to fill [`DEFAULT_BYTE_CACHE_MAX_BYTES`].
+pub const DEFAULT_BYTE_CACHE_MAX_ENTRIES: usize = 512;
+/// Default per-entry byte cap for the byte cache, matching the largest object
+/// class it admits
+/// ([`DEFAULT_MAX_SNAPSHOT_PART_BYTES`](snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES) ==
+/// [`DEFAULT_MAX_POSTINGS_BYTES`](snapshot_format::DEFAULT_MAX_POSTINGS_BYTES), both 256 MiB).
+pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
 
 /// Catalog configuration.
 ///
@@ -94,6 +110,16 @@ pub struct CatalogConfig {
     /// [`crate::cache::HeadCache`] holds at once, process-wide. Default
     /// [`DEFAULT_HEAD_CACHE_CAPACITY`].
     pub head_cache_capacity: usize,
+    /// Total byte budget for the byte cache (ADR-0046), the RAM tier of raw
+    /// content-addressed bytes consulted ahead of a store GET for snapshot
+    /// parts and postings objects. Default [`DEFAULT_BYTE_CACHE_MAX_BYTES`].
+    pub byte_cache_max_bytes: u64,
+    /// Entry-count bound for the byte cache. Default
+    /// [`DEFAULT_BYTE_CACHE_MAX_ENTRIES`].
+    pub byte_cache_max_entries: usize,
+    /// Per-entry byte cap for the byte cache; an object larger than this is
+    /// never admitted. Default [`DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES`].
+    pub byte_cache_max_entry_bytes: u64,
 }
 
 impl Default for CatalogConfig {
@@ -111,6 +137,9 @@ impl Default for CatalogConfig {
             max_postings_bytes: snapshot_format::DEFAULT_MAX_POSTINGS_BYTES,
             postings_cache_entries: DEFAULT_POSTINGS_CACHE_ENTRIES,
             head_cache_capacity: DEFAULT_HEAD_CACHE_CAPACITY,
+            byte_cache_max_bytes: DEFAULT_BYTE_CACHE_MAX_BYTES,
+            byte_cache_max_entries: DEFAULT_BYTE_CACHE_MAX_ENTRIES,
+            byte_cache_max_entry_bytes: DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES,
         }
     }
 }

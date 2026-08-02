@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use prost::Message;
+use ravel_cache::{Cache, CacheKey, CacheLimits};
 use ravel_commit::keys::BucketEntry;
 use ravel_commit::{keys, record, signal};
 use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
@@ -66,6 +68,15 @@ pub struct Catalog {
     head_cache: HeadCache,
     part_cache: PartCache,
     postings_cache: PostingsCache,
+    /// The RAM byte cache (ADR-0046 decisions 1-2): raw bytes of
+    /// content-addressed objects (snapshot parts, postings), keyed by
+    /// `(tenant_hash, content_hash, offset, len)`, consulted at
+    /// [`Catalog::fetch_content_addressed`] before a store GET. `E` is
+    /// `Infallible` because this cache is never used through
+    /// `get_or_fetch`: every call site here does its own plain
+    /// get-then-insert, mirroring the five decoded caches' idiom, so no
+    /// upstream fetch-closure error type is ever constructed.
+    byte_cache: Cache<std::convert::Infallible>,
     /// Count of unlisted L0 records observed postdating a compaction record
     /// in their bucket (docs/catalog-and-mvcc.md step 3: an interlock
     /// breach, since a flush should have sealed before compaction ran). The
@@ -94,6 +105,11 @@ impl Catalog {
         if config.shard_count == 0 {
             return Err(CatalogError::InvalidConfig);
         }
+        let byte_cache_limits = CacheLimits::new(
+            config.byte_cache_max_bytes,
+            config.byte_cache_max_entries,
+            config.byte_cache_max_entry_bytes,
+        );
         Ok(Catalog {
             store,
             config,
@@ -102,6 +118,7 @@ impl Catalog {
             head_cache: HeadCache::default(),
             part_cache: PartCache::default(),
             postings_cache: PostingsCache::default(),
+            byte_cache: Cache::new(byte_cache_limits),
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
@@ -134,6 +151,50 @@ impl Catalog {
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
         }
         result
+    }
+
+    /// One store GET for an object named by a content-addressed ref
+    /// (`SnapshotPartRef`/`SnapshotPostingsRef`), consulted through the byte
+    /// cache before falling through to [`Catalog::guarded_get`] (ADR-0046
+    /// decisions 1-2). `content_hash` and `size` are the ref's own blake3 and
+    /// declared size, both known before the fetch is planned; a hit records
+    /// one cache hit and skips the GET (so `guarded_get`'s own accounting,
+    /// which credits an S3 request unconditionally, never runs), a miss
+    /// records one cache miss and falls through, admitting the bytes on
+    /// success.
+    ///
+    /// When `content_hash` is not exactly 32 bytes the ref is malformed; this
+    /// bypasses the cache entirely and calls `guarded_get` directly, exactly
+    /// as an uncached GET would, leaving the existing hash-mismatch handling
+    /// at the call site (which re-derives the same malformed comparison) to
+    /// catch it. This never happens for a well-formed ref.
+    ///
+    /// The catalog HEAD has no counterpart to this method: `SnapshotHead`
+    /// carries no content hash, so `read_head` has no `content_hash` value it
+    /// could pass here, and it never calls this method. The byte cache is
+    /// reachable only through this one function, which is the structural
+    /// reason HEAD cannot be admitted to it.
+    pub(crate) async fn fetch_content_addressed(
+        &self,
+        tenant: &TenantHash,
+        key: &str,
+        content_hash: &[u8],
+        size: u64,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, StoreError> {
+        let Ok(content_hash) = <[u8; 32]>::try_from(content_hash) else {
+            return Ok(self.guarded_get(key, GetRange::Full, accounting).await?.data);
+        };
+        let cache_key = CacheKey::new(tenant.0, content_hash, 0, size);
+        if let Some(bytes) = self.byte_cache.get(&cache_key) {
+            accounting.record_cache_hit();
+            accounting.add_cache_bytes(bytes.len() as u64);
+            return Ok(bytes);
+        }
+        accounting.record_cache_miss();
+        let got = self.guarded_get(key, GetRange::Full, accounting).await?;
+        self.byte_cache.insert(cache_key, got.data.clone());
+        Ok(got.data)
     }
 
     /// Prefix listing bounded by the same in-flight semaphore, draining every
@@ -216,6 +277,14 @@ impl Catalog {
     /// cache (P5b).
     pub(crate) fn postings_cache(&self) -> &PostingsCache {
         &self.postings_cache
+    }
+
+    /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the
+    /// byte cache directly (ADR-0046). Not used by `snapshot_resolve`, which
+    /// only ever reaches the byte cache through
+    /// [`Catalog::fetch_content_addressed`].
+    pub(crate) fn byte_cache(&self) -> &Cache<std::convert::Infallible> {
+        &self.byte_cache
     }
 
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot
