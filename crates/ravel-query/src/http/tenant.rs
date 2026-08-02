@@ -6,6 +6,7 @@
 use axum::http::HeaderMap;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -136,13 +137,27 @@ pub struct OidcJwksCache {
     http: reqwest::Client,
 }
 
+/// How long a single JWKS fetch may take before it is treated as a failure.
+/// A stalled fetch with no timeout wedges the readiness gate, the periodic
+/// refresh loop, and the refresh task's shutdown alike (see [`OidcJwksCache::new`]).
+const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl OidcJwksCache {
     /// A cache with no keys yet. Until the first successful
     /// [`refresh`](Self::refresh) (or [`install_jwks`](Self::install_jwks)) it
     /// trusts nothing, so every OIDC request is rejected. Fails only if the
     /// HTTP client cannot be built, a startup misconfiguration.
     pub fn new() -> Result<Self, OidcError> {
+        // reqwest applies no timeout by default. A JWKS host that accepts the
+        // connection and then stalls would otherwise wedge every caller of
+        // `refresh` forever: the readiness gate (which awaits the first
+        // refresh before marking the server ready), the periodic refresh
+        // loop (permanently stopping key rotation, so every OIDC request
+        // starts failing once the IdP rotates keys, with no recovery short
+        // of a restart), and the refresh task's shutdown (which joins the
+        // same stuck task).
         let http = reqwest::Client::builder()
+            .timeout(JWKS_FETCH_TIMEOUT)
             .build()
             .map_err(OidcError::HttpClient)?;
         Ok(OidcJwksCache {
@@ -202,11 +217,14 @@ impl OidcJwksCache {
 }
 
 /// Turn a JWK set into decoding entries, keeping only keys that declare a
-/// supported *signature* algorithm. A key that omits `alg`, or declares an
-/// encryption algorithm (`RSA-OAEP`, `RSA1_5`, ...), is skipped: without a
-/// declared signing algorithm there is nothing safe to pin [`Validation`] to,
-/// and admitting the token's own `alg` instead is the attack this design
-/// forbids. A key whose components will not parse is a hard error, not a skip.
+/// supported, asymmetric *signature* algorithm. A key that omits `alg`,
+/// declares an encryption algorithm (`RSA-OAEP`, `RSA1_5`, ...), or declares a
+/// symmetric one (`HS256`/`HS384`/`HS512`), is skipped: without a declared
+/// signing algorithm there is nothing safe to pin [`Validation`] to, admitting
+/// the token's own `alg` instead is the attack this design forbids, and a
+/// symmetric key in a *public* JWKS document is a published secret, never a
+/// valid one to verify with (see [`signing_algorithm`]). A key whose
+/// components will not parse is a hard error, not a skip.
 fn parse_signing_keys(jwks: &JwkSet) -> Result<Vec<DecodingEntry>, OidcError> {
     let mut out = Vec::new();
     for jwk in &jwks.keys {
@@ -232,13 +250,15 @@ fn decoding_key(jwk: &Jwk) -> Result<DecodingKey, OidcError> {
 }
 
 /// Map a JWKS `alg` to the `jsonwebtoken` signature algorithm it names, or
-/// `None` for a non-signature (encryption/key-agreement) algorithm we must not
-/// verify tokens with.
+/// `None` for an algorithm we must not verify tokens with: a non-signature
+/// (encryption/key-agreement) algorithm, or a symmetric (HMAC) one. A JWKS is
+/// a *public* document by definition (that is the entire point of publishing
+/// one), so a symmetric key inside it is a published verification secret, not
+/// a usable signing key - admitting it would let anyone who can read the JWKS
+/// forge tokens for any tenant.
 fn signing_algorithm(alg: KeyAlgorithm) -> Option<Algorithm> {
     Some(match alg {
-        KeyAlgorithm::HS256 => Algorithm::HS256,
-        KeyAlgorithm::HS384 => Algorithm::HS384,
-        KeyAlgorithm::HS512 => Algorithm::HS512,
+        KeyAlgorithm::HS256 | KeyAlgorithm::HS384 | KeyAlgorithm::HS512 => return None,
         KeyAlgorithm::ES256 => Algorithm::ES256,
         KeyAlgorithm::ES384 => Algorithm::ES384,
         KeyAlgorithm::RS256 => Algorithm::RS256,
@@ -378,6 +398,15 @@ impl TenantResolver for OidcResolver {
 /// exposed, or behind a proxy that forwards the raw client header, hands tenant
 /// selection to the client. It must be opt-in for exactly this reason.
 ///
+/// This resolver is reachable from every ingress that ultimately builds an
+/// `axum::http::HeaderMap` for a `TenantResolver` to read - which includes the
+/// gRPC listener: gRPC metadata keys are copied into the same `HeaderMap` type
+/// (see `services/ravel-server/src/otlp_grpc.rs`'s `metadata_to_headers` and
+/// `flight_auth`). Point (2) above therefore applies to every listener this
+/// process exposes, not only the HTTP one - a proxy that sanitizes the HTTP
+/// vhost but forwards gRPC traffic (or a different, unsanitized gRPC vhost)
+/// straight through leaves a live bypass on Flight SQL and OTLP gRPC ingest.
+///
 /// The header value maps straight to a [`TenantId`] with no further parsing:
 /// certificate SAN/CN extraction already happened at the proxy, and duplicating
 /// it here would be a second, weaker parser of a format Ravel never sees.
@@ -419,22 +448,43 @@ impl TenantResolver for MtlsResolver {
 mod tests {
     use super::*;
 
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use jsonwebtoken::{EncodingKey, Header, encode, get_current_timestamp};
 
-    const SECRET: &[u8] = b"a-test-hmac-signing-secret-value";
-    const OTHER_SECRET: &[u8] = b"a-different-secret-not-in-the-jwks";
     const ISSUER: &str = "https://issuer.example.com";
     const KID: &str = "test-key-1";
 
-    /// An oct (HMAC) JWK set carrying `secret` under key id `kid`, declaring
-    /// `alg`. Real public JWKS use RSA/EC, but oct keys exercise the exact same
-    /// parse -> validate -> claim path with no keypair generation or network.
-    fn jwks_with(secret: &[u8], kid: &str, alg: &str) -> JwkSet {
-        let k = URL_SAFE_NO_PAD.encode(secret);
+    // A real P-256 keypair (openssl ecparam -name prime256v1 -genkey), used to
+    // sign and verify ES256 tokens in these tests. Deliberately a genuine
+    // asymmetric key, not an HMAC secret: `parse_signing_keys` now refuses
+    // symmetric (oct) JWKS keys outright (a JWKS is a *public* document, so a
+    // symmetric key inside one is a published verification secret), so a test
+    // JWKS has to be built from a real keypair like any production one would
+    // be.
+    const EC_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwdzs5ZXprZ+FrmVM\n\
+2x3N9ehoXMhkWfOx7M0217LOtmehRANCAASPG9SIk2E3UTJC4nxm1l6y6yzX8N38\n\
+lVNfCuKwwBrIas5yannzOq4NUHTqcDRTLWg1ZyMnLrUgZ/WHc4/TGBXG\n\
+-----END PRIVATE KEY-----\n";
+    const EC_X: &str = "jxvUiJNhN1EyQuJ8ZtZesuss1_Dd_JVTXwrisMAayGo";
+    const EC_Y: &str = "znJqefM6rg1QdOpwNFMtaDVnIycutSBn9Ydzj9MYFcY";
+
+    // A second, unrelated P-256 keypair: the JWKS trusts the key above, so a
+    // token correctly ES256-signed with THIS key's private half must still
+    // fail (it is not the key the JWKS names for `kid`).
+    const OTHER_EC_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZ6KBsuAiIsR5NQD7\n\
+Vae0EmUbQ1GlLHprkMJ5vohUznahRANCAASlmFCeM19pdfZHYImxsgltyYZcRbOA\n\
+v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
+-----END PRIVATE KEY-----\n";
+
+    /// An EC (P-256) JWK set carrying the real public key above under key id
+    /// `kid`, declaring `ES256`.
+    fn jwks_with(kid: &str) -> JwkSet {
         let doc = serde_json::json!({
-            "keys": [{ "kty": "oct", "kid": kid, "alg": alg, "k": k }]
+            "keys": [{
+                "kty": "EC", "crv": "P-256", "kid": kid, "alg": "ES256",
+                "x": EC_X, "y": EC_Y,
+            }]
         });
         serde_json::from_value(doc).expect("valid JWKS")
     }
@@ -445,11 +495,24 @@ mod tests {
         Arc::new(cache)
     }
 
-    /// Sign a claims object as a JWT with `alg` and `kid` using `secret`.
-    fn sign(claims: &serde_json::Value, alg: Algorithm, kid: &str, secret: &[u8]) -> String {
-        let mut header = Header::new(alg);
+    /// Sign a claims object as an ES256 JWT with `kid`, using the given PEM
+    /// EC private key.
+    fn sign_es256(claims: &serde_json::Value, kid: &str, priv_pem: &str) -> String {
+        let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(kid.to_string());
-        encode(&header, claims, &EncodingKey::from_secret(secret)).expect("token encodes")
+        let key = EncodingKey::from_ec_pem(priv_pem.as_bytes()).expect("valid EC PEM");
+        encode(&header, claims, &key).expect("token encodes")
+    }
+
+    /// Sign a claims object as an HS256 JWT, keyed on the EC public key's raw
+    /// coordinate bytes reinterpreted as an HMAC secret - the classic
+    /// algorithm-confusion attack shape (an RS256/ES256 public key, which is
+    /// by definition published, reused as if it were a symmetric secret).
+    fn sign_hs256_confused(claims: &serde_json::Value, kid: &str) -> String {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(kid.to_string());
+        let secret = [EC_X.as_bytes(), EC_Y.as_bytes()].concat();
+        encode(&header, claims, &EncodingKey::from_secret(&secret)).expect("token encodes")
     }
 
     fn bearer(token: &str) -> HeaderMap {
@@ -479,8 +542,8 @@ mod tests {
 
     #[test]
     fn valid_token_resolves_claimed_tenant() {
-        let cache = cache_with(&jwks_with(SECRET, KID, "HS256"));
-        let token = sign(&claims(Some("acme"), 3600), Algorithm::HS256, KID, SECRET);
+        let cache = cache_with(&jwks_with(KID));
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
         let tenant = resolver(cache)
             .resolve(&bearer(&token))
             .expect("valid token resolves");
@@ -489,34 +552,34 @@ mod tests {
 
     #[test]
     fn expired_token_is_auth_error() {
-        let cache = cache_with(&jwks_with(SECRET, KID, "HS256"));
+        let cache = cache_with(&jwks_with(KID));
         // Past the default 60s leeway.
-        let token = sign(&claims(Some("acme"), -3600), Algorithm::HS256, KID, SECRET);
+        let token = sign_es256(&claims(Some("acme"), -3600), KID, EC_PRIV_PEM);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
     }
 
     #[test]
     fn token_signed_with_key_not_in_jwks_is_auth_error() {
-        // JWKS trusts SECRET; the token is signed with OTHER_SECRET under the
-        // same kid, so signature verification against the cached key fails.
-        let cache = cache_with(&jwks_with(SECRET, KID, "HS256"));
-        let token = sign(
-            &claims(Some("acme"), 3600),
-            Algorithm::HS256,
-            KID,
-            OTHER_SECRET,
-        );
+        // The JWKS trusts EC_PRIV_PEM's public half under `kid`; the token is
+        // correctly ES256-signed, but with the OTHER keypair's private half,
+        // so signature verification against the cached key fails.
+        let cache = cache_with(&jwks_with(KID));
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, OTHER_EC_PRIV_PEM);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
     }
 
     #[test]
-    fn algorithm_not_in_allowed_list_is_auth_error() {
-        // The JWKS declares HS256 for this key, so the resolver only admits
-        // HS256. A token signed HS384 with the very same secret and kid is
-        // otherwise well-formed and correctly signed, yet rejected because its
-        // alg is not the one the key declares (algorithm-confusion defense).
-        let cache = cache_with(&jwks_with(SECRET, KID, "HS256"));
-        let token = sign(&claims(Some("acme"), 3600), Algorithm::HS384, KID, SECRET);
+    fn algorithm_confusion_reusing_the_public_key_as_an_hmac_secret_is_auth_error() {
+        // The JWKS declares ES256 for this key, so the resolver only admits
+        // ES256 for it. A token whose header claims HS256 - signed with the
+        // EC public key's own (published) coordinate bytes reused as an HMAC
+        // secret, the classic algorithm-confusion attack - must be rejected
+        // regardless of which of jsonwebtoken's two independent gates catches
+        // it first: the allow-list this resolver pins Validation to (which
+        // only contains ES256 for this key) excludes HS256, and separately
+        // the key's family (EC) does not match HS256's family (HMAC).
+        let cache = cache_with(&jwks_with(KID));
+        let token = sign_hs256_confused(&claims(Some("acme"), 3600), KID);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
     }
 
@@ -524,23 +587,23 @@ mod tests {
     fn token_missing_tenant_claim_is_auth_error() {
         // A perfectly valid, correctly-signed token with no `tenant` claim must
         // not fall back to `sub` or anything else.
-        let cache = cache_with(&jwks_with(SECRET, KID, "HS256"));
-        let token = sign(&claims(None, 3600), Algorithm::HS256, KID, SECRET);
+        let cache = cache_with(&jwks_with(KID));
+        let token = sign_es256(&claims(None, 3600), KID, EC_PRIV_PEM);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
     }
 
     #[test]
     fn wrong_issuer_is_auth_error() {
-        let cache = cache_with(&jwks_with(SECRET, KID, "HS256"));
+        let cache = cache_with(&jwks_with(KID));
         let mut c = claims(Some("acme"), 3600);
         c["iss"] = "https://evil.example.com".into();
-        let token = sign(&c, Algorithm::HS256, KID, SECRET);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
     }
 
     #[test]
     fn missing_authorization_header_is_auth_error() {
-        let cache = cache_with(&jwks_with(SECRET, KID, "HS256"));
+        let cache = cache_with(&jwks_with(KID));
         assert!(resolver(cache).resolve(&HeaderMap::new()).is_err());
     }
 
@@ -548,7 +611,7 @@ mod tests {
     fn empty_cache_rejects_every_token() {
         let cache = Arc::new(OidcJwksCache::new().expect("client builds"));
         assert!(!cache.has_keys());
-        let token = sign(&claims(Some("acme"), 3600), Algorithm::HS256, KID, SECRET);
+        let token = sign_es256(&claims(Some("acme"), 3600), KID, EC_PRIV_PEM);
         assert!(resolver(cache).resolve(&bearer(&token)).is_err());
     }
 
@@ -558,7 +621,23 @@ mod tests {
         // no usable key and installing it fails loudly rather than silently
         // caching nothing.
         let doc = serde_json::json!({
-            "keys": [{ "kty": "oct", "kid": KID, "k": URL_SAFE_NO_PAD.encode(SECRET) }]
+            "keys": [{ "kty": "EC", "crv": "P-256", "kid": KID, "x": EC_X, "y": EC_Y }]
+        });
+        let jwks: JwkSet = serde_json::from_value(doc).expect("valid JWKS");
+        let cache = OidcJwksCache::new().expect("client builds");
+        assert!(matches!(
+            cache.install_jwks(&jwks),
+            Err(OidcError::NoUsableKeys)
+        ));
+    }
+
+    #[test]
+    fn symmetric_jwks_key_is_never_installed() {
+        // A JWKS is a *public* document; an oct (HMAC) key inside one is a
+        // published secret, never a valid signing key to trust. Confirm it is
+        // rejected outright, not silently accepted as if it were RSA/EC.
+        let doc = serde_json::json!({
+            "keys": [{ "kty": "oct", "kid": KID, "alg": "HS256", "k": EC_X }]
         });
         let jwks: JwkSet = serde_json::from_value(doc).expect("valid JWKS");
         let cache = OidcJwksCache::new().expect("client builds");

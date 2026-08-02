@@ -69,6 +69,31 @@ pub fn warn_dev_insecure_tenant_header(enabled: bool) {
     }
 }
 
+/// Warn loudly when `--mtls-enabled` trusts a header for tenant identity
+/// (ADR-0042 decision 6). Unlike `--dev-insecure-tenant-header`, this is a
+/// legitimate production configuration, not a dev-only bypass - the warning
+/// exists because the trust it grants depends entirely on every ingress into
+/// this process actually stripping or overwriting a client-supplied value of
+/// `header_name` before Ravel ever sees it. That includes the HTTP listener
+/// AND the gRPC listener: gRPC metadata keys are copied wholesale into the
+/// same `HeaderMap` this resolver reads (see `otlp_grpc::metadata_to_headers`
+/// and `flight_auth`), so a proxy that sanitizes only the HTTP vhost and
+/// forgets the gRPC one leaves a live tenant-impersonation bypass on Flight
+/// SQL and OTLP gRPC ingest.
+pub fn warn_mtls_trusted_header(header_name: Option<&str>) {
+    if let Some(header_name) = header_name {
+        tracing::warn!(
+            header = header_name,
+            "SECURITY: --mtls-enabled trusts the '{header_name}' header for tenant identity. \
+             This is only safe if EVERY ingress into this process (the HTTP listener and the \
+             gRPC listener, including Flight SQL and OTLP gRPC) sits behind a reverse proxy \
+             that terminates mTLS, verifies the client certificate, and strips or overwrites \
+             any client-supplied value of this header before forwarding. A deployment that \
+             protects one listener and not the other has a live tenant-impersonation bypass."
+        );
+    }
+}
+
 pub struct ServerConfig {
     pub mode: Mode,
     pub listen_http: SocketAddr,

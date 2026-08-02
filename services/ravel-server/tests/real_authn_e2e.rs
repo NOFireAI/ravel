@@ -3,18 +3,19 @@
 //! through a real HTTP request via the OIDC and mTLS resolvers in the
 //! `FallbackResolver` chain, and rejects unauthenticated requests.
 //!
-//! The OIDC case installs a locally-built oct (HMAC) JWKS directly into the
+//! The OIDC case installs a locally-built EC (P-256) JWKS directly into the
 //! cache, so the whole path (JWT signature + issuer + expiry validation, tenant
 //! claim extraction, and the trait boundary the query handler consumes) runs
-//! with no network and no live JWKS server.
+//! with no network and no live JWKS server. A real asymmetric key is used
+//! deliberately: `parse_signing_keys` refuses symmetric (oct/HMAC) JWKS keys
+//! outright, since a JWKS is a public document and a symmetric key inside one
+//! is a published verification secret, never a usable one.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
 use ravel_object_store::memory::MemoryStore;
@@ -24,8 +25,17 @@ use ravel_server::tenant::FallbackResolver;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 
 const ISSUER: &str = "https://issuer.example.com";
-const SECRET: &[u8] = b"integration-test-hmac-signing-secret";
 const KID: &str = "itest-key";
+
+// A real P-256 keypair (openssl ecparam -name prime256v1 -genkey), PKCS8
+// PEM for jsonwebtoken's `EncodingKey::from_ec_pem`.
+const EC_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwdzs5ZXprZ+FrmVM\n\
+2x3N9ehoXMhkWfOx7M0217LOtmehRANCAASPG9SIk2E3UTJC4nxm1l6y6yzX8N38\n\
+lVNfCuKwwBrIas5yannzOq4NUHTqcDRTLWg1ZyMnLrUgZ/WHc4/TGBXG\n\
+-----END PRIVATE KEY-----\n";
+const EC_X: &str = "jxvUiJNhN1EyQuJ8ZtZesuss1_Dd_JVTXwrisMAayGo";
+const EC_Y: &str = "znJqefM6rg1QdOpwNFMtaDVnIycutSBn9Ydzj9MYFcY";
 
 async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server::Running {
     let store = Arc::new(MemoryStore::new());
@@ -52,10 +62,8 @@ async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server:
 fn jwks() -> JwkSet {
     let doc = serde_json::json!({
         "keys": [{
-            "kty": "oct",
-            "kid": KID,
-            "alg": "HS256",
-            "k": URL_SAFE_NO_PAD.encode(SECRET),
+            "kty": "EC", "crv": "P-256", "kid": KID, "alg": "ES256",
+            "x": EC_X, "y": EC_Y,
         }]
     });
     serde_json::from_value(doc).expect("valid JWKS")
@@ -69,9 +77,10 @@ fn sign_token(tenant: &str, exp_offset_secs: i64) -> String {
         "tenant": tenant,
         "exp": exp,
     });
-    let mut header = Header::new(Algorithm::HS256);
+    let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(KID.to_string());
-    encode(&header, &claims, &EncodingKey::from_secret(SECRET)).expect("token encodes")
+    let key = EncodingKey::from_ec_pem(EC_PRIV_PEM.as_bytes()).expect("valid EC PEM");
+    encode(&header, &claims, &key).expect("token encodes")
 }
 
 /// The OIDC resolver, wrapped in a FallbackResolver exactly as the wiring does,

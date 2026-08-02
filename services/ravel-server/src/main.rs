@@ -40,6 +40,35 @@ async fn main() -> anyhow::Result<()> {
     // flags are set. Validation of dependent-flag misuse happens in
     // `parse_auth_resolvers`, fail-fast at startup.
     let auth = cli.parse_auth_resolvers()?;
+    // The JWKS fetch is the entire root of trust for JWT verification: an
+    // on-path attacker who can substitute the JWKS response controls which
+    // keys every OIDC request is verified against. Refuse a non-loopback
+    // plaintext URL outright, mirroring the loopback guard already applied to
+    // `--dev-insecure-tenant-header` above, rather than silently trusting it.
+    if let Some(oidc) = &auth.oidc
+        && oidc.jwks_url.starts_with("http://")
+    {
+        let jwks_host = oidc
+            .jwks_url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .unwrap_or("");
+        let is_loopback = jwks_host == "localhost"
+            || jwks_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        anyhow::ensure!(
+            is_loopback,
+            "--oidc-jwks-url '{}' uses plaintext http:// to a non-loopback host: the JWKS \
+             response is the entire trust root for JWT verification, and fetching it in \
+             plaintext lets an on-path attacker substitute their own keys and forge tokens for \
+             any tenant. Use https://, or point at a loopback address for local development \
+             only.",
+            oidc.jwks_url
+        );
+    }
+    ravel_server::warn_mtls_trusted_header(auth.mtls_header.as_deref());
+
     let resolver_bundle = ravel_server::tenant::build_auth_resolver(
         tenant_tokens,
         cli.dev_insecure_tenant_header,

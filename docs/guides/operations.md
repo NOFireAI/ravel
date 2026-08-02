@@ -14,7 +14,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--tenant-token TOKEN=TENANT` | | none, repeatable | Registers one bearer token for the static resolver. Pass it once per tenant. With no `--tenant-token` at all, every request is unauthenticated and rejected. |
 | `--dev-insecure-tenant-header` | | off | Adds tenant resolution through the `x-ravel-tenant` request header, tried only when bearer lookup fails. If `--listen-http` does not bind a loopback address, the process refuses to start with this set. |
 | `--oidc-issuer <url>` | | none | OIDC issuer, the exact `iss` every JWT must carry. Set together with `--oidc-jwks-url` to enable the OIDC resolver (ADR-0042 decision 6). Setting only one of the pair refuses to start. |
-| `--oidc-jwks-url <url>` | | none | URL of the issuer's JWKS document (its public signing keys), fetched directly (no OIDC discovery). Enables OIDC together with `--oidc-issuer`. |
+| `--oidc-jwks-url <url>` | | none | URL of the issuer's JWKS document (its public signing keys), fetched directly (no OIDC discovery). Enables OIDC together with `--oidc-issuer`. Refuses a plaintext `http://` URL to a non-loopback host at startup. |
 | `--oidc-audience <aud>` | | none, repeatable | Acceptable JWT `aud` value. With none set, audience is not checked. Set without OIDC enabled refuses to start. |
 | `--oidc-tenant-claim <claim>` | | `tenant` (when OIDC on) | String claim the tenant id is read from. A token missing it, or whose value is not a non-empty string, is rejected with no fallback to `sub`. Set without OIDC enabled refuses to start. |
 | `--oidc-jwks-refresh-interval-secs <n>` | | `300` | How often the JWKS document is refetched. The first fetch is awaited before the server reports ready; if it fails, an OIDC-enabled server refuses to start rather than serve with an empty key cache. |
@@ -171,11 +171,18 @@ chain; enabling them does not disable the bearer resolver.
   JWKS: signature, `iss`, and `exp` (and `aud` if any `--oidc-audience` is
   set). The signature algorithm is pinned from the JWKS key that verifies the
   token, never from the token's own `alg` header, so `alg: none` and
-  algorithm-confusion tokens are rejected. The tenant is read from
-  `--oidc-tenant-claim` (default `tenant`) as a string, with no fallback to
-  any other claim. The JWKS is cached in memory and refreshed on
-  `--oidc-jwks-refresh-interval-secs`; the request path never makes a network
-  call. The first fetch must succeed before the server reports ready.
+  algorithm-confusion tokens are rejected; a symmetric (HMAC) key in the JWKS
+  is rejected outright, since a JWKS is a public document and a symmetric key
+  inside one is a published verification secret, never a usable one. The
+  tenant is read from `--oidc-tenant-claim` (default `tenant`) as a string,
+  with no fallback to any other claim. The JWKS is cached in memory and
+  refreshed on `--oidc-jwks-refresh-interval-secs`; the request path never
+  makes a network call, and the fetch is bounded by a timeout so a stalled
+  JWKS host cannot wedge the refresh loop or the readiness gate. The first
+  fetch must succeed before the server reports ready. `--oidc-jwks-url`
+  refuses a plaintext `http://` URL to a non-loopback host at startup: the
+  JWKS response is the entire trust root for JWT verification, and fetching
+  it in plaintext lets an on-path attacker substitute their own keys.
 
 - **mTLS (proxy-forwarded).** Ravel does **not** terminate TLS or verify
   client certificates itself. `--mtls-enabled` reads a header (default
@@ -185,8 +192,13 @@ chain; enabling them does not disable the bearer resolver.
   is authoritative only because a trusted hop set it, and forgeable by anyone
   if that hop is absent. Enable it **only** behind a proxy that (a) actually
   performs mTLS client-certificate verification and (b) strips or overwrites
-  any client-supplied value of the header before forwarding. It is off by
-  default and opt-in for exactly this reason.
+  any client-supplied value of the header before forwarding **on every
+  ingress this process exposes** - the HTTP listener, and the gRPC listener
+  (Flight SQL and OTLP gRPC ingest read the same header, since gRPC metadata
+  is copied into the same header map). Sanitizing only the HTTP vhost and
+  forgetting the gRPC one leaves a live bypass. It is off by default and
+  opt-in for exactly this reason, and enabling it logs a startup warning
+  naming the trusted header.
 
 Dependent flags fail fast at startup: OIDC needs both its issuer and JWKS URL;
 `--oidc-tenant-claim`/`--oidc-audience` without OIDC, or `--mtls-header`
