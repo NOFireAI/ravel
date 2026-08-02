@@ -907,6 +907,7 @@ fn build_series_by_id(
 /// The partial map at the moment `max_series` was exceeded, kept around
 /// (instead of dropped immediately) so a test can assert its length directly
 /// rather than trusting only the `count` the resulting [`QueryError`] reports.
+#[derive(Debug)]
 struct SeriesCapExceeded {
     by_id: HashMap<SeriesId, LabelSet>,
     max: usize,
