@@ -1,7 +1,7 @@
 //! Local-disk tier of ADR-0046's read cache (docs/adrs/0046-read-cache-tier.md,
-//! decision 3's disk half, decision 4, decision 7, and rejected alternative
-//! 6). Content-addressed raw-byte-range storage under a configured
-//! directory, keyed by the existing [`CacheKey`].
+//! decision 3's disk half, decision 4, decision 6, decision 7, and rejected
+//! alternative 6). Content-addressed raw-byte-range storage under a
+//! configured directory, keyed by the existing [`CacheKey`].
 //!
 //! This is the first production file Ravel writes (ADR-0046's survey found
 //! none outside test code and two startup/CLI conveniences). Object storage
@@ -23,30 +23,40 @@
 //! atomic: any process that opens the final path either finds nothing (the
 //! old miss it already tolerates) or finds every byte the writer produced,
 //! never a byte range that stops partway through a write. A process killed
-//! mid-write leaves an orphaned temp file that no reader ever looks at,
-//! rather than a half-written file sitting at the path readers use. This is
-//! the mechanism, not merely a belt on top of a checksum: the checksum below
-//! exists for corruption *after* a successful rename (bit rot, a previous
-//! release's incompatible format, a hand-edited or garbage file), not for
-//! crash safety, which rename already provides on its own.
+//! mid-write leaves an orphaned temp file that no reader ever looks at
+//! through its content-addressed path, but the startup scan (and every
+//! later scan, since a fresh `DiskCache` can be constructed against a
+//! directory another instance is still using) sweeps it: any file in a
+//! shard directory that is not a live entry at its own canonical path is
+//! deleted rather than left to accumulate.
 //!
-//! **Read-time verification is crc32c, not blake3, and that is deliberate**
-//! (decision 4). [`DiskCache::insert`] computes a blake3 hash of the exact
-//! bytes being admitted, once, and stores it in the entry header -- this is
-//! the "verified once, on admission" blake3 the ADR asks for: a
-//! content-hash-based cache key does not by itself prove the payload bytes
-//! are what the key claims (the crate has no way to check a byte range
-//! against `CacheKey::content_hash`, which is the *whole object's* hash, not
-//! a range's), and computing that fingerprint once at write time is the
-//! honest thing to do with it. It is deliberately **not** recomputed on
-//! every hit: recomputing blake3 over a multi-megabyte segment range on
-//! every cache hit would put a full hash pass on the hot read path, which
-//! ADR-0046 rejects outright (rejected alternative 4). Every hit instead
-//! recomputes crc32c over the payload -- far cheaper, and exactly the
-//! integrity primitive the rest of Ravel's read path already pays for at
-//! every level of the footer/section/page/block/frame/window hierarchy, so
-//! a corrupt cached range is caught the same way a corrupt store read would
-//! be, just earlier.
+//! **Read-time verification is crc32c, and that is the whole of it**
+//! (decision 4, amended 2026-08-02). `CacheKey` is `(tenant_hash,
+//! content_hash, offset, len)`, where `content_hash` is the blake3 of the
+//! *whole object* an entry is a byte sub-range of, and the key carries no
+//! object size -- so this crate has no way to identify the full-object case
+//! where `blake3(payload) == content_hash` would even be checkable, and the
+//! original "verify blake3 once, on admission" design this crate shipped
+//! with turned out to be unimplementable: the hash it computed and stored
+//! was never anything readers could check the payload against, so no code
+//! path ever read it back. What actually protects a disk entry, stated so
+//! no later reader assumes more:
+//!
+//! - **Corruption after a successful write** (bit rot, a hand-edited or
+//!   otherwise damaged file) is caught by a crc32c over the payload,
+//!   recomputed on every hit.
+//! - **A foreign or stale file at an entry's path** (a previous release's
+//!   incompatible format, a file this cache never wrote) is caught by
+//!   comparing all four key fields in the entry header against the
+//!   requested key.
+//! - **Bytes that were never the named range to begin with** are caught by
+//!   nothing here, or anywhere else in the tree. Such bytes pass this
+//!   cache's crc32c and pass every crc32c in the segment reader's
+//!   footer/section/page/block hierarchy, and would produce silently wrong
+//!   query results. Closing that gap is the admitting funnel's obligation,
+//!   not this crate's: the funnel holds both the `SegmentRef` a range came
+//!   from and the bytes themselves, and must not admit a payload under a
+//!   key that does not describe it.
 //!
 //! **Plaintext, no encryption inside Ravel** (decision 7). Cached bytes are
 //! written to disk exactly as received, with no cipher. **With SSE-KMS
@@ -55,17 +65,17 @@
 //! it at the filesystem layer, the same precedent ADR-0042 already set for
 //! object storage.
 //!
-//! **Eviction** bounds the directory by total resident bytes and entry
-//! count (deliverable 7 of issue #442; rejected alternative 6 -- the tier
-//! must stay optional, never load-bearing for a node to start). Entries
-//! evict in FIFO order: oldest-inserted first. This tier does not reuse the
-//! RAM tier's S3-FIFO scan resistance (decision 6 scopes that to the RAM
-//! tier, whose caches sit under the compactor and the folder's continuous
-//! cold scans in the same process); a disk tier miss costs a network round
-//! trip, not a queue promotion, and plain FIFO is enough to keep the
-//! directory bounded without that complexity.
+//! **Eviction is S3-FIFO** (decision 6, amended 2026-08-02), the same
+//! policy and the same implementation the RAM tier uses (see [`crate::s3fifo`]):
+//! this tier instantiates `S3Fifo<()>`, since the payload itself lives on
+//! disk rather than in the eviction structure, and passes the entry size in
+//! explicitly. Scan resistance matters *more* here than in RAM: a disk miss
+//! costs an S3 fetch, the single most expensive thing a query does, and
+//! this is the large tier that actually holds the working set. A plain FIFO
+//! would let one compaction or fold pass evict everything queries rely on;
+//! S3-FIFO's probation queue absorbs a scan without ever touching entries
+//! already promoted to main.
 
-use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -78,11 +88,18 @@ use parking_lot::Mutex;
 use crate::key::CacheKey;
 use crate::limits::CacheLimits;
 use crate::metrics::CacheMetrics;
+use crate::s3fifo::S3Fifo;
 
 const MAGIC: [u8; 4] = *b"RVCD";
-const FORMAT_VERSION: u32 = 1;
-const HEADER_LEN: usize = 4 + 4 + 16 + 32 + 8 + 8 + 4 + 32;
+const FORMAT_VERSION: u32 = 2;
+const HEADER_LEN: usize = 4 + 4 + 16 + 32 + 8 + 8 + 4;
 const ENTRY_EXTENSION: &str = "rvc";
+
+/// Process-wide counter so two `DiskCache` instances constructed in the
+/// same process (even pointed at the same directory) never derive the same
+/// scratch filename: the temp path includes both the OS pid and this
+/// instance id, where the pid alone only disambiguates across processes.
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Header {
     tenant_hash: [u8; 16],
@@ -108,10 +125,6 @@ fn encode_header(key: &CacheKey, payload: &[u8]) -> [u8; HEADER_LEN] {
     buf[pos..pos + 8].copy_from_slice(&key.len.to_le_bytes());
     pos += 8;
     buf[pos..pos + 4].copy_from_slice(&crc32c::crc32c(payload).to_le_bytes());
-    pos += 4;
-    // Recorded once, verified never again on the read path -- see the
-    // module docs on why this crate does not decode this field back out.
-    buf[pos..pos + 32].copy_from_slice(blake3::hash(payload).as_bytes());
     buf
 }
 
@@ -119,6 +132,9 @@ fn encode_header(key: &CacheKey, payload: &[u8]) -> [u8; HEADER_LEN] {
 /// well-formed header this format produced: short reads, bad magic, and an
 /// unknown version all collapse to the same "not a usable entry" outcome,
 /// because the caller's only two responses are "use it" or "discard it".
+/// The version check also means a header this same code wrote under the
+/// previous, wider layout (with a trailing blake3 field no reader ever
+/// consumed) is rejected here rather than misread at the wrong offsets.
 fn decode_header(buf: &[u8; HEADER_LEN]) -> Option<Header> {
     let mut pos = 0usize;
     let magic: [u8; 4] = buf[pos..pos + 4].try_into().ok()?;
@@ -174,31 +190,15 @@ fn path_for(dir: &Path, key: &CacheKey) -> PathBuf {
     dir.join(shard).join(name).with_extension(ENTRY_EXTENSION)
 }
 
-struct DiskState {
-    order: VecDeque<CacheKey>,
-    sizes: HashMap<CacheKey, u64>,
-    total_bytes: u64,
-}
-
-impl DiskState {
-    fn forget(&mut self, key: &CacheKey) {
-        if let Some(size) = self.sizes.remove(key) {
-            self.total_bytes -= size;
-            if let Some(pos) = self.order.iter().position(|k| k == key) {
-                self.order.remove(pos);
-            }
-        }
-    }
-}
-
 /// The disk tier of ADR-0046's read cache. See the [module docs](self) for
 /// the crash-safety, verification, encryption, and eviction rationale.
 pub struct DiskCache {
     dir: PathBuf,
     limits: CacheLimits,
-    state: Mutex<DiskState>,
+    state: Mutex<S3Fifo<()>>,
     metrics: Arc<CacheMetrics>,
     tmp_counter: AtomicU64,
+    instance_id: u64,
 }
 
 impl DiskCache {
@@ -211,32 +211,28 @@ impl DiskCache {
     ///
     /// A best-effort scan seeds byte and entry accounting from whatever is
     /// already on disk (a previous process's entries surviving a restart).
-    /// Anything the scan cannot parse as one of this format's own entries
-    /// -- a previous release's incompatible layout, a partial file left by
-    /// a crash, a foreign file -- is deleted on sight rather than counted:
-    /// discard and rebuild, never repair, applies at startup exactly as it
-    /// does on a live read.
+    /// Anything the scan cannot recognise as a live entry at its own
+    /// canonical path -- a previous release's incompatible layout, an
+    /// orphaned `.tmp-*` scratch file left by a crash mid-insert, a foreign
+    /// file, or a valid-looking entry sitting at the wrong path -- is
+    /// deleted on sight rather than counted: discard and rebuild, never
+    /// repair, applies at startup exactly as it does on a live read.
     pub fn new(dir: PathBuf, limits: CacheLimits) -> Self {
-        let (order, sizes, total_bytes) = Self::scan_existing(&dir);
+        let state = Self::scan_existing(&dir, limits);
         DiskCache {
             dir,
             limits,
-            state: Mutex::new(DiskState {
-                order,
-                sizes,
-                total_bytes,
-            }),
+            state: Mutex::new(state),
             metrics: Arc::new(CacheMetrics::default()),
             tmp_counter: AtomicU64::new(0),
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
-    fn scan_existing(dir: &Path) -> (VecDeque<CacheKey>, HashMap<CacheKey, u64>, u64) {
-        let mut order = VecDeque::new();
-        let mut sizes = HashMap::new();
-        let mut total_bytes = 0u64;
+    fn scan_existing(dir: &Path, limits: CacheLimits) -> S3Fifo<()> {
+        let mut fifo = S3Fifo::new(limits);
         let Ok(shards) = fs::read_dir(dir) else {
-            return (order, sizes, total_bytes);
+            return fifo;
         };
         for shard in shards.flatten() {
             let Ok(file_type) = shard.file_type() else {
@@ -250,22 +246,25 @@ impl DiskCache {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some(ENTRY_EXTENSION) {
-                    continue;
-                }
                 match Self::scan_one(&path) {
-                    Some((key, size)) => {
-                        total_bytes += size;
-                        sizes.insert(key, size);
-                        order.push_back(key);
+                    Some((key, size)) if path_for(dir, &key) == path => {
+                        fifo.seed(key, (), size);
                     }
-                    None => {
+                    _ => {
+                        // Not recognisable as a live entry at its own
+                        // canonical path: a foreign file, a previous
+                        // format, an orphaned scratch file (a `.tmp-*`
+                        // name has no parseable header at all), or a
+                        // well-formed entry that simply lives at the
+                        // wrong path (which would otherwise leak its real
+                        // file uncounted and double-count a duplicate key
+                        // into `total_bytes`). Delete rather than count.
                         let _ = fs::remove_file(&path);
                     }
                 }
             }
         }
-        (order, sizes, total_bytes)
+        fifo
     }
 
     /// Reads just the header of a candidate file and cross-checks the
@@ -299,7 +298,7 @@ impl DiskCache {
 
     /// Current number of resident entries this process knows about.
     pub fn len(&self) -> usize {
-        self.state.lock().sizes.len()
+        self.state.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -309,7 +308,7 @@ impl DiskCache {
     /// Current total bytes across every resident entry this process knows
     /// about.
     pub fn total_bytes(&self) -> u64 {
-        self.state.lock().total_bytes
+        self.state.lock().total_bytes()
     }
 
     /// Look up `key`. Every failure -- the directory or file missing, a
@@ -321,6 +320,10 @@ impl DiskCache {
         let path = path_for(&self.dir, key);
         match self.read_and_verify(key, &path) {
             Some(bytes) => {
+                // Record the touch for S3-FIFO promotion. The entry is
+                // already known-resident (verification just re-read it
+                // from disk); this only affects eviction ordering.
+                self.state.lock().get(key);
                 self.metrics.record_hit(bytes.len() as u64);
                 Some(bytes)
             }
@@ -332,7 +335,18 @@ impl DiskCache {
     }
 
     fn read_and_verify(&self, key: &CacheKey, path: &Path) -> Option<Bytes> {
-        let mut file = fs::File::open(path).ok()?;
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => {
+                // Missing, permission-denied, or otherwise unopenable:
+                // forget any accounting for this key so a later insert of
+                // the identical key is not refused as "already resident"
+                // forever (the scenario ADR-0046 requires a query to
+                // survive -- the cache directory disappearing mid-flight).
+                self.discard(key, path);
+                return None;
+            }
+        };
         let mut header_buf = [0u8; HEADER_LEN];
         if file.read_exact(&mut header_buf).is_err() {
             // Shorter than even a header: cannot be a complete entry.
@@ -381,7 +395,7 @@ impl DiskCache {
 
     fn discard(&self, key: &CacheKey, path: &Path) {
         let _ = fs::remove_file(path);
-        self.state.lock().forget(key);
+        self.state.lock().remove(key);
     }
 
     /// Admit `value` under `key`. Never an error and never partially
@@ -392,13 +406,23 @@ impl DiskCache {
     /// uncreatable, read-only, out of space, or anything else -- leaves no
     /// trace and is not reported: the caller already has its own copy of
     /// `value`, so nothing is lost by declining to cache it.
+    ///
+    /// Rejects `value` outright, without touching disk, if its length
+    /// disagrees with `key.len`: the header records `key.len` as the
+    /// payload length, so admitting a mismatched `value` would store a
+    /// self-contradictory entry that can only ever miss on every future
+    /// read while still counting as a successful admission.
     pub fn insert(&self, key: CacheKey, value: &[u8]) {
         let size = value.len() as u64;
+        if size != key.len {
+            self.metrics.record_rejected_size();
+            return;
+        }
         if size > self.limits.max_entry_bytes {
             self.metrics.record_rejected_size();
             return;
         }
-        if self.state.lock().sizes.contains_key(&key) {
+        if self.state.lock().contains(&key) {
             // Content-addressed: an existing entry for this key is already
             // these exact bytes.
             return;
@@ -423,41 +447,24 @@ impl DiskCache {
             let _ = fs::remove_file(&tmp_path);
             return;
         }
-        self.metrics.record_admission(size);
 
-        let mut state = self.state.lock();
-        if state.sizes.contains_key(&key) {
-            // Lost a race with a concurrent insert of the same key: both
-            // wrote identical bytes (content-addressed), so keep the
-            // existing accounting rather than double-count.
-            return;
+        let evicted = {
+            let mut state = self.state.lock();
+            let (_, evicted) = state.insert(key, (), size, &self.metrics);
+            evicted
+        };
+        for evicted_key in evicted {
+            let _ = fs::remove_file(path_for(&self.dir, &evicted_key));
         }
-        state.order.push_back(key);
-        state.sizes.insert(key, size);
-        state.total_bytes += size;
-        self.evict_to_bounds(&mut state);
     }
 
     fn tmp_path_for(&self, parent: &Path) -> PathBuf {
         let id = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
-        parent.join(format!(".tmp-{}-{id}", std::process::id()))
-    }
-
-    fn evict_to_bounds(&self, state: &mut DiskState) {
-        while state.total_bytes > self.limits.max_bytes
-            || state.order.len() > self.limits.max_entries
-        {
-            let Some(oldest) = state.order.pop_front() else {
-                break;
-            };
-            let Some(size) = state.sizes.remove(&oldest) else {
-                continue;
-            };
-            state.total_bytes -= size;
-            let path = path_for(&self.dir, &oldest);
-            let _ = fs::remove_file(&path);
-            self.metrics.record_eviction();
-        }
+        parent.join(format!(
+            ".tmp-{}-{}-{id}",
+            std::process::id(),
+            self.instance_id
+        ))
     }
 }
 
@@ -588,9 +595,8 @@ mod tests {
         }
 
         // Entry whose crc32c (the per-hit integrity check the header
-        // carries; see the module docs on why blake3 is not recomputed
-        // here) no longer matches the payload: a single flipped byte after
-        // a clean write, simulating bit rot or on-disk damage.
+        // carries) no longer matches the payload: a single flipped byte
+        // after a clean write, simulating bit rot or on-disk damage.
         {
             let dir = base.join("bitrot");
             fs::create_dir_all(&dir).unwrap();
@@ -707,8 +713,12 @@ mod tests {
         let other_key = test_key_with_len(2, 5);
         assert!(cache.get(&other_key).is_none());
 
-        // The directory comes back on the next insert, and the tier keeps
-        // working correctly rather than staying wedged.
+        // The directory comes back on the next insert, and -- critically
+        // -- the *same* key that just missed is insertable again: the
+        // external deletion must not leave this key permanently wedged in
+        // "already resident" accounting with no backing file.
+        cache.insert(key, b"again");
+        assert_eq!(cache.get(&key).as_deref(), Some(b"again".as_slice()));
         cache.insert(other_key, b"world");
         assert_eq!(cache.get(&other_key).as_deref(), Some(b"world".as_slice()));
     }
@@ -784,5 +794,123 @@ mod tests {
             reopened.get(&test_key_with_len(2, 20)).as_deref(),
             Some([2u8; 20].as_slice())
         );
+    }
+
+    /// Finding 3: `.tmp-<pid>-<instance>-<n>` scratch files left behind by
+    /// a crash mid-insert have a leading-dot name with no other `.`, so
+    /// `Path::extension()` returns `None` for them. A scan that filters on
+    /// `Some("rvc")` never even looks at them, and they survive across
+    /// restarts forever, silently exceeding the directory's configured
+    /// byte bound. The fix inspects every file, not just `.rvc`-suffixed
+    /// ones, and deletes anything it cannot parse as a live entry.
+    #[test]
+    fn startup_scan_sweeps_orphaned_scratch_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let shard = dir.join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        let orphan = shard.join(format!(".tmp-{}-0-0", std::process::id()));
+        fs::write(&orphan, vec![0u8; 4096]).unwrap();
+
+        let cache = DiskCache::new(dir, generous_limits());
+        assert_eq!(cache.total_bytes(), 0);
+        assert_eq!(cache.len(), 0);
+        assert!(
+            !orphan.exists(),
+            "an orphaned scratch file must be swept at startup"
+        );
+    }
+
+    /// Finding 4: `insert` must reject a payload whose length disagrees
+    /// with `key.len`, rather than writing an entry the header itself
+    /// contradicts (which then misses on every future read while still
+    /// counting as an admission).
+    #[test]
+    fn insert_rejects_length_mismatch_between_key_and_payload() {
+        let tmp = TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+
+        let key = test_key_with_len(1, 999);
+        cache.insert(key, b"much shorter than 999 bytes");
+
+        assert!(cache.get(&key).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.total_bytes(), 0);
+        assert_eq!(cache.metrics().snapshot().admissions_rejected_size, 1);
+        assert_eq!(cache.metrics().snapshot().bytes_admitted, 0);
+    }
+
+    /// Finding 6: a well-formed entry file living at a path other than
+    /// its own canonical `path_for` (a corrupted rename, a hand-placed
+    /// file, or -- before this fix -- an orphaned pre-rename temp file
+    /// that happened to be complete) must be deleted at startup, not
+    /// counted: counting it would leak the real file at the canonical
+    /// path uncounted and double-book its size into `total_bytes`.
+    #[test]
+    fn startup_scan_deletes_misplaced_entry_rather_than_counting_it() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let real_key = test_key_with_len(1, 64);
+        let payload = vec![7u8; 64];
+        let header = encode_header(&real_key, &payload);
+        let wrong_shard = dir.join("zz");
+        fs::create_dir_all(&wrong_shard).unwrap();
+        let wrong_path = wrong_shard.join("misplaced.rvc");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&payload);
+        fs::write(&wrong_path, &buf).unwrap();
+
+        let cache = DiskCache::new(dir, generous_limits());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.total_bytes(), 0);
+        assert!(cache.get(&real_key).is_none());
+        assert!(
+            !wrong_path.exists(),
+            "a misplaced entry file must be deleted, not counted"
+        );
+    }
+
+    /// Finding 1: the disk tier now evicts with S3-FIFO, the same policy
+    /// and implementation the RAM tier uses, so a scan of distinct
+    /// once-touched keys must not evict a working set that was re-accessed
+    /// after admission (a plain-FIFO disk tier fails this).
+    #[test]
+    fn disk_tier_survives_repeated_scans_via_s3_fifo_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let entry_size = 1024u64;
+        let working_set_len = 20u64;
+        let limits = CacheLimits::new(entry_size * 100, 1000, entry_size * 10);
+        let cache = DiskCache::new(tmp.path().to_path_buf(), limits);
+
+        let working_set: Vec<CacheKey> = (0..working_set_len)
+            .map(|i| test_key_with_len(i, entry_size))
+            .collect();
+        for key in &working_set {
+            cache.insert(*key, &vec![0xAAu8; entry_size as usize]);
+        }
+        // A second touch so S3-FIFO promotes each entry out of probation.
+        for key in &working_set {
+            assert!(cache.get(key).is_some());
+        }
+
+        for pass in 0..3u64 {
+            let base = 1_000 + pass * 500;
+            for i in base..base + 500 {
+                cache.insert(
+                    test_key_with_len(i, entry_size),
+                    &vec![0xEEu8; entry_size as usize],
+                );
+            }
+            let resident = working_set
+                .iter()
+                .filter(|key| cache.get(key).is_some())
+                .count();
+            assert!(
+                resident as f64 >= working_set_len as f64 * 0.9,
+                "working set collapsed on disk-tier scan pass {pass}: only {resident}/{working_set_len} resident"
+            );
+        }
     }
 }

@@ -21,7 +21,7 @@ const CORRUPTION_XOR: u8 = 0xA5;
 /// fetch error type; this crate defines no error type of its own and has
 /// no opinion on what a miss's upstream call looks like.
 pub struct Cache<E> {
-    fifo: Mutex<S3Fifo>,
+    fifo: Mutex<S3Fifo<Bytes>>,
     single_flight: SingleFlight<CacheKey, Bytes, E>,
     metrics: Arc<CacheMetrics>,
     corrupt_hits: bool,
@@ -98,7 +98,8 @@ where
     /// eviction state, if `value` is larger than the configured maximum
     /// single-entry size: the caller still has its own copy of the bytes.
     pub fn insert(&self, key: CacheKey, value: Bytes) {
-        self.fifo.lock().insert(key, value, &self.metrics);
+        let size = value.len() as u64;
+        self.fifo.lock().insert(key, value, size, &self.metrics);
     }
 
     fn maybe_corrupt(&self, bytes: Bytes) -> Bytes {
