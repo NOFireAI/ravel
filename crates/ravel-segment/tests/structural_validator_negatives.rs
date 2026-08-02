@@ -2,15 +2,16 @@
 //! (finding a1-F02 of the 2026-07-27 storage-engine quality audit, issue #50).
 //! A byte-flip test cannot reach these branches: a flip in a length/offset/
 //! count field also invalidates the covering crc and is caught earlier. Each
-//! test below violates exactly one structural rule of `validate_sections_v5`
-//! (the only version ADR-0027 keeps) and asserts the exact typed corruption
-//! error, never a panic and never wrong data. The test name names the precise
-//! rule pinned, so an editor who weakens that branch sees one red test.
+//! test below violates exactly one structural rule of `validate_sections_v6`
+//! (the only version ADR-0047 keeps, superseding ADR-0027's v5) and asserts
+//! the exact typed corruption error, never a panic and never wrong data. The
+//! test name names the precise rule pinned, so an editor who weakens that
+//! branch sees one red test.
 #![allow(clippy::expect_used)]
 
 use ravel_segment::{
     Footer, IngestBounds, ReaderLimits, SegmentError, SegmentIdentity, SegmentWriter, SeriesInput,
-    open_from_full, validate_sections,
+    VERSION_V6, open_from_full, validate_sections,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -21,8 +22,6 @@ const TS_PAGES: u32 = 3;
 const SERIES_IDS: u32 = 5;
 const SERIES_META: u32 = 6;
 const SERIES_IDX: u32 = 8;
-
-const VERSION_V5: u16 = 5;
 
 fn labels(pairs: &[(&str, &str)]) -> LabelSet {
     LabelSet::new(
@@ -54,7 +53,7 @@ fn bounds() -> IngestBounds {
     }
 }
 
-/// A minimal real, valid v5 object (one series, one sample) -- below the
+/// A minimal real, valid v6 object (one series, one sample) -- below the
 /// sparse threshold, so LABEL_DICT/SERIES_IDS/SERIES_META/TS_PAGES/VAL_PAGES.
 fn one_sample_object() -> bytes::Bytes {
     let series = vec![SeriesInput {
@@ -70,7 +69,7 @@ fn one_sample_object() -> bytes::Bytes {
         .bytes
 }
 
-/// A real, valid v5 footer plus its `page_region_end` (the footer offset,
+/// A real, valid v6 footer plus its `page_region_end` (the footer offset,
 /// exactly what `open_from_full` passes to `validate_sections`).
 fn valid_footer() -> (Footer, u64) {
     let object = one_sample_object();
@@ -78,24 +77,24 @@ fn valid_footer() -> (Footer, u64) {
     (loc.footer, loc.footer_offset)
 }
 
-/// Control: a real, unmutated v5 footer validates.
+/// Control: a real, unmutated v6 footer validates.
 #[test]
-fn valid_v5_footer_accepted() {
+fn valid_v6_footer_accepted() {
     let (footer, region) = valid_footer();
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Ok(())
     );
 }
 
-/// Pins: every mandatory v5 kind must be present. SERIES_IDS is a kind that
+/// Pins: every mandatory v6 kind must be present. SERIES_IDS is a kind that
 /// did not exist in the retired v1 layout; dropping it is rejected.
 #[test]
 fn missing_mandatory_section_rejected() {
     let (mut footer, region) = valid_footer();
     footer.sections.retain(|s| s.kind != SERIES_IDS);
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Err(SegmentError::MissingSection("SERIES_IDS"))
     );
 }
@@ -113,7 +112,7 @@ fn duplicate_known_kind_rejected() {
         .expect("LABEL_DICT present");
     footer.sections.push(dup);
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Err(SegmentError::DuplicateSection(LABEL_DICT))
     );
 }
@@ -131,7 +130,7 @@ fn section_offset_len_overflow_rejected() {
     s.offset = u64::MAX;
     s.len = 1;
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Err(SegmentError::SectionOutOfBounds)
     );
 }
@@ -149,7 +148,7 @@ fn section_range_past_region_rejected() {
     s.offset = 0;
     s.len = region + 1;
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Err(SegmentError::SectionOutOfBounds)
     );
 }
@@ -166,7 +165,7 @@ fn section_uncompressed_len_over_cap_rejected() {
         .expect("LABEL_DICT present");
     s.uncompressed_len = limits.max_section_uncompressed_bytes + 1;
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, limits),
+        validate_sections(&footer, VERSION_V6, region, limits),
         Err(SegmentError::SectionTooLarge {
             len: limits.max_section_uncompressed_bytes + 1,
             cap: limits.max_section_uncompressed_bytes,
@@ -189,7 +188,7 @@ fn unknown_kind_is_skipped_not_rejected() {
     unknown.kind = 0xBEEF;
     footer.sections.push(unknown);
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Ok(())
     );
 }
@@ -209,7 +208,7 @@ fn both_whole_and_sparse_catalog_rejected() {
     idx.kind = SERIES_IDX;
     footer.sections.push(idx);
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Err(SegmentError::DuplicateSection(SERIES_META))
     );
 }
@@ -230,21 +229,23 @@ fn incomplete_sparse_catalog_rejected() {
     footer.sections.push(idx);
     footer.sections.retain(|s| s.kind != SERIES_META);
     assert_eq!(
-        validate_sections(&footer, VERSION_V5, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
         Err(SegmentError::SparseSectionsIncomplete)
     );
 }
 
-/// Pins: `validate_sections` rejects any trailer version other than 5
-/// (ADR-0027), matching `parse_footer`'s accepted set.
+/// Pins: `validate_sections` rejects any trailer version other than 6
+/// (ADR-0047), matching `parse_footer`'s accepted set.
 #[test]
 fn unsupported_version_rejected() {
     let (footer, region) = valid_footer();
+    // v5 (ADR-0026) is retired by the v6 EXEMPLARS bump; rejected the same
+    // way as any other non-6 version.
     assert_eq!(
-        validate_sections(&footer, 6, region, ReaderLimits::default()),
-        Err(SegmentError::UnsupportedVersion(6))
+        validate_sections(&footer, 5, region, ReaderLimits::default()),
+        Err(SegmentError::UnsupportedVersion(5))
     );
-    // A retired version is rejected the same way.
+    // A version that never existed is rejected the same way.
     assert_eq!(
         validate_sections(&footer, 1, region, ReaderLimits::default()),
         Err(SegmentError::UnsupportedVersion(1))
