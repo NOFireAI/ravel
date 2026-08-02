@@ -403,14 +403,20 @@ impl TenantResolver for OidcResolver {
 /// exposed, or behind a proxy that forwards the raw client header, hands tenant
 /// selection to the client. It must be opt-in for exactly this reason.
 ///
-/// This resolver is reachable from every ingress that ultimately builds an
-/// `axum::http::HeaderMap` for a `TenantResolver` to read - which includes the
-/// gRPC listener: gRPC metadata keys are copied into the same `HeaderMap` type
-/// (see `services/ravel-server/src/otlp_grpc.rs`'s `metadata_to_headers` and
-/// `flight_auth`). Point (2) above therefore applies to every listener this
-/// process exposes, not only the HTTP one - a proxy that sanitizes the HTTP
-/// vhost but forwards gRPC traffic (or a different, unsanitized gRPC vhost)
-/// straight through leaves a live bypass on Flight SQL and OTLP gRPC ingest.
+/// Its **one legitimate source** is `--mtls-listener`, per
+/// `docs/adrs/0050-fail-closed-isolation-and-startup-invariants.md` section 1:
+/// `services/ravel-server` installs this resolver only in the router chain
+/// bound to that dedicated listener address. The public HTTP listener
+/// (`--listen-http`) and the public gRPC/Flight listener (`--listen-grpc`) are
+/// built with a resolver chain that structurally never contains an
+/// `MtlsResolver`, so the header has no effect there regardless of what a
+/// proxy in front of them does or does not strip - the old bypass (gRPC
+/// metadata is copied into the same `HeaderMap` type any `TenantResolver`
+/// reads, see `services/ravel-server/src/otlp_grpc.rs`'s
+/// `metadata_to_headers` and `flight_auth`) is closed by construction, not by
+/// convention. `services/ravel-server` refuses to start rather than run with
+/// this resolver reachable from a public listener; see
+/// `ravel_server::config::Cli::validate`.
 ///
 /// The header value maps straight to a [`TenantId`] with no further parsing:
 /// certificate SAN/CN extraction already happened at the proxy, and duplicating
