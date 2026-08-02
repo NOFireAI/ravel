@@ -193,6 +193,17 @@ pub struct Cli {
     /// Setting it without `--mtls-enabled` fails startup.
     #[arg(long, value_name = "HEADER")]
     pub mtls_header: Option<String>,
+
+    /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
+    /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
+    /// stack; this flag is the runtime opt-in that decides whether a given
+    /// process actually serves it. Absent, `ArrowMetricsService` is not
+    /// registered even in an `otap`-enabled build. The flag itself only exists
+    /// in a build with the `otap` feature, so it never appears in `--help`
+    /// otherwise (mirroring how a feature that is not compiled has no surface).
+    #[cfg(feature = "otap")]
+    #[arg(long)]
+    pub otap: bool,
 }
 
 /// Validated OIDC settings, present only when `--oidc-issuer`/`--oidc-jwks-url`
@@ -580,6 +591,16 @@ mod tests {
             err.to_string().contains("--oidc-audience"),
             "error names the flag: {err}"
         );
+    }
+
+    #[cfg(feature = "otap")]
+    #[test]
+    fn otap_flag_defaults_off_and_parses_when_present() {
+        // The `otap` cargo feature links the service; the flag is the runtime
+        // opt-in (ADR-0011). Absent, it defaults false, so an otap-enabled
+        // build still does not register the service unless asked.
+        assert!(!cli(&[]).otap, "--otap defaults off even in an otap build");
+        assert!(cli(&["--otap"]).otap, "--otap enables the service");
     }
 
     #[test]
