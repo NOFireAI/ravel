@@ -1,4 +1,4 @@
-# ADR-0049: Tenant admission control and ingest-time correctness
+# ADR-0051: Tenant admission control and ingest-time correctness
 
 Status: Accepted (2026-08-02)
 

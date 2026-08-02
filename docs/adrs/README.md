@@ -35,12 +35,22 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0029](0029-rlog-v1-log-segment.md) | RLOG v1: columnar log segment format, a sibling to RSEG | Accepted |
 | [0030](0030-promql-subquery-point-cap-divergence.md) | PromQL subquery point-cap divergence from Prometheus: Ravel's documented cap rejects two cases Prometheus succeeds on, by design | Accepted |
 | [0031](0031-empty-label-identity.md) | Empty-valued labels absent from series identity everywhere; empty-named labels always rejected | Proposed |
+| [0032](0032-rlog-compaction-and-generic-maintain.md) | RLOG compaction, and a signal-generic ravel-maintain | Accepted |
+| [0033](0033-sql-query-over-logs.md) | SQL query over logs (log storage phase 3) | Proposed |
+| [0034](0034-k8s-operator.md) | Kubernetes operator, kind development environment, and k8s CI lane | Proposed |
 | [0035](0035-conformance-scoring.md) | Conformance scoring: three-state classification over the full PromQL and SQL surfaces, scored on the claimed subset | Proposed |
+| [0036](0036-performance-investigation-methodology.md) | Performance investigation methodology and scope | Accepted |
 | [0037](0037-container-image-ci-registry.md) | CI-built container images published to GHCR, tag-push/dispatch only, public after a manual visibility flip | Proposed |
 | [0038](0038-empty-value-label-drop-otlp-otap.md) | Drop empty-valued labels at OTLP and OTAP admission, matching remote-write | Accepted |
+| [0039](0039-prometheus-http-api-compat.md) | Prometheus HTTP API compatibility surface for Grafana | Proposed |
+| [0040](0040-alerts-and-audit-signals.md) | `Signal::Alerts` and `Signal::Audit`, sharing RLOG's format | Accepted |
+| [0041](0041-rspan-v1-span-segment-format.md) | RSPAN v1 span segment format and trace routing | Amended by 0045 |
+| [0042](0042-compliance-custody.md) | Compliance-grade custody - legal hold, per-tenant KMS, pluggable auth, verify-custody | Accepted |
+| [0043](0043-unified-alerting-engine.md) | Unified alerting engine - observability alerts and detection rules, stored as data | Accepted |
 | [0048](0048-maintenance-safety-and-coverage.md) | Maintenance safety and coverage: legal hold wired, storage-derived tenant set, mass-orphan circuit breaker, compaction conservation gate | Accepted |
 | [0044](0044-query-cost-accounting.md) | Per-query cost accounting, a bounded metrics endpoint, and a two-part pre-execution cost estimate | Accepted |
 | [0045](0045-rspan-v2-trace-investigation.md) | RSPAN v2 and v3: pruning columns, a shared codec crate, and a reachable spans table | Accepted |
 | [0046](0046-read-cache-tier.md) | A content-addressed read cache at the read funnels, not a store decorator | Accepted |
 | [0047](0047-exemplars.md) | Exemplars: an RSEG section, a capped admission, and a correlation surface | Accepted |
 | [0049](0049-rlog-postings.md) | RLOG POSTINGS: exact block-level attribute pruning, opt-in per field | Accepted |
+| [0051](0051-tenant-admission-control.md) | Tenant admission control and ingest-time correctness | Accepted |

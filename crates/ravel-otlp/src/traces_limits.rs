@@ -72,14 +72,14 @@ pub struct SpanIngestLimits {
     /// encoding. Applied to each blob independently.
     pub max_raw_blob_len: usize,
     /// Nanoseconds a span's resolved `end_ts_ns` may lead ingest time
-    /// (ADR-0049 §4). Default 10 minutes, the same value the metrics and
+    /// (ADR-0051 §4). Default 10 minutes, the same value the metrics and
     /// log paths use: the catalog listing window is one shared
     /// `max_ingest_lag_ns`, not per-signal, so the admission bounds that
     /// make it sound are shared too. The end timestamp is the bounded one
     /// because the commit record advertises `max end_ts`.
     pub max_future_skew_ns: i64,
     /// Nanoseconds a span's resolved `start_ts_ns` may lag ingest time
-    /// (ADR-0049 §4). Default 2 hours, shared with metrics and logs; the
+    /// (ADR-0051 §4). Default 2 hours, shared with metrics and logs; the
     /// start timestamp is the bounded one because the commit record
     /// advertises `min start_ts`. Consequence: a span longer than this, or
     /// reported later than this after it started, is rejected at admission.
@@ -170,7 +170,7 @@ pub enum SpanRejection {
     InvalidTimeRange { start_ts_ns: i64, end_ts_ns: i64 },
 
     /// The span's resolved `end_ts_ns` leads ingest time by more than the
-    /// admission bound (ADR-0049 §4). Rejected rather than clamped:
+    /// admission bound (ADR-0051 §4). Rejected rather than clamped:
     /// rewriting a sender's timestamps would be silent data corruption, and
     /// a span past this bound would be stored but invisible to every
     /// listing-window query and its hour bucket unexpirable. The end
@@ -182,7 +182,7 @@ pub enum SpanRejection {
     FutureSkew { skew_ns: i64, max_ns: i64 },
 
     /// The span's resolved `start_ts_ns` lags ingest time by more than the
-    /// admission bound (ADR-0049 §4). The start timestamp is the checked one
+    /// admission bound (ADR-0051 §4). The start timestamp is the checked one
     /// because the commit record advertises `min start_ts`; a span longer
     /// than the bound, or reported later than that after it started, lands
     /// here. Mirrors [`crate::limits::Rejection::TooOld`].
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(limits.max_ingest_lag_ns, 7_200_000_000_000);
     }
 
-    /// The skew bounds are the metrics ones verbatim (ADR-0049 §4): the
+    /// The skew bounds are the metrics ones verbatim (ADR-0051 §4): the
     /// catalog listing window is one shared value, so the admission bounds
     /// that make it sound cannot differ per signal. Pinned so a per-signal
     /// "tuning" edit has to argue with a failing test.

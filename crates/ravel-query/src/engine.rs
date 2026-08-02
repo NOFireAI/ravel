@@ -882,7 +882,7 @@ impl QueryEngine {
 }
 
 /// Builds a `series_id -> labels` map incrementally, rejecting the moment a
-/// new id would push it past `max_series` (issue #470, ADR-0049 S7 / S4-07)
+/// new id would push it past `max_series` (issue #470, ADR-0051 S7 / S4-07)
 /// instead of finishing the build and checking the total afterward. Peak map
 /// size is therefore bounded by `max_series`, so the cap protects the memory
 /// the construction itself consumes, not just the size of the result it
@@ -1178,7 +1178,7 @@ impl YieldBudget {
 /// ([`YieldBudget`]); duplicate timestamps resolve under the full total
 /// order in [`is_greater`]. `max_series` is enforced incrementally, the
 /// moment a new series id would push the map past the cap (issue #470,
-/// ADR-0049 S7 / S4-07), so peak map size is bounded by the cap rather than
+/// ADR-0051 S7 / S4-07), so peak map size is bounded by the cap rather than
 /// by however many distinct series the fetch actually returned.
 fn merge_soa_runs(
     fetched: Vec<Vec<FetchedSeriesSoa>>,
@@ -2160,7 +2160,7 @@ mod merge_tests {
     }
 }
 
-/// Covers `build_series_by_id` directly (issue #470, ADR-0049 S7 / S4-07):
+/// Covers `build_series_by_id` directly (issue #470, ADR-0051 S7 / S4-07):
 /// the `/series`, `/labels`, and `/label/{name}/values` endpoints' map
 /// construction, distinct from the PromQL evaluation path's own series maps
 /// exercised in `merge_tests`/`histogram_merge_tests`.

@@ -53,13 +53,13 @@ pub struct LogIngestLimits {
     /// Attributes on an instrumentation scope. Also part of stream identity.
     pub max_scope_attributes: usize,
     /// Nanoseconds a record's resolved event time may lead ingest time
-    /// (ADR-0049 §4). Default 10 minutes, the same value the metrics path
+    /// (ADR-0051 §4). Default 10 minutes, the same value the metrics path
     /// uses ([`crate::IngestLimits::max_future_skew_ns`]): the catalog
     /// listing window is one shared `max_ingest_lag_ns`, not per-signal, so
     /// the admission bounds that make it sound are shared too.
     pub max_future_skew_ns: i64,
     /// Nanoseconds a record's resolved event time may lag ingest time
-    /// (ADR-0049 §4). Default 2 hours, shared with metrics for the same
+    /// (ADR-0051 §4). Default 2 hours, shared with metrics for the same
     /// reason as [`LogIngestLimits::max_future_skew_ns`]. Raising it for a
     /// tenant is legal only together with the catalog-side window config.
     pub max_ingest_lag_ns: i64,
@@ -123,7 +123,7 @@ pub enum LogRejection {
 
     /// The record's resolved event time (`ts_ns`, after the observed-time and
     /// ingest-time fallbacks) leads ingest time by more than the admission
-    /// bound (ADR-0049 §4). Rejected rather than clamped: rewriting a
+    /// bound (ADR-0051 §4). Rejected rather than clamped: rewriting a
     /// sender's event time would be silent data corruption, and a record
     /// past this bound would be stored but invisible to every listing-window
     /// query and its hour bucket unexpirable. Mirrors
@@ -134,7 +134,7 @@ pub enum LogRejection {
     FutureSkew { skew_ns: i64, max_ns: i64 },
 
     /// The record's resolved event time lags ingest time by more than the
-    /// admission bound (ADR-0049 §4). Mirrors
+    /// admission bound (ADR-0051 §4). Mirrors
     /// [`crate::limits::Rejection::TooOld`].
     #[error(
         "record timestamp is {lag_ns} ns behind ingest time, more than the max ingest lag of {max_ns} ns"
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(limits.max_ingest_lag_ns, 7_200_000_000_000);
     }
 
-    /// The skew bounds are the metrics ones verbatim (ADR-0049 §4): the
+    /// The skew bounds are the metrics ones verbatim (ADR-0051 §4): the
     /// catalog listing window is one shared value, so the admission bounds
     /// that make it sound cannot differ per signal. Pinned so a per-signal
     /// "tuning" edit has to argue with a failing test.
