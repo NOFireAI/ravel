@@ -1488,16 +1488,17 @@ mod tests {
         );
 
         for line in body.lines() {
-            let expected_keys = if line.starts_with("ravel_maintain_legal_hold_refresh_failures_total") {
-                vec!["mode"]
-            } else if line.starts_with("ravel_maintain_conservation_aborts_total")
-                || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
-                || line.starts_with("ravel_maintain_orphans_withheld")
-            {
-                vec!["mode", "signal"]
-            } else {
-                continue;
-            };
+            let expected_keys =
+                if line.starts_with("ravel_maintain_legal_hold_refresh_failures_total") {
+                    vec!["mode"]
+                } else if line.starts_with("ravel_maintain_conservation_aborts_total")
+                    || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
+                    || line.starts_with("ravel_maintain_orphans_withheld")
+                {
+                    vec!["mode", "signal"]
+                } else {
+                    continue;
+                };
             let brace = line.find('{').expect("sample line carries labels");
             let labels = &line[brace + 1..line.find('}').expect("closed label block")];
             let keys: Vec<&str> = labels
