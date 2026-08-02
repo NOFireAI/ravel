@@ -261,6 +261,78 @@ leases. MinIO supports the full mandatory set; like AWS S3, its
 server-side upload checksums are unreachable through `object_store`'s
 client, which is why `S3Store` reports `upload_checksum: false` for both.
 
+## Runtime qualification (executable contract)
+
+`Capabilities` is self-reported: a backend declares `consistent_list: true`
+because its adapter believes the vendor provides it, not because anything
+checked. Adversarial review finding S5-20 is that nothing did — a backend
+that advertises S3 compatibility but actually delivers eventually consistent
+listing was trusted silently, and the resulting failures at the commit layer
+looked like data loss rather than a misconfigured store.
+
+`crates/ravel-object-store/src/conformance.rs` is this contract turned into
+a suite that empirically probes a live backend rather than reading its
+declared flags. `run_conformance_suite(store, scratch_prefix)` runs, under a
+throwaway key prefix:
+
+- `ConditionalWriteCreateIfAbsent` — two concurrent `CreateIfAbsent` puts to
+  the same key: exactly one must win and the loser must observe
+  `AlreadyExists` (the losing-writer outcome the "Semantics adapters MUST
+  honor" section above requires).
+- `ConditionalWriteCasVersion` — a `CasVersion` put against a stale version
+  must fail `PreconditionFailed`, not silently overwrite.
+- `ConsistentReadAfterWrite` — a `get` immediately following a `put` returns
+  the just-written bytes, repeated over several keys to catch a
+  read-your-writes gap that only shows up intermittently.
+- `ConsistentListAfterWrite` — a `list` immediately following a `put`
+  includes the new key, repeated the same way, to catch eventual-consistency
+  listing rather than trusting the `consistent_list` flag.
+
+Each probe returns a `ProbeResult` naming which `Property` it checked, so a
+failure reads "this backend cannot do conditional writes" or "this backend's
+listing is eventually consistent" instead of a bare pass/fail — an operator
+does not have to guess which mandatory capability the backend actually
+lacks.
+
+ADR-0050 section 6 also names cross-page listing consistency and
+multipart-complete visibility as probes for this suite; neither is
+implemented yet. `CONFORMANCE_SUITE_VERSION` exists precisely so a later
+addition can be told apart from the four probes qualifying a bucket today.
+
+This is a runtime, once-per-bucket check, not a replacement for the
+compile-time contract suite below: `tests/contract.rs` is a development-time
+proof that each adapter *implementation* honors the trait, run in CI against
+all three backends including a real MinIO endpoint. `conformance.rs` is an
+operator-facing probe of one specific *deployment* — the actual configured
+endpoint and bucket — because the adapter can be correct while the vendor
+serving it is not (a misconfigured storage class, a proxy in front of the
+bucket, a non-S3 vendor's compatibility gap).
+
+`ravel-cli store qualify` runs this suite against the backend configured by
+the CLI's usual `--store`/`RAVEL_S3_*` flags and, on a full pass, writes a
+JSON record to `sys/qualification` via `CreateIfAbsent`:
+
+```json
+{
+  "suite_version": 1,
+  "backend_identity": "s3://<bucket>@<endpoint>",
+  "qualified_unix_ns": 1234567890000000000,
+  "passed_properties": ["conditional_write_create_if_absent", "..."]
+}
+```
+
+`CreateIfAbsent` makes qualification once-per-bucket: a second `store
+qualify` run against an already-qualified bucket leaves the existing record
+untouched and reports it instead of overwriting it, per ADR-0050 section 6.
+A failing run writes nothing new to `sys/qualification`; its process exit
+names every failing property. The command only ever writes under
+`sys/qualify/<run-id>/` (a handful of small scratch objects the suite does
+not delete afterward — each run's key is unique, so this is unbounded
+untracked storage a runbook should sweep periodically, not a correctness
+issue) and the single `sys/qualification` key; it never reads, lists, or
+writes any tenant-prefixed key, so it is safe to run against a bucket that
+already holds production data.
+
 ## Implementations
 
 1. `MemoryStore`: reference implementation and semantics oracle; strong
