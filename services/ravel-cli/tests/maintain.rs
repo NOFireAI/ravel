@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use prost::Message;
+use ravel_cli::hold;
 use ravel_cli::maintain::{
     SignalArg, audit_versions, compact, decode_compaction_record, decode_retention_tombstone,
     status, sweep, verify_custody,
@@ -17,7 +18,7 @@ use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, RetentionTombstone,
 };
@@ -163,6 +164,72 @@ async fn put_l0_object_at(
         .expect("put l0 object");
 }
 
+/// Like `publish_l0`, but with a caller-controlled writer identity so a test
+/// can seed a compaction record whose `inputs` name this exact object.
+async fn publish_l0_with_identity(
+    store: &MemoryStore,
+    tenant: &str,
+    shard: u32,
+    identity: (Uuid, u64, u64),
+    created_unix_ns: i64,
+) -> String {
+    let tenant_hash = TenantId::new(tenant).hash();
+    let ingest_hour_bucket = u32::try_from(created_unix_ns / 3_600_000_000_000).expect("fits u32");
+    let payload = format!("seg-{shard}-{}", identity.2).into_bytes();
+    let content_hash = *blake3::hash(&payload).as_bytes();
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard,
+        writer_id: identity.0,
+        writer_epoch: identity.1,
+        writer_seq: identity.2,
+        object_size: payload.len() as u64,
+        content_hash,
+        sample_count: 1,
+        series_count: 1,
+        min_event_ts_ns: created_unix_ns - 1_000,
+        max_event_ts_ns: created_unix_ns,
+        min_ingest_ts_ns: created_unix_ns - 1_000,
+        max_ingest_ts_ns: created_unix_ns,
+        segment_format_version: 1,
+        created_unix_ns,
+        ingest_hour_bucket,
+    })
+    .expect("valid record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(store, &data_key, Bytes::from(payload))
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+    data_key
+}
+
+/// Put a record-less `l0/` data object directly, for orphan-GC tests. Content
+/// need not match any embedded hash16 verification path, since orphan GC
+/// never re-hashes: it deletes on record absence and age alone.
+async fn seed_orphan_l0(store: &MemoryStore, tenant: &str, shard: u32, seq: u64) {
+    let tenant_hash = TenantId::new(tenant).hash();
+    let payload = format!("orphan-{shard}-{seq}").into_bytes();
+    let content_hash = *blake3::hash(&payload).as_bytes();
+    let key = keys::data_key(
+        &tenant_hash,
+        Signal::Metrics,
+        shard,
+        Uuid::new_v4(),
+        1,
+        seq,
+        &content_hash,
+    )
+    .expect("data key");
+    store
+        .put(&key, Bytes::from(payload), PutOptions::default())
+        .await
+        .expect("put orphan data object");
+}
+
 #[tokio::test]
 async fn compact_empty_bucket_is_below_min() {
     // Hour 0 is long sealed; an empty bucket has zero inputs, below the
@@ -174,9 +241,143 @@ async fn compact_empty_bucket_is_below_min() {
 
 #[tokio::test]
 async fn sweep_empty_shard_dry_run_is_clean() {
-    sweep(store(), "acme", SignalArg::Logs, 0, true)
+    sweep(store(), "acme", SignalArg::Logs, 0, true, false)
         .await
         .expect("sweep dry-run runs");
+}
+
+/// A superseded input's commit record and data object survive a real sweep
+/// pass when the shard's L0 prefix is under legal hold, even though the
+/// compaction record's `created_unix_ns` (999, far in the past) is well
+/// beyond the default protection horizon and would otherwise make the input
+/// immediately eligible for deletion.
+#[tokio::test]
+async fn sweep_does_not_delete_data_under_legal_hold() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant = "acme";
+    let identity = (Uuid::new_v4(), 1, 1);
+    let data_key =
+        publish_l0_with_identity(&store, tenant, 0, identity, 100 * 3_600_000_000_000).await;
+    seed_compaction(&store, tenant, &[identity]).await;
+
+    let tenant_hash = TenantId::new(tenant).hash();
+    let commit_key = keys::commit_key(
+        &tenant_hash,
+        Signal::Metrics,
+        0,
+        100,
+        identity.0,
+        identity.1,
+        identity.2,
+    )
+    .expect("commit key");
+
+    // Hold the shard's three prefixes via the --signal/--shard sugar before
+    // sweeping.
+    hold::set(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        None,
+        Some(SignalArg::Metrics),
+        Some(0),
+        "litigation hold",
+    )
+    .await
+    .expect("hold set succeeds");
+
+    sweep(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SignalArg::Metrics,
+        0,
+        false,
+        false,
+    )
+    .await
+    .expect("sweep runs");
+
+    assert!(
+        store.get(&data_key, GetRange::Full).await.is_ok(),
+        "held data object must survive sweep"
+    );
+    assert!(
+        store.get(&commit_key, GetRange::Full).await.is_ok(),
+        "held commit record must survive sweep"
+    );
+}
+
+/// `--override-orphan-breaker` forces exactly the one pass it is given for:
+/// it does not persist, so a tripped breaker trips again on the very next
+/// invocation with a fresh batch of orphan candidates.
+#[tokio::test]
+async fn override_orphan_breaker_runs_exactly_one_forced_pass() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant = "acme";
+    let tenant_hash = TenantId::new(tenant).hash();
+    let prefix = format!(
+        "t/{}/{}/l0/0000/",
+        tenant_hash.to_hex(),
+        Signal::Metrics.key_prefix()
+    );
+
+    for seq in 0..60u64 {
+        seed_orphan_l0(&store, tenant, 0, seq).await;
+    }
+
+    // Without override: the mass-orphan breaker trips (60 candidates, 100% of
+    // the shard's listed L0 objects), deleting nothing.
+    sweep(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SignalArg::Metrics,
+        0,
+        false,
+        false,
+    )
+    .await
+    .expect("sweep runs even though the breaker trips");
+    let after_tripped = list_all(store.as_ref(), &prefix).await.expect("list");
+    assert_eq!(after_tripped.len(), 60, "a tripped breaker deletes nothing");
+
+    // With override: this one pass deletes despite the breaker's threshold.
+    sweep(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SignalArg::Metrics,
+        0,
+        false,
+        true,
+    )
+    .await
+    .expect("overridden sweep runs");
+    let after_override = list_all(store.as_ref(), &prefix).await.expect("list");
+    assert_eq!(
+        after_override.len(),
+        0,
+        "the override must delete every orphan candidate"
+    );
+
+    // A fresh batch, swept again without the override: the breaker must trip
+    // again, proving the prior override did not persist.
+    for seq in 100..160u64 {
+        seed_orphan_l0(&store, tenant, 0, seq).await;
+    }
+    sweep(
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        tenant,
+        SignalArg::Metrics,
+        0,
+        false,
+        false,
+    )
+    .await
+    .expect("sweep runs");
+    let after_second_round = list_all(store.as_ref(), &prefix).await.expect("list");
+    assert_eq!(
+        after_second_round.len(),
+        60,
+        "the breaker override must not persist across invocations"
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
-use ravel_cli::{catalog, maintain, now_ns, store};
+use ravel_cli::{catalog, hold, maintain, now_ns, store};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, kind};
@@ -85,6 +85,48 @@ enum Command {
         #[command(subcommand)]
         command: StoreCommand,
     },
+    /// Place, clear, and list legal holds (ADR-0048 decision 2, issue #505):
+    /// the only production mechanism to set a hold.
+    Hold {
+        #[command(subcommand)]
+        command: HoldCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HoldCommand {
+    /// Place a legal hold, writing an immutable ADR-0040 audit record. Either
+    /// `--scope` alone, or `--signal` together with `--shard` (the sugar,
+    /// which writes all three `shard_hold_scopes` prefixes).
+    Set {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, value_enum)]
+        signal: Option<SignalArg>,
+        #[arg(long)]
+        shard: Option<u32>,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Release a legal hold, writing an immutable ADR-0040 audit record. Same
+    /// `--scope` or `--signal`/`--shard` sugar as `hold set`.
+    Clear {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, value_enum)]
+        signal: Option<SignalArg>,
+        #[arg(long)]
+        shard: Option<u32>,
+    },
+    /// List a tenant's currently active legal holds.
+    List {
+        #[arg(long)]
+        tenant: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -163,6 +205,12 @@ enum MaintainCommand {
         /// Compute the eligible set and report it, but delete nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Force exactly one overridden pass through a tripped mass-orphan
+        /// circuit breaker (ADR-0048 decision 4). The breaker never
+        /// auto-resumes; this is the only way to clear it, and only for this
+        /// one invocation.
+        #[arg(long)]
+        override_orphan_breaker: bool,
     },
     /// Report a bucket's maintenance state (read-only; no --dry-run needed).
     Status {
@@ -309,6 +357,7 @@ async fn main() -> anyhow::Result<()> {
                     signal,
                     shard,
                     dry_run,
+                    override_orphan_breaker,
                 },
         } => {
             maintain::sweep(
@@ -317,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
                 signal,
                 shard,
                 dry_run,
+                override_orphan_breaker,
             )
             .await
         }
@@ -355,6 +405,47 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Hold {
+            command:
+                HoldCommand::Set {
+                    tenant,
+                    scope,
+                    signal,
+                    shard,
+                    reason,
+                },
+        } => {
+            hold::set(
+                store::build_store(&cli.store)?,
+                &tenant,
+                scope,
+                signal,
+                shard,
+                &reason,
+            )
+            .await
+        }
+        Command::Hold {
+            command:
+                HoldCommand::Clear {
+                    tenant,
+                    scope,
+                    signal,
+                    shard,
+                },
+        } => {
+            hold::clear(
+                store::build_store(&cli.store)?,
+                &tenant,
+                scope,
+                signal,
+                shard,
+            )
+            .await
+        }
+        Command::Hold {
+            command: HoldCommand::List { tenant },
+        } => hold::list(store::build_store(&cli.store)?, &tenant).await,
     }
 }
 
