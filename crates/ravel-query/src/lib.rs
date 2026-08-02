@@ -1,6 +1,8 @@
 //! Query engine: snapshot resolve, segment pruning, footer-first reads,
 //! sample iterators feeding the PromQL evaluator (ADR-0006).
 
+#[cfg(test)]
+mod cache_correctness;
 mod config;
 mod engine;
 mod error;
