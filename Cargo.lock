@@ -4321,6 +4321,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "prost",
+ "ravel-cache",
  "ravel-commit",
  "ravel-object-store",
  "ravel-proto",

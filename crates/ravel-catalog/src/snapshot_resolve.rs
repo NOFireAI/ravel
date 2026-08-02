@@ -256,17 +256,23 @@ impl Catalog {
             return Some(cached);
         }
 
-        let got = match self
-            .guarded_get(&postings_ref.key, GetRange::Full, accounting)
+        let data = match self
+            .fetch_content_addressed(
+                tenant,
+                &postings_ref.key,
+                &postings_ref.blake3,
+                postings_ref.size,
+                accounting,
+            )
             .await
         {
-            Ok(got) => got,
+            Ok(data) => data,
             Err(err) => {
                 tracing::warn!(error = %err, key = %postings_ref.key, "postings GET failed, pruning disabled");
                 return None;
             }
         };
-        let digest = blake3::hash(&got.data);
+        let digest = blake3::hash(&data);
         if digest.as_bytes().as_slice() != postings_ref.blake3.as_slice() {
             tracing::warn!(key = %postings_ref.key, "postings hash mismatch, pruning disabled");
             return None;
@@ -274,11 +280,8 @@ impl Catalog {
         let limits = PostingsLimits {
             max_postings_bytes: self.config().max_postings_bytes,
         };
-        let decoded = match snapshot_format::decode_postings(
-            &got.data,
-            &limits,
-            &expected_part_blake3,
-        ) {
+        let decoded = match snapshot_format::decode_postings(&data, &limits, &expected_part_blake3)
+        {
             Ok(decoded) => decoded,
             Err(err) => {
                 tracing::warn!(error = %err, key = %postings_ref.key, "postings failed to decode, pruning disabled");
@@ -300,7 +303,7 @@ impl Catalog {
             *tenant,
             postings_ref.key.clone(),
             decoded.clone(),
-            got.data.len() as u64,
+            data.len() as u64,
             self.config().postings_cache_entries,
         );
         Some(decoded)
@@ -427,11 +430,17 @@ impl Catalog {
         if let Some(cached) = self.part_cache().get(tenant, &part_ref.key, accounting) {
             return OnePartOutcome::Loaded(cached);
         }
-        let got = match self
-            .guarded_get(&part_ref.key, GetRange::Full, accounting)
+        let data = match self
+            .fetch_content_addressed(
+                tenant,
+                &part_ref.key,
+                &part_ref.blake3,
+                part_ref.size,
+                accounting,
+            )
             .await
         {
-            Ok(got) => got,
+            Ok(data) => data,
             Err(StoreError::NotFound) => {
                 tracing::warn!(key = %part_ref.key, "snapshot part not found, will re-read HEAD once");
                 return OnePartOutcome::NotFoundRace;
@@ -441,7 +450,7 @@ impl Catalog {
                 return OnePartOutcome::Unusable;
             }
         };
-        let digest = blake3::hash(&got.data);
+        let digest = blake3::hash(&data);
         if digest.as_bytes().as_slice() != part_ref.blake3.as_slice() {
             tracing::warn!(key = %part_ref.key, "snapshot part hash mismatch, falling back to listing");
             return OnePartOutcome::Unusable;
@@ -449,7 +458,7 @@ impl Catalog {
         let limits = PartLimits {
             max_snapshot_part_bytes: self.config().max_snapshot_part_bytes,
         };
-        let decoded = match snapshot_format::decode_part(&got.data, &limits) {
+        let decoded = match snapshot_format::decode_part(&data, &limits) {
             Ok(decoded) => Arc::new(decoded),
             Err(err) => {
                 tracing::warn!(error = %err, key = %part_ref.key, "snapshot part failed to decode, falling back to listing");
@@ -460,7 +469,7 @@ impl Catalog {
             *tenant,
             part_ref.key.clone(),
             decoded.clone(),
-            got.data.len() as u64,
+            data.len() as u64,
             self.config().snapshot_cache_parts,
         );
         OnePartOutcome::Loaded(decoded)
