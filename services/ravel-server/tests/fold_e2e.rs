@@ -462,9 +462,21 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
     .await
     .expect("server starts");
 
+    let sealed_ts_ns = now_ns() - i64::try_from(SEALED_AGE.as_nanos()).expect("fits i64");
+    let sealed_hour = u32::try_from(sealed_ts_ns.div_euclid(NS_PER_HOUR)).expect("hour fits u32");
+
+    // Storage-derived discovery (ADR-0048 decision 3) only folds a tenant once
+    // it has some durable footprint under `t/<hash>/`; the metric export below
+    // only ever reaches the ingest shard's in-memory buffer within this test's
+    // polling window (`ravel-ingest` flushes on its own age/size timer, not on
+    // export), exactly the buffered-flush gap `seed_sealed_log_commit` already
+    // works around for the sibling test above. Seeding one sealed log commit
+    // first makes the tenant discoverable on fold's very first tick, so the
+    // metrics fold loop can run and seal the (otherwise dataless) hour.
+    seed_sealed_log_commit(store.as_ref(), &tenant, sealed_hour, sealed_ts_ns).await;
+
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
-    let sealed_ts_ns = now_ns() - i64::try_from(SEALED_AGE.as_nanos()).expect("fits i64");
     let request = export_request("cpu_usage", "demo", 42.5, sealed_ts_ns);
     let response = client
         .post(format!("{base}/v1/metrics"))

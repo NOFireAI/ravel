@@ -26,6 +26,7 @@ pub mod remote_write;
 pub mod sql;
 pub mod store;
 pub mod tenant;
+pub mod tenant_discovery;
 pub mod traces_ingest;
 
 use std::net::SocketAddr;
@@ -117,15 +118,21 @@ pub struct ServerConfig {
     /// public listeners, so a future refactor cannot reintroduce the mTLS
     /// resolver onto them by accident.
     pub mtls_listener: Option<MtlsListenerConfig>,
-    /// Tenants this process folds catalog snapshots for
-    /// (docs/metric-index-plan.md section 4). Independent of
-    /// `tenant_resolver`: any (tenant, signal) whose commit history should
-    /// stay indexed belongs here.
+    /// An optional restriction on the tenants the fold and maintenance tasks
+    /// act on (ADR-0048 decision 3, issue #504). Both tasks derive their
+    /// working tenant set from storage each cycle
+    /// (`ravel_maintain::discover_tenants`); an empty `fold_tenants` (the
+    /// default, from no `--tenant-token`/`--maintain-tenant`) means no
+    /// restriction is configured, so every tenant storage reports data for is
+    /// folded and maintained. A non-empty list narrows the storage-discovered
+    /// set to exactly the named tenants, and a discovered tenant it excludes
+    /// is counted, not silently dropped. Independent of `tenant_resolver`.
     pub fold_tenants: Vec<TenantHash>,
     pub fold: FoldTaskConfig,
     /// Background maintenance (compaction, retention, sweep) config. Its
-    /// tenant list is `fold_tenants` (both derive from the same tenant-token
-    /// config). Only spawned in [`Mode::Maintain`]; `enabled` gates it.
+    /// tenant set is storage-discovered each cycle, restricted by
+    /// `fold_tenants` when non-empty (ADR-0048 decision 3). Only spawned in
+    /// [`Mode::Maintain`]; `enabled` gates it.
     pub maintain: MaintenanceTaskConfig,
     /// Background alert-rule evaluation (ADR-0043). Its tenant list is the key
     /// set of its own rule map, loaded from `--alert-rules-file`, independent
@@ -367,6 +374,13 @@ pub async fn start(
     }
     let catalog = query::build_catalog(store.clone(), config.shard_count)?;
 
+    // Built in every mode, `Some` only in Mode::Maintain (the one mode that
+    // spawns `maintain::spawn` below and therefore has discovery counters to
+    // render). Constructed here so both the `/metrics` state and the
+    // maintenance supervisor share the same instance.
+    let tenant_discovery_metrics = matches!(config.mode, Mode::Maintain)
+        .then(|| Arc::new(tenant_discovery::TenantDiscoveryMetrics::default()));
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
@@ -378,6 +392,7 @@ pub async fn start(
         log_ingest_router: log_ingest_router.clone(),
         span_ingest_router: span_ingest_router.clone(),
         catalog: catalog.clone(),
+        tenant_discovery: tenant_discovery_metrics.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 
@@ -484,8 +499,15 @@ pub async fn start(
     // loops over the same tenant list, and no non-maintain mode runs
     // maintenance.
     let (fold_tasks, maintenance_tasks) = if matches!(config.mode, Mode::Maintain) {
-        let maintenance_tasks =
-            maintain::spawn(store.clone(), &config.fold_tenants, config.maintain.clone());
+        let discovery_metrics = tenant_discovery_metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(tenant_discovery::TenantDiscoveryMetrics::default()));
+        let maintenance_tasks = maintain::spawn(
+            store.clone(),
+            config.fold_tenants.clone(),
+            config.maintain.clone(),
+            discovery_metrics,
+        );
         (fold::FoldTasks::none(), maintenance_tasks)
     } else {
         let fold_tasks = fold::spawn(catalog, store.clone(), &config.fold_tenants, config.fold);

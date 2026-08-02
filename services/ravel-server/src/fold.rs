@@ -1,10 +1,22 @@
-//! Per-(tenant, signal) background catalog fold task (docs/metric-index-plan.md
-//! section 4, ADR-0020). Periodically calls [`Catalog::fold`] so query
-//! resolve can serve sealed history from snapshots instead of full listing.
+//! Per-signal background catalog fold task (docs/metric-index-plan.md
+//! section 4, ADR-0020; storage-derived tenant set is ADR-0048 decision 3,
+//! issue #504). Periodically calls [`Catalog::fold`] so query resolve can
+//! serve sealed history from snapshots instead of full listing.
 //!
 //! Never runs on the ingest or query path, and never affects correctness:
 //! every failure here is logged and retried on the next tick. Disabling this
 //! task (`--disable-fold`) only changes query cost, never query results.
+//!
+//! One loop per [`FOLD_SIGNALS`] entry, not one per tenant: each tick
+//! re-enumerates tenants from storage
+//! ([`crate::tenant_discovery::discover_and_restrict`]) and folds every
+//! tenant the cycle discovers (narrowed to the configured
+//! `--tenant-token`/`--maintain-tenant` restriction, when one is set). A
+//! tenant onboarded mid-run is folded starting the next tick with no restart.
+//! A discovery failure skips that signal's whole cycle -- no tenant is folded
+//! -- and is retried next tick; it never falls back to an empty set, since
+//! fold is best-effort and a quiet failure here would look identical to
+//! "nothing new to fold."
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +29,8 @@ use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+use crate::tenant_discovery::discover_and_restrict;
 
 /// Default `fold_interval`: 5 minutes (docs/metric-index-plan.md section 4).
 pub const DEFAULT_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -77,10 +91,11 @@ impl FoldTasks {
 /// postings ref, same as logs' signal=2).
 const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
-/// Spawns one fold loop per (tenant, signal), for every signal in
-/// [`FOLD_SIGNALS`]. [`run_loop`] is signal-generic; a new signal is added by
-/// extending that array, not by restructuring this function (ADR-0033 gap 1;
-/// docs/metric-index-plan.md is written per (tenant, signal) throughout).
+/// Spawns one fold loop per signal in [`FOLD_SIGNALS`], not one per tenant:
+/// each tick re-derives the tenant set from storage. [`run_loop`] is
+/// signal-generic; a new signal is added by extending that array, not by
+/// restructuring this function (ADR-0033 gap 1; docs/metric-index-plan.md is
+/// written per (tenant, signal) throughout).
 ///
 /// [`Signal::Logs`] folds through the same [`Catalog::fold`] path as metrics
 /// and produces `catalog/l/HEAD` plus snapshot parts, but no name-postings
@@ -95,45 +110,52 @@ const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans]
 /// mean a signal-aware short-circuit inside `ravel-catalog`, deliberately out
 /// of scope here.
 ///
-/// Tenants come from the static tenant-token config, per the plan's own note
-/// (section 11) that no separate enumeration mechanism is needed. Returns
-/// immediately; tasks run in the background until [`FoldTasks::shutdown`].
+/// `restrict` is the merged `--tenant-token`/`--maintain-tenant` set: empty
+/// means unconfigured (every storage-discovered tenant is folded), non-empty
+/// narrows the discovered set to exactly those tenants (ADR-0048 decision 3).
+/// Returns immediately; tasks run in the background until
+/// [`FoldTasks::shutdown`].
 pub fn spawn(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
-    tenants: &[TenantHash],
+    restrict: &[TenantHash],
     config: FoldTaskConfig,
 ) -> FoldTasks {
-    if !config.enabled || tenants.is_empty() {
+    if !config.enabled {
         return FoldTasks::none();
     }
 
     // One folder_id per process start (proto/ravel/catalog.proto,
-    // `SnapshotHead.folder_id`), shared by every tenant task in this process.
+    // `SnapshotHead.folder_id`), shared by every signal loop in this process.
     let folder_id = Uuid::new_v4();
+    let restrict = if restrict.is_empty() {
+        None
+    } else {
+        Some(restrict.to_vec())
+    };
     let mut shutdown = Vec::new();
     let mut handles = Vec::new();
-    for &tenant in tenants {
-        for signal in FOLD_SIGNALS {
-            let (tx, rx) = oneshot::channel();
-            let catalog = catalog.clone();
-            let store = store.clone();
-            let interval = config.fold_interval;
-            let handle = tokio::spawn(async move {
-                run_loop(catalog, store, tenant, signal, folder_id, interval, rx).await;
-            });
-            shutdown.push(tx);
-            handles.push(handle);
-        }
+    for signal in FOLD_SIGNALS {
+        let (tx, rx) = oneshot::channel();
+        let catalog = catalog.clone();
+        let store = store.clone();
+        let restrict = restrict.clone();
+        let interval = config.fold_interval;
+        let handle = tokio::spawn(async move {
+            run_loop(catalog, store, signal, restrict, folder_id, interval, rx).await;
+        });
+        shutdown.push(tx);
+        handles.push(handle);
     }
     FoldTasks { shutdown, handles }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
-    tenant: TenantHash,
     signal: Signal,
+    restrict: Option<Vec<TenantHash>>,
     folder_id: Uuid,
     interval: Duration,
     mut shutdown: oneshot::Receiver<()>,
@@ -144,42 +166,86 @@ async fn run_loop(
             _ = &mut shutdown => return,
         }
 
-        let now_ns = SystemClock.now_ns();
-        if head_fresh_enough(store.as_ref(), &tenant, signal, interval, now_ns).await {
-            tracing::debug!(
-                tenant = %tenant.to_hex(),
-                signal = ?signal,
-                "catalog fold: HEAD already fresh, skipping this tick"
-            );
-            continue;
-        }
-
-        match catalog.fold(&tenant, signal, folder_id, now_ns, &[]).await {
-            Ok(report) => {
-                tracing::info!(
-                    tenant = %tenant.to_hex(),
-                    signal = ?signal,
-                    no_op = report.no_op,
-                    rebuilt = report.rebuilt,
-                    watermark_hour = ?report.watermark_hour,
-                    previous_watermark_hour = ?report.previous_watermark_hour,
-                    buckets_folded = report.buckets_folded,
-                    entry_count = report.entry_count,
-                    part_bytes = report.part_bytes,
-                    list_requests = report.list_requests,
-                    get_requests = report.get_requests,
-                    put_requests = report.put_requests,
-                    "catalog fold complete"
-                );
-            }
+        let outcome = match discover_and_restrict(store.as_ref(), restrict.as_deref()).await {
+            Ok(outcome) => outcome,
             Err(err) => {
-                tracing::warn!(
-                    tenant = %tenant.to_hex(),
+                tracing::error!(
                     signal = ?signal,
                     error = %err,
-                    "catalog fold failed; the index degrades to listing until a later fold succeeds"
+                    "catalog fold: tenant discovery failed; skipping this cycle entirely, retried next tick"
                 );
+                continue;
             }
+        };
+        if outcome.excluded > 0 {
+            tracing::debug!(
+                signal = ?signal,
+                excluded = outcome.excluded,
+                "catalog fold: flag restriction excluded discovered tenants"
+            );
+        }
+
+        for tenant in outcome.maintained {
+            run_tenant_tick(
+                catalog.as_ref(),
+                store.as_ref(),
+                &tenant,
+                signal,
+                folder_id,
+                interval,
+            )
+            .await;
+        }
+    }
+}
+
+/// One fold attempt for one tenant: the HEAD freshness peek, then
+/// [`Catalog::fold`] if it's stale. Split out from [`run_loop`] so discovery
+/// and the per-tenant fold logic stay independently readable.
+#[allow(clippy::too_many_arguments)]
+async fn run_tenant_tick(
+    catalog: &Catalog,
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    folder_id: Uuid,
+    interval: Duration,
+) {
+    let now_ns = SystemClock.now_ns();
+    if head_fresh_enough(store, tenant, signal, interval, now_ns).await {
+        tracing::debug!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            "catalog fold: HEAD already fresh, skipping this tick"
+        );
+        return;
+    }
+
+    match catalog.fold(tenant, signal, folder_id, now_ns, &[]).await {
+        Ok(report) => {
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                no_op = report.no_op,
+                rebuilt = report.rebuilt,
+                watermark_hour = ?report.watermark_hour,
+                previous_watermark_hour = ?report.previous_watermark_hour,
+                buckets_folded = report.buckets_folded,
+                entry_count = report.entry_count,
+                part_bytes = report.part_bytes,
+                list_requests = report.list_requests,
+                get_requests = report.get_requests,
+                put_requests = report.put_requests,
+                "catalog fold complete"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                error = %err,
+                "catalog fold failed; the index degrades to listing until a later fold succeeds"
+            );
         }
     }
 }

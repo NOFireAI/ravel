@@ -1,18 +1,31 @@
-//! Per-tenant background maintenance task (docs/compaction-retention-plan.md
-//! P8, issue #115). Periodically runs age-based retention, L0->L1 compaction,
-//! and the GC sweeper over every `(signal, shard)` of each tenant, mirroring
-//! the shape of the fold task (`crate::fold`): one loop per tenant from the
-//! static tenant-token config, a config struct, and a handle with clean
-//! shutdown.
+//! Background maintenance task (docs/compaction-retention-plan.md P8, issue
+//! #115; storage-derived tenant set is ADR-0048 decision 3, issue #504).
+//! Periodically runs age-based retention, L0->L1 compaction, and the GC
+//! sweeper over every `(signal, shard)` of every tenant storage holds data
+//! for.
 //!
 //! Unlike fold (a pure query-cost optimization), this task deletes and rewrites
 //! durable objects, but it changes nothing about *what* any sweep, retention,
 //! or compaction rule decides: it is only the driver that calls
 //! [`scan_and_maintain_with_memo`] (retention-before-compaction over every
 //! sealed bucket) and [`ravel_maintain::sweep_shard`] (the three GC rules) once
-//! per tick. Both are idempotent, so a missed or crashed tick is recovered on
-//! the next one. The clock is the real [`SystemClock`], matching everything
-//! else in this crate.
+//! per tenant per tick. Both are idempotent, so a missed or crashed tick is
+//! recovered on the next one. The clock is the real [`SystemClock`], matching
+//! everything else in this crate.
+//!
+//! [`spawn`] runs one supervisor task, not one task per tenant: at the start
+//! of every tick it re-enumerates tenants from storage
+//! ([`ravel_maintain::discover_tenants`] via
+//! [`crate::tenant_discovery::discover_and_restrict`]), optionally narrows
+//! that set to the configured `--tenant-token`/`--maintain-tenant`
+//! restriction, then runs [`run_tick`] for each tenant in the result. A
+//! tenant that first writes data mid-run is picked up on the next cycle with
+//! no restart, and a tenant removed from the restriction (but still holding
+//! data) is counted as excluded rather than silently dropped. Discovery
+//! failure (the LIST errors) skips the whole cycle -- no tenant's tick runs
+//! -- with a logged warning and a failure counter; it never falls back to an
+//! empty set, because that would be indistinguishable from healthy idleness,
+//! the exact silence findings S2-17/S5-09 describe.
 //!
 //! [`LegalHoldCheck::refresh`] is called once per tenant per tick, before
 //! either pass, and its snapshot is the [`LeaseCheck`] threaded through every
@@ -21,15 +34,16 @@
 //! retried next tick, so a transient store fault can never turn into an
 //! unprotected delete pass.
 //!
-//! [`run_loop`] holds one [`MaintainMemo`] across every tick until shutdown
-//! (issue #280, #330). The memo records buckets already known terminal so a
-//! steady-state tick skips re-listing and re-reading them, until a periodic
-//! full re-verify forces a fresh evaluation. It is ephemeral and never
-//! correctness-bearing: a fresh (cold) memo on the first tick after a worker
-//! start does exactly one full rescan identical to the pre-memo behavior, and a
-//! wrong or lost entry only defers work by at most the re-verify interval. The
-//! memo key is `(tenant, signal, shard, hour)`, so one memo per worker spans
-//! every `(signal, shard)` of the one tenant this loop maintains.
+//! One [`MaintainMemo`] is held across every tick and every tenant until
+//! shutdown (issue #280, #330). The memo records buckets already known
+//! terminal so a steady-state tick skips re-listing and re-reading them,
+//! until a periodic full re-verify forces a fresh evaluation. It is ephemeral
+//! and never correctness-bearing: a fresh (cold) memo on the first tick after
+//! a worker start does exactly one full rescan identical to the pre-memo
+//! behavior, and a wrong or lost entry only defers work by at most the
+//! re-verify interval. The memo key is `(tenant, signal, shard, hour)`, so one
+//! process-wide memo safely spans every tenant this supervisor discovers,
+//! across ticks.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +57,8 @@ use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+use crate::tenant_discovery::{TenantDiscoveryMetrics, discover_and_restrict};
 
 /// Default `maintain_interval`: 5 minutes.
 pub const DEFAULT_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -118,90 +134,149 @@ impl MaintenanceTasks {
     }
 }
 
-/// Spawn one maintenance loop per tenant. Tenants come from the static
-/// tenant-token config, the same list [`crate::fold::spawn`] uses. Returns
-/// immediately; tasks run until [`MaintenanceTasks::shutdown`].
+/// Spawn one supervisor task that re-discovers the tenant set from storage
+/// every tick (ADR-0048 decision 3). `restrict` is the merged
+/// `--tenant-token`/`--maintain-tenant` set: empty means unconfigured (every
+/// discovered tenant is maintained), non-empty narrows the discovered set to
+/// exactly those tenants. Returns immediately; the task runs until
+/// [`MaintenanceTasks::shutdown`].
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
-    tenants: &[TenantHash],
+    restrict: Vec<TenantHash>,
     config: MaintenanceTaskConfig,
+    metrics: Arc<TenantDiscoveryMetrics>,
 ) -> MaintenanceTasks {
-    if !config.enabled || tenants.is_empty() {
+    if !config.enabled {
         return MaintenanceTasks::none();
     }
 
-    // One compactor writer_id per process start, shared by every tenant task
-    // (recorded in each L1 part's footer; informational, never dedup-priority).
+    // One compactor writer_id per process start, shared across every tenant
+    // this supervisor maintains (recorded in each L1 part's footer;
+    // informational, never dedup-priority).
     let mut compactor = config.compactor.clone();
     compactor.compactor_writer_id = Uuid::new_v4();
     let compactor = Arc::new(compactor);
     let retention = Arc::new(config.retention.clone());
+    let restrict = if restrict.is_empty() {
+        None
+    } else {
+        Some(restrict)
+    };
 
-    let mut shutdown = Vec::new();
-    let mut handles = Vec::new();
-    for &tenant in tenants {
-        let (tx, rx) = oneshot::channel();
-        let store = store.clone();
-        let compactor = compactor.clone();
-        let retention = retention.clone();
-        let interval = config.interval;
-        let shard_count = config.shard_count;
-        let handle = tokio::spawn(async move {
-            run_loop(
-                store,
-                tenant,
-                compactor,
-                retention,
-                shard_count,
-                interval,
-                rx,
-            )
-            .await;
-        });
-        shutdown.push(tx);
-        handles.push(handle);
+    let (tx, rx) = oneshot::channel();
+    let interval = config.interval;
+    let shard_count = config.shard_count;
+    let handle = tokio::spawn(async move {
+        run_loop(
+            store,
+            restrict,
+            compactor,
+            retention,
+            shard_count,
+            interval,
+            metrics,
+            rx,
+        )
+        .await;
+    });
+    MaintenanceTasks {
+        shutdown: vec![tx],
+        handles: vec![handle],
     }
-    MaintenanceTasks { shutdown, handles }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     store: Arc<dyn ObjectStoreBackend>,
-    tenant: TenantHash,
+    restrict: Option<Vec<TenantHash>>,
     compactor: Arc<CompactorConfig>,
     retention: Arc<RetentionConfig>,
     shard_count: u32,
     interval: Duration,
+    metrics: Arc<TenantDiscoveryMetrics>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    // One memo per worker, held across every tick until shutdown (issue #280,
-    // #330). Its key includes the tenant and signal, so this single instance
-    // safely spans every (signal, shard) this loop maintains. Cold on the first
-    // tick, so that tick is a full rescan identical to the pre-memo behavior.
+    // One memo for the whole process, held across every tick and every
+    // discovered tenant until shutdown (issue #280, #330). Its key includes
+    // the tenant and signal, so this single instance safely spans every
+    // tenant this supervisor discovers. Cold on the first tick, so that tick
+    // is a full rescan identical to the pre-memo behavior.
     let mut memo = MaintainMemo::with_default_interval();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(jittered(interval)) => {}
             _ = &mut shutdown => return,
         }
-        run_tick(
+        run_discovery_cycle(
             store.as_ref(),
-            &tenant,
+            restrict.as_deref(),
             &compactor,
             &retention,
             shard_count,
             &mut memo,
+            metrics.as_ref(),
         )
         .await;
     }
+}
+
+/// One discovery cycle: re-enumerate tenants from storage, narrow to
+/// `restrict` when configured, then run [`run_tick`] for each tenant in the
+/// result (ADR-0048 decision 3, issue #504). `metrics` records the discovered
+/// and maintained gauges on success; a discovery failure -- the LIST itself
+/// erroring -- skips the whole cycle (no tenant's tick runs) and only bumps
+/// the failure counter, never falling back to an empty set. Falling back
+/// would render identically to "storage has no tenants," the exact silent
+/// failure findings S2-17/S5-09 describe.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_discovery_cycle(
+    store: &dyn ObjectStoreBackend,
+    restrict: Option<&[TenantHash]>,
+    compactor: &CompactorConfig,
+    retention: &RetentionConfig,
+    shard_count: u32,
+    memo: &mut MaintainMemo,
+    metrics: &TenantDiscoveryMetrics,
+) -> MaintainReport {
+    let outcome = match discover_and_restrict(store, restrict).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "maintenance: tenant discovery failed; skipping this cycle entirely, retried next cycle"
+            );
+            metrics.record_discovery_failure();
+            return MaintainReport::default();
+        }
+    };
+
+    metrics.record_discovery(outcome.discovered.len(), outcome.maintained.len());
+    if outcome.excluded > 0 {
+        tracing::info!(
+            excluded = outcome.excluded,
+            "maintenance: flag restriction excluded discovered tenants holding data"
+        );
+    }
+
+    let mut total = MaintainReport::default();
+    for tenant in &outcome.maintained {
+        let report = run_tick(store, tenant, compactor, retention, shard_count, memo).await;
+        total.retired += report.retired;
+        total.compacted += report.compacted;
+        total.already_done += report.already_done;
+        total.not_sealed += report.not_sealed;
+        total.skipped_terminal += report.skipped_terminal;
+    }
+    total
 }
 
 /// One maintenance pass over every `(signal, shard)` of one tenant: a legal
 /// hold refresh, then retention before compaction (via
 /// [`scan_and_maintain_with_memo`]), then the GC sweeper (via
 /// [`sweep_shard`]). Every scan/sweep error is logged and retried next tick;
-/// nothing here affects query correctness. Split out from [`run_loop`] so a
-/// test can drive a single deterministic tick without the timer.
+/// nothing here affects query correctness. Split out from [`run_discovery_cycle`]
+/// so a test can drive a single deterministic tenant tick without discovery or
+/// the timer.
 ///
 /// The legal hold refresh (ADR-0048 decision 1) runs once, before either
 /// pass, and its snapshot gates every `(signal, shard)` of this tick. If the
@@ -638,5 +713,129 @@ mod tests {
             !surviving.is_empty(),
             "the tenant's bucket must be untouched when the hold refresh fails"
         );
+    }
+
+    /// The test the task spec requires by name: a tenant known only to
+    /// storage (no `--tenant-token`, no `--maintain-tenant`, i.e. `restrict =
+    /// None`) is discovered and maintained by the real driver wiring
+    /// (ADR-0048 decision 3, issue #504, experiment L2). This is exactly the
+    /// OIDC/mTLS-authenticated-tenant scenario findings S2-17/S5-09
+    /// describe: the flag-derived set used to be empty and nothing ran.
+    #[tokio::test]
+    async fn storage_discovered_tenant_is_maintained_without_flags() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let metrics = TenantDiscoveryMetrics::default();
+
+        let report =
+            run_discovery_cycle(&store, None, &compactor, &retention, 1, &mut memo, &metrics).await;
+
+        assert_eq!(
+            report.already_done, 1,
+            "the storage-discovered tenant's bucket must actually be evaluated"
+        );
+        assert_eq!(metrics.tenants_discovered(), 1);
+        assert_eq!(metrics.tenants_maintained(), 1);
+        assert_eq!(metrics.discovery_failures(), 0);
+    }
+
+    /// A flag restriction narrows the discovered set: a discovered tenant not
+    /// named by `--tenant-token`/`--maintain-tenant` is excluded from the
+    /// cycle (never maintained) and counted, rather than either running
+    /// unconditionally or being indistinguishable from "storage didn't report
+    /// it."
+    #[tokio::test]
+    async fn flag_restriction_excludes_a_discovered_tenant_and_counts_it() {
+        let store = MemoryStore::new();
+        let acme = TenantId::new("acme");
+        let globex = TenantId::new("globex");
+        publish_terminal_bucket(&store, &acme).await;
+        publish_terminal_bucket(&store, &globex).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let metrics = TenantDiscoveryMetrics::default();
+        let restrict = [acme.hash()];
+
+        let report = run_discovery_cycle(
+            &store,
+            Some(&restrict),
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(
+            report.already_done, 1,
+            "only the restricted-in tenant's bucket is evaluated"
+        );
+        assert_eq!(metrics.tenants_discovered(), 2, "both tenants hold data");
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "only the restriction-named tenant is maintained"
+        );
+        assert_eq!(
+            memo.len(),
+            1,
+            "only the maintained tenant's bucket is memoized"
+        );
+    }
+
+    /// ADR-0048 decision 3: a tenant discovery failure (the `list_delimited("t/")`
+    /// LIST erroring) must skip the entire cycle -- no tenant's tick runs --
+    /// and must never fall back to an empty tenant set and report success.
+    /// Uses `FaultStore` to fail the discovery LIST specifically and asserts
+    /// its fault counter to prove the fault actually fired, not just that
+    /// there happened to be nothing to do.
+    #[tokio::test]
+    async fn discovery_failure_skips_cycle_without_running_empty_set() {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        publish_terminal_bucket(&inner, &tenant_id).await;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("tenant discovery unavailable".into()),
+            )
+            .with_key_contains("t/"),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let metrics = TenantDiscoveryMetrics::default();
+
+        let report =
+            run_discovery_cycle(&store, None, &compactor, &retention, 1, &mut memo, &metrics).await;
+
+        assert_eq!(
+            report,
+            MaintainReport::default(),
+            "a discovery failure must skip the whole cycle, never run an empty set"
+        );
+        assert_eq!(
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the injected discovery fault must actually have fired"
+        );
+        assert_eq!(metrics.discovery_failures(), 1);
+        assert_eq!(
+            metrics.tenants_discovered(),
+            0,
+            "gauges stay at their last known-good value, never reporting this failed cycle"
+        );
+        assert!(memo.is_empty(), "a skipped cycle memoizes nothing");
     }
 }

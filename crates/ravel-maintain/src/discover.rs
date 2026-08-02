@@ -68,7 +68,11 @@ mod tests {
         let acme = TenantId::new("acme").hash();
         let globex = TenantId::new("globex").hash();
         put(&store, &format!("t/{}/catalog/m/HEAD", acme.to_hex())).await;
-        put(&store, &format!("t/{}/m/l0/0/writer.1.1.abcd.rseg", acme.to_hex())).await;
+        put(
+            &store,
+            &format!("t/{}/m/l0/0/writer.1.1.abcd.rseg", acme.to_hex()),
+        )
+        .await;
         put(&store, &format!("t/{}/catalog/m/HEAD", globex.to_hex())).await;
 
         let mut tenants = discover_tenants(&store).await.expect("discover");

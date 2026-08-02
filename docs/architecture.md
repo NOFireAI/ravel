@@ -65,6 +65,28 @@ a `multipart`-capable object store (compaction is the only writer of
 multipart objects) and still binds `--listen-http`, serving the `/healthz`,
 `/readyz`, and `/metrics` routes only (no ingest or query surface).
 
+The maintenance driver and the catalog fold task (below) both derive their
+tenant set from storage, not from CLI flags (ADR-0048 decision 3, issue
+#504): each cycle, one supervisor re-enumerates every tenant prefix storage
+reports under `t/` (`ravel_maintain::discover_tenants`, one `list_delimited`
+call) and runs the existing per-tenant maintenance tick for each. This is
+what makes a server authenticating tenants through OIDC or mTLS -- which
+populates neither `--tenant-token` nor `--maintain-tenant` -- still compact,
+retain, and GC every tenant it holds data for; previously the tenant set came
+only from those flags, so such a deployment silently maintained nothing
+(findings S2-17, S5-09). `--tenant-token`/`--maintain-tenant` are now an
+optional *restriction* on the discovered set, not its source: unset, every
+discovered tenant is maintained; set, the discovered set is narrowed to
+exactly the named tenants, and an excluded discovered tenant is counted, not
+silently dropped. A discovery failure (the LIST itself erroring) skips the
+whole cycle -- no tenant's tick runs -- and is retried next cycle; it never
+falls back to an empty tenant set, since that would look identical to a
+healthy "nothing to do" on the very dashboard meant to catch this failure
+mode (see the `/metrics` gauges below). ADR-0048 deliberately rejected a
+durable tenant-registry object as an alternative: a second source of truth
+for the tenant set could itself drift from the prefixes actually holding
+data, the same config-asserts-reality bug class this derivation removes.
+
 Every mode, maintain included, serves two health routes on `--listen-http`
 (ADR-0034 decision 4). `/healthz` (liveness) returns 200 whenever the HTTP
 listener is serving, so a routed 200 proves the axum event loop is alive.
@@ -87,6 +109,17 @@ are restricted to a fixed, exhaustively-matched set (`tenant_hash`, `signal`,
 excluded because Ravel's own telemetry must not be able to explode. Like
 `/readyz`, this endpoint performs no object-store call: every sample comes
 from an in-memory counter already held by a running process.
+
+`--mode maintain` additionally renders three tenant-discovery samples
+(ADR-0048 decision 3, issue #504) through this same renderer, no second
+registry: the gauges `ravel_maintain_tenants_discovered` and
+`ravel_maintain_tenants_maintained` (updated once per discovery cycle,
+holding their last known-good value across a failed one), and the counter
+`ravel_maintain_tenant_discovery_failures_total`. The condition these exist to
+alarm on is a prefix that holds data but receives no maintenance:
+`tenants_maintained` staying below `tenants_discovered` with no corresponding
+flag restriction configured, or `tenants_maintained` at zero while
+`tenants_discovered` is not, in a mode that should be maintaining.
 
 Remote Write (ADR-0015) reuses this same gateway/router/shard pipeline: RW1
 and RW2 payloads decode and normalize to the same `NormalizedPoint` shape

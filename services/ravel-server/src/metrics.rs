@@ -702,17 +702,88 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     );
 }
 
+/// Storage-derived tenant discovery counters for the maintenance driver
+/// (ADR-0048 decision 3, issue #504), decoupled from
+/// [`crate::tenant_discovery::TenantDiscoveryMetrics`] so the renderer is
+/// testable with a plain struct literal, matching [`CatalogCountersSnapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceDiscoverySnapshot {
+    /// Tenant prefixes storage reported under `t/` on the last successful
+    /// discovery cycle. Stays at its last known-good value across a failed
+    /// cycle; never reset to zero by a failure.
+    pub tenants_discovered: u64,
+    /// Of `tenants_discovered`, the ones actually maintained this cycle
+    /// (narrowed by a flag restriction, when one is configured). Equal to
+    /// `tenants_discovered` when no restriction is configured.
+    pub tenants_maintained: u64,
+    /// Cycles where the discovery LIST itself failed and the whole cycle was
+    /// skipped (never an empty-set fallback).
+    pub tenant_discovery_failures: u64,
+}
+
+/// The alarm this family exists for (ADR-0048 decision 3 "What alarms"): a
+/// prefix under `t/` holds data storage discovered, but nothing maintained
+/// it this cycle. `tenants_maintained < tenants_discovered` is the flag-scoped
+/// version of that condition (some discovered tenants were deliberately
+/// excluded); `tenants_maintained == 0` while `tenants_discovered > 0` is the
+/// version this task exists to make impossible outside a deliberate
+/// exclusion, so an operator's alert rule should distinguish the two using
+/// the excluded count logged alongside this gauge, not this snapshot alone.
+fn render_maintain_family(out: &mut String, mode: Mode, snapshot: &MaintenanceDiscoverySnapshot) {
+    write_header(
+        out,
+        "ravel_maintain_tenants_discovered",
+        "Tenant prefixes storage reported under t/ on the last successful discovery cycle.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_tenants_discovered",
+        &[Label::Mode(mode)],
+        snapshot.tenants_discovered,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_tenants_maintained",
+        "Discovered tenants actually maintained this cycle, after any flag restriction.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_tenants_maintained",
+        &[Label::Mode(mode)],
+        snapshot.tenants_maintained,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_tenant_discovery_failures_total",
+        "Maintenance cycles skipped because tenant discovery itself failed.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_tenant_discovery_failures_total",
+        &[Label::Mode(mode)],
+        snapshot.tenant_discovery_failures,
+    );
+}
+
 /// Render every source this module knows about into one Prometheus text
 /// exposition document. `ingest` is empty in a mode that builds no ingest
 /// router (`Mode::Query`, `Mode::Maintain`): those families are omitted
 /// entirely rather than rendered with no samples, since the pipelines
 /// structurally do not exist in that mode. `store` and `catalog` are always
-/// present: the store and the catalog are built in every mode.
+/// present: the store and the catalog are built in every mode. `maintain` is
+/// `None` in every mode but [`Mode::Maintain`], the only mode that runs
+/// [`crate::maintain::spawn`].
 pub fn render(
     mode: Mode,
     store: &StoreMetricsSnapshot,
     ingest: &[IngestPipelineSnapshot],
     catalog: &CatalogCountersSnapshot,
+    maintain: Option<&MaintenanceDiscoverySnapshot>,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -720,6 +791,9 @@ pub fn render(
         render_ingest_family(&mut out, mode, ingest);
     }
     render_catalog_family(&mut out, mode, catalog);
+    if let Some(snapshot) = maintain {
+        render_maintain_family(&mut out, mode, snapshot);
+    }
     out
 }
 
@@ -734,6 +808,10 @@ pub struct MetricsState {
     pub log_ingest_router: Option<Arc<LogIngestRouter>>,
     pub span_ingest_router: Option<Arc<SpanIngestRouter>>,
     pub catalog: Arc<Catalog>,
+    /// `Some` only in [`Mode::Maintain`], the one mode that spawns
+    /// [`crate::maintain::spawn`] and therefore has tenant discovery counters
+    /// to render (ADR-0048 decision 3, issue #504).
+    pub tenant_discovery: Option<Arc<crate::tenant_discovery::TenantDiscoveryMetrics>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -765,7 +843,23 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         compaction_input_set_conflicts: state.catalog.compaction_input_set_conflicts(),
     };
 
-    let body = render(state.mode, &store_snapshot, &pipelines, &catalog_snapshot);
+    let maintain_snapshot =
+        state
+            .tenant_discovery
+            .as_ref()
+            .map(|metrics| MaintenanceDiscoverySnapshot {
+                tenants_discovered: metrics.tenants_discovered(),
+                tenants_maintained: metrics.tenants_maintained(),
+                tenant_discovery_failures: metrics.discovery_failures(),
+            });
+
+    let body = render(
+        state.mode,
+        &store_snapshot,
+        &pipelines,
+        &catalog_snapshot,
+        maintain_snapshot.as_ref(),
+    );
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -823,6 +917,7 @@ mod tests {
             &snapshot,
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -924,7 +1019,7 @@ mod tests {
             interlock_violations: 1,
             compaction_input_set_conflicts: 2,
         };
-        let body = render(Mode::Gateway, &store, &ingest, &catalog);
+        let body = render(Mode::Gateway, &store, &ingest, &catalog, None);
 
         let mut declared_types: HashSet<String> = HashSet::new();
         let mut bucket_state: std::collections::HashMap<String, (Vec<u64>, u64)> =
@@ -1062,6 +1157,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -1078,6 +1174,43 @@ mod tests {
                 "ravel_store_latency_seconds_bucket{mode=\"maintain\",op=\"get\",le=\"+Inf\"} 0"
             ),
             "zero histogram must still render every bucket:\n{body}"
+        );
+        assert!(
+            !body.contains("ravel_maintain_tenants_discovered"),
+            "the maintain family must be omitted entirely when no snapshot is passed, \
+             not rendered with zeroes: a mode without tenant discovery has no counters to zero"
+        );
+    }
+
+    /// ADR-0048 decision 3 / issue #504: the tenant discovery gauges and
+    /// failure counter render through this same closed-label renderer, no
+    /// second registry, exactly like every other family here.
+    #[test]
+    fn maintain_family_renders_tenant_discovery_gauges_and_failure_counter() {
+        let snapshot = MaintenanceDiscoverySnapshot {
+            tenants_discovered: 5,
+            tenants_maintained: 3,
+            tenant_discovery_failures: 2,
+        };
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            Some(&snapshot),
+        );
+
+        assert!(
+            body.contains("ravel_maintain_tenants_discovered{mode=\"maintain\"} 5"),
+            "missing tenants_discovered sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_maintain_tenants_maintained{mode=\"maintain\"} 3"),
+            "missing tenants_maintained sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_maintain_tenant_discovery_failures_total{mode=\"maintain\"} 2"),
+            "missing tenant_discovery_failures sample:\n{body}"
         );
     }
 
@@ -1098,6 +1231,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &ingest,
             &CatalogCountersSnapshot::default(),
+            None,
         );
 
         assert!(
