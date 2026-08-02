@@ -250,14 +250,31 @@ The estimate has two parts, computed at two different moments, because
 one moment cannot cover both (ADR-0044 decision 3, amended).
 
 **The catalog term**, computed before `Catalog::resolve` runs:
-`Catalog::estimated_list_requests` bounds the LISTs resolve will issue
-from inputs the planner already has going in — `shard_count` and the
-number of hour buckets the padded window spans — with no snapshot HEAD
-to shorten the listed suffix, one LIST per `(shard, hour)` pair. This
-term is folded into `estimated_requests` unconditionally, including when
-the window resolves to zero segments, so a fully-pruned window still
-carries a non-zero request estimate against its non-zero actual LIST
-count.
+`Catalog::estimated_catalog_requests` bounds the store requests resolve
+will issue before it has listed anything, from inputs the planner already
+has going in. Two pieces: one LIST per `(shard, hour)` pair — `shard_count`
+times the number of hour buckets the padded window spans, with no snapshot
+HEAD to shorten the listed suffix — plus
+`SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`, a fixed constant covering the
+snapshot-window path (`Catalog::resolve_snapshot_window`) that
+`resolve_impl` always tries first whenever the window is non-empty, before
+any LIST runs. This term is folded into `estimated_requests`
+unconditionally, including when the window resolves to zero segments, so a
+fully-pruned window still carries a non-zero request estimate against its
+non-zero actual request count.
+
+`SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` is not a structural bound and is the
+one open gap in this estimate (see its doc comment in catalog.rs): it
+covers one HEAD GET (always attempted), one part GET (capped at 1 because
+every writer today emits exactly one part — metric-index-plan.md 3.1's
+"v1 writes exactly one part" — even though the wire format's `repeated
+SnapshotPartRef parts` allows more), and one postings GET (worst case, for
+an equality `__name__` filter). Part count is only knowable after the HEAD
+GET this constant exists to avoid, so a future multi-part writer (the
+sharding escape hatch the format already reserves) would silently make
+this an under-estimate again. ADR-0044 decision 3 does not account for the
+snapshot-acceleration path at all; this is flagged there as an open
+question, not resolved by a data-dependent bound here.
 
 **The segment term**, computed after `Catalog::resolve` returns a pinned
 snapshot and before any page fetch: `engine::estimate_cost` computes the
@@ -284,8 +301,10 @@ Constants (crates/ravel-query/src/engine.rs):
 - `STORE_BYTES_SAFETY_FACTOR = 2` applied to `object_size` — covers
   re-reading a segment across a retry (snapshot invalidation) without
   claiming a tighter per-page bound than the catalog can prove pre-fetch.
-- `Catalog::estimated_list_requests(window, now_ns)` — the catalog term:
-  `shard_count * hour_buckets_spanned`, computed pre-resolve.
+- `Catalog::estimated_catalog_requests(window, now_ns)` — the catalog term:
+  `shard_count * hour_buckets_spanned` LISTs plus
+  `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` (3) for the snapshot-window path,
+  computed pre-resolve.
 - `segment_decompressed_bytes_upper_bound` applied per segment for
   `estimated_decompressed_bytes` — derived from the segment's own value
   kinds rather than one constant, per ADR-0044's amended requirement.
