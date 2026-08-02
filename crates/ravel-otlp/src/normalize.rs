@@ -3376,6 +3376,241 @@ mod tests {
         assert_eq!(out.rejected[0].rejected_count(), 0);
     }
 
+    // --- exemplars (ADR-0047) ---
+
+    fn otlp_exemplar(
+        ts_ns: i64,
+        value: f64,
+        trace_id: Vec<u8>,
+        span_id: Vec<u8>,
+        filtered_attributes: Vec<KeyValue>,
+    ) -> Exemplar {
+        Exemplar {
+            time_unix_nano: ts_ns as u64,
+            span_id,
+            trace_id,
+            value: Some(OtlpExemplarValue::AsDouble(value)),
+            filtered_attributes,
+        }
+    }
+
+    #[test]
+    fn exemplars_are_carried_and_capped_per_series_window() {
+        let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(42.0));
+        dp.exemplars = vec![
+            otlp_exemplar(100, 3.5, vec![], vec![], vec![]),
+            otlp_exemplar(500, 1.5, vec![], vec![], vec![]),
+            // Newest of the three, and the only one carrying trace/span id
+            // and a filtered attribute: this is the one that must survive.
+            otlp_exemplar(
+                700,
+                2.5,
+                vec![7; 16],
+                vec![3; 8],
+                vec![string_kv("db.name", "orders")],
+            ),
+        ];
+        let metric = gauge_metric("request_latency", vec![dp]);
+        let rm = resource_metrics(vec![], vec![metric]);
+
+        let mut cap = ExemplarCap::new(10_000_000_000);
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.output.points.len(), 1);
+        let series_id = result.output.points[0].series_id;
+
+        // Three exemplars land in the same window; exactly the newest
+        // survives, every field intact.
+        assert_eq!(result.exemplars.len(), 1);
+        let kept = &result.exemplars[0].exemplar;
+        assert_eq!(result.exemplars[0].series_id, series_id);
+        assert_eq!(kept.ts_ns, 700);
+        assert_eq!(kept.value_bits, 2.5f64.to_bits());
+        assert_eq!(kept.trace_id, [7u8; 16]);
+        assert_eq!(kept.span_id, [3u8; 8]);
+        assert_eq!(
+            kept.filtered_attributes,
+            vec![Label {
+                name: "db_name".to_string(),
+                value: "orders".to_string(),
+            }]
+        );
+
+        // The other two are counted as dropped, not silently discarded and
+        // not inflating the sender-facing rejected-points count.
+        assert_eq!(
+            result.output.rejected,
+            vec![Rejection::HistogramExemplarsDropped { count: 2 }]
+        );
+        assert_eq!(result.output.rejected[0].rejected_count(), 0);
+    }
+
+    #[test]
+    fn exemplar_value_round_trips_nan_payload_and_negative_zero_by_bit_pattern() {
+        let nan_bits: u64 = 0x7ff8_0000_0000_0001;
+        let nan_value = f64::from_bits(nan_bits);
+
+        let mut dp_nan = number_point(vec![], 1_000, NumberValue::AsDouble(1.0));
+        dp_nan.exemplars = vec![otlp_exemplar(1_000, nan_value, vec![], vec![], vec![])];
+        let mut dp_negzero = number_point(vec![], 1_000, NumberValue::AsDouble(1.0));
+        dp_negzero.exemplars = vec![otlp_exemplar(1_000, -0.0, vec![], vec![], vec![])];
+
+        let rm = resource_metrics(
+            vec![],
+            vec![
+                gauge_metric("nan_metric", vec![dp_nan]),
+                gauge_metric("negzero_metric", vec![dp_negzero]),
+            ],
+        );
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 2);
+        assert_eq!(result.exemplars[0].exemplar.value_bits, nan_bits);
+        assert_eq!(result.exemplars[1].exemplar.value_bits, (-0.0f64).to_bits());
+        // Bit patterns distinguish -0.0 from 0.0, unlike `==`.
+        assert_ne!(result.exemplars[1].exemplar.value_bits, 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn exemplar_with_absent_trace_id_or_absent_span_id_is_carried() {
+        let mut dp_no_trace = number_point(vec![], 1_000, NumberValue::AsDouble(1.0));
+        dp_no_trace.exemplars = vec![otlp_exemplar(1_000, 1.0, vec![], vec![9; 8], vec![])];
+        let mut dp_no_span = number_point(vec![], 1_000, NumberValue::AsDouble(2.0));
+        dp_no_span.exemplars = vec![otlp_exemplar(1_000, 2.0, vec![5; 16], vec![], vec![])];
+
+        let rm = resource_metrics(
+            vec![],
+            vec![
+                gauge_metric("no_trace_metric", vec![dp_no_trace]),
+                gauge_metric("no_span_metric", vec![dp_no_span]),
+            ],
+        );
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 2);
+        assert_eq!(result.exemplars[0].exemplar.trace_id, [0u8; 16]);
+        assert_eq!(result.exemplars[0].exemplar.span_id, [9u8; 8]);
+        assert_eq!(result.exemplars[1].exemplar.trace_id, [5u8; 16]);
+        assert_eq!(result.exemplars[1].exemplar.span_id, [0u8; 8]);
+    }
+
+    #[test]
+    fn exemplar_cap_is_per_series_not_global() {
+        let mut dp_a = number_point(
+            vec![string_kv("shard", "a")],
+            1_000,
+            NumberValue::AsDouble(1.0),
+        );
+        dp_a.exemplars = vec![otlp_exemplar(1_000, 1.0, vec![1; 16], vec![1; 8], vec![])];
+        let mut dp_b = number_point(
+            vec![string_kv("shard", "b")],
+            1_000,
+            NumberValue::AsDouble(2.0),
+        );
+        dp_b.exemplars = vec![otlp_exemplar(1_000, 2.0, vec![2; 16], vec![2; 8], vec![])];
+
+        let metric = gauge_metric("m", vec![dp_a, dp_b]);
+        let rm = resource_metrics(vec![], vec![metric]);
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.output.points.len(), 2);
+        assert!(result.output.rejected.is_empty());
+        assert_eq!(result.exemplars.len(), 2);
+
+        let point_series: HashSet<_> = result.output.points.iter().map(|p| p.series_id).collect();
+        let exemplar_series: HashSet<_> = result.exemplars.iter().map(|e| e.series_id).collect();
+        assert_eq!(point_series, exemplar_series);
+    }
+
+    #[test]
+    fn exemplar_with_no_recognized_value_is_dropped_and_counted_not_carried() {
+        let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(1.0));
+        dp.exemplars = vec![Exemplar {
+            time_unix_nano: 999,
+            ..Default::default()
+        }];
+        let metric = gauge_metric("m", vec![dp]);
+        let rm = resource_metrics(vec![], vec![metric]);
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+            &mut cap,
+        );
+
+        assert!(result.exemplars.is_empty());
+        assert_eq!(
+            result.output.rejected,
+            vec![Rejection::HistogramExemplarsDropped { count: 1 }]
+        );
+    }
+
+    #[test]
+    fn classic_histogram_exemplar_attaches_to_matching_bucket_series() {
+        let mut dp = histogram_point(vec![], 1_000, 3, Some(6.0), vec![1.0, 10.0], vec![1, 1, 1]);
+        // Falls in the `le=10.0` bucket (1.0 < 5.0 <= 10.0).
+        dp.exemplars = vec![otlp_exemplar(1_000, 5.0, vec![9; 16], vec![9; 8], vec![])];
+        let rm = resource_metrics(
+            vec![],
+            vec![histogram_metric(
+                "latency",
+                vec![dp],
+                AggregationTemporality::Cumulative,
+            )],
+        );
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 1);
+        let bucket_10 = result
+            .output
+            .points
+            .iter()
+            .find(|p| p.labels.iter().any(|l| l.name == "le" && l.value == "10"))
+            .expect("le=10 bucket series exists");
+        assert_eq!(result.exemplars[0].series_id, bucket_10.series_id);
+    }
+
     #[test]
     fn histogram_no_recorded_value_flag_maps_every_series_to_stale_marker() {
         let mut dp = histogram_point(vec![], 1_000, 3, Some(1.0), vec![1.0], vec![1, 2]);
