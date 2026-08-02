@@ -373,6 +373,114 @@ maintenance loop uses the defaults.
   write or delete, without mutating anything; `verify-custody` is
   read-only and has no `--dry-run` since there is nothing to simulate.
 
+### Maintenance safety metrics and alerts
+
+`--mode maintain` renders four additional samples on the existing `GET
+/metrics` endpoint (ADR-0044 section 4), alongside the tenant-discovery
+gauges (issue #504): `ravel_maintain_legal_hold_refresh_failures_total`
+(counter), `ravel_maintain_conservation_aborts_total` (counter, labeled
+by `signal`), `ravel_maintain_orphan_breaker_tripped_total` (counter,
+labeled by `signal`), and `ravel_maintain_orphans_withheld` (gauge,
+labeled by `signal`). No new label is added to the renderer's
+compile-time-closed allowlist; these reuse the existing `mode` and
+`signal` labels only. ADR-0048 names `tenant_hash` as a label on the
+orphan-breaker-trip counter, but ADR-0044 blocks any
+`tenant_hash`-labeled sample on the unauthenticated `/metrics` route
+until the opt-in `--metrics-tenant-labels` flag ADR-0051 describes
+exists; it does not exist in this codebase yet, so all four samples are
+process-wide totals, not broken out per tenant.
+
+Default alert rules:
+
+| Condition | Query | Why |
+|---|---|---|
+| Legal hold refresh failing | `increase(ravel_maintain_legal_hold_refresh_failures_total[15m]) > 0` | Every failure already skips that tenant's tick entirely (fail-closed, ADR-0048 decision 1); a sustained failure means a tenant is silently receiving no maintenance at all. |
+| Compaction conservation gate aborting | `increase(ravel_maintain_conservation_aborts_total[15m]) > 0` | Each abort means a compaction publish was refused because input and output record counts disagreed (ADR-0048 decision 6); nothing was written, but a bucket stuck retrying every tick without ever compacting needs an operator, not just a retry. |
+| Mass-orphan circuit breaker trip | `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | Fire on the **first trip**, not on a sustained condition. The trip condition can clear itself (dilution or partial restoration, see below) while the underlying record loss and the pass's withheld deletions persist; a sustained-state alert (`orphan_breaker_tripped_total` treated as a level) can clear before anyone looks. The counter only increments, so any `increase() > 0` is a real trip that happened, whether or not the shard is still tripping now. |
+
+`ravel_maintain_orphans_withheld` is a gauge, not an alert target: it
+reflects only the most recent sweep pass and drops to zero on the very
+next non-tripping pass, including one that stopped tripping only
+because of dilution or partial restoration (see below). It is for
+inspecting the size of the most recent withheld set once the trip
+counter has already told you a trip happened, not for detecting the
+trip itself.
+
+### Mass-orphan circuit breaker runbook
+
+A trip means: the current sweep pass found at least
+`orphan_breaker_min_count` (default 50) orphan-GC candidates, and they
+were more than `orphan_breaker_max_ratio` (default 10%) of the shard's
+listed L0 objects. Both conditions must hold. The pass deleted nothing
+and halted; the other two sweep rules (superseded-input,
+unreferenced-part) are unaffected and still ran, since they are
+anchored on durable records, never on record absence.
+
+**It is not self-clearing in the sense an operator expects.** The
+predicate is recomputed from live counts on every pass, with no memory
+of a prior trip. A shard can stop tripping while the missing commit
+records are still missing, through either of two mechanisms
+(docs/consistency-model.md "Deletion and GC"):
+
+- **Dilution**: new well-recorded writes to the same shard lower the
+  orphan ratio below `orphan_breaker_max_ratio` even though the orphan
+  count itself hasn't changed (55 orphans among 500 objects trips at
+  11%; 200 further writes with no data loss give 55/700 = 7.9%, which
+  does not trip, and the 55 still-orphaned objects get deleted on the
+  next pass).
+- **Partial restoration**: an operator restores some but not all of the
+  missing commit records, and the remaining candidate count crosses
+  below `orphan_breaker_min_count` (55 orphans trips; restoring 6 leaves
+  49 candidates, under the default floor of 50, so the very next pass
+  stops tripping and deletes the other 49 before they were restored).
+
+Relying on the breaker to hold a shard open until every missing record
+is back is relying on a guarantee the code does not provide. The only
+durable way to stop deletion is to restore the missing records before
+the next pass runs, not to assume a trip persists or that a clear
+`ravel_maintain_orphan_breaker_tripped_total` increase rate means the
+loss was resolved.
+
+**Inspecting what was withheld**: run `ravel-cli maintain sweep
+--tenant <t> --signal <metrics|logs|spans> --shard <n> --dry-run`
+(without `--override-orphan-breaker`) to recompute the same candidate
+set and print the withheld count without deleting or clearing anything;
+the `ravel_maintain_orphans_withheld` gauge on `/metrics` shows the
+count from the most recent real pass. Neither one tells you why the
+records are missing; that requires the operator's own investigation
+into what deleted or corrupted them out of band.
+
+**Forcing a pass through a trip**: `ravel-cli maintain sweep --tenant
+<t> --signal <metrics|logs|spans> --shard <n>
+--override-orphan-breaker` runs exactly one overridden pass, deleting
+the withheld candidates despite the trip. This sets
+`CompactorConfig::force_orphan_gc` for that single invocation only; the
+server itself never sets it, and the breaker has no memory across
+invocations, so an un-overridden pass afterward evaluates fresh. Use
+this only after confirming (by restoring records, or by independently
+verifying the candidates really are abandoned data) that deletion is
+safe, since the same record-absence signal orphan GC re-verifies
+against is exactly what out-of-band record loss forges.
+
+**Known blind spots (tracked as open gaps in issue #500, not fixed by
+this design)**:
+
+- **No protection below the floor.** The breaker never trips below
+  `orphan_breaker_min_count` (default 50) regardless of ratio, so total
+  loss on a small shard is always deletable in one pass.
+- **Up to the ratio ceiling is deletable per pass.** Because the breaker
+  only trips once the candidate ratio exceeds `orphan_breaker_max_ratio`
+  (default 10%), up to that fraction of a large shard's objects can be
+  deleted in a single pass without ever tripping.
+- **Silent un-trip via dilution or partial restoration.** See above:
+  the predicate has no memory of a prior trip, so either mechanism can
+  let a pass through the remaining loss without an operator's
+  intervention.
+- **No cross-shard or cross-tenant aggregation.** Each (tenant, signal,
+  shard) is evaluated in isolation, so loss spread thin across many
+  shards can stay under every single shard's threshold even though the
+  total loss across the tenant or the deployment is large.
+
 ## Known limitations
 
 From [PROGRESS.md](../../PROGRESS.md), as of the Phase 1 vertical slice:
