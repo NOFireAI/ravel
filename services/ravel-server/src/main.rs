@@ -35,8 +35,16 @@ async fn main() -> anyhow::Result<()> {
 
     let tenant_tokens = cli.parse_tenant_tokens()?;
     let fold_tenants = tenant_tokens.values().map(|id| id.hash()).collect();
-    let tenant_resolver =
-        ravel_server::tenant::build_resolver(tenant_tokens, cli.dev_insecure_tenant_header);
+    // Real authn (ADR-0042 decision 6): the OIDC and mTLS resolvers join the
+    // FallbackResolver chain alongside the static bearer resolver when their
+    // flags are set. Validation of dependent-flag misuse happens in
+    // `parse_auth_resolvers`, fail-fast at startup.
+    let auth = cli.parse_auth_resolvers()?;
+    let resolver_bundle = ravel_server::tenant::build_auth_resolver(
+        tenant_tokens,
+        cli.dev_insecure_tenant_header,
+        auth,
+    )?;
     // Every object-store call this process makes is counted by the decorator
     // `build_store` wraps the backend in (issue #272). Held for the whole
     // process lifetime so a later task can surface the counters; nothing
@@ -83,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         listen_http: cli.listen_http,
         listen_grpc: cli.listen_grpc,
         shard_count: cli.shards,
-        tenant_resolver,
+        tenant_resolver: resolver_bundle.resolver,
         fold_tenants,
         fold: FoldTaskConfig {
             enabled: !cli.disable_fold,
@@ -105,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
             sink_timeout: DEFAULT_SINK_TIMEOUT,
             sql_lookback: cli.parse_alert_sql_lookback()?,
         },
+        oidc_refresh: resolver_bundle.oidc_refresh,
     };
 
     let running = ravel_server::start(config, store).await?;

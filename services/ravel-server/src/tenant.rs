@@ -2,12 +2,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::HeaderMap;
+use rand::RngExt as _;
 use ravel_query::http::{
-    AuthError, DevHeaderTenantResolver, StaticBearerTokenResolver, TenantResolver,
+    AuthError, DevHeaderTenantResolver, MtlsResolver, OidcJwksCache, OidcResolver,
+    StaticBearerTokenResolver, TenantResolver,
 };
 use ravel_types::TenantId;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+use crate::config::AuthResolverSettings;
 
 /// Tries each resolver in order, returning the first successful match.
 pub struct FallbackResolver {
@@ -44,4 +51,148 @@ pub fn build_resolver(
     } else {
         bearer
     }
+}
+
+/// The resolver chain plus, when OIDC is configured, everything the caller needs
+/// to drive the JWKS refresh background task. The `OidcResolver` in the chain
+/// and [`OidcRefreshParams::cache`] share the same [`OidcJwksCache`], so the
+/// task's async refresh is what the sync request-path resolver reads.
+pub struct ResolverBundle {
+    pub resolver: Arc<dyn TenantResolver>,
+    pub oidc_refresh: Option<OidcRefreshParams>,
+}
+
+/// Inputs for the JWKS refresh task: the cache the request-path `OidcResolver`
+/// reads, the JWKS URL to fetch, and how often to refetch.
+pub struct OidcRefreshParams {
+    pub cache: Arc<OidcJwksCache>,
+    pub jwks_url: String,
+    pub interval: Duration,
+}
+
+/// Build the full tenant-resolution chain: the static bearer resolver always,
+/// plus the optional mTLS, dev-header, and OIDC resolvers (ADR-0042 decision 6).
+///
+/// `FallbackResolver` tries every resolver and returns the first success, so
+/// order is functionally irrelevant (the resolvers key off disjoint headers or
+/// token shapes and never both claim one request). The static bearer map is a
+/// cheap `HashMap` lookup, so it goes first to fail fast for a dev/local token;
+/// the more expensive JWT verification is last. `StaticBearerTokenResolver` and
+/// `DevHeaderTenantResolver` keep their existing behavior unchanged.
+pub fn build_auth_resolver(
+    tokens: HashMap<String, TenantId>,
+    dev_header: bool,
+    auth: AuthResolverSettings,
+) -> anyhow::Result<ResolverBundle> {
+    let mut resolvers: Vec<Arc<dyn TenantResolver>> =
+        vec![Arc::new(StaticBearerTokenResolver::new(tokens))];
+
+    if let Some(header) = auth.mtls_header {
+        resolvers.push(Arc::new(MtlsResolver::new(header)));
+    }
+    if dev_header {
+        resolvers.push(Arc::new(DevHeaderTenantResolver::default()));
+    }
+
+    let mut oidc_refresh = None;
+    if let Some(oidc) = auth.oidc {
+        let cache = Arc::new(
+            OidcJwksCache::new().map_err(|e| anyhow::anyhow!("failed to build OIDC cache: {e}"))?,
+        );
+        resolvers.push(Arc::new(OidcResolver::new(
+            cache.clone(),
+            oidc.issuer,
+            oidc.audiences,
+            oidc.tenant_claim,
+        )));
+        oidc_refresh = Some(OidcRefreshParams {
+            cache,
+            jwks_url: oidc.jwks_url,
+            interval: oidc.refresh_interval,
+        });
+    }
+
+    // A single resolver wrapped in a FallbackResolver behaves identically to the
+    // resolver alone, so this needs no special-case for len 1.
+    let resolver: Arc<dyn TenantResolver> = Arc::new(FallbackResolver::new(resolvers));
+    Ok(ResolverBundle {
+        resolver,
+        oidc_refresh,
+    })
+}
+
+/// Handle to the JWKS refresh task, for clean shutdown (mirrors
+/// [`crate::maintain::MaintenanceTasks`]).
+pub struct JwksRefreshTask {
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl JwksRefreshTask {
+    pub fn none() -> Self {
+        JwksRefreshTask {
+            shutdown: None,
+            handle: None,
+        }
+    }
+
+    pub async fn shutdown(self) {
+        if let Some(tx) = self.shutdown {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Spawn the periodic JWKS refresh loop for an OIDC-enabled server. Returns
+/// immediately; the task runs until [`JwksRefreshTask::shutdown`]. Follows the
+/// same shape as [`crate::maintain::spawn`]: a jittered interval and a `oneshot`
+/// shutdown. The request path never blocks on this: it only reads the cache the
+/// loop writes.
+pub fn spawn_jwks_refresh(params: OidcRefreshParams) -> JwksRefreshTask {
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        refresh_loop(params.cache, params.jwks_url, params.interval, rx).await;
+    });
+    JwksRefreshTask {
+        shutdown: Some(tx),
+        handle: Some(handle),
+    }
+}
+
+async fn refresh_loop(
+    cache: Arc<OidcJwksCache>,
+    jwks_url: String,
+    interval: Duration,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(jittered(interval)) => {}
+            _ = &mut shutdown => return,
+        }
+        match cache.refresh(&jwks_url).await {
+            Ok(()) => tracing::debug!(jwks_url = %jwks_url, "JWKS refresh complete"),
+            // A failed refresh keeps the previously cached keys, so a transient
+            // JWKS outage does not start rejecting every OIDC request.
+            Err(err) => tracing::warn!(
+                jwks_url = %jwks_url,
+                error = %err,
+                "JWKS refresh failed; keeping previously cached keys"
+            ),
+        }
+    }
+}
+
+/// Up to 10% jitter over `base`, so co-started replicas do not refetch the JWKS
+/// in lockstep (same rationale as the fold, maintenance, and alert tasks).
+fn jittered(base: Duration) -> Duration {
+    let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
+    if jitter_bound_ms == 0 {
+        return base;
+    }
+    let extra_ms = rand::rng().random_range(0..=jitter_bound_ms);
+    base + Duration::from_millis(extra_ms)
 }

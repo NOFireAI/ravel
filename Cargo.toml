@@ -55,6 +55,19 @@ tower = "0.5"
 hyper = "1.11"
 futures = "0.3"
 async-trait = "0.1"
+# HTTP client. Used by services/ravel-server (alert/webhook sinks) and, for the
+# OIDC JWKS fetch, by ravel-query (ADR-0042 decision 6). Pinned once here so the
+# two crates resolve the same reqwest.
+reqwest = { version = "0.13", features = ["json"] }
+
+# JWT validation for OIDC tenant resolution (ADR-0042 decision 6, issue #392).
+# 9.x is pinned rather than 10/11: 9.x keeps ring (already built in this
+# workspace) as its default crypto backend and carries a stable `jwk` module,
+# whereas 10/11 drop the default backend and force an explicit aws-lc-rs (heavier
+# C toolchain) or rust_crypto selection. Signature verification, issuer/audience/
+# expiry checks, and the algorithm allow-list all come from this crate rather
+# than any hand-rolled JWT code.
+jsonwebtoken = "9.3"
 
 # telemetry protocol types
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }

@@ -110,6 +110,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
     };
     let running = ravel_server::start(config, store.clone())
         .await
@@ -279,6 +280,7 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
     };
     let running = ravel_server::start(config, store.clone())
         .await
