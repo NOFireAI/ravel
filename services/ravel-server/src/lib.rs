@@ -72,27 +72,35 @@ pub fn warn_dev_insecure_tenant_header(enabled: bool) {
 
 /// Warn loudly when `--mtls-enabled` trusts a header for tenant identity
 /// (ADR-0042 decision 6). Unlike `--dev-insecure-tenant-header`, this is a
-/// legitimate production configuration, not a dev-only bypass - the warning
-/// exists because the trust it grants depends entirely on every ingress into
-/// this process actually stripping or overwriting a client-supplied value of
-/// `header_name` before Ravel ever sees it. That includes the HTTP listener
-/// AND the gRPC listener: gRPC metadata keys are copied wholesale into the
-/// same `HeaderMap` this resolver reads (see `otlp_grpc::metadata_to_headers`
-/// and `flight_auth`), so a proxy that sanitizes only the HTTP vhost and
-/// forgets the gRPC one leaves a live tenant-impersonation bypass on Flight
-/// SQL and OTLP gRPC ingest.
+/// legitimate production configuration, not a dev-only bypass. Since
+/// ADR-0050 section 1 the trust this grants depends only on the dedicated
+/// `--mtls-listener`: the `MtlsResolver` is installed exclusively in that
+/// listener's chain, so the public HTTP and gRPC/Flight listeners never read
+/// this header at all, regardless of proxy hygiene there. The remaining
+/// precondition is narrower than before: the operator must point the
+/// TLS-terminating, header-stripping proxy at the mTLS listener alone and
+/// keep it off the public listeners at the network layer.
 pub fn warn_mtls_trusted_header(header_name: Option<&str>) {
     if let Some(header_name) = header_name {
         tracing::warn!(
             header = header_name,
-            "SECURITY: --mtls-enabled trusts the '{header_name}' header for tenant identity. \
-             This is only safe if EVERY ingress into this process (the HTTP listener and the \
-             gRPC listener, including Flight SQL and OTLP gRPC) sits behind a reverse proxy \
-             that terminates mTLS, verifies the client certificate, and strips or overwrites \
-             any client-supplied value of this header before forwarding. A deployment that \
-             protects one listener and not the other has a live tenant-impersonation bypass."
+            "SECURITY: --mtls-enabled trusts the '{header_name}' header for tenant identity on \
+             the dedicated mTLS listener. This is only safe if the reverse proxy in front of \
+             THAT listener terminates mTLS, verifies the client certificate, and strips or \
+             overwrites any client-supplied value of this header before forwarding, and if \
+             network policy ensures no other traffic reaches that listener directly. The public \
+             HTTP and gRPC/Flight listeners never read this header (ADR-0050 section 1)."
         );
     }
+}
+
+/// The dedicated listener the mTLS resolver runs on (ADR-0050 section 1).
+/// `resolver` is wired only into this listener's router chain; the public
+/// HTTP and gRPC/Flight chains are built from `ServerConfig::tenant_resolver`
+/// and never see it.
+pub struct MtlsListenerConfig {
+    pub addr: SocketAddr,
+    pub resolver: Arc<dyn TenantResolver>,
 }
 
 pub struct ServerConfig {
@@ -101,6 +109,13 @@ pub struct ServerConfig {
     pub listen_grpc: SocketAddr,
     pub shard_count: u32,
     pub tenant_resolver: Arc<dyn TenantResolver>,
+    /// The dedicated mTLS listener (ADR-0050 section 1), `None` unless
+    /// `--mtls-enabled`. Serves the same ingest and query surface as the
+    /// public HTTP listener, resolved through `MtlsListenerConfig::resolver`
+    /// instead of `tenant_resolver` above. Never shares a router with the
+    /// public listeners, so a future refactor cannot reintroduce the mTLS
+    /// resolver onto them by accident.
+    pub mtls_listener: Option<MtlsListenerConfig>,
     /// Tenants this process folds catalog snapshots for
     /// (docs/metric-index-plan.md section 4). Independent of
     /// `tenant_resolver`: any (tenant, signal) whose commit history should
@@ -134,10 +149,15 @@ pub struct ServerConfig {
 pub struct Running {
     pub http_addr: SocketAddr,
     pub grpc_addr: Option<SocketAddr>,
+    /// Bound address of the dedicated mTLS listener (ADR-0050 section 1),
+    /// `Some` exactly when `ServerConfig::mtls_listener` was.
+    pub mtls_addr: Option<SocketAddr>,
     http_shutdown: oneshot::Sender<()>,
     http_task: JoinHandle<anyhow::Result<()>>,
     grpc_shutdown: Option<oneshot::Sender<()>>,
     grpc_task: Option<JoinHandle<anyhow::Result<()>>>,
+    mtls_shutdown: Option<oneshot::Sender<()>>,
+    mtls_task: Option<JoinHandle<anyhow::Result<()>>>,
     ingest_router: Option<Arc<IngestRouter>>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
@@ -159,6 +179,13 @@ impl Running {
             let _ = tx.send(());
         }
         if let Some(task) = self.grpc_task {
+            task.await??;
+        }
+
+        if let Some(tx) = self.mtls_shutdown {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.mtls_task {
             task.await??;
         }
 
@@ -309,6 +336,13 @@ pub async fn start(
     // `/healthz` truly reflects "the axum server task can route requests".
     let readiness = health::Readiness::new();
     let mut http_router = Router::new().merge(health::router(readiness.clone()));
+    // The dedicated mTLS listener's router (ADR-0050 section 1): built up in
+    // parallel with `http_router` below, merging the same tenant-resolving
+    // routes but constructed with `mtls.resolver` instead of
+    // `config.tenant_resolver`. `None` unless `--mtls-listener` is
+    // configured. Deliberately serves no health or metrics routes - those
+    // carry no tenant identity and stay on the public listener only.
+    let mut mtls_router = Router::new();
     if let (Some(router), Some(log_router), Some(span_router)) =
         (&ingest_router, &log_ingest_router, &span_ingest_router)
     {
@@ -321,6 +355,14 @@ pub async fn start(
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(router, config.tenant_resolver.clone());
         http_router = http_router.merge(remote_write::router(rw_state));
+
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_state = gateway_state(router, log_router, span_router, mtls.resolver.clone());
+            let mtls_rw_state = remote_write_state(router, mtls.resolver.clone());
+            mtls_router = mtls_router
+                .merge(otlp_http::router(mtls_state))
+                .merge(remote_write::router(mtls_rw_state));
+        }
     }
     let catalog = query::build_catalog(store.clone(), config.shard_count)?;
 
@@ -377,6 +419,17 @@ pub async fn start(
             )?;
             alert_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));
+            // The mTLS listener's SQL route shares the same executor (built
+            // once above) rather than calling `build_sql_state` a second
+            // time, which would stand up a second `Catalog`/`SqlExecutor`
+            // pair with its own per-tenant memory accounting.
+            if let Some(mtls) = &config.mtls_listener {
+                let mtls_state = sql::SqlState {
+                    tenant_resolver: mtls.resolver.clone(),
+                    ..state.clone()
+                };
+                mtls_router = mtls_router.merge(sql::router(mtls_state));
+            }
             #[cfg(feature = "flight-sql")]
             {
                 sql_state = Some(state);
@@ -392,6 +445,14 @@ pub async fn start(
             clock: Arc::new(SystemClock),
         };
         http_router = http_router.merge(analytics::router(analytics_state));
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_analytics_state = analytics::AnalyticsState {
+                engine: app_state.engine.clone(),
+                tenant_resolver: mtls.resolver.clone(),
+                clock: Arc::new(SystemClock),
+            };
+            mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
+        }
 
         // Same `QueryEngine` (and, under the `sql` feature, the same
         // `SqlExecutor`) the routes just mounted serve from.
@@ -406,6 +467,13 @@ pub async fn start(
             config.alerting.clone(),
         )?;
 
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_app_state = ravel_query::http::AppState {
+                engine: app_state.engine.clone(),
+                tenant_resolver: mtls.resolver.clone(),
+            };
+            mtls_router = mtls_router.merge(ravel_query::http::router(mtls_app_state));
+        }
         http_router = http_router.merge(ravel_query::http::router(app_state));
     }
 
@@ -517,6 +585,28 @@ pub async fn start(
         (None, None, None)
     };
 
+    // The dedicated mTLS listener (ADR-0050 section 1): bound only when
+    // `--mtls-listener` was configured, serving `mtls_router` built up above.
+    // No gRPC/Flight service is registered on it - Flight SQL and OTLP gRPC
+    // keep resolving tenants only through `config.tenant_resolver`, which
+    // never contains the mTLS resolver.
+    let (mtls_addr, mtls_shutdown, mtls_task) = if let Some(mtls) = &config.mtls_listener {
+        let listener = tokio::net::TcpListener::bind(mtls.addr).await?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = oneshot::channel::<()>();
+        let task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            axum::serve(listener, mtls_router)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await?;
+            Ok(())
+        });
+        (Some(addr), Some(tx), Some(task))
+    } else {
+        (None, None, None)
+    };
+
     // OIDC readiness gate (ADR-0042 decision 6): when OIDC is enabled, do one
     // blocking JWKS fetch here and refuse to start if it fails, rather than
     // serving with an empty key cache that would reject every OIDC request with
@@ -550,10 +640,13 @@ pub async fn start(
     Ok(Running {
         http_addr,
         grpc_addr,
+        mtls_addr,
         http_shutdown: http_shutdown_tx,
         http_task,
         grpc_shutdown,
         grpc_task,
+        mtls_shutdown,
+        mtls_task,
         ingest_router,
         log_ingest_router,
         span_ingest_router,
