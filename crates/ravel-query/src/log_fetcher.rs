@@ -287,9 +287,13 @@ impl LogSegmentFetcher {
     /// Accounted counterpart of [`fetch`](Self::fetch): identical behavior,
     /// plus the object GET is recorded against `accounting` (ADR-0044 "2.
     /// Accounting is recorded at existing funnels only" -- this call is the
-    /// funnel `LogSegmentFetcher` did not have before). `engine.rs` calls
-    /// this; `fetch` stays the unaccounted entry point so existing callers
-    /// need no signature change.
+    /// funnel `LogSegmentFetcher` did not have before). `engine.rs` has no
+    /// references to `LogSegmentFetcher` at all; the real production callers
+    /// (ravel-sql's `logs_provider`, `alerts_scan`, `audit_scan`, and
+    /// `audit_provider`) still call the unaccounted [`fetch`](Self::fetch).
+    /// Wiring them onto this funnel is issue #424; `fetch` stays the
+    /// unaccounted entry point until that lands, so those callers need no
+    /// signature change yet.
     pub async fn fetch_accounted(
         &self,
         seg_ref: &SegmentRef,
