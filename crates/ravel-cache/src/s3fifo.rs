@@ -163,7 +163,14 @@ impl<V: Clone> S3Fifo<V> {
             self.ghost.remove(pos);
         }
 
-        self.entries.insert(key, Entry { value, size, freq: 0 });
+        self.entries.insert(
+            key,
+            Entry {
+                value,
+                size,
+                freq: 0,
+            },
+        );
         if promote_to_main {
             self.main.push_back(key);
             self.main_bytes += size;
@@ -188,7 +195,14 @@ impl<V: Clone> S3Fifo<V> {
         if self.entries.contains_key(&key) {
             return;
         }
-        self.entries.insert(key, Entry { value, size, freq: 0 });
+        self.entries.insert(
+            key,
+            Entry {
+                value,
+                size,
+                freq: 0,
+            },
+        );
         self.small.push_back(key);
         self.small_bytes += size;
     }
@@ -214,7 +228,8 @@ impl<V: Clone> S3Fifo<V> {
 
     fn evict_to_bounds(&mut self, metrics: &CacheMetrics) -> Vec<CacheKey> {
         let mut evicted_keys = Vec::new();
-        while self.total_bytes() > self.limits.max_bytes || self.entries.len() > self.limits.max_entries
+        while self.total_bytes() > self.limits.max_bytes
+            || self.entries.len() > self.limits.max_entries
         {
             let step = if self.small_bytes > self.small_quota_bytes && !self.small.is_empty() {
                 self.evict_from_small(metrics)
