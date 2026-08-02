@@ -1,7 +1,8 @@
 //! End-to-end coverage for the real-authn resolvers (ADR-0042 decision 6,
-//! issue #392): an in-process server backed by `MemoryStore` resolves a tenant
-//! through a real HTTP request via the OIDC and mTLS resolvers in the
-//! `FallbackResolver` chain, and rejects unauthenticated requests.
+//! issue #392) and the mTLS dedicated-listener isolation (ADR-0050 section 1,
+//! issue #477): an in-process server backed by `MemoryStore` resolves a
+//! tenant through a real HTTP request via the OIDC and mTLS resolvers, and
+//! rejects unauthenticated requests.
 //!
 //! The OIDC case installs a locally-built EC (P-256) JWKS directly into the
 //! cache, so the whole path (JWT signature + issuer + expiry validation, tenant
@@ -10,6 +11,13 @@
 //! deliberately: `parse_signing_keys` refuses symmetric (oct/HMAC) JWKS keys
 //! outright, since a JWKS is a public document and a symmetric key inside one
 //! is a published verification secret, never a usable one.
+//!
+//! The mTLS cases exercise the fix for adversarial review finding S4-08: the
+//! `MtlsResolver` trusts an unauthenticated `x-ravel-client-cert-cn` header,
+//! so it must be reachable only from the dedicated `--mtls-listener`, never
+//! from the public HTTP or gRPC/Flight listeners. `forged_mtls_header_rejected_on_public_listeners`
+//! is experiment L8 from that review, run against real server wiring rather
+//! than a hand-built rig.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -22,10 +30,11 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_query::http::{OidcJwksCache, OidcResolver, TenantResolver};
 use ravel_server::config::AuthResolverSettings;
 use ravel_server::tenant::FallbackResolver;
-use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_server::{FoldTaskConfig, Mode, MtlsListenerConfig, ServerConfig};
 
 const ISSUER: &str = "https://issuer.example.com";
 const KID: &str = "itest-key";
+const MTLS_HEADER: &str = "x-ravel-client-cert-cn";
 
 // A real P-256 keypair (openssl ecparam -name prime256v1 -genkey), PKCS8
 // PEM for jsonwebtoken's `EncodingKey::from_ec_pem`.
@@ -37,7 +46,16 @@ lVNfCuKwwBrIas5yannzOq4NUHTqcDRTLWg1ZyMnLrUgZ/WHc4/TGBXG\n\
 const EC_X: &str = "jxvUiJNhN1EyQuJ8ZtZesuss1_Dd_JVTXwrisMAayGo";
 const EC_Y: &str = "znJqefM6rg1QdOpwNFMtaDVnIycutSBn9Ydzj9MYFcY";
 
-async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server::Running {
+/// Starts a real server, optionally with the dedicated mTLS listener wired up
+/// (ADR-0050 section 1). `mtls_resolver` mirrors `--mtls-enabled` +
+/// `--mtls-listener`: when `Some`, `ravel_server::start` binds a third
+/// listener whose router chain is built from this resolver alone, entirely
+/// separate from `resolver`, which backs the public HTTP and gRPC/Flight
+/// listeners.
+async fn start_with_mtls(
+    resolver: Arc<dyn TenantResolver>,
+    mtls_resolver: Option<Arc<dyn TenantResolver>>,
+) -> ravel_server::Running {
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
         mode: Mode::All,
@@ -45,6 +63,10 @@ async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server:
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
         shard_count: 1,
         tenant_resolver: resolver,
+        mtls_listener: mtls_resolver.map(|resolver| MtlsListenerConfig {
+            addr: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            resolver,
+        }),
         fold_tenants: Vec::new(),
         fold: FoldTaskConfig {
             enabled: false,
@@ -62,6 +84,10 @@ async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server:
     )
     .await
     .expect("server starts")
+}
+
+async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server::Running {
+    start_with_mtls(resolver, None).await
 }
 
 fn jwks() -> JwkSet {
@@ -100,6 +126,27 @@ fn oidc_chain() -> Arc<dyn TenantResolver> {
         "tenant",
     ));
     Arc::new(FallbackResolver::new(vec![oidc]))
+}
+
+/// Builds the real `build_auth_resolver` wiring with only the mTLS resolver
+/// configured (no static tokens, no dev header, no OIDC), the same shape
+/// `--mtls-enabled --mtls-header x-ravel-client-cert-cn` produces. Returns the
+/// public chain (never containing the mTLS resolver, ADR-0050 section 1) and
+/// the mTLS resolver on its own.
+fn mtls_bundle() -> (Arc<dyn TenantResolver>, Arc<dyn TenantResolver>) {
+    let bundle = ravel_server::tenant::build_auth_resolver(
+        HashMap::new(),
+        false,
+        AuthResolverSettings {
+            oidc: None,
+            mtls_header: Some(MTLS_HEADER.to_string()),
+        },
+    )
+    .expect("resolver builds");
+    let mtls_resolver = bundle
+        .mtls_resolver
+        .expect("mtls_header was set above, so build_auth_resolver returns Some");
+    (bundle.resolver, mtls_resolver)
 }
 
 #[tokio::test]
@@ -145,33 +192,29 @@ async fn oidc_expired_jwt_is_unauthorized_end_to_end() {
 }
 
 #[tokio::test]
-async fn mtls_header_resolves_tenant_end_to_end() {
-    // Exercise the real wiring: build_auth_resolver assembles the chain with the
-    // mTLS resolver enabled (no static tokens, no dev header).
-    let bundle = ravel_server::tenant::build_auth_resolver(
-        HashMap::new(),
-        false,
-        AuthResolverSettings {
-            oidc: None,
-            mtls_header: Some("x-ravel-client-cert-cn".to_string()),
-        },
-    )
-    .expect("resolver builds");
-    assert!(bundle.oidc_refresh.is_none());
-
-    let running = start_with_resolver(bundle.resolver).await;
-    let base = format!("http://{}", running.http_addr);
+async fn mtls_header_authenticates_only_on_dedicated_listener() {
+    let (resolver, mtls_resolver) = mtls_bundle();
+    let running = start_with_mtls(resolver, Some(mtls_resolver)).await;
+    let mtls_addr = running
+        .mtls_addr
+        .expect("mtls_resolver was configured above");
+    let base = format!("http://{mtls_addr}");
     let client = reqwest::Client::new();
 
-    // With the trusted client-cert header present, the request authenticates.
+    // On the dedicated mTLS listener, the header authenticates exactly as a
+    // TLS-terminating, header-stripping proxy in front of it would present it.
     let ok = client
         .get(format!("{base}/api/v1/query"))
-        .header("x-ravel-client-cert-cn", "acme")
+        .header(MTLS_HEADER, "acme")
         .query(&[("query", "up")])
         .send()
         .await
         .expect("query request succeeds");
-    assert_eq!(ok.status(), 200, "mTLS header should authenticate");
+    assert_eq!(
+        ok.status(),
+        200,
+        "mTLS header should authenticate on the dedicated listener"
+    );
 
     // Without it, no resolver in the chain matches: unauthenticated.
     let denied = client
@@ -181,6 +224,95 @@ async fn mtls_header_resolves_tenant_end_to_end() {
         .await
         .expect("query request succeeds");
     assert_eq!(denied.status(), 401, "absent header must be rejected");
+
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// Experiment L8 from the adversarial review (finding S4-08): a forged
+/// `x-ravel-client-cert-cn` header, naming a victim tenant with no client
+/// certificate at all, sent directly to every public listener. Before
+/// ADR-0050 section 1 this authenticated as the named tenant on any listener
+/// the resolver chain was installed on; the fix makes the public chains
+/// structurally incapable of reading the header at all, so this must be
+/// rejected on the HTTP query listener, the gRPC OTLP listener, and (where
+/// compiled in) the Flight SQL listener, even though the same process has a
+/// real mTLS resolver configured and reachable on its own dedicated listener.
+#[tokio::test]
+async fn forged_mtls_header_rejected_on_public_listeners() {
+    let (resolver, mtls_resolver) = mtls_bundle();
+    let running = start_with_mtls(resolver, Some(mtls_resolver)).await;
+
+    // HTTP: the public query listener.
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/api/v1/query"))
+        .header(MTLS_HEADER, "victim-tenant")
+        .query(&[("query", "up")])
+        .send()
+        .await
+        .expect("query request succeeds");
+    assert_eq!(
+        resp.status(),
+        401,
+        "forged mTLS header must not authenticate on the public HTTP listener"
+    );
+
+    // gRPC: the public OTLP listener, which the same chain resolver backs.
+    {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+        let grpc_addr = running.grpc_addr.expect("gRPC listener binds in All mode");
+        let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+            .await
+            .expect("gRPC client connects");
+        let mut request = tonic::Request::new(ExportMetricsServiceRequest {
+            resource_metrics: Vec::new(),
+        });
+        request.metadata_mut().insert(
+            MTLS_HEADER,
+            "victim-tenant".parse().expect("ascii metadata"),
+        );
+        let status = client
+            .export(request)
+            .await
+            .expect_err("forged header must not authenticate on the public gRPC listener");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    // Flight SQL: rides the same gRPC listener and the same public chain.
+    #[cfg(feature = "flight-sql")]
+    {
+        use arrow_flight::FlightDescriptor;
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
+        use prost::Message as _;
+
+        let grpc_addr = running.grpc_addr.expect("gRPC listener binds in All mode");
+        let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+            .expect("valid endpoint uri")
+            .connect()
+            .await
+            .expect("Flight client connects");
+        let mut client = FlightServiceClient::new(channel);
+
+        let command = CommandStatementQuery {
+            query: "SELECT 1".to_string(),
+            transaction_id: None,
+        };
+        let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+        let mut request = tonic::Request::new(descriptor);
+        request.metadata_mut().insert(
+            MTLS_HEADER,
+            "victim-tenant".parse().expect("ascii metadata"),
+        );
+        let status = client
+            .get_flight_info(request)
+            .await
+            .expect_err("forged header must not authenticate on the public Flight listener");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
 
     running.shutdown().await.expect("clean shutdown");
 }
