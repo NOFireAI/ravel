@@ -61,6 +61,7 @@ pub struct RspanReader<'a> {
     bytes: &'a [u8],
     skip: SkipIndex,
     blocks_offset: u64,
+    blocks_len: u64,
     max_uncomp: u64,
 }
 
@@ -76,6 +77,7 @@ impl<'a> RspanReader<'a> {
             bytes,
             skip,
             blocks_offset: blocks.offset,
+            blocks_len: blocks.len,
             max_uncomp: DEFAULT_MAX_UNCOMP,
         })
     }
@@ -113,6 +115,21 @@ impl<'a> RspanReader<'a> {
 
     /// Slice of one block's stored bytes (offset is relative to BLOCKS).
     fn block_bytes(&self, block_offset: u64, block_len: u64) -> Result<&'a [u8], SpanSegError> {
+        // The read must stay within the BLOCKS section itself, not merely within
+        // the whole object. A corrupt (block_offset, block_len) decoded from
+        // SKIP_IDX could otherwise land `end` past the BLOCKS section's own
+        // boundary while still inside the file (into SKIP_IDX or the footer),
+        // and return foreign bytes (issue #349). Checked against the section
+        // length captured at open time: `block_offset + block_len <=
+        // blocks_len`.
+        let rel_end = block_offset
+            .checked_add(block_len)
+            .ok_or_else(|| SpanSegError::Corrupted("block range overflow".into()))?;
+        if rel_end > self.blocks_len {
+            return Err(SpanSegError::Corrupted(
+                "block range exceeds BLOCKS section".into(),
+            ));
+        }
         let abs = self
             .blocks_offset
             .checked_add(block_offset)
@@ -269,6 +286,90 @@ mod tests {
             reader.scan(&SpanQuery::ts_range(i64::MIN, i64::MAX)),
             Err(SpanSegError::Corrupted(_))
         ));
+    }
+
+    #[test]
+    fn block_range_past_blocks_section_is_error() {
+        use crate::footer::{COMP_NONE, SectionDesc, write_footer_and_trailer};
+        use crate::skip_index::BlockEntry;
+
+        let cfg = RspanConfig::default();
+        // Arbitrary BLOCKS content; the crafted entry errors out in block_bytes
+        // before this is ever decoded, so its bytes are irrelevant.
+        let blocks_bytes = vec![0u8; 8];
+
+        // One skip entry whose (offset, len) stays inside the whole file but
+        // runs past the BLOCKS section's own end (8): rel_end = 0 + 12 > 8. Its
+        // trace_id range and time interval are wide open so pruning keeps it and
+        // the scan actually reaches block_bytes (issue #349).
+        let entry = BlockEntry {
+            block_offset: 0,
+            block_len: 12,
+            block_crc32c: 0,
+            record_count: 1,
+            min_trace_id: [0u8; 16],
+            max_trace_id: [0xffu8; 16],
+            min_start_ts: i64::MIN,
+            max_end_ts: i64::MAX,
+        };
+        let skip_raw = SkipIndex::new(vec![entry]).encode();
+
+        let mut obj = Vec::new();
+        obj.extend_from_slice(&blocks_bytes);
+        let skip_off = obj.len() as u64;
+        obj.extend_from_slice(&skip_raw);
+
+        let sections = vec![
+            SectionDesc {
+                kind: kind::BLOCKS,
+                offset: 0,
+                len: blocks_bytes.len() as u64,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: blocks_bytes.len() as u64,
+            },
+            SectionDesc {
+                kind: kind::SKIP_IDX,
+                offset: skip_off,
+                len: skip_raw.len() as u64,
+                crc32c: crc32c::crc32c(&skip_raw),
+                comp: COMP_NONE,
+                uncomp_len: skip_raw.len() as u64,
+            },
+        ];
+        let footer = SpanFooter {
+            tenant_hash: [0u8; 16],
+            shard: 0,
+            writer_id: [0u8; 16],
+            writer_epoch: 0,
+            writer_seq: 0,
+            min_start_ts_ns: i64::MIN,
+            max_end_ts_ns: i64::MAX,
+            record_count: 1,
+            block_count: 1,
+            min_trace_id: [0u8; 16],
+            max_trace_id: [0xffu8; 16],
+            sections,
+            level: 0,
+            input_set_hash: Vec::new(),
+            part_index: 0,
+        };
+        write_footer_and_trailer(&mut obj, &footer);
+
+        // The crafted end (12) lands well inside the whole file, so the old
+        // whole-object bound would have returned foreign SKIP_IDX/footer bytes.
+        assert!(obj.len() as u64 > 12);
+
+        let reader = RspanReader::new(&obj, &cfg).expect("open");
+        let err = reader
+            .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+            .expect_err("out-of-section block range must be rejected");
+        match err {
+            SpanSegError::Corrupted(msg) => {
+                assert!(msg.contains("BLOCKS section"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
     }
 
     #[test]
