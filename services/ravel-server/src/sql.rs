@@ -59,6 +59,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ravel_ingest::Clock;
+use ravel_maintain::{QueryStatus, write_query_audit};
+use ravel_object_store::ObjectStoreBackend;
 use ravel_query::http::TenantResolver;
 use ravel_sql::{ErrorClass, SqlError, SqlExecutor, SqlRequest};
 use ravel_types::{CommitToken, TenantHash, TimeRange};
@@ -80,6 +82,10 @@ const ONE_HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
 pub struct SqlState {
     pub executor: Arc<SqlExecutor>,
     pub tenant_resolver: Arc<dyn TenantResolver>,
+    /// Object store handle used to write the query-audit record (ADR-0042
+    /// decision 4). The audit record is written by the server itself, never
+    /// derived from a client body, so a tenant cannot forge or suppress it.
+    pub store: Arc<dyn ObjectStoreBackend>,
     /// Injected clock. Library logic never calls `SystemTime::now()`; the
     /// endpoint reads the clock once per request and threads the same
     /// `now_ns` through resolution and the snapshot retry.
@@ -132,13 +138,52 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
 
-    let outcome = state
-        .executor
-        .execute(tenant_hash, &request)
-        .await
-        .map_err(|err| ApiError::from_sql(err, tenant_hash))?;
+    // The query has now reached execution for a resolved tenant, so it is
+    // auditable (ADR-0042 decision 4). Run it, then write exactly one
+    // query-audit record for the outcome - success or the specific SqlError -
+    // before mapping the result to a response. Requests rejected earlier (no
+    // tenant, an unreadable body, or invalid request parameters) never reach
+    // here and are not audited: there is no executed query to attribute.
+    let result = state.executor.execute(tenant_hash, &request).await;
+    let status = match &result {
+        Ok(_) => QueryStatus::Ok,
+        Err(_) => QueryStatus::Error,
+    };
+    write_audit(state, tenant_hash, now_ns, &request.sql, status).await;
 
+    let outcome = result.map_err(|err| ApiError::from_sql(err, tenant_hash))?;
     encode(&headers, &outcome, tenant_hash)
+}
+
+/// Write the query-audit record for one request. The audit trail is a
+/// server-side obligation independent of the query result, so a failure to
+/// write it must never change the client's response: it is logged loudly
+/// (`tracing::error!`) - a silently dropped audit record would defeat the whole
+/// feature - and then swallowed, so a successful query stays a success.
+async fn write_audit(
+    state: &SqlState,
+    tenant_hash: TenantHash,
+    now_ns: i64,
+    query_text: &str,
+    status: QueryStatus,
+) {
+    if let Err(err) = write_query_audit(
+        state.store.as_ref(),
+        &tenant_hash,
+        now_ns,
+        query_text,
+        "sql",
+        status,
+    )
+    .await
+    {
+        tracing::error!(
+            tenant = %tenant_hash.to_hex(),
+            error = %err,
+            "failed to write query-audit record; client response unaffected but the audit \
+             trail is now incomplete for this request",
+        );
+    }
 }
 
 fn authenticate(state: &SqlState, headers: &HeaderMap) -> Result<TenantHash, ApiError> {

@@ -155,13 +155,14 @@ fn sql_state(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantI
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(store.clone()),
-        LogSegmentFetcher::new(store),
+        LogSegmentFetcher::new(store.clone()),
         SqlConfig::default(),
         1 << 30,
     );
     SqlState {
         executor: Arc::new(executor),
         tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+        store,
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
     }
