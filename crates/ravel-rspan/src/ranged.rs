@@ -132,11 +132,10 @@ impl RspanRangeReader {
         let mut start = u64::MAX;
         let mut end = 0u64;
         for &b in &blocks {
-            let entry = self
-                .skip
-                .blocks
-                .get(b)
-                .ok_or_else(|| SpanSegError::Corrupted("skip block index out of range".into()))?;
+            let entry =
+                self.skip.blocks.get(b).ok_or_else(|| {
+                    SpanSegError::Corrupted("skip block index out of range".into())
+                })?;
             let (abs, abs_end) = self.block_abs_range(entry)?;
             start = start.min(abs);
             end = end.max(abs_end);
@@ -171,11 +170,10 @@ impl RspanRangeReader {
         }
         let mut out = Vec::new();
         for &b in &span.blocks {
-            let entry = self
-                .skip
-                .blocks
-                .get(b)
-                .ok_or_else(|| SpanSegError::Corrupted("skip block index out of range".into()))?;
+            let entry =
+                self.skip.blocks.get(b).ok_or_else(|| {
+                    SpanSegError::Corrupted("skip block index out of range".into())
+                })?;
             let (abs, _abs_end) = self.block_abs_range(entry)?;
             let rel = abs
                 .checked_sub(span.start)
@@ -255,12 +253,12 @@ mod tests {
             name: format!("op-{span}"),
             start_ts_ns: start,
             end_ts_ns: end,
-            status_code: if span % 3 == 0 {
+            status_code: if span.is_multiple_of(3) {
                 StatusCode::Error
             } else {
                 StatusCode::Ok
             },
-            status_message: if span % 3 == 0 {
+            status_message: if span.is_multiple_of(3) {
                 Some(format!("err {span}"))
             } else {
                 None
@@ -392,7 +390,9 @@ mod tests {
             block_target_records: 5,
             ..RspanConfig::default()
         };
-        let recs: Vec<SpanRecord> = (0..37u8).map(|s| span(9, s, i64::from(s), i64::from(s) + 1)).collect();
+        let recs: Vec<SpanRecord> = (0..37u8)
+            .map(|s| span(9, s, i64::from(s), i64::from(s) + 1))
+            .collect();
         let obj = build(cfg, recs.clone());
         let footer = open(&obj).expect("open");
         let blocks_section = footer.section(kind::BLOCKS).expect("blocks section");
