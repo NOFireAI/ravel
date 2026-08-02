@@ -77,6 +77,7 @@ use crate::logs_provider::LogsTableProvider;
 use crate::logs_udf::has_word_udf;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::provider::RavelTableProvider;
+use crate::spans_provider::SpansTableProvider;
 use crate::udf::{label_match_udf, label_udf};
 
 /// The metrics table name (`Signal::Metrics`).
@@ -85,15 +86,25 @@ pub const SAMPLES_TABLE: &str = "samples";
 /// The logs table name (`Signal::Logs`, ADR-0033).
 pub const LOGS_TABLE: &str = "logs";
 
+/// The spans table name (`Signal::Spans`, ADR-0045 decision 5).
+pub const SPANS_TABLE: &str = "spans";
+
 /// The single table a query's session registers. ADR-0033 decision C admits
 /// exactly one signal per query in v1, so the executor resolves one snapshot
-/// and hands [`build_session`] one provider; the enum keeps the two provider
-/// types (metrics vs logs) apart without a `dyn TableProvider` erasure.
+/// and hands [`build_session`] one provider; the enum keeps the provider
+/// types (metrics vs logs vs spans) apart without a `dyn TableProvider`
+/// erasure.
 pub enum SessionTable {
     /// The `samples` table over a resolved `Signal::Metrics` snapshot.
     Metrics(Arc<RavelTableProvider>),
     /// The `logs` table over a resolved `Signal::Logs` snapshot.
     Logs(Arc<LogsTableProvider>),
+    /// The `spans` table over a resolved `Signal::Spans` snapshot (ADR-0045
+    /// decision 5). Needs no table-specific scalar UDF: unlike `logs`'
+    /// `has_word` and metrics' `label`/`label_match`, every `spans` predicate
+    /// this ships (ts, trace_id, duration, status_code, service_name) is a
+    /// plain column comparison.
+    Spans(Arc<SpansTableProvider>),
 }
 
 /// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
@@ -236,6 +247,9 @@ pub fn build_session(
             ctx.register_udf(has_word_udf());
             ctx.register_table(LOGS_TABLE, provider)?;
         }
+        SessionTable::Spans(provider) => {
+            ctx.register_table(SPANS_TABLE, provider)?;
+        }
     }
     Ok(ctx)
 }
@@ -243,7 +257,47 @@ pub fn build_session(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use ravel_catalog::Snapshot;
+    use ravel_object_store::memory::MemoryStore;
+
     use super::*;
+    use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+    use crate::spans_fetcher::SpanSegmentFetcher;
+
+    fn test_pool() -> Arc<dyn MemoryPool> {
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let breach = CeilingBreach::new();
+        Arc::new(TenantDelegatingPool::new(1 << 30, tenant, breach))
+    }
+
+    /// A trivial `SELECT * FROM spans` plans once `SessionTable::Spans` is
+    /// registered (ADR-0045 decision 5). An empty snapshot, so this proves
+    /// registration and planning only, not execution over real data.
+    #[tokio::test]
+    async fn spans_table_is_registered_and_a_select_star_plans() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> =
+            Arc::new(MemoryStore::new());
+        let fetcher = SpanSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+        };
+        let provider =
+            crate::spans_provider::SpansTableProvider::new(snapshot, fetcher, SqlConfig::default());
+        let ctx = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            SessionTable::Spans(Arc::new(provider)),
+        )
+        .expect("spans session builds");
+
+        let df = ctx
+            .sql("SELECT * FROM spans")
+            .await
+            .expect("SELECT * FROM spans plans");
+        let batches = df.collect().await.expect("empty snapshot scan executes");
+        assert!(batches.iter().all(|b| b.num_rows() == 0));
+    }
 
     #[test]
     fn information_schema_is_disabled_and_repartitioning_is_off() {
