@@ -339,9 +339,13 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         oidc_refresh: None,
         otap: false,
     };
-    let running = ravel_server::start(config, store_dyn)
-        .await
-        .expect("server starts");
+    let running = ravel_server::start(
+        config,
+        store_dyn,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts");
 
     // The logs fold loop -- newly wired by this change -- must produce
     // catalog/l/HEAD even though no metric ever existed.
@@ -448,9 +452,13 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         oidc_refresh: None,
         otap: false,
     };
-    let running = ravel_server::start(config, store_dyn)
-        .await
-        .expect("server starts");
+    let running = ravel_server::start(
+        config,
+        store_dyn,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts");
 
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();

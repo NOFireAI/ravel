@@ -454,7 +454,13 @@ async fn the_server_registers_the_real_flight_sql_service() {
         oidc_refresh: None,
         otap: false,
     };
-    let running = ravel_server::start(config, store).await.expect("starts");
+    let running = ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("starts");
     let grpc_addr = running
         .grpc_addr
         .expect("query mode binds gRPC when flight-sql is on");

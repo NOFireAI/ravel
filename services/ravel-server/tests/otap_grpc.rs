@@ -57,9 +57,13 @@ async fn start_test_server() -> ravel_server::Running {
         oidc_refresh: None,
         otap: true,
     };
-    ravel_server::start(config, store)
-        .await
-        .expect("server starts")
+    ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts")
 }
 
 /// One encoded OTAP batch: a single gauge `metric_name` with one point at

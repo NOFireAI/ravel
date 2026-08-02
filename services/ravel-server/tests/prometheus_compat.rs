@@ -47,9 +47,13 @@ async fn start_test_server() -> ravel_server::Running {
         oidc_refresh: None,
         otap: false,
     };
-    ravel_server::start(config, store)
-        .await
-        .expect("server starts")
+    ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts")
 }
 
 /// Drive one GET through a `Router` via `oneshot`, returning status and body

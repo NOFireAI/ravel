@@ -13,6 +13,7 @@ pub mod health;
 pub mod ingest;
 pub mod logs_ingest;
 pub mod maintain;
+pub mod metrics;
 #[cfg(feature = "otap")]
 pub mod otap_grpc;
 pub mod otlp_grpc;
@@ -36,7 +37,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, SystemClock};
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
 #[cfg(feature = "otap")]
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsServiceServer;
 use ravel_otlp::{IngestLimits, LogIngestLimits, SpanIngestLimits};
@@ -249,6 +250,7 @@ fn remote_write_state(
 pub async fn start(
     config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
+    store_metrics: Arc<StoreMetrics>,
 ) -> anyhow::Result<Running> {
     let ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
         Some(Arc::new(IngestRouter::new(
@@ -321,6 +323,20 @@ pub async fn start(
         http_router = http_router.merge(remote_write::router(rw_state));
     }
     let catalog = query::build_catalog(store.clone(), config.shard_count)?;
+
+    // Mounted unconditionally: the store and catalog above are built in every
+    // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
+    // where today only /healthz and /readyz exist. Cloned here, before
+    // `catalog` is moved into `fold::spawn` below in every non-maintain mode.
+    let metrics_state = metrics::MetricsState {
+        mode: config.mode,
+        store_metrics,
+        ingest_router: ingest_router.clone(),
+        log_ingest_router: log_ingest_router.clone(),
+        span_ingest_router: span_ingest_router.clone(),
+        catalog: catalog.clone(),
+    };
+    http_router = http_router.merge(metrics::router(metrics_state));
 
     // Held past the HTTP wiring so the Flight SQL service can register
     // against the same executor rather than building a second one; `None`

@@ -55,9 +55,13 @@ async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server:
         oidc_refresh: None,
         otap: false,
     };
-    ravel_server::start(config, store)
-        .await
-        .expect("server starts")
+    ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts")
 }
 
 fn jwks() -> JwkSet {

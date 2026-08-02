@@ -112,9 +112,9 @@ async fn main() -> anyhow::Result<()> {
     )?;
     // Every object-store call this process makes is counted by the decorator
     // `build_store` wraps the backend in (issue #272). Held for the whole
-    // process lifetime so a later task can surface the counters; nothing
-    // scrapes or exports them yet, and nothing correctness-bearing reads them.
-    let (store, _store_metrics) =
+    // process lifetime and threaded into `start` below, which serves it at
+    // `GET /metrics` (issue #423).
+    let (store, store_metrics) =
         ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
     // Retention windows are validated at startup against the ADR-0019 floor,
@@ -200,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
         otap,
     };
 
-    let running = ravel_server::start(config, store).await?;
+    let running = ravel_server::start(config, store, store_metrics).await?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
     if cfg!(feature = "flight-sql") {
         tracing::info!(
