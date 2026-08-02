@@ -72,3 +72,130 @@ pub(crate) fn put_ivarint(out: &mut Vec<u8>, value: i64) {
 pub(crate) fn get_ivarint(buf: &[u8], pos: &mut usize) -> Result<i64, CodecError> {
     Ok(zigzag_decode(get_uvarint(buf, pos)?))
 }
+
+/// The rejection semantics below are what make this decoder safe on
+/// untrusted bytes. They are duplicated from `ravel-logseg`'s varint
+/// alongside the code itself: without them, a later edit that loosened the
+/// canonical-encoding check or the 10-byte cap would compile clean, pass
+/// `cargo test -p ravel-codec`, and produce a decoder that accepts byte
+/// sequences the RLOG format forbids.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn is_corrupted<T>(r: Result<T, CodecError>) -> bool {
+        matches!(r, Err(CodecError::Corrupted(_)))
+    }
+
+    #[test]
+    fn uvarint_hand_vectors() {
+        let enc = |v| {
+            let mut b = Vec::new();
+            put_uvarint(&mut b, v);
+            b
+        };
+        assert_eq!(enc(0), vec![0x00]);
+        assert_eq!(enc(1), vec![0x01]);
+        assert_eq!(enc(127), vec![0x7f]);
+        assert_eq!(enc(128), vec![0x80, 0x01]);
+        assert_eq!(enc(300), vec![0xac, 0x02]);
+        assert_eq!(enc(16384), vec![0x80, 0x80, 0x01]);
+        assert_eq!(
+            enc(u64::MAX),
+            vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+        );
+    }
+
+    #[test]
+    fn uvarint_rejects_truncated() {
+        let mut pos = 0;
+        assert!(is_corrupted(get_uvarint(&[0x80], &mut pos)));
+    }
+
+    #[test]
+    fn uvarint_rejects_overlong_11_bytes() {
+        let mut pos = 0;
+        assert!(is_corrupted(get_uvarint(&[0xff; 11], &mut pos)));
+    }
+
+    #[test]
+    fn uvarint_rejects_out_of_range_10th_byte() {
+        let bytes = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        let mut pos = 0;
+        assert!(is_corrupted(get_uvarint(&bytes, &mut pos)));
+    }
+
+    #[test]
+    fn uvarint_rejects_non_canonical_overlong() {
+        // [0x80, 0x00] is a two-byte encoding of 0; canonical is [0x00].
+        let mut pos = 0;
+        assert!(is_corrupted(get_uvarint(&[0x80, 0x00], &mut pos)));
+        // [0x81, 0x00] is a two-byte encoding of 1; canonical is [0x01].
+        let mut pos = 0;
+        assert!(is_corrupted(get_uvarint(&[0x81, 0x00], &mut pos)));
+    }
+
+    #[test]
+    fn ivarint_hand_vectors() {
+        assert_eq!(zigzag_encode(0), 0);
+        assert_eq!(zigzag_encode(-1), 1);
+        assert_eq!(zigzag_encode(1), 2);
+        assert_eq!(zigzag_encode(i64::MIN), u64::MAX);
+        assert_eq!(zigzag_encode(i64::MAX), u64::MAX - 1);
+    }
+}
+
+/// Property tests over the untrusted decode surface: round-trips are exact
+/// and consume exactly their bytes; arbitrary input never panics and yields
+/// only a typed error or a valid decode.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn uvarint_roundtrips_any_u64(value in any::<u64>()) {
+            let mut buf = Vec::new();
+            put_uvarint(&mut buf, value);
+            let mut pos = 0;
+            prop_assert_eq!(get_uvarint(&buf, &mut pos).expect("decode"), value);
+            prop_assert_eq!(pos, buf.len());
+        }
+
+        #[test]
+        fn ivarint_roundtrips_any_i64(value in any::<i64>()) {
+            let mut buf = Vec::new();
+            put_ivarint(&mut buf, value);
+            let mut pos = 0;
+            prop_assert_eq!(get_ivarint(&buf, &mut pos).expect("decode"), value);
+            prop_assert_eq!(pos, buf.len());
+        }
+
+        #[test]
+        fn uvarint_arbitrary_bytes_never_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..32),
+            start in 0usize..40,
+        ) {
+            let start = if bytes.is_empty() { 0 } else { start % (bytes.len() + 1) };
+            let mut pos = start;
+            match get_uvarint(&bytes, &mut pos) {
+                Ok(_) => {
+                    prop_assert!(pos > start && pos <= start + MAX_VARINT_BYTES);
+                    prop_assert!(pos <= bytes.len());
+                }
+                Err(CodecError::Corrupted(_)) => {}
+            }
+        }
+
+        #[test]
+        fn ivarint_arbitrary_bytes_never_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..32),
+        ) {
+            let mut pos = 0;
+            let _ = get_ivarint(&bytes, &mut pos);
+        }
+    }
+}
