@@ -1,0 +1,63 @@
+total_size: 1022
+trailer_offset: 1006
+version: 6
+footer_offset: 756
+tenant_hash: c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6
+shard: 6
+writer_id: golden-v6-writer
+writer_epoch: 6
+writer_seq: 60
+min_event_ts_ns: 1650000000000000000
+max_event_ts_ns: 1650000000000000758
+min_ingest_ts_ns: -2000
+max_ingest_ts_ns: 30000
+sample_count: 15
+series_count (footer): 9
+base_created_unix_ns: 219
+level: 1
+input_set_hash: 4646464646464646464646464646464646464646464646464646464646464646
+part_index: 2
+sections:
+  kind=1 name=LABEL_DICT offset=0 len=106 uncompressed_len=111 comp=2
+  kind=5 name=SERIES_IDS offset=106 len=148 uncompressed_len=148 comp=0
+  kind=6 name=SERIES_META offset=254 len=117 uncompressed_len=200 comp=2
+  kind=3 name=TS_PAGES offset=371 len=147 uncompressed_len=147 comp=0
+  kind=4 name=VAL_PAGES offset=520 len=99 uncompressed_len=99 comp=0
+  kind=7 name=HIST_PAGES offset=619 len=96 uncompressed_len=96 comp=0
+  kind=10 name=EXEMPLARS offset=715 len=41 uncompressed_len=41 comp=0
+schema_count (derived): 1
+  schema[0]: __name__,inst,job
+series_count (decoded): 9
+series:
+  series_id=00000000000000000000000000000000 labels=__name__=golden_v6,inst=i0,job=job0 sample_count=1 min_ts_ns=1650000000000000000 max_ts_ns=1650000000000000000 value_kind=HIST_SPANS run_count=1
+    run[0] created_unix_ns=219 writer_epoch=2 writer_seq=3 sample_count=1 ts_range=[371, 386) hist_range=[619, 651)
+    hist[0]: ts_ns=1650000000000000000 scale=2 zero_threshold=0.000001 sum=0.125 reset_hint=UNKNOWN
+      count_kind=INT zero_count=1 count=4
+      positive: spans=[(0, 2)] counts=[2,1]
+      negative: spans=[] counts=[]
+  series_id=010000000000010000000100000001b3 labels=__name__=golden_v6,inst=i1,job=job1 sample_count=2 min_ts_ns=1650000000000000001 max_ts_ns=1650000000000000751 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=220 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[386, 403) val_range=[520, 538)
+  series_id=02000000000002000000020000000366 labels=__name__=golden_v6,inst=i2,job=job2 sample_count=2 min_ts_ns=1650000000000000002 max_ts_ns=1650000000000000752 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=221 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[403, 420) val_range=[538, 554)
+  series_id=03000000000003000000030000000519 labels=__name__=golden_v6,inst=i3,job=job3 sample_count=1 min_ts_ns=1650000000000000003 max_ts_ns=1650000000000000003 value_kind=HIST_SPANS run_count=1
+    run[0] created_unix_ns=222 writer_epoch=2 writer_seq=3 sample_count=1 ts_range=[420, 435) hist_range=[651, 683)
+    hist[0]: ts_ns=1650000000000000003 scale=2 zero_threshold=0.000001 sum=3.125 reset_hint=UNKNOWN
+      count_kind=INT zero_count=1 count=7
+      positive: spans=[(0, 2)] counts=[2,4]
+      negative: spans=[] counts=[]
+  series_id=040000000000040000000400000006cc labels=__name__=golden_v6,inst=i4,job=job4 sample_count=2 min_ts_ns=1650000000000000004 max_ts_ns=1650000000000000754 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=223 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[435, 452) val_range=[554, 570)
+  series_id=0500000000000500000005000000087f labels=__name__=golden_v6,inst=i5,job=job5 sample_count=2 min_ts_ns=1650000000000000005 max_ts_ns=1650000000000000755 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=224 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[452, 469) val_range=[570, 587)
+  series_id=06000000000006000000060000000a32 labels=__name__=golden_v6,inst=i6,job=job0 sample_count=1 min_ts_ns=1650000000000000006 max_ts_ns=1650000000000000006 value_kind=HIST_SPANS run_count=1
+    run[0] created_unix_ns=225 writer_epoch=2 writer_seq=3 sample_count=1 ts_range=[469, 484) hist_range=[683, 715)
+    hist[0]: ts_ns=1650000000000000006 scale=2 zero_threshold=0.000001 sum=6.125 reset_hint=UNKNOWN
+      count_kind=INT zero_count=1 count=10
+      positive: spans=[(0, 2)] counts=[2,7]
+      negative: spans=[] counts=[]
+  series_id=07000000000007000000070000000be5 labels=__name__=golden_v6,inst=i7,job=job1 sample_count=2 min_ts_ns=1650000000000000007 max_ts_ns=1650000000000000757 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=226 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[484, 501) val_range=[587, 603)
+  series_id=08000000000008000000080000000d98 labels=__name__=golden_v6,inst=i8,job=job2 sample_count=2 min_ts_ns=1650000000000000008 max_ts_ns=1650000000000000758 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=227 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[501, 518) val_range=[603, 619)
+exemplar_count: 1
+  exemplar[0]: series_index=0 ts_ns=1650000000000000000 value=42.5 trace_id=abababababababababababababababab span_id=cdcdcdcdcdcdcdcd attrs=trace_state=sampled=1

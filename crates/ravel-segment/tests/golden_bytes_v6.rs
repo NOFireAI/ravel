@@ -285,8 +285,7 @@ fn no_sparse_matches_golden_fixture() {
     assert_eq!(loc.version, 6);
     assert!(loc.footer.sections.iter().any(|s| s.kind == SERIES_META));
     assert!(
-        !loc
-            .footer
+        !loc.footer
             .sections
             .iter()
             .any(|s| s.kind == SERIES_IDX || s.kind == SERIES_META_CHUNKS)
@@ -353,8 +352,7 @@ fn sparse_object_structure_and_roundtrip() {
         "SERIES_IDX"
     );
     assert!(
-        loc
-            .footer
+        loc.footer
             .sections
             .iter()
             .any(|s| s.kind == SERIES_META_CHUNKS),
