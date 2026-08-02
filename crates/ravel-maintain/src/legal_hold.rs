@@ -48,8 +48,16 @@
 //!
 //! All of a tenant's legal-hold records live on one control-plane bucket,
 //! [`Signal::Audit`] shard [`AUDIT_HOLD_SHARD`], so a refresh is a single
-//! shard listing. An empty snapshot (a tenant that has never set a hold)
-//! protects nothing, so it behaves identically to [`crate::NoLeases`].
+//! shard listing. That single-listing property is about legal hold's own
+//! refresh, not a claim that [`AUDIT_HOLD_SHARD`] is the only shard under
+//! [`Signal::Audit`]: query-audit records live on a separate sibling shard
+//! ([`crate::query_audit::QUERY_AUDIT_SHARD`]), kept deliberately apart from
+//! this control-plane shard so an unbounded query-audit stream never bloats a
+//! hold refresh (see [`crate::query_audit`] for the full rationale). Those
+//! records are on a different shard, so a hold refresh never lists them and
+//! they are correctly invisible to the fold. An empty snapshot (a tenant that
+//! has never set a hold) protects nothing, so it behaves identically to
+//! [`crate::NoLeases`].
 
 use std::collections::HashMap;
 
