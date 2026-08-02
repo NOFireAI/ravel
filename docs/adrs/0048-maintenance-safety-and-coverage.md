@@ -82,10 +82,10 @@ not triggered.
 `LegalHoldCheck::refresh(store, tenant)` once per tenant per tick,
 before any destructive pass, and passes the resulting snapshot as the
 `LeaseCheck` to both `scan_and_maintain_with_memo` and `sweep_shard`,
-replacing `&NoLeases`. The CLI driver (`ravel-cli maintain sweep`, and
-the retention path inside its scan-driven commands) does the same
-refresh before its pass. There is no flag to skip the refresh in either
-driver.
+replacing `&NoLeases`. The CLI driver (`ravel-cli maintain sweep`, its
+only destructive command; `compact`, `status`, `audit-versions`, and
+`verify-custody` never delete) does the same refresh before its pass.
+There is no flag to skip the refresh in either driver.
 
 Refresh failure fails safe: if `refresh` errors, the tenant's entire
 tick (retention, compaction, and sweep) is skipped, a warning is logged,

@@ -11,8 +11,8 @@ use clap::ValueEnum;
 use prost::Message;
 use ravel_commit::keys;
 use ravel_maintain::{
-    Bucket, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, PublishOutcome, SweepReport,
-    compact_bucket, sweep_shard,
+    Bucket, CompactionOutcome, CompactorConfig, FixedClock, LegalHoldCheck, PublishOutcome,
+    SweepReport, compact_bucket, sweep_shard,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::{CompactionRecord, RetentionTombstone};
@@ -28,7 +28,7 @@ pub enum SignalArg {
 }
 
 impl SignalArg {
-    fn to_signal(self) -> Signal {
+    pub(crate) fn to_signal(self) -> Signal {
         match self {
             SignalArg::Metrics => Signal::Metrics,
             SignalArg::Logs => Signal::Logs,
@@ -95,19 +95,38 @@ pub async fn compact(
 }
 
 /// `maintain sweep`: run one sweep pass (all three GC rules) over a shard.
+///
+/// Refreshes the tenant's [`LegalHoldCheck`] before the pass, matching the
+/// server driver's semantics (ADR-0048 decision 1): the refresh happens once,
+/// per invocation, with no flag to skip it. A refresh failure skips the whole
+/// pass (`Err`, not a fallback to `NoLeases`), since running the sweep
+/// unprotected would convert a transient store fault into an unprotected
+/// delete pass.
 pub async fn sweep(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     signal: SignalArg,
     shard: u32,
     dry_run: bool,
+    override_orphan_breaker: bool,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let config = CompactorConfig {
         dry_run,
+        force_orphan_gc: override_orphan_breaker,
         ..CompactorConfig::default()
     };
     let clock = wall_clock()?;
+
+    let hold = LegalHoldCheck::refresh(store.as_ref(), &tenant_hash)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "legal hold refresh failed for tenant {tenant}: {err}; sweep skipped this \
+                 invocation rather than falling back to unprotected (rerun once the hold shard \
+                 is reachable)"
+            )
+        })?;
 
     let SweepReport {
         orphans_deleted,
@@ -121,7 +140,7 @@ pub async fn sweep(
         store.as_ref(),
         &clock,
         &config,
-        &NoLeases,
+        &hold,
         &tenant_hash,
         signal.to_signal(),
         shard,
