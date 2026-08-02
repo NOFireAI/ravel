@@ -38,9 +38,11 @@
 //!   mirroring `trace_id`.
 //!
 //! All five are conjunctive-only (ADR-0045 decision 5): a disjunction anywhere
-//! in a conjunct's own subtree drops that whole conjunct rather than being
-//! soundly pushed, since refusing to push is always widen-safe (the `Inexact`
-//! residual re-applies it).
+//! in a conjunct's own subtree ([`contains_or`]) drops that whole conjunct
+//! rather than being soundly pushed, since refusing to push is always
+//! widen-safe (the `Inexact` residual re-applies it). This crate does not
+//! attempt a sound OR pushdown; see [`contains_or`]'s doc for what one would
+//! require.
 //!
 //! # Why one window covers both `start_ts` and `end_ts`
 //!
@@ -168,6 +170,14 @@ fn walk_conjunct(expr: &Expr, out: &mut SpansPushdown) {
 }
 
 fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
+    // A disjunction anywhere in this conjunct's subtree means the conjunct
+    // as a whole cannot be soundly narrowed on any axis: see `contains_or`'s
+    // doc for why refusing is the only safe move. Checked once here, up
+    // front, rather than threaded into every shape matcher below, so a
+    // future shape added to `handle_binary` can't forget the check.
+    if contains_or(expr) {
+        return;
+    }
     match expr {
         Expr::BinaryExpr(be) => handle_binary(be, out),
         // BETWEEN low AND high desugars to `col >= low AND col <= high`. A
@@ -181,6 +191,39 @@ fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
             }
         }
         _ => {}
+    }
+}
+
+/// True if `expr`'s subtree contains a disjunction anywhere: an `Or`
+/// `BinaryExpr` at any depth, or a negated `BETWEEN` (`NOT (col BETWEEN lo
+/// AND hi)` desugars to `col < lo OR col > hi`, a disjunction in substance
+/// even though it has no `Expr::BinaryExpr(Or)` node).
+///
+/// No shape in this file attempts to push a disjunction soundly; a burned
+/// prior attempt is the reason ("do not attempt to handle OR"). Refusing is
+/// always widen-safe: DataFusion's `Inexact` residual re-applies the
+/// original predicate above the scan, so dropping the whole conjunct only
+/// ever costs pruning, never correctness.
+///
+/// A sound disjunctive pushdown would need a different algorithm, not an
+/// extension of this one: each disjunct would have to be extracted into its
+/// own bound, all disjuncts would have to constrain the *same* single axis
+/// (a mixed `duration_ns > 5 OR status_code = 1` cannot produce one bound on
+/// either axis, since a row can satisfy the predicate via either disjunct
+/// alone), and the per-disjunct bounds would then have to be combined by
+/// *union* (widest span / broadest mask covering every disjunct) rather than
+/// this file's AND-intersection (narrowest span / tightest mask). Detecting
+/// "all disjuncts hit the same column" and building the union bound is the
+/// unimplemented part; this function only ever detects and refuses.
+fn contains_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            *op == Operator::Or || contains_or(left) || contains_or(right)
+        }
+        Expr::Between(bt) => {
+            bt.negated || contains_or(&bt.expr) || contains_or(&bt.low) || contains_or(&bt.high)
+        }
+        _ => false,
     }
 }
 
@@ -702,6 +745,49 @@ mod tests {
     fn service_name_equality_is_last_writer_wins() {
         let p = extract_spans(&[col("service_name").eq(lit("checkout"))]);
         assert_eq!(p.service_name, Some("checkout".to_string()));
+    }
+
+    #[test]
+    fn a_disjunction_in_one_conjunct_drops_only_that_conjunct() {
+        // duration_ns > 5 stays; the OR'd conjunct on status_code/service_name
+        // contributes nothing, on either axis it touches.
+        let p = extract_spans(&[
+            col("duration_ns").gt(lit(5i64)),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("service_name").eq(lit("x")),
+            ),
+        ]);
+        assert_eq!(p.duration_lo, Some(6));
+        assert_eq!(p.status_mask, None);
+        assert_eq!(p.service_name, None);
+    }
+
+    #[test]
+    fn or_nested_under_and_still_drops_the_whole_conjunct() {
+        // `status_code = 1 OR (status_code = 2 AND duration_ns > 5)`: the top
+        // node is Or, so duration_ns > 5 is not always true (only in the
+        // second disjunct) and must not be pushed even though it is itself an
+        // AND conjunct one level down.
+        let inner = and(
+            col("status_code").eq(lit(2i64)),
+            col("duration_ns").gt(lit(5i64)),
+        );
+        let mixed = or(col("status_code").eq(lit(1i64)), inner);
+        let p = extract_spans(&[mixed]);
+        assert_eq!(p, SpansPushdown::default());
+    }
+
+    #[test]
+    fn negated_between_is_treated_as_a_disjunction_and_contributes_nothing() {
+        let e = Expr::Between(datafusion::logical_expr::Between {
+            expr: Box::new(col("end_ts")),
+            negated: true,
+            low: Box::new(ts_lit(10)),
+            high: Box::new(ts_lit(20)),
+        });
+        let p = extract_spans(&[e]);
+        assert_eq!((p.ts_lo, p.ts_hi), (None, None));
     }
 
     #[test]
