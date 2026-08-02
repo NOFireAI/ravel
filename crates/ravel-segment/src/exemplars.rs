@@ -27,7 +27,9 @@ use ravel_types::SeriesId;
 
 use crate::error::{SegmentError, WriteError};
 use crate::format::{ReaderLimits, section_kind};
-use crate::reader::{DictResolver, decode_section_bytes, find_section, index_label_dict, take_u32_le};
+use crate::reader::{
+    DictResolver, decode_section_bytes, find_section, index_label_dict, take_u32_le,
+};
 use crate::varint::{read_uvarint, read_zigzag_varint, write_uvarint, write_zigzag_varint};
 
 /// One exemplar as a writer caller supplies it: labels ride as owned
@@ -154,10 +156,10 @@ fn read_sort_key(
     let ts_ns = min_event_ts_ns
         .checked_add(ts_delta)
         .ok_or(SegmentError::TimestampOverflow)?;
-    if let Some(p) = *prev {
-        if (series_index, ts_ns) <= p {
-            return Err(SegmentError::ExemplarRecordsUnsorted);
-        }
+    if let Some(p) = *prev
+        && (series_index, ts_ns) <= p
+    {
+        return Err(SegmentError::ExemplarRecordsUnsorted);
     }
     *prev = Some((series_index, ts_ns));
     Ok((series_index, ts_ns))
@@ -357,7 +359,12 @@ mod tests {
         buf
     }
 
-    fn resolved(series_index: u32, ts_ns: i64, value: f64, attr_ords: Vec<(u32, u32)>) -> ResolvedExemplar {
+    fn resolved(
+        series_index: u32,
+        ts_ns: i64,
+        value: f64,
+        attr_ords: Vec<(u32, u32)>,
+    ) -> ResolvedExemplar {
         ResolvedExemplar {
             series_index,
             ts_ns,
@@ -427,8 +434,9 @@ mod tests {
 
         // Probe for a series with no exemplar returns empty, not an error.
         let mut resolver = DictResolver::new(&dict, &index);
-        let probed_none = probe_exemplars_from_decoded(&encoded, min_event_ts_ns, 6, 1, &mut resolver)
-            .expect("probe series 1");
+        let probed_none =
+            probe_exemplars_from_decoded(&encoded, min_event_ts_ns, 6, 1, &mut resolver)
+                .expect("probe series 1");
         assert!(probed_none.is_empty());
 
         // The probe for series_index 0 never reaches record 2's corrupted
@@ -438,8 +446,9 @@ mod tests {
         let last_byte = corrupt.len() - 1;
         corrupt[last_byte] ^= 0xFF;
         let mut resolver = DictResolver::new(&dict, &index);
-        let probed_early = probe_exemplars_from_decoded(&corrupt, min_event_ts_ns, 6, 0, &mut resolver)
-            .expect("probe for an early series must not touch corrupted later bytes");
+        let probed_early =
+            probe_exemplars_from_decoded(&corrupt, min_event_ts_ns, 6, 0, &mut resolver)
+                .expect("probe for an early series must not touch corrupted later bytes");
         // Two records carry series_index 0 (ts 1_000 and ts 1_200); the
         // probe fully resolves both before it reaches record 2's
         // series_index > 0 and breaks, so it never touches the corrupted

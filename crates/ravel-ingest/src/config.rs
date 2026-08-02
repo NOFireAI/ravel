@@ -8,7 +8,7 @@ use std::time::Duration;
 /// its `format` module private), and is stamped verbatim into the commit
 /// record's `segment_format_version`. Changing it is a format-level ADR, not
 /// a routine edit.
-pub const SEGMENT_FORMAT_VERSION: u16 = 5;
+pub const SEGMENT_FORMAT_VERSION: u16 = ravel_segment::VERSION_V6;
 
 /// RLOG trailer version every log flush emits. Mirrors `ravel_logseg`'s own
 /// object trailer version (`docs/log-segment-format.md`, ADR-0029); like
@@ -95,8 +95,12 @@ mod tests {
     }
 
     #[test]
-    fn segment_format_version_is_v5() {
-        assert_eq!(SEGMENT_FORMAT_VERSION, 5);
+    fn segment_format_version_tracks_the_rseg_trailer() {
+        // Asserted against the format's own constant, never a literal. A
+        // literal here is exactly what let the RSPAN v2 bump ship a
+        // version-1 claim in every span commit record while this style of
+        // test stayed green (see the same fix for spans and logs).
+        assert_eq!(SEGMENT_FORMAT_VERSION, ravel_segment::VERSION_V6);
     }
 
     #[test]
