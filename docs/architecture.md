@@ -97,6 +97,33 @@ failure point, since no new flush/commit path was added.
 Signals other than metrics, compaction, catalog snapshots, RavelQL,
 Sigma/OCSF: later phases. See the spec docs as they land.
 
+## Listener topology
+
+`ravel-server` binds up to three listeners:
+
+- `--listen-http`: OTLP HTTP-protobuf, Remote Write, `/api/v1/*` query and
+  analytics routes, `/api/v1/sql` (feature `sql`), and the mode-independent
+  `/healthz`, `/readyz`, `/metrics` routes.
+- `--listen-grpc`: OTLP gRPC and, under the `flight-sql` feature, Flight SQL.
+  Bound only in the modes and feature combinations that serve one of those.
+- `--mtls-listener` (ADR-0050 section 1, issue #477): a third listener,
+  required by and only meaningful together with `--mtls-enabled`. It serves
+  the same ingest and query surface as `--listen-http`, but its router chain
+  is built with the `MtlsResolver` in place of whatever resolver backs the
+  other two. The chains built for `--listen-http` and `--listen-grpc` never
+  contain the `MtlsResolver` at all -- structurally, not just inertly -- so
+  the `x-ravel-client-cert-cn` header it trusts has no effect there
+  regardless of what a proxy in front of them does or does not strip.
+
+`Cli::validate` refuses to start (typed error, not a warning) on any
+configuration where this isolation would not hold: `--mtls-enabled` without
+`--mtls-listener`, `--mtls-listener` without `--mtls-enabled`, or
+`--mtls-listener` colliding with `--listen-http`/`--listen-grpc` (including
+when `--dev-insecure-tenant-header` is also on `--listen-http`). The operator
+contract is that only a TLS-terminating, header-stripping proxy is network-
+reachable on the mTLS listener's address; the public listeners are safe
+against header forgery by construction, independent of that proxy hygiene.
+
 ## SQL query path (in progress)
 
 `ravel-sql` (ADR-0013, docs/arrow-datafusion-plan.md) adds a second query
