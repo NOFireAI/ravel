@@ -98,7 +98,21 @@ impl AdmissionLimits {
     pub const DEFAULT_SERIES_CREATION_BURST: u64 = 100_000;
 }
 
-/// ADR-0051 section 3 shipped defaults.
+/// ADR-0051 section 3's defaults, NOT what `services/ravel-server` ships.
+///
+/// `DEFAULT_MAX_ACTIVE_SERIES` / `DEFAULT_MAX_ACTIVE_STREAMS` here are
+/// 1,000,000, the ADR's original figure, assuming ~16 bytes per tracked
+/// identity in the two-epoch `HashSet` tracker. Issue #491 measured the
+/// real cost at 35-56 bytes per live entry (hashbrown's power-of-two
+/// table sizing plus allocator headroom), so at 1,000,000 the worst case
+/// (cap x bytes-per-entry x 2 rotating epochs x 2 tracked signals) is
+/// roughly 140-224 MiB per fully active tenant. `ravel-server` overrides
+/// both to 200,000 in its own shipped defaults
+/// (`services/ravel-server/src/config.rs`, `limits::shipped_defaults`),
+/// cutting that worst case to roughly 27-43 MiB, and does not construct
+/// this `Default` impl in its startup path. The two crates carrying
+/// different defaults is a known discrepancy, not yet reconciled; see
+/// issue #491.
 impl Default for AdmissionLimits {
     fn default() -> Self {
         AdmissionLimits {
