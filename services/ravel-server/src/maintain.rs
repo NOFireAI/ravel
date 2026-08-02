@@ -12,8 +12,14 @@
 //! sealed bucket) and [`ravel_maintain::sweep_shard`] (the three GC rules) once
 //! per tick. Both are idempotent, so a missed or crashed tick is recovered on
 //! the next one. The clock is the real [`SystemClock`], matching everything
-//! else in this crate, and the only [`LeaseCheck`] that exists ([`NoLeases`])
-//! is used.
+//! else in this crate.
+//!
+//! [`LegalHoldCheck::refresh`] is called once per tenant per tick, before
+//! either pass, and its snapshot is the [`LeaseCheck`] threaded through every
+//! `(signal, shard)` of that tick (ADR-0048 decision 1). A refresh failure
+//! never falls back to [`NoLeases`]: the tenant's whole tick is skipped and
+//! retried next tick, so a transient store fault can never turn into an
+//! unprotected delete pass.
 //!
 //! [`run_loop`] holds one [`MaintainMemo`] across every tick until shutdown
 //! (issue #280, #330). The memo records buckets already known terminal so a
@@ -31,7 +37,7 @@ use std::time::Duration;
 use rand::RngExt as _;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
-use ravel_maintain::{Clock, CompactorConfig, NoLeases, RetentionConfig, sweep_shard};
+use ravel_maintain::{Clock, CompactorConfig, LegalHoldCheck, RetentionConfig, sweep_shard};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
@@ -190,11 +196,21 @@ async fn run_loop(
     }
 }
 
-/// One maintenance pass over every `(signal, shard)` of one tenant: retention
-/// before compaction (via [`scan_and_maintain_with_memo`]) then the GC sweeper
-/// (via [`sweep_shard`]). Every error is logged and retried next tick; nothing
-/// here affects query correctness. Split out from [`run_loop`] so a test can
-/// drive a single deterministic tick without the timer.
+/// One maintenance pass over every `(signal, shard)` of one tenant: a legal
+/// hold refresh, then retention before compaction (via
+/// [`scan_and_maintain_with_memo`]), then the GC sweeper (via
+/// [`sweep_shard`]). Every scan/sweep error is logged and retried next tick;
+/// nothing here affects query correctness. Split out from [`run_loop`] so a
+/// test can drive a single deterministic tick without the timer.
+///
+/// The legal hold refresh (ADR-0048 decision 1) runs once, before either
+/// pass, and its snapshot gates every `(signal, shard)` of this tick. If the
+/// refresh fails, the entire tenant tick is skipped -- no signal, no shard,
+/// no pass runs -- and an empty [`MaintainReport`] is returned; the driver
+/// never falls back to [`ravel_maintain::NoLeases`], because that would
+/// convert a transient store fault into an unprotected delete pass. The
+/// failure is logged at error level so it is visible to an operator, and the
+/// tick is retried next interval.
 ///
 /// `memo` is the caller's per-worker [`MaintainMemo`], threaded through every
 /// `(signal, shard)` and mutated in place: buckets it already knows terminal
@@ -211,11 +227,24 @@ pub async fn run_tick(
     memo: &mut MaintainMemo,
 ) -> MaintainReport {
     let clock = WallClock;
+
+    let hold = match LegalHoldCheck::refresh(store, tenant).await {
+        Ok(hold) => hold,
+        Err(err) => {
+            tracing::error!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: legal hold refresh failed; skipping this tenant's tick entirely, retried next tick"
+            );
+            return MaintainReport::default();
+        }
+    };
+
     let mut total = MaintainReport::default();
     for signal in MAINTAINED_SIGNALS {
         for shard in 0..shard_count {
             match scan_and_maintain_with_memo(
-                memo, store, &clock, compactor, retention, &NoLeases, *tenant, signal, shard,
+                memo, store, &clock, compactor, retention, &hold, *tenant, signal, shard,
             )
             .await
             {
@@ -248,7 +277,7 @@ pub async fn run_tick(
                 }
             }
 
-            match sweep_shard(store, &clock, compactor, &NoLeases, tenant, signal, shard).await {
+            match sweep_shard(store, &clock, compactor, &hold, tenant, signal, shard).await {
                 Ok(report) => {
                     tracing::info!(
                         tenant = %tenant.to_hex(),
@@ -294,8 +323,11 @@ mod tests {
     use ravel_commit::publish::RetryPolicy;
     use ravel_commit::record::NewCommitRecord;
     use ravel_commit::{keys, publish, record};
+    use ravel_maintain::{AUDIT_HOLD_SHARD, RetentionPolicy, shard_hold_scopes, write_hold_set};
     use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
+    use ravel_object_store::list_all;
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
@@ -448,6 +480,163 @@ mod tests {
         assert!(
             second_reads < first_reads,
             "the skipped tick reads fewer objects (first={first_reads}, second={second_reads})"
+        );
+    }
+
+    /// ADR-0048 decision 1 / ADR-0042: a legal hold covering a bucket stops
+    /// the real driver's retention path from ever physically deleting it.
+    ///
+    /// Retention's physical delete is horizon-gated (`retention_sweep_bucket`
+    /// only sweeps once `now >= tombstone.retired_at_ns + protection_horizon_ns`),
+    /// and a tombstone write itself is not lease-gated (only the physical
+    /// delete is), so reaching the delete path this driver actually guards
+    /// takes two ticks even with a zero horizon: the first tombstones the
+    /// already-expired bucket, the second attempts the now horizon-elapsed
+    /// physical sweep. The hold must block every delete in that second tick.
+    #[tokio::test]
+    async fn held_bucket_survives_retention_tick() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        // Cover all three prefixes a shard-level hold must (L0 data, commit
+        // records, L1 parts), exactly as the CLI's --signal/--shard
+        // convenience form does, so nothing in this bucket is left
+        // unprotected.
+        for scope in shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("valid hold scopes") {
+            write_hold_set(
+                &store,
+                &tenant,
+                Uuid::new_v4(),
+                SystemClock.now_ns(),
+                &scope,
+                "held for held_bucket_survives_retention_tick",
+            )
+            .await
+            .expect("write hold set");
+        }
+
+        let compactor = CompactorConfig {
+            protection_horizon_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let max_ingest_lag_ns = ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
+        let floor_ns = compactor.retention_floor_ns(max_ingest_lag_ns);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(floor_ns),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            max_ingest_lag_ns,
+        )
+        .expect("valid retention policy");
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Tick 1: the bucket's one sample is from ingest hour 0 (1970), so any
+        // valid retention window is already expired against the real wall
+        // clock. Not memoized terminal (Tombstoned isn't a terminal state),
+        // so tick 2 re-evaluates it for real rather than skipping it.
+        let first = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        assert_eq!(first.retired, 1, "the expired bucket is tombstoned");
+
+        // Tick 2: the tombstone's horizon has elapsed (zero protection
+        // horizon), so this tick attempts the physical sweep. The hold must
+        // block it entirely.
+        let second = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+        assert_eq!(
+            second.retired, 1,
+            "still counted retired (tombstoned), never actually swept"
+        );
+
+        let l0_prefix = &shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("scopes")[0];
+        let surviving = list_all(&store, l0_prefix)
+            .await
+            .expect("list held l0 prefix");
+        assert!(
+            !surviving.is_empty(),
+            "held bucket's L0 data object must still exist after a retention tick"
+        );
+
+        let commit_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid commit shard prefix");
+        let surviving_commit = list_all(&store, &commit_prefix)
+            .await
+            .expect("list held commit prefix");
+        assert!(
+            surviving_commit
+                .iter()
+                .any(|meta| keys::partition_bucket_entry(&meta.key)
+                    .is_ok_and(|entry| matches!(entry, keys::BucketEntry::CommitRecord(_)))),
+            "held bucket's commit record must still exist after a retention tick"
+        );
+    }
+
+    /// ADR-0048 decision 1: a legal-hold refresh failure must never fall back
+    /// to `NoLeases`. It must skip the whole tenant tick -- no bucket
+    /// touched, nothing deleted -- and the failure must be visible (not
+    /// swallowed). Uses `FaultStore` to fail the one LIST `LegalHoldCheck::refresh`
+    /// issues (the audit hold shard's commit prefix) and asserts its fault
+    /// counter to prove the fault actually fired, not just that nothing
+    /// happened to be due for deletion.
+    #[tokio::test]
+    async fn hold_refresh_failure_skips_tenant_tick_and_deletes_nothing() {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&inner, &tenant_id).await;
+
+        let hold_prefix = keys::commit_shard_prefix(&tenant, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("valid audit hold shard prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("hold shard unavailable".into()),
+            )
+            .with_key_contains(hold_prefix),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let compactor = CompactorConfig {
+            protection_horizon_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let max_ingest_lag_ns = ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
+        let floor_ns = compactor.retention_floor_ns(max_ingest_lag_ns);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(floor_ns),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            max_ingest_lag_ns,
+        )
+        .expect("valid retention policy");
+        let mut memo = MaintainMemo::with_default_interval();
+
+        let report = run_tick(&store, &tenant, &compactor, &retention, 1, &mut memo).await;
+
+        assert_eq!(
+            report,
+            MaintainReport::default(),
+            "a refresh failure must skip the whole tick, not just gate deletes"
+        );
+        assert_eq!(
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the injected refresh fault must actually have fired"
+        );
+        assert!(memo.is_empty(), "a skipped tick memoizes nothing");
+
+        let commit_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid commit shard prefix");
+        let surviving = list_all(store.inner(), &commit_prefix)
+            .await
+            .expect("list commit prefix");
+        assert!(
+            !surviving.is_empty(),
+            "the tenant's bucket must be untouched when the hold refresh fails"
         );
     }
 }
