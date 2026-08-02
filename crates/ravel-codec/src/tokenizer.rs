@@ -125,6 +125,21 @@ mod tests {
         );
         assert_eq!(toks("   ,,..  "), Vec::<Vec<u8>>::new());
 
+        // Rule 1 again, with non-ASCII separators. The assertions above use
+        // only ASCII punctuation, so on their own they would also pass for an
+        // implementation that split on a hardcoded ASCII punctuation set and
+        // treated every non-ASCII character as a word character. These pin
+        // `char::is_alphanumeric` specifically: U+00B7 MIDDLE DOT and U+3000
+        // IDEOGRAPHIC SPACE are both non-ASCII and both non-alphanumeric.
+        assert_eq!(toks("a\u{00b7}b"), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(
+            toks("\u{03b1}\u{3000}\u{03b2}"),
+            vec![
+                "\u{03b1}".as_bytes().to_vec(),
+                "\u{03b2}".as_bytes().to_vec()
+            ]
+        );
+
         // Rule 2: lowercase each token, Unicode-aware (`char::to_lowercase`,
         // not an ASCII-only lowercasing). Greek and Cyrillic letters
         // lowercase to their own multi-byte lowercase codepoints.
