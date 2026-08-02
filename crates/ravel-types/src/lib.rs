@@ -6,6 +6,7 @@
 //! are persistent contracts: changing them requires a new version domain
 //! string, never an in-place edit.
 
+pub mod accounting;
 pub mod logstream;
 
 use base64::Engine as _;
