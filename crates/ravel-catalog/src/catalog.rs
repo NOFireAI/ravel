@@ -424,6 +424,31 @@ impl Catalog {
         })
     }
 
+    /// Upper bound on the LIST requests a `resolve`/`resolve_pruned` call for
+    /// this `(range, now_ns)` window will issue, computed without running any
+    /// part of resolve itself (ADR-0044 decision 3, "catalog term": computed
+    /// before `Catalog::resolve` runs, from `shard_count` and the number of
+    /// hour buckets the padded window spans -- both inputs the planner
+    /// already holds).
+    ///
+    /// Worst case is one LIST per `(shard, hour)` pair, i.e. what
+    /// `resolve_impl` issues with no snapshot watermark to shorten the
+    /// listed suffix (a watermark can only narrow the listed range, never
+    /// widen it, so this bound holds whether or not folding has run). The
+    /// record GETs `resolve` also issues for whatever those LISTs turn up
+    /// are not included here: which records exist, and how many, is only
+    /// knowable after a LIST actually runs, so they cannot be bounded before
+    /// resolve starts.
+    pub fn estimated_list_requests(&self, range: TimeRange, now_ns: i64) -> u64 {
+        match self.window_hour_bounds(range, now_ns) {
+            Some((start_hour, end_hour)) => {
+                let hours = u64::from(end_hour - start_hour) + 1;
+                u64::from(self.config.shard_count).saturating_mul(hours)
+            }
+            None => 0,
+        }
+    }
+
     /// The (start_hour, end_hour) ingest-hour bucket range the listing
     /// window covers, inclusive, or `None` if the window is empty. Applies
     /// to every shard alike; callers cross it with `0..shard_count`
