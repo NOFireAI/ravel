@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, MapBuilder, StringArray, StringBuilder,
+    ArrayRef, FixedSizeBinaryBuilder, Int64Array, MapBuilder, StringArray, StringBuilder,
     TimestampNanosecondArray, UInt8Array,
 };
 use datafusion::arrow::compute::SortOptions;
@@ -357,6 +357,32 @@ fn build_batch(records: &[SpanRecord], schema: SchemaRef) -> DFResult<RecordBatc
     }
     let attrs = attrs.finish();
 
+    // service_name (ADR-0045 decision 5): RSPAN v1 has no dedicated column
+    // for it yet, so it is looked up in the same merged attrs map the
+    // `attrs` column above copies verbatim; NULL when the span carries no
+    // `service.name` attribute.
+    let service_name = StringArray::from(
+        records
+            .iter()
+            .map(|r| {
+                r.attrs
+                    .iter()
+                    .find(|(k, _)| k == "service.name")
+                    .map(|(_, v)| v.as_str())
+            })
+            .collect::<Vec<_>>(),
+    );
+    // duration_ns is computed, never stored (ADR-0045 decision 5, rejected
+    // alternative 3). `saturating_sub` rather than a bare `-`: end_ts_ns >=
+    // start_ts_ns is a format invariant, not one this column should assume
+    // and panic on if corrupt or adversarial data ever violates it.
+    let duration_ns = Int64Array::from(
+        records
+            .iter()
+            .map(|r| r.end_ts_ns.saturating_sub(r.start_ts_ns))
+            .collect::<Vec<_>>(),
+    );
+
     let columns: Vec<ArrayRef> = vec![
         Arc::new(trace),
         Arc::new(span),
@@ -367,6 +393,8 @@ fn build_batch(records: &[SpanRecord], schema: SchemaRef) -> DFResult<RecordBatc
         Arc::new(status_code),
         Arc::new(status_message),
         Arc::new(attrs),
+        Arc::new(service_name),
+        Arc::new(duration_ns),
     ];
     debug_assert_eq!(schema.fields().len(), columns.len());
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
