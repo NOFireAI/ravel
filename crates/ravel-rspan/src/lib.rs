@@ -20,6 +20,7 @@
 pub mod block;
 pub mod error;
 pub mod footer;
+pub mod ranged;
 pub mod reader;
 pub mod record;
 pub mod skip_index;
@@ -35,6 +36,7 @@ pub(crate) mod pb {
 
 pub use error::SpanSegError;
 pub use footer::{SpanFooter, SuffixOutcome, open, open_from_suffix, read_section};
+pub use ranged::{RspanRangeReader, TraceBlockSpan};
 pub use reader::{RspanReader, ScanStats, SpanQuery};
 pub use record::{SpanRecord, StatusCode, merge_attrs};
 pub use writer::{ObjectIdentity, RspanConfig, RspanWriter};
