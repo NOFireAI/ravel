@@ -114,9 +114,34 @@ in the read-path survey are called on cached bytes exactly as on fetched
 bytes. A corrupt entry is therefore indistinguishable from a corrupt S3
 read and fails closed on the existing path.
 
-The blake3 is verified once, when bytes are admitted to the disk tier,
-not on every hit. Admission is off the critical path; per-hit blake3 over
-megabytes is not.
+**Amended 2026-08-02, after a checkpoint review found the original
+instruction unimplementable.** It said the blake3 is verified once, when
+bytes are admitted to the disk tier. The cache crate cannot do that.
+`CacheKey` is `(tenant_hash, content_hash, offset, len)` where
+`content_hash` is the blake3 of the *whole object* and the entry is a byte
+sub-range of it, and the key carries no object size, so the crate cannot
+even identify the full-object case where `blake3(payload) ==
+content_hash` would be checkable.
+
+What actually protects a disk entry, stated so no later reader assumes
+more:
+
+- **Corruption after a successful write** is caught by a crc32c over the
+  payload, recomputed on every hit. Present and proven.
+- **A foreign or stale file at an entry's path** is caught by comparing
+  all four key fields in the entry header against the requested key.
+  Present and proven.
+- **Bytes that were never the named range to begin with** are caught by
+  nothing, here or anywhere else in the tree. Such bytes pass the cache's
+  crc32c and pass every crc32c in the segment reader's
+  footer/section/page/block hierarchy, and produce silently wrong query
+  results.
+
+The third case is a real gap and it is not the cache's to close. The
+obligation belongs to the funnel that admits bytes: it holds both the
+`SegmentRef` the range came from and the bytes themselves, and it must
+not admit a payload under a key that does not describe it. The wiring
+tasks own this, and the acceptance gate below is what proves it.
 
 The acceptance gate for this epic is a test mode in which every cache hit
 returns deliberately corrupted bytes, and the entire query test suite
@@ -139,10 +164,19 @@ roughly a hundred lines. No new external dependency.
 
 The disk tier evicts with S3-FIFO. The compactor and the folder run
 continuously over cold data in the same process as queries in every mode
-except a dedicated maintain deployment; plain LRU would let one
-compaction pass evict the entire query working set. The existing catalog
-caches keep their FIFO capacity caps, which are adequate for small
+except a dedicated maintain deployment; plain LRU or plain FIFO would let
+one compaction pass evict the entire query working set. The existing
+catalog caches keep their FIFO capacity caps, which are adequate for small
 decoded structures.
+
+Scan resistance matters **more** on disk than in RAM, not less, and this
+is worth stating because the reasoning inverts easily. It is tempting to
+argue that a disk miss is cheap because it only costs a round trip. That
+round trip is a fetch from S3, which is the single most expensive thing a
+query does and the entire reason this cache exists. The disk tier is also
+the large one, so it is where the working set actually lives. A scan that
+evicts it converts every subsequent query back into the cold path this
+epic was written to remove.
 
 ### 7. No encryption inside Ravel
 
