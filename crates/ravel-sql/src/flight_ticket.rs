@@ -86,6 +86,10 @@
 //!     writer_id         16   Uuid bytes
 //!     key_len            4   u32
 //!     key                N   data_object_key (UTF-8)
+//!     level_tag          1   0 = L0, 1 = L1
+//!       if L1:
+//!         input_set_hash 32   [u8; 32]
+//!         part_index      4   u32
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
 //! mac          32   keyed BLAKE3-256 over every preceding byte
@@ -139,8 +143,17 @@
 //! there is no compatibility window to preserve. Version 3 (issue #185)
 //! replaces the unkeyed FNV-1a-64 checksum with a keyed BLAKE3 MAC; see
 //! "Integrity: a keyed MAC, not a checksum" above.
+//!
+//! Because a ticket is ephemeral and never persisted, a new [`SegmentRef`]
+//! field is threaded into the current version's layout in place rather than
+//! behind a fresh version byte: there is no older-version ticket in flight to
+//! stay compatible with, and any that somehow were would fail the MAC or
+//! length check regardless. Issue #394 added the per-segment `level_tag`
+//! (L0 vs L1, with an L1 part's `input_set_hash`/`part_index`) this way, so
+//! [`SegmentPin::to_segment_ref`] reconstructs the level and a rebuilt L1 part
+//! is verified against the v4 footer contract, not read as an L0 segment.
 
-use ravel_catalog::SegmentRef;
+use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
@@ -214,6 +227,13 @@ pub struct SegmentPin {
     /// Wall-clock the commit record was created. First component of the
     /// dedup total order.
     pub created_unix_ns: i64,
+    /// L0 vs L1 discriminator, mirrored from [`SegmentRef::level`]. Determines
+    /// how `DoGet` verifies the segment footer and how the ref sorts into the
+    /// mixed-level snapshot order, so it must be pinned like every other
+    /// identity field: rebuilding the snapshot without it would reconstruct an
+    /// L1 part as if it were L0 (or vice versa) and read it against the wrong
+    /// footer contract.
+    pub level: SegmentLevel,
 }
 
 impl SegmentPin {
@@ -233,6 +253,7 @@ impl SegmentPin {
             writer_epoch: seg.writer_epoch,
             writer_seq: seg.writer_seq,
             created_unix_ns: seg.created_unix_ns,
+            level: seg.level.clone(),
         }
     }
 
@@ -256,6 +277,7 @@ impl SegmentPin {
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
             created_unix_ns: self.created_unix_ns,
+            level: self.level.clone(),
         }
     }
 }
@@ -327,6 +349,7 @@ impl FlightTicket {
             buf.extend_from_slice(&seg.content_hash);
             buf.extend_from_slice(seg.writer_id.as_bytes());
             write_len_prefixed(&mut buf, seg.data_object_key.as_bytes())?;
+            write_segment_level(&mut buf, &seg.level);
         }
 
         write_len_prefixed(&mut buf, self.statement.as_bytes())?;
@@ -393,6 +416,7 @@ impl FlightTicket {
             let key = cur.read_len_prefixed()?;
             let data_object_key =
                 std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
+            let level = read_segment_level(&mut cur)?;
             segments.push(SegmentPin {
                 data_object_key: data_object_key.to_owned(),
                 object_size,
@@ -407,6 +431,7 @@ impl FlightTicket {
                 writer_epoch,
                 writer_seq,
                 created_unix_ns,
+                level,
             });
         }
 
@@ -492,6 +517,9 @@ pub enum FlightTicketError {
     /// An embedded commit token failed [`CommitToken::decode`].
     #[error("ticket contains an invalid commit token")]
     InvalidCommitToken,
+    /// A segment's level tag byte was neither L0 (0) nor L1 (1).
+    #[error("ticket contains an invalid segment level tag {0}")]
+    InvalidSegmentLevel(u8),
     /// Bytes remained after the last field was read.
     #[error("ticket has trailing bytes")]
     TrailingBytes,
@@ -533,6 +561,42 @@ fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) -> Result<(), FlightTicke
     write_u32(buf, u32_len(bytes.len())?);
     buf.extend_from_slice(bytes);
     Ok(())
+}
+
+/// Per-segment wire encoding of [`SegmentLevel`]: a single tag byte (0 = L0,
+/// 1 = L1) followed, for L1, by the part's `input_set_hash` (`[u8; 32]`) and
+/// `part_index` (`u32`). These bytes land in the payload before the trailing
+/// MAC is computed, so the level is covered by the tag like every other field
+/// and cannot be flipped without invalidating it. `ravel-catalog` keeps its
+/// own snapshot-format encoding of the level internal, so no public codec is
+/// reused; this hand-rolled layout matches the rest of this ephemeral ticket.
+fn write_segment_level(buf: &mut Vec<u8>, level: &SegmentLevel) {
+    match level {
+        SegmentLevel::L0 => buf.push(0),
+        SegmentLevel::L1 {
+            input_set_hash,
+            part_index,
+        } => {
+            buf.push(1);
+            buf.extend_from_slice(input_set_hash);
+            buf.extend_from_slice(&part_index.to_le_bytes());
+        }
+    }
+}
+
+fn read_segment_level(cur: &mut Cursor<'_>) -> Result<SegmentLevel, FlightTicketError> {
+    match cur.read_u8()? {
+        0 => Ok(SegmentLevel::L0),
+        1 => {
+            let input_set_hash = cur.read_array::<32>()?;
+            let part_index = u32::from_le_bytes(cur.read_array::<4>()?);
+            Ok(SegmentLevel::L1 {
+                input_set_hash,
+                part_index,
+            })
+        }
+        other => Err(FlightTicketError::InvalidSegmentLevel(other)),
+    }
 }
 
 /// A bounds-checked forward reader over the checksum-verified payload. Every
@@ -607,8 +671,18 @@ mod tests {
     }
 
     /// A pin whose every field is distinct, so a codec that swapped two of
-    /// them fails the round trip instead of silently agreeing.
+    /// them fails the round trip instead of silently agreeing. The level
+    /// alternates by seed parity so a mixed L0/L1 pin set exercises both
+    /// wire encodings of [`SegmentLevel`].
     fn sample_pin(seed: u64, key: &str) -> SegmentPin {
+        let level = if seed.is_multiple_of(2) {
+            SegmentLevel::L0
+        } else {
+            SegmentLevel::L1 {
+                input_set_hash: [(seed % 241) as u8; 32],
+                part_index: seed as u32 + 11,
+            }
+        };
         SegmentPin {
             data_object_key: key.to_owned(),
             object_size: seed * 1_000 + 1,
@@ -623,6 +697,7 @@ mod tests {
             writer_epoch: seed * 1_000 + 8,
             writer_seq: seed * 1_000 + 9,
             created_unix_ns: seed as i64 * 1_000 + 10,
+            level,
         }
     }
 
@@ -631,8 +706,11 @@ mod tests {
             tenant: TenantHash([7u8; 16]),
             statement: "SELECT * FROM samples WHERE ts >= 1 AND ts < 2".to_owned(),
             segments: vec![
-                sample_pin(3, "t/aa/metrics/l0/0000/w.1.2.abc.rseg"),
-                sample_pin(9, "t/aa/metrics/l0/0001/w.4.5.def.rseg"),
+                // Odd seed -> L1, even seed -> L0: the fixed ticket carries one
+                // of each so the generic round-trip and flip tests exercise both
+                // level encodings.
+                sample_pin(3, "t/aa/metrics/l1/0000/w.1.2.abc.rseg"),
+                sample_pin(8, "t/aa/metrics/l0/0001/w.4.5.def.rseg"),
             ],
             min_commit_tokens: vec![sample_token(1), sample_token(2)],
             now_ns: 1_700_000_000_000_000_000,
@@ -645,31 +723,45 @@ mod tests {
     /// dedups differently than the one `GetFlightInfo` resolved.
     #[test]
     fn segment_ref_round_trips_through_the_pin() {
-        let seg = SegmentRef {
-            data_object_key: "t/aa/metrics/l0/0000/w.1.2.abc.rseg".to_owned(),
-            object_size: 4096,
-            min_event_ts_ns: -17,
-            max_event_ts_ns: 1_700_000_000_000_000_000,
-            ingest_hour_bucket: 471_000,
-            sample_count: 9_999,
-            series_count: 12,
-            shard: 63,
-            content_hash: [0xabu8; 32],
-            writer_id: Uuid::from_u128(0x9e37_79b9_7f4a_7c15),
-            writer_epoch: 7,
-            writer_seq: 4_294_967_296,
-            created_unix_ns: 1_699_999_999_999_999_999,
-        };
-        let pin = SegmentPin::from_segment_ref(&seg);
-        assert_eq!(pin.to_segment_ref(), seg);
+        // Cover both level variants through the real ticket encode/decode
+        // path: the pin is only lossless if L0 and an L1 part's
+        // input_set_hash/part_index both survive the wire and rebuild.
+        for level in [
+            SegmentLevel::L0,
+            SegmentLevel::L1 {
+                input_set_hash: [0xcdu8; 32],
+                part_index: 7,
+            },
+        ] {
+            let seg = SegmentRef {
+                data_object_key: "t/aa/metrics/l0/0000/w.1.2.abc.rseg".to_owned(),
+                object_size: 4096,
+                min_event_ts_ns: -17,
+                max_event_ts_ns: 1_700_000_000_000_000_000,
+                ingest_hour_bucket: 471_000,
+                sample_count: 9_999,
+                series_count: 12,
+                shard: 63,
+                content_hash: [0xabu8; 32],
+                writer_id: Uuid::from_u128(0x9e37_79b9_7f4a_7c15),
+                writer_epoch: 7,
+                writer_seq: 4_294_967_296,
+                created_unix_ns: 1_699_999_999_999_999_999,
+                level: level.clone(),
+            };
+            let pin = SegmentPin::from_segment_ref(&seg);
+            assert_eq!(pin.to_segment_ref(), seg);
 
-        let ticket = FlightTicket {
-            segments: vec![pin],
-            ..sample_ticket()
-        };
-        let bytes = ticket.encode(&test_key()).expect("encode");
-        let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
-        assert_eq!(decoded.snapshot().segments, vec![seg]);
+            let ticket = FlightTicket {
+                segments: vec![pin],
+                ..sample_ticket()
+            };
+            let bytes = ticket.encode(&test_key()).expect("encode");
+            let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
+            // Reconstruct the SegmentRef through the full mint/decode/rebuild
+            // path, not just the in-memory struct conversion.
+            assert_eq!(decoded.snapshot().segments, vec![seg]);
+        }
     }
 
     /// A redeemed ticket reports no pruning of its own. The pin already holds
@@ -899,6 +991,38 @@ mod tests {
     /// keyed MAC closes exactly this: recomputing the tag under any key other
     /// than the minting process's own is rejected, even though the tag is
     /// self-consistent under the attacker's own (wrong) key.
+    /// The level is an identity field the redemption path trusts to pick the
+    /// footer contract (L0 flush vs L1 v4 part), so flipping only the level
+    /// tag on an otherwise-valid ticket must be rejected as a MAC mismatch,
+    /// exactly like flipping the deadline. If `level` were added to the struct
+    /// but left out of the MACed bytes, this flip would be silently accepted.
+    #[test]
+    fn flipping_the_level_tag_is_rejected_as_a_mac_mismatch() {
+        let key = test_key();
+        let object_key = "t/aa/metrics/l0/0000/w.1.2.abc.rseg";
+        let ticket = FlightTicket {
+            tenant: TenantHash([1u8; 16]),
+            statement: String::new(),
+            // Even seed -> L0, so the level tag byte is 0.
+            segments: vec![sample_pin(2, object_key)],
+            min_commit_tokens: vec![],
+            now_ns: 5,
+            deadline_ns: 6,
+        };
+        let mut bytes = ticket.encode(&key).expect("encode");
+        // The level tag sits right after the per-segment fixed fields and the
+        // length-prefixed key: header (magic 4 + version 1 + tenant 16 + now 8
+        // + deadline 8 = 37) + token_count (4) + seg_count (4) + the segment's
+        // 120 fixed bytes + key_len (4) + the key bytes.
+        let level_offset = 37 + 4 + 4 + 120 + 4 + object_key.len();
+        assert_eq!(bytes[level_offset], 0, "expected the L0 level tag here");
+        bytes[level_offset] ^= 0x01;
+        assert_eq!(
+            FlightTicket::decode(&bytes, &key),
+            Err(FlightTicketError::MacMismatch)
+        );
+    }
+
     #[test]
     fn recomputing_the_tag_under_the_wrong_key_does_not_forge_a_valid_ticket() {
         let real_key = test_key();
@@ -925,6 +1049,18 @@ mod tests {
         assert!(ticket.is_expired(i64::MAX));
     }
 
+    fn segment_level_strategy() -> impl Strategy<Value = SegmentLevel> {
+        prop_oneof![
+            Just(SegmentLevel::L0),
+            (any::<[u8; 32]>(), any::<u32>()).prop_map(|(input_set_hash, part_index)| {
+                SegmentLevel::L1 {
+                    input_set_hash,
+                    part_index,
+                }
+            }),
+        ]
+    }
+
     fn segment_pin_strategy() -> impl Strategy<Value = SegmentPin> {
         (
             ".{0,80}",
@@ -933,6 +1069,7 @@ mod tests {
             (any::<u64>(), any::<u64>(), any::<i64>(), any::<u64>()),
             (any::<i64>(), any::<i64>(), any::<u64>(), any::<u64>()),
             (any::<u32>(), any::<u32>()),
+            segment_level_strategy(),
         )
             .prop_map(
                 |(
@@ -942,6 +1079,7 @@ mod tests {
                     (writer_epoch, writer_seq, created_unix_ns, object_size),
                     (min_event_ts_ns, max_event_ts_ns, sample_count, series_count),
                     (ingest_hour_bucket, shard),
+                    level,
                 )| SegmentPin {
                     data_object_key,
                     object_size,
@@ -956,6 +1094,7 @@ mod tests {
                     writer_epoch,
                     writer_seq,
                     created_unix_ns,
+                    level,
                 },
             )
     }
