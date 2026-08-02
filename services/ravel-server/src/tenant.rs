@@ -60,6 +60,11 @@ pub fn build_resolver(
 pub struct ResolverBundle {
     pub resolver: Arc<dyn TenantResolver>,
     pub oidc_refresh: Option<OidcRefreshParams>,
+    /// The mTLS resolver, kept out of `resolver` entirely (ADR-0050 section 1).
+    /// `None` when `--mtls-enabled` is off. The caller wires this into the
+    /// dedicated `--mtls-listener` chain only; it must never be merged into
+    /// `resolver`, which backs every public listener.
+    pub mtls_resolver: Option<Arc<dyn TenantResolver>>,
 }
 
 /// Inputs for the JWKS refresh task: the cache the request-path `OidcResolver`
@@ -71,7 +76,11 @@ pub struct OidcRefreshParams {
 }
 
 /// Build the full tenant-resolution chain: the static bearer resolver always,
-/// plus the optional mTLS, dev-header, and OIDC resolvers (ADR-0042 decision 6).
+/// plus the optional dev-header and OIDC resolvers (ADR-0042 decision 6). The
+/// mTLS resolver, when configured, is returned separately in
+/// [`ResolverBundle::mtls_resolver`] and never enters this chain (ADR-0050
+/// section 1) - `resolver` backs every public listener, and a resolver that
+/// trusts an unauthenticated header has no business there.
 ///
 /// `FallbackResolver` tries every resolver and returns the first success, so
 /// order is functionally irrelevant (the resolvers key off disjoint headers or
@@ -87,9 +96,10 @@ pub fn build_auth_resolver(
     let mut resolvers: Vec<Arc<dyn TenantResolver>> =
         vec![Arc::new(StaticBearerTokenResolver::new(tokens))];
 
-    if let Some(header) = auth.mtls_header {
-        resolvers.push(Arc::new(MtlsResolver::new(header)));
-    }
+    let mtls_resolver: Option<Arc<dyn TenantResolver>> = auth
+        .mtls_header
+        .map(|header| Arc::new(MtlsResolver::new(header)) as Arc<dyn TenantResolver>);
+
     if dev_header {
         resolvers.push(Arc::new(DevHeaderTenantResolver::default()));
     }
@@ -118,6 +128,7 @@ pub fn build_auth_resolver(
     Ok(ResolverBundle {
         resolver,
         oidc_refresh,
+        mtls_resolver,
     })
 }
 

@@ -194,6 +194,15 @@ pub struct Cli {
     #[arg(long, value_name = "HEADER")]
     pub mtls_header: Option<String>,
 
+    /// Dedicated listener address the mTLS resolver is installed on
+    /// (ADR-0050 section 1). Required when `--mtls-enabled` is set: the
+    /// resolver is never added to the public HTTP or gRPC/Flight listener
+    /// chains, so without this flag `--mtls-enabled` has nowhere to run.
+    /// Must differ from `--listen-http` and `--listen-grpc`; see
+    /// `Cli::validate`.
+    #[arg(long, value_name = "ADDR")]
+    pub mtls_listener: Option<SocketAddr>,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -402,6 +411,63 @@ impl Cli {
             )
         })
     }
+
+    /// Cross-flag startup invariants that do not fit `parse_auth_resolvers`'s
+    /// per-resolver shape (ADR-0050 section 1, plus the pre-existing
+    /// dev-header loopback rule this consolidates from `main`). Every case
+    /// here refuses startup outright; none of them warn and continue.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.dev_insecure_tenant_header && !self.listen_http.ip().is_loopback() {
+            anyhow::bail!(
+                "--dev-insecure-tenant-header refuses to enable unless --listen-http binds a \
+                 loopback address"
+            );
+        }
+
+        // A listener with no resolver installed on it is a dead flag: it binds
+        // a socket that answers every request as unauthenticated, giving a
+        // reader (or a future refactor) no signal that mTLS was ever intended
+        // there. ADR-0050 section 1 assumes `--mtls-listener` only ever
+        // appears paired with `--mtls-enabled`; this is the case that makes
+        // the pairing load-bearing rather than implicit.
+        if self.mtls_listener.is_some() && !self.mtls_enabled {
+            anyhow::bail!(
+                "--mtls-listener was set but --mtls-enabled was not: the listener would bind \
+                 with no resolver installed on it. Set --mtls-enabled, or drop --mtls-listener."
+            );
+        }
+
+        if self.mtls_enabled && self.mtls_listener.is_none() {
+            anyhow::bail!(
+                "--mtls-enabled requires --mtls-listener: the mTLS resolver is only installed on \
+                 its own dedicated listener (ADR-0050 section 1), never on the public HTTP or \
+                 gRPC/Flight listeners."
+            );
+        }
+
+        if let Some(mtls_listener) = self.mtls_listener {
+            // More specific than the general aliasing check below: names the
+            // exact combination (dev header plus mTLS listener on the public
+            // HTTP address) rather than just "listener address collides".
+            if self.dev_insecure_tenant_header && mtls_listener == self.listen_http {
+                anyhow::bail!(
+                    "--mtls-listener '{mtls_listener}' is the same address as --listen-http, \
+                     which also has --dev-insecure-tenant-header enabled: the mTLS listener \
+                     would inherit the dev tenant-header bypass. Bind --mtls-listener to a \
+                     different address."
+                );
+            }
+            if mtls_listener == self.listen_http || mtls_listener == self.listen_grpc {
+                anyhow::bail!(
+                    "--mtls-listener '{mtls_listener}' must not equal --listen-http or \
+                     --listen-grpc: the mTLS resolver would become reachable from a public \
+                     listener, defeating the dedicated-listener isolation (ADR-0050 section 1)."
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// The tenant set background fold and maintenance run for: every tenant named
@@ -601,6 +667,113 @@ mod tests {
         // build still does not register the service unless asked.
         assert!(!cli(&[]).otap, "--otap defaults off even in an otap build");
         assert!(cli(&["--otap"]).otap, "--otap enables the service");
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_non_loopback_fails_validate() {
+        let err = cli(&[
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "0.0.0.0:4318",
+        ])
+        .validate()
+        .expect_err("non-loopback --listen-http with the dev header must refuse startup");
+        assert!(
+            err.to_string().contains("--dev-insecure-tenant-header"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_loopback_validates() {
+        cli(&[
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:4318",
+        ])
+        .validate()
+        .expect("loopback --listen-http with the dev header is fine");
+    }
+
+    #[test]
+    fn mtls_listener_without_mtls_enabled_fails_validate() {
+        let err = cli(&["--mtls-listener", "127.0.0.1:9443"])
+            .validate()
+            .expect_err("--mtls-listener with no --mtls-enabled must refuse startup");
+        assert!(
+            err.to_string().contains("--mtls-enabled"),
+            "error names the missing flag: {err}"
+        );
+    }
+
+    #[test]
+    fn mtls_enabled_without_mtls_listener_fails_validate() {
+        let err = cli(&["--mtls-enabled"])
+            .validate()
+            .expect_err("--mtls-enabled with no --mtls-listener must refuse startup");
+        assert!(
+            err.to_string().contains("--mtls-listener"),
+            "error names the missing flag: {err}"
+        );
+    }
+
+    #[test]
+    fn mtls_listener_equal_to_listen_http_fails_validate() {
+        let err = cli(&[
+            "--mtls-enabled",
+            "--mtls-listener",
+            "127.0.0.1:4318",
+            "--listen-http",
+            "127.0.0.1:4318",
+        ])
+        .validate()
+        .expect_err("--mtls-listener aliasing --listen-http must refuse startup");
+        assert!(
+            err.to_string().contains("--listen-http"),
+            "error names the colliding flag: {err}"
+        );
+    }
+
+    #[test]
+    fn mtls_listener_equal_to_listen_grpc_fails_validate() {
+        let err = cli(&[
+            "--mtls-enabled",
+            "--mtls-listener",
+            "127.0.0.1:4317",
+            "--listen-grpc",
+            "127.0.0.1:4317",
+        ])
+        .validate()
+        .expect_err("--mtls-listener aliasing --listen-grpc must refuse startup");
+        assert!(
+            err.to_string().contains("--listen-grpc"),
+            "error names the colliding flag: {err}"
+        );
+    }
+
+    #[test]
+    fn mtls_listener_with_dev_header_on_same_address_fails_validate() {
+        let err = cli(&[
+            "--mtls-enabled",
+            "--mtls-listener",
+            "127.0.0.1:4318",
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--dev-insecure-tenant-header",
+        ])
+        .validate()
+        .expect_err("dev header plus aliased mTLS listener must refuse startup");
+        assert!(
+            err.to_string().contains("--dev-insecure-tenant-header"),
+            "error names the specific dev-header case, not just the generic alias: {err}"
+        );
+    }
+
+    #[test]
+    fn mtls_enabled_with_distinct_listener_validates() {
+        cli(&["--mtls-enabled", "--mtls-listener", "127.0.0.1:9443"])
+            .validate()
+            .expect("a distinct --mtls-listener with --mtls-enabled is fine");
     }
 
     #[test]
