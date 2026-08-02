@@ -6,8 +6,10 @@
 //! wiring: it adapts the two deployment-owned things ravel-sql states as
 //! traits -- the authoritative request identity and the injected clock -- and
 //! hands them to [`RavelFlightSqlService`] together with the same
-//! `SqlExecutor`, clock, and deadline ceiling `SqlState` already carries for
-//! `POST /api/v1/sql`.
+//! `SqlExecutor`, clock, deadline ceiling, and object store `SqlState` already
+//! carries for `POST /api/v1/sql`. Sharing the store is what lets the Flight
+//! path write the same query-audit record the HTTP endpoint does (issue #395),
+//! so a tenant's query activity is durably logged on both transports.
 //!
 //! Sharing the executor is the point, not an optimization: the per-tenant
 //! memory accountants live inside it, so a tenant that runs one query over
@@ -88,5 +90,9 @@ pub fn service(state: &SqlState) -> FlightServiceServer<RavelFlightSqlService> {
         auth,
         clock,
         config,
+        // The same object store `SqlState` writes the HTTP endpoint's
+        // query-audit record to, so Flight statements are audited through the
+        // same store (issue #395).
+        Arc::clone(&state.store),
     ))
 }

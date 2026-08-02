@@ -1,18 +1,25 @@
 //! Query-audit records (ADR-0042 decision 4, issue #391).
 //!
 //! `ravel-server` writes one immutable [`Signal::Audit`] record every time it
-//! executes a tenant's SQL request through `POST /api/v1/sql`, so that
-//! transport's query activity is durably logged and cannot be forged or
-//! suppressed by the tenant: the record is written by the server itself, from
-//! the interception point in the SQL handler, never derived from a
-//! client-supplied request body.
+//! executes a tenant's SQL request, so query activity is durably logged and
+//! cannot be forged or suppressed by the tenant: the record is written by the
+//! server itself, from the interception point in the SQL execution path, never
+//! derived from a client-supplied request body or ticket.
 //!
-//! This does not yet cover every way a tenant can run SQL: the Flight SQL
-//! transport (`services/ravel-server/src/flight.rs`) executes tenant queries
-//! against the same `SqlExecutor` with no audit hook, so a tenant using that
-//! transport today leaves no query-audit trail (tracked as a fast-follow).
-//! The "cannot be forged or suppressed" property holds only for the
-//! transport this module instruments.
+//! Both SQL transports write this record. `POST /api/v1/sql`
+//! (`services/ravel-server/src/sql.rs`) writes one after every request, and the
+//! Flight SQL transport (`crates/ravel-sql/src/flight`) writes one after every
+//! executed statement, from `DoGet` where the statement runs through the same
+//! `SqlExecutor` (issue #395). The "cannot be forged or suppressed" property
+//! now holds for every way a tenant runs SQL, not just one transport.
+//!
+//! The two paths share this writer and differ only in what a time window means
+//! to each. The HTTP body carries an explicit event-time range, recorded
+//! verbatim. A Flight statement's window is consumed at `GetFlightInfo` to
+//! resolve and pin the snapshot and is not carried on the `DoGet` redemption
+//! path, so the Flight path has no resolved window to record at the point it
+//! audits and passes `window_start_ns`/`window_end_ns` as `0` (unknown) rather
+//! than a fabricated range. Every other attribute is identical across the two.
 //!
 //! # Record shape
 //!
