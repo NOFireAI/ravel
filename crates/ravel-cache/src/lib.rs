@@ -1,0 +1,377 @@
+//! ADR-0046's read cache, RAM tier only (docs/adrs/0046-read-cache-tier.md,
+//! decisions 1-6; the disk tier is a later task in the same epic).
+//!
+//! This crate is consulted at a read funnel; it is never a store
+//! decorator (decision 1). It is not wired into anything yet: it does not
+//! depend on `ravel-types`, does not touch `ravel-catalog` or
+//! `ravel-query`, and does not reference `QueryAccounting`. Three later
+//! tasks in this epic connect it to those.
+//!
+//! [`CacheKey`] is content-addressed (decision 2): `(tenant_hash,
+//! content_hash, offset, len)`, with no constructor from an object key
+//! string, because the mutable objects that own such strings (the
+//! catalog HEAD, the maintenance cursor) have no content hash and must
+//! stay unrepresentable rather than merely un-cached-by-convention.
+//!
+//! [`Cache`] bounds total bytes, entry count, and maximum single-entry
+//! size (deliverable 4); evicts with S3-FIFO, not LRU, because the
+//! compactor and the folder scan cold data in the same process as
+//! queries and a single scan must not evict the query working set
+//! (decision 6, see [`s3fifo`]); collapses concurrent misses on one key
+//! into a single upstream call (decision 5, see [`single_flight`]); and
+//! has a constructor, [`Cache::with_corruption`], that makes every hit
+//! return deliberately corrupted bytes -- the supported acceptance-gate
+//! mode for the whole epic (decision 4), not a test fixture.
+
+mod cache;
+mod key;
+mod limits;
+mod metrics;
+mod s3fifo;
+mod single_flight;
+
+pub use cache::Cache;
+pub use key::CacheKey;
+pub use limits::CacheLimits;
+pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
+pub use single_flight::{Role, SingleFlight, SingleFlightError};
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    fn test_key(n: u64) -> CacheKey {
+        let mut content_hash = [0u8; 32];
+        content_hash[..8].copy_from_slice(&n.to_le_bytes());
+        CacheKey::new([7u8; 16], content_hash, 0, 0)
+    }
+
+    #[tokio::test]
+    async fn single_flight_collapses_concurrent_misses_and_propagates_errors() {
+        let flight: Arc<SingleFlight<CacheKey, Bytes, &'static str>> =
+            Arc::new(SingleFlight::new());
+        let key = test_key(1);
+
+        // N concurrent misses on one key produce exactly one upstream
+        // call, and every waiter receives the same bytes.
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let flight = flight.clone();
+            let upstream_calls = upstream_calls.clone();
+            handles.push(tokio::spawn(async move {
+                flight
+                    .run(key, move || {
+                        let upstream_calls = upstream_calls.clone();
+                        async move {
+                            upstream_calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok::<Bytes, &'static str>(Bytes::from_static(b"payload"))
+                        }
+                    })
+                    .await
+            }));
+        }
+        for handle in handles {
+            let (result, _role) = handle.await.unwrap();
+            assert_eq!(result.unwrap().as_ref(), b"payload".as_slice());
+        }
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            1,
+            "N concurrent misses on one key must produce exactly one upstream call"
+        );
+
+        // A failing upstream call reaches every waiter as an error,
+        // rather than hanging any of them.
+        let key2 = test_key(2);
+        let upstream_calls2 = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let flight = flight.clone();
+            let upstream_calls2 = upstream_calls2.clone();
+            handles.push(tokio::spawn(async move {
+                flight
+                    .run(key2, move || {
+                        let upstream_calls2 = upstream_calls2.clone();
+                        async move {
+                            upstream_calls2.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Err::<Bytes, &'static str>("upstream exploded")
+                        }
+                    })
+                    .await
+            }));
+        }
+        for handle in handles {
+            let (result, _role) = handle.await.unwrap();
+            match result {
+                Err(SingleFlightError::Upstream(message)) => {
+                    assert_eq!(message, "upstream exploded")
+                }
+                other => panic!("expected every waiter to see the upstream error, got {other:?}"),
+            }
+        }
+        assert_eq!(upstream_calls2.load(Ordering::SeqCst), 1);
+
+        // A second, later miss on the same key after the first completed
+        // does not reuse the completed slot: it starts a fresh leader.
+        let third_call_ran = Arc::new(AtomicUsize::new(0));
+        let third_call_ran_clone = third_call_ran.clone();
+        let (third_result, third_role) = flight
+            .run(key2, move || async move {
+                third_call_ran_clone.fetch_add(1, Ordering::SeqCst);
+                Ok::<Bytes, &'static str>(Bytes::from_static(b"fresh"))
+            })
+            .await;
+        assert_eq!(
+            third_role,
+            Role::Leader,
+            "a miss after completion must start a fresh leader"
+        );
+        assert_eq!(third_result.unwrap().as_ref(), b"fresh".as_slice());
+        assert_eq!(third_call_ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn single_flight_panicking_or_cancelled_leader_unblocks_waiters() {
+        let flight: Arc<SingleFlight<CacheKey, Bytes, &'static str>> =
+            Arc::new(SingleFlight::new());
+
+        // A leader that panics before producing a result must not leave a
+        // concurrent follower waiting forever.
+        let key = test_key(100);
+        let leader = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                flight
+                    .run(key, || async {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        panic!("leader blew up before producing a result");
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let follower_ran = Arc::new(AtomicUsize::new(0));
+        let follower = {
+            let flight = flight.clone();
+            let follower_ran = follower_ran.clone();
+            tokio::spawn(async move {
+                flight
+                    .run(key, move || {
+                        let follower_ran = follower_ran.clone();
+                        async move {
+                            follower_ran.fetch_add(1, Ordering::SeqCst);
+                            Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+                        }
+                    })
+                    .await
+            })
+        };
+
+        assert!(
+            leader.await.is_err(),
+            "the leader task itself should have panicked"
+        );
+        let (follower_result, follower_role) = timeout(Duration::from_secs(2), follower)
+            .await
+            .expect("a panicking leader must not leave a follower parked forever")
+            .expect("follower task must not itself panic");
+        assert!(matches!(
+            follower_result,
+            Err(SingleFlightError::LeaderLost)
+        ));
+        assert_eq!(follower_role, Role::Follower);
+        assert_eq!(
+            follower_ran.load(Ordering::SeqCst),
+            0,
+            "a follower never runs its own fetch"
+        );
+
+        // A leader whose task is cancelled before it produces a result
+        // must not leave a concurrent follower waiting forever either.
+        let key2 = test_key(101);
+        let leader2 = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                flight
+                    .run(key2, || async {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"unreachable"))
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let follower2 = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                flight
+                    .run(key2, || async {
+                        Ok::<Bytes, &'static str>(Bytes::from_static(b"never"))
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        leader2.abort();
+
+        let (follower2_result, _role) = timeout(Duration::from_secs(2), follower2)
+            .await
+            .expect("a cancelled leader must not leave a follower parked forever")
+            .expect("follower task must not itself panic");
+        assert!(matches!(
+            follower2_result,
+            Err(SingleFlightError::LeaderLost)
+        ));
+    }
+
+    #[test]
+    fn s3_fifo_scan_resistance_keeps_working_set_resident() {
+        let entry_size = 1024u64;
+        let working_set_len = 20u64;
+        let limits = CacheLimits::new(entry_size * 100, 1000, entry_size * 10);
+        let cache: Cache<&'static str> = Cache::new(limits);
+
+        let working_set: Vec<CacheKey> = (0..working_set_len).map(test_key).collect();
+        for key in &working_set {
+            cache.insert(*key, Bytes::from(vec![0xAAu8; entry_size as usize]));
+        }
+        // Access each working-set entry a second time so S3-FIFO promotes
+        // it out of the small probation queue into main.
+        for key in &working_set {
+            assert!(cache.get(key).is_some());
+        }
+
+        // A long one-shot scan: far more distinct keys than the cache
+        // holds, each admitted and never touched again -- exactly the
+        // compactor/folder access pattern ADR-0046 decision 6 is written
+        // against.
+        for i in 1_000..1_500u64 {
+            cache.insert(test_key(i), Bytes::from(vec![0xEEu8; entry_size as usize]));
+        }
+
+        let resident = working_set
+            .iter()
+            .filter(|key| cache.get(key).is_some())
+            .count();
+        assert!(
+            resident as f64 >= working_set_len as f64 * 0.9,
+            "expected the working set to stay resident under a one-shot scan, only {resident}/{working_set_len} survived (a plain-LRU cache would evict nearly all of it)"
+        );
+    }
+
+    #[test]
+    fn bounds_respected_under_insertion_pressure_and_oversized_entry_not_admitted() {
+        let limits = CacheLimits::new(10 * 1024, 5, 4096);
+        let cache: Cache<&'static str> = Cache::new(limits);
+
+        for i in 0..50u64 {
+            cache.insert(test_key(i), Bytes::from(vec![0u8; 512]));
+        }
+        assert!(
+            cache.len() <= 5,
+            "entry-count bound violated: {} entries resident",
+            cache.len()
+        );
+        assert!(
+            cache.total_bytes() <= 10 * 1024,
+            "byte bound violated: {} bytes resident",
+            cache.total_bytes()
+        );
+
+        let oversized_key = test_key(9_999);
+        cache.insert(oversized_key, Bytes::from(vec![0u8; 8192]));
+        assert!(
+            cache.get(&oversized_key).is_none(),
+            "an oversized entry must not be admitted"
+        );
+        assert_eq!(cache.metrics().snapshot().admissions_rejected_size, 1);
+    }
+
+    #[test]
+    fn corruption_mode_returns_bytes_that_differ_on_every_hit() {
+        let limits = CacheLimits::new(1024 * 1024, 100, 1024 * 1024);
+        let cache: Cache<&'static str> = Cache::with_corruption(limits);
+        let key = test_key(1);
+        let original = Bytes::from_static(b"trust no cached byte");
+        cache.insert(key, original.clone());
+
+        for _ in 0..5 {
+            let hit = cache.get(&key).expect("entry should be resident");
+            assert_ne!(hit.as_ref(), original.as_ref());
+            assert_eq!(hit.len(), original.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn counters_match_hand_computed_sequence() {
+        let limits = CacheLimits::new(1024 * 1024, 1, 1024 * 1024);
+        let cache: Cache<&'static str> = Cache::new(limits);
+        let a = test_key(1);
+        let b = test_key(2);
+
+        assert!(cache.get(&a).is_none()); // miss 1
+        cache.insert(a, Bytes::from_static(b"aaa"));
+        assert!(cache.get(&a).is_some()); // hit 1
+
+        // max_entries == 1, and `a` was never touched again after this
+        // admission-time insert, so it is evicted (freq == 0) rather than
+        // promoted when `b` arrives.
+        cache.insert(b, Bytes::from_static(b"bb"));
+
+        assert!(cache.get(&a).is_none()); // miss 2 (evicted)
+        assert!(cache.get(&b).is_some()); // hit 2
+
+        let snap = cache.metrics().snapshot();
+        assert_eq!(snap.hits, 2);
+        assert_eq!(snap.misses, 2);
+        assert_eq!(snap.evictions, 1);
+        assert_eq!(snap.bytes_admitted, 5); // "aaa" (3) + "bb" (2)
+        assert_eq!(snap.bytes_served, 5); // "aaa" (3) + "bb" (2)
+        assert_eq!(snap.admissions_rejected_size, 0);
+        assert_eq!(snap.single_flight_collapses, 0);
+
+        // Single-flight collapse: two concurrent get_or_fetch calls for a
+        // new key collapse into one upstream call and one collapse.
+        let limits2 = CacheLimits::new(1024 * 1024, 10, 1024 * 1024);
+        let cache = Arc::new(Cache::<&'static str>::new(limits2));
+        let c = test_key(3);
+        let (first, second) = tokio::join!(
+            {
+                let cache = cache.clone();
+                async move {
+                    cache
+                        .get_or_fetch(c, || async {
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            Ok::<Bytes, &'static str>(Bytes::from_static(b"c"))
+                        })
+                        .await
+                }
+            },
+            {
+                let cache = cache.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    cache
+                        .get_or_fetch(c, || async {
+                            Ok::<Bytes, &'static str>(Bytes::from_static(b"c"))
+                        })
+                        .await
+                }
+            }
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(cache.metrics().snapshot().single_flight_collapses, 1);
+    }
+}
