@@ -15,11 +15,26 @@ t/<tenant_hash>/m/maint/<shard>/cursor                                    adviso
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable, phase 5)
+sys/qualification                                                       store qualification record (write-once, additive)
+sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 ```
 
 The four compaction/retention key shapes (ADR-0018, ADR-0019;
 docs/compaction-retention-plan.md §3.1) are additive: existing keys and
 their meaning are untouched.
+
+`sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
+additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.
+`sys/qualification` is written once per bucket by `ravel-cli store
+qualify` (services/ravel-cli/src/qualify.rs) via `CreateIfAbsent` after a
+passing conformance run; it is never overwritten, and server startup on a
+production store kind reads it to refuse starting when the record is
+absent or its suite version is stale. `sys/qualify/<run-id>/...` holds the
+scratch objects the conformance suite (crates/ravel-object-store/src/
+conformance.rs) writes and reads while probing conditional-write and
+listing consistency under a fresh `run-id` each run; these objects are
+transient probe fixtures, not durable state, and carry no lifecycle
+guarantee beyond the run that created them.
 
 - `input_set_hash16`: first 16 hex chars of the blake3 digest over the
   compaction record's sorted `inputs` list (canonical encoding, sorted by
