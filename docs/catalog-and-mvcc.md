@@ -270,6 +270,34 @@ derived, rebuildable index, never a durability or correctness dependency.
 
 (docs/metric-index-plan.md 5.1, ADR-0020.)
 
+## Query cost accounting
+
+`resolve` and `resolve_pruned` account for every store call and cache access
+they make on the caller's behalf when driven through their
+`*_with_accounting` counterparts (`resolve_with_accounting`,
+`resolve_pruned_with_accounting`; ADR-0044, issue #421). The plain `resolve`
+and `resolve_pruned` entry points are unchanged and pass a discarded
+`QueryAccounting` handle, so every existing caller keeps its current
+signature and behavior.
+
+`Catalog::guarded_get` and `Catalog::guarded_list_all` are the only two
+places a resolve issues an S3 request (both Phase 1 listing and Phase 2
+snapshot reads funnel through them), so accounting is recorded there, never
+at a call site: one `AccountedOp::Get` per GET attempt and one
+`AccountedOp::List` per LIST page, both unconditional; bytes are added only
+for a successful GET, matching `InstrumentedStore`'s convention that a
+failed request and a LIST move no bytes. `resolve`'s two funnels never issue
+a HEAD.
+
+All five caches (`RecordCache`, `CompactionRecordCache`, `HeadCache`,
+`PartCache`, `PostingsCache`) record a cache hit or miss on every lookup and
+add the cached object's original wire-encoded byte size on a hit; a miss
+does not double-count bytes the funnel GET that filled the cache already
+recorded. `HeadCache` additionally carries a process-wide capacity bound
+(`head_cache_capacity`, default 10,000 (tenant, signal) entries, FIFO
+eviction), closing the one cache of the five that previously had a TTL but
+no bound on the number of tenants it could grow to hold.
+
 ## MVCC rules
 
 - Snapshots are logical sets of immutable segments. Compaction (Phase 2)
