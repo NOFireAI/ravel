@@ -212,6 +212,107 @@ output size: every matched series in every matched segment is still fully
 fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
 scales with the query's matched input, not with `max_samples`.
 
+## Query cost accounting and estimate (ADR-0044)
+
+Every query carries a `ravel_types::accounting::QueryAccounting` handle,
+created once per query attempt and passed explicitly (never thread-local
+or task-local, since the fetch path fans out across `buffer_unordered`).
+It is recorded at existing funnels only, never at scattered call sites:
+
+- `SegmentFetcher::guarded_get` (crates/ravel-query/src/fetcher.rs), for
+  every metric-path store call: `s3_requests`/`s3_bytes` split by op
+  (get/list/head), `bytes_reused` (bytes served from an already-fetched
+  region without a second GET), `decompressed_bytes`, `segments_opened`,
+  `series_matched`.
+- `LogSegmentFetcher`'s own funnel (crates/ravel-query/src/log_fetcher.rs),
+  so the log path is accounted like the metric path instead of being
+  silently free.
+
+`Catalog::guarded_get`/`guarded_list_all` (crates/ravel-catalog) are the
+third funnel ADR-0044 names, threading `QueryAccounting` through
+`Catalog::resolve` itself. That wiring is a separate, parallel task; a
+seam comment at `QueryEngine::resolve_bounded`'s `catalog.resolve_pruned`
+call marks where it plugs in. Until it lands, `cache_hits`/`cache_misses`/
+`cache_bytes` and the catalog-side share of `segments_pruned` stay at
+zero in the snapshot; every counter recorded from `ravel-query`'s own two
+funnels above is live today.
+
+A `QueryAccountingSnapshot` (point-in-time copy via `.snapshot()`) is
+attached to `QueryStats` alongside the existing `segments_fetched`/
+`segments_pruned`/per-run `FetchStats` (`raw_f64_pages`/`raw_f64_bytes`,
+narrower than `decompressed_bytes`: only `ValPageKind::RawF64` pages).
+
+### Pre-execution cost estimate
+
+After `Catalog::resolve` returns a pinned snapshot and before any page
+fetch, `engine::estimate_cost` computes a `CostEstimate` from fields
+already on that snapshot's `SegmentRef`s (`object_size`, `sample_count`,
+`series_count`); nothing about the fetch plan needs to run first because
+it is deterministic given the matchers. The estimate is an upper
+envelope, never a prediction: every quantity the planner cannot bound
+exactly takes the worst case, because under-estimating is the failure
+that matters once a later ADR enforces a budget on this number.
+
+Constants (crates/ravel-query/src/engine.rs):
+
+- `OPEN_REQUESTS_PER_SEGMENT = 2` — `open_segment`'s footer GET plus the
+  worst-case one extra `NeedRange` chase.
+- `CATALOG_REQUESTS_PER_SEGMENT = 4` — the sparse catalog-probe path's
+  worst-case coalesced GET count over LABEL_DICT/SERIES_IDS/
+  SERIES_META_CHUNKS/SERIES_IDX; the whole-object and below-threshold
+  paths cost strictly less.
+- `PAGE_REQUESTS_PER_RUN = 2` per matched series — a TS run and a VAL (or
+  HIST) run, before `ensure_ranges`' `covers()` dedup can ever reduce it.
+- `STORE_BYTES_SAFETY_FACTOR = 2` applied to `object_size` — covers
+  re-reading a segment across a retry (snapshot invalidation) without
+  claiming a tighter per-page bound than the catalog can prove pre-fetch.
+- `BYTES_PER_SAMPLE_UPPER_BOUND = 512` applied to `sample_count` for
+  `estimated_decompressed_bytes` — a heuristic ceiling, not a proven
+  bound. Native histograms have no fixed per-sample size (bucket count
+  varies per series), so this is deliberately generous rather than
+  derived from the format.
+
+`prefetch` fans out one independent fetch per selector against the same
+shared snapshot, so `estimate_cost` takes a `fetch_multiplier` (the
+selector/plan count; 1 for the single-fetch `resolve_series_inner` path)
+and scales every estimated quantity by it — an N-selector query can cost
+up to N times a single per-segment pass.
+
+Each query records the estimate and the actual accounting snapshot side
+by side, so the estimate's accuracy is itself measurable before anything
+enforces it. `CostEstimate::divergence` computes the actual/estimated
+ratio per quantity for that purpose. The estimate is recorded but never
+enforced: nothing in this change rejects a query that runs today.
+
+### Tracing spans
+
+`tracing::instrument` spans on the query path, named for the phase they
+cover: `catalog_resolve` (`resolve_bounded`), `segment_open`
+(`open_segment`), `catalog_decode` (`decode_selected`), `page_fetch`
+(`fetch_scalar_pages`/`fetch_histogram_pages`), `decode`
+(`build_scalar_decodes`/`build_histogram_decodes`), `evaluate` (wrapping
+the evaluator call in `instant_inner`/`range_inner`). Span fields carry
+only bounded values — `tenant_hash` as a hex string, `shard`,
+`object_size`, matcher/series counts, and fixed-set kind strings
+(`page_kind`, `eval_kind`) — never query text, label values, or object
+keys, the same allowlist ADR-0044 sets for `/metrics` labels.
+
+### JSON response shape
+
+`GET /api/v1/query` and `/query_range`'s `stats` object gains two new
+fields alongside the existing `segmentsFetched`/`segmentsPruned`:
+
+- `stats.accounting` — the `QueryAccountingSnapshot`, split by op for the
+  S3 counters (`s3GetRequests`/`s3GetBytes`, `s3ListRequests`/
+  `s3ListBytes`, `s3HeadRequests`/`s3HeadBytes`), plus `cacheHits`/
+  `cacheMisses`/`cacheBytes`, `decompressedBytes`, `segmentsOpened`,
+  `segmentsPruned`, `seriesMatched`, `bytesReused`,
+  `peakIntermediateBytes`, and the pre-existing per-run `rawF64Pages`/
+  `rawF64Bytes`.
+- `stats.estimate` — the `CostEstimate`: `estimatedRequests`,
+  `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
+  `series`.
+
 ## PromQL conformance (ADR-0035, issue #133)
 
 What Ravel supports, what it deliberately refuses, and what is simply
