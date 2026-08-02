@@ -128,6 +128,9 @@ impl RspanWriter {
                 max_trace_id: out.max_trace_id,
                 min_start_ts: out.min_start_ts,
                 max_end_ts: out.max_end_ts,
+                min_duration_ns: out.min_duration_ns,
+                max_duration_ns: out.max_duration_ns,
+                status_mask: out.status_mask,
             });
         }
 

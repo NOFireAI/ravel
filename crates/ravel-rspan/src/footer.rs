@@ -14,8 +14,11 @@ use crate::pb;
 
 /// Trailer magic, last 4 bytes of every RSPAN object.
 pub const MAGIC: [u8; 4] = *b"RSP1";
-/// RSPAN trailer version.
-pub const VERSION: u16 = 1;
+/// RSPAN trailer version. v2 (ADR-0045) added per-block duration bounds and a
+/// status mask to SKIP_IDX; v1 is rejected with the same typed
+/// `unsupported version` error as any other unknown version (ADR-0045
+/// decision 4, no dual reader).
+pub const VERSION: u16 = 2;
 /// Signal byte for span segments (Metrics=1 in RSEG, Logs=2 in RLOG, Spans=3).
 pub const SIGNAL_SPANS: u8 = 3;
 /// Reserved trailer byte; must be zero.
@@ -483,6 +486,23 @@ mod tests {
         let mut bad = obj.clone();
         bad[n - 16..n - 12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(open(&bad), Err(SpanSegError::Corrupted(_))));
+    }
+
+    #[test]
+    fn rejects_v1_object() {
+        // A v1 object (trailer version 1) is rejected with the same typed
+        // error as any other unsupported version (ADR-0045 decision 4: no
+        // dual reader).
+        let obj = build_object(2);
+        let n = obj.len();
+        let mut v1 = obj.clone();
+        v1[n - TRAILER_LEN + 8..n - TRAILER_LEN + 10].copy_from_slice(&1u16.to_le_bytes());
+        match open(&v1) {
+            Err(SpanSegError::Corrupted(msg)) => {
+                assert!(msg.contains("unsupported version"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
     }
 
     #[test]

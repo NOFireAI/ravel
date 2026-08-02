@@ -18,6 +18,7 @@ use crate::record::{
     COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID, SPAN_ID_WIDTH, SpanRecord, StatusCode,
     TRACE_ID_WIDTH, encode_attrs,
 };
+use crate::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
 use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
 
 /// Upper bound on a block's decoded record count (untrusted-input guard).
@@ -72,6 +73,12 @@ pub struct BlockWriteOut {
     pub max_end_ts: i64,
     pub min_trace_id: [u8; 16],
     pub max_trace_id: [u8; 16],
+    /// `min(end_ts_ns - start_ts_ns)` over the block's rows (ADR-0045).
+    pub min_duration_ns: i64,
+    /// `max(end_ts_ns - start_ts_ns)` over the block's rows (ADR-0045).
+    pub max_duration_ns: i64,
+    /// Bits 0/1/2 set when any row has status Unset/Ok/Error (ADR-0045).
+    pub status_mask: u8,
 }
 
 /// One page's descriptor, stored in the block header.
@@ -229,6 +236,32 @@ pub fn write_block(rows: &[SpanRecord], zstd_level: i32) -> Result<BlockWriteOut
     let min_trace_id = rows[0].trace_id;
     let max_trace_id = rows[n - 1].trace_id;
 
+    // Duration and status_mask (ADR-0045 decision 2): derived from the same
+    // start/end/status vectors already scanned above, not stored per row. A
+    // negative duration (end precedes start) is a valid ivarint value and is
+    // kept as-is; only true i64 overflow of the subtraction is rejected.
+    let mut min_duration_ns = i64::MAX;
+    let mut max_duration_ns = i64::MIN;
+    let mut status_mask = 0u8;
+    for i in 0..n {
+        let duration = end[i]
+            .checked_sub(start[i])
+            .ok_or_else(|| SpanSegError::Corrupted("span duration overflow".into()))?;
+        min_duration_ns = min_duration_ns.min(duration);
+        max_duration_ns = max_duration_ns.max(duration);
+        status_mask |= match StatusCode::from_u8(status[i] as u8) {
+            Some(StatusCode::Unset) => STATUS_BIT_UNSET,
+            Some(StatusCode::Ok) => STATUS_BIT_OK,
+            Some(StatusCode::Error) => STATUS_BIT_ERROR,
+            None => {
+                return Err(SpanSegError::Corrupted(format!(
+                    "unknown status code {}",
+                    status[i]
+                )));
+            }
+        };
+    }
+
     Ok(BlockWriteOut {
         bytes: block,
         crc32c: crc,
@@ -237,6 +270,9 @@ pub fn write_block(rows: &[SpanRecord], zstd_level: i32) -> Result<BlockWriteOut
         max_end_ts,
         min_trace_id,
         max_trace_id,
+        min_duration_ns,
+        max_duration_ns,
+        status_mask,
     })
 }
 
