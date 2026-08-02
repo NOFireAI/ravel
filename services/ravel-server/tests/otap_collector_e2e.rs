@@ -81,11 +81,6 @@ fn now_ns() -> i64 {
 }
 
 async fn start_test_server() -> ravel_server::Running {
-    // The `otap` feature links the service; this is the runtime opt-in the
-    // `--otap` flag drives in the binary. Without it the ArrowMetricsService
-    // is not registered and the collector's stream would be UNIMPLEMENTED.
-    ravel_server::set_otap_enabled(true);
-
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -106,6 +101,11 @@ async fn start_test_server() -> ravel_server::Running {
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
+        // The `otap` feature links the service; this is the runtime opt-in
+        // the `--otap` flag drives in the binary. Without it the
+        // ArrowMetricsService is not registered and the collector's stream
+        // would be UNIMPLEMENTED.
+        otap: true,
     };
     ravel_server::start(config, store)
         .await

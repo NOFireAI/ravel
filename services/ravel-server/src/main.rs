@@ -35,9 +35,13 @@ async fn main() -> anyhow::Result<()> {
 
     // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
     // feature links the arrow decode stack, `--otap` decides whether this
-    // process registers the ArrowMetricsService. Set before `start` reads it.
+    // process registers the ArrowMetricsService (ServerConfig::otap, read by
+    // `start`). `cli.otap` only exists in an `otap`-featured build; a build
+    // without the feature never registers the service regardless.
     #[cfg(feature = "otap")]
-    ravel_server::set_otap_enabled(cli.otap);
+    let otap = cli.otap;
+    #[cfg(not(feature = "otap"))]
+    let otap = false;
 
     let tenant_tokens = cli.parse_tenant_tokens()?;
     // Fold and maintenance run for the union of the statically mapped bearer
@@ -175,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             sql_lookback: cli.parse_alert_sql_lookback()?,
         },
         oidc_refresh: resolver_bundle.oidc_refresh,
+        otap,
     };
 
     let running = ravel_server::start(config, store).await?;

@@ -53,6 +53,7 @@ async fn start_with_resolver(resolver: Arc<dyn TenantResolver>) -> ravel_server:
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
+        otap: false,
     };
     ravel_server::start(config, store)
         .await
