@@ -499,7 +499,10 @@ mod tests {
         v1[n - TRAILER_LEN + 8..n - TRAILER_LEN + 10].copy_from_slice(&1u16.to_le_bytes());
         match open(&v1) {
             Err(SpanSegError::Corrupted(msg)) => {
-                assert!(msg.contains("unsupported version"), "unexpected message: {msg}");
+                assert!(
+                    msg.contains("unsupported version"),
+                    "unexpected message: {msg}"
+                );
             }
             other => panic!("expected Corrupted, got {other:?}"),
         }
