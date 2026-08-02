@@ -114,6 +114,9 @@ pub async fn sweep(
         superseded_records_deleted,
         superseded_data_deleted,
         unreferenced_parts_deleted,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
     } = sweep_shard(
         store.as_ref(),
         &clock,
@@ -132,6 +135,14 @@ pub async fn sweep(
     println!("superseded_records ({verb}): {superseded_records_deleted}");
     println!("superseded_data ({verb}): {superseded_data_deleted}");
     println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
+    if orphan_breaker_tripped {
+        println!(
+            "orphan breaker: TRIPPED, {orphans_withheld} candidates withheld, deleted nothing \
+             (halt is sticky; see docs/consistency-model.md \"Deletion and GC\")"
+        );
+    } else if orphan_breaker_overridden {
+        println!("orphan breaker: overridden by force_orphan_gc, deleted despite tripping");
+    }
     Ok(())
 }
 

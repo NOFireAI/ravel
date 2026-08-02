@@ -49,6 +49,17 @@ pub const DEFAULT_PROTECTION_HORIZON_NS: i64 = DEFAULT_MAX_QUERY_DURATION_NS + D
 /// value is duplicated here and this comment is the sync contract.
 pub const DEFAULT_MAX_INGEST_LAG_NS: i64 = 2 * NS_PER_HOUR;
 
+/// Default `orphan_breaker_min_count` (ADR-0048 decision 4): the mass-orphan
+/// circuit breaker never trips below this many candidates, however small the
+/// shard, so a handful of genuine orphans in a tiny shard is never mistaken
+/// for mass record loss.
+pub const DEFAULT_ORPHAN_BREAKER_MIN_COUNT: usize = 50;
+/// Default `orphan_breaker_max_ratio` (ADR-0048 decision 4): the mass-orphan
+/// circuit breaker never trips at or below this fraction of the shard's
+/// listed L0 objects, so a large but proportionally unremarkable orphan count
+/// in a large shard is never mistaken for mass record loss.
+pub const DEFAULT_ORPHAN_BREAKER_MAX_RATIO: f64 = 0.10;
+
 /// Everything the compactor needs beyond the store and the clock.
 #[derive(Debug, Clone)]
 pub struct CompactorConfig {
@@ -84,6 +95,30 @@ pub struct CompactorConfig {
     /// query resolved just before the anchor still has time to read the
     /// inputs it pinned. Default [`DEFAULT_PROTECTION_HORIZON_NS`] (25 h).
     pub protection_horizon_ns: i64,
+    /// Mass-orphan circuit breaker minimum candidate count (ADR-0048
+    /// decision 4). The breaker trips a pass only when it would delete at
+    /// least this many orphan candidates AND more than
+    /// [`Self::orphan_breaker_max_ratio`] of the shard's listed L0 objects;
+    /// both conditions must hold, so a tiny shard's small orphan count never
+    /// trips on ratio alone. Default [`DEFAULT_ORPHAN_BREAKER_MIN_COUNT`]
+    /// (50).
+    pub orphan_breaker_min_count: usize,
+    /// Mass-orphan circuit breaker maximum ratio (ADR-0048 decision 4): the
+    /// fraction of a shard's listed L0 objects that orphan candidates may
+    /// reach before the breaker trips, paired with
+    /// [`Self::orphan_breaker_min_count`]. Default
+    /// [`DEFAULT_ORPHAN_BREAKER_MAX_RATIO`] (0.10).
+    pub orphan_breaker_max_ratio: f64,
+    /// One-shot deliberate operator override for a tripped mass-orphan
+    /// breaker (ADR-0048 decision 4). The server never sets this; it exists
+    /// so a future `ravel-cli maintain sweep --override-orphan-breaker`
+    /// invocation can force a single overridden pass. Default `false`: the
+    /// breaker's halt is sticky and never auto-resumes (ADR-0048 rejected
+    /// alternative 3), because in a mass-orphan state the record-absence
+    /// signal orphan GC re-verifies against is exactly what out-of-band
+    /// record loss forges, so only a human can tell mass record loss from a
+    /// legitimate mass abandonment.
+    pub force_orphan_gc: bool,
     /// Dry-run switch (plan §8, P8). When `true`, every maintenance path
     /// computes exactly the same eligible set and decision it would in a real
     /// run -- all reads (LIST/GET/HEAD, re-verify listings, k-way merges,
@@ -110,6 +145,9 @@ impl Default for CompactorConfig {
             compactor_writer_id: Uuid::nil(),
             grace_ns: DEFAULT_GRACE_NS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
+            orphan_breaker_min_count: DEFAULT_ORPHAN_BREAKER_MIN_COUNT,
+            orphan_breaker_max_ratio: DEFAULT_ORPHAN_BREAKER_MAX_RATIO,
+            force_orphan_gc: false,
             dry_run: false,
         }
     }

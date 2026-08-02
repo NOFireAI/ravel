@@ -69,6 +69,6 @@ pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
 pub use scan::{MaintainReport, ScanReport, scan_and_compact, scan_and_maintain};
 pub use sweep::{
-    LeaseCheck, NoLeases, SweepReport, sweep_orphans, sweep_shard, sweep_superseded,
-    sweep_unreferenced_parts,
+    LeaseCheck, NoLeases, OrphanSweepOutcome, SweepReport, sweep_orphans, sweep_shard,
+    sweep_superseded, sweep_unreferenced_parts,
 };

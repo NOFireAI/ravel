@@ -7,8 +7,14 @@
 //!    (a writer abandons any flush older than `max_flush_lifetime` and never
 //!    publishes it afterward) is what makes this safe: a record-less object
 //!    that old can never gain a commit record later, so deleting it cannot
-//!    orphan a future reader. Commit-record absence is re-verified with a
-//!    fresh strongly consistent LIST immediately before each delete.
+//!    orphan a future reader. Commit-record absence is re-verified with one
+//!    fresh strongly consistent LIST shared by every candidate in the pass
+//!    (ADR-0048 decision 5), then gated by a mass-orphan circuit breaker
+//!    (ADR-0048 decision 4): a pass that would delete at least
+//!    `orphan_breaker_min_count` candidates AND more than
+//!    `orphan_breaker_max_ratio` of the shard's listed L0 objects deletes
+//!    nothing and halts, because that shape is the signature of an
+//!    out-of-band commit-record loss, not routine cleanup.
 //! 2. **Superseded-input sweep** (ADR-0018): the L0 commit records and data
 //!    objects a compaction record names in its input list, once
 //!    `now >= record.created_unix_ns + protection_horizon`. Records are
@@ -92,6 +98,20 @@ pub struct SweepReport {
     pub superseded_data_deleted: usize,
     /// Rule 3: unreferenced `l1/` part objects deleted.
     pub unreferenced_parts_deleted: usize,
+    /// Rule 1's mass-orphan circuit breaker tripped this pass (ADR-0048
+    /// decision 4): `orphans_deleted` is `0` and `orphans_withheld` carries
+    /// what would have been deleted. Rules 2 and 3 above are unaffected and
+    /// still ran, since they are anchored on durable records an operator or
+    /// compactor deliberately wrote, never on record absence.
+    pub orphan_breaker_tripped: bool,
+    /// Orphan candidates withheld by a tripped breaker this pass. Always `0`
+    /// when `orphan_breaker_tripped` is `false`.
+    pub orphans_withheld: usize,
+    /// This pass deleted orphans despite exceeding the breaker's threshold,
+    /// because `CompactorConfig::force_orphan_gc` overrode it (ADR-0048
+    /// decision 4's one-shot operator override). Always `false` when
+    /// `orphan_breaker_tripped` is `true`.
+    pub orphan_breaker_overridden: bool,
 }
 
 /// Run all three sweep rules over one `(tenant, signal, shard)` and report
@@ -116,20 +136,53 @@ pub async fn sweep_shard(
         sweep_superseded(store, clock, config, lease, tenant, signal, shard).await?;
     let unreferenced_parts_deleted =
         sweep_unreferenced_parts(store, clock, config, lease, tenant, signal, shard).await?;
-    let orphans_deleted = sweep_orphans(store, clock, config, lease, tenant, signal, shard).await?;
+    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
+        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
+            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+                (0, true, candidates, false)
+            }
+            Err(e) => return Err(e),
+        };
     Ok(SweepReport {
         orphans_deleted,
         superseded_records_deleted,
         superseded_data_deleted,
         unreferenced_parts_deleted,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
     })
 }
 
 // --- Rule 1: orphan GC (ADR-0010 §11) --------------------------------------
 
-/// Delete every record-less `l0/` data object older than the orphan age gate,
-/// re-verifying commit-record absence with a fresh strongly consistent LIST
-/// immediately before each delete. Returns the number deleted.
+/// What one orphan-GC pass did (ADR-0048 decisions 4 and 5). A pass that
+/// trips the mass-orphan breaker without an override returns
+/// [`MaintainError::OrphanBreakerTripped`] instead of this type, and deletes
+/// nothing; [`sweep_shard`] folds that error into [`SweepReport`]'s breaker
+/// fields for callers that run the whole shard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanSweepOutcome {
+    /// Record-less `l0/` data objects deleted this pass.
+    pub deleted: usize,
+    /// This pass exceeded the breaker's threshold but proceeded anyway
+    /// because [`CompactorConfig::force_orphan_gc`] was set (ADR-0048
+    /// decision 4's one-shot operator override).
+    pub breaker_overridden: bool,
+}
+
+/// Delete every record-less `l0/` data object older than the orphan age
+/// gate. Three phases (ADR-0048 decisions 4 and 5): (a) candidate selection
+/// over one listing of the shard's L0 data objects, filtered by the
+/// commit-record identities already present, the age gate, and lease
+/// protection; (b) one fresh strongly consistent LIST of the commit prefix,
+/// shared by every candidate, dropping any whose identity now appears
+/// (replacing the old per-candidate full-shard LIST, the dominant request
+/// cost of a sweep); (c) the mass-orphan circuit breaker gate; (d) delete.
+/// A tripped, non-overridden breaker returns
+/// [`MaintainError::OrphanBreakerTripped`] before phase (d), so the pass is
+/// all-or-nothing: either every surviving candidate is deleted, or none are.
 pub async fn sweep_orphans(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -138,14 +191,19 @@ pub async fn sweep_orphans(
     tenant: &TenantHash,
     signal: Signal,
     shard: u32,
-) -> Result<usize> {
+) -> Result<OrphanSweepOutcome> {
     let now = clock.now_ns();
     let gate = config.orphan_age_gate_ns();
-    let referenced = referenced_l0_identities(store, tenant, signal, shard).await?;
 
+    // Phase (a): candidate selection over one listing of the shard's L0 data
+    // objects, checked against the commit-record identities from one initial
+    // commit-prefix LIST.
     let prefix = l0_data_prefix(tenant, signal, shard)?;
     let objects = list_all(store, &prefix).await?;
-    let mut deleted = 0usize;
+    let l0_objects_listed = objects.len();
+    let referenced = referenced_l0_identities(store, tenant, signal, shard).await?;
+
+    let mut candidates: Vec<(ObjectMeta, (Uuid, u64, u64))> = Vec::new();
     for meta in objects {
         let parsed = keys::parse_data_key(&meta.key)?;
         let identity = (parsed.writer_id, parsed.epoch, parsed.seq);
@@ -158,19 +216,50 @@ pub async fn sweep_orphans(
         if lease.is_protected(&meta.key) {
             continue;
         }
-        // Re-verify absence immediately before the delete, via a fresh
-        // strongly consistent LIST (ADR-0010 §11): a commit record may have
-        // landed for this identity since the first listing.
+        candidates.push((meta, identity));
+    }
+
+    // Phase (b): one fresh, batched re-verify LIST of the commit prefix,
+    // shared by every candidate this pass (ADR-0048 decision 5): a commit
+    // record may have landed for a candidate's identity since the first
+    // listing. Skipped when there is nothing to re-verify.
+    if !candidates.is_empty() {
         let fresh = referenced_l0_identities(store, tenant, signal, shard).await?;
-        if fresh.contains(&identity) {
-            continue;
-        }
+        candidates.retain(|(_, identity)| !fresh.contains(identity));
+    }
+
+    // Phase (c): the mass-orphan circuit breaker (ADR-0048 decision 4). Both
+    // conditions must hold: a tiny shard's small orphan count never trips on
+    // ratio alone, and any genuinely mass orphan population trips regardless
+    // of shard size.
+    let candidate_count = candidates.len();
+    let would_trip = candidate_count >= config.orphan_breaker_min_count
+        && (candidate_count as f64) > config.orphan_breaker_max_ratio * (l0_objects_listed as f64);
+
+    if would_trip && !config.force_orphan_gc {
+        return Err(MaintainError::OrphanBreakerTripped {
+            tenant_hash: tenant.to_hex(),
+            signal: signal.key_prefix().to_string(),
+            shard,
+            candidates: candidate_count,
+            l0_objects_listed,
+            min_count: config.orphan_breaker_min_count,
+            max_ratio: config.orphan_breaker_max_ratio,
+        });
+    }
+
+    // Phase (d): delete. All-or-nothing: phase (c) already returned if the
+    // pass should delete zero.
+    for (meta, _) in &candidates {
         if !config.dry_run {
             store.delete(&meta.key).await?;
         }
-        deleted += 1;
     }
-    Ok(deleted)
+
+    Ok(OrphanSweepOutcome {
+        deleted: candidate_count,
+        breaker_overridden: would_trip && config.force_orphan_gc,
+    })
 }
 
 /// The set of L0 commit-record identities `(writer_id, epoch, seq)` present in
