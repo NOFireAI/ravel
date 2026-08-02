@@ -224,18 +224,20 @@ It is recorded at existing funnels only, never at scattered call sites:
   (get/list/head), `bytes_reused` (bytes served from an already-fetched
   region without a second GET), `decompressed_bytes`, `segments_opened`,
   `series_matched`.
-- `LogSegmentFetcher`'s own funnel (crates/ravel-query/src/log_fetcher.rs),
-  so the log path is accounted like the metric path instead of being
-  silently free.
-
-`Catalog::guarded_get`/`guarded_list_all` (crates/ravel-catalog) are the
-third funnel ADR-0044 names, threading `QueryAccounting` through
-`Catalog::resolve` itself. That wiring is a separate, parallel task; a
-seam comment at `QueryEngine::resolve_bounded`'s `catalog.resolve_pruned`
-call marks where it plugs in. Until it lands, `cache_hits`/`cache_misses`/
-`cache_bytes` and the catalog-side share of `segments_pruned` stay at
-zero in the snapshot; every counter recorded from `ravel-query`'s own two
-funnels above is live today.
+- `LogSegmentFetcher::fetch_accounted` (crates/ravel-query/src/
+  log_fetcher.rs), so the log path can be accounted like the metric path
+  instead of being silently free. `engine.rs` has no references to
+  `LogSegmentFetcher` at all: the real production callers (ravel-sql's
+  `logs_provider`, `alerts_scan`, `audit_scan`, `audit_provider`) still
+  call the unaccounted `fetch`. Wiring them onto this funnel is issue
+  #424.
+- `Catalog::guarded_get`/`guarded_list_all` (crates/ravel-catalog), for
+  every catalog-side store call `Catalog::resolve` makes on the query's
+  behalf: `s3_requests`/`s3_bytes` for the resolve LISTs and GETs, plus
+  `cache_hits`/`cache_misses`/`cache_bytes` for the record cache.
+  `QueryEngine::resolve_bounded` calls `resolve_pruned_with_accounting`
+  with the same handle the query attempt reports, so these counters are
+  live in the snapshot today, not zero.
 
 A `QueryAccountingSnapshot` (point-in-time copy via `.snapshot()`) is
 attached to `QueryStats` alongside the existing `segments_fetched`/
@@ -244,14 +246,30 @@ narrower than `decompressed_bytes`: only `ValPageKind::RawF64` pages).
 
 ### Pre-execution cost estimate
 
-After `Catalog::resolve` returns a pinned snapshot and before any page
-fetch, `engine::estimate_cost` computes a `CostEstimate` from fields
-already on that snapshot's `SegmentRef`s (`object_size`, `sample_count`,
-`series_count`); nothing about the fetch plan needs to run first because
-it is deterministic given the matchers. The estimate is an upper
-envelope, never a prediction: every quantity the planner cannot bound
-exactly takes the worst case, because under-estimating is the failure
-that matters once a later ADR enforces a budget on this number.
+The estimate has two parts, computed at two different moments, because
+one moment cannot cover both (ADR-0044 decision 3, amended).
+
+**The catalog term**, computed before `Catalog::resolve` runs:
+`Catalog::estimated_list_requests` bounds the LISTs resolve will issue
+from inputs the planner already has going in — `shard_count` and the
+number of hour buckets the padded window spans — with no snapshot HEAD
+to shorten the listed suffix, one LIST per `(shard, hour)` pair. This
+term is folded into `estimated_requests` unconditionally, including when
+the window resolves to zero segments, so a fully-pruned window still
+carries a non-zero request estimate against its non-zero actual LIST
+count.
+
+**The segment term**, computed after `Catalog::resolve` returns a pinned
+snapshot and before any page fetch: `engine::estimate_cost` computes the
+rest of the `CostEstimate` from fields already on that snapshot's
+`SegmentRef`s (`object_size`, `sample_count`, `series_count`); nothing
+about the fetch plan needs to run first because it is deterministic
+given the matchers.
+
+Both terms are an upper envelope, never a prediction: every quantity the
+planner cannot bound exactly takes the worst case, because
+under-estimating is the failure that matters once a later ADR enforces a
+budget on this number.
 
 Constants (crates/ravel-query/src/engine.rs):
 
@@ -266,11 +284,20 @@ Constants (crates/ravel-query/src/engine.rs):
 - `STORE_BYTES_SAFETY_FACTOR = 2` applied to `object_size` — covers
   re-reading a segment across a retry (snapshot invalidation) without
   claiming a tighter per-page bound than the catalog can prove pre-fetch.
-- `BYTES_PER_SAMPLE_UPPER_BOUND = 512` applied to `sample_count` for
-  `estimated_decompressed_bytes` — a heuristic ceiling, not a proven
-  bound. Native histograms have no fixed per-sample size (bucket count
-  varies per series), so this is deliberately generous rather than
-  derived from the format.
+- `Catalog::estimated_list_requests(window, now_ns)` — the catalog term:
+  `shard_count * hour_buckets_spanned`, computed pre-resolve.
+- `segment_decompressed_bytes_upper_bound` applied per segment for
+  `estimated_decompressed_bytes` — derived from the segment's own value
+  kinds rather than one constant, per ADR-0044's amended requirement.
+  `SegmentRef::sample_count` aggregates scalar and native-histogram
+  samples with no split by kind, so this bounds every sample at
+  `ReaderLimits::max_page_uncompressed_bytes` (the page-size ceiling no
+  decoded sample can structurally exceed), capped again by twice
+  `ReaderLimits::max_section_uncompressed_bytes` (a segment carries at
+  most one VAL_PAGES and one HIST_PAGES section). This never
+  under-shoots, but is deliberately loose for scalar-only segments —
+  closing that gap needs a persisted per-kind sample count, which is a
+  frozen-format change, not something this estimate can derive today.
 
 `prefetch` fans out one independent fetch per selector against the same
 shared snapshot, so `estimate_cost` takes a `fetch_multiplier` (the
@@ -292,10 +319,11 @@ cover: `catalog_resolve` (`resolve_bounded`), `segment_open`
 (`fetch_scalar_pages`/`fetch_histogram_pages`), `decode`
 (`build_scalar_decodes`/`build_histogram_decodes`), `evaluate` (wrapping
 the evaluator call in `instant_inner`/`range_inner`). Span fields carry
-only bounded values — `tenant_hash` as a hex string, `shard`,
-`object_size`, matcher/series counts, and fixed-set kind strings
-(`page_kind`, `eval_kind`) — never query text, label values, or object
-keys, the same allowlist ADR-0044 sets for `/metrics` labels.
+only bounded values — `tenant_hash` as a hex string, `object_size`,
+matcher/series counts, and fixed-set kind strings (`page_kind`,
+`eval_kind`) — never query text, label values, object keys, or `shard`
+(ADR-0044 decision 5's rejected alternative 6: shard is not a label),
+the same allowlist ADR-0044 sets for `/metrics` labels.
 
 ### JSON response shape
 
@@ -306,9 +334,12 @@ fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   S3 counters (`s3GetRequests`/`s3GetBytes`, `s3ListRequests`/
   `s3ListBytes`, `s3HeadRequests`/`s3HeadBytes`), plus `cacheHits`/
   `cacheMisses`/`cacheBytes`, `decompressedBytes`, `segmentsOpened`,
-  `segmentsPruned`, `seriesMatched`, `bytesReused`,
-  `peakIntermediateBytes`, and the pre-existing per-run `rawF64Pages`/
-  `rawF64Bytes`.
+  `seriesMatched`, `bytesReused`, `peakIntermediateBytes`, and the
+  pre-existing per-run `rawF64Pages`/`rawF64Bytes`. No `segmentsPruned`
+  here: `stats.segmentsPruned` (below) is the sole source, sourced from
+  `Catalog::resolve`'s own count; `QueryAccounting`'s own
+  `segments_pruned` counter has no caller in `ravel-query` or
+  `ravel-catalog` and would only ever render 0.
 - `stats.estimate` — the `CostEstimate`: `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.

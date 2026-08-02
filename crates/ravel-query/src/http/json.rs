@@ -90,7 +90,12 @@ impl From<crate::QueryStats> for QueryStatsJson {
 /// pre-existing per-segment `FetchStats` (issue #25, X1): a narrower count
 /// of `ValPageKind::RawF64` pages specifically, kept distinct from
 /// `decompressed_bytes` (the typed-output footprint of every decoded
-/// sample, any encoding).
+/// sample, any encoding). Has no `segmentsPruned` field: `QueryAccounting`
+/// carries a `segments_pruned` counter, but nothing in `ravel-query` or
+/// `ravel-catalog` ever calls `add_segments_pruned`, so it would always
+/// render 0 next to the correctly-populated `QueryStatsJson.segments_pruned`
+/// (sourced from `Catalog::resolve`'s own count). Sibling field, sole
+/// source of truth; do not reintroduce a second, always-zero copy here.
 #[derive(Debug, Serialize)]
 pub struct QueryAccountingJson {
     #[serde(rename = "s3GetRequests")]
@@ -115,8 +120,6 @@ pub struct QueryAccountingJson {
     pub decompressed_bytes: u64,
     #[serde(rename = "segmentsOpened")]
     pub segments_opened: u64,
-    #[serde(rename = "segmentsPruned")]
-    pub segments_pruned: u64,
     #[serde(rename = "seriesMatched")]
     pub series_matched: u64,
     #[serde(rename = "bytesReused")]
@@ -146,7 +149,6 @@ impl QueryAccountingJson {
             cache_bytes: snapshot.cache_bytes,
             decompressed_bytes: snapshot.decompressed_bytes,
             segments_opened: snapshot.segments_opened,
-            segments_pruned: snapshot.segments_pruned,
             series_matched: snapshot.series_matched,
             bytes_reused: snapshot.bytes_reused,
             peak_intermediate_bytes: snapshot.peak_intermediate_bytes,

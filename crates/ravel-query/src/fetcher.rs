@@ -402,7 +402,7 @@ impl SegmentFetcher {
         level = "debug",
         name = "segment_open",
         skip_all,
-        fields(tenant_hash = %tenant_hash.to_hex(), shard = seg_ref.shard, object_size = seg_ref.object_size),
+        fields(tenant_hash = %tenant_hash.to_hex(), object_size = seg_ref.object_size),
     )]
     async fn open_segment(
         &self,
