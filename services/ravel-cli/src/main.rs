@@ -80,6 +80,18 @@ enum Command {
         #[command(subcommand)]
         command: MaintainCommand,
     },
+    /// Object store backend qualification (ADR-0050 section 6).
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StoreCommand {
+    /// Run the conformance suite against the configured backend and, on a
+    /// pass, record the outcome at `sys/qualification`.
+    Qualify {},
 }
 
 #[derive(Debug, Subcommand)]
@@ -332,6 +344,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Maintain {
             command: MaintainCommand::VerifyCustody { tenant, shards },
         } => maintain::verify_custody(store::build_store(&cli.store)?, &tenant, shards).await,
+        Command::Store {
+            command: StoreCommand::Qualify {},
+        } => {
+            let run_id = uuid::Uuid::new_v4();
+            ravel_cli::qualify::qualify(
+                store::build_store(&cli.store)?,
+                cli.store.backend_identity(),
+                &run_id.to_string(),
+            )
+            .await
+        }
     }
 }
 

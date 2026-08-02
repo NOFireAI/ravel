@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod maintain;
+pub mod qualify;
 pub mod store;
 
 use std::time::{SystemTime, UNIX_EPOCH};

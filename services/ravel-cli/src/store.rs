@@ -36,6 +36,25 @@ pub struct StoreArgs {
     pub s3_secret_key: Option<String>,
 }
 
+impl StoreArgs {
+    /// Human-readable backend identity for display and for the
+    /// `sys/qualification` record (ADR-0050 section 6): distinguishes which
+    /// bucket/endpoint a qualification result belongs to, without leaking
+    /// credentials.
+    pub fn backend_identity(&self) -> String {
+        match self.store {
+            StoreKind::Memory => "memory".to_string(),
+            StoreKind::S3 => {
+                let bucket = self.s3_bucket.as_deref().unwrap_or("<unset>");
+                match self.s3_endpoint.as_deref() {
+                    Some(endpoint) => format!("s3://{bucket}@{endpoint}"),
+                    None => format!("s3://{bucket}"),
+                }
+            }
+        }
+    }
+}
+
 pub fn build_store(args: &StoreArgs) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
     match args.store {
         StoreKind::Memory => Ok(Arc::new(MemoryStore::new())),
