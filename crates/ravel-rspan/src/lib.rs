@@ -26,8 +26,9 @@ pub mod skip_index;
 pub mod varint;
 pub mod writer;
 
-/// Generated protobuf types for the RSPAN footer. The `proto/rspan.proto` file
-/// is the source of truth; field numbers are frozen (see the file header).
+/// Generated protobuf types for the RSPAN footer. The
+/// `proto/ravel/rspan.proto` file is the source of truth; field numbers are
+/// frozen (see the file header).
 pub(crate) mod pb {
     include!(concat!(env!("OUT_DIR"), "/ravel.rspan.v1.rs"));
 }
