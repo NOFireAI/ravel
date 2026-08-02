@@ -83,7 +83,7 @@ Identical in shape to RLOG/RSEG:
 
 ## SpanFooter
 
-Defined in `crates/ravel-rspan/proto/rspan.proto`
+Defined in `proto/ravel/rspan.proto`
 (`ravel.rspan.v1.SpanFooter`). Field numbers are frozen; only additive changes
 with new field numbers are permitted. The message is separate from RLOG's
 `ravel.logseg.v1.LogFooter`, not an extension of it: a span object has no
