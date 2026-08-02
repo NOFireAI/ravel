@@ -311,6 +311,42 @@ async fn empty_holds_equals_no_leases() {
     );
 }
 
+/// An empty scope is a prefix of every key, so `write_hold_set`/
+/// `write_hold_clear` must reject it before writing any object. Proven by
+/// asserting the store's object count is unchanged after each failed call.
+#[tokio::test]
+async fn empty_scope_is_rejected_before_any_write() {
+    let store = MemoryStore::new();
+    let tenant = tenant_hash();
+    let before = all_keys(&store).await.len();
+
+    let set_err = write_hold_set(&store, &tenant, Uuid::from_u128(1), 100, "", "reason")
+        .await
+        .expect_err("empty-scope set must error");
+    assert!(matches!(
+        set_err,
+        ravel_maintain::MaintainError::Invariant(_)
+    ));
+    assert_eq!(
+        all_keys(&store).await.len(),
+        before,
+        "no object written for a rejected set"
+    );
+
+    let clear_err = write_hold_clear(&store, &tenant, Uuid::from_u128(2), 100, "")
+        .await
+        .expect_err("empty-scope clear must error");
+    assert!(matches!(
+        clear_err,
+        ravel_maintain::MaintainError::Invariant(_)
+    ));
+    assert_eq!(
+        all_keys(&store).await.len(),
+        before,
+        "no object written for a rejected clear"
+    );
+}
+
 /// Every object key under the tenant prefix, sorted.
 async fn all_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
     let prefix = format!("t/{}/", tenant_hash().to_hex());
