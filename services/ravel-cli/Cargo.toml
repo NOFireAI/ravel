@@ -20,11 +20,10 @@ blake3 = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
-
-[dev-dependencies]
 bytes = { workspace = true }
 
 [lints]

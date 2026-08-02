@@ -4352,6 +4352,7 @@ dependencies = [
  "ravel-rspan",
  "ravel-segment",
  "ravel-types",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
