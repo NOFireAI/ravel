@@ -141,7 +141,7 @@ async fn histogram_and_scalar_points_ingest_and_read_back_as_v5() {
         .data;
     let limits = ReaderLimits::default();
     let loc = ravel_segment::open_from_full(&data_bytes, limits).expect("opens segment");
-    assert_eq!(loc.version, 5);
+    assert_eq!(loc.version, SEGMENT_FORMAT_VERSION);
 
     let entries = ravel_segment::decode_catalog_v5(&loc.footer, &data_bytes, limits)
         .expect("decodes catalog");

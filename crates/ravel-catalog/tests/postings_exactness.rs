@@ -30,6 +30,7 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_proto::catalog::v1::SnapshotEntry;
 use ravel_segment::{
     ExpectedIdentity, IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInput,
+    VERSION_V6,
 };
 use ravel_types::{
     Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
@@ -72,8 +73,8 @@ fn series_input(tenant: &TenantId, metric: &str) -> SeriesInput {
     }
 }
 
-/// Writes one real RSEG v5 segment covering `metrics` and publishes its
-/// commit record. ADR-0027 left v5 the only version; the trailing `_use_v2`
+/// Writes one real RSEG v6 segment covering `metrics` and publishes its
+/// commit record. ADR-0027 left v6 the only version; the trailing `_use_v2`
 /// flag is retained (ignored) so the call sites need not change.
 #[allow(clippy::too_many_arguments)]
 async fn publish_real_segment(
@@ -100,7 +101,7 @@ async fn publish_real_segment(
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
     };
-    let written = SegmentWriter::write(inputs, identity, bounds).expect("write v5 segment");
+    let written = SegmentWriter::write(inputs, identity, bounds).expect("write v6 segment");
 
     let new_record = NewCommitRecord {
         tenant_hash,
@@ -117,7 +118,7 @@ async fn publish_real_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
         created_unix_ns: 0,
         ingest_hour_bucket,
     };
@@ -169,12 +170,16 @@ async fn brute_force_names(
     };
     ravel_segment::check_identity(&location.footer, &expected).expect("identity checks out");
 
-    assert_eq!(location.version, 5, "ADR-0027: v5 is the only version");
-    // The chunked v5 catalog spans sections; decode it over the whole object
-    // (already fetched) and fold to the per-series `SeriesEntry` view.
+    assert_eq!(
+        location.version, VERSION_V6,
+        "ADR-0027: v6 is the only version"
+    );
+    // The chunked v5-shaped catalog (unchanged by the v6 EXEMPLARS addition)
+    // spans sections; decode it over the whole object (already fetched) and
+    // fold to the per-series `SeriesEntry` view.
     let series: Vec<ravel_segment::SeriesEntry> =
         ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)
-            .expect("decode v5 catalog")
+            .expect("decode catalog")
             .into_iter()
             .map(|e| e.entry)
             .collect();

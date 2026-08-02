@@ -8,7 +8,7 @@
 //! records and reconstructs keys), so these tests build commit and
 //! compaction records directly and never need real segment bytes; the
 //! full fetch-and-decode differential proof lives in ravel-query's
-//! `differential_compaction` test against real RSEG v5 L1 parts.
+//! `differential_compaction` test against real RSEG v6 L1 parts.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -26,6 +26,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
 };
+use ravel_segment::VERSION_V6;
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
@@ -69,7 +70,7 @@ fn l0_record(
         max_event_ts_ns,
         min_ingest_ts_ns: min_event_ts_ns,
         max_ingest_ts_ns: max_event_ts_ns,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
         created_unix_ns,
         ingest_hour_bucket: hour,
     })
@@ -96,7 +97,7 @@ fn part(part_index: u32, min_event_ts_ns: i64, max_event_ts_ns: i64, seed: u8) -
         run_count: 3,
         min_event_ts_ns,
         max_event_ts_ns,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
     }
 }
 

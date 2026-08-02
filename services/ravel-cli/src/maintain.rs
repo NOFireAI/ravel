@@ -222,7 +222,7 @@ pub async fn status(
 /// audit, not a migration tool.
 ///
 /// The supported version is read from each reader crate's own constant
-/// (`ravel_segment::VERSION_V5`, `ravel_logseg::footer::VERSION`,
+/// (`ravel_segment::VERSION_V6`, `ravel_logseg::footer::VERSION`,
 /// `ravel_rspan::footer::VERSION`) so a future version bump does not silently
 /// make this audit stale. Version numbers are
 /// read from each surviving commit record's `segment_format_version` (an L0

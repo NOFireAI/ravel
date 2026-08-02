@@ -21,6 +21,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, RetentionTombstone,
 };
+use ravel_segment::VERSION_V6;
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
@@ -92,7 +93,7 @@ async fn seed_compaction(store: &MemoryStore, tenant: &str, inputs: &[(Uuid, u64
         run_count: 1,
         min_event_ts_ns: 100,
         max_event_ts_ns: 200,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
     };
     let record = CompactionRecord {
         format_version: 1,
@@ -296,7 +297,7 @@ fn decode_compaction_record_prints_fields() {
             run_count: 3,
             min_event_ts_ns: 100,
             max_event_ts_ns: 200,
-            segment_format_version: 5,
+            segment_format_version: u32::from(VERSION_V6),
         }],
         created_unix_ns: 999,
     };

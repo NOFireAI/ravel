@@ -22,7 +22,9 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine, QueryError};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment};
+use ravel_segment::{
+    IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V6, WrittenSegment,
+};
 use ravel_types::{
     Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
 };
@@ -62,9 +64,9 @@ fn series_input(tenant_id: &TenantId, metric: &str, ts_ns: i64, value: f64) -> S
     }
 }
 
-/// Writes one real RSEG v5 segment and publishes its commit record,
+/// Writes one real RSEG v6 segment and publishes its commit record,
 /// mirroring `postings_exactness.rs`'s `publish_real_segment`. ADR-0027 left
-/// v5 the only version; the trailing `_use_v2` flag is retained (ignored) so
+/// v6 the only version; the trailing `_use_v2` flag is retained (ignored) so
 /// the many call sites need not change.
 async fn publish_segment(
     store: &dyn ObjectStoreBackend,
@@ -87,7 +89,7 @@ async fn publish_segment(
         max_ingest_ts_ns: 0,
     };
     let written: WrittenSegment =
-        SegmentWriter::write(inputs, identity, bounds).expect("write v5 segment");
+        SegmentWriter::write(inputs, identity, bounds).expect("write v6 segment");
 
     let new_record = NewCommitRecord {
         tenant_hash,
@@ -104,7 +106,7 @@ async fn publish_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: 5,
+        segment_format_version: u32::from(VERSION_V6),
         created_unix_ns: 0,
         ingest_hour_bucket,
     };
