@@ -16,7 +16,9 @@ pub use config::{
 };
 pub use engine::{QueryEngine, QueryStats};
 pub use error::QueryError;
-pub use fetcher::{FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SegmentFetcher};
+pub use fetcher::{
+    CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SegmentFetcher,
+};
 pub use log_fetcher::{
     LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher, StreamAttrEquals,
 };
