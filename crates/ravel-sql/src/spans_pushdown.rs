@@ -600,6 +600,7 @@ fn lit_utf8(e: &Expr) -> Option<String> {
 mod tests {
     use datafusion::logical_expr::{BinaryExpr, and, or};
     use datafusion::prelude::{col, lit};
+    use ravel_rspan::skip_index::{BlockEntry, SkipIndex};
 
     use super::*;
 
@@ -609,6 +610,25 @@ mod tests {
 
     fn fsb(bytes: [u8; 16]) -> Expr {
         lit(ScalarValue::FixedSizeBinary(16, Some(bytes.to_vec())))
+    }
+
+    /// A block whose trace_id/ts/duration/status ranges are maximally wide,
+    /// so a test can narrow only the one field it cares about and be sure no
+    /// other axis is what caused a survive/prune result.
+    fn full_range_block() -> BlockEntry {
+        BlockEntry {
+            block_offset: 0,
+            block_len: 0,
+            block_crc32c: 0,
+            record_count: 1,
+            min_trace_id: [0u8; 16],
+            max_trace_id: [0xffu8; 16],
+            min_start_ts: i64::MIN,
+            max_end_ts: i64::MAX,
+            min_duration_ns: i64::MIN,
+            max_duration_ns: i64::MAX,
+            status_mask: STATUS_BIT_UNSET | STATUS_BIT_OK | STATUS_BIT_ERROR,
+        }
     }
 
     #[test]
@@ -788,6 +808,105 @@ mod tests {
         });
         let p = extract_spans(&[e]);
         assert_eq!((p.ts_lo, p.ts_hi), (None, None));
+    }
+
+    // --- widen-only soundness: extracted bounds fed into the real
+    // ravel_rspan::skip_index::candidate_blocks, proving a block containing a
+    // matching row always survives (not just "some blocks get dropped") ---
+
+    #[test]
+    fn duration_gt_boundary_excludes_the_threshold_row_but_keeps_the_next_one() {
+        // `duration_ns > 500_000_000`: a row of exactly 500_000_000 does not
+        // match (strict), a row of 500_000_001 does.
+        let p = extract_spans(&[col("duration_ns").gt(lit(500_000_000i64))]);
+        let window = p.duration_window().expect("duration bound extracted");
+
+        let at_threshold = BlockEntry {
+            min_duration_ns: 500_000_000,
+            max_duration_ns: 500_000_000,
+            ..full_range_block()
+        };
+        let one_above = BlockEntry {
+            min_duration_ns: 500_000_001,
+            max_duration_ns: 500_000_001,
+            ..full_range_block()
+        };
+        let index = SkipIndex::new(vec![at_threshold, one_above]);
+        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, Some(window), None);
+        assert!(
+            kept.contains(&1),
+            "a block whose only row is one ns past a strict > threshold must survive"
+        );
+    }
+
+    #[test]
+    fn duration_gteq_boundary_keeps_the_exact_threshold_row() {
+        // `duration_ns >= 500_000_000`: a row of exactly 500_000_000 matches.
+        let p = extract_spans(&[col("duration_ns").gt_eq(lit(500_000_000i64))]);
+        let window = p.duration_window().expect("duration bound extracted");
+
+        let at_threshold = BlockEntry {
+            min_duration_ns: 500_000_000,
+            max_duration_ns: 500_000_000,
+            ..full_range_block()
+        };
+        let index = SkipIndex::new(vec![at_threshold]);
+        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, Some(window), None);
+        assert_eq!(
+            kept,
+            vec![0],
+            "a row exactly at a >= threshold must survive pruning"
+        );
+    }
+
+    #[test]
+    fn status_mask_soundness_a_block_with_the_matching_status_survives() {
+        let p = extract_spans(&[col("status_code").eq(lit(2i64))]);
+        let mask = p.status_mask.expect("status bit extracted");
+
+        let has_error = BlockEntry {
+            status_mask: STATUS_BIT_ERROR,
+            ..full_range_block()
+        };
+        let no_error = BlockEntry {
+            status_mask: STATUS_BIT_OK | STATUS_BIT_UNSET,
+            ..full_range_block()
+        };
+        let index = SkipIndex::new(vec![has_error, no_error]);
+        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, None, Some(mask));
+        assert!(
+            kept.contains(&0) && !kept.contains(&1),
+            "only the block that can hold an Error row may survive"
+        );
+    }
+
+    #[test]
+    fn disjunctive_status_predicate_disables_pruning_and_keeps_every_block() {
+        // `status_code = 1 OR status_code = 2`: no bound is extracted, per
+        // contains_or. Fed straight into candidate_blocks, that `None` keeps
+        // every block -- including one that (as it happens) cannot satisfy
+        // either disjunct. That is the correct, widen-only behavior: proving
+        // such a block unreachable would require soundly narrowing an OR,
+        // which this file deliberately refuses to attempt (see
+        // `contains_or`'s doc).
+        let disjunctive = or(
+            col("status_code").eq(lit(1i64)),
+            col("status_code").eq(lit(2i64)),
+        );
+        let p = extract_spans(&[disjunctive]);
+        assert_eq!(p.status_mask, None, "an OR must not narrow the status axis");
+
+        let only_unset = BlockEntry {
+            status_mask: STATUS_BIT_UNSET,
+            ..full_range_block()
+        };
+        let index = SkipIndex::new(vec![only_unset]);
+        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, None, p.status_mask);
+        assert_eq!(
+            kept,
+            vec![0],
+            "with pruning disabled for the OR'd axis every block must survive"
+        );
     }
 
     #[test]

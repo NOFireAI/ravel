@@ -801,6 +801,23 @@ mod tests {
         assert!(tables("SELECT 1").is_empty());
     }
 
+    /// The two-real-table detection ADR-0033 and ADR-0045 decision 5 both
+    /// rely on (`target_signal`'s `has_samples`/`has_logs` check is the same
+    /// idea for its own pair) must see every one of the three real-table
+    /// pairs `samples`/`logs`/`spans` can form, since `referenced_base_tables`
+    /// is signal-agnostic and does not special-case which table names are
+    /// "real": adding `spans` as a third table needed no change here, only a
+    /// query proving it.
+    #[test]
+    fn referenced_tables_see_all_three_real_table_pairs() {
+        let samples_spans =
+            tables("SELECT * FROM samples JOIN spans ON samples.ts = spans.start_ts");
+        assert!(samples_spans.contains("samples") && samples_spans.contains("spans"));
+
+        let logs_spans = tables("SELECT * FROM logs JOIN spans ON logs.ts = spans.start_ts");
+        assert!(logs_spans.contains("logs") && logs_spans.contains("spans"));
+    }
+
     /// A CTE whose declared name collides with a real table name is not a
     /// reference to that real table: `WITH logs AS (...) ... FROM logs` reads
     /// only whatever the CTE body reads. Regression for the ADR-0033 wiring,
@@ -829,6 +846,23 @@ mod tests {
         assert!(
             !via_cte.contains("samples"),
             "a CTE named `samples` is not the real samples table: {via_cte:?}"
+        );
+    }
+
+    /// A CTE named `spans` is query-local, just like the existing `logs`/
+    /// `samples` cases: it must not be mistaken for the real `spans` table
+    /// (ADR-0045 decision 5).
+    #[test]
+    fn a_cte_named_spans_is_not_that_base_table() {
+        let via_cte =
+            tables("WITH spans AS (SELECT value FROM samples) SELECT count(*) FROM spans");
+        assert!(
+            via_cte.contains("samples"),
+            "the CTE body's real base table is still seen: {via_cte:?}"
+        );
+        assert!(
+            !via_cte.contains("spans"),
+            "a CTE named `spans` is not the real spans table: {via_cte:?}"
         );
     }
 
