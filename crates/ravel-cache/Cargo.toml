@@ -8,8 +8,13 @@ description = "Content-addressed, single-flighted, S3-FIFO read cache RAM tier (
 
 [dependencies]
 bytes = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
