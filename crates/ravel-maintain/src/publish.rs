@@ -69,6 +69,28 @@ pub async fn publish_record(
         return Ok(PublishOutcome::Abandoned);
     }
 
+    // Record-count conservation gate (ADR-0048 decision 6, review finding
+    // S2-03): compaction is a verbatim page copy for every signal and never
+    // dedups, so the built parts must carry exactly the records the inputs
+    // carry. Publishing a lossy merge would be a permanent silent loss (the
+    // resolver excludes the inputs the moment the record lands, and the
+    // sweep removes them after the horizon), so a mismatch aborts before
+    // anything is PUT: the L0 inputs stay live and queryable, and the
+    // abandoned parts age out under sweep rule 3 like any abandoned run's.
+    // This runs under dry_run too, so a dry run reports the violation.
+    let input_sample_count = checked_sample_sum(inputs.iter().map(|i| i.record.sample_count))?;
+    let part_sample_count = checked_sample_sum(parts.iter().map(|p| p.part.sample_count))?;
+    if input_sample_count != part_sample_count {
+        return Err(MaintainError::ConservationViolation {
+            tenant_hash: hex::encode(bucket.tenant_hash.0),
+            signal: bucket.signal.key_prefix().to_string(),
+            shard: bucket.shard,
+            ingest_hour_bucket: bucket.ingest_hour_bucket,
+            input_sample_count,
+            part_sample_count,
+        });
+    }
+
     let signal = ravel_commit::signal::to_proto(bucket.signal) as i32;
     let identities: Vec<CompactionInputIdentity> = inputs
         .iter()
@@ -115,6 +137,19 @@ pub async fn publish_record(
         }
         Err(e) => Err(MaintainError::Store(e)),
     }
+}
+
+/// Sum `sample_count`s in u64 with checked addition; an overflowing sum is
+/// itself an invariant breach (real buckets are nowhere near 2^64 records),
+/// never a silent wrap that could fake or mask a conservation mismatch.
+fn checked_sample_sum(counts: impl Iterator<Item = u64>) -> Result<u64> {
+    let mut sum: u64 = 0;
+    for count in counts {
+        sum = sum.checked_add(count).ok_or_else(|| {
+            MaintainError::Invariant("sample_count sum overflowed u64".to_string())
+        })?;
+    }
+    Ok(sum)
 }
 
 /// GET the record that beat us. Same `input_set_hash`: HEAD every part it
@@ -169,4 +204,216 @@ async fn resolve_already_exists(
     Ok(PublishOutcome::Converged {
         parts_repaired: repaired,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use proptest::prelude::*;
+    use ravel_object_store::list_all;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::commit::v1::{CommitRecord, CompactionPart};
+    use ravel_types::{Signal, TenantId};
+
+    use super::*;
+    use crate::clock::FixedClock;
+
+    const SHARD: u32 = 7;
+    const HOUR: u32 = 495_000;
+    const ALL_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
+    fn bucket(signal: Signal) -> Bucket {
+        Bucket::new(TenantId::new("acme").hash(), signal, SHARD, HOUR)
+    }
+
+    /// A minimal input for the publish gate: only the identity fields the
+    /// record assembly reads and the `sample_count` the gate sums matter.
+    /// Key/bucket verification happens upstream in `load_inputs`, not here.
+    fn input(seq: u64, sample_count: u64, bucket: &Bucket) -> InputRecord {
+        let record = CommitRecord {
+            format_version: 1,
+            tenant_hash: bucket.tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(bucket.signal) as i32,
+            shard: bucket.shard,
+            writer_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+            sample_count,
+            ingest_hour_bucket: bucket.ingest_hour_bucket,
+            ..CommitRecord::default()
+        };
+        InputRecord {
+            commit_key: format!("input/{seq}"),
+            record,
+        }
+    }
+
+    fn part(index: u32, sample_count: u64) -> BuiltPart {
+        BuiltPart {
+            key: format!("part/{index}"),
+            bytes: bytes::Bytes::new(),
+            part: CompactionPart {
+                part_index: index,
+                content_hash: vec![0u8; 32],
+                sample_count,
+                segment_format_version: crate::build::OUTPUT_FORMAT_VERSION,
+                ..CompactionPart::default()
+            },
+        }
+    }
+
+    async fn publish(
+        store: &MemoryStore,
+        bucket: &Bucket,
+        inputs: &[InputRecord],
+        parts: &[BuiltPart],
+    ) -> Result<PublishOutcome> {
+        let clock = FixedClock::new(1);
+        publish_record(
+            store,
+            &CompactorConfig::default(),
+            &clock,
+            bucket,
+            inputs,
+            &[7u8; 32],
+            parts,
+            1,
+        )
+        .await
+    }
+
+    /// The gate itself (ADR-0048 decision 6): output parts one record short
+    /// of the input sum abort with the typed error carrying both sums and
+    /// the full bucket identity, and nothing at all is written to the store.
+    /// `publish_record` is the shared choke point for all three signals'
+    /// pipelines, so all three are driven through the same assertion.
+    #[tokio::test]
+    async fn conservation_mismatch_aborts_publish() {
+        for signal in ALL_SIGNALS {
+            let store = MemoryStore::new();
+            let bucket = bucket(signal);
+            let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+            let parts = vec![part(0, 16)]; // short by one record
+            let err = publish(&store, &bucket, &inputs, &parts)
+                .await
+                .expect_err("lossy merge must not publish");
+            match err {
+                MaintainError::ConservationViolation {
+                    tenant_hash,
+                    signal: signal_prefix,
+                    shard,
+                    ingest_hour_bucket,
+                    input_sample_count,
+                    part_sample_count,
+                } => {
+                    assert_eq!(tenant_hash, hex::encode(bucket.tenant_hash.0));
+                    assert_eq!(signal_prefix, signal.key_prefix());
+                    assert_eq!(shard, SHARD);
+                    assert_eq!(ingest_hour_bucket, HOUR);
+                    assert_eq!(input_sample_count, 17);
+                    assert_eq!(part_sample_count, 16);
+                }
+                other => panic!("expected ConservationViolation, got {other:?}"),
+            }
+            let listed = list_all(&store, "").await.expect("list");
+            assert!(
+                listed.is_empty(),
+                "aborted publish must write nothing, found {listed:?}"
+            );
+        }
+    }
+
+    /// The complementary direction: a conserving publish (same sums, any
+    /// part split) is not disturbed by the gate and lands exactly one
+    /// record object, for every signal.
+    #[tokio::test]
+    async fn conserving_publish_writes_record() {
+        for signal in ALL_SIGNALS {
+            let store = MemoryStore::new();
+            let bucket = bucket(signal);
+            let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+            let parts = vec![part(0, 12), part(1, 5)];
+            let outcome = publish(&store, &bucket, &inputs, &parts)
+                .await
+                .expect("conserving publish");
+            assert_eq!(outcome, PublishOutcome::Published);
+            let listed = list_all(&store, "").await.expect("list");
+            assert_eq!(listed.len(), 1, "exactly the record object: {listed:?}");
+        }
+    }
+
+    /// Inputs invented records must abort the same as dropped ones: the gate
+    /// is exact equality, not a one-sided bound.
+    #[tokio::test]
+    async fn conservation_surplus_also_aborts() {
+        let store = MemoryStore::new();
+        let bucket = bucket(Signal::Metrics);
+        let inputs = vec![input(1, 10, &bucket)];
+        let parts = vec![part(0, 11)]; // one invented record
+        let err = publish(&store, &bucket, &inputs, &parts)
+            .await
+            .expect_err("surplus must not publish");
+        assert!(matches!(err, MaintainError::ConservationViolation { .. }));
+        assert!(list_all(&store, "").await.expect("list").is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// Over randomized multi-input buckets on every signal: any part
+        /// split conserving the input sum publishes, and bumping any single
+        /// part's count aborts with the typed error and writes nothing.
+        #[test]
+        fn conserving_merge_publishes_and_any_mutation_aborts(
+            counts in prop::collection::vec(0u64..100_000, 1..8),
+            part_count in 1usize..5,
+            mutate_part in any::<prop::sample::Index>(),
+            signal_idx in 0usize..3,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let bucket = bucket(ALL_SIGNALS[signal_idx]);
+                let inputs: Vec<InputRecord> = counts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| input(i as u64, c, &bucket))
+                    .collect();
+                let total: u64 = counts.iter().sum();
+
+                // Split the exact total across `part_count` parts.
+                let base = total / part_count as u64;
+                let mut parts: Vec<BuiltPart> = (0..part_count)
+                    .map(|i| {
+                        let c = if i == part_count - 1 {
+                            total - base * (part_count as u64 - 1)
+                        } else {
+                            base
+                        };
+                        part(i as u32, c)
+                    })
+                    .collect();
+
+                let store = MemoryStore::new();
+                let outcome = publish(&store, &bucket, &inputs, &parts)
+                    .await
+                    .expect("conserving publish");
+                prop_assert_eq!(outcome, PublishOutcome::Published);
+                prop_assert_eq!(list_all(&store, "").await.unwrap().len(), 1);
+
+                // Mutate one part's count; the merge no longer conserves.
+                let idx = mutate_part.index(parts.len());
+                parts[idx].part.sample_count += 1;
+                let store = MemoryStore::new();
+                let err = publish(&store, &bucket, &inputs, &parts).await;
+                let aborted = matches!(err, Err(MaintainError::ConservationViolation { .. }));
+                prop_assert!(aborted, "expected ConservationViolation, got {:?}", err);
+                prop_assert!(list_all(&store, "").await.unwrap().is_empty());
+                Ok(())
+            })?;
+        }
+    }
 }
