@@ -63,6 +63,7 @@ mod logs_pushdown;
 mod logs_scan;
 mod logs_schema;
 mod logs_udf;
+mod map_field_planner;
 mod memory;
 mod minmax;
 mod output;

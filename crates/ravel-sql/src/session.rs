@@ -67,6 +67,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use url::Url;
@@ -75,6 +76,7 @@ use crate::avg::sequential_avg_udaf;
 use crate::config::SqlConfig;
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_udf::has_word_udf;
+use crate::map_field_planner::map_field_access_planner;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::provider::RavelTableProvider;
 use crate::spans_provider::SpansTableProvider;
@@ -191,7 +193,15 @@ pub fn build_session(
         .with_object_store_registry(Arc::new(EmptyObjectStoreRegistry))
         .build_arc()?;
 
-    let ctx = SessionContext::new_with_config_rt(session_config(config), runtime);
+    let mut ctx = SessionContext::new_with_config_rt(session_config(config), runtime);
+
+    // Issue #507: register a hand-written `ExprPlanner` so `col['key']`
+    // (`logs.attrs`, `samples.labels`) plans instead of failing with
+    // `GetFieldAccess not supported`. See `crate::map_field_planner` for why
+    // this small planner is used instead of the `nested_expressions`
+    // feature. Registered for both tables, since `samples.labels` is a `Map`
+    // column too and this planner is table-agnostic.
+    ctx.register_expr_planner(map_field_access_planner())?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
     // boundary behind the parse gate. Enumerate every aggregate UDAF the

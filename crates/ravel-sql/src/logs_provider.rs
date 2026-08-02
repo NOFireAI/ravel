@@ -186,3 +186,316 @@ impl TableProvider for LogsTableProvider {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use datafusion::arrow::array::{StringArray, TimestampNanosecondArray};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_query::EngineConfig;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::memory::TenantMemoryAccountant;
+    use crate::session::{SessionTable, build_session};
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [1u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn s(v: &str) -> AttrValue {
+        AttrValue::Str(v.to_string())
+    }
+
+    /// A record on the stream identified by `resource`, carrying per-record
+    /// dynamic `attrs` (which win over resource/scope attributes on a key
+    /// collision in the merged `attrs` column).
+    fn record(resource: &[(String, AttrValue)], attrs: &[(String, AttrValue)], ts: i64, body: &str) -> LogRecord {
+        LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: body.into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: attrs.to_vec(),
+        }
+    }
+
+    /// Write one RLOG object from `records`, put it at `key`, and return a
+    /// matching L0 `SegmentRef` carrying the object's true ts span.
+    async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> SegmentRef {
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let size = bytes.len() as u64;
+        store
+            .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put object");
+
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        }
+    }
+
+    /// A `SessionContext` built through the real production path
+    /// (`crate::session::build_session`), the same one the SQL endpoint and
+    /// Flight SQL use, with `provider` registered as `logs`. This drives the
+    /// planner registration this task adds, not a bespoke test-only session.
+    fn logs_session(provider: LogsTableProvider) -> DFResult<datafusion::prelude::SessionContext> {
+        let config = SqlConfig::default();
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let (pool, _breach) = config.query_pool(tenant);
+        build_session(&config, pool, SessionTable::Logs(Arc::new(provider)))
+    }
+
+    /// Every test here selects exactly `SELECT ts, body FROM logs WHERE ...`,
+    /// so `ts` and `body` are columns 0 and 1 of the projected result, not
+    /// their positions in the full public `logs` schema.
+    fn rows(batches: &[RecordBatch]) -> BTreeSet<(i64, String)> {
+        let mut out = BTreeSet::new();
+        for batch in batches {
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts col");
+            let body = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("body col");
+            for i in 0..batch.num_rows() {
+                out.insert((ts.value(i), body.value(i).to_string()));
+            }
+        }
+        out
+    }
+
+    /// Issue #507's acceptance test: `attrs['k'] = 'v'` must plan (the whole
+    /// point of registering `crate::map_field_planner::MapFieldAccessPlanner`)
+    /// and, once planned, filter to exactly the matching records over the
+    /// merged, record-wins `attrs` column (ADR-0033).
+    ///
+    /// Four records on one stream:
+    /// - ts=1: resource `service.name = "worker"`, overridden by a per-record
+    ///   `service.name = "api"` -- the record-wins collision case.
+    /// - ts=2: no `service.name` anywhere; a key that exists ONLY in
+    ///   per-record attrs (`request.id`).
+    /// - ts=3: resource `service.name = "worker"`, no override -- must not
+    ///   match `service.name = 'api'`.
+    /// - ts=4: resource `service.name = "api"` genuinely (no per-record attrs
+    ///   at all) -- the plain top-level case.
+    #[tokio::test]
+    async fn attrs_subscript_plans_and_filters_correctly() {
+        let store = MemoryStore::new();
+
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records = vec![
+            record(
+                &worker,
+                &[("service.name".to_string(), s("api"))],
+                1,
+                "hello match world",
+            ),
+            record(
+                &worker,
+                &[("request.id".to_string(), s("abc123"))],
+                2,
+                "record only",
+            ),
+            record(&worker, &[], 3, "no match here"),
+            record(
+                &[("service.name".to_string(), s("api"))],
+                &[],
+                4,
+                "another match example",
+            ),
+        ];
+        let seg = write_object(&store, "logs/attrs.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let ctx = logs_session(provider).expect("build session");
+
+        // Planning: `attrs['service.name'] = 'api'` must not error with
+        // "GetFieldAccess not supported" -- the bug this task fixes.
+        let df = ctx
+            .sql("SELECT ts, body FROM logs WHERE attrs['service.name'] = 'api'")
+            .await
+            .expect("attrs['k'] = 'v' must plan");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(
+            rows(&batches),
+            BTreeSet::from([
+                (1, "hello match world".to_string()),
+                (4, "another match example".to_string()),
+            ]),
+            "must keep the record-wins override (ts=1) and the plain top-level \
+             match (ts=4), and exclude the non-matching stream (ts=3)"
+        );
+    }
+
+    /// A subscript on a key that exists nowhere in the merged map returns no
+    /// rows, not a planning or execution error.
+    #[tokio::test]
+    async fn attrs_subscript_on_missing_key_returns_no_rows() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records = vec![record(&worker, &[], 1, "irrelevant")];
+        let seg = write_object(&store, "logs/missing.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let ctx = logs_session(provider).expect("build session");
+
+        let df = ctx
+            .sql("SELECT ts, body FROM logs WHERE attrs['does.not.exist'] = 'v'")
+            .await
+            .expect("must still plan");
+        let batches = df.collect().await.expect("collect");
+        assert!(
+            rows(&batches).is_empty(),
+            "a missing key must filter out every row, not error"
+        );
+    }
+
+    /// A key present only in per-record attributes (never in the resource
+    /// stream attrs) is still reachable through the subscript.
+    #[tokio::test]
+    async fn attrs_subscript_matches_record_only_key() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records = vec![
+            record(
+                &worker,
+                &[("request.id".to_string(), s("abc123"))],
+                2,
+                "record only",
+            ),
+            record(&worker, &[], 3, "no request id"),
+        ];
+        let seg = write_object(&store, "logs/record-only.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let ctx = logs_session(provider).expect("build session");
+
+        let df = ctx
+            .sql("SELECT ts, body FROM logs WHERE attrs['request.id'] = 'abc123'")
+            .await
+            .expect("must plan");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(
+            rows(&batches),
+            BTreeSet::from([(2, "record only".to_string())])
+        );
+    }
+
+    /// `attrs['k'] = 'v'` combined with a `ts` range and `has_word` still
+    /// plans and returns correct results: the new planner must not disturb
+    /// the existing ts/content pushdown paths.
+    #[tokio::test]
+    async fn attrs_subscript_combines_with_ts_range_and_has_word() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records = vec![
+            record(
+                &worker,
+                &[("service.name".to_string(), s("api"))],
+                1,
+                "hello match world",
+            ),
+            record(&worker, &[], 3, "no match here"),
+            record(
+                &[("service.name".to_string(), s("api"))],
+                &[],
+                4,
+                "another match example",
+            ),
+            // Outside the ts range below even though it would otherwise match.
+            record(
+                &[("service.name".to_string(), s("api"))],
+                &[],
+                100,
+                "far away match",
+            ),
+        ];
+        let seg = write_object(&store, "logs/combined.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let ctx = logs_session(provider).expect("build session");
+
+        let df = ctx
+            .sql(
+                "SELECT ts, body FROM logs \
+                 WHERE ts >= TIMESTAMP '1970-01-01 00:00:00.000000001' \
+                 AND ts <= TIMESTAMP '1970-01-01 00:00:00.000000004' \
+                 AND attrs['service.name'] = 'api' \
+                 AND has_word(body, 'match')",
+            )
+            .await
+            .expect("must plan with ts range and has_word together");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(
+            rows(&batches),
+            BTreeSet::from([
+                (1, "hello match world".to_string()),
+                (4, "another match example".to_string()),
+            ]),
+            "ts=3 fails the attrs filter, ts=100 fails the ts range"
+        );
+    }
+}
