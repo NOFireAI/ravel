@@ -783,6 +783,26 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
 
 /// Human-readable name for a known RSPAN section kind
 /// (docs/span-segment-format.md).
+/// Readable names for an RSPAN v2 block `status_mask`. Bit 0 Unset, bit 1 Ok,
+/// bit 2 Error; an empty mask on a non-empty block would be a writer bug, so
+/// it is rendered as `none` rather than silently as an empty string.
+fn rspan_status_mask_names(mask: u8) -> String {
+    let mut names = Vec::new();
+    if mask & 0b001 != 0 {
+        names.push("unset");
+    }
+    if mask & 0b010 != 0 {
+        names.push("ok");
+    }
+    if mask & 0b100 != 0 {
+        names.push("error");
+    }
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names.join("|")
+}
+
 fn rspan_section_kind_name(kind: u32) -> &'static str {
     match kind {
         ravel_rspan::footer::kind::BLOCKS => "BLOCKS",
@@ -858,7 +878,8 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     for (i, entry) in skip.blocks.iter().enumerate() {
         println!(
             "  block[{i}] offset={} len={} crc32c={:08x} record_count={} \
-             trace_id_range=[{}, {}] start_ts_min={} end_ts_max={}",
+             trace_id_range=[{}, {}] start_ts_min={} end_ts_max={} \
+             duration_ns=[{}, {}] status_mask={:03b} ({})",
             entry.block_offset,
             entry.block_len,
             entry.block_crc32c,
@@ -867,6 +888,10 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
             hex::encode(entry.max_trace_id),
             entry.min_start_ts,
             entry.max_end_ts,
+            entry.min_duration_ns,
+            entry.max_duration_ns,
+            entry.status_mask,
+            rspan_status_mask_names(entry.status_mask),
         );
     }
 

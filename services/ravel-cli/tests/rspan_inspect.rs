@@ -105,7 +105,7 @@ fn rspan_inspect_output_matches_golden_fixture() {
     assert_eq!(
         stdout, expected,
         "`rspan inspect` output regressed; the RSPAN format is frozen \
-         (docs/span-segment-format.md, currently trailer v1) -- this must not \
+         (docs/span-segment-format.md, currently trailer v2) -- this must not \
          change without a version bump and ADR"
     );
     assert!(

@@ -17,12 +17,19 @@ pub const SEGMENT_FORMAT_VERSION: u16 = 5;
 /// a format-level ADR, not a routine edit.
 pub const LOG_SEGMENT_FORMAT_VERSION: u16 = 2;
 
-/// RSPAN trailer version every span flush emits. Mirrors `ravel_rspan`'s own
-/// object trailer version (`docs/span-segment-format.md`, ADR-0041); like the
-/// two constants above it is not a configurable knob, and is stamped verbatim
-/// into the commit record's `segment_format_version`. Changing it is a
-/// format-level ADR, not a routine edit.
-pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = 1;
+/// RSPAN trailer version every span flush emits. Stamped verbatim into the
+/// commit record's `segment_format_version`. Changing it is a format-level
+/// ADR, not a routine edit.
+///
+/// Tied to `ravel_rspan`'s own trailer version at compile time rather than
+/// hand-mirrored. It was a mirrored literal, and the RSPAN v2 bump left it
+/// at 1: every v2 span object was published under a commit record claiming
+/// version 1. Commit records are immutable, so each such record carries the
+/// wrong version forever, and `ravel-cli maintain audit-versions` derives
+/// `supported` from the real trailer version, so it flagged every live span
+/// object as an unsupported-version anomaly. The tool whose only purpose is
+/// catching this drift class was defeated by the drift it failed to prevent.
+pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = ravel_rspan::footer::VERSION;
 
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +105,15 @@ mod tests {
     }
 
     #[test]
-    fn span_segment_format_version_is_v1() {
-        assert_eq!(SPAN_SEGMENT_FORMAT_VERSION, 1);
+    fn span_segment_format_version_tracks_the_rspan_trailer() {
+        // Asserted against the format's own constant, not a literal. A literal
+        // here is what let the v2 bump ship a version-1 claim in every span
+        // commit record while this test stayed green.
+        assert_eq!(SPAN_SEGMENT_FORMAT_VERSION, ravel_rspan::footer::VERSION);
+    }
+
+    #[test]
+    fn log_segment_format_version_tracks_the_rlog_trailer() {
+        assert_eq!(LOG_SEGMENT_FORMAT_VERSION, ravel_logseg::footer::VERSION);
     }
 }

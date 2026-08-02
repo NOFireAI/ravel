@@ -68,11 +68,16 @@ use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
 
-/// The RSPAN output trailer version every L1 part carries (ADR-0041, trailer
-/// version 1). Recorded in each part's `CompactionPart.segment_format_version`,
-/// the span analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`] and
-/// RLOG's [`crate::rlog::OUTPUT_FORMAT_VERSION`].
-pub const OUTPUT_FORMAT_VERSION: u32 = 1;
+/// The RSPAN output trailer version every L1 part carries. Recorded in each
+/// part's `CompactionPart.segment_format_version`, the span analogue of RSEG's
+/// [`crate::build::OUTPUT_FORMAT_VERSION`] and RLOG's
+/// [`crate::rlog::OUTPUT_FORMAT_VERSION`].
+///
+/// Tied to `ravel_rspan`'s own trailer version at compile time. As a mirrored
+/// literal it went stale on the RSPAN v2 bump: `finish_compacted` stamps
+/// `footer::VERSION` into the trailer while this recorded 1, so the compactor
+/// wrote v2 parts that claimed to be v1.
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::VERSION as u32;
 
 /// One RSPAN input's retained catalog metadata: the data-object key and its
 /// decoded footer. The footer is the object's cheap metadata (trace_id/ts
