@@ -89,7 +89,7 @@ fn build_object() -> Vec<u8> {
 }
 
 #[test]
-fn rspan_inspect_output_matches_golden_fixture() {
+fn v2_output_matches_golden_fixture() {
     let path = temp_path("golden");
     std::fs::write(&path, build_object()).expect("writes object");
     let output = run_inspect(&path);
