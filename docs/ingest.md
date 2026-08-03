@@ -51,7 +51,10 @@ holds the request open and its own concurrency limits bound global memory.
 Single task per shard. No locks on the hot path; all state actor-local:
 
 - `buf: HashMap<SeriesId, SeriesBuf { labels: LabelSet, samples: Vec<Sample> }>`
-- `est_bytes`: running estimate (samples * 16 + label bytes on first sight)
+- `exemplars: Vec<IngestExemplar>` in arrival order, one per exemplar the wire
+  admitted for a series routed to this shard (ADR-0047)
+- `est_bytes`: running estimate (samples * 16 + label bytes on first sight,
+  plus ~40 bytes and its attribute strings per buffered exemplar)
 - `oldest_ns`: ingest-arrival time of the oldest buffered point
 - `waiters: Vec<oneshot::Sender<...>>` for strict-mode acks in this flush window
 - writer identity: (writer_id uuid, epoch, next_seq) owned by the process
@@ -92,6 +95,17 @@ Flush (still inside the actor; ingest-ordering per shard is the point):
 4. Send token to all waiters; clear buffer; seq += 1.
 5. On permanent failure: error to all waiters (client retries; nothing was
    acknowledged), drop the buffer (documented at-least-once), count it.
+
+Step 1 also decides which buffered exemplars the object carries (ADR-0047
+decisions 1 and 2). An exemplar whose parent sample is not in this flush is
+dropped first, before the cap, since the object carries no measurement for it
+and the writer treats such a record as an error rather than a silent drop.
+What survives is offered to an `ExemplarCap` built for this flush and dropped
+with it (a shard-lived cap would hold an unbounded per-series map), newest
+-first with a stable sort, because `ExemplarCap::admit` is first-wins and
+never retracts. A flush with nothing admitted emits no EXEMPLARS section at
+all. Both outcomes are counted (`exemplars_written_total`,
+`exemplars_dropped_total`) so the drop stays visible.
 
 The commit record's `ingest_hour_bucket` is derived from the flush-open
 clock reading at step 1, before the segment is built. A non-positive or
