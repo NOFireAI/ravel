@@ -17,6 +17,10 @@ Start here to run Ravel, ingest into it, or query it.
   flag and env reference, storage backend setup, tenancy, the disposability
   model, and what garbage collection does and does not do today. Read this to
   deploy or operate Ravel.
+- [guides/caching.md](guides/caching.md): the ADR-0046 read cache -- what it
+  stores, its CLI flags, startup warmup, its `/metrics` counters, and its
+  known gaps (the disk tier, spans, `alerts`/`audit`). Read this to size or
+  tune the cache, or to understand a warm-vs-cold latency difference.
 - [guides/kubernetes.md](guides/kubernetes.md): the Ravel operator and the
   `RavelCluster` custom resource, the kind development environment
   (`scripts/kind-up.sh`), and what the `/healthz` and `/readyz` probes mean.
