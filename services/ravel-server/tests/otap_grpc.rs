@@ -103,6 +103,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         config,
         store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts")

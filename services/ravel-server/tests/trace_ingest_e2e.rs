@@ -119,6 +119,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         config,
         store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts");
@@ -296,6 +297,7 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
         config,
         store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts");

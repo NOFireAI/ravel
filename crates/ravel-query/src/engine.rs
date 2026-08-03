@@ -25,7 +25,8 @@ use ravel_types::{
 use crate::config::EngineConfig;
 use crate::error::QueryError;
 use crate::fetcher::{
-    FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, SegmentFetcher,
+    CacheFetchError, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
+    SegmentFetcher,
 };
 
 /// Which evaluation shape a prefetch is being computed for: an instant
@@ -234,6 +235,16 @@ impl QueryEngine {
             fetcher: SegmentFetcher::new(store),
             config,
         }
+    }
+
+    /// Attaches the ADR-0046 read cache to this engine's fetcher, via
+    /// [`SegmentFetcher::with_cache`]. `QueryEngine::new` builds its fetcher
+    /// privately, so this is the only seam a caller has to opt a `QueryEngine`
+    /// into the cache after construction.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<ravel_cache::Cache<CacheFetchError>>) -> Self {
+        self.fetcher = self.fetcher.with_cache(cache);
+        self
     }
 
     pub fn config(&self) -> &EngineConfig {

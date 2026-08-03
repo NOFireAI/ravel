@@ -108,6 +108,7 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
         config,
         store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts")

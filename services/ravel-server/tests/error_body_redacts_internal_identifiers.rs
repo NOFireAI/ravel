@@ -139,6 +139,7 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
         config,
         store_dyn,
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts");
