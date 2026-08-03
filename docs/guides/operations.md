@@ -206,6 +206,16 @@ requesting tenant's prefix. Unlike the two counters beside it, which tally a
 harmless-overlap anomaly the query still resolves past, every increment here
 is a query that failed with an explicit isolation-fault error.
 
+Coverage is not yet complete: the PromQL/remote-read and SQL query paths
+share one `Catalog` instance and both count here, but a `tenant_hash`
+mismatch on a commit or compaction record (`crates/ravel-catalog/src/
+catalog.rs`'s `validate_expected_fields` / `validate_compaction_expected_fields`)
+hard-fails its query without incrementing this counter (issue #529), and a
+foreign postings object that fails its part-binding check first degrades
+silently before the tenant_hash comparison ever runs (issue #528). A silent
+gap for snapshot parts also exists (issue #527): a part's own `tenant_hash`
+is never checked against the requesting tenant at all.
+
 Default alert rule:
 
 | Condition | Query | Why |
