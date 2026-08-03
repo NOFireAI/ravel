@@ -155,6 +155,12 @@ enum PartLoadOutcome {
     /// once and retries before falling back.
     NotFoundRace,
     Unusable,
+    /// A part's own `header.tenant_hash` names a different tenant than the
+    /// requester (ADR-0050 §2). Like the HEAD `tenant_hash` mismatch, this is
+    /// an isolation breach, never absorbed into a listing fallback that could
+    /// go on to serve the foreign part's bytes: the caller propagates it as a
+    /// hard `CatalogError`.
+    IsolationBreach(CatalogError),
 }
 
 impl Catalog {
@@ -199,6 +205,7 @@ impl Catalog {
                 }))
             }
             PartLoadOutcome::Unusable => Ok(None),
+            PartLoadOutcome::IsolationBreach(err) => Err(err),
             PartLoadOutcome::NotFoundRace => {
                 // At most one HEAD re-read (docs/metric-index-plan.md 5.1
                 // step 2): bypass the TTL cache so a part GC'd since the
@@ -226,6 +233,7 @@ impl Catalog {
                             postings,
                         }))
                     }
+                    PartLoadOutcome::IsolationBreach(err) => Err(err),
                     PartLoadOutcome::Unusable | PartLoadOutcome::NotFoundRace => Ok(None),
                 }
             }
@@ -289,6 +297,30 @@ impl Catalog {
             tracing::warn!(key = %postings_ref.key, "postings hash mismatch, pruning disabled");
             return Ok(None);
         }
+        // ADR-0050 §2 (#528): the tenant_hash check runs BEFORE decode's
+        // part-binding check. `decode_postings` rejects an object not bound to
+        // this HEAD's exact part hashes with `PostingsPartBindingMismatch`,
+        // which degrades to `Ok(None)` (stale derived data, no cross-tenant
+        // signal). Reading the declared tenant_hash first, off the already
+        // hash-verified bytes, means a foreign tenant_hash hard-fails as an
+        // isolation breach even when the object also fails to bind, instead of
+        // that breach being masked by the binding degrade.
+        match snapshot_format::postings_declared_tenant_hash(&data) {
+            Ok(declared) if declared != tenant.0 => {
+                self.record_isolation_breach();
+                return Err(CatalogError::FieldMismatch {
+                    key: postings_ref.key.clone(),
+                    field: "tenant_hash",
+                    expected: tenant.to_hex(),
+                    actual: hex::encode(declared),
+                });
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, key = %postings_ref.key, "postings header unreadable, pruning disabled");
+                return Ok(None);
+            }
+        }
         let limits = PostingsLimits {
             max_postings_bytes: self.config().max_postings_bytes,
         };
@@ -300,15 +332,6 @@ impl Catalog {
                 return Ok(None);
             }
         };
-        if decoded.header.tenant_hash.as_slice() != tenant.0.as_slice() {
-            self.record_isolation_breach();
-            return Err(CatalogError::FieldMismatch {
-                key: postings_ref.key.clone(),
-                field: "tenant_hash",
-                expected: tenant.to_hex(),
-                actual: hex::encode(&decoded.header.tenant_hash),
-            });
-        }
         let total_entries: u64 = parts.iter().map(|p| p.entries.len() as u64).sum();
         if decoded.header.entry_count != total_entries {
             tracing::warn!(key = %postings_ref.key, "postings entry_count mismatch, pruning disabled");
@@ -439,6 +462,9 @@ impl Catalog {
                 OnePartOutcome::Loaded(part) => parts.push(part),
                 OnePartOutcome::NotFoundRace => return PartLoadOutcome::NotFoundRace,
                 OnePartOutcome::Unusable => return PartLoadOutcome::Unusable,
+                OnePartOutcome::IsolationBreach(err) => {
+                    return PartLoadOutcome::IsolationBreach(err);
+                }
             }
         }
         PartLoadOutcome::Loaded(parts)
@@ -491,6 +517,21 @@ impl Catalog {
                 return OnePartOutcome::Unusable;
             }
         };
+        // ADR-0050 §2: a part whose own header names a different tenant is an
+        // isolation breach, hard-fail, never cached or served. The HEAD's
+        // per-part blake3 was already verified above, but a HEAD that passes
+        // that check can still reference a part object belonging to another
+        // tenant; the part header's tenant_hash is the independent binding to
+        // the requester (#527).
+        if decoded.header.tenant_hash.as_slice() != tenant.0.as_slice() {
+            self.record_isolation_breach();
+            return OnePartOutcome::IsolationBreach(CatalogError::FieldMismatch {
+                key: part_ref.key.clone(),
+                field: "tenant_hash",
+                expected: tenant.to_hex(),
+                actual: hex::encode(&decoded.header.tenant_hash),
+            });
+        }
         self.part_cache().insert(
             *tenant,
             part_ref.key.clone(),
@@ -508,6 +549,8 @@ enum OnePartOutcome {
     Loaded(Arc<DecodedPart>),
     NotFoundRace,
     Unusable,
+    /// This part's header names a foreign tenant (ADR-0050 §2, #527).
+    IsolationBreach(CatalogError),
 }
 
 fn build_segment_ref_from_entry(
@@ -767,6 +810,141 @@ mod tests {
             .load_snapshot_postings(&tenant, &head, &[], &accounting)
             .await
             .expect_err("tenant_hash mismatch must hard-fail, never degrade pruning");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "tenant_hash"),
+            other => panic!("expected FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+    }
+
+    /// #527 / ADR-0050 §2: a snapshot part whose own header names a foreign
+    /// tenant, referenced by a HEAD that is otherwise valid for this tenant
+    /// (correct HEAD tenant_hash, correct per-part blake3), must hard-fail on
+    /// the part's tenant_hash, never be served, and must count the breach.
+    #[tokio::test]
+    async fn part_tenant_hash_mismatch_is_hard_error() {
+        let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let catalog = Catalog::new(instrumented.clone(), config(1)).expect("catalog");
+        let tenant = tenant();
+        let wrong_tenant = TenantHash([0xff; 16]);
+
+        // A real, decodable part object whose header declares the wrong tenant.
+        let part_bytes = snapshot_format::encode_part(
+            wrong_tenant.0,
+            signal::to_proto(Signal::Metrics) as u32,
+            1,
+            10,
+            &[],
+        )
+        .expect("encode part");
+        let part_hash = *blake3::hash(&part_bytes).as_bytes();
+        let part_key = "part-key".to_string();
+        instrumented
+            .put(
+                &part_key,
+                Bytes::from(part_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put part");
+
+        // A HEAD valid for THIS tenant that references the part by its correct
+        // blake3: the existing HEAD tenant_hash and part blake3 checks both
+        // pass, so only the part header betrays the foreign tenant.
+        let head = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as u32,
+            shard_count: 1,
+            watermark_hour: 10,
+            parts: vec![SnapshotPartRef {
+                key: part_key,
+                blake3: part_hash.to_vec(),
+                size: part_bytes.len() as u64,
+                entry_count: 0,
+                watermark_hour: 10,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+        };
+        let head_bytes = snapshot_format::encode_head(&head).expect("encode head");
+        let head_key = head_object_key(&tenant, Signal::Metrics);
+        instrumented
+            .put(&head_key, Bytes::from(head_bytes), PutOptions::default())
+            .await
+            .expect("put head");
+
+        let now_ns = 20 * NS_PER_HOUR;
+        let range = TimeRange {
+            start_ns: now_ns - 1_000,
+            end_ns: now_ns,
+        };
+        let err = catalog
+            .resolve(&tenant, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("a part naming a foreign tenant must hard-fail, never be served");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "tenant_hash"),
+            other => panic!("expected FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+        assert_eq!(
+            instrumented.metrics().snapshot().op(StoreOp::List).calls,
+            0,
+            "a part tenant_hash mismatch must never fall back to listing"
+        );
+    }
+
+    /// #528 / ADR-0050 §2: a postings object declaring a foreign tenant_hash
+    /// that is NOT bound to this HEAD's part hashes must hard-fail on the
+    /// tenant, not degrade to `Ok(None)` through the binding-mismatch path
+    /// that runs first for a bound object.
+    #[tokio::test]
+    async fn postings_foreign_tenant_unbound_still_hard_fails() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let tenant = tenant();
+        let wrong_tenant = TenantHash([0xff; 16]);
+
+        let mut head = head_with_tenant(tenant.0);
+        // Bind the postings to a part hash the HEAD does not carry (HEAD's
+        // part blake3 is all-zero), so decode's part-binding check would
+        // reject first and, unfixed, degrade to Ok(None).
+        let unbound_part_blake3 = [0x77u8; 32];
+
+        let postings_bytes = snapshot_format::encode_postings(
+            wrong_tenant.0,
+            signal::to_proto(Signal::Metrics) as u32,
+            &[unbound_part_blake3],
+            0,
+            &[],
+        )
+        .expect("encode postings");
+        let postings_hash = *blake3::hash(&postings_bytes).as_bytes();
+        let postings_key = "postings-key".to_string();
+        catalog
+            .store()
+            .put(
+                &postings_key,
+                Bytes::from(postings_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put postings");
+        head.postings = Some(SnapshotPostingsRef {
+            key: postings_key,
+            blake3: postings_hash.to_vec(),
+            size: postings_bytes.len() as u64,
+            name_count: 0,
+            part_blake3: vec![unbound_part_blake3.to_vec()],
+        });
+
+        let accounting = QueryAccounting::new();
+        let err = catalog
+            .load_snapshot_postings(&tenant, &head, &[], &accounting)
+            .await
+            .expect_err("foreign tenant_hash must hard-fail even when the object does not bind");
         match err {
             CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "tenant_hash"),
             other => panic!("expected FieldMismatch, got {other:?}"),
