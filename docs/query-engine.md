@@ -655,10 +655,27 @@ oversights.
    the equality exactly over the merged `attrs` column. The prune changes which
    blocks the fetch reads. It does not change which rows the query returns.
 
+   One arm the channel declines: a key that also appears at resource or scope
+   level anywhere in the object. POSTINGS indexes the per-record layer only, so
+   one record carrying a key per-record makes it an indexed column for the whole
+   object, including for records whose value for that key lives in their
+   resource blob. Those records are in no posting list, so probing the term
+   would prune their block away. An exact index over one layer cannot prune a
+   query over the union of two, so the reader declines to prune that key and
+   the residual does the work alone. Declining is widen-only; pruning wrongly
+   is not.
+
+   That exclusion costs the common case. `service.name` is a resource attribute
+   in ordinary OTLP, so an object holding it that way prunes nothing for it.
+   Making the prune reach those keys means indexing the merged view rather than
+   the per-record layer, which changes what POSTINGS stores and needs a version
+   bump and an ADR-0049 amendment.
+
    The reader channel and the SQL extractor land in issue #538. The log fetch
    plumbing that carries `LogsPushdown::prune` to `RlogReader::scan_pruned` (a
    `prune` field on `ravel_query::LogQuery` and the fetch that applies it) is a
-   follow-up in `ravel-query`.
+   follow-up in `ravel-query`, so no live query prunes through this channel
+   yet.
 
 ## Caching note
 

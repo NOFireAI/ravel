@@ -113,6 +113,11 @@ impl<'a> RlogReader<'a> {
     /// to hold no record carrying the term; it is widen-only by construction
     /// (docs/adrs/0013, docs/adrs/0049 decision 7).
     ///
+    /// One more arm is declined: a key that also appears at resource or scope
+    /// level anywhere in this object. POSTINGS indexes the per-record layer
+    /// only, so an exact index over one layer cannot prune a merged-view query
+    /// that spans two. See [`RlogReader::prune_postings_arms`].
+    ///
     /// The separation is deliberate and load-bearing. A `prune` `Equals` on
     /// `FieldSel::Attr` resolves against a record's own dynamic column and
     /// `attrs_raw` overflow only (see [`RlogReader::equals`]), never against
@@ -192,7 +197,7 @@ impl<'a> RlogReader<'a> {
             // postings pruning; an unindexed or capped field on either falls
             // through to bloom + exact scan via the `Ok(None)` path below.
             let mut postings_arms = self.postings_arms(&arms);
-            postings_arms.extend(self.postings_arms(&prune_arms));
+            postings_arms.extend(self.prune_postings_arms(&prune_arms));
             if !postings_arms.is_empty() {
                 match self
                     .postings_section_verified(desc)
@@ -308,6 +313,61 @@ impl<'a> RlogReader<'a> {
             }
         }
         out
+    }
+
+    /// Prune-only postings arms, dropping any whose field also appears at
+    /// resource or scope level in this object.
+    ///
+    /// POSTINGS indexes the per-record layer only: `resolve_row` builds its
+    /// terms from a record's own attributes, and the write path keeps
+    /// resource/scope attributes out of the per-record columns. `field_dir` is
+    /// object-wide, so one record carrying a key per-record makes it an indexed
+    /// column for the whole object, including for records whose value for that
+    /// key lives in their resource blob. Those records are in no posting list,
+    /// so probing the term prunes their block away.
+    ///
+    /// A caller pruning for a merged view (`ravel_sql::rlog_attrs`) needs the
+    /// union of both layers, and an exact index over one layer cannot prune a
+    /// union over two. So when the key is present in either layer at the stream
+    /// level anywhere in this object, this declines to prune it: the arm
+    /// contributes nothing and the exact residual does the work. Declining is
+    /// widen-only (ADR-0013), which pruning wrongly is not.
+    ///
+    /// Only the prune channel needs this. A `content` arm is the caller's own
+    /// exact per-record predicate, so pruning it to the records that carry the
+    /// term per-record is precisely right.
+    fn prune_postings_arms(&self, arms: &[&Predicate]) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for a in arms {
+            if let Predicate::Equals {
+                field: FieldSel::Attr(name),
+                value,
+            } = a
+            {
+                if self.name_in_stream_attrs(name) {
+                    continue;
+                }
+                let (ty, cv) = resolve_value(value);
+                if let Some(entry) = self.field_dir.column(name, ty) {
+                    out.push((entry.column_id, term_key(&cv)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `name` appears as a resource or scope attribute of any stream in
+    /// this object. A blob that fails to decode counts as "present", so a
+    /// corrupt STREAM_DIR declines to prune rather than pruning on a partial
+    /// read.
+    fn name_in_stream_attrs(&self, name: &str) -> bool {
+        self.stream_dir
+            .entries()
+            .iter()
+            .any(|e| match stream_attr_names(&e.blob) {
+                Ok(names) => names.iter().any(|n| n == name),
+                Err(_) => true,
+            })
     }
 
     /// The bloom column id for a string field selector, if one exists.
@@ -797,6 +857,34 @@ fn phrase_match(value: &[u8], word: &str) -> bool {
 /// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
 /// back into attributes. Used for `attrs_raw` overflow. Depth-bounded against
 /// hostile nesting.
+/// The attribute names a STREAM_DIR blob carries, at resource and scope level.
+/// The blob layout is `canonical_attr_bytes(resource) || len+scope_name ||
+/// len+scope_version || canonical_attr_bytes(scope)` (see
+/// [`crate::record::stream_attrs_bytes`]).
+fn stream_attr_names(blob: &[u8]) -> Result<Vec<String>, LogSegError> {
+    use crate::varint::get_uvarint;
+    let mut pos = 0usize;
+    let mut names: Vec<String> = decode_attr_set(blob, &mut pos, 0)?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    for _ in 0..2 {
+        let len = get_uvarint(blob, &mut pos)?;
+        let len = usize::try_from(len)
+            .map_err(|_| LogSegError::Corrupted("stream_attrs scope string len".into()))?;
+        pos = pos
+            .checked_add(len)
+            .filter(|p| *p <= blob.len())
+            .ok_or_else(|| LogSegError::Corrupted("stream_attrs scope string".into()))?;
+    }
+    names.extend(
+        decode_attr_set(blob, &mut pos, 0)?
+            .into_iter()
+            .map(|(k, _)| k),
+    );
+    Ok(names)
+}
+
 fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
     let mut pos = 0usize;
     let out = decode_attr_set(bytes, &mut pos, 0)?;
@@ -1384,19 +1472,21 @@ mod tests {
         );
     }
 
-    /// UNSOUND (found reviewing #538): a key that is an indexed per-record
-    /// column for SOME records and a resource attribute for OTHERS lets the
-    /// prune drop a record the query needs.
+    /// A key that is an indexed per-record column for SOME records and a
+    /// resource attribute for OTHERS must not let the prune drop a record the
+    /// query needs.
     ///
     /// `field_dir` is object-wide, so one record carrying `service.name` as a
     /// per-record attribute makes it an indexed column for the whole object.
     /// A record whose `service.name` comes from its resource blob has no value
-    /// in that column, so it is in no posting list, so its block is pruned.
-    /// The merged SQL view (`ravel_sql::rlog_attrs::merged_attrs`) is the union
-    /// of both layers and needs that record.
+    /// in that column, so it is in no posting list, so probing the term would
+    /// prune its block. The merged SQL view
+    /// (`ravel_sql::rlog_attrs::merged_attrs`) is the union of both layers and
+    /// needs that record. This is the same union-over-two-layers problem #510
+    /// refused to ship, relocated into the prune channel.
     ///
-    /// This is the same union-over-two-layers problem #510 refused to ship,
-    /// relocated into the prune channel.
+    /// `prune_postings_arms` declines to prune a key that appears at stream
+    /// level anywhere in the object, so every record survives.
     #[test]
     fn prune_must_not_drop_a_resource_only_match_when_the_key_is_also_a_column() {
         let cfg = RlogConfig {
