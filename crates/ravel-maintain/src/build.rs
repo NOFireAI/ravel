@@ -40,8 +40,8 @@ use ravel_commit::keys;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
 use ravel_segment::{
-    CompactionMetaV4, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity, SegmentWriter,
-    SeriesInputV4, ValueKind,
+    CompactionMetaV4, ExemplarInput, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity,
+    SegmentWriter, SeriesInputV4, ValueKind,
 };
 use ravel_types::{LabelSet, SeriesId};
 use tokio::sync::Semaphore;
@@ -98,6 +98,25 @@ pub async fn build_parts(
     }
     let ingest_bounds = merged_ingest_bounds(inputs);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+
+    // Every input's exemplars, grouped by the series they name, in canonical
+    // input order then each object's own stored order (ADR-0047 decision 3).
+    // Grouping is only how a part collects the exemplars of the series it
+    // carries: nothing here merges, deduplicates, re-caps, or re-sorts them,
+    // and two inputs each carrying an exemplar for the same (series, ts) both
+    // stay. `exemplar_total` is what the per-part assignment below must
+    // conserve.
+    let mut exemplars_by_series: BTreeMap<[u8; 16], Vec<ExemplarInput>> = BTreeMap::new();
+    let mut exemplar_total = 0usize;
+    for catalog in catalogs {
+        for e in &catalog.exemplars {
+            exemplar_total += 1;
+            exemplars_by_series
+                .entry(e.series_id.0)
+                .or_default()
+                .push(e.clone());
+        }
+    }
 
     // Group every series across every input by id, carrying the input index
     // so pages can be fetched from the right object. Inserting in canonical
@@ -172,9 +191,13 @@ pub async fn build_parts(
     // over the cap; a single series larger than the cap is its own part). Then
     // fetch that batch's pages (coalesced + concurrent), materialize them in
     // order, and flush the part.
+    let mut exemplars_assigned = 0usize;
     for i in 0..builds.len() {
         batch_bytes = batch_bytes.saturating_add(builds[i].page_bytes);
         if batch_bytes >= config.max_l1_part_bytes {
+            let batch = &builds[batch_start..=i];
+            let batch_exemplars = take_batch_exemplars(&mut exemplars_by_series, batch);
+            exemplars_assigned += batch_exemplars.len();
             let part = build_part_from_batch(
                 store,
                 &semaphore,
@@ -184,7 +207,8 @@ pub async fn build_parts(
                 input_set_hash,
                 &input_set_hash16,
                 part_index,
-                &builds[batch_start..=i],
+                batch,
+                batch_exemplars,
             )
             .await?;
             parts.push(part);
@@ -195,6 +219,9 @@ pub async fn build_parts(
     }
 
     if batch_start < builds.len() {
+        let batch = &builds[batch_start..];
+        let batch_exemplars = take_batch_exemplars(&mut exemplars_by_series, batch);
+        exemplars_assigned += batch_exemplars.len();
         let part = build_part_from_batch(
             store,
             &semaphore,
@@ -204,13 +231,58 @@ pub async fn build_parts(
             input_set_hash,
             &input_set_hash16,
             part_index,
-            &builds[batch_start..],
+            batch,
+            batch_exemplars,
         )
         .await?;
         parts.push(part);
     }
 
+    // Exemplar conservation, the ADR-0018 overlap-harmlessness rule applied to
+    // this signal: every input exemplar reaches exactly one part. Anything left
+    // in the map names a series no part carries, which would make the L1 output
+    // less than the multiset of its inputs, so the run fails here rather than
+    // publishing a lossy merge. `publish.rs`'s own conservation gate counts
+    // samples (the only count the commit record carries), so it cannot see
+    // this; the check belongs where the assignment happens.
+    if exemplars_assigned != exemplar_total {
+        let orphaned: Vec<String> = exemplars_by_series
+            .keys()
+            .map(|id| hex::encode(&id[..8]))
+            .collect();
+        return Err(MaintainError::Invariant(format!(
+            "exemplar conservation violated: {exemplar_total} input exemplars, \
+             {exemplars_assigned} assigned to parts; series with unassigned \
+             exemplars: {}",
+            orphaned.join(",")
+        )));
+    }
+
     Ok(parts)
+}
+
+/// Take the exemplars belonging to one batch's series out of the by-series map,
+/// in the batch's own series order (ascending series id, the same order the
+/// output's SERIES_IDS takes) and, within a series, in the order the inputs
+/// carried them.
+///
+/// Removing rather than copying is what lets [`build_parts`] prove conservation:
+/// a series is in exactly one batch, so after the last batch the map must be
+/// empty. The output writer re-resolves each record's `series_index` against
+/// its own SERIES_IDS and stable-sorts by `(series_index, ts_ns)`, so this
+/// ordering is what breaks ties between two records sharing a key, and the
+/// encoded section stays a function of the canonical input order alone.
+fn take_batch_exemplars(
+    by_series: &mut BTreeMap<[u8; 16], Vec<ExemplarInput>>,
+    batch: &[SeriesBuild<'_>],
+) -> Vec<ExemplarInput> {
+    let mut out = Vec::new();
+    for build in batch {
+        if let Some(mut records) = by_series.remove(&build.series_id.0) {
+            out.append(&mut records);
+        }
+    }
+    out
 }
 
 /// One output series' merge plan without its page bytes: identity, borrowed
@@ -239,6 +311,7 @@ async fn build_part_from_batch(
     input_set_hash16: &str,
     part_index: u32,
     builds: &[SeriesBuild<'_>],
+    exemplars: Vec<ExemplarInput>,
 ) -> Result<BuiltPart> {
     let regions = fetch_batch_pages(store, semaphore, builds).await?;
     let batch = materialize_batch(builds, &regions)?;
@@ -250,6 +323,7 @@ async fn build_part_from_batch(
         input_set_hash16,
         part_index,
         batch,
+        exemplars,
     )?;
     if !config.dry_run {
         put_part(store, &part).await?;
@@ -452,6 +526,7 @@ fn flush_part(
     input_set_hash16: &str,
     part_index: u32,
     batch: Vec<SeriesInputV4>,
+    exemplars: Vec<ExemplarInput>,
 ) -> Result<BuiltPart> {
     let run_count: u64 = batch.iter().map(|s| s.runs.len() as u64).sum();
     let first_series_id = batch.iter().map(|s| s.series_id).min();
@@ -474,7 +549,12 @@ fn flush_part(
         min_ingest_ts_ns: ingest_bounds.min_ingest_ts_ns,
         max_ingest_ts_ns: ingest_bounds.max_ingest_ts_ns,
     };
-    let written = SegmentWriter::write_v5(batch, identity, ingest, meta)?;
+    // Exemplars ride along verbatim; the writer resolves each record's
+    // `series_index` against this part's own sorted SERIES_IDS, which is the
+    // only field the copy changes (ADR-0047 decision 3). An exemplar naming a
+    // series this part does not carry is a writer error, not a silent drop, so
+    // a mis-assignment above fails the run instead of shrinking the output.
+    let written = SegmentWriter::write_v5_with_exemplars(batch, identity, ingest, meta, exemplars)?;
     let content_hash = written.summary.blake3;
     let hash16 = hex::encode(&content_hash[..8]);
     let key = keys::l1_part_key(
