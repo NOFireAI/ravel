@@ -18,6 +18,13 @@ ravel-otlp = { workspace = true }
 ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
+# The exemplars endpoint (issue #475, ADR-0047 decision 4) reads the RSEG
+# EXEMPLARS section back out of the segments a query already matched, using
+# ravel-segment's public `open_from_full`/`decode_catalog_v5`/
+# `decode_exemplars_section`. It was previously only a dev-dependency (for
+# tests that decode written objects); this promotes the same workspace pin to
+# a normal dependency so the query handler can call those functions.
+ravel-segment = { workspace = true }
 ravel-analytics = { workspace = true }
 # Prost types for the sys/tenancy marker and the recovery manifest
 # (ADR-0050 section 3, proto/ravel/sys.proto).
@@ -137,7 +144,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # Test-only: the Flight SQL tests adapt a `tonic::Streaming` into the stream
 # `arrow_flight::decode` consumes, which needs the `TryStreamExt` combinators.
 futures = { workspace = true }
-ravel-segment = { workspace = true }
 # Test-only, same reason for spans: the trace ingest end-to-end test decodes the
 # RSPAN object the write flushed. ravel-rspan (ADR-0041) is new and not yet
 # listed in the workspace [workspace.dependencies]; the root Cargo.toml is out

@@ -6,6 +6,7 @@ pub mod alerting;
 pub mod analytics;
 pub mod cache_warm;
 pub mod config;
+pub mod exemplars;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
 pub mod flight_auth;
@@ -592,6 +593,31 @@ pub async fn start(
                 clock: Arc::new(SystemClock),
             };
             mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
+        }
+
+        // GET/POST /api/v1/query_exemplars (ADR-0047 decision 4, issue #475):
+        // reads the RSEG EXEMPLARS section back out of the segments a query
+        // already matched. Shares the same `Catalog` and object store the
+        // PromQL engine uses (so an exemplar query resolves byte-for-byte the
+        // snapshot a sample query would) and reuses the engine's budget
+        // configuration for its deadline and max_segments ceiling.
+        let exemplars_state = exemplars::ExemplarsState::from_engine(
+            &app_state.engine,
+            catalog.clone(),
+            store.clone(),
+            config.tenant_resolver.clone(),
+            Arc::new(SystemClock),
+        );
+        http_router = http_router.merge(exemplars::router(exemplars_state));
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_exemplars_state = exemplars::ExemplarsState::from_engine(
+                &app_state.engine,
+                catalog.clone(),
+                store.clone(),
+                mtls.resolver.clone(),
+                Arc::new(SystemClock),
+            );
+            mtls_router = mtls_router.merge(exemplars::router(mtls_exemplars_state));
         }
 
         // Same `QueryEngine` (and, under the `sql` feature, the same
