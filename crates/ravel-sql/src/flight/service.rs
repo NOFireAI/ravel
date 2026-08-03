@@ -40,6 +40,7 @@ use prost::Message;
 use ravel_maintain::{QueryStatus, write_query_audit};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
@@ -251,9 +252,17 @@ impl FlightSqlService for RavelFlightSqlService {
 
         // Step 2: resolve exactly once. This snapshot, and only this
         // snapshot, is what DoGet will execute against (review F18).
-        let snapshot = self
+        //
+        // This accounting handle covers only this RPC's resolve and logical
+        // plan; DoGet (crate::flight::stream) builds its own for the
+        // execution it runs, so a Flight SQL statement's accounting is split
+        // across two handles rather than unified across the two RPCs like
+        // the HTTP path's single `SqlExecutor::execute` call. Known,
+        // documented gap (ADR-0044); not fixed by this ticket.
+        let accounting = QueryAccounting::new();
+        let (snapshot, _estimate) = self
             .executor
-            .resolve_snapshot(tenant, &req)
+            .resolve_snapshot(tenant, &req, &accounting)
             .await
             .map_err(|err| status_from_sql(&err, tenant))?;
         let segments: Vec<SegmentPin> = snapshot
@@ -269,7 +278,7 @@ impl FlightSqlService for RavelFlightSqlService {
         // segments.
         let planned = self
             .executor
-            .plan_pinned(tenant, snapshot, &query.query)
+            .plan_pinned(tenant, snapshot, &query.query, &accounting)
             .await
             .map_err(|err| status_from_sql(&err, tenant))?;
         let schema = planned.schema();

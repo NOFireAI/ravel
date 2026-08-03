@@ -84,9 +84,11 @@ use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
 use crate::config::SqlConfig;
+use crate::cost::{estimate_logs_cost, estimate_metrics_cost};
 use crate::error::SqlError;
 use crate::logs_provider::LogsTableProvider;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
@@ -154,6 +156,14 @@ pub struct SqlStats {
 pub struct SqlOutcome {
     pub output: QueryOutput,
     pub stats: SqlStats,
+    /// This query's accounting counters (ADR-0044 "1. A per-request
+    /// accounting handle"), from the attempt that succeeded. A retried
+    /// attempt's discarded counters never bleed into this one: `run` builds
+    /// a fresh [`QueryAccounting`] per attempt.
+    pub accounting: QueryAccountingSnapshot,
+    /// The pre-execution cost estimate (ADR-0044 "3."), from the same
+    /// successful attempt's resolve.
+    pub estimate: CostEstimate,
 }
 
 /// Executes SQL for any tenant against one catalog and object store.
@@ -243,18 +253,28 @@ impl SqlExecutor {
         let mut stats = SqlStats::default();
 
         // At most two passes: the original and the one retry the
-        // consistency model allows.
+        // consistency model allows. Each pass gets its own QueryAccounting
+        // (ADR-0044): a discarded first attempt's counts must never bleed
+        // into the retry's.
         for attempt in 0..2u32 {
-            let snapshot = self.resolve(tenant_hash, req).await?;
+            let accounting = QueryAccounting::new();
+            let (snapshot, estimate) = self.resolve(tenant_hash, req, &accounting).await?;
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
 
-            let (result, emitted) = self.attempt(tenant_hash, req, snapshot).await;
+            let (result, emitted) = self.attempt(tenant_hash, req, snapshot, &accounting).await;
             stats.batches_emitted += emitted;
 
             match result {
-                Ok(output) => return Ok(SqlOutcome { output, stats }),
+                Ok(output) => {
+                    return Ok(SqlOutcome {
+                        output,
+                        stats,
+                        accounting: accounting.snapshot(),
+                        estimate,
+                    });
+                }
                 Err(err) => match retry_decision(err.is_segment_not_found(), emitted, attempt) {
                     RetryDecision::RetryOnce => continue,
                     RetryDecision::FailInvalidated => return Err(SqlError::SnapshotInvalidated),
@@ -282,12 +302,17 @@ impl SqlExecutor {
     /// injected-clock discipline. Validation is *not* performed here: the
     /// caller runs [`crate::validate`] first, exactly as [`Self::execute`]
     /// does, so a rejected statement still costs no catalog LIST.
+    ///
+    /// `accounting` receives this resolve's store counters; the returned
+    /// [`CostEstimate`] is the two-part estimate for the query this snapshot
+    /// will be planned against.
     pub async fn resolve_snapshot(
         &self,
         tenant_hash: TenantHash,
         req: &SqlRequest,
-    ) -> Result<Snapshot, SqlError> {
-        self.resolve(tenant_hash, req).await
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, CostEstimate), SqlError> {
+        self.resolve(tenant_hash, req, accounting).await
     }
 
     /// Build the fresh per-query, single-tenant session over an already
@@ -302,13 +327,21 @@ impl SqlExecutor {
     /// rather than merely resemble it (review F13): the pool the returned
     /// query owns is dropped with it, and every `MemoryReservation` the plan
     /// took shrinks back through it into the tenant accountant.
+    ///
+    /// `accounting` is this query's [`QueryAccounting`] handle: it is cloned
+    /// into the query's memory pool (peak intermediate bytes) and into
+    /// whichever table provider the query targets (every store fetch the
+    /// scan issues).
     pub async fn plan_pinned(
         &self,
         tenant_hash: TenantHash,
         snapshot: Snapshot,
         sql: &str,
+        accounting: &QueryAccounting,
     ) -> Result<PinnedQuery, SqlError> {
-        let (pool, breach) = self.config.query_pool(self.tenant_budget(tenant_hash));
+        let (pool, breach) = self
+            .config
+            .query_pool(self.tenant_budget(tenant_hash), accounting.clone());
         // Build the one table the query targets over the snapshot resolved for
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
@@ -318,11 +351,13 @@ impl SqlExecutor {
                 tenant_hash,
                 self.fetcher.clone(),
                 self.config,
+                accounting.clone(),
             ))),
             TargetSignal::Logs => SessionTable::Logs(Arc::new(LogsTableProvider::new(
                 snapshot,
                 self.log_fetcher.clone(),
                 self.config,
+                accounting.clone(),
             ))),
         };
 
@@ -340,11 +375,19 @@ impl SqlExecutor {
     /// One `Catalog::resolve` plus the `max_segments` budget check. Resolves
     /// the signal the query's `FROM` clause targets ([`Self::target_signal`]),
     /// so a metrics-only query never lists the logs keyspace and vice versa.
+    ///
+    /// Also computes the two-part cost estimate (ADR-0044 "3.", amended): the
+    /// catalog term from `shard_count` and the window's hour-bucket count,
+    /// computed here *before* `resolve_pruned_with_accounting` runs (resolve
+    /// itself is not free, and an estimate computed only after resolve
+    /// structurally cannot bound resolve's own spend), and the segment term
+    /// from the pinned snapshot's `SegmentRef`s, computed after.
     async fn resolve(
         &self,
         tenant_hash: TenantHash,
         req: &SqlRequest,
-    ) -> Result<Snapshot, SqlError> {
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, CostEstimate), SqlError> {
         let target = Self::target_signal(&req.sql)?;
         // Postings pruning by the equality `__name__` predicate pushed down
         // from the query's WHERE clause (#278 item 4). Without this the SQL
@@ -361,15 +404,17 @@ impl SqlExecutor {
             TargetSignal::Metrics => self.pushed_down_name_filter(tenant_hash, &req.sql).await,
             TargetSignal::Logs => None,
         };
+        let catalog_requests = self.catalog.estimated_catalog_requests(req.window, req.now_ns);
         let snapshot = self
             .catalog
-            .resolve_pruned(
+            .resolve_pruned_with_accounting(
                 &tenant_hash,
                 target.signal(),
                 req.window,
                 &req.min_tokens,
                 req.now_ns,
                 name_filter.as_deref(),
+                accounting,
             )
             .await?;
         if snapshot.segments.len() > self.config.engine.max_segments {
@@ -378,7 +423,11 @@ impl SqlExecutor {
                 max: self.config.engine.max_segments,
             });
         }
-        Ok(snapshot)
+        let estimate = match target {
+            TargetSignal::Metrics => estimate_metrics_cost(&snapshot, catalog_requests),
+            TargetSignal::Logs => estimate_logs_cost(&snapshot, catalog_requests),
+        };
+        Ok((snapshot, estimate))
     }
 
     /// The equality `__name__` value a metrics query's pushed-down predicates
@@ -408,6 +457,10 @@ impl SqlExecutor {
             tenant_hash,
             self.fetcher.clone(),
             self.config,
+            // Throwaway handle: this plans over an empty snapshot purely to
+            // recover predicates, so no store fetch is ever issued through
+            // it and nothing would ever be recorded here.
+            QueryAccounting::new(),
         );
         ctx.register_table(SAMPLES_TABLE, Arc::new(provider)).ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
@@ -456,8 +509,9 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         req: &SqlRequest,
         snapshot: Snapshot,
+        accounting: &QueryAccounting,
     ) -> (Result<QueryOutput, SqlError>, usize) {
-        let planned = match self.plan_pinned(tenant_hash, snapshot, &req.sql).await {
+        let planned = match self.plan_pinned(tenant_hash, snapshot, &req.sql, accounting).await {
             Ok(planned) => planned,
             Err(e) => return (Err(e), 0),
         };

@@ -40,6 +40,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::LogRecord;
 use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_types::accounting::QueryAccounting;
 
 use crate::audit_schema::audit_schema;
 use crate::error::SqlError;
@@ -60,6 +61,9 @@ pub struct AuditScanExec {
     ts_max: i64,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// This query's accounting handle (ADR-0044), threaded into every
+    /// per-partition fetch.
+    accounting: QueryAccounting,
 }
 
 impl AuditScanExec {
@@ -72,6 +76,7 @@ impl AuditScanExec {
         target_partitions: usize,
         ts_min: i64,
         ts_max: i64,
+        accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -87,6 +92,7 @@ impl AuditScanExec {
             ts_max,
             schema,
             properties,
+            accounting,
         })
     }
 
@@ -156,7 +162,13 @@ impl ExecutionPlan for AuditScanExec {
         let reservation = MemoryConsumer::new(format!("AuditScanExec[{partition}]"))
             .register(context.memory_pool());
 
-        let fut = Box::pin(prepare_partition(fetcher, segs, self.ts_min, self.ts_max));
+        let fut = Box::pin(prepare_partition(
+            fetcher,
+            segs,
+            self.ts_min,
+            self.ts_max,
+            self.accounting.clone(),
+        ));
         Ok(Box::pin(AuditScanStream {
             schema,
             reservation,
@@ -173,12 +185,17 @@ async fn prepare_partition(
     segs: Vec<SegmentRef>,
     ts_min: i64,
     ts_max: i64,
+    accounting: QueryAccounting,
 ) -> DFResult<Vec<LogRecord>> {
     let query = LogQuery::new(ts_min, ts_max);
 
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
-        let Some(output) = fetcher.fetch(seg, &query).await.map_err(SqlError::from)? else {
+        let Some(output) = fetcher
+            .fetch_accounted(seg, &query, &accounting)
+            .await
+            .map_err(SqlError::from)?
+        else {
             continue;
         };
         out.extend(output.records);

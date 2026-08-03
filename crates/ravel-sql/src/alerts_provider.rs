@@ -33,6 +33,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::alerts_pushdown::{AlertsPushdown, extract_alerts};
 use crate::alerts_scan::AlertsScanExec;
@@ -47,6 +48,9 @@ pub struct AlertsTableProvider {
     fetcher: LogSegmentFetcher,
     config: SqlConfig,
     schema: SchemaRef,
+    /// This query's accounting handle (ADR-0044), cloned into every
+    /// `AlertsScanExec` the provider builds.
+    accounting: QueryAccounting,
 }
 
 impl AlertsTableProvider {
@@ -57,12 +61,14 @@ impl AlertsTableProvider {
         snapshot: Snapshot,
         fetcher: LogSegmentFetcher,
         config: impl Into<SqlConfig>,
+        accounting: QueryAccounting,
     ) -> Self {
         AlertsTableProvider {
             snapshot: Arc::new(snapshot),
             fetcher,
             config: config.into(),
             schema: alerts_schema(),
+            accounting,
         }
     }
 
@@ -104,6 +110,7 @@ impl AlertsTableProvider {
             pushdown.ts_min(),
             pushdown.ts_max(),
             Arc::new(pushdown.content.clone()),
+            self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
     }

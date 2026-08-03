@@ -32,6 +32,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::audit_pushdown::{AuditPushdown, extract_audit};
 use crate::audit_scan::AuditScanExec;
@@ -46,6 +47,9 @@ pub struct AuditTableProvider {
     fetcher: LogSegmentFetcher,
     config: SqlConfig,
     schema: SchemaRef,
+    /// This query's accounting handle (ADR-0044), cloned into every
+    /// `AuditScanExec` the provider builds.
+    accounting: QueryAccounting,
 }
 
 impl AuditTableProvider {
@@ -56,12 +60,14 @@ impl AuditTableProvider {
         snapshot: Snapshot,
         fetcher: LogSegmentFetcher,
         config: impl Into<SqlConfig>,
+        accounting: QueryAccounting,
     ) -> Self {
         AuditTableProvider {
             snapshot: Arc::new(snapshot),
             fetcher,
             config: config.into(),
             schema: audit_schema(),
+            accounting,
         }
     }
 
@@ -101,6 +107,7 @@ impl AuditTableProvider {
             target_partitions,
             pushdown.ts_min(),
             pushdown.ts_max(),
+            self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
     }

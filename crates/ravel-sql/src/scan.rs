@@ -102,6 +102,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
 use ravel_query::SegmentFetcher;
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, TenantHash};
 
 use crate::error::SqlError;
@@ -160,6 +161,9 @@ pub struct RsegScanExec {
     max_series: usize,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// This query's accounting handle (ADR-0044), cloned into every
+    /// partition's `fetch_soa_accounted` call.
+    accounting: QueryAccounting,
 }
 
 impl RsegScanExec {
@@ -175,6 +179,7 @@ impl RsegScanExec {
         matchers: Arc<Vec<LabelMatcher>>,
         series_ids: Option<Arc<HashSet<[u8; 16]>>>,
         max_series: usize,
+        accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -192,6 +197,7 @@ impl RsegScanExec {
             max_series,
             schema,
             properties,
+            accounting,
         })
     }
 
@@ -292,6 +298,7 @@ impl ExecutionPlan for RsegScanExec {
             series_ids,
             self.max_series,
             reservation,
+            self.accounting.clone(),
         ));
         Ok(Box::pin(ScanStream {
             schema,
@@ -324,13 +331,14 @@ async fn prepare_partition(
     series_ids: Option<Arc<HashSet<[u8; 16]>>>,
     max_series: usize,
     reservation: MemoryReservation,
+    accounting: QueryAccounting,
 ) -> DFResult<(Prepared, MemoryReservation)> {
     let mut runs: Vec<Vec<ScanRow>> = Vec::with_capacity(segs.len());
     let mut labels: HashMap<[u8; 16], LabelSet> = HashMap::new();
 
     for seg in &segs {
         let (series, stats) = fetcher
-            .fetch_soa(tenant, seg, &matchers)
+            .fetch_soa_accounted(tenant, seg, &matchers, &accounting)
             .await
             .map_err(SqlError::from)?;
         let mut run: Vec<ScanRow> = Vec::new();
