@@ -3,11 +3,39 @@
 
 use std::sync::Arc;
 
+use ravel_cache::{Cache, CacheLimits};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_object_store::{Capabilities, InstrumentedStore, ObjectStoreBackend, StoreMetrics};
+use ravel_query::CacheFetchError;
 
 use crate::config::{Cli, Mode, StoreKind};
+
+/// RAM cache single-entry cap (ADR-0046): comfortably larger than any one
+/// planned byte range this process fetches (`ravel_query::fetcher`'s
+/// suffix/coalesce/whole-object thresholds all stay well under this), so a
+/// legitimate cache admission is never rejected for size.
+const CACHE_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// RAM cache entry-count cap (ADR-0046): high enough that `--cache-max-bytes`,
+/// not this count, is what drives eviction in practice.
+const CACHE_MAX_ENTRIES: usize = 1_000_000;
+
+/// Build the ADR-0046 RAM read cache from CLI config, or `None` when
+/// `--disable-cache` is set. `None` must leave query behavior byte-for-byte
+/// identical to a build with no cache wiring at all: callers pass it to
+/// `SegmentFetcher`/`LogSegmentFetcher`/`QueryEngine`'s `with_cache` only when
+/// `Some`.
+pub fn build_cache(cli: &Cli) -> Option<Arc<Cache<CacheFetchError>>> {
+    if cli.disable_cache {
+        return None;
+    }
+    Some(Arc::new(Cache::new(CacheLimits::new(
+        cli.cache_max_bytes,
+        CACHE_MAX_ENTRIES,
+        CACHE_MAX_ENTRY_BYTES,
+    ))))
+}
 
 /// A constructed backend under-reports a capability Ravel's commit protocol
 /// and catalog require in production. Startup aborts here rather than trusting
@@ -122,21 +150,30 @@ pub fn check_mandatory_capabilities(
     check_capabilities(backend, Mode::All)
 }
 
-/// Build the configured backend, wrap it in the instrumentation decorator, and
-/// enforce the capability contract for `cli.mode`.
+/// Build the configured backend, wrap it in the instrumentation decorator,
+/// enforce the capability contract for `cli.mode`, and build the ADR-0046
+/// read cache from the same CLI config.
 ///
-/// Returns the store the whole process shares plus the metrics handle the
-/// decorator counts into. Every backend is wrapped, unconditionally and in
-/// every mode: the decorator is observability only, never
-/// correctness-bearing, and wrapping is a zero behavior change (results
-/// forward verbatim and `capabilities()` passes through), so there is no
-/// configuration to get wrong and no "instrumented vs not" pair of behaviors
-/// to reason about. Because capabilities pass through, the gate below still
-/// checks the real backend's declaration.
+/// Returns the store the whole process shares, the metrics handle the
+/// decorator counts into, and the cache (`None` when `--disable-cache`).
+/// Every backend is wrapped, unconditionally and in every mode: the decorator
+/// is observability only, never correctness-bearing, and wrapping is a zero
+/// behavior change (results forward verbatim and `capabilities()` passes
+/// through), so there is no configuration to get wrong and no "instrumented
+/// vs not" pair of behaviors to reason about. Because capabilities pass
+/// through, the gate below still checks the real backend's declaration.
 ///
-/// Nothing surfaces the handle yet (no scrape endpoint, no exporter); it is
-/// returned so the caller can hold it for that later work.
-pub fn build_store(cli: &Cli) -> anyhow::Result<(Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>)> {
+/// The store metrics handle is not yet exposed on any scrape endpoint; it is
+/// returned so the caller can hold it for that later work. The cache is
+/// exposed: the caller attaches it to the query fetchers via their existing
+/// `with_cache` builders.
+pub fn build_store(
+    cli: &Cli,
+) -> anyhow::Result<(
+    Arc<dyn ObjectStoreBackend>,
+    Arc<StoreMetrics>,
+    Option<Arc<Cache<CacheFetchError>>>,
+)> {
     let (store, metrics): (Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>) = match cli.store {
         StoreKind::Memory => {
             let instrumented = InstrumentedStore::new(MemoryStore::new());
@@ -184,7 +221,8 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<(Arc<dyn ObjectStoreBackend>, Ar
     // Runs against the decorator, which passes `capabilities()` straight
     // through, so this still gates on the wrapped backend's own declaration.
     check_capabilities(store.as_ref(), cli.mode)?;
-    Ok((store, metrics))
+    let cache = build_cache(cli);
+    Ok((store, metrics, cache))
 }
 
 #[cfg(test)]
@@ -433,7 +471,7 @@ mod tests {
         use ravel_object_store::PutOptions;
 
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
-        let (store, metrics) = build_store(&cli).expect("memory backend must build");
+        let (store, metrics, _cache) = build_store(&cli).expect("memory backend must build");
         assert_eq!(
             store.capabilities(),
             MemoryStore::new().capabilities(),

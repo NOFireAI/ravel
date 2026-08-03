@@ -226,7 +226,36 @@ pub struct Cli {
     #[cfg(feature = "otap")]
     #[arg(long)]
     pub otap: bool,
+
+    /// Maximum resident bytes for the ADR-0046 read cache's RAM tier. Read at
+    /// startup only; there is no live resize. Ignored when `--disable-cache`
+    /// is set.
+    #[arg(long, default_value_t = DEFAULT_CACHE_MAX_BYTES)]
+    pub cache_max_bytes: u64,
+
+    /// Directory for the ADR-0046 read cache's local-disk tier. Not yet
+    /// wired to anything: `ravel-query`'s `SegmentFetcher::with_cache` and
+    /// `LogSegmentFetcher::with_cache` (the read funnels this process calls,
+    /// already reviewed and merged) each accept only a RAM `Cache`, with no
+    /// parameter or builder method to attach a `DiskCache` at all. Setting
+    /// this flag fails startup rather than silently running with no disk
+    /// tier (see `Cli::validate`). Reported as a gap rather than worked
+    /// around: adding that attachment point means changing the fetcher
+    /// funnels, which is out of this task's scope.
+    #[arg(long, value_name = "PATH")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Disables the ADR-0046 read cache entirely. With this set, no cache is
+    /// constructed and query behavior is byte-for-byte identical to a build
+    /// with no read cache wiring at all.
+    #[arg(long)]
+    pub disable_cache: bool,
 }
+
+/// Default `--cache-max-bytes`: generous enough to hold a working set of
+/// recently fetched segment/log byte ranges across a handful of concurrent
+/// queries, small enough that a dev process does not need tuning to pick it.
+pub const DEFAULT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Validated OIDC settings, present only when `--oidc-issuer`/`--oidc-jwks-url`
 /// are configured.
@@ -455,6 +484,21 @@ impl Cli {
                 "--mtls-enabled requires --mtls-listener: the mTLS resolver is only installed on \
                  its own dedicated listener (ADR-0050 section 1), never on the public HTTP or \
                  gRPC/Flight listeners."
+            );
+        }
+
+        // The disk tier has no attachment point in the fetcher funnels this
+        // process calls (`SegmentFetcher::with_cache` /
+        // `LogSegmentFetcher::with_cache` each take only a RAM `Cache`), so
+        // silently accepting `--cache-dir` and doing nothing with it would be
+        // exactly the "looks configured, is actually inert" regression this
+        // whole cache epic exists to avoid. Fail fast instead.
+        if self.cache_dir.is_some() {
+            anyhow::bail!(
+                "--cache-dir was set but the local-disk cache tier has no attachment point yet: \
+                 ravel-query's SegmentFetcher::with_cache and LogSegmentFetcher::with_cache each \
+                 accept only a RAM Cache. Drop --cache-dir; the RAM tier alone is configured by \
+                 --cache-max-bytes and --disable-cache."
             );
         }
 
