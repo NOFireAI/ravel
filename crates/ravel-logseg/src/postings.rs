@@ -129,7 +129,11 @@ pub fn encode_postings_section(
     stride: u32,
     zstd_level: i32,
 ) -> Result<Vec<u8>, LogSegError> {
-    assert!(stride > 0, "postings stride must be nonzero");
+    if stride == 0 {
+        return Err(LogSegError::LimitExceeded(
+            "postings stride must be nonzero".into(),
+        ));
+    }
 
     struct BuiltBlock {
         first_term: Vec<u8>,
@@ -516,6 +520,11 @@ impl<'a> PostingsSection<'a> {
             Err(i) => i - 1,
         };
         let block = &field.blocks[block_idx];
+        // The next sparse entry's `first_term`, known at parse time: every
+        // term this block decodes to must sort strictly below it, or the
+        // block's actual contents disagree with the header range `probe`
+        // picked it by.
+        let upper_bound = field.blocks.get(block_idx + 1).map(|b| b.first_term.as_slice());
         let stored = self
             .bytes
             .get(block.offset..block.offset + block.stored_len)
@@ -530,7 +539,7 @@ impl<'a> PostingsSection<'a> {
                 "postings block decompressed length".into(),
             ));
         }
-        find_term_in_block(&payload, term)
+        find_term_in_block(&payload, term, &block.first_term, upper_bound)
     }
 }
 
@@ -548,7 +557,31 @@ fn read_u64_le(bytes: &[u8], pos: &mut usize, what: &str) -> Result<u64, LogSegE
 /// list if present (`Some(vec![])` counts as "found the field's dictionary,
 /// term is absent" -- callers distinguish that from "field not indexed" via
 /// the `Option` at the [`PostingsSection::probe`] layer, not here).
-fn find_term_in_block(payload: &[u8], term: &[u8]) -> Result<Option<Vec<u32>>, LogSegError> {
+///
+/// Also re-derives, from the block's own crc-verified bytes, the two
+/// properties `probe`'s binary search otherwise trusts blindly from the
+/// unchecksummed sparse-index header: the block's actual first decoded term
+/// must equal `expected_first_term` (the sparse entry `probe` selected this
+/// block by), and every decoded term must sort strictly below `upper_bound`
+/// (the next sparse entry's `first_term`, already known at parse time, or
+/// `None` for the last block). A header whose `first_term` was corrupted to
+/// redirect a probe at a different, still crc-valid block is caught here
+/// instead of silently narrowing the result (docs/log-segment-format.md
+/// "Pruning soundness"). This holds even when the whole-section crc
+/// (verified separately by the caller before [`PostingsSection::parse`]) was
+/// not consulted, e.g. a future ranged reader that fetches only the header
+/// and one addressed block.
+///
+/// The whole block is always decoded -- never returned early on a match --
+/// so the ascending-order and upper-bound checks cover every term, not just
+/// the ones scanned before a hit, and the loop's exact byte consumption can
+/// be checked against the payload length.
+fn find_term_in_block(
+    payload: &[u8],
+    term: &[u8],
+    expected_first_term: &[u8],
+    upper_bound: Option<&[u8]>,
+) -> Result<Option<Vec<u32>>, LogSegError> {
     let mut pos = 0usize;
     let term_count = get_uvarint(payload, &mut pos)?;
     if term_count > MAX_POSTINGS_TERMS_PER_FIELD {
@@ -556,8 +589,14 @@ fn find_term_in_block(payload: &[u8], term: &[u8]) -> Result<Option<Vec<u32>>, L
             "postings block term_count over cap".into(),
         ));
     }
+    if term_count == 0 {
+        return Err(LogSegError::Corrupted(
+            "postings block has zero terms".into(),
+        ));
+    }
     let mut prev_term: Option<Vec<u8>> = None;
-    for _ in 0..term_count {
+    let mut found: Option<Vec<u32>> = None;
+    for i in 0..term_count {
         let term_len = usize::try_from(get_uvarint(payload, &mut pos)?)
             .map_err(|_| LogSegError::Corrupted("postings term_len range".into()))?;
         let end = pos
@@ -566,11 +605,23 @@ fn find_term_in_block(payload: &[u8], term: &[u8]) -> Result<Option<Vec<u32>>, L
         let this_term = payload
             .get(pos..end)
             .ok_or_else(|| LogSegError::Corrupted("postings term truncated".into()))?;
+        if i == 0 && this_term != expected_first_term {
+            return Err(LogSegError::Corrupted(
+                "postings block first term does not match sparse index".into(),
+            ));
+        }
         if let Some(prev) = &prev_term
             && this_term <= prev.as_slice()
         {
             return Err(LogSegError::Corrupted(
                 "postings block terms not ascending".into(),
+            ));
+        }
+        if let Some(upper) = upper_bound
+            && this_term >= upper
+        {
+            return Err(LogSegError::Corrupted(
+                "postings block term exceeds next sparse entry".into(),
             ));
         }
         pos = end;
@@ -604,17 +655,16 @@ fn find_term_in_block(payload: &[u8], term: &[u8]) -> Result<Option<Vec<u32>>, L
             prev_block = Some(block);
         }
         if this_term == term {
-            // Not returned early: the loop still must be trusted to consume
-            // exactly the declared bytes below, but there is nothing left to
-            // learn once found, and consuming remaining terms costs nothing
-            // callers should pay for -- keep decoding for a definitive
-            // trailing-bytes check across the fuzz corpus is unnecessary here
-            // since this is a single addressed block, not the whole section.
-            return Ok(Some(list));
+            found = Some(list);
         }
         prev_term = Some(this_term.to_vec());
     }
-    Ok(Some(Vec::new()))
+    if pos != payload.len() {
+        return Err(LogSegError::Corrupted(
+            "postings block trailing bytes".into(),
+        ));
+    }
+    Ok(Some(found.unwrap_or_default()))
 }
 
 #[cfg(test)]
@@ -806,5 +856,63 @@ mod tests {
             PostingsSection::parse(&bytes),
             Err(LogSegError::Corrupted(_))
         ));
+    }
+
+    /// Targeted reproduction (fix-task on epic #479, issue #508 follow-up):
+    /// a one-byte flip of a sparse-index `first_term`, touching no term
+    /// block, used to silently narrow a probe's result instead of failing
+    /// loud. `tests/corrupt.rs`'s proptest cannot find this: a random byte
+    /// flip almost never both lands in the header and preserves ascending
+    /// `first_term` order, and `parse` rejects anything that doesn't.
+    ///
+    /// Four terms `aa, bz, ca, cz` with `stride = 2` split into two term
+    /// blocks: `B0 = [aa, bz]` (sparse entry `first_term = "aa"`) and
+    /// `B1 = [ca, cz]` (sparse entry `first_term = "ca"`). Flipping the
+    /// declared `first_term` for `B1` from `"ca"` to `"ba"` preserves
+    /// ascending order across entries (`"aa" < "ba"`), so `parse` still
+    /// accepts, and touches no term-block bytes, so `B1`'s own `crc32c`
+    /// still verifies. Probing `"bz"` sorts between the corrupted `"ba"` and
+    /// the next entry, so the binary search still lands on `B1` -- which,
+    /// before this fix, decoded fine, did not contain `"bz"`, and reported
+    /// it exact-absent instead of catching that `B1`'s real first term
+    /// ("ca") disagrees with the header entry that pointed at it.
+    #[test]
+    fn corrupted_first_term_header_byte_is_caught_not_silently_narrowed() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            1,
+            FieldTerms::Terms(terms_map(&[
+                (b"aa", &[0]),
+                (b"bz", &[1]),
+                (b"ca", &[2]),
+                (b"cz", &[3]),
+            ])),
+        );
+        let mut bytes = encode_postings_section(&fields, 2, 3).expect("encode");
+
+        // Baseline: the uncorrupted section resolves "bz" to block 1, exact.
+        let baseline = PostingsSection::parse(&bytes).expect("parse");
+        assert_eq!(baseline.probe(1, b"bz").expect("probe"), Some(vec![1]));
+
+        // B1's declared first_term "ca" lives at a fixed offset: version(1) +
+        // field_count(4) + column_id(1) + capped(1) + stride(1) +
+        // term_count(1) + block_count(1) = 10, then B0's whole entry
+        // (first_term_len(1) + "aa"(2) + offset/stored_len/uncompressed_len/
+        // crc32c(8+8+8+4)) is 31 bytes, ending at 41; B1's first_term_len(1)
+        // puts its first_term bytes at [42, 44).
+        let corrupt_at = 42;
+        assert_eq!(
+            &bytes[corrupt_at..corrupt_at + 2],
+            b"ca",
+            "offset math must match the header layout"
+        );
+        bytes[corrupt_at] = b'b';
+
+        let section =
+            PostingsSection::parse(&bytes).expect("ascending order preserved, parse still accepts");
+        let err = section
+            .probe(1, b"bz")
+            .expect_err("a header pointing at a block whose real first term disagrees must fail loud, not report an exact miss");
+        assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
     }
 }
