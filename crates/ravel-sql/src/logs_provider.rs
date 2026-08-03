@@ -285,7 +285,7 @@ mod tests {
     fn logs_session(provider: LogsTableProvider) -> DFResult<datafusion::prelude::SessionContext> {
         let config = SqlConfig::default();
         let tenant = TenantMemoryAccountant::new(1 << 30);
-        let (pool, _breach) = config.query_pool(tenant);
+        let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
         build_session(&config, pool, SessionTable::Logs(Arc::new(provider)))
     }
 
@@ -359,7 +359,12 @@ mod tests {
             segments: vec![seg],
             segments_pruned: 0,
         };
-        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let provider = LogsTableProvider::new(
+            snapshot,
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
         let ctx = logs_session(provider).expect("build session");
 
         // Planning: `attrs['service.name'] = 'api'` must not error with
@@ -394,7 +399,12 @@ mod tests {
             segments: vec![seg],
             segments_pruned: 0,
         };
-        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let provider = LogsTableProvider::new(
+            snapshot,
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
         let ctx = logs_session(provider).expect("build session");
 
         let df = ctx
@@ -430,7 +440,12 @@ mod tests {
             segments: vec![seg],
             segments_pruned: 0,
         };
-        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let provider = LogsTableProvider::new(
+            snapshot,
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
         let ctx = logs_session(provider).expect("build session");
 
         let df = ctx
@@ -480,7 +495,12 @@ mod tests {
             segments: vec![seg],
             segments_pruned: 0,
         };
-        let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+        let provider = LogsTableProvider::new(
+            snapshot,
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
         let ctx = logs_session(provider).expect("build session");
 
         let df = ctx
