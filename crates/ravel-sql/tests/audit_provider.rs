@@ -30,6 +30,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::AuditTableProvider;
+use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 fn identity() -> ObjectIdentity {
@@ -158,7 +159,7 @@ fn provider(store: MemoryStore, segments: Vec<SegmentRef>) -> AuditTableProvider
         segments,
         segments_pruned: 0,
     };
-    AuditTableProvider::new(snapshot, fetcher, EngineConfig::default())
+    AuditTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new())
 }
 
 /// A ts range returns exactly the surviving generic rows across several objects,

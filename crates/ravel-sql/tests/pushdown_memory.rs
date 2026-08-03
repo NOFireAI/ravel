@@ -35,6 +35,7 @@ use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{
     RavelTableProvider, SqlConfig, TenantMemoryAccountant, label_match_udf, label_udf,
 };
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -324,7 +325,13 @@ fn ts_lit(v: i64) -> datafusion::logical_expr::Expr {
 
 fn register(ctx: &SessionContext, snapshot: Snapshot, store: Arc<dyn ObjectStoreBackend>) {
     let fetcher = SegmentFetcher::new(store);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
+    let provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
     ctx.register_udf(label_udf());
     ctx.register_udf(label_match_udf());
     ctx.register_table("samples", Arc::new(provider))
@@ -442,7 +449,13 @@ async fn label_equality_prunes_series_pages() {
     let fetcher = SegmentFetcher::new(Arc::clone(&backend))
         .with_whole_object_threshold(0)
         .with_suffix_len(256);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
+    let provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
     ctx.register_udf(label_udf());
     ctx.register_table("samples", Arc::new(provider)).unwrap();
 
@@ -480,7 +493,13 @@ async fn label_equality_prunes_series_pages() {
     let fetcher2 = SegmentFetcher::new(Arc::clone(&backend2))
         .with_whole_object_threshold(0)
         .with_suffix_len(256);
-    let provider2 = RavelTableProvider::new(snapshot2, TENANT, fetcher2, EngineConfig::default());
+    let provider2 = RavelTableProvider::new(
+        snapshot2,
+        TENANT,
+        fetcher2,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
     let plan = provider2.plan(1).expect("plan");
     let _ = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -768,7 +787,7 @@ async fn pushdown_path_preserves_sort_preserving_merge() {
 // ---------------------------------------------------------------------------
 
 fn task_ctx_with_pool(config: &SqlConfig, tenant: Arc<TenantMemoryAccountant>) -> Arc<TaskContext> {
-    let (pool, _breach) = config.query_pool(tenant);
+    let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
     let rt = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .build_arc()
@@ -799,7 +818,7 @@ async fn byte_budget_exceeded_returns_typed_error() {
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx).await.expect_err("budget must trip");
     let msg = format!("{err}");
@@ -832,7 +851,7 @@ async fn dropped_mid_scan_stream_releases_tenant_bytes() {
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(1).expect("plan");
 
     let mut stream = plan.execute(0, task_ctx).expect("execute");
@@ -882,7 +901,7 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx)
         .await
@@ -931,7 +950,7 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
         max_query_bytes: 1 << 30,
     };
     let tenant = TenantMemoryAccountant::new(8);
-    let (pool, _breach) = config.query_pool(Arc::clone(&tenant));
+    let (pool, _breach) = config.query_pool(Arc::clone(&tenant), QueryAccounting::new());
     let reserved_before = pool.reserved();
     let rt = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::clone(&pool))
@@ -940,7 +959,7 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
     let task_ctx = Arc::new(TaskContext::default().with_runtime(rt));
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx)
         .await
@@ -988,7 +1007,7 @@ async fn query_budget_reported_first_when_both_ceilings_are_equally_reachable() 
     let task_ctx = task_ctx_with_pool(&config, Arc::clone(&tenant));
 
     let fetcher = SegmentFetcher::new(Arc::clone(&store));
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, task_ctx).await.expect_err("budget must trip");
     let msg = format!("{err}");

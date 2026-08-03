@@ -44,6 +44,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::{LogsTableProvider, has_word_udf};
+use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 fn identity() -> ObjectIdentity {
@@ -238,7 +239,8 @@ async fn scan_prunes_by_ts_and_word_returns_exact_rows() {
     };
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
     let fetcher = LogSegmentFetcher::new(store);
-    let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+    let provider =
+        LogsTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new());
 
     // WHERE ts >= 100 AND ts <= 250 AND has_word(body, 'timeout')
     let (lo, hi) = (100i64, 250i64);
@@ -333,7 +335,8 @@ async fn stream_attr_equality_is_resolved_by_the_residual() {
         segments: vec![seg],
         segments_pruned: 0,
     };
-    let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+    let provider =
+        LogsTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new());
 
     // A full SessionContext query so DataFusion's residual FilterExec actually
     // runs the `attrs['service.name'] = 'api'` equality (via the `get_field` UDF)
@@ -513,7 +516,8 @@ async fn residual_recheck_keeps_resource_only_stream_attr_match() {
         segments: vec![seg],
         segments_pruned: 0,
     };
-    let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+    let provider =
+        LogsTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new());
 
     let ctx = SessionContext::new();
     ctx.register_udf(ScalarUDF::from(GetField::new()));

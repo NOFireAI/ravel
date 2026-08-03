@@ -31,6 +31,7 @@ use ravel_sql::{
     RavelTableProvider, SessionTable, SqlConfig, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantId;
+use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
 /// Comfortably more than `RsegScanExec`'s 8192-row batch size, so the scan
@@ -63,6 +64,7 @@ async fn drain(
         tenant.hash(),
         SegmentFetcher::new(Arc::clone(&fixture.store)),
         SqlConfig::default(),
+        QueryAccounting::new(),
     ));
     let ctx = build_session(
         &SqlConfig::default(),
@@ -105,7 +107,8 @@ async fn a_multi_batch_query_returns_every_reserved_byte() {
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
     let accountant = TenantMemoryAccountant::new(1 << 30);
-    let (pool, _breach) = SqlConfig::default().query_pool(Arc::clone(&accountant));
+    let (pool, _breach) =
+        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
     assert_eq!(pool.reserved(), 0, "a fresh pool starts empty");
 
     let (batches, after_first, peak) = drain(
@@ -152,7 +155,8 @@ async fn a_multi_batch_aggregate_query_returns_every_reserved_byte() {
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
 
     let accountant = TenantMemoryAccountant::new(1 << 30);
-    let (pool, _breach) = SqlConfig::default().query_pool(Arc::clone(&accountant));
+    let (pool, _breach) =
+        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
 
     let (_batches, _first, _peak) = drain(
         &fixture,
@@ -177,7 +181,8 @@ async fn repeated_multi_batch_queries_do_not_accumulate_tenant_bytes() {
 
     let accountant = TenantMemoryAccountant::new(1 << 30);
     for round in 0..3 {
-        let (pool, _breach) = SqlConfig::default().query_pool(Arc::clone(&accountant));
+        let (pool, _breach) =
+            SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
         let (batches, _first, _peak) = drain(
             &fixture,
             &tenant,
@@ -246,7 +251,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         max_query_bytes: 1_400_000,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
-    let (pool, _breach) = config.query_pool(Arc::clone(&accountant));
+    let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
 
     let snapshot = fixture.snapshot(&tenant).await;
     let provider = Arc::new(RavelTableProvider::new(
@@ -254,6 +259,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         tenant.hash(),
         SegmentFetcher::new(Arc::clone(&fixture.store)),
         config,
+        QueryAccounting::new(),
     ));
     let ctx = build_session(&config, Arc::clone(&pool), SessionTable::Metrics(provider))
         .expect("session");

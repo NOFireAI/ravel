@@ -68,6 +68,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::{LogsTableProvider, has_word_udf};
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
@@ -909,7 +910,8 @@ async fn scan_rows(
     query: &QuerySpec,
 ) -> Vec<Row> {
     let fetcher = LogSegmentFetcher::new(store);
-    let provider = LogsTableProvider::new(snapshot, fetcher, EngineConfig::default());
+    let provider =
+        LogsTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new());
 
     let ctx = SessionContext::new();
     let get_field = ScalarUDF::from(GetField::new());
