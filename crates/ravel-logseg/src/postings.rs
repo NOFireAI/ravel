@@ -21,6 +21,22 @@
 //! section's own internal grammar version, independent of the RLOG trailer
 //! `VERSION`.
 //!
+//! Grammar versions. The byte layout below is identical for every version;
+//! the version byte records what a posting list *means*, which a reader
+//! cannot recover from the bytes (docs/adrs/0049-rlog-postings.md amendment
+//! 2026-08-03):
+//!
+//! - version 1: posting lists index the per-record attribute layer only.
+//! - version 2: posting lists index the merged attribute view of each record
+//!   (resource + scope + per-record, the record winning on a key collision),
+//!   which is the view SQL's `attrs` column exposes.
+//!
+//! The writer emits [`POSTINGS_VERSION`] (2). [`PostingsSection::parse`]
+//! accepts both and records which it read in [`PostingsSection::version`], so
+//! the reader can apply the pruning rule the stored meaning requires: a v2
+//! object prunes a merged-view query directly, a v1 object must decline any
+//! key that also lives at stream level (see [`crate::reader`]).
+//!
 //! Byte layout (section body, uncompressed at the section-comp level; each
 //! term block carries its own independent zstd frame, mirroring how BLOOM's
 //! per-entry crc lets a ranged read verify one entry without a whole-section
@@ -70,9 +86,19 @@ use crate::error::LogSegError;
 use crate::record::ColumnValue;
 use crate::varint::{get_uvarint, put_uvarint};
 
-/// This section's internal grammar version (independent of the RLOG trailer
-/// version; see the module doc for why no trailer bump is needed).
-pub const POSTINGS_VERSION: u8 = 1;
+/// This section's internal grammar version emitted by the writer (independent
+/// of the RLOG trailer version; see the module doc for why no trailer bump is
+/// needed). Bumped 1 -> 2 by ADR-0049's 2026-08-03 amendment: a v2 posting
+/// list indexes the merged attribute view, a v1 posting list indexed the
+/// per-record layer only. Same bytes, different meaning, so the version byte
+/// distinguishes them.
+pub const POSTINGS_VERSION: u8 = 2;
+
+/// The pre-amendment grammar version. Posting lists indexed the per-record
+/// attribute layer only. Still read, never written: stored v1 objects are not
+/// rewritten, so a reader keeps the conservative merged-view rule for them
+/// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
+pub const POSTINGS_VERSION_V1: u8 = 1;
 
 /// Default number of distinct terms held per term block. Small enough that a
 /// probe's one term-block fetch stays a modest ranged GET, large enough that
@@ -302,6 +328,11 @@ struct FieldIndex {
 pub struct PostingsSection<'a> {
     bytes: &'a [u8],
     fields: Vec<FieldIndex>,
+    /// The grammar version read from the section header
+    /// ([`POSTINGS_VERSION`] or [`POSTINGS_VERSION_V1`]). It selects what a
+    /// posting list means, and so which merged-view pruning rule the reader
+    /// applies (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
+    version: u8,
 }
 
 impl<'a> PostingsSection<'a> {
@@ -316,7 +347,7 @@ impl<'a> PostingsSection<'a> {
             .get(pos)
             .ok_or_else(|| LogSegError::Corrupted("postings version truncated".into()))?;
         pos += 1;
-        if version != POSTINGS_VERSION {
+        if version != POSTINGS_VERSION && version != POSTINGS_VERSION_V1 {
             return Err(LogSegError::Corrupted(format!(
                 "unsupported postings version {version}"
             )));
@@ -480,7 +511,18 @@ impl<'a> PostingsSection<'a> {
         if cursor != bytes.len() {
             return Err(LogSegError::Corrupted("postings trailing bytes".into()));
         }
-        Ok(PostingsSection { bytes, fields })
+        Ok(PostingsSection {
+            bytes,
+            fields,
+            version,
+        })
+    }
+
+    /// The grammar version this section was written with ([`POSTINGS_VERSION`]
+    /// for a merged-view index, [`POSTINGS_VERSION_V1`] for a per-record-only
+    /// one). The reader consults it to pick the merged-view pruning rule.
+    pub fn version(&self) -> u8 {
+        self.version
     }
 
     /// Looks up `term`'s posting list for `column_id`.
@@ -695,11 +737,42 @@ mod tests {
     fn rejects_wrong_version() {
         let mut bytes =
             encode_postings_section(&BTreeMap::new(), DEFAULT_STRIDE, 3).expect("encode");
+        // A version past the highest known grammar (2) is rejected; 1 and 2 are
+        // both accepted (see `accepts_both_grammar_versions`).
         bytes[0] = POSTINGS_VERSION + 1;
         assert!(matches!(
             PostingsSection::parse(&bytes),
             Err(LogSegError::Corrupted(_))
         ));
+    }
+
+    /// Both grammar versions parse and probe identically (the byte layout is
+    /// the same); only [`PostingsSection::version`] differs, and it is what the
+    /// reader keys the merged-view pruning rule on. A stored v1 object must
+    /// keep reading after the writer moved to v2.
+    #[test]
+    fn accepts_both_grammar_versions() {
+        let mut fields = BTreeMap::new();
+        fields.insert(10, FieldTerms::Terms(terms_map(&[(b"alpha", &[0, 2])])));
+
+        let v2 = encode_postings_section(&fields, DEFAULT_STRIDE, 3).expect("encode");
+        assert_eq!(v2[0], POSTINGS_VERSION);
+        let section = PostingsSection::parse(&v2).expect("parse v2");
+        assert_eq!(section.version(), POSTINGS_VERSION);
+        assert_eq!(
+            section.probe(10, b"alpha").expect("probe"),
+            Some(vec![0, 2])
+        );
+
+        // Pin the version byte to 1: the same bytes now read as a v1 section.
+        let mut v1 = v2.clone();
+        v1[0] = POSTINGS_VERSION_V1;
+        let section = PostingsSection::parse(&v1).expect("parse v1");
+        assert_eq!(section.version(), POSTINGS_VERSION_V1);
+        assert_eq!(
+            section.probe(10, b"alpha").expect("probe"),
+            Some(vec![0, 2])
+        );
     }
 
     #[test]

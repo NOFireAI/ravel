@@ -195,6 +195,17 @@ pub struct ResolvedRow {
     /// Resolved dynamic columns, `(column_id, value)`. A column id appears at
     /// most once per row.
     pub columns: Vec<(u32, ColumnValue)>,
+    /// The merged-view values this row contributes to POSTINGS, one
+    /// `(column_id, value)` per indexed field the row carries after merging its
+    /// resource, scope, and per-record attributes (the record winning on a key
+    /// collision), keyed by the same dynamic column the value's type resolves
+    /// to. Empty when the writer was given no indexed fields, or the row's
+    /// merged value for an indexed field has no matching dynamic column. This
+    /// is what makes a v2 POSTINGS list index the merged attribute view rather
+    /// than the per-record layer alone (docs/adrs/0049-rlog-postings.md
+    /// amendment 2026-08-03); it never affects block encoding, only postings
+    /// accumulation.
+    pub indexed_terms: Vec<(u32, ColumnValue)>,
 }
 
 /// Selects the field a predicate arm applies to.

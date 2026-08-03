@@ -633,6 +633,7 @@ mod tests {
             flags: 0,
             attrs_raw: None,
             columns: Vec::new(),
+            indexed_terms: Vec::new(),
         }
     }
 

@@ -20,6 +20,7 @@ use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
 use crate::footer::{COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
+use crate::reader::stream_attr_pairs;
 use crate::record::{
     COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord, ResolvedRow,
     resolve_value,
@@ -254,11 +255,16 @@ impl RlogWriter {
             .collect();
 
         // Resolve every record into storage form, then sort by (stream_ref, ts).
+        // `resolve_row` also computes each row's merged-view POSTINGS terms,
+        // which decodes the record's `stream_attrs` blob and so can fail on a
+        // corrupt blob; that failure is propagated rather than silently
+        // under-indexing (an under-populated posting list would prune a block a
+        // merged-view query needs).
         let mut rows: Vec<ResolvedRow> = self
             .records
             .iter()
-            .map(|r| resolve_row(r, &ref_of, &column_of))
-            .collect();
+            .map(|r| resolve_row(r, &ref_of, &column_of, &indexed_names))
+            .collect::<Result<Vec<_>, _>>()?;
         rows.sort_by(|a, b| {
             a.stream_ref
                 .cmp(&b.stream_ref)
@@ -325,16 +331,28 @@ impl RlogWriter {
                     if let ColumnValue::Str(bytes) = v {
                         insert_text(&mut builder, *cid, bytes);
                     }
-                    if indexed_column_ids.contains(cid) && !postings_capped.contains(cid) {
-                        let field_map = postings_terms.entry(*cid).or_default();
-                        field_map
-                            .entry(term_key(v))
-                            .or_default()
-                            .insert(blk_idx_u32);
-                        if field_map.len() > self.cfg.postings_max_distinct {
-                            postings_terms.remove(cid);
-                            postings_capped.insert(*cid);
-                        }
+                }
+                // POSTINGS: index each row's merged-view values (resource +
+                // scope + per-record, the record winning on a key collision),
+                // precomputed in `resolve_row` as `indexed_terms`. That view is
+                // what SQL's `attrs` column exposes, so a v2 posting list
+                // answers the merged-view query directly
+                // (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
+                // `indexed_terms` only ever names indexed columns, so no
+                // `indexed_column_ids` check is needed here; the per-field
+                // distinct-value cap (decision 4) now counts merged values.
+                for (cid, v) in &row.indexed_terms {
+                    if postings_capped.contains(cid) {
+                        continue;
+                    }
+                    let field_map = postings_terms.entry(*cid).or_default();
+                    field_map
+                        .entry(term_key(v))
+                        .or_default()
+                        .insert(blk_idx_u32);
+                    if field_map.len() > self.cfg.postings_max_distinct {
+                        postings_terms.remove(cid);
+                        postings_capped.insert(*cid);
                     }
                 }
             }
@@ -510,12 +528,14 @@ impl RlogWriter {
 }
 
 /// Resolves one record into storage form: dense stream ref, dynamic columns
-/// split by type, and overflow attributes canonicalized into `attrs_raw`.
+/// split by type, overflow attributes canonicalized into `attrs_raw`, and the
+/// merged-view POSTINGS terms this record contributes ([`merged_indexed_terms`]).
 fn resolve_row(
     r: &LogRecord,
     ref_of: &HashMap<LogStreamId, u32>,
     column_of: &HashMap<(String, u8), u32>,
-) -> ResolvedRow {
+    indexed_names: &std::collections::HashSet<&str>,
+) -> Result<ResolvedRow, LogSegError> {
     let stream_ref = ref_of.get(&r.stream_id).copied().unwrap_or(0);
     let mut cols: BTreeMap<u32, ColumnValue> = BTreeMap::new();
     let mut overflow: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
@@ -535,7 +555,8 @@ fn resolve_row(
     } else {
         Some(canonical_attr_bytes(&overflow))
     };
-    ResolvedRow {
+    let indexed_terms = merged_indexed_terms(r, indexed_names, column_of)?;
+    Ok(ResolvedRow {
         stream_ref,
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
@@ -547,7 +568,62 @@ fn resolve_row(
         flags: r.flags,
         attrs_raw,
         columns: cols.into_iter().collect(),
+        indexed_terms,
+    })
+}
+
+/// The merged-view POSTINGS terms one record contributes.
+///
+/// For each indexed field the record resolves to after merging its resource,
+/// scope, and per-record attributes (the record winning on a key collision),
+/// this returns `(column_id, value)` under the dynamic column that value's type
+/// resolves to. That precedence is exactly what
+/// `ravel_sql::rlog_attrs::merged_attrs` computes for SQL's `attrs` column,
+/// reproduced here so the writer does not depend on ravel-sql
+/// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
+///
+/// A field with no matching dynamic column contributes nothing: a key that is
+/// resource-only across the whole object has no column to key a posting by, and
+/// a key that overflowed the dynamic-column budget likewise. Absence is legal;
+/// no posting for a field means no pruning on it, never a wrong prune. The
+/// decode of `stream_attrs` can fail on a corrupt blob, which is propagated
+/// (the caller fails the write) rather than silently dropping stream-level
+/// terms, since an under-populated posting list would prune a needed block.
+fn merged_indexed_terms(
+    r: &LogRecord,
+    indexed_names: &std::collections::HashSet<&str>,
+    column_of: &HashMap<(String, u8), u32>,
+) -> Result<Vec<(u32, ColumnValue)>, LogSegError> {
+    if indexed_names.is_empty() {
+        return Ok(Vec::new());
     }
+    // Merge, restricted to indexed keys, record-wins: resource/scope pairs
+    // first, then each per-record attribute overrides in place or appends. This
+    // mirrors `merged_attrs` (resource/scope, then record attrs win).
+    let mut merged: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
+    for (k, v) in stream_attr_pairs(&r.stream_attrs)? {
+        if indexed_names.contains(k.as_str()) {
+            merged.push((k, v));
+        }
+    }
+    for (k, v) in &r.attrs {
+        if !indexed_names.contains(k.as_str()) {
+            continue;
+        }
+        if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == k) {
+            slot.1 = v.clone();
+        } else {
+            merged.push((k.clone(), v.clone()));
+        }
+    }
+    let mut out = Vec::with_capacity(merged.len());
+    for (name, value) in merged {
+        let (ty, cv) = resolve_value(&value);
+        if let Some(&cid) = column_of.get(&(name, ty.to_u8())) {
+            out.push((cid, cv));
+        }
+    }
+    Ok(out)
 }
 
 /// Splits row indices into block spans by record target and an estimated
