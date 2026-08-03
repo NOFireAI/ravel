@@ -36,6 +36,7 @@ use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
 /// Section kinds (docs/segment-format.md; crate-internal `format::section_kind`
 /// is not public, so the wire values are named locally here).
+const LABEL_DICT: u32 = 1;
 const SERIES_META: u32 = 6;
 const SERIES_IDX: u32 = 8;
 const SERIES_META_CHUNKS: u32 = 9;
@@ -377,4 +378,77 @@ fn write_v6_is_deterministic_across_repeated_calls() {
         write_sparse().blake3,
         "sparse v6 output must be deterministic"
     );
+}
+
+/// Two exemplars for the same series at the same timestamp both survive a
+/// write-read round trip. Compaction copies exemplars verbatim and never drops
+/// a record, so a retried write that lands in two L0 objects must produce an L1
+/// object holding both (ADR-0047 amendment 2026-08-03). An earlier revision of
+/// the writer collapsed a run of equal keys to its last record, which made that
+/// impossible.
+#[test]
+fn two_exemplars_sharing_a_key_both_survive_a_round_trip() {
+    let series = no_sparse_inputs();
+    let target = series.first().expect("at least one series");
+    let ts_ns = target.runs[0].min_ts_ns;
+    let both = vec![
+        ExemplarInput {
+            series_id: target.series_id,
+            ts_ns,
+            value: 1.0,
+            trace_id: [0x11; 16],
+            span_id: [0x22; 8],
+            attrs: Vec::new(),
+        },
+        ExemplarInput {
+            series_id: target.series_id,
+            ts_ns,
+            value: 2.0,
+            trace_id: [0x33; 16],
+            span_id: [0x44; 8],
+            attrs: Vec::new(),
+        },
+    ];
+    let written = SegmentWriter::write_v5_with_exemplars(
+        series,
+        fixed_identity(),
+        fixed_bounds(),
+        fixed_meta(),
+        both,
+    )
+    .expect("write v6 with duplicate exemplar keys")
+    .bytes;
+
+    let loc = open_from_full(&written, ReaderLimits::default()).expect("open");
+    let dict_bytes = section_bytes(&written, &loc.footer, LABEL_DICT);
+    let exemplars_bytes = section_bytes(&written, &loc.footer, EXEMPLARS);
+
+    let got = ravel_segment::decode_exemplars_section(
+        &loc.footer,
+        dict_bytes,
+        exemplars_bytes,
+        ReaderLimits::default(),
+    )
+    .expect("decode exemplars");
+
+    assert_eq!(got.len(), 2, "both records must survive, not just the last");
+    assert_eq!(got[0].series_index, got[1].series_index);
+    assert_eq!(got[0].ts_ns, got[1].ts_ns);
+    // Bit patterns, never `==`: an exemplar value can be NaN or -0.0.
+    assert_eq!(got[0].value.to_bits(), 1.0f64.to_bits());
+    assert_eq!(got[1].value.to_bits(), 2.0f64.to_bits());
+    assert_eq!(got[0].trace_id, [0x11; 16]);
+    assert_eq!(got[1].trace_id, [0x33; 16]);
+
+    // The per-series probe must return both too, not stop at the first.
+    let probed = ravel_segment::probe_exemplars_by_series(
+        &loc.footer,
+        dict_bytes,
+        exemplars_bytes,
+        ReaderLimits::default(),
+        got[0].series_index,
+    )
+    .expect("probe exemplars");
+    assert_eq!(probed.len(), 2);
+    assert_eq!(probed[1].trace_id, [0x33; 16]);
 }
