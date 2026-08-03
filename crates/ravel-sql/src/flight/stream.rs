@@ -59,6 +59,7 @@ use datafusion::arrow::array::RecordBatch;
 use futures::{Stream, StreamExt};
 use ravel_catalog::Snapshot;
 use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
 use tonic::Status;
 
 use crate::error::SqlError;
@@ -203,7 +204,13 @@ async fn first_batch(
     snapshot: &Snapshot,
     sql: &str,
 ) -> Result<(Option<RecordBatch>, PinnedStream), SqlError> {
-    let planned = executor.plan_pinned(tenant, snapshot.clone(), sql).await?;
+    // A fresh handle per attempt, matching `SqlExecutor::run`'s per-attempt
+    // accounting: DoGet's own execution accounting (crate::flight::service
+    // covers only its own RPC, a documented gap, see the comment there).
+    let accounting = QueryAccounting::new();
+    let planned = executor
+        .plan_pinned(tenant, snapshot.clone(), sql, &accounting)
+        .await?;
     let mut stream = planned.execute().await?;
     match stream.next().await {
         None => Ok((None, stream)),

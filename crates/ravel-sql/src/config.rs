@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use datafusion::execution::memory_pool::MemoryPool;
 use ravel_query::EngineConfig;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 
@@ -69,15 +70,21 @@ impl SqlConfig {
     /// stream so a `grow` that overshoots either ceiling aborts the query at
     /// its next poll (issue #163). The two are created together so the caller
     /// cannot install a pool whose breach nothing observes.
+    ///
+    /// `accounting` is the calling query's [`QueryAccounting`] handle
+    /// (ADR-0044); the pool reports this query's reserved-bytes high-water
+    /// mark into it on every grow, feeding `peak_intermediate_bytes`.
     pub fn query_pool(
         &self,
         tenant: Arc<TenantMemoryAccountant>,
+        accounting: QueryAccounting,
     ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
         let breach = CeilingBreach::new();
         let pool = Arc::new(TenantDelegatingPool::new(
             self.max_query_bytes,
             tenant,
             Arc::clone(&breach),
+            accounting,
         ));
         (pool, breach)
     }

@@ -78,6 +78,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{LogRecord, Predicate};
 use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_types::accounting::QueryAccounting;
 
 use crate::error::SqlError;
 use crate::logs_schema::{SPAN_ID_WIDTH, TRACE_ID_WIDTH, logs_schema};
@@ -101,6 +102,10 @@ pub struct LogsScanExec {
     content: Arc<Vec<Predicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// This query's accounting handle (ADR-0044), threaded into every
+    /// per-partition fetch so log fetches are recorded like every other
+    /// funnel.
+    accounting: QueryAccounting,
 }
 
 impl LogsScanExec {
@@ -117,6 +122,7 @@ impl LogsScanExec {
         ts_min: i64,
         ts_max: i64,
         content: Arc<Vec<Predicate>>,
+        accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -133,6 +139,7 @@ impl LogsScanExec {
             content,
             schema,
             properties,
+            accounting,
         })
     }
 
@@ -214,6 +221,7 @@ impl ExecutionPlan for LogsScanExec {
             self.ts_min,
             self.ts_max,
             content,
+            self.accounting.clone(),
         ));
         Ok(Box::pin(LogScanStream {
             schema,
@@ -233,6 +241,7 @@ async fn prepare_partition(
     ts_min: i64,
     ts_max: i64,
     content: Arc<Vec<Predicate>>,
+    accounting: QueryAccounting,
 ) -> DFResult<Vec<LogRecord>> {
     let mut query = LogQuery::new(ts_min, ts_max);
     for c in content.iter() {
@@ -241,7 +250,11 @@ async fn prepare_partition(
 
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
-        let Some(output) = fetcher.fetch(seg, &query).await.map_err(SqlError::from)? else {
+        let Some(output) = fetcher
+            .fetch_accounted(seg, &query, &accounting)
+            .await
+            .map_err(SqlError::from)?
+        else {
             continue;
         };
         // Emit every fetched record: stream-attribute equalities are not pushed

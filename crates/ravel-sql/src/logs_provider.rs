@@ -29,6 +29,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::config::SqlConfig;
 use crate::error::SqlError;
@@ -43,6 +44,10 @@ pub struct LogsTableProvider {
     fetcher: LogSegmentFetcher,
     config: SqlConfig,
     schema: SchemaRef,
+    /// This query's accounting handle (ADR-0044), cloned into every
+    /// `LogsScanExec` the provider builds so every store fetch the scan
+    /// issues on this query's behalf is recorded against it.
+    accounting: QueryAccounting,
 }
 
 impl LogsTableProvider {
@@ -53,12 +58,14 @@ impl LogsTableProvider {
         snapshot: Snapshot,
         fetcher: LogSegmentFetcher,
         config: impl Into<SqlConfig>,
+        accounting: QueryAccounting,
     ) -> Self {
         LogsTableProvider {
             snapshot: Arc::new(snapshot),
             fetcher,
             config: config.into(),
             schema: logs_schema(),
+            accounting,
         }
     }
 
@@ -99,6 +106,7 @@ impl LogsTableProvider {
             pushdown.ts_min(),
             pushdown.ts_max(),
             Arc::new(pushdown.content.clone()),
+            self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
     }

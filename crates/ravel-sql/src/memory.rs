@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
+use ravel_types::accounting::QueryAccounting;
 
 /// A one-shot per-query abort flag for the best-effort memory ceiling.
 ///
@@ -159,6 +160,12 @@ pub struct TenantDelegatingPool {
     /// ceiling. Shared with the query's stream, which reads it each poll and
     /// aborts once it is set (issue #163).
     breach: Arc<CeilingBreach>,
+    /// The query this pool was built for (ADR-0044 "1. A per-request
+    /// accounting handle"). Every successful grow reports the query's new
+    /// reserved high-water mark to `observe_intermediate_bytes`, so
+    /// `peak_intermediate_bytes` reflects this pool's own reservations
+    /// rather than staying zero, as it does on the PromQL path today.
+    accounting: QueryAccounting,
 }
 
 impl fmt::Debug for TenantDelegatingPool {
@@ -186,16 +193,20 @@ impl fmt::Display for TenantDelegatingPool {
 impl TenantDelegatingPool {
     /// A pool capped at `query_limit` bytes that delegates to `tenant` and
     /// trips `breach` if `grow`'s unconditional path overshoots either ceiling.
+    /// `accounting` receives this query's reserved-bytes high-water mark on
+    /// every successful grow.
     pub fn new(
         query_limit: usize,
         tenant: Arc<TenantMemoryAccountant>,
         breach: Arc<CeilingBreach>,
+        accounting: QueryAccounting,
     ) -> Self {
         TenantDelegatingPool {
             query_limit,
             query_used: AtomicUsize::new(0),
             tenant,
             breach,
+            accounting,
         }
     }
 
@@ -206,8 +217,8 @@ impl TenantDelegatingPool {
     }
 
     /// Reserve `additional` against the query budget only. CAS loop; returns
-    /// `Err` reserving nothing on overflow.
-    fn query_try_grow(&self, additional: usize) -> Result<(), ()> {
+    /// the new query total on success, reserving nothing on overflow.
+    fn query_try_grow(&self, additional: usize) -> Result<usize, ()> {
         let mut cur = self.query_used.load(Ordering::Acquire);
         loop {
             let next = cur.saturating_add(additional);
@@ -220,7 +231,7 @@ impl TenantDelegatingPool {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(next),
                 Err(observed) => cur = observed,
             }
         }
@@ -278,6 +289,8 @@ impl MemoryPool for TenantDelegatingPool {
             .query_used
             .fetch_add(additional, Ordering::AcqRel)
             .saturating_add(additional);
+        self.accounting
+            .observe_intermediate_bytes(query_total as u64);
         let tenant_total = self.tenant.grow(additional);
         if query_total > self.query_limit {
             self.breach.trip(format!(
@@ -306,12 +319,14 @@ impl MemoryPool for TenantDelegatingPool {
     fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
         // Query budget first: a query must trip its own pool before it can
         // threaten the tenant budget (review F10).
-        self.query_try_grow(additional).map_err(|()| {
+        let query_total = self.query_try_grow(additional).map_err(|()| {
             DataFusionError::ResourcesExhausted(format!(
                 "query memory pool exhausted: {additional} more bytes exceeds per-query limit {}",
                 self.query_limit
             ))
         })?;
+        self.accounting
+            .observe_intermediate_bytes(query_total as u64);
         if self.tenant.try_grow(additional).is_err() {
             // Roll the query reservation back so a tenant-budget failure
             // leaves nothing reserved on either budget.
@@ -337,6 +352,7 @@ impl MemoryPool for TenantDelegatingPool {
 #[allow(clippy::expect_used)]
 mod tests {
     use datafusion::execution::memory_pool::MemoryConsumer;
+    use ravel_types::accounting::QueryAccounting;
 
     use super::*;
 
@@ -351,6 +367,7 @@ mod tests {
             1024,
             Arc::clone(&tenant),
             Arc::clone(&breach),
+            QueryAccounting::new(),
         ));
         let res = MemoryConsumer::new("ceiling-query").register(&pool);
 
@@ -388,6 +405,7 @@ mod tests {
             1 << 30,
             Arc::clone(&tenant),
             Arc::clone(&breach),
+            QueryAccounting::new(),
         ));
         let res = MemoryConsumer::new("ceiling-tenant").register(&pool);
 
@@ -414,6 +432,7 @@ mod tests {
             1 << 30,
             Arc::clone(&tenant),
             Arc::clone(&breach),
+            QueryAccounting::new(),
         ));
         let res = MemoryConsumer::new("ceiling-none").register(&pool);
 
@@ -421,6 +440,34 @@ mod tests {
         assert!(
             breach.message().is_none(),
             "a grow under both ceilings must not trip the breach"
+        );
+    }
+
+    /// `grow` reports the query's reserved high-water mark to the accounting
+    /// handle, and a later shrink does not pull the recorded peak back down
+    /// (`observe_intermediate_bytes` is a maximum, never a sum or a gauge).
+    #[test]
+    fn grow_then_shrink_leaves_peak_intermediate_bytes_at_the_high_water_mark() {
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let breach = CeilingBreach::new();
+        let accounting = QueryAccounting::new();
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&tenant),
+            Arc::clone(&breach),
+            accounting.clone(),
+        ));
+        let res = MemoryConsumer::new("peak-bytes").register(&pool);
+
+        res.try_grow(4096).expect("within both ceilings");
+        res.grow(2048);
+        assert_eq!(accounting.snapshot().peak_intermediate_bytes, 6144);
+
+        res.shrink(5000);
+        assert_eq!(
+            accounting.snapshot().peak_intermediate_bytes,
+            6144,
+            "a shrink must not lower the recorded peak"
         );
     }
 }

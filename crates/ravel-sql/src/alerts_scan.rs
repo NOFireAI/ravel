@@ -46,6 +46,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{AttrValue, LogRecord, Predicate};
 use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_types::accounting::QueryAccounting;
 
 use crate::alerts_schema::{ALERT_ID_KEY, GENERATION_KEY, RULE_ID_KEY, STATE_KEY, alerts_schema};
 use crate::error::SqlError;
@@ -69,6 +70,9 @@ pub struct AlertsScanExec {
     content: Arc<Vec<Predicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// This query's accounting handle (ADR-0044), threaded into every
+    /// per-partition fetch.
+    accounting: QueryAccounting,
 }
 
 impl AlertsScanExec {
@@ -82,6 +86,7 @@ impl AlertsScanExec {
         ts_min: i64,
         ts_max: i64,
         content: Arc<Vec<Predicate>>,
+        accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -98,6 +103,7 @@ impl AlertsScanExec {
             content,
             schema,
             properties,
+            accounting,
         })
     }
 
@@ -179,6 +185,7 @@ impl ExecutionPlan for AlertsScanExec {
             self.ts_min,
             self.ts_max,
             content,
+            self.accounting.clone(),
         ));
         Ok(Box::pin(AlertScanStream {
             schema,
@@ -197,6 +204,7 @@ async fn prepare_partition(
     ts_min: i64,
     ts_max: i64,
     content: Arc<Vec<Predicate>>,
+    accounting: QueryAccounting,
 ) -> DFResult<Vec<LogRecord>> {
     let mut query = LogQuery::new(ts_min, ts_max);
     for c in content.iter() {
@@ -205,7 +213,11 @@ async fn prepare_partition(
 
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
-        let Some(output) = fetcher.fetch(seg, &query).await.map_err(SqlError::from)? else {
+        let Some(output) = fetcher
+            .fetch_accounted(seg, &query, &accounting)
+            .await
+            .map_err(SqlError::from)?
+        else {
             continue;
         };
         out.extend(output.records);

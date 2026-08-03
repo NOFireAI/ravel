@@ -40,6 +40,7 @@ use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_promql::LabelMatcher;
 use ravel_query::SegmentFetcher;
 use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::config::SqlConfig;
 use crate::dedup::RsegDedupExec;
@@ -55,6 +56,10 @@ pub struct RavelTableProvider {
     fetcher: SegmentFetcher,
     config: SqlConfig,
     schema: SchemaRef,
+    /// This query's accounting handle (ADR-0044), cloned into every
+    /// `RsegScanExec` the provider builds so every store fetch the scan
+    /// issues on this query's behalf is recorded against it.
+    accounting: QueryAccounting,
 }
 
 impl RavelTableProvider {
@@ -68,6 +73,7 @@ impl RavelTableProvider {
         tenant_hash: TenantHash,
         fetcher: SegmentFetcher,
         config: impl Into<SqlConfig>,
+        accounting: QueryAccounting,
     ) -> Self {
         RavelTableProvider {
             snapshot: Arc::new(snapshot),
@@ -75,6 +81,7 @@ impl RavelTableProvider {
             fetcher,
             config: config.into(),
             schema: public_schema(),
+            accounting,
         }
     }
 
@@ -118,6 +125,7 @@ impl RavelTableProvider {
             matchers,
             series_ids,
             self.config.engine.max_series,
+            self.accounting.clone(),
         )?);
         let scan_schema = scan.schema();
 
