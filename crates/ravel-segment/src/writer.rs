@@ -396,27 +396,16 @@ impl SegmentWriter {
                 attr_ords,
             });
         }
-        // Sort by (series_index, ts_ns) per the EXEMPLARS grammar, then
-        // dedup keeping the LAST of any run of exact-duplicate keys: two
-        // caller-supplied exemplars for the same series at the same
-        // timestamp would otherwise violate the reader's strict-ascending
-        // invariant. `sort_by_key` is stable, so "last" here means last in
-        // the caller's original order. Admission-time capping/deduplication
-        // is ADR-0047 decision 2 (issue #472, out of scope); this is only
-        // the writer's own guarantee that whatever it emits is decodable.
+        // Sort by (series_index, ts_ns) per the EXEMPLARS grammar. Equal keys
+        // are kept, not collapsed: compaction is a verbatim copy that never
+        // drops a record (crates/ravel-maintain/src/publish.rs), so two inputs
+        // each carrying an exemplar for the same series at the same timestamp
+        // must both reach the output. The reader accepts equal keys for this
+        // reason (ADR-0047 amendment 2026-08-03). `sort_by_key` is stable, so
+        // equal keys keep the caller's original order, which makes the encoded
+        // bytes a function of the input order alone. Admission-time capping is
+        // ADR-0047 decision 2 and happens earlier, on a different layer.
         resolved_exemplars.sort_by_key(|r| (r.series_index, r.ts_ns));
-        let mut deduped_exemplars: Vec<ResolvedExemplar> =
-            Vec::with_capacity(resolved_exemplars.len());
-        for r in resolved_exemplars {
-            if let Some(last) = deduped_exemplars.last_mut()
-                && last.series_index == r.series_index
-                && last.ts_ns == r.ts_ns
-            {
-                *last = r;
-                continue;
-            }
-            deduped_exemplars.push(r);
-        }
 
         let total_samples =
             usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
@@ -542,8 +531,8 @@ impl SegmentWriter {
         // EXEMPLARS (kind 10, ADR-0047), RSEG v6 only: present only when at
         // least one sample carried an exemplar (docs/segment-format.md).
         // Physical section order 1, 5, 6, 3, 4, 7, 10.
-        if !deduped_exemplars.is_empty() {
-            let exemplars_raw = encode_exemplars_section(&deduped_exemplars, min_event_ts_ns)?;
+        if !resolved_exemplars.is_empty() {
+            let exemplars_raw = encode_exemplars_section(&resolved_exemplars, min_event_ts_ns)?;
             let exemplars_offset = object.len() as u64;
             object.extend_from_slice(&exemplars_raw);
             sections.push(Section {

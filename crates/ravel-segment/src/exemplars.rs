@@ -80,11 +80,12 @@ pub(crate) struct ResolvedExemplar {
 }
 
 /// Encodes the EXEMPLARS section body from writer-resolved records, already
-/// sorted and deduplicated by `(series_index, ts_ns)` by the caller. Returns
-/// `Ok(vec![])`... no: callers must skip calling this at all when `resolved`
-/// is empty, since an empty EXEMPLARS section is never legal to emit --
-/// absence, not an empty section, is how "no exemplars" is represented
-/// (ADR-0047 decision 1).
+/// sorted by `(series_index, ts_ns)` by the caller. Equal keys are legal and
+/// must not be collapsed (ADR-0047 amendment 2026-08-03).
+///
+/// Callers must skip calling this at all when `resolved` is empty: an empty
+/// EXEMPLARS section is never legal to emit. Absence, not an empty section, is
+/// how "no exemplars" is represented (ADR-0047 decision 1).
 pub(crate) fn encode_exemplars_section(
     resolved: &[ResolvedExemplar],
     min_event_ts_ns: i64,
@@ -137,7 +138,13 @@ fn take_record_fixed_fields(
 }
 
 /// Reads one record's `(series_index, ts_ns)` sort key, validating
-/// `series_index` is in range and the sequence is strictly ascending.
+/// `series_index` is in range and the sequence is ascending. Equal keys are
+/// legal: compaction copies exemplars verbatim and never drops a record, so
+/// two inputs each carrying an exemplar for the same series at the same
+/// timestamp both reach the output (ADR-0047 amendment 2026-08-03). Only a
+/// descending key is rejected, which is what the early-exit probe needs to
+/// stop safely.
+///
 /// Shared by the whole-section decode and the probe: both must apply the
 /// identical untrusted-input checks to every record they touch, including
 /// ones a probe will discard without resolving attrs.
@@ -157,7 +164,7 @@ fn read_sort_key(
         .checked_add(ts_delta)
         .ok_or(SegmentError::TimestampOverflow)?;
     if let Some(p) = *prev
-        && (series_index, ts_ns) <= p
+        && (series_index, ts_ns) < p
     {
         return Err(SegmentError::ExemplarRecordsUnsorted);
     }
@@ -496,6 +503,34 @@ mod tests {
             decode_exemplars_from_decoded(&encoded, 0, 1, &mut resolver),
             Err(SegmentError::BadOrdinal(9))
         ));
+    }
+
+    /// Two records sharing a `(series_index, ts_ns)` key are legal and both
+    /// survive a round trip. Compaction copies exemplars verbatim and never
+    /// drops a record, so two inputs each carrying an exemplar for the same
+    /// series at the same timestamp must both reach the output (ADR-0047
+    /// amendment 2026-08-03). The probe must return both, not the first.
+    #[test]
+    fn keeps_both_records_that_share_a_sort_key() {
+        let dict = dict_bytes(&["a", "b"]);
+        let index = index_label_dict(&dict).expect("index");
+        let records = vec![
+            resolved(0, 0, 1.0, vec![(0, 1)]),
+            resolved(0, 0, 2.0, vec![(1, 0)]),
+        ];
+        let encoded = encode_exemplars_section(&records, 0).expect("encode");
+
+        let mut resolver = DictResolver::new(&dict, &index);
+        let decoded = decode_exemplars_from_decoded(&encoded, 0, 1, &mut resolver).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        // Bit patterns, never `==`: an exemplar value can be NaN or -0.0.
+        assert_eq!(decoded[0].value.to_bits(), 1.0f64.to_bits());
+        assert_eq!(decoded[1].value.to_bits(), 2.0f64.to_bits());
+
+        let mut resolver = DictResolver::new(&dict, &index);
+        let probed = probe_exemplars_from_decoded(&encoded, 0, 1, 0, &mut resolver).expect("probe");
+        assert_eq!(probed.len(), 2);
+        assert_eq!(probed[1].value.to_bits(), 2.0f64.to_bits());
     }
 
     #[test]

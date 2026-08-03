@@ -164,3 +164,38 @@ still holds, so v6 retires v5 in the change that introduces it.
   the spans it links to are already stored and, after epic #427, queryable.
 - `min`/`max` for native histograms stay dropped. Named gap, not an
   oversight.
+
+## Amendment (2026-08-03): duplicate sort keys are legal
+
+Decision 1 gave the EXEMPLARS section a `(series_index, ts_ns)` sort order.
+The implementation read that as strictly ascending and rejected an equal
+key, and the writer collapsed a run of equal keys to its last record.
+
+That contradicts decision 3. Compaction is a verbatim page copy that never
+drops a record, and `crates/ravel-maintain/src/publish.rs` enforces it with
+a record-count conservation gate that abandons the run on any mismatch. The
+admission cap is scoped to one flush, so a retried write gives two L0
+objects that each hold an exemplar for the same series at the same
+timestamp. Under the strict rule the compactor could not encode both, which
+is the case decision 3 names explicitly.
+
+This amendment makes the format match decision 3:
+
+- Records are ascending by `(series_index, ts_ns)`. Two records can share a
+  key.
+- Readers reject only a descending key, still as `ExemplarRecordsUnsorted`.
+  The early-exit probe needs no more than that to stop safely, and it
+  already returns every record at the target key.
+- The writer sorts with a stable sort and collapses nothing. Records that
+  share a key keep the caller's order, so the encoded bytes stay a function
+  of the input order alone.
+
+This needs no version bump. The reader now accepts a superset of what it
+accepted before, so every existing v6 object stays readable, and ADR-0027
+keeps exactly one supported RSEG version before release.
+
+The rejected alternative was to dedup at compaction, keeping the first
+exemplar in the inputs' canonical order. It loses little (the collapsed
+records share a series and a timestamp and differ only in trace id), but it
+would make exemplars the only non-verbatim signal in the compactor, under a
+gate whose stated premise is that nothing is ever dropped.

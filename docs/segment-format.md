@@ -359,17 +359,22 @@ count records, each:
     value_ord:  uvarint       (LABEL_DICT ordinal)
 ```
 
-Records are sorted by `(series_index, ts_ns)`, strictly ascending, with no
-duplicate key. A per-series lookup is therefore a scan that stops early on
-the sort invariant rather than a search: the record width varies with
+Records are sorted by `(series_index, ts_ns)`, ascending. Two records can
+share a key. A per-series lookup is therefore a scan that stops early on the
+sort invariant rather than a search: the record width varies with
 `attr_count`, so records are not addressable by index and binary search is
-not possible.
+not possible. A lookup returns every record at the key, not the first.
 
-Two exemplars supplied for the same series at the same timestamp would
-violate the strict-ascending invariant, so the writer keeps the last of any
-such run in the caller's original order and drops the rest. This is only
-the writer's own guarantee that whatever it emits is decodable; admission
-capping is a separate, earlier concern (ADR-0047 decision 2).
+Duplicate keys are legal because compaction copies exemplars verbatim and
+never drops a record. Two L0 objects can each hold an exemplar for the same
+series at the same timestamp, which is what a retried write produces, and
+both must reach the L1 output. Readers therefore reject only a descending
+key. An earlier revision required strictly ascending keys, and ADR-0047's
+2026-08-03 amendment relaxed it.
+
+The writer sorts with a stable sort, so records that share a key keep the
+caller's order and the encoded bytes stay a function of the input order
+alone.
 
 `value` is stored as the raw f64 bit pattern, not a decimal form, so a NaN
 payload and a negative zero survive a write-read round trip exactly. Every
@@ -388,7 +393,7 @@ the two cases have the same meaning to any consumer.
 
 Readers reject, as Corrupted and never a panic: a `series_index` at or
 beyond `series_count` (`ExemplarSeriesIndexOutOfRange`); any record whose
-`(series_index, ts_ns)` does not strictly exceed its predecessor's
+`(series_index, ts_ns)` is less than its predecessor's
 (`ExemplarRecordsUnsorted`); a `ts_delta` whose sum with
 `footer.min_event_ts_ns` overflows (`TimestampOverflow`); a `name_ord` or
 `value_ord` outside the LABEL_DICT; a record whose fixed-width fields run
