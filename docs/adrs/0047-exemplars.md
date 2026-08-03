@@ -195,7 +195,15 @@ accepted before, so every existing v6 object stays readable, and ADR-0027
 keeps exactly one supported RSEG version before release.
 
 The rejected alternative was to dedup at compaction, keeping the first
-exemplar in the inputs' canonical order. It loses little (the collapsed
-records share a series and a timestamp and differ only in trace id), but it
-would make exemplars the only non-verbatim signal in the compactor, under a
-gate whose stated premise is that nothing is ever dropped.
+exemplar in the inputs' canonical order. It would make exemplars the only
+non-verbatim signal in the compactor, under a gate whose stated premise is
+that nothing is ever dropped.
+
+Note what this format does NOT promise. Two records sharing
+`(series_index, ts_ns)` can differ in any other field: trace id, span id,
+value, or attributes. The writer preserves them verbatim and checks nothing
+beyond the sort order. An earlier revision of this amendment said in passing
+that such records "differ only in trace id"; that was an observation about the
+duplicate-delivery case, not a guarantee, and issue #475 read it as one and
+built a query-time dedup key on it. Any reader that collapses records must key
+on every field it would otherwise lose.
