@@ -4,8 +4,12 @@
 //! `input_set_hash`, and decodes each input segment's catalog down to
 //! per-run absolute page ranges.
 //!
-//! Only catalog metadata is retained here: footers and the LABEL_DICT /
-//! SERIES_IDS / SERIES_META sections. The verbatim TS/VAL/HIST page bytes are
+//! Only catalog metadata is retained here: footers, the LABEL_DICT /
+//! SERIES_IDS / SERIES_META sections, and (when present) the EXEMPLARS
+//! section, whose records the merge copies verbatim into the output with only
+//! their `series_index` remapped (ADR-0047 decision 3). Exemplar records are
+//! small and bounded by the ingest admission cap, so they stay inside this
+//! metadata bound. The verbatim TS/VAL/HIST page bytes are
 //! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so
 //! peak memory is bounded by catalog metadata plus one in-flight part buffer
 //! (plan §3.3 memory bound), not by the whole bucket's page data.
@@ -15,8 +19,8 @@ use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    FooterOutcome, ReaderLimits, VERSION_V6, ValueKind, decode_catalog_v4, decode_catalog_v5,
-    open_from_suffix, plan_ranges_v4,
+    ExemplarInput, FooterOutcome, ReaderLimits, VERSION_V6, ValueKind, decode_catalog_v4,
+    decode_catalog_v5, decode_exemplars_section, open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::{LabelSet, SeriesId, Signal};
 
@@ -29,6 +33,7 @@ use crate::error::{MaintainError, Result};
 const LABEL_DICT: u32 = 1;
 const SERIES_IDS: u32 = 5;
 const SERIES_META: u32 = 6;
+const EXEMPLARS: u32 = 10;
 
 /// Domain-separated prefix for the `input_set_hash` preimage. Fixes the
 /// canonical byte stream so any two compactors over the same sealed bucket
@@ -223,6 +228,20 @@ pub struct SeriesPlan {
 pub struct InputCatalog {
     pub object_key: String,
     pub series: Vec<SeriesPlan>,
+    /// Every exemplar this input carries (ADR-0047 decision 3), in the
+    /// object's own stored order, with `series_index` already resolved to the
+    /// series id it named. The output writer resolves the id back into an
+    /// index in the *output's* SERIES_IDS ordering, which is the whole remap:
+    /// the record's other fields are copied verbatim and never merged,
+    /// deduplicated, re-capped, or re-sampled.
+    ///
+    /// Empty when the input has no EXEMPLARS section, which is the common case
+    /// and always legal. Unlike page bytes, these are retained (not fetched
+    /// lazily during the merge): a record is ~40 bytes plus attributes and the
+    /// admission cap bounds how many an object can hold, so this stays inside
+    /// the plan's "catalog metadata" memory bound rather than scaling with the
+    /// bucket's data.
+    pub exemplars: Vec<ExemplarInput>,
 }
 
 /// Decode one input's catalog into per-run absolute page ranges, stamping
@@ -320,7 +339,73 @@ pub async fn load_input_catalog(
         ));
     }
 
-    Ok(InputCatalog { object_key, series })
+    let exemplars = load_input_exemplars(store, &object_key, footer, limits, &series).await?;
+
+    Ok(InputCatalog {
+        object_key,
+        series,
+        exemplars,
+    })
+}
+
+/// Decode one input's EXEMPLARS section (kind 10, ADR-0047) and resolve each
+/// record's `series_index` to the series id it names, so the merge can hand the
+/// records to the output writer and let it re-resolve the index against the
+/// output's own SERIES_IDS ordering (docs/segment-format.md "Compaction rule").
+///
+/// An absent section is legal and yields no exemplars, which is the common
+/// case: this costs two extra ranged GETs (the LABEL_DICT the attributes intern
+/// into, and the section itself) only for an object that actually carries
+/// exemplars.
+///
+/// `series` MUST be the object's catalog in SERIES_IDS order, which is what
+/// `decode_catalog_v4`/`decode_catalog_v5` return: that ordering is what makes
+/// `series_index` an index into it. The decoder already rejects an index at or
+/// beyond `footer.series_count`, and a catalog whose length disagrees with
+/// `series_count` is a corrupt object rather than something to index into
+/// hopefully, so it fails loud here.
+async fn load_input_exemplars(
+    store: &dyn ObjectStoreBackend,
+    object_key: &str,
+    footer: &ravel_segment::Footer,
+    limits: ReaderLimits,
+    series: &[SeriesPlan],
+) -> Result<Vec<ExemplarInput>> {
+    if !footer.sections.iter().any(|s| s.kind == EXEMPLARS) {
+        return Ok(Vec::new());
+    }
+    if series.len() as u64 != footer.series_count {
+        return Err(MaintainError::Invariant(format!(
+            "input {object_key} decoded {} series but its footer claims {}; \
+             exemplar series_index values cannot be resolved",
+            series.len(),
+            footer.series_count
+        )));
+    }
+    let dict = get_section(store, object_key, footer, LABEL_DICT).await?;
+    let section = get_section(store, object_key, footer, EXEMPLARS).await?;
+    let records = decode_exemplars_section(footer, &dict, &section, limits)?;
+
+    let mut out = Vec::with_capacity(records.len());
+    for r in records {
+        let idx = usize::try_from(r.series_index).map_err(|_| {
+            MaintainError::Invariant("exemplar series_index overflows usize".into())
+        })?;
+        let plan = series.get(idx).ok_or_else(|| {
+            MaintainError::Invariant(format!(
+                "exemplar series_index {idx} is outside input {object_key}'s catalog"
+            ))
+        })?;
+        out.push(ExemplarInput {
+            series_id: plan.series_id,
+            ts_ns: r.ts_ns,
+            value: r.value,
+            trace_id: r.trace_id,
+            span_id: r.span_id,
+            attrs: r.attrs,
+        });
+    }
+    Ok(out)
 }
 
 async fn get_section(
