@@ -582,7 +582,12 @@ mod tests {
             record(&worker, &[], 2, "worker only"),
             record(&worker, &[], 3, "worker only again"),
             // `api` as a genuine resource attribute, no per-record attrs at all.
-            record(&[("service.name".to_string(), s("api"))], &[], 4, "resource"),
+            record(
+                &[("service.name".to_string(), s("api"))],
+                &[],
+                4,
+                "resource",
+            ),
         ];
         let seg = write_object_with(
             &store,

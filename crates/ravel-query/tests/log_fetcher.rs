@@ -699,7 +699,11 @@ async fn prune_channel_prunes_blocks_and_never_drops_a_match() {
         .filter(|r| matches(r))
         .map(|r| r.ts_ns)
         .collect();
-    assert_eq!(expected, vec![105], "the fixture has exactly one r105 record");
+    assert_eq!(
+        expected,
+        vec![105],
+        "the fixture has exactly one r105 record"
+    );
     let kept: Vec<i64> = pruned
         .records
         .iter()
