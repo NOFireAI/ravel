@@ -255,6 +255,7 @@ fn gateway_state(
     span_ingest_router: &Arc<SpanIngestRouter>,
     tenant_resolver: Arc<dyn TenantResolver>,
     admission: &Arc<AdmissionController>,
+    store: &Arc<dyn ObjectStoreBackend>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -269,11 +270,13 @@ fn gateway_state(
             limits: LogIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
+            store: store.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
             limits: SpanIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
+            store: store.clone(),
         },
         admission: admission.clone(),
     })
@@ -386,6 +389,7 @@ pub async fn start(
             span_router,
             config.tenant_resolver.clone(),
             &admission,
+            &store,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(router, config.tenant_resolver.clone(), &admission);
@@ -398,6 +402,7 @@ pub async fn start(
                 span_router,
                 mtls.resolver.clone(),
                 &admission,
+                &store,
             );
             let mtls_rw_state = remote_write_state(router, mtls.resolver.clone(), &admission);
             mtls_router = mtls_router
@@ -602,6 +607,7 @@ pub async fn start(
             span_router,
             config.tenant_resolver.clone(),
             &admission,
+            &store,
         )),
         _ => None,
     };

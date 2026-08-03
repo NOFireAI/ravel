@@ -16,7 +16,10 @@ use tonic::{Request, Response, Status};
 
 use crate::logs_ingest::LogIngestRequestError;
 use crate::otlp_grpc::{admission_rejection_status, metadata_to_headers};
-use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, now_ns, write_mode_from_headers};
+use crate::otlp_http::{
+    COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns,
+    write_mode_from_headers,
+};
 
 pub struct GrpcLogsService {
     state: Arc<GatewayState>,
@@ -54,33 +57,36 @@ impl LogsService for GrpcLogsService {
             return Err(admission_rejection_status(rejection));
         }
 
+        let idempotency_key = idempotency_key_from_headers(&headers);
+
         let outcome = crate::logs_ingest::handle_export_logs(
             &self.state.logs_ingest,
             tenant,
             mode,
             request.into_inner(),
             now_ns(),
+            idempotency_key,
         )
         .await
         .map_err(|err| match err {
             LogIngestRequestError::Admission(rejection) => admission_rejection_status(rejection),
+            err @ LogIngestRequestError::InvalidIdempotencyKey { .. } => {
+                Status::invalid_argument(err.to_string())
+            }
             LogIngestRequestError::Write(write_err) if write_err.is_retryable() => {
                 Status::unavailable(write_err.to_string())
             }
             LogIngestRequestError::Write(write_err) => Status::internal(write_err.to_string()),
         })?;
 
+        // Verbatim on a replay, encoded-from-tokens otherwise: identical to the
+        // HTTP path's header choice. Built before `outcome.response` is moved.
+        let commit_token = outcome.commit_token_header();
         let mut response = Response::new(outcome.response);
-        if !outcome.tokens.is_empty() {
-            let encoded = outcome
-                .tokens
-                .iter()
-                .map(|token| token.encode())
-                .collect::<Vec<_>>()
-                .join(",");
-            if let Ok(value) = MetadataValue::try_from(encoded.as_str()) {
-                response.metadata_mut().insert(COMMIT_TOKEN_HEADER, value);
-            }
+        if let Some(encoded) = commit_token
+            && let Ok(value) = MetadataValue::try_from(encoded.as_str())
+        {
+            response.metadata_mut().insert(COMMIT_TOKEN_HEADER, value);
         }
         Ok(response)
     }
