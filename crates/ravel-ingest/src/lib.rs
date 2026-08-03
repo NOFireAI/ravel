@@ -9,6 +9,7 @@ mod admission;
 mod clock;
 mod config;
 mod error;
+mod idempotency;
 mod log_error;
 mod log_metrics;
 mod log_router;
@@ -31,6 +32,10 @@ pub use config::{
     IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
 };
 pub use error::WriteError;
+pub use idempotency::{
+    IdempotencyReceipt, LookupOutcome, MarkerError, MarkerWriteError, WriteOutcome, keyhash32,
+    marker_key, read_marker, write_marker,
+};
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
 pub use log_router::{LogIngestRouter, LogWriteReceipt};
