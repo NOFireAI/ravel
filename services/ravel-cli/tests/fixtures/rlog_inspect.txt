@@ -1,4 +1,4 @@
-total_size: 732
+total_size: 814
 version: 2
 signal: 2
 tenant_hash: abababababababababababababababab
@@ -22,6 +22,7 @@ sections:
   kind=3 name=BLOCKS offset=94 len=214 comp=none uncompressed_len=214
   kind=4 name=SKIP_IDX offset=308 len=75 comp=zstd uncompressed_len=104
   kind=5 name=BLOOM offset=383 len=164 comp=none uncompressed_len=164
+  kind=6 name=POSTINGS offset=547 len=66 comp=none uncompressed_len=66
 skip_index level 0 (2 block(s)):
   block[0] offset=0 len=105 crc32c=e97c8ea6 record_count=2 ts_range=[100, 200] stream_ref_range=[0, 0]
     stat column_id=10 type=i64 min_bits=200 max_bits=504 null_count=0 has_nan=false
