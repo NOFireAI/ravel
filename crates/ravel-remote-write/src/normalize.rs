@@ -17,6 +17,14 @@
 //! marker (a specific NaN payload) round-trips unchanged: to the storage
 //! layer it is an ordinary sample.
 //!
+//! Exemplars are admitted since ADR-0047 gave them an RSEG section and a
+//! per-series admission cap. Remote Write carries no trace-id or span-id
+//! field, so the conventional `trace_id`/`span_id` labels are decoded from hex
+//! into the fixed-size ids [`ravel_types::Exemplar`] holds and the remaining
+//! labels become that exemplar's filtered attributes. A label whose hex does
+//! not decode is not an error: the id stays all-zero ("absent") and the label
+//! survives as an ordinary attribute.
+//!
 //! Native `Histogram` messages are admitted since RSEG v5 gave them durable
 //! storage (ADR-0017, docs/rseg-v3-plan.md phase C8). Their wire shape is
 //! close to the storage model's but not identical: integer bucket sides
@@ -25,16 +33,29 @@
 //! re-checked here so an accepted point can never fail either (see
 //! [`build_histogram_value`]).
 
-use ravel_otlp::normalize::{NormalizedHistogramPoint, NormalizedPoint};
+use ravel_otlp::normalize::{NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint};
 use ravel_otlp::{IngestLimits, Rejection};
 use ravel_segment::{
     HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint as SegResetHint,
 };
-use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+use ravel_types::{
+    Exemplar, ExemplarCap, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId,
+};
 
 use crate::resolved::{
-    ResolvedCount, ResolvedHistogram, ResolvedRequest, ResolvedSample, ResolvedSeries, ResolvedSpan,
+    ResolvedCount, ResolvedExemplar, ResolvedHistogram, ResolvedRequest, ResolvedSample,
+    ResolvedSeries, ResolvedSpan,
 };
+
+/// Exemplar label name a Remote Write sender uses to carry a trace id
+/// (`io/prometheus/write/v2/types.proto` names it as a best practice, and it
+/// is the key Grafana's exemplar-to-trace link reads; ADR-0047 decision 4
+/// serves it back under the same name).
+const TRACE_ID_LABEL: &str = "trace_id";
+
+/// Exemplar label name for a span id, by the same convention as
+/// [`TRACE_ID_LABEL`].
+const SPAN_ID_LABEL: &str = "span_id";
 
 /// Why a Remote Write series or sample was not admitted.
 ///
@@ -137,9 +158,25 @@ pub struct RwNormalizeOutput {
     /// point count; broken out because the RW stats surface reports it as
     /// its own header, distinct from the generic rejected-sample count).
     pub histograms_dropped: usize,
-    /// Exemplars accepted-and-dropped (ADR-0017 deferral): every exemplar
-    /// attached to an otherwise-processed series counts here, whether or
-    /// not that series' own points were admitted.
+    /// Exemplars dropped rather than carried, and why they can be dropped at
+    /// all: the per-series admission cap (ADR-0047 decision 2) keeps at most
+    /// one exemplar per series per window, and this counts the ones it turned
+    /// away, plus the ones whose own timestamp failed the same event-time
+    /// bounds a sample's must pass, plus every exemplar on a series whose
+    /// label set was rejected outright (that series has no `SeriesId` to
+    /// attach an exemplar to).
+    ///
+    /// It no longer means "every exemplar, always". Exemplars the cap admits
+    /// leave through [`normalize_with_exemplars`] as
+    /// [`ravel_otlp::normalize::NormalizedExemplar`]s and are not counted
+    /// here. (Until ADR-0047 this counted every exemplar in the request and
+    /// cited ADR-0017's deferral of exemplar storage as the reason; that
+    /// deferral is over, and RSEG v6 has an `EXEMPLARS` section.)
+    ///
+    /// A caller that uses the [`normalize_resolved`] wrapper rather than
+    /// [`normalize_with_exemplars`] has nowhere to put admitted exemplars, so
+    /// for that caller an admitted exemplar is neither stored nor counted
+    /// here; see [`normalize_resolved`].
     pub exemplars_dropped: usize,
     /// Metric metadata entries accepted-and-dropped: Ravel has no
     /// metric-metadata store yet (ADR-0015).
@@ -151,18 +188,71 @@ pub struct RwNormalizeOutput {
     pub created_timestamps_dropped: usize,
 }
 
-/// Normalize a resolved Remote Write request into Ravel canonical points.
+/// Result of normalizing one resolved Remote Write request, including the
+/// exemplars admitted through the caller's [`ExemplarCap`] (ADR-0047
+/// decisions 1 and 2).
+///
+/// The RW-surface sibling of [`ravel_otlp::normalize::MetricsNormalizeResult`],
+/// and kept as a separate type from [`RwNormalizeOutput`] for the same reason
+/// that one is: `RwNormalizeOutput` is built by struct literal in tests and
+/// read field-by-field by the RW stats surface, and adding a field to it would
+/// break both for callers that have nowhere to put an exemplar.
+/// [`NormalizedExemplar`] itself is reused from `ravel-otlp` rather than
+/// redefined here: an exemplar paired with its series is the same thing on
+/// every ingest path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RwMetricsNormalizeResult {
+    pub output: RwNormalizeOutput,
+    pub exemplars: Vec<NormalizedExemplar>,
+}
+
+/// Normalize a resolved Remote Write request into Ravel canonical points,
+/// discarding any exemplars it carried.
 ///
 /// `ingest_ts_ns` is the receiver's clock reading at admission time, used to
 /// bound event-time skew identically to the OTLP surface (ADR-0010 section
 /// 8). Nothing here panics for malformed or oversized input: every problem
 /// becomes an [`RwRejection`].
+///
+/// Kept with its original signature and return type for existing callers;
+/// internally a thin wrapper around [`normalize_with_exemplars`] with a
+/// throwaway, request-scoped [`ExemplarCap`], exactly as
+/// `ravel_otlp::normalize_metrics` wraps its own exemplar-carrying twin. One
+/// consequence is worth stating plainly: with a request-scoped cap the
+/// admitted exemplars this discards are not added to
+/// [`RwNormalizeOutput::exemplars_dropped`] either, so that counter reports
+/// what the cap rejected and not what this wrapper threw away afterwards.
+/// Callers with somewhere to put admitted exemplars (issue #474) should call
+/// [`normalize_with_exemplars`] with a cap that outlives one request, which is
+/// the only way the per-series window means anything.
 pub fn normalize_resolved(
     tenant: &TenantId,
     resolved: ResolvedRequest,
     limits: &IngestLimits,
     ingest_ts_ns: i64,
 ) -> RwNormalizeOutput {
+    let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
+    normalize_with_exemplars(tenant, resolved, limits, ingest_ts_ns, &mut cap).output
+}
+
+/// Normalize a resolved Remote Write request into Ravel canonical points,
+/// admitting exemplars through `exemplar_cap` (ADR-0047 decisions 1 and 2).
+///
+/// `exemplar_cap` is `&mut` and caller-owned rather than built here: a
+/// per-series-per-window cap only means something across many requests over
+/// wall-clock time, so whoever holds the long-lived per-shard state (issue
+/// #474) owns one `ExemplarCap` and passes it into every call that shard
+/// makes.
+///
+/// See [`normalize_resolved`] for the panic and error-handling contract, which
+/// is identical here.
+pub fn normalize_with_exemplars(
+    tenant: &TenantId,
+    resolved: ResolvedRequest,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+) -> RwMetricsNormalizeResult {
     // Native histograms count toward the per-request data-point limit now
     // that they are admitted rather than rejected: one histogram sample is
     // one stored data point, the same as one scalar sample.
@@ -172,21 +262,27 @@ pub fn normalize_resolved(
         .map(|s| s.samples.len() + s.histograms.len())
         .sum();
     if total_points > limits.max_data_points_per_request {
-        return RwNormalizeOutput {
-            points: Vec::new(),
-            histogram_points: Vec::new(),
-            rejected: vec![RwRejection::Otlp {
-                reason: Rejection::TooManyDataPoints {
+        // Nothing in the request is looked at past this point, so no exemplar
+        // reaches the cap; the whole request's exemplars are dropped with it.
+        let exemplars_dropped = resolved.series.iter().map(|s| s.exemplars.len()).sum();
+        return RwMetricsNormalizeResult {
+            output: RwNormalizeOutput {
+                points: Vec::new(),
+                histogram_points: Vec::new(),
+                rejected: vec![RwRejection::Otlp {
+                    reason: Rejection::TooManyDataPoints {
+                        count: total_points,
+                        max: limits.max_data_points_per_request,
+                    },
                     count: total_points,
-                    max: limits.max_data_points_per_request,
-                },
-                count: total_points,
-            }],
-            histograms_written: 0,
-            histograms_dropped: 0,
-            exemplars_dropped: 0,
-            metadata_dropped: resolved.metadata_count,
-            created_timestamps_dropped: resolved.created_timestamps_count,
+                }],
+                histograms_written: 0,
+                histograms_dropped: 0,
+                exemplars_dropped,
+                metadata_dropped: resolved.metadata_count,
+                created_timestamps_dropped: resolved.created_timestamps_count,
+            },
+            exemplars: Vec::new(),
         };
     }
 
@@ -194,31 +290,37 @@ pub fn normalize_resolved(
     let mut histogram_points = Vec::new();
     let mut rejected = Vec::new();
     let mut counts = HistogramTallies::default();
+    let mut exemplars = Vec::new();
     let mut exemplars_dropped = 0usize;
 
     for series in &resolved.series {
-        exemplars_dropped += series.exemplar_count;
         normalize_series(
             tenant,
             series,
             limits,
             ingest_ts_ns,
+            exemplar_cap,
             &mut points,
             &mut histogram_points,
+            &mut exemplars,
+            &mut exemplars_dropped,
             &mut rejected,
             &mut counts,
         );
     }
 
-    RwNormalizeOutput {
-        points,
-        histogram_points,
-        rejected,
-        histograms_written: counts.written,
-        histograms_dropped: counts.dropped,
-        exemplars_dropped,
-        metadata_dropped: resolved.metadata_count,
-        created_timestamps_dropped: resolved.created_timestamps_count,
+    RwMetricsNormalizeResult {
+        output: RwNormalizeOutput {
+            points,
+            histogram_points,
+            rejected,
+            histograms_written: counts.written,
+            histograms_dropped: counts.dropped,
+            exemplars_dropped,
+            metadata_dropped: resolved.metadata_count,
+            created_timestamps_dropped: resolved.created_timestamps_count,
+        },
+        exemplars,
     }
 }
 
@@ -235,8 +337,11 @@ fn normalize_series(
     series: &ResolvedSeries,
     limits: &IngestLimits,
     ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
+    exemplars_out: &mut Vec<NormalizedExemplar>,
+    exemplars_dropped: &mut usize,
     rejected: &mut Vec<RwRejection>,
     counts: &mut HistogramTallies,
 ) {
@@ -245,6 +350,7 @@ fn normalize_series(
     let (metric_name, label_set) = match resolve_series_identity(series, limits, point_count) {
         Ok(v) => v,
         Err(rejection) => {
+            *exemplars_dropped += series.exemplars.len();
             rejected.push(rejection);
             return;
         }
@@ -253,6 +359,7 @@ fn normalize_series(
     let series_id = match SeriesId::compute(tenant, &metric_name, &label_set) {
         Ok(id) => id,
         Err(_) => {
+            *exemplars_dropped += series.exemplars.len();
             rejected.push(RwRejection::Otlp {
                 reason: Rejection::OversizedSeriesComponent,
                 count: point_count,
@@ -260,6 +367,16 @@ fn normalize_series(
             return;
         }
     };
+
+    admit_exemplars(
+        series,
+        series_id,
+        limits,
+        ingest_ts_ns,
+        exemplar_cap,
+        exemplars_out,
+        exemplars_dropped,
+    );
 
     for histogram in &series.histograms {
         match build_histogram_sample(histogram, ingest_ts_ns, limits) {
@@ -294,6 +411,120 @@ fn normalize_series(
             Err(reason) => rejected.push(reason),
         }
     }
+}
+
+/// Offer `series`' exemplars to `cap` (ADR-0047 decision 2) and push the
+/// admitted ones onto `exemplars_out`, tagged with the series they belong to.
+/// Everything the cap turns away, and everything whose own timestamp fails the
+/// event-time bounds, increments `exemplars_dropped` so the count stays
+/// visible now that some exemplars survive.
+///
+/// Unlike the OTLP surface, a Remote Write exemplar needs no bucket lookup to
+/// find its series: RW carries the exploded `{name}_bucket{le=...}` series
+/// itself, so an exemplar is already attached to the exact series a sender
+/// meant, whichever one that is.
+///
+/// Candidates are offered newest-first, since [`ExemplarCap::admit`] never
+/// retracts an admission it already handed back: that ordering is what makes
+/// decision 2's "keep the newest within each window" hold when one series
+/// carries several exemplars inside one window.
+fn admit_exemplars(
+    series: &ResolvedSeries,
+    series_id: SeriesId,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    cap: &mut ExemplarCap,
+    exemplars_out: &mut Vec<NormalizedExemplar>,
+    exemplars_dropped: &mut usize,
+) {
+    if series.exemplars.is_empty() {
+        return;
+    }
+
+    let mut candidates = Vec::with_capacity(series.exemplars.len());
+    for exemplar in &series.exemplars {
+        match build_exemplar(exemplar, ingest_ts_ns, limits) {
+            Some(candidate) => candidates.push(candidate),
+            None => *exemplars_dropped += 1,
+        }
+    }
+    candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.ts_ns));
+
+    for candidate in candidates {
+        if cap.admit(series_id, candidate.ts_ns) {
+            exemplars_out.push(NormalizedExemplar {
+                series_id,
+                exemplar: candidate,
+            });
+        } else {
+            *exemplars_dropped += 1;
+        }
+    }
+}
+
+/// Convert one wire exemplar into the shared canonical shape (ADR-0047
+/// decision 1), or `None` when its millisecond timestamp cannot pass the same
+/// event-time admission a sample's must ([`checked_event_ts`]): an exemplar
+/// stored outside the event-time window its series' samples live in would sit
+/// in a segment no query for those samples ever reads.
+///
+/// The value is carried as a bit pattern, so a NaN payload or a negative zero
+/// round-trips exactly rather than being normalized by an `f64` comparison.
+fn build_exemplar(
+    exemplar: &ResolvedExemplar,
+    ingest_ts_ns: i64,
+    limits: &IngestLimits,
+) -> Option<Exemplar> {
+    let ts_ns = checked_event_ts(exemplar.ts_ms, ingest_ts_ns, limits).ok()?;
+
+    let mut trace_id = [0u8; 16];
+    let mut span_id = [0u8; 8];
+    let mut filtered_attributes =
+        Vec::with_capacity(exemplar.labels.len().min(limits.max_attributes_per_point));
+    for label in &exemplar.labels {
+        // A conventional id label whose hex is well-formed is consumed into
+        // the fixed-size array; one that is not decodable stays a plain
+        // filtered attribute, so a malformed id costs the exemplar its
+        // correlation but never the label the sender wrote. A later duplicate
+        // of the same name overwrites an earlier one, matching how the RW
+        // model treats a repeated exemplar label as the sender's own problem
+        // rather than a request-level error.
+        if label.name == TRACE_ID_LABEL
+            && let Some(id) = decode_hex_id::<16>(&label.value)
+        {
+            trace_id = id;
+            continue;
+        }
+        if label.name == SPAN_ID_LABEL
+            && let Some(id) = decode_hex_id::<8>(&label.value)
+        {
+            span_id = id;
+            continue;
+        }
+        if filtered_attributes.len() < limits.max_attributes_per_point {
+            filtered_attributes.push(label.clone());
+        }
+    }
+
+    Some(Exemplar {
+        ts_ns,
+        value_bits: exemplar.value.to_bits(),
+        trace_id,
+        span_id,
+        filtered_attributes,
+    })
+}
+
+/// Decode a lowercase- or uppercase-hex id of exactly `N` bytes, or `None` for
+/// any input that is not one: a wrong length, an odd length, or a non-hex
+/// character. `None` leaves the caller's id all-zero, which
+/// [`ravel_types::Exemplar`] documents as "absent"; it is never an error,
+/// since a sender's malformed correlation hint is no reason to reject a
+/// perfectly good measurement.
+fn decode_hex_id<const N: usize>(value: &str) -> Option<[u8; N]> {
+    let mut out = [0u8; N];
+    hex::decode_to_slice(value, &mut out).ok()?;
+    Some(out)
 }
 
 /// Resolve one series' `__name__` and remaining labels into a metric name
@@ -729,7 +960,7 @@ mod tests {
             labels,
             samples,
             histograms: vec![],
-            exemplar_count: 0,
+            exemplars: vec![],
         }
     }
 
@@ -1520,14 +1751,265 @@ mod tests {
         );
     }
 
-    // --- exemplars and metadata: accepted-and-dropped, counted ---
+    // --- exemplars (ADR-0047 decisions 1 and 2) ---
+
+    const TRACE_ID_HEX: &str = "0123456789abcdef0123456789abcdef";
+    const TRACE_ID_BYTES: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
+    ];
+    const SPAN_ID_HEX: &str = "fedcba9876543210";
+    const SPAN_ID_BYTES: [u8; 8] = [0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10];
+
+    fn exemplar(ts_ms: i64, value: f64, labels: Vec<Label>) -> ResolvedExemplar {
+        ResolvedExemplar {
+            ts_ms,
+            value,
+            labels,
+        }
+    }
+
+    fn series_with_exemplars(exemplars: Vec<ResolvedExemplar>) -> ResolvedSeries {
+        let mut s = series(vec![label("__name__", "up")], vec![sample(1_000, 1.0)]);
+        s.exemplars = exemplars;
+        s
+    }
 
     #[test]
-    fn exemplars_counted_regardless_of_series_admission() {
-        let mut admitted = series(vec![label("__name__", "up")], vec![sample(1_000, 1.0)]);
-        admitted.exemplar_count = 2;
+    fn exemplar_with_well_formed_ids_is_carried_with_them_decoded_byte_for_byte() {
+        let s = series_with_exemplars(vec![exemplar(
+            1_000,
+            2.5,
+            vec![
+                label(TRACE_ID_LABEL, TRACE_ID_HEX),
+                label(SPAN_ID_LABEL, SPAN_ID_HEX),
+                label("env", "prod"),
+            ],
+        )]);
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 1);
+        let carried = &result.exemplars[0];
+        assert_eq!(carried.series_id, result.output.points[0].series_id);
+        assert_eq!(carried.exemplar.ts_ns, 1_000_000_000);
+        assert_eq!(carried.exemplar.value_bits, 2.5f64.to_bits());
+        assert_eq!(carried.exemplar.trace_id, TRACE_ID_BYTES);
+        assert_eq!(carried.exemplar.span_id, SPAN_ID_BYTES);
+        // The conventional id labels are consumed into the fixed-size arrays;
+        // every other label stays a filtered attribute.
+        assert_eq!(
+            carried.exemplar.filtered_attributes,
+            vec![label("env", "prod")]
+        );
+        assert_eq!(result.output.exemplars_dropped, 0);
+    }
+
+    #[test]
+    fn two_exemplars_for_one_series_in_one_window_admit_the_newest_and_count_one_dropped() {
+        let s = series_with_exemplars(vec![
+            exemplar(1_000, 1.0, vec![label(TRACE_ID_LABEL, TRACE_ID_HEX)]),
+            exemplar(5_000, 2.0, vec![]),
+        ]);
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        // Both land in the window starting at 0 (10 s wide), so the cap keeps
+        // one: the newest, since candidates are offered newest-first.
+        assert_eq!(result.exemplars.len(), 1);
+        assert_eq!(result.exemplars[0].exemplar.ts_ns, 5_000_000_000);
+        assert_eq!(result.output.exemplars_dropped, 1);
+    }
+
+    #[test]
+    fn two_exemplars_for_one_series_in_different_windows_are_both_admitted() {
+        let s = series_with_exemplars(vec![
+            exemplar(1_000, 1.0, vec![]),
+            exemplar(12_000, 2.0, vec![]),
+        ]);
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        // 1 s and 12 s fall in the windows starting at 0 and at 10 s.
+        assert_eq!(result.exemplars.len(), 2);
+        let mut carried: Vec<i64> = result.exemplars.iter().map(|e| e.exemplar.ts_ns).collect();
+        carried.sort_unstable();
+        assert_eq!(carried, vec![1_000_000_000, 12_000_000_000]);
+        assert_eq!(result.output.exemplars_dropped, 0);
+    }
+
+    #[test]
+    fn malformed_id_labels_leave_all_zero_ids_and_keep_the_exemplar_intact() {
+        let s = series_with_exemplars(vec![exemplar(
+            1_000,
+            3.5,
+            vec![
+                // Too short, and not hex at all.
+                label(TRACE_ID_LABEL, "abcd"),
+                label(SPAN_ID_LABEL, "zzzzzzzzzzzzzzzz"),
+                label("env", "prod"),
+            ],
+        )]);
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 1);
+        let carried = &result.exemplars[0].exemplar;
+        assert_eq!(carried.trace_id, [0u8; 16]);
+        assert_eq!(carried.span_id, [0u8; 8]);
+        assert_eq!(carried.ts_ns, 1_000_000_000);
+        assert_eq!(carried.value_bits, 3.5f64.to_bits());
+        // Nothing is lost: an id label that did not decode stays a plain
+        // filtered attribute rather than being swallowed by the failed parse.
+        assert_eq!(
+            carried.filtered_attributes,
+            vec![
+                label(TRACE_ID_LABEL, "abcd"),
+                label(SPAN_ID_LABEL, "zzzzzzzzzzzzzzzz"),
+                label("env", "prod"),
+            ]
+        );
+        assert_eq!(result.output.exemplars_dropped, 0);
+    }
+
+    #[test]
+    fn exemplar_value_round_trips_nan_payload_and_negative_zero_by_bit_pattern() {
+        let nan_bits = 0x7ff8_0000_dead_beef_u64;
+        let s = series_with_exemplars(vec![
+            exemplar(1_000, f64::from_bits(nan_bits), vec![]),
+            exemplar(12_000, -0.0, vec![]),
+        ]);
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        let mut bits: Vec<u64> = result
+            .exemplars
+            .iter()
+            .map(|e| e.exemplar.value_bits)
+            .collect();
+        bits.sort_unstable();
+        let mut expected = vec![nan_bits, (-0.0f64).to_bits()];
+        expected.sort_unstable();
+        assert_eq!(bits, expected);
+        assert_ne!((-0.0f64).to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn cap_is_per_series_so_two_series_in_one_window_both_admit() {
+        let mut first = series_with_exemplars(vec![exemplar(1_000, 1.0, vec![])]);
+        first.labels = vec![label("__name__", "up"), label("job", "a")];
+        let mut second = series_with_exemplars(vec![exemplar(1_500, 2.0, vec![])]);
+        second.labels = vec![label("__name__", "up"), label("job", "b")];
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![first, second]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 2);
+        assert_ne!(result.exemplars[0].series_id, result.exemplars[1].series_id);
+        assert_eq!(result.output.exemplars_dropped, 0);
+    }
+
+    #[test]
+    fn cap_spans_requests_when_the_caller_owns_it() {
+        let limits = IngestLimits::default();
+        let mut cap = ExemplarCap::default();
+        let first = normalize_with_exemplars(
+            &tenant(),
+            request(vec![series_with_exemplars(vec![exemplar(
+                1_000,
+                1.0,
+                vec![],
+            )])]),
+            &limits,
+            1_000_000,
+            &mut cap,
+        );
+        // Same series, same window, a separate request: the long-lived cap is
+        // the only thing that can see the collision, which is why it is the
+        // caller's (ADR-0047 decision 2).
+        let second = normalize_with_exemplars(
+            &tenant(),
+            request(vec![series_with_exemplars(vec![exemplar(
+                9_000,
+                2.0,
+                vec![],
+            )])]),
+            &limits,
+            1_000_000,
+            &mut cap,
+        );
+
+        assert_eq!(first.exemplars.len(), 1);
+        assert!(second.exemplars.is_empty());
+        assert_eq!(second.output.exemplars_dropped, 1);
+    }
+
+    #[test]
+    fn exemplar_whose_timestamp_fails_event_time_bounds_is_dropped_and_counted() {
+        let s = series_with_exemplars(vec![exemplar(i64::MAX, 1.0, vec![])]);
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        assert!(result.exemplars.is_empty());
+        assert_eq!(result.output.exemplars_dropped, 1);
+        // The series' own sample is unaffected: an exemplar is a hint, never a
+        // reason to reject a measurement.
+        assert_eq!(result.output.points.len(), 1);
+    }
+
+    /// The legacy entry point keeps working and keeps reporting a cap-based
+    /// drop count. It cannot report the exemplars it discards itself, since it
+    /// has nowhere to put an admitted one (see `normalize_resolved`).
+    #[test]
+    fn exemplars_of_a_rejected_series_are_counted_dropped() {
+        let admitted = series_with_exemplars(vec![
+            exemplar(1_000, 1.0, vec![]),
+            exemplar(5_000, 2.0, vec![]),
+        ]);
         let mut rejected_series = series(vec![label("job", "svc")], vec![sample(1_000, 1.0)]);
-        rejected_series.exemplar_count = 1;
+        rejected_series.exemplars = vec![exemplar(1_000, 1.0, vec![])];
 
         let out = normalize_resolved(
             &tenant(),
@@ -1535,8 +2017,38 @@ mod tests {
             &IngestLimits::default(),
             1_000_000,
         );
-        assert_eq!(out.exemplars_dropped, 3);
+        // One of the admitted series' two same-window exemplars loses the cap,
+        // and the rejected series has no `SeriesId` to attach its one to.
+        assert_eq!(out.exemplars_dropped, 2);
     }
+
+    #[test]
+    fn exemplars_are_dropped_and_counted_when_the_whole_request_is_too_large() {
+        let limits = IngestLimits {
+            max_data_points_per_request: 1,
+            ..IngestLimits::default()
+        };
+        let s = series_with_exemplars(vec![
+            exemplar(1_000, 1.0, vec![]),
+            exemplar(12_000, 2.0, vec![]),
+        ]);
+        let mut with_two_points = s.clone();
+        with_two_points.samples.push(sample(2_000, 2.0));
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![with_two_points]),
+            &limits,
+            1_000_000,
+            &mut cap,
+        );
+
+        assert!(result.exemplars.is_empty());
+        assert_eq!(result.output.exemplars_dropped, 2);
+    }
+
+    // --- metadata: accepted-and-dropped, counted ---
 
     #[test]
     fn metadata_dropped_is_request_level_tally() {
@@ -1686,5 +2198,50 @@ mod tests {
         assert_eq!(out.points[4].sample.value, 42.5);
         assert_eq!(out.points[5].series_id, count_id);
         assert_eq!(out.points[5].sample.value, 10.0);
+    }
+
+    proptest::proptest! {
+        /// Arbitrary exemplar input never panics, and never turns an exemplar
+        /// into a stored record without accounting for it: every exemplar in
+        /// the request is either carried or counted dropped, exactly once.
+        #[test]
+        fn arbitrary_exemplars_never_panic_and_are_always_accounted(
+            wire in proptest::collection::vec(
+                (
+                    proptest::prelude::any::<i64>(),
+                    proptest::prelude::any::<f64>(),
+                    proptest::collection::vec(
+                        ("[a-z_]{0,4}|trace_id|span_id", "[0-9a-zA-Z]{0,34}"),
+                        0..4,
+                    ),
+                ),
+                0..8,
+            ),
+        ) {
+            let exemplars: Vec<ResolvedExemplar> = wire
+                .into_iter()
+                .map(|(ts_ms, value, labels)| ResolvedExemplar {
+                    ts_ms,
+                    value,
+                    labels: labels
+                        .into_iter()
+                        .map(|(name, value)| Label { name, value })
+                        .collect(),
+                })
+                .collect();
+            let total = exemplars.len();
+            let mut cap = ExemplarCap::default();
+            let result = normalize_with_exemplars(
+                &tenant(),
+                request(vec![series_with_exemplars(exemplars)]),
+                &IngestLimits::default(),
+                1_000_000,
+                &mut cap,
+            );
+            proptest::prop_assert_eq!(
+                result.exemplars.len() + result.output.exemplars_dropped,
+                total
+            );
+        }
     }
 }

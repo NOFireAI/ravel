@@ -14,7 +14,8 @@ use crate::proto::prometheus::{
     BucketSpan, Histogram as ProtoHistogram, TimeSeries as ProtoTimeSeries, WriteRequest,
 };
 use crate::resolved::{
-    ResolvedCount, ResolvedHistogram, ResolvedRequest, ResolvedSample, ResolvedSeries, ResolvedSpan,
+    ResolvedCount, ResolvedExemplar, ResolvedHistogram, ResolvedRequest, ResolvedSample,
+    ResolvedSeries, ResolvedSpan,
 };
 use crate::snappy::{self, SnappyError};
 
@@ -71,7 +72,22 @@ fn resolve_series(series: ProtoTimeSeries) -> ResolvedSeries {
             .into_iter()
             .map(resolve_histogram)
             .collect(),
-        exemplar_count: series.exemplars.len(),
+        exemplars: series
+            .exemplars
+            .into_iter()
+            .map(|e| ResolvedExemplar {
+                ts_ms: e.timestamp,
+                value: e.value,
+                labels: e
+                    .labels
+                    .into_iter()
+                    .map(|l| Label {
+                        name: l.name,
+                        value: l.value,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -159,20 +175,21 @@ mod tests {
         assert_eq!(series.samples[0].ts_ms, 1_700_000_000_000);
         assert_eq!(series.samples[0].value, 1.0);
         assert!(series.histograms.is_empty());
-        assert_eq!(series.exemplar_count, 0);
+        assert!(series.exemplars.is_empty());
     }
 
-    /// Native histograms are materialized (they have durable storage since
-    /// RSEG v5); exemplars stay a tally, since ADR-0017 defers exemplar
-    /// storage.
+    /// Native histograms are materialized (durable storage since RSEG v5), and
+    /// so are exemplars, body and all, since ADR-0047 gave them an RSEG
+    /// section: the wire labels arrive unsplit and undecoded, for
+    /// [`crate::normalize`] to map.
     #[test]
-    fn materializes_histograms_and_tallies_exemplars() {
+    fn materializes_histograms_and_exemplars() {
         use crate::proto::prometheus::Exemplar as ProtoExemplar;
         let req = write_request(vec![ProtoTimeSeries {
             labels: vec![proto_label("__name__", "latency")],
             samples: vec![],
             exemplars: vec![ProtoExemplar {
-                labels: vec![],
+                labels: vec![proto_label("trace_id", "0123456789abcdef0123456789abcdef")],
                 value: 1.0,
                 timestamp: 1_000,
             }],
@@ -182,7 +199,17 @@ mod tests {
 
         let resolved = decode_write_request(&body, 1_000_000).expect("decode");
         assert_eq!(resolved.series[0].histograms.len(), 2);
-        assert_eq!(resolved.series[0].exemplar_count, 1);
+        assert_eq!(
+            resolved.series[0].exemplars,
+            vec![ResolvedExemplar {
+                ts_ms: 1_000,
+                value: 1.0,
+                labels: vec![Label {
+                    name: "trace_id".to_string(),
+                    value: "0123456789abcdef0123456789abcdef".to_string(),
+                }],
+            }]
+        );
     }
 
     /// Every histogram field reaches [`ResolvedHistogram`] unreshaped: the

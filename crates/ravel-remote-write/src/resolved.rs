@@ -77,19 +77,39 @@ pub struct ResolvedHistogram {
     pub custom_values: Vec<f64>,
 }
 
-/// One series (label set plus its samples and native histograms) resolved
-/// from either RW1 or RW2, before normalization.
+/// One exemplar as carried on the wire (`prometheus.Exemplar` in RW1,
+/// `io.prometheus.write.v2.Exemplar` in RW2; the two are field-identical
+/// once RW2's symbol references are resolved): milliseconds since epoch, the
+/// value verbatim as an `f64`, and the exemplar's own labels.
 ///
-/// `exemplar_count` is a tally only: exemplars are accepted-and-dropped
-/// (counted), so their bodies need not survive decode (ADR-0017 defers
-/// exemplar storage). Native histograms do survive: since RSEG v5 they are
-/// admitted and written (docs/rseg-v3-plan.md phase C8).
+/// Remote Write has no dedicated trace-id or span-id field. By convention
+/// the sender carries them as labels named `trace_id` and `span_id`
+/// (`io/prometheus/write/v2/types.proto` calls the `trace_id` name a best
+/// practice, and it is what Grafana's exemplar-to-trace link reads). This
+/// layer keeps them in `labels` alongside every other label, unsplit and
+/// undecoded, for the same reason nothing else here is validated:
+/// [`crate::normalize`] owns every admission and mapping decision (ADR-0047
+/// decision 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedExemplar {
+    pub ts_ms: i64,
+    pub value: f64,
+    pub labels: Vec<Label>,
+}
+
+/// One series (label set plus its samples, native histograms, and exemplars)
+/// resolved from either RW1 or RW2, before normalization.
+///
+/// Exemplar bodies survive decode since ADR-0047 gave exemplars storage and
+/// an admission cap: they used to be a bare count here, because everything
+/// beyond the tally was thrown away. Native histograms have survived since
+/// RSEG v5 admitted and wrote them (docs/rseg-v3-plan.md phase C8).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSeries {
     pub labels: Vec<Label>,
     pub samples: Vec<ResolvedSample>,
     pub histograms: Vec<ResolvedHistogram>,
-    pub exemplar_count: usize,
+    pub exemplars: Vec<ResolvedExemplar>,
 }
 
 /// A resolved `WriteRequest`, version-blind.
