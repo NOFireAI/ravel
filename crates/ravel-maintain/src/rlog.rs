@@ -998,6 +998,96 @@ mod tests {
     /// output's own block indices (checked against an oracle derived from the
     /// output's decoded rows and its own SKIP_IDX, never from POSTINGS), and a
     /// query over the L1 part returns exactly the records the same query returns
+    /// The rebuild inherits POSTINGS v2's merged-view indexing with no code of
+    /// its own (ADR-0049's 2026-08-03 amendment, issue #547).
+    ///
+    /// `gather_stream` materializes records through the reader, which populates
+    /// `stream_attrs` from STREAM_DIR, and `flush_part` hands whole
+    /// `LogRecord`s to `RlogWriter::with_indexed_fields`. This module collects
+    /// no terms itself, so the L1 output indexes the merged view exactly as the
+    /// writer does at L0. That is the property that would break if this module
+    /// ever grew its own term collection.
+    ///
+    /// The object mixes both layers for one key: stream 1's records get
+    /// `service.name = "svc1"` from their resource blob, and stream 2's records
+    /// carry it as a per-record attribute. A v1 index would name only stream
+    /// 2's blocks. The merged index must name both, which is what makes the
+    /// prune sound for a merged-view query.
+    ///
+    /// A key that is resource-level across the WHOLE object still has no
+    /// postings, because postings are keyed by a FIELD_DIR column and those come
+    /// from the per-record layer. That gap is issue #552, not this ticket.
+    #[tokio::test]
+    async fn compaction_indexes_the_merged_view_in_the_output() {
+        let store = MemoryStore::new();
+        let svc = || {
+            (
+                "service.name".to_string(),
+                AttrValue::Str("svc1".to_string()),
+            )
+        };
+        // Input A: stream 1, whose resource blob is `service.name = "svc1"`.
+        // No record carries it per-record.
+        // 9000 records, so the output's first 8192-record block holds nothing
+        // but these: a block whose only match for the key is resource-level.
+        let a: Vec<LogRecord> = (0..9_000)
+            .map(|i| record(1, 1_000 + i, "resource-only", vec![]))
+            .collect();
+        // Input B: stream 2 (resource `svc2`), each record carrying
+        // `service.name = "svc1"` itself. This is what gives the object a
+        // FIELD_DIR column for the key.
+        let b: Vec<LogRecord> = (0..1_000)
+            .map(|i| record(2, 20_000 + i, "per-record", vec![svc()]))
+            .collect();
+        seed_l0(
+            &store,
+            Uuid::from_u128(1),
+            1,
+            &a,
+            l0_blocked_cfg(),
+            &["service.name"],
+        )
+        .await;
+        seed_l0(
+            &store,
+            Uuid::from_u128(2),
+            2,
+            &b,
+            l0_blocked_cfg(),
+            &["service.name"],
+        )
+        .await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+
+        // Every record in the object matches `service.name = "svc1"` on the
+        // merged view, so every block holding a record must be in the list.
+        for l1 in &parts {
+            let per_record = true_blocks_for(l1, "service.name", "svc1");
+            let listed = postings_probe(l1, "service.name", "svc1").expect("the key is indexed");
+            assert!(
+                per_record.is_subset(&listed),
+                "the per-record matches must still be listed"
+            );
+            let all_blocks: BTreeSet<u32> = row_block_indices(l1).into_iter().collect();
+            // Guard against a degenerate corpus: if both layers happened to
+            // cover the same blocks, the assertion below would hold under v1
+            // indexing too and prove nothing.
+            assert_ne!(
+                per_record, all_blocks,
+                "corpus must have a block whose only match is resource-level"
+            );
+            assert_eq!(
+                listed, all_blocks,
+                "a resource-level match must be indexed too, not only the per-record ones"
+            );
+        }
+    }
+
     /// over its inputs.
     #[tokio::test]
     async fn compaction_rebuilds_postings_from_merged_blocks() {
