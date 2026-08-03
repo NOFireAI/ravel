@@ -186,3 +186,98 @@ from SQL, and it is named here rather than assumed.
   parallel nuisance, and is tracked as such.
 - Nothing about durability, the commit protocol, the key layout, or
   snapshot resolution changes.
+
+## Amendment (2026-08-03): postings index the merged attribute view
+
+Decision 7 said the SQL path extracts attribute equality and `IN`, and that
+this closes ADR-0033 gap 2 and makes `attrs['k'] = 'v'` prunable end to end.
+Two things were wrong with that, both found by building it.
+
+### What was wrong
+
+**The extraction cannot go through the reader's exact channel.**
+`RlogReader::scan` evaluates every `content` arm exactly, per row, and
+`equals` on an attribute reads a record's own dynamic column plus its
+`attrs_raw` overflow only. It never reads the resource or scope blob,
+because the write path keeps stream attributes out of the per-record
+columns. SQL's `attrs` column is the merged view: resource and scope
+attributes with the record's own overriding them on a key collision. So the
+reader's per-record equality matches a strict subset of the SQL equality.
+Pushdown is `Inexact`, which requires the scan to return a superset, and a
+residual removes emitted rows but never restores a dropped one. Issue #510
+proved this empirically and shipped the finding instead of the push.
+
+Issue #538 answered it with a prune-only channel: arms that drive block
+pruning and never the per-row filter.
+
+**A prune-only channel is not enough either, because the index covers one
+layer and the query spans two.** `FIELD_DIR` is object-wide, so one record
+carrying a key as a per-record attribute makes it an indexed column for the
+whole object, including for records whose value for that key lives in their
+resource blob. Those records appear in no posting list for the term, so
+probing it prunes their block away. This needs no key collision on a single
+stream. It needs only the key present as a per-record attribute somewhere in
+the object and as a resource attribute elsewhere, which two senders under
+one tenant produce without arranging it.
+
+`IN` was also wrong in decision 7. An `IN` list is a disjunction and the
+prune channel intersects its arms, so one arm per element drops true
+results. Issue #519 tracks a sound disjunctive form.
+
+### Decision
+
+**POSTINGS indexes the merged attribute view**: for each record, the union
+of its resource, scope, and own attributes, with its own winning on a key
+collision, which is exactly what `ravel_sql::rlog_attrs::merged_attrs`
+computes. The prune then answers the question SQL asks.
+
+The `POSTINGS_VERSION` byte goes from 1 to 2. The grammar is unchanged; the
+meaning of what a posting list contains is not, and a reader cannot tell the
+two apart from the bytes. Same bytes with a different meaning is the failure
+mode a version byte exists to prevent.
+
+Readers keep both:
+
+- version 2: probe the term and prune, since the index covers the same union
+  the query does.
+- version 1: prune only for a key that appears at no stream's resource or
+  scope level anywhere in the object, which is the conservative rule issue
+  #538 landed. Every pre-existing object stays correct without a rewrite.
+
+Decision 6 is unchanged in principle and gains a requirement: the compaction
+rebuild indexes the merged view too, and writes version 2. A rebuild that
+kept version 1 semantics under a version 2 byte would be the one way to make
+this silently wrong.
+
+The per-field distinct-value cap of decision 4 now counts merged values.
+Resource attributes are low cardinality by nature, so this moves the count
+little, and the cap already degrades loudly to the bloom.
+
+### Why not keep the conservative rule
+
+Because it excludes the keys the feature exists for. `service.name`,
+`k8s.namespace.name`, and `deployment.environment` are resource attributes in
+ordinary OTLP, and decision 3's own default indexed-field list names two of
+them. Under the version 1 rule an object carrying them that way prunes
+nothing at all. The epic would ship an index that is correct and close to
+useless, and every measurement decision 4 and issue #511 ask for would report
+a constant.
+
+### Rejected alternatives
+
+**Index both layers separately and intersect at probe time.** A posting list
+per layer, unioned when the query spans both. It stores less than the merged
+index, since a resource value is recorded once per stream rather than once
+per block that holds the stream's records. It also reintroduces the
+record-wins precedence at probe time, where getting it wrong is silent, and
+saves little: records are sorted by stream, so a block usually holds one
+stream and the merged index adds a handful of terms to it.
+
+**Leave the conservative rule and document the limitation.** Honest, and it
+is what is on main today. It defers the same decision to whoever first
+measures the prune ratio and finds it is 1.0.
+
+**Resolve the merged view at query time instead of index time.** The reader
+would decode `stream_attrs` per block to decide whether a prune is safe. It
+moves per-record work onto the path whose whole point is to avoid reading
+records, and it still cannot recover a record the index never listed.
