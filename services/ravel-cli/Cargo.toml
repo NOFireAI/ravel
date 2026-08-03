@@ -15,8 +15,10 @@ ravel-rspan = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-maintain = { workspace = true }
+ravel-ingest = { workspace = true }
 prost = { workspace = true }
 blake3 = { workspace = true }
+crc32c = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
 tokio = { workspace = true }

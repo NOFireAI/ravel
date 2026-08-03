@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
-use ravel_cli::{catalog, hold, maintain, now_ns, store};
+use ravel_cli::{catalog, hold, idem, maintain, now_ns, store};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, kind};
@@ -91,6 +91,11 @@ enum Command {
         #[command(subcommand)]
         command: HoldCommand,
     },
+    /// Inspect an idempotency marker object (ADR-0051 section 5, issue #532).
+    Idem {
+        #[command(subcommand)]
+        command: IdemCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,6 +131,16 @@ enum HoldCommand {
     List {
         #[arg(long)]
         tenant: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdemCommand {
+    /// Fetch and decode an idempotency marker by its exact object key
+    /// (`t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`).
+    Inspect {
+        /// Object store key of the marker.
+        key: String,
     },
 }
 
@@ -446,6 +461,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Hold {
             command: HoldCommand::List { tenant },
         } => hold::list(store::build_store(&cli.store)?, &tenant).await,
+        Command::Idem {
+            command: IdemCommand::Inspect { key },
+        } => {
+            let report = idem::inspect(store::build_store(&cli.store)?, &key).await?;
+            println!("{report}");
+            Ok(())
+        }
     }
 }
 

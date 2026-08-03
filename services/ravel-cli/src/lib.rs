@@ -7,6 +7,7 @@
 
 pub mod catalog;
 pub mod hold;
+pub mod idem;
 pub mod maintain;
 pub mod qualify;
 pub mod store;
