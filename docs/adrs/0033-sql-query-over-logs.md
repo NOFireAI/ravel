@@ -210,6 +210,20 @@ supported map-access syntax and have the planner reject the subscript
 form with a clear error. `has_word(col, 'literal')` and `LIKE` do not
 depend on this — both plan and push down today without it.
 
+**Amended 2026-08-03: this gap is closed.** The gate above offered two
+ways out; the first was taken. `crates/ravel-sql/src/map_field_planner.rs`
+registers a hand-written `ExprPlanner` covering only the map-field case, so
+`attrs['k'] = 'v'` plans and answers without enabling DataFusion's
+`nested_expressions` feature. The no-nested-expressions dependency stance
+this ADR weighed therefore survives intact: the subscript is supported and
+the dependency surface did not grow.
+
+The paragraph above is left as written because an ADR records what was
+decided and why, and the reasoning that made fail-loud acceptable for v1 is
+still the reasoning that governs any construct outside the subset. Only the
+gap's status changed. The pruning gap described earlier in this section is a
+different problem and is still open; ADR-0049 addresses it.
+
 **One SQL endpoint, two tables, exactly one registered per session.** No
 new HTTP endpoint; `POST /api/v1/sql` is unchanged. This paragraph's
 first draft said the per-query `SessionContext` "registers `logs`

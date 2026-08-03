@@ -243,13 +243,25 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
   -d '{"query": "SELECT ts, body FROM logs WHERE has_word(body, '\''timeout'\'') ORDER BY ts"}'
 ```
 
-A filter by an attribute value (the `attrs['service.name'] = 'api'` shape) is
-**not yet available over SQL**. This build registers no nested-expression
-planner, so the `attrs['k']` subscript fails query planning with a loud error
-rather than returns a wrong answer (a documented ADR-0033 gap). Until it is
-wired, use `has_word` over `body` for content search. Only the `attrs['k']`
-subscript form is affected; other predicates (`ts`, `has_word`) are
-unaffected.
+A filter by an attribute value, with the `attrs['k']` subscript:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT ts, body FROM logs WHERE attrs['\''service.name'\''] = '\''api'\'' ORDER BY ts"}'
+```
+
+The `attrs` column merges three sources of attributes into one map. The
+sources are the resource, the scope, and the log record. If more than one
+source sets the same key, the value from the record wins.
+
+A key that no record carries returns zero rows. It is not an error.
+
+Attribute equality does not prune which objects Ravel reads. The engine
+reads the objects that the `ts` range selects, then applies the attribute
+filter to the decoded records. A filter on `ts`, or a `has_word` content
+search, does prune the read.
 
 ## HTTP status codes
 

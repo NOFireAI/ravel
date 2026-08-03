@@ -610,15 +610,24 @@ never drop a true result):
   A plain `LIKE '%word%'` pattern's literal is recognized but is **not** pushed
   as a prune, because token matching is not a superset of SQL substring `LIKE`.
 
-Two known gaps, both inherited from ADR-0033 and deliberate, not oversights:
+One known gap remains of the two ADR-0033 recorded. Both were deliberate,
+not oversights.
 
-1. **`attrs['k']` subscript planning is not wired.** This crate's DataFusion is
-   built with `features = ["sql"]` only, so no nested-expression `ExprPlanner`
-   (`GetFieldAccess`/`NamedStructField`) is registered and the `attrs['k']`
-   subscript **fails query planning** with a loud `GetFieldAccess not supported`
-   error rather than returning a wrong answer. Filtering by an attribute value
-   over SQL therefore is not usable end to end yet; `has_word` and `LIKE` do not
-   depend on this and work today.
+1. ~~**`attrs['k']` subscript planning is not wired.**~~ **Closed.** This
+   crate's DataFusion is built with `features = ["sql"]` only, so no
+   nested-expression `ExprPlanner` (`GetFieldAccess`/`NamedStructField`) came
+   registered, and the `attrs['k']` subscript failed query planning with a
+   loud `GetFieldAccess not supported` error. `map_field_planner.rs` now
+   registers a hand-written `ExprPlanner` for the map-field case, so
+   `attrs['k'] = 'v'` plans and answers. Enabling DataFusion's `nested_expressions`
+   feature would have done the same thing at the cost of a much larger
+   dependency surface for one expression form.
+
+   The planner is registered in `session.rs`'s logs session and covered end to
+   end at the HTTP boundary
+   (`services/ravel-server/tests/sql_endpoint.rs::a_logs_attrs_subscript_query_succeeds_over_http`),
+   not only against a session the crate's own tests build. Gap 2 below is
+   what remains, and it is about pruning, not planning.
 2. **A stream-attribute equality has no fetch-time prune.** Because `attrs`
    merges resource, scope, and per-record attributes with record-wins
    precedence, no stream-level (STREAM_DIR) match can soundly prune it: a

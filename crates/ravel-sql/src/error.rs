@@ -57,9 +57,13 @@ pub const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; 
 /// It names both v1 tables rather than one: a `Plan` error is built from a
 /// bare `DataFusionError` in `crate::executor::plan_error`, which has no
 /// handle on which table the failed query targeted, and a `logs` query can
-/// now fail to plan too (e.g. the `attrs['k']` subscript gap ADR-0033
-/// documents). Naming only `samples` would point a `logs` client at the
-/// wrong table.
+/// fail to plan like any other (an unregistered function, an unknown
+/// column). Naming only `samples` would point a `logs` client at the wrong
+/// table.
+///
+/// This doc cited the `attrs['k']` subscript gap as the example until
+/// `crate::map_field_planner` closed it. The reason for naming both tables
+/// never depended on that particular gap, so only the example changed.
 pub const MSG_PLAN: &str = "the SQL query could not be planned; check that it uses only the v1 subset \
      over the samples or logs table";
 
