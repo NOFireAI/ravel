@@ -196,7 +196,6 @@ async fn prepare_partition(
 ) -> DFResult<Vec<LogRecord>> {
     let query = LogQuery::new(ts_min, ts_max);
 
-    let accounting = QueryAccounting::new();
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher

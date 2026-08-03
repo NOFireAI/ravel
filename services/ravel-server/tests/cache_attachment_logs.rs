@@ -27,7 +27,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::http::StaticBearerTokenResolver;
 use ravel_server::Cli;
-use ravel_server::query::build_sql_state;
+use ravel_server::query::{build_catalog, build_sql_state};
 use ravel_server::store::build_cache;
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantId};
@@ -177,9 +177,10 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
 
     let mut tokens = HashMap::new();
     tokens.insert("acme-token".to_string(), tenant.clone());
+    let catalog = build_catalog(Arc::clone(&store), 1).expect("catalog");
     let sql_state = build_sql_state(
+        catalog,
         store,
-        1,
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache.clone()),
     )
