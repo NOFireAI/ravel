@@ -42,6 +42,16 @@ const IDEM_DIR: &str = "idem";
 /// Marker object filename suffix.
 pub const MARKER_SUFFIX: &str = "idm";
 
+/// Forward clock-skew tolerance for a marker's `<ingest_hour>`, in hours:
+/// [`read_marker`] still honors a marker up to this many hours ahead of the
+/// reader's own current ingest-hour bucket, absorbing a writer whose clock
+/// ran slightly ahead across an hour boundary. `ravel-maintain`'s sweep
+/// subtracts this same constant from its own age gate
+/// (`crates/ravel-maintain/src/sweep.rs`), so a marker this path would still
+/// honor is never swept out from under it by a sweeper whose clock lags an
+/// ingest node's by up to this much.
+pub const IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS: u32 = 1;
+
 const MAGIC: &[u8; 4] = b"RIDM";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = MAGIC.len() + 2 + 4;
@@ -316,10 +326,11 @@ pub async fn write_marker(
 /// original request pinned), so this lists every marker under
 /// [`marker_prefix`] and considers only those whose `ingest_hour` falls in
 /// the closed window `[now_ingest_hour_bucket - dedup_window_hours,
-/// now_ingest_hour_bucket + 1]`, picking the most recent in-window hit. The
-/// one-hour forward tolerance absorbs the original writer's clock running
-/// slightly ahead of the reader's across an hour boundary; a marker further
-/// in the future than that is never in-window and is left for the sweep.
+/// now_ingest_hour_bucket + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS]`,
+/// picking the most recent in-window hit. The forward tolerance absorbs the
+/// original writer's clock running slightly ahead of the reader's across an
+/// hour boundary; a marker further in the future than that is never
+/// in-window and is left for the sweep.
 ///
 /// Returns [`LookupOutcome::Miss`] if nothing in-window is found (or
 /// everything found there has already been swept), and
@@ -348,12 +359,15 @@ pub async fn read_marker(
         let Ok(hour) = parse_ingest_hour_string(hour_text) else {
             continue;
         };
-        // Upper bound tolerates one hour of forward clock skew (a writer
-        // whose clock ran slightly ahead across an hour boundary), while
-        // still bounding the LIST window: this is not the sweep-safety
-        // bound itself, just enough slack that a marker isn't dropped for
-        // having been pinned an hour ahead of this reader's clock.
-        if hour < min_hour || hour > now_ingest_hour_bucket.saturating_add(1) {
+        // Upper bound tolerates IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS of
+        // forward clock skew (a writer whose clock ran slightly ahead across
+        // an hour boundary), while still bounding the LIST window: this is
+        // not the sweep-safety bound itself, just enough slack that a marker
+        // isn't dropped for having been pinned ahead of this reader's clock.
+        if hour < min_hour
+            || hour
+                > now_ingest_hour_bucket.saturating_add(IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS)
+        {
             continue;
         }
         if best.as_ref().is_none_or(|(best_hour, _)| hour > *best_hour) {

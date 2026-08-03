@@ -8,10 +8,12 @@
 //! durable objects, but it changes nothing about *what* any sweep, retention,
 //! or compaction rule decides: it is only the driver that calls
 //! [`scan_and_maintain_with_memo`] (retention-before-compaction over every
-//! sealed bucket) and [`ravel_maintain::sweep_shard`] (the three GC rules) once
-//! per tenant per tick. Both are idempotent, so a missed or crashed tick is
-//! recovered on the next one. The clock is the real [`SystemClock`], matching
-//! everything else in this crate.
+//! sealed bucket), [`ravel_maintain::sweep_shard`] (the three per-shard GC
+//! rules), and [`ravel_maintain::sweep_idempotency_markers`] (the fourth GC
+//! rule, run once per signal instead of per shard) once per tenant per tick.
+//! All are idempotent, so a missed or crashed tick is recovered on the next
+//! one. The clock is the real [`SystemClock`], matching everything else in
+//! this crate.
 //!
 //! [`spawn`] runs one supervisor task, not one task per tenant: at the start
 //! of every tick it re-enumerates tenants from storage
@@ -53,7 +55,8 @@ use rand::RngExt as _;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
 use ravel_maintain::{
-    Clock, CompactorConfig, LegalHoldCheck, MaintainError, RetentionConfig, sweep_shard,
+    Clock, CompactorConfig, LegalHoldCheck, MaintainError, RetentionConfig,
+    sweep_idempotency_markers, sweep_shard,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
@@ -378,7 +381,12 @@ pub async fn run_discovery_cycle(
 /// One maintenance pass over every `(signal, shard)` of one tenant: a legal
 /// hold refresh, then retention before compaction (via
 /// [`scan_and_maintain_with_memo`]), then the GC sweeper (via
-/// [`sweep_shard`]). Every scan/sweep error is logged and retried next tick;
+/// [`sweep_shard`]), then, once per signal after that signal's shard loop
+/// completes, the idempotency-marker sweep (via [`sweep_idempotency_markers`])
+/// for [`Signal::Logs`] and [`Signal::Spans`] only -- markers don't exist for
+/// [`Signal::Metrics`] (ADR-0051 §5) and the marker sweep already covers every
+/// shard of a signal in one LIST, so it does not belong in the per-shard
+/// loop. Every scan/sweep error is logged and retried next tick;
 /// nothing here affects query correctness. Split out from [`run_discovery_cycle`]
 /// so a test can drive a single deterministic tenant tick without discovery or
 /// the timer.
@@ -518,6 +526,34 @@ pub async fn run_tick(
                 }
             }
         }
+
+        // Idempotency markers exist only for logs and spans (ADR-0051 SS5);
+        // the sweep LISTs one coarse prefix covering every shard of the
+        // signal, so it runs once per signal here, not inside the per-shard
+        // loop above. Logged like the GC sweep pass, not folded into
+        // `MaintainReport`'s summed fields.
+        if matches!(signal, Signal::Logs | Signal::Spans) {
+            match sweep_idempotency_markers(store, &clock, compactor, &hold, tenant, signal).await {
+                Ok(outcome) => {
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        deleted = outcome.deleted,
+                        kept = outcome.kept,
+                        skipped_malformed = outcome.skipped_malformed,
+                        "maintenance: idempotency marker sweep pass complete"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        error = %err,
+                        "maintenance: idempotency marker sweep pass failed; retried next tick"
+                    );
+                }
+            }
+        }
     }
     total
 }
@@ -541,6 +577,7 @@ mod tests {
     use ravel_commit::record::NewCommitRecord;
     use ravel_commit::{keys, publish, record};
     use ravel_maintain::{AUDIT_HOLD_SHARD, RetentionPolicy, shard_hold_scopes, write_hold_set};
+    use ravel_object_store::GetRange;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
@@ -548,6 +585,15 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+
+    use ravel_ingest::{IdempotencyReceipt, marker_key, write_marker};
+
+    /// Real wall-clock nanoseconds per hour, matching the private constant
+    /// every ingest-hour-bucket computation in this crate and ravel-ingest
+    /// shares (`run_tick` always uses the real [`WallClock`], never an
+    /// injected one, so tests that exercise the idempotency sweep must derive
+    /// "now" the same way production does rather than fix a clock).
+    const TEST_NS_PER_HOUR: i64 = 3_600_000_000_000;
 
     /// The retention floor is validated against the catalog's max_ingest_lag,
     /// which must equal ravel-maintain's own DEFAULT_MAX_INGEST_LAG_NS: the two
@@ -586,6 +632,98 @@ mod tests {
         // find nothing to skip.
         assert_eq!(report, MaintainReport::default());
         assert!(memo.is_empty());
+    }
+
+    /// `run_tick` must actually call the idempotency-marker sweep for logs
+    /// and spans, once per signal, using the real [`WallClock`] (issue #531's
+    /// adversarial checkpoint: the sweep previously had no production
+    /// caller). Seeds one marker per maintained signal at ingest hour 0
+    /// (1970, far past any real dedup window) and one at the real current
+    /// ingest hour (still within window), then asserts the past-window
+    /// marker is gone and the in-window one survives after a single tick --
+    /// for logs and spans. A metrics marker is never written in production
+    /// (ADR-0051 §5), so this also proves the sweep is not mistakenly called
+    /// for `Signal::Metrics`: a metrics marker seeded the same way must
+    /// survive regardless of age, since nothing calls the marker sweep for
+    /// that signal at all.
+    #[tokio::test]
+    async fn run_tick_sweeps_idempotency_markers_for_logs_and_spans_only() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let now_hour = u32::try_from(SystemClock.now_ns().div_euclid(TEST_NS_PER_HOUR))
+            .expect("real wall clock ingest hour bucket fits in u32");
+
+        for signal in [Signal::Logs, Signal::Spans, Signal::Metrics] {
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                b"past-window",
+                0,
+                &IdempotencyReceipt {
+                    written_count: 1,
+                    commit_token: "v2:token".to_string(),
+                },
+            )
+            .await
+            .expect("seed past-window marker");
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                b"in-window",
+                now_hour,
+                &IdempotencyReceipt {
+                    written_count: 1,
+                    commit_token: "v2:token".to_string(),
+                },
+            )
+            .await
+            .expect("seed in-window marker");
+        }
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        run_tick(
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+        )
+        .await;
+
+        for signal in [Signal::Logs, Signal::Spans] {
+            let past_key = marker_key(&tenant_id, signal, b"past-window", 0);
+            assert!(
+                store.get(&past_key, GetRange::Full).await.is_err(),
+                "{signal:?}'s past-window marker must be swept by a real tick"
+            );
+            let in_window_key = marker_key(&tenant_id, signal, b"in-window", now_hour);
+            assert!(
+                store.get(&in_window_key, GetRange::Full).await.is_ok(),
+                "{signal:?}'s in-window marker must survive a real tick"
+            );
+        }
+
+        // Metrics markers are never produced in production and the sweep is
+        // never called for that signal; both survive regardless of age.
+        for hour in [0, now_hour] {
+            let key = marker_key(
+                &tenant_id,
+                Signal::Metrics,
+                if hour == 0 {
+                    b"past-window"
+                } else {
+                    b"in-window"
+                },
+                hour,
+            );
+            assert!(
+                store.get(&key, GetRange::Full).await.is_ok(),
+                "a Metrics marker must never be touched: the sweep is not called for that signal"
+            );
+        }
     }
 
     /// Publish one real sealed segment plus its commit record into a past ingest

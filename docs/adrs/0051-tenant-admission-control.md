@@ -264,10 +264,13 @@ Two-part decision:
    existing read, resolve, or sweep path lists it (commit resolution
    lists `c/…`, the orphan sweep lists `l0/…`; the fail-loud unknown-key
    rule applies to the `c/` prefix only). Markers older than the dedup
-   window (default 24 h, from the `ingest_hour` in the file name) will be
-   deleted by a stateless sweep rule in `ravel-maintain` (epic #452,
-   EB-9; not yet implemented); `ravel-cli` will get an inspector for the
-   new object class (EB-12; not yet implemented).
+   window (default 24 h, from the `ingest_hour` in the file name) are
+   deleted by a stateless sweep rule in `ravel-maintain`
+   (`ravel_maintain::sweep_idempotency_markers`, epic #452, EB-9), wired
+   into the maintenance driver's tick in
+   `services/ravel-server/src/maintain.rs::run_tick`, once per signal for
+   logs and spans (metrics has no markers); `ravel-cli` will get an
+   inspector for the new object class (EB-12; not yet implemented).
 
    **Amendment (2026-08-03):** the checksum coverage above was
    implemented as `crc32c(magic || version || payload)`, not

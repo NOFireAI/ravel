@@ -60,6 +60,16 @@ pub const DEFAULT_ORPHAN_BREAKER_MIN_COUNT: usize = 50;
 /// in a large shard is never mistaken for mass record loss.
 pub const DEFAULT_ORPHAN_BREAKER_MAX_RATIO: f64 = 0.10;
 
+/// Default `idem_dedup_window_hours` (ADR-0051 §5): this crate's own policy
+/// default, chosen to match the 24h dedup window ADR-0051 documents.
+/// `ravel_ingest::idempotency::read_marker` has no default of its own --
+/// `dedup_window_hours` is always caller-supplied -- so there is no shared
+/// code-level default to match; what actually keeps the sweep from reaping a
+/// marker the read path would still honor is
+/// `ravel_ingest::IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`, subtracted from
+/// the sweep's own `min_hour` calculation (`crate::sweep`).
+pub const DEFAULT_IDEM_DEDUP_WINDOW_HOURS: u32 = 24;
+
 /// Everything the compactor needs beyond the store and the clock.
 #[derive(Debug, Clone)]
 pub struct CompactorConfig {
@@ -119,6 +129,16 @@ pub struct CompactorConfig {
     /// record loss forges, so only a human can tell mass record loss from a
     /// legitimate mass abandonment.
     pub force_orphan_gc: bool,
+    /// How far behind the current ingest-hour bucket an idempotency marker
+    /// (ADR-0051 §5) must be before [`crate::sweep::sweep_idempotency_markers`]
+    /// deletes it. Kept here rather than as a bare parameter to that function,
+    /// matching how every other shared sweep/compaction knob in this struct is
+    /// threaded, and so existing call sites built via
+    /// `..CompactorConfig::default()` stay unaffected. Default
+    /// [`DEFAULT_IDEM_DEDUP_WINDOW_HOURS`] (24h): this crate's own policy
+    /// default matching the window ADR-0051 documents, not a shared
+    /// code-level default (`read_marker` has no default of its own).
+    pub idem_dedup_window_hours: u32,
     /// Dry-run switch (plan §8, P8). When `true`, every maintenance path
     /// computes exactly the same eligible set and decision it would in a real
     /// run -- all reads (LIST/GET/HEAD, re-verify listings, k-way merges,
@@ -148,6 +168,7 @@ impl Default for CompactorConfig {
             orphan_breaker_min_count: DEFAULT_ORPHAN_BREAKER_MIN_COUNT,
             orphan_breaker_max_ratio: DEFAULT_ORPHAN_BREAKER_MAX_RATIO,
             force_orphan_gc: false,
+            idem_dedup_window_hours: DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
             dry_run: false,
         }
     }
