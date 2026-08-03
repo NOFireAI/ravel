@@ -1384,6 +1384,62 @@ mod tests {
         );
     }
 
+    /// UNSOUND (found reviewing #538): a key that is an indexed per-record
+    /// column for SOME records and a resource attribute for OTHERS lets the
+    /// prune drop a record the query needs.
+    ///
+    /// `field_dir` is object-wide, so one record carrying `service.name` as a
+    /// per-record attribute makes it an indexed column for the whole object.
+    /// A record whose `service.name` comes from its resource blob has no value
+    /// in that column, so it is in no posting list, so its block is pruned.
+    /// The merged SQL view (`ravel_sql::rlog_attrs::merged_attrs`) is the union
+    /// of both layers and needs that record.
+    ///
+    /// This is the same union-over-two-layers problem #510 refused to ship,
+    /// relocated into the prune channel.
+    #[test]
+    fn prune_must_not_drop_a_resource_only_match_when_the_key_is_also_a_column() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        // Block 0: stream 0, resource `service.name = "svc0"`, no per-record
+        // `service.name`. These are the records the merged view must return.
+        for i in 0..5i64 {
+            recs.push(rec(0, i, "resource-only"));
+        }
+        // Block 1: stream 1, resource `service.name = "svc1"`, but each record
+        // carries a per-record `service.name = "svc0"`. This is what makes
+        // `service.name` an indexed column for the whole object.
+        for i in 5..10i64 {
+            let mut r = rec(1, i, "per-record");
+            r.attrs.push((
+                "service.name".to_string(),
+                AttrValue::Str("svc0".to_string()),
+            ));
+            recs.push(r);
+        }
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, _stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+
+        // Ten records match `attrs['service.name'] = 'svc0'` on the merged
+        // view: five by resource attribute, five by per-record attribute.
+        assert_eq!(
+            rows.len(),
+            10,
+            "the prune dropped the block whose match lives only in the resource blob"
+        );
+    }
+
     /// The prune-only channel actually skips blocks. 12 blocks of 5 records, an
     /// indexed per-record `svc` cycling through 3 values, so a prune for one
     /// value proves the other 8 blocks absent through POSTINGS. Asserted on
