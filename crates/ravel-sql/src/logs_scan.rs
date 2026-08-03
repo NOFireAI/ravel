@@ -117,6 +117,10 @@ impl LogsScanExec {
     /// deliberately not accepted: they are not pushed into the fetch, because a
     /// stream-level prune is unsound against the merged `attrs` column (see the
     /// module doc). DataFusion's residual filters attributes.
+    // `tenant_hash` widened this past clippy\'s 7-argument
+    // threshold; the codebase allows it at the equivalent sites
+    // (scan.rs, ravel-query\'s fetcher.rs).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
@@ -255,7 +259,6 @@ async fn prepare_partition(
         query = query.with_content(c.clone());
     }
 
-    let accounting = QueryAccounting::new();
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher

@@ -81,6 +81,10 @@ impl AlertsScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given ts
     /// bounds and content predicates.
+    // `tenant_hash` widened this past clippy\'s 7-argument
+    // threshold; the codebase allows it at the equivalent sites
+    // (scan.rs, ravel-query\'s fetcher.rs).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
@@ -218,7 +222,6 @@ async fn prepare_partition(
         query = query.with_content(c.clone());
     }
 
-    let accounting = QueryAccounting::new();
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher
