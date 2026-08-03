@@ -418,17 +418,21 @@ fn group_and_dedup(
 
     // Deterministic series order by id bytes, independent of segment fetch
     // order and hash-map iteration order.
-    series_order.sort_by(|a, b| a.0.cmp(&b.0));
+    series_order.sort_by_key(|s| s.0);
 
+    // `series_order` holds exactly the keys of `by_series`, so the removal
+    // cannot miss. It is expressed as a `filter_map` rather than an `expect`
+    // anyway: this runs on a request path, where a panic takes the whole
+    // process (and every co-tenant's in-flight query) down with it.
     series_order
         .into_iter()
-        .map(|series_id| {
-            let (labels, mut records) = by_series.remove(&series_id).expect("series present");
-            records.sort_by(|a, b| (a.ts_ns, a.trace_id).cmp(&(b.ts_ns, b.trace_id)));
-            ExemplarSeriesJson {
+        .filter_map(|series_id| {
+            let (labels, mut records) = by_series.remove(&series_id)?;
+            records.sort_by_key(|r| (r.ts_ns, r.trace_id));
+            Some(ExemplarSeriesJson {
                 series_labels: labels_to_map(&labels),
                 exemplars: records.into_iter().map(exemplar_to_json).collect(),
-            }
+            })
         })
         .collect()
 }
