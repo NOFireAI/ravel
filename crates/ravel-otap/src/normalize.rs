@@ -2109,7 +2109,12 @@ impl ExemplarAdmission<'_, '_> {
                 None => dropped += 1,
             }
         }
-        candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.ts_ns));
+        // Stable sort: candidates are built in wire (table) order, so among
+        // exemplars sharing one `ts_ns` the first in wire order stays first and
+        // is offered to the cap first, making the tie-break deterministic
+        // rather than implementation-defined. Descending still holds
+        // keep-the-newest.
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.ts_ns));
 
         for candidate in candidates {
             let series_id = series_id_for(f64::from_bits(candidate.value_bits));

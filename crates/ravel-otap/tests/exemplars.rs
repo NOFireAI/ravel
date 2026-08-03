@@ -174,6 +174,32 @@ fn two_exemplars_for_one_series_in_one_window_admit_the_newest_and_count_one_dro
     assert_eq!(dropped_counts(&result.output.rejected), vec![1]);
 }
 
+/// FINDING 4: two exemplars on one series with identical `ts_ns` must break
+/// the tie deterministically. A bounds-less histogram gives one `+Inf` bucket,
+/// so both exemplars attach to the same series; the stable descending sort
+/// keeps the first in wire order, which is offered to the cap first and wins.
+/// Distinguishable values (1.0 then 2.0) name the survivor; an unstable sort
+/// could keep either.
+#[test]
+fn identical_timestamp_exemplars_keep_the_first_in_wire_order() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize(
+        &histogram_with(
+            vec![],
+            vec![
+                exemplar_row(INGEST_TS_NS, 1.0, Some(TRACE_ID)),
+                exemplar_row(INGEST_TS_NS, 2.0, None),
+            ],
+        ),
+        &mut cap,
+    );
+
+    assert_eq!(result.exemplars.len(), 1);
+    // The first exemplar in wire order (value 1.0) survives the tie.
+    assert_eq!(result.exemplars[0].exemplar.value_bits, 1.0f64.to_bits());
+    assert_eq!(dropped_counts(&result.output.rejected), vec![1]);
+}
+
 #[test]
 fn two_exemplars_for_one_series_in_different_windows_are_both_admitted() {
     let mut cap = ExemplarCap::default();

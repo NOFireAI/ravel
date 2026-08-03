@@ -465,7 +465,11 @@ fn admit_exemplars(
             None => *exemplars_dropped += 1,
         }
     }
-    candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.ts_ns));
+    // Stable sort: candidates are built in wire order, so among exemplars
+    // sharing one `ts_ns` the first in wire order stays first and is offered to
+    // the cap first, making the tie-break deterministic rather than
+    // implementation-defined. Descending still holds keep-the-newest.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.ts_ns));
 
     for candidate in candidates {
         if cap.admit(series_id, candidate.ts_ns) {
@@ -1879,6 +1883,32 @@ mod tests {
         // one: the newest, since candidates are offered newest-first.
         assert_eq!(result.exemplars.len(), 1);
         assert_eq!(result.exemplars[0].exemplar.ts_ns, 5_000_000_000);
+        assert_eq!(result.output.exemplars_dropped, 1);
+    }
+
+    /// FINDING 4: two exemplars on one series with identical `ts_ns` must break
+    /// the tie deterministically. Candidates are sorted descending by `ts_ns`
+    /// with a stable sort, so the first in wire order wins the tie and is
+    /// offered to the cap first. Distinguishable values (1.0 then 2.0) let the
+    /// assertion name the survivor; an unstable sort could keep either.
+    #[test]
+    fn identical_timestamp_exemplars_keep_the_first_in_wire_order() {
+        let s = series_with_exemplars(vec![
+            exemplar(1_000, 1.0, vec![]),
+            exemplar(1_000, 2.0, vec![]),
+        ]);
+        let mut cap = ExemplarCap::default();
+        let result = normalize_with_exemplars(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 1);
+        // The first exemplar in wire order (value 1.0) survives the tie.
+        assert_eq!(result.exemplars[0].exemplar.value_bits, 1.0f64.to_bits());
         assert_eq!(result.output.exemplars_dropped, 1);
     }
 
