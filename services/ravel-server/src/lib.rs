@@ -432,11 +432,13 @@ pub async fn start(
         #[cfg(feature = "sql")]
         {
             // Mounted alongside the Prometheus-shaped routes on the same
-            // listener, sharing the catalog and object store but nothing
-            // else: the SQL path builds its own session per query.
+            // listener, sharing the catalog and object store (so
+            // ravel_catalog_isolation_breach_total, ADR-0050 section 2,
+            // counts breaches hit through either path) but nothing else:
+            // the SQL path builds its own session per query.
             let state = query::build_sql_state(
+                catalog.clone(),
                 store.clone(),
-                config.shard_count,
                 config.tenant_resolver.clone(),
             )?;
             alert_sql_executor = Some(state.executor.clone());

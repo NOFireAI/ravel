@@ -46,21 +46,20 @@ pub const DEFAULT_MAX_TENANT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Build the state for `POST /api/v1/sql`.
 ///
-/// The SQL path gets its own `Catalog` instance rather than sharing the
-/// PromQL engine's: `QueryEngine` owns its catalog privately and exposes no
-/// accessor, and a second listing catalog over the same store is
-/// behaviourally identical (its only mutable state is a decoded-record
-/// cache). Sharing one would be a small allocation win and no more.
+/// Takes the same `Catalog` instance the PromQL engine and `/metrics` use
+/// (ADR-0050 section 2): a second, independent `Catalog` here would carry
+/// its own `isolation_breaches` counter, so a tenant_hash or LIST-prefix
+/// breach hit only through the SQL path would never reach
+/// `ravel_catalog_isolation_breach_total` and the alert rule built on it.
 #[cfg(feature = "sql")]
 pub fn build_sql_state(
+    catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
-    shard_count: u32,
     tenant_resolver: Arc<dyn TenantResolver>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SqlConfig, SqlExecutor};
 
-    let catalog = build_catalog(store.clone(), shard_count)?;
     let config = SqlConfig::default();
     let max_deadline = config.engine.deadline;
     // The metrics fetcher (RSEG) and the logs fetcher (RLOG) both read the
