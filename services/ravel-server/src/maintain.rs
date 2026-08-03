@@ -114,11 +114,11 @@ fn signal_index(signal: Signal) -> usize {
 /// deliberately no `tenant_hash` dimension here. ADR-0048's decision 4 names
 /// `tenant_hash` as a label for the breaker-trip counter, but ADR-0044
 /// section 4 blocks any per-tenant `/metrics` series on this unauthenticated
-/// route pending an authentication decision, and ADR-0051's resolution of
-/// that block (an opt-in `--metrics-tenant-labels` flag) is not implemented
-/// anywhere in this codebase. Adding a raw `tenant_hash` label here would
-/// violate ADR-0044's safety precondition; see the issue #517 report for the
-/// full contradiction.
+/// route pending an authentication decision. ADR-0051's `--metrics-tenant-labels`
+/// flag now exists, but it applies only to the admission usage family
+/// (ADR-0051 section 6), not to this maintenance-safety family. Adding a
+/// raw `tenant_hash` label here would violate ADR-0044's safety
+/// precondition; see the issue #517 report for the full contradiction.
 #[derive(Debug, Default)]
 pub struct MaintenanceSafetyMetrics {
     legal_hold_refresh_failures: AtomicU64,

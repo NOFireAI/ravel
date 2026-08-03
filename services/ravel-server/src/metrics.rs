@@ -12,10 +12,11 @@
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and its
 //! variants are exhaustively `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, and `level` (ADR-0044 section 4). Every
-//! variant's payload is a closed enum or [`TenantHash`]'s fixed-width hash, so
-//! there is no `String` or `&str` anywhere on this path an unlisted label
-//! could travel through, and adding an eighth variant is a compile error
+//! `error_kind`, `workload_class`, `level`, and `reason` (ADR-0044 section 4,
+//! `reason` added by ADR-0051 section 6 for the admission-rejection family).
+//! Every variant's payload is a closed enum or [`TenantHash`]'s fixed-width
+//! hash, so there is no `String` or `&str` anywhere on this path an unlisted
+//! label could travel through, and adding a ninth variant is a compile error
 //! everywhere this module matches on `Label` exhaustively. `shard` is
 //! deliberately absent: shard count times tenant count times operation count
 //! is unbounded in the dimension Ravel controls least (ADR-0044, rejected
@@ -44,8 +45,8 @@ use axum::routing::get;
 use ravel_cache::CacheMetricsSnapshot;
 use ravel_catalog::Catalog;
 use ravel_ingest::{
-    IngestMetricsSnapshot, IngestRouter, LogIngestMetricsSnapshot, LogIngestRouter,
-    SpanIngestMetricsSnapshot, SpanIngestRouter,
+    AdmissionController, IngestMetricsSnapshot, IngestRouter, LogIngestMetricsSnapshot,
+    LogIngestRouter, SpanIngestMetricsSnapshot, SpanIngestRouter, TenantUsage,
 };
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::instrument::{
@@ -96,13 +97,50 @@ impl Level {
     }
 }
 
+/// The `reason` label on `ravel_admission_rejected_total` (ADR-0051 section
+/// 6). ADR-0051 names a closed set of six reasons
+/// `{body_size, byte_rate, series_rate, series_cap, skew, structural}`; the
+/// three here are exactly the ones `AdmissionController::usage_snapshot`
+/// counts today (`ravel_ingest::TenantUsage`). The other three are enforced
+/// at layers that keep no per-tenant counter in that snapshot yet (body size
+/// at the transport, skew and structural in normalization), so a variant for
+/// them would render samples no data source can fill. They join this enum
+/// when their counters do, additively, the same way a new `Signal` variant
+/// joins `signal_name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    ByteRate,
+    SeriesRate,
+    SeriesCap,
+}
+
+impl RejectReason {
+    /// Every reason with a counter, so the rejected family renders all three
+    /// series per (tenant, signal) even when some are zero (the same
+    /// zero-is-not-absence discipline the other families keep).
+    const ALL: [RejectReason; 3] = [
+        RejectReason::ByteRate,
+        RejectReason::SeriesRate,
+        RejectReason::SeriesCap,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            RejectReason::ByteRate => "byte_rate",
+            RejectReason::SeriesRate => "series_rate",
+            RejectReason::SeriesCap => "series_cap",
+        }
+    }
+}
+
 /// A `tenant_hash` label value: either a configured tenant's fixed-width hash
 /// or the `other` bucket every unconfigured tenant folds into (ADR-0044
 /// section 4), so per-tenant cardinality is bounded by the configured tenant
-/// count rather than by traffic. No sample this module renders is per-tenant
-/// yet (`StoreMetrics`, ingest metrics, and the catalog anomaly counters are
-/// all process-global by design); this exists so a future per-tenant source
-/// has a value to construct.
+/// count rather than by traffic. `StoreMetrics`, ingest metrics, and the
+/// catalog anomaly counters stay process-global by design; the admission
+/// usage family (ADR-0051 section 6) is the one family that renders real
+/// `tenant_hash` values, and only when `--metrics-tenant-labels` is set --
+/// otherwise it too folds into `other` like every other family here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TenantHashLabel {
     Hash(TenantHash),
@@ -130,6 +168,7 @@ pub enum Label {
     ErrorKind(StoreErrorClass),
     WorkloadClass(WorkloadClass),
     Level(Level),
+    RejectReason(RejectReason),
 }
 
 impl Label {
@@ -142,6 +181,7 @@ impl Label {
             Label::ErrorKind(_) => "error_kind",
             Label::WorkloadClass(_) => "workload_class",
             Label::Level(_) => "level",
+            Label::RejectReason(_) => "reason",
         }
     }
 
@@ -154,6 +194,7 @@ impl Label {
             Label::ErrorKind(class) => class.name().to_string(),
             Label::WorkloadClass(class) => class.name().to_string(),
             Label::Level(level) => level.name().to_string(),
+            Label::RejectReason(reason) => reason.name().to_string(),
         }
     }
 }
@@ -827,11 +868,12 @@ pub struct MaintenanceSafetySnapshot {
 /// No `tenant_hash` label on any series here. ADR-0048 decision 4 names
 /// `tenant_hash` for the breaker-trip counter, but ADR-0044 section 4 blocks
 /// any per-tenant series on this unauthenticated route pending an
-/// authentication decision, and ADR-0051's resolution of that block (an
-/// opt-in `--metrics-tenant-labels` flag, default off) is not implemented
-/// anywhere in this codebase. Adding a raw tenant hash here would violate
-/// ADR-0044's safety precondition; see [`crate::maintain::MaintenanceSafetyMetrics`]
-/// and the issue #517 report for the full contradiction.
+/// authentication decision. ADR-0051's `--metrics-tenant-labels` flag now
+/// exists, but it only applies to the admission usage family (ADR-0051
+/// section 6); this maintenance-safety family is untouched by it. Adding a
+/// raw tenant hash here would violate ADR-0044's safety precondition; see
+/// [`crate::maintain::MaintenanceSafetyMetrics`] and the issue #517 report
+/// for the full contradiction.
 fn render_maintain_safety_family(
     out: &mut String,
     mode: Mode,
@@ -996,6 +1038,174 @@ fn render_cache_family(out: &mut String, mode: Mode, snapshot: &CacheMetricsSnap
     );
 }
 
+/// The per-(tenant, signal) admission counters (ADR-0051 section 6), read
+/// from [`AdmissionController::usage_snapshot`] at scrape time and paired with
+/// the `--metrics-tenant-labels` decision, matching every other family's
+/// snapshot-plus-config shape ([`CatalogCountersSnapshot`]). `tenant_labels`
+/// off (the default) folds every tenant's row into `tenant_hash="other"` and
+/// sums, so the exposition's cardinality is bounded by the closed [`Signal`]
+/// and [`RejectReason`] enums alone, regardless of tenant count; on, each
+/// observed tenant keeps its own `tenant_hash`, one set of counters per
+/// (tenant, signal). The fold is the same bounded-cardinality mechanism
+/// [`TenantHashLabel`] provides everywhere else, and the flag is the opt-in
+/// ADR-0044 section 4 blocked per-tenant series on: turned on only where the
+/// operator attests the scrape network is trusted (ADR-0051 section 6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdmissionCountersSnapshot {
+    pub usage: Vec<TenantUsage>,
+    pub tenant_labels: bool,
+}
+
+/// The counters this family sums per rendered series. Split out so the fold
+/// (many tenants into `other`) and the per-tenant case share one accumulator;
+/// summing the active-series gauge across folded tenants is correct, it is the
+/// fleet-total active count for that signal.
+#[derive(Debug, Clone, Copy, Default)]
+struct AdmissionAcc {
+    active: u64,
+    requests_admitted: u64,
+    bytes_admitted: u64,
+    rejected_byte_rate: u64,
+    rejected_series_rate: u64,
+    rejected_series_cap: u64,
+}
+
+impl AdmissionAcc {
+    fn rejected(&self, reason: RejectReason) -> u64 {
+        match reason {
+            RejectReason::ByteRate => self.rejected_byte_rate,
+            RejectReason::SeriesRate => self.rejected_series_rate,
+            RejectReason::SeriesCap => self.rejected_series_cap,
+        }
+    }
+}
+
+/// `Some(hash)` renders that tenant's real hash; `None` renders `other`.
+fn tenant_label(hash: Option<TenantHash>) -> TenantHashLabel {
+    match hash {
+        Some(hash) => TenantHashLabel::Hash(hash),
+        None => TenantHashLabel::Other,
+    }
+}
+
+fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCountersSnapshot) {
+    // Fold to (tenant_hash key, signal). With tenant labels off every row keys
+    // to `None` (rendered `tenant_hash="other"`) and its counters sum, so N
+    // tenants collapse to one series per signal and the exposition's
+    // cardinality never grows with tenant count; with them on each observed
+    // tenant keeps its own hash, one series set per (tenant, signal).
+    let mut rows: std::collections::HashMap<(Option<TenantHash>, Signal), AdmissionAcc> =
+        std::collections::HashMap::new();
+    for row in &snapshot.usage {
+        let key = (
+            snapshot.tenant_labels.then_some(row.tenant_hash),
+            row.signal,
+        );
+        let acc = rows.entry(key).or_default();
+        acc.active = acc.active.saturating_add(row.active_series);
+        acc.requests_admitted = acc
+            .requests_admitted
+            .saturating_add(row.requests_admitted_total);
+        acc.bytes_admitted = acc.bytes_admitted.saturating_add(row.bytes_admitted_total);
+        acc.rejected_byte_rate = acc
+            .rejected_byte_rate
+            .saturating_add(row.requests_rejected_byte_rate_total);
+        acc.rejected_series_rate = acc
+            .rejected_series_rate
+            .saturating_add(row.requests_rejected_series_rate_total);
+        acc.rejected_series_cap = acc
+            .rejected_series_cap
+            .saturating_add(row.series_rejected_cap_total);
+    }
+
+    // A HashMap iterates in an unspecified order; Prometheus does not require
+    // sorted output, but a stable render keeps scrapes and test assertions
+    // diffable. Order by tenant label then signal name.
+    let mut ordered: Vec<((Option<TenantHash>, Signal), AdmissionAcc)> = rows.into_iter().collect();
+    ordered.sort_by(|(a_key, _), (b_key, _)| {
+        tenant_label(a_key.0)
+            .value()
+            .cmp(&tenant_label(b_key.0).value())
+            .then_with(|| signal_name(a_key.1).cmp(signal_name(b_key.1)))
+    });
+
+    // Every sample carries `mode` like every other family here (the module
+    // docs' invariant), in addition to the {tenant_hash, signal[, reason]}
+    // dimensions ADR-0051 section 6 names.
+    fn labels(mode: Mode, hash: Option<TenantHash>, signal: Signal) -> [Label; 3] {
+        [
+            Label::Mode(mode),
+            Label::TenantHash(tenant_label(hash)),
+            Label::Signal(signal),
+        ]
+    }
+
+    write_header(
+        out,
+        "ravel_admission_active_series",
+        "Active series (metrics) or streams (logs) tracked for the active-cap, by tenant and \
+         signal.",
+        "gauge",
+    );
+    for ((hash, signal), acc) in &ordered {
+        write_sample(
+            out,
+            "ravel_admission_active_series",
+            &labels(mode, *hash, *signal),
+            acc.active,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_admission_admitted_total",
+        "Requests admitted past the ingest byte-rate layer, by tenant and signal.",
+        "counter",
+    );
+    for ((hash, signal), acc) in &ordered {
+        write_sample(
+            out,
+            "ravel_admission_admitted_total",
+            &labels(mode, *hash, *signal),
+            acc.requests_admitted,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_admission_admitted_bytes_total",
+        "Wire body bytes admitted past the ingest byte-rate layer, by tenant and signal.",
+        "counter",
+    );
+    for ((hash, signal), acc) in &ordered {
+        write_sample(
+            out,
+            "ravel_admission_admitted_bytes_total",
+            &labels(mode, *hash, *signal),
+            acc.bytes_admitted,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_admission_rejected_total",
+        "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap).",
+        "counter",
+    );
+    for ((hash, signal), acc) in &ordered {
+        for reason in RejectReason::ALL {
+            let mut sample_labels = labels(mode, *hash, *signal).to_vec();
+            sample_labels.push(Label::RejectReason(reason));
+            write_sample(
+                out,
+                "ravel_admission_rejected_total",
+                &sample_labels,
+                acc.rejected(reason),
+            );
+        }
+    }
+}
+
 /// Render every source this module knows about into one Prometheus text
 /// exposition document. `ingest` is empty in a mode that builds no ingest
 /// router (`Mode::Query`, `Mode::Maintain`): those families are omitted
@@ -1003,7 +1213,14 @@ fn render_cache_family(out: &mut String, mode: Mode, snapshot: &CacheMetricsSnap
 /// structurally do not exist in that mode. `store` and `catalog` are always
 /// present: the store and the catalog are built in every mode. `maintain` is
 /// `None` in every mode but [`Mode::Maintain`], the only mode that runs
-/// [`crate::maintain::spawn`].
+/// [`crate::maintain::spawn`]. `admission` is always present: the controller
+/// is built in every mode (ADR-0051), and renders no per-tenant samples in a
+/// mode that serves no ingest.
+// One argument per metric source, each a distinct snapshot type: bundling
+// them into one struct would only move the same list behind a name without
+// removing a caller's need to build every field, so the sources stay
+// positional and this lint is allowed here rather than worked around.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     mode: Mode,
     store: &StoreMetricsSnapshot,
@@ -1012,6 +1229,7 @@ pub fn render(
     maintain: Option<&MaintenanceDiscoverySnapshot>,
     maintain_safety: Option<&MaintenanceSafetySnapshot>,
     cache: Option<&CacheMetricsSnapshot>,
+    admission: &AdmissionCountersSnapshot,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -1028,6 +1246,7 @@ pub fn render(
     if let Some(snapshot) = cache {
         render_cache_family(&mut out, mode, snapshot);
     }
+    render_admission_family(&mut out, mode, admission);
     out
 }
 
@@ -1052,6 +1271,16 @@ pub struct MetricsState {
     /// The ADR-0046 read cache's counters handle (issues #445, #502), or
     /// `None` when `--disable-cache` leaves no cache constructed at all.
     pub cache_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
+    /// The one process-wide admission controller (ADR-0051), shared with every
+    /// ingest path. Always present (built in every mode); in a mode that
+    /// serves no ingest its `usage_snapshot` is simply empty, so the admission
+    /// family renders its headers with no per-tenant samples.
+    pub admission: Arc<AdmissionController>,
+    /// `--metrics-tenant-labels` (ADR-0051 section 6, default off): off folds
+    /// every tenant's admission counters into `tenant_hash="other"`; on renders
+    /// each observed tenant's real hash. Off keeps the exposition's cardinality
+    /// bounded regardless of tenant count, which is why it is opt-in.
+    pub metrics_tenant_labels: bool,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -1116,6 +1345,14 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         .as_ref()
         .map(|metrics| metrics.snapshot());
 
+    // Read the admission counters at scrape time (a lock-and-copy, no
+    // `.await`), like every other family, rather than baking a snapshot in at
+    // construction.
+    let admission_snapshot = AdmissionCountersSnapshot {
+        usage: state.admission.usage_snapshot(),
+        tenant_labels: state.metrics_tenant_labels,
+    };
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -1124,6 +1361,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         maintain_snapshot.as_ref(),
         maintain_safety_snapshot.as_ref(),
         cache_snapshot.as_ref(),
+        &admission_snapshot,
     );
     (
         StatusCode::OK,
@@ -1185,6 +1423,7 @@ mod tests {
             None,
             None,
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(
@@ -1220,7 +1459,8 @@ mod tests {
         // This match has no wildcard arm, so a ninth `Label` variant fails
         // this compile until a case is added here, and the fixed array below
         // then fails the length assertion until it is extended too -- two
-        // independent breaks for one added variant, by design.
+        // independent breaks for one added variant, by design. `reason` is the
+        // eighth, added by ADR-0051 section 6 for the admission family.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -1229,6 +1469,7 @@ mod tests {
             Label::ErrorKind(StoreErrorClass::NotFound),
             Label::WorkloadClass(WorkloadClass::Interactive),
             Label::Level(Level::Info),
+            Label::RejectReason(RejectReason::ByteRate),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -1240,6 +1481,7 @@ mod tests {
                 Label::ErrorKind(_) => "error_kind",
                 Label::WorkloadClass(_) => "workload_class",
                 Label::Level(_) => "level",
+                Label::RejectReason(_) => "reason",
             })
             .collect();
         assert_eq!(
@@ -1252,10 +1494,12 @@ mod tests {
                 "error_kind",
                 "workload_class",
                 "level",
+                "reason",
             ],
-            "ADR-0044 section 4's exhaustive label allowlist; `shard` must never appear here"
+            "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason`; `shard` must \
+             never appear here"
         );
-        assert_eq!(one_of_each.len(), 7, "exactly 7 permitted label keys");
+        assert_eq!(one_of_each.len(), 8, "exactly 8 permitted label keys");
     }
 
     /// Every non-comment line is `name{labels} value`, every `# TYPE`
@@ -1287,7 +1531,16 @@ mod tests {
             compaction_input_set_conflicts: 2,
             isolation_breaches: 3,
         };
-        let body = render(Mode::Gateway, &store, &ingest, &catalog, None, None, None);
+        let body = render(
+            Mode::Gateway,
+            &store,
+            &ingest,
+            &catalog,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+        );
 
         let mut declared_types: HashSet<String> = HashSet::new();
         let mut bucket_state: std::collections::HashMap<String, (Vec<u64>, u64)> =
@@ -1433,6 +1686,7 @@ mod tests {
             None,
             None,
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(
@@ -1451,6 +1705,7 @@ mod tests {
             None,
             None,
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -1501,6 +1756,7 @@ mod tests {
             Some(&snapshot),
             None,
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(
@@ -1537,6 +1793,7 @@ mod tests {
             None,
             None,
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(
@@ -1581,6 +1838,7 @@ mod tests {
             None,
             Some(&snapshot),
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(
@@ -1644,6 +1902,7 @@ mod tests {
             None,
             Some(&snapshot),
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         for line in body.lines() {
@@ -1691,6 +1950,7 @@ mod tests {
             None,
             None,
             Some(&snapshot),
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(
@@ -1734,12 +1994,181 @@ mod tests {
             None,
             None,
             None,
+            &AdmissionCountersSnapshot::default(),
         );
 
         assert!(
             !body.contains("ravel_cache_"),
             "a server run with --disable-cache must not render any cache \
              family at all:\n{body}"
+        );
+    }
+
+    fn tenant_usage(tenant: &str, signal: Signal) -> TenantUsage {
+        TenantUsage {
+            tenant_hash: ravel_types::TenantId::new(tenant).hash(),
+            signal,
+            active_series: 0,
+            requests_admitted_total: 0,
+            bytes_admitted_total: 0,
+            series_admitted_total: 0,
+            requests_rejected_byte_rate_total: 0,
+            requests_rejected_series_rate_total: 0,
+            series_rejected_cap_total: 0,
+        }
+    }
+
+    /// Count the distinct `tenant_hash` label values across every
+    /// `ravel_admission_*` sample line.
+    fn admission_tenant_hashes(body: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for line in body.lines() {
+            if !line.starts_with("ravel_admission_") {
+                continue;
+            }
+            let brace = line.find('{').expect("admission sample carries labels");
+            let labels = &line[brace + 1..line.find('}').expect("closed label block")];
+            for pair in labels.split(',') {
+                if let Some(value) = pair.strip_prefix("tenant_hash=\"") {
+                    out.insert(value.trim_end_matches('"').to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Default (`--metrics-tenant-labels` off): every tenant's admission
+    /// counters fold into `tenant_hash="other"` and sum, so the exposition's
+    /// cardinality is bounded by the closed `Signal`/`RejectReason` enums,
+    /// never by tenant count (ADR-0051 section 6). This is the render-level
+    /// half of the `metrics_endpoint::admission_family_tenant_labels_bounded`
+    /// acceptance test.
+    #[test]
+    fn admission_family_folds_every_tenant_to_other_by_default() {
+        let usage: Vec<TenantUsage> = (0..50)
+            .map(|i| {
+                let mut row = tenant_usage(&format!("tenant-{i}"), Signal::Metrics);
+                row.active_series = 2;
+                row.requests_admitted_total = 3;
+                row.bytes_admitted_total = 100;
+                row.series_rejected_cap_total = 1;
+                row
+            })
+            .collect();
+        let snapshot = AdmissionCountersSnapshot {
+            usage,
+            tenant_labels: false,
+        };
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            &snapshot,
+        );
+
+        assert_eq!(
+            admission_tenant_hashes(&body),
+            HashSet::from(["other".to_string()]),
+            "50 tenants must collapse to exactly tenant_hash=\"other\":\n{body}"
+        );
+        // The fold sums, so the single "other" series carries every tenant's
+        // contribution: 50 * 3 admitted requests, 50 * 100 bytes, 50 * 2
+        // active, 50 * 1 cap rejections.
+        assert!(
+            body.contains(
+                "ravel_admission_admitted_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 signal=\"metrics\"} 150"
+            ),
+            "folded admitted counter must sum across tenants:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_admission_active_series{mode=\"gateway\",tenant_hash=\"other\",\
+                 signal=\"metrics\"} 100"
+            ),
+            "folded active gauge must sum across tenants:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_admission_rejected_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 signal=\"metrics\",reason=\"series_cap\"} 50"
+            ),
+            "folded cap-rejection counter must sum across tenants:\n{body}"
+        );
+    }
+
+    /// With `--metrics-tenant-labels` on, each observed tenant keeps its own
+    /// real `tenant_hash`, one set of counters per (tenant, signal), and the
+    /// three rejection reasons are distinguishable.
+    #[test]
+    fn admission_family_renders_real_hashes_and_all_reasons_when_enabled() {
+        let mut byte_rate = tenant_usage("byte-heavy", Signal::Metrics);
+        byte_rate.requests_rejected_byte_rate_total = 4;
+        let mut series_rate = tenant_usage("churny", Signal::Logs);
+        series_rate.requests_rejected_series_rate_total = 5;
+        let mut series_cap = tenant_usage("wide", Signal::Metrics);
+        series_cap.series_rejected_cap_total = 6;
+
+        let hashes: Vec<String> = [&byte_rate, &series_rate, &series_cap]
+            .iter()
+            .map(|row| row.tenant_hash.to_hex())
+            .collect();
+
+        let snapshot = AdmissionCountersSnapshot {
+            usage: vec![byte_rate, series_rate, series_cap],
+            tenant_labels: true,
+        };
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            &snapshot,
+        );
+
+        let rendered = admission_tenant_hashes(&body);
+        for hash in &hashes {
+            assert!(
+                rendered.contains(hash),
+                "tenant hash {hash} must appear with labels on:\n{body}"
+            );
+        }
+        assert!(
+            !rendered.contains("other"),
+            "no tenant folds to other with labels on:\n{body}"
+        );
+
+        // Each reason is a distinct series with its own counter value.
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{}\",\
+                 signal=\"metrics\",reason=\"byte_rate\"}} 4",
+                hashes[0]
+            )),
+            "byte_rate rejection must render distinctly:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{}\",\
+                 signal=\"logs\",reason=\"series_rate\"}} 5",
+                hashes[1]
+            )),
+            "series_rate rejection must render distinctly:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{}\",\
+                 signal=\"metrics\",reason=\"series_cap\"}} 6",
+                hashes[2]
+            )),
+            "series_cap rejection must render distinctly:\n{body}"
         );
     }
 }

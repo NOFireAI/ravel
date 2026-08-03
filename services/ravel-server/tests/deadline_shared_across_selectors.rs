@@ -102,6 +102,7 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
     };
     ravel_server::start(

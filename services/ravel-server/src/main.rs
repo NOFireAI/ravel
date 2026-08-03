@@ -212,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         oidc_refresh: resolver_bundle.oidc_refresh,
         otap,
         limits,
+        metrics_tenant_labels: cli.metrics_tenant_labels,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;

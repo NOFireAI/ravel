@@ -158,6 +158,12 @@ pub struct ServerConfig {
     /// constructs: `defaults` becomes the controller's baseline and each
     /// `tenants` entry overrides it per tenant via `set_tenant_limits`.
     pub limits: LimitsConfig,
+    /// `--metrics-tenant-labels` (ADR-0051 section 6, default off): render real
+    /// per-tenant `tenant_hash` labels on the `/metrics` admission family
+    /// instead of folding every tenant into `tenant_hash="other"`. Opt-in
+    /// because it unbounds `/metrics` cardinality by tenant count on an
+    /// unauthenticated route; on only where the scrape network is trusted.
+    pub metrics_tenant_labels: bool,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -438,6 +444,8 @@ pub async fn start(
         tenant_discovery: tenant_discovery_metrics.clone(),
         maintenance_safety: maintenance_safety_metrics.clone(),
         cache_metrics: cache.as_ref().map(|c| c.metrics()),
+        admission: admission.clone(),
+        metrics_tenant_labels: config.metrics_tenant_labels,
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 

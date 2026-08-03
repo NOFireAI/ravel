@@ -216,6 +216,17 @@ pub struct Cli {
     #[arg(long = "limits-file", value_name = "PATH")]
     pub limits_file: Option<PathBuf>,
 
+    /// Render real per-tenant `tenant_hash` labels on the `/metrics` admission
+    /// family (ADR-0051 section 6). Off by default, every tenant's admission
+    /// counters fold into `tenant_hash="other"`, so `/metrics` cardinality is
+    /// bounded by signal and reason, not by tenant count. Turn on only where
+    /// the scrape network is trusted: the `/metrics` route is unauthenticated,
+    /// and per-tenant labels let a scraper enumerate tenant hashes and their
+    /// traffic. Opt-in for exactly that reason (the auth decision ADR-0044
+    /// deferred), not a default.
+    #[arg(long = "metrics-tenant-labels")]
+    pub metrics_tenant_labels: bool,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given

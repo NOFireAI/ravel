@@ -34,6 +34,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--cache-max-bytes <n>` | | `268435456` (256 MiB) | Maximum resident bytes for the ADR-0046 read cache's RAM tier. Read once at startup; there is no live resize. Ignored when `--disable-cache` is set. See [guides/caching.md](caching.md). |
 | `--cache-dir <path>` | | none | Directory for the read cache's local-disk tier. Not wired to anything yet: the query fetchers only accept a RAM cache. Setting this flag fails startup rather than silently running with no disk tier. See [guides/caching.md](caching.md#known-gaps). |
 | `--disable-cache` | | off | Disables the ADR-0046 read cache entirely. Query behavior becomes byte-for-byte identical to a build with no read cache wiring at all. |
+| `--metrics-tenant-labels` | | off | Emits real per-tenant `tenant_hash` labels on the `ravel_admission_*` family at `/metrics` (ADR-0051 section 6) instead of folding every tenant into `tenant_hash="other"`. A deliberate cardinality trade; off by default so `/metrics` cardinality never scales with tenant count unless an operator opts in. See "Admission usage" above. |
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (through
 flag or env) fails at startup with an explicit error that names the missing
@@ -438,9 +439,22 @@ compile-time-closed allowlist; these reuse the existing `mode` and
 `signal` labels only. ADR-0048 names `tenant_hash` as a label on the
 orphan-breaker-trip counter, but ADR-0044 blocks any
 `tenant_hash`-labeled sample on the unauthenticated `/metrics` route
-until the opt-in `--metrics-tenant-labels` flag ADR-0051 describes
-exists; it does not exist in this codebase yet, so all four samples are
-process-wide totals, not broken out per tenant.
+unless the opt-in `--metrics-tenant-labels` flag is set (see below); by
+default all four samples stay process-wide totals, not broken out per
+tenant.
+
+### Admission usage (ADR-0051 section 6)
+
+`ravel_admission_admitted_total`, `ravel_admission_rejected_total`
+(labeled by `reason`: `byte_rate`, `series_rate`, or `series_cap`),
+`ravel_admission_active_series`, and `ravel_admission_active_streams`
+(all labeled by `signal`) export the admission controller's
+per-(tenant, signal) usage counters. By default every tenant folds
+into `tenant_hash="other"` and the families sum across tenants, so
+cardinality stays bounded regardless of tenant count. Pass
+`--metrics-tenant-labels` to emit real per-tenant `tenant_hash` values
+instead -- one series per (tenant, signal, reason) -- which is a
+cardinality trade an operator opts into deliberately, not a default.
 
 Default alert rules:
 

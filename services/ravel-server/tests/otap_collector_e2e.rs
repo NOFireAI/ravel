@@ -108,6 +108,7 @@ async fn start_test_server() -> ravel_server::Running {
         // ArrowMetricsService is not registered and the collector's stream
         // would be UNIMPLEMENTED.
         otap: true,
+        metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
     };
     ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
