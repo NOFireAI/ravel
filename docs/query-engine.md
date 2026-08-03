@@ -645,9 +645,11 @@ oversights.
    strict subset of the merged equality. To evaluate it as the reader's exact
    per-row filter drops every resource-only match.
 
-   ADR-0049 closes the gap in two layers. Layer 1 is the index: the POSTINGS
-   section prunes blocks exactly on an indexed per-record attribute value.
-   Layer 2 is a prune-only channel: `extract_logs` sends `attrs['k'] = 'v'` to
+   ADR-0049 closes the gap in two layers. Layer 1 is the index: a version 2
+   POSTINGS section prunes blocks exactly on an indexed attribute value in the
+   merged view (resource, scope, and per-record attributes, the record winning
+   on a key collision) -- the same view `attrs` exposes. Layer 2 is a
+   prune-only channel: `extract_logs` sends `attrs['k'] = 'v'` to
    `LogsPushdown::prune`, and `RlogReader::scan_pruned` applies that channel to
    POSTINGS block pruning alone. The channel never feeds the per-row filter. If
    the POSTINGS index does not cover a field, the channel prunes nothing, so it
@@ -655,21 +657,24 @@ oversights.
    the equality exactly over the merged `attrs` column. The prune changes which
    blocks the fetch reads. It does not change which rows the query returns.
 
-   One arm the channel declines: a key that also appears at resource or scope
-   level anywhere in the object. POSTINGS indexes the per-record layer only, so
-   one record carrying a key per-record makes it an indexed column for the whole
+   Version 1 (the description below applies to version 1 objects only) indexed
+   the per-record layer only. For those objects the channel declines one arm: a
+   key that also appears at resource or scope level anywhere in the object. One
+   record carrying a key per-record makes it an indexed column for the whole
    object, including for records whose value for that key lives in their
-   resource blob. Those records are in no posting list, so probing the term
-   would prune their block away. An exact index over one layer cannot prune a
-   query over the union of two, so the reader declines to prune that key and
-   the residual does the work alone. Declining is widen-only; pruning wrongly
-   is not.
+   resource blob. Those records are in no version-1 posting list, so probing
+   the term would prune their block away. An exact index over one layer cannot
+   prune a query over the union of two, so the reader declines to prune that
+   key on a version 1 object and the residual does the work alone. Declining is
+   widen-only; pruning wrongly is not.
 
-   That exclusion costs the common case. `service.name` is a resource attribute
-   in ordinary OTLP, so an object holding it that way prunes nothing for it.
-   Making the prune reach those keys means indexing the merged view rather than
-   the per-record layer, which changes what POSTINGS stores and needs a version
-   bump and an ADR-0049 amendment.
+   That exclusion cost the common case on version 1. `service.name` is a
+   resource attribute in ordinary OTLP, so a version 1 object holding it that
+   way prunes nothing for it. Version 2 removes the cost by indexing the merged
+   view, so a merged-view prune on such a key is sound and applied directly; the
+   exclusion is kept for version 1 objects, which are not rewritten. The move to
+   the merged view is the ADR-0049 amendment (2026-08-03, issue #547), a change
+   to the POSTINGS grammar version only, not the trailer version.
 
    The reader channel and the SQL extractor land in issue #538. The log fetch
    plumbing that carries `LogsPushdown::prune` to `RlogReader::scan_pruned` (a

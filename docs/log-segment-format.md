@@ -481,7 +481,7 @@ RSEG's `SERIES_IDX`, collapsed into one section here since POSTINGS has
 no separate whole-object summary to keep apart from its per-field detail.
 
 ```
-version: u8            (this section's own grammar version, currently 1;
+version: u8            (this section's own grammar version, currently 2;
                          independent of the trailer version -- see "Version")
 field_count: u32 LE
 repeat field_count, ascending column_id:
@@ -548,14 +548,40 @@ how many fields this happened to. A capped field is queried exactly as an
 unindexed one: bloom pruning plus an exact scan, never a narrowed or
 missing result.
 
+The count is over merged values (version 2): a field's distinct terms are
+its distinct merged-view values across the object, so resource and scope
+values count too. Resource attributes are low cardinality by nature, so
+this moves the count little, and the cap already degrades loudly to the
+bloom.
+
 ### Version
+
+The POSTINGS `version` byte records what a posting list contains. The byte
+layout is the same for every version; a reader cannot tell the meanings
+apart from the bytes, which is why the version byte exists.
+
+- version 1: a posting list indexes the per-record attribute layer only. A
+  reader must not prune a merged-view query on a key that also appears at
+  resource or scope level anywhere in the object; it declines and falls
+  back to the exact scan.
+- version 2: a posting list indexes the merged attribute view of each
+  record. The merged view is the union of the record's resource, scope, and
+  per-record attributes, the record winning on a key collision (the view
+  `ravel_sql::rlog_attrs::merged_attrs` computes for the `attrs` column). A
+  reader prunes a merged-view query directly. This is the version the writer
+  emits (ADR-0049 amendment 2026-08-03, issue #547).
+
+A reader accepts both versions. Stored version-1 objects are not rewritten,
+so the conservative rule keeps them correct with no migration.
 
 Adding POSTINGS did not bump the trailer `version` (still 2): ADR-0029's
 versioning carve-out excepts a new section kind, since unknown kinds are
 already skipped by old readers and an absent kind is already legal --
-exactly POSTINGS's own fallback behavior. Only a change to an *existing*
-section's grammar, or to a mandatory/optional kind's legality, needs a
-version bump and an ADR.
+exactly POSTINGS's own fallback behavior. The POSTINGS `version` byte above
+is this section's own grammar version, separate from the trailer version;
+its 1 → 2 bump changed no bytes and needs no trailer bump. Only a change to
+an *existing* section's grammar shape, or to a mandatory/optional kind's
+legality, needs a trailer version bump and an ADR.
 
 ## Compaction (L0 → L1)
 
