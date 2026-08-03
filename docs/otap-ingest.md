@@ -93,7 +93,8 @@ spec's default). The normalizer (`ravel-otap::normalize`) decodes:
   chain: it is a valid encoding only on the `*Attrs`/`*DpExemplars` columns
   below, never here.
 - `parent_id` on the `*Attrs` tables (`RESOURCE_ATTRS`, `SCOPE_ATTRS`,
-  `NUMBER_DP_ATTRS`, `HISTOGRAM_DP_ATTRS`, `SUMMARY_DP_ATTRS`) and on
+  `NUMBER_DP_ATTRS`, `HISTOGRAM_DP_ATTRS`, `SUMMARY_DP_ATTRS`,
+  `HISTOGRAM_DP_EXEMPLAR_ATTRS`) and on
   `HISTOGRAM_DP_EXEMPLARS`: QUASI-DELTA (section 6.4.3), applied whenever
   declared or when the `encoding` metadata is absent, since QUASI-DELTA is
   the spec default for these columns; PLAIN or DELTA only when explicitly
@@ -108,6 +109,32 @@ Not decoded:
 
 - `EXP_HISTOGRAM_DATA_POINTS` is unaffected by any of the above: the
   normalizer already rejects that table outright as unsupported.
+
+## Exemplars
+
+`HISTOGRAM_DP_EXEMPLARS` rows are carried, not just counted (ADR-0047).
+Each row's own columns (`time_unix_nano`, `int_value`/`double_value`,
+`span_id`, `trace_id`) become a `ravel_types::Exemplar`, its attributes are
+joined from `HISTOGRAM_DP_EXEMPLAR_ATTRS` by the exemplar's `id`, and it
+attaches to the bucket series whose `le` bound is the smallest at or above
+its value, the same rule the OTLP path applies. Admission goes through the
+caller's `ravel_types::ExemplarCap` (one exemplar per series per window, a
+security control per ADR-0047 decision 2), so
+`normalize_decoded_with_exemplars` takes that cap by `&mut` from whoever
+owns the long-lived per-shard state; `normalize_decoded` keeps its old
+signature and wraps it with a batch-scoped cap.
+
+A row too malformed to carry (no value column set, which OTLP itself calls
+an invalid exemplar; or no timestamp, which leaves nothing to place it in a
+window) and a row the cap turns away both increment the pre-existing
+`HistogramExemplarsDropped` counter, so that counter now means "dropped by
+the cap or malformed" rather than "every exemplar, always". A `trace_id` or
+`span_id` cell that is null, absent, or in a column of the wrong fixed width
+reads back all-zero, the layout's convention for "absent"; it never rejects
+the exemplar carrying it.
+
+`NUMBER_DP_EXEMPLARS` (exemplars on gauge and sum points) is still not
+decoded at all, the same as before this change.
 
 ## Phasing
 
