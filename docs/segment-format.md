@@ -1,8 +1,8 @@
-# RSEG v5: Ravel Segment Format (metrics)
+# RSEG v6: Ravel Segment Format (metrics)
 
 Persistent contract. ADR-0027 leaves exactly one supported version until the
-first public release: v5. The reader accepts trailer `version = 5` only;
-versions 1 through 4 fail closed with the same typed `UnsupportedVersion`
+first public release: v6. The reader accepts trailer `version = 6` only;
+versions 1 through 5 fail closed with the same typed `UnsupportedVersion`
 error as any unknown future version. Any change to the layout bumps the
 version and retires the previous one in the same change (an ADR plus a
 version bump, never an in-place edit under the same number).
@@ -12,13 +12,16 @@ bounds-check everything, fuzz all decoders, return typed errors and never
 panic. No `unsafe`. All integers little-endian. "varint" means
 protobuf-style LEB128; signed values use zigzag.
 
-> History (all superseded/amended by ADR-0027, which retired v1-v4 as
-> readable/writable versions): the v1 baseline and its row-major catalog;
-> the v2 columnar catalog (ADR-0014); native histograms (ADR-0017); the
-> multi-run compaction layout (ADR-0018); and the sparse id index and
-> chunked catalog (ADR-0026). v5 is the union of those layouts, restated
-> here as one self-contained specification. Earlier versions live only in
-> those ADRs.
+> History (v1-v4 were retired as readable/writable versions by ADR-0027,
+> and v5 by ADR-0047): the v1 baseline and its row-major catalog; the v2
+> columnar catalog (ADR-0014); native histograms (ADR-0017); the multi-run
+> compaction layout (ADR-0018); and the sparse id index and chunked catalog
+> (ADR-0026). v5 was the union of those layouts. v6 is v5 plus the optional
+> EXEMPLARS section (ADR-0047) and changes nothing else: every v5 grammar
+> below is unchanged, and an object carrying no exemplars differs from its
+> v5 equivalent only in the trailer's version field. This document is the
+> self-contained specification of v6; earlier versions live only in those
+> ADRs.
 
 ![RSEG object byte layout](diagrams/rseg-layout.svg)
 
@@ -32,7 +35,7 @@ protobuf-style LEB128; signed values use zigzag.
 | trailer (16 bytes):                        |
 |   footer_len:   u32                        |
 |   footer_crc32c:u32                        |
-|   version:      u16   (= 5)                |
+|   version:      u16   (= 6)                |
 |   signal:       u8    (1 = metrics)        |
 |   reserved:     u8    (= 0)                |
 |   magic:        [u8;4] = "RSG1"            |
@@ -43,14 +46,14 @@ protobuf-style LEB128; signed values use zigzag.
 LE), version (u16 LE), signal, reserved, magic. Every trailer byte except
 the crc field itself is covered (ADR-0010 §4). `magic` identifies the format
 family, not a specific layout; the version field selects the layout and is
-covered by `footer_crc32c`, so a reader that meets any non-5 version fails
+covered by `footer_crc32c`, so a reader that meets any non-6 version fails
 closed with `UnsupportedVersion`, never a silent misdecode.
 
 ### Reader protocol
 
 1. Reject objects smaller than 16 bytes as Corrupted.
 2. Suffix-GET 64 KiB (or the whole object if smaller). Verify magic,
-   `version == 5`, signal, reserved.
+   `version == 6`, signal, reserved.
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`; otherwise
    Corrupted. If the suffix does not cover the footer, issue one more ranged
    GET.
@@ -84,6 +87,8 @@ Validation (all violations are Corrupted, never panics):
   (9) together. Carrying both bodies, or one half of the sparse pair without
   the other, is Corrupted. VAL_PAGES (4) and HIST_PAGES (7) are each
   conditional (below), with at least one present when `series_count > 0`.
+  EXEMPLARS (10) is optional and never mandatory: its absence is legal for
+  any object.
 - Every section `[offset, offset+len)` must lie within
   `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
 - `uncompressed_len` is capped by config (default 1 GiB per section,
@@ -116,6 +121,7 @@ foreign rather than plausibly parseable.
 | 7 | HIST_PAGES | histogram-value pages | none (pages self-compressed) |
 | 8 | SERIES_IDX | sparse id index (present at/above the threshold) | none |
 | 9 | SERIES_META_CHUNKS | chunked SERIES_META (replaces kind 6 at/above the threshold) | none (per-frame zstd) |
+| 10 | EXEMPLARS | per-sample exemplars (present only when a sample carried one) | none |
 
 Below the sparse-emission threshold a segment carries kind 6 and neither 8
 nor 9; at or above it, kinds 8 + 9 replace kind 6 (see "Sparse catalog").
@@ -123,12 +129,20 @@ VAL_PAGES is present iff at least one series is scalar-kind; HIST_PAGES iff
 at least one series is histogram-kind. A `sections` entry for a conditional
 kind whose count is zero is Corrupted.
 
+EXEMPLARS (kind 10) is optional and independent of every other condition:
+present iff at least one sample in the object carried an exemplar. An empty
+EXEMPLARS section is never legal to emit — absence, not a zero-count
+section, is how "no exemplars" is represented. Absence is always legal, so
+a reader must treat a missing EXEMPLARS section as "this object has no
+exemplars", never as an error.
+
 Writers emit sections physically in a fixed order (readers rely only on
 footer offsets; placement is self-describing): `1, 5, 6, 3, 4, 7` below the
-threshold, `1, 5, 9, 8, 3, <pad> 4, 7` at/above it. Bytes between sections
-are permitted and MUST be `0x00`; the writer uses them to 8-byte-align the
-VAL_PAGES section offset (see "VAL_RAW_F64 alignment"). Section crc32c covers
-the stored (compressed) bytes.
+threshold, `1, 5, 9, 8, 3, <pad> 4, 7` at/above it. EXEMPLARS, when
+present, is written last in either case. Bytes between sections are
+permitted and MUST be `0x00`; the writer uses them to 8-byte-align the
+VAL_PAGES section offset (see "VAL_RAW_F64 alignment"). Section crc32c
+covers the stored (compressed) bytes.
 
 ## LABEL_DICT (uncompressed form)
 
@@ -244,9 +258,10 @@ the sections themselves. The stride is `K = 512` for both the sparse-id index
 and the meta-chunk grouping: every Kth id is indexed, and every K series form
 one chunk.
 
-Below the threshold a v5 object carries the kind-6 catalog verbatim and its
-grammar is identical to the pre-v5 compaction layout byte for byte, so a
-small L0 object pays nothing for being v5 beyond the trailer version field.
+Below the threshold a v6 object carries the kind-6 catalog verbatim and its
+grammar is identical to the pre-sparse compaction layout byte for byte, so a
+small L0 object with no exemplars pays nothing for being v6 beyond the
+trailer version field.
 
 ### SERIES_IDX (kind 8, uncompressed body)
 
@@ -323,6 +338,83 @@ The chunked form re-lays the identical raw delta/gap/len columns plus per-frame
 bases, so the whole-catalog decode of a sparse object is bit-identical to the
 whole-catalog decode of the same batch below the threshold, and a sparse
 point-probe of any series is bit-identical to that series' slice of it.
+
+## EXEMPLARS (kind 10, uncompressed body)
+
+New in v6 (ADR-0047). Optional: present iff at least one sample in the
+object carried an exemplar. Absence is always legal and means the object
+has no exemplars.
+
+```
+count: u32                    (record count)
+count records, each:
+  series_index: uvarint       (index into sorted SERIES_IDS)
+  ts_delta:     zigzag varint (ts_ns - footer.min_event_ts_ns)
+  value:        8 bytes       (IEEE-754 f64, little-endian bit pattern)
+  trace_id:     16 bytes      (all-zero means absent)
+  span_id:      8 bytes       (all-zero means absent)
+  attr_count:   uvarint
+  attr_count pairs:
+    name_ord:   uvarint       (LABEL_DICT ordinal)
+    value_ord:  uvarint       (LABEL_DICT ordinal)
+```
+
+Records are sorted by `(series_index, ts_ns)`, strictly ascending, with no
+duplicate key. A per-series lookup is therefore a scan that stops early on
+the sort invariant rather than a search: the record width varies with
+`attr_count`, so records are not addressable by index and binary search is
+not possible.
+
+Two exemplars supplied for the same series at the same timestamp would
+violate the strict-ascending invariant, so the writer keeps the last of any
+such run in the caller's original order and drops the rest. This is only
+the writer's own guarantee that whatever it emits is decodable; admission
+capping is a separate, earlier concern (ADR-0047 decision 2).
+
+`value` is stored as the raw f64 bit pattern, not a decimal form, so a NaN
+payload and a negative zero survive a write-read round trip exactly. Every
+float comparison against an exemplar value must use bit patterns
+(`f64::to_bits`), never `==`.
+
+Attribute strings intern into the object's existing LABEL_DICT rather than
+a dictionary of their own. An exemplar attribute that repeats a series
+label name or value therefore costs nothing beyond its two ordinals.
+
+`trace_id` and `span_id` use the same all-zero convention the rest of the
+format uses for an absent fixed-width id. A producer that explicitly sends
+an all-zero trace id is indistinguishable from one that sends none, which
+matches W3C Trace Context: an all-zero trace id is reserved as invalid, so
+the two cases have the same meaning to any consumer.
+
+Readers reject, as Corrupted and never a panic: a `series_index` at or
+beyond `series_count` (`ExemplarSeriesIndexOutOfRange`); any record whose
+`(series_index, ts_ns)` does not strictly exceed its predecessor's
+(`ExemplarRecordsUnsorted`); a `ts_delta` whose sum with
+`footer.min_event_ts_ns` overflows (`TimestampOverflow`); a `name_ord` or
+`value_ord` outside the LABEL_DICT; a record whose fixed-width fields run
+past the section end (`Truncated`); and any byte left over after the last
+record (`TrailingBytes`).
+
+A `count` of 0 is not rejected by the decoder — it yields zero records and
+consumes the section exactly, so it is indistinguishable from a
+well-formed section that happens to be empty. The writer never emits one,
+which is why absence rather than a zero-count section is the representation
+of "no exemplars". A reader that meets one has met a foreign writer, not a
+corrupt object, and treating it as zero exemplars is the safe reading.
+
+**Compaction rule.** Exemplar records are copied verbatim, remapping only
+`series_index` into the output's own sorted SERIES_IDS. They are never
+merged, re-sorted, or deduplicated across inputs. An exemplar carries no
+dedup priority of its own — it inherits its sample's — so any rule that
+dropped one exemplar in favour of another would make an L1 object something
+other than the exact multiset of its inputs, which is precisely what
+ADR-0018's overlap harmlessness forbids.
+
+`decode_exemplars_from_decoded` exists to serve that remap, but the
+compactor does not yet call it: L0-to-L1 compaction currently carries no
+exemplars, so an L1 object has none regardless of its inputs. The rule
+above is normative for the change that adds it (issue #474), not a
+description of what compaction does today.
 
 ## Page format (TS, VAL, HIST)
 
@@ -422,6 +514,13 @@ Every byte a reader interprets is checksum-verified before use (ADR-0010 §4).
   first touch. Pages copied verbatim by the compactor keep their original
   per-page crc (a verbatim copy alters none of `series_id || enc || comp ||
   payload`).
+- EXEMPLARS carries no crc beyond its section crc32c, and that is sufficient
+  because every read of it decompresses and verifies the whole section
+  first: there is no ranged fetch into the section, so there is no partial
+  read for a whole-section crc to miss. The per-series probe scans the
+  already-verified bytes. If a future change adds a ranged probe into
+  EXEMPLARS, it needs its own per-range crc for the same reason SERIES_IDX
+  carries the meta-chunk-frame crcs.
 
 ## Sparse reader protocol
 
@@ -460,3 +559,12 @@ granularity, a run with `sample_count == 0` is dropped and a series left with
 no runs is dropped entirely. Duplicate series ids across the input batch are a
 writer error. An empty segment records `min_event_ts_ns = max_event_ts_ns =
 base_created_unix_ns = 0`.
+
+An exemplar naming a series that the output does not carry is a writer
+error (`ExemplarUnknownSeries`), not a silent drop. A series can leave the
+output through the rules above, so this is reachable, and it must fail
+loudly: an exemplar points at a measurement, and one that points at nothing
+is a defect in the caller.
+
+When every exemplar is dropped, or none was supplied, the writer omits the
+EXEMPLARS section rather than emitting a zero-count one.
