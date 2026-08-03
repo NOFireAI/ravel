@@ -130,9 +130,8 @@ async fn main() -> anyhow::Result<()> {
     // Admission limits (ADR-0051 section 3): --limits-file is parsed and
     // validated at startup regardless of mode, so an unparseable file, an
     // unknown key, or a nonsensical limit fails startup rather than silently
-    // keeping the shipped defaults. No `AdmissionController` reads `limits`
-    // yet - wiring one into an ingest path is a separate change - so this
-    // only logs what was resolved.
+    // keeping the shipped defaults. `ravel_server::start` builds one
+    // `AdmissionController` from this and threads it into every ingest path.
     let limits = cli
         .parse_limits_file()
         .context("failed to parse --limits-file")?;
@@ -209,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
         },
         oidc_refresh: resolver_bundle.oidc_refresh,
         otap,
+        limits,
     };
 
     let running = ravel_server::start(config, store, store_metrics).await?;

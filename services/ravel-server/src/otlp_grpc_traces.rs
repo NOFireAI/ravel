@@ -9,10 +9,12 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Trac
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
+use prost::Message;
+use ravel_types::Signal;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
-use crate::otlp_grpc::metadata_to_headers;
+use crate::otlp_grpc::{admission_rejection_status, metadata_to_headers};
 use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, now_ns, write_mode_from_headers};
 
 pub struct GrpcTraceService {
@@ -38,6 +40,18 @@ impl TraceService for GrpcTraceService {
             .resolve(&headers)
             .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
         let mode = write_mode_from_headers(&headers);
+
+        // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every
+        // signal including spans, even though spans get no layer-4 admission
+        // (ADR-0051 excludes spans from series/stream admission).
+        let request_bytes = request.get_ref().encoded_len() as u64;
+        if let Err(rejection) =
+            self.state
+                .admission
+                .check_byte_rate(&tenant, Signal::Spans, request_bytes, now_ns())
+        {
+            return Err(admission_rejection_status(rejection));
+        }
 
         let outcome = crate::traces_ingest::handle_export_traces(
             &self.state.traces_ingest,

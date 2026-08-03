@@ -19,19 +19,21 @@
 //! stream keeps going, while a corrupt IPC stream ([`DecodeError::Stream`])
 //! nacks the batch and ends the gRPC stream so the client re-establishes it.
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use ravel_ingest::{IngestPoint, WriteError, WriteMode};
+use prost::Message;
+use ravel_ingest::{IngestPoint, WriteMode};
 use ravel_otap::normalize::normalize_decoded;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
 use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamState};
-use ravel_types::{CommitToken, TenantId};
+use ravel_types::{CommitToken, SeriesId, Signal, TenantId};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::ingest::IngestState;
+use crate::ingest::{IngestRequestError, IngestState};
 use crate::otlp_grpc::metadata_to_headers;
 use crate::otlp_http::{GatewayState, now_ns, write_mode_from_headers};
 
@@ -119,13 +121,56 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
 /// `BatchStatus` to reply and whether the stream must be torn down after it.
 async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchStatus, bool) {
     // Captured before `decode` consumes the batch, so a decode error can still
-    // name the batch it rejects.
+    // name the batch it rejects, and so the byte-rate check below sees the
+    // wire size before anything is decoded out of it.
     let batch_id = batch.batch_id;
+    let batch_bytes = batch.encoded_len() as u64;
+
+    // Layer 2 (ADR-0051 section 1, layer 2): byte rate on the wire batch,
+    // charged before decode so over-rate bytes cost one buffered body and
+    // nothing else. The ADR pins this check ahead of decode for exactly that
+    // cost reason, so it cannot move to run on the decoded batch size.
+    //
+    // A pre-decode rejection means this batch's Schema/DictionaryBatch IPC
+    // messages never reach the stateful per-`DecoderKey` `StreamDecoder`
+    // (crates/ravel-otap/src/stream.rs): the decoder caches schema and
+    // dictionary state across batches, so every later batch on this stream
+    // would decode against state that silently skipped a batch, desyncing it.
+    // A byte-rate rejection therefore tears the gRPC stream down (returns
+    // `true`, matching the `DecodeError::Stream` arm below), forcing the
+    // client to re-establish a fresh stream with fresh decoder state rather
+    // than feeding more batches into a decoder that missed one.
+    if let Err(rejection) =
+        ctx.state
+            .admission
+            .check_byte_rate(&ctx.tenant, Signal::Metrics, batch_bytes, now_ns())
+    {
+        return (
+            nack(
+                batch_id,
+                StatusCode::ResourceExhausted,
+                rejection.reason.to_string(),
+            ),
+            true,
+        );
+    }
+
     match ctx.decoder.decode(batch) {
         Ok(decoded) => {
-            match write_batch(&ctx.state.ingest, &ctx.tenant, ctx.mode, &decoded).await {
-                Ok(tokens) => (ack(batch_id, &tokens), false),
-                Err(err) => {
+            match write_batch(&ctx.state.ingest, &ctx.tenant, ctx.mode, &decoded, now_ns()).await {
+                Ok(outcome) => (
+                    ack(batch_id, &outcome.tokens, outcome.dropped_points),
+                    false,
+                ),
+                Err(IngestRequestError::Admission(rejection)) => (
+                    nack(
+                        batch_id,
+                        StatusCode::ResourceExhausted,
+                        rejection.reason.to_string(),
+                    ),
+                    false,
+                ),
+                Err(IngestRequestError::Write(err)) => {
                     // Same retry classification the OTLP gRPC path applies: a
                     // retryable write is RESOURCE_EXHAUSTED/UNAVAILABLE-shaped
                     // backpressure, anything else is an internal fault.
@@ -153,19 +198,36 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
     }
 }
 
+/// The result of a successful [`write_batch`]: the commit tokens a strict
+/// write produces, and how many data points the active-series cap dropped
+/// from the batch before the write. `dropped_points` is what the ack must
+/// surface so an OTAP client sees a partial success rather than a clean ack
+/// (ADR-0051 layer 4: active-series-cap breaches are per-series partial
+/// success, "OK + partial success" in the rejection-status table).
+struct WriteOutcome {
+    tokens: Vec<CommitToken>,
+    dropped_points: usize,
+}
+
 /// Normalize a decoded batch and write its points through the shared ingest
-/// router, returning the commit tokens a strict write produces. Mirrors
-/// [`crate::ingest::handle_export`]'s point assembly (scalar and native-
-/// histogram points feed one write so a batch shares a single receipt); OTAP
-/// carries only scalar metric points, so `histogram_points` here is the
+/// router, returning the commit tokens a strict write produces and the count
+/// of points the active-series cap dropped. Mirrors
+/// [`crate::ingest::handle_export`]'s point assembly and layer-4 admission
+/// (scalar and native-histogram points feed one write so a batch shares a
+/// single receipt, and series-creation-rate/active-series-cap are enforced
+/// the same way); this is a genuinely separate code path from
+/// `handle_export` (it normalizes and builds points itself rather than
+/// calling it), so it carries its own copy of that wiring. OTAP carries only
+/// scalar metric points, so `histogram_points` here is the
 /// exploded-histogram output, not native histograms.
 async fn write_batch(
     ingest: &IngestState,
     tenant: &TenantId,
     mode: WriteMode,
     decoded: &DecodedBatch,
-) -> Result<Vec<CommitToken>, WriteError> {
-    let normalized = normalize_decoded(tenant, decoded, &ingest.limits, now_ns());
+    ingest_ts_ns: i64,
+) -> Result<WriteOutcome, IngestRequestError> {
+    let normalized = normalize_decoded(tenant, decoded, &ingest.limits, ingest_ts_ns);
     let mut points: Vec<IngestPoint> =
         Vec::with_capacity(normalized.points.len() + normalized.histogram_points.len());
     points.extend(normalized.points.into_iter().map(IngestPoint::from));
@@ -176,23 +238,63 @@ async fn write_batch(
             .map(IngestPoint::from),
     );
 
+    let candidate_series: Vec<SeriesId> = points.iter().map(|p| p.series_id).collect();
+    ingest
+        .admission
+        .check_series_creation_rate(tenant, &candidate_series, ingest_ts_ns)
+        .map_err(IngestRequestError::Admission)?;
+    let admission = ingest
+        .admission
+        .admit_series(tenant, candidate_series, ingest_ts_ns);
+    let points_before = points.len();
+    if !admission.rejected.is_empty() {
+        let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();
+        points.retain(|p| admitted.contains(&p.series_id));
+    }
+    // Points dropped by the active-series cap. Reported on the ack so the
+    // client sees the partial success rather than a clean OK (ADR-0051
+    // layer 4), never silently discarded.
+    let dropped_points = points_before - points.len();
+
     let receipt = ingest
         .router
         .write_values(tenant.clone(), points, mode, ingest.ack_deadline)
-        .await?;
-    Ok(receipt.tokens)
+        .await
+        .map_err(IngestRequestError::Write)?;
+    Ok(WriteOutcome {
+        tokens: receipt.tokens,
+        dropped_points,
+    })
 }
 
-/// An OK `BatchStatus` whose `status_message` carries the batch's commit
+/// An OK `BatchStatus` for a written batch.
+///
+/// With no dropped points, `status_message` carries the batch's commit
 /// tokens, comma-joined, the way the OTLP path returns them in the
-/// `x-ravel-commit-token` header. Empty when the write produced no token
-/// (a buffered write, or a batch that normalized to zero admitted points).
-fn ack(batch_id: i64, tokens: &[CommitToken]) -> BatchStatus {
-    let status_message = tokens
+/// `x-ravel-commit-token` header (empty when the write produced no token: a
+/// buffered write, or a batch that normalized to zero admitted points).
+///
+/// When the active-series cap dropped points, the status stays `Ok` (ADR-0051
+/// layer 4 is "OK + partial success", not a nack) but `status_message` leads
+/// with a `partial-success:` line reporting the dropped-point count before the
+/// `commit-tokens=` list, so a client sees the drop instead of reading a clean
+/// ack as if the whole batch landed. This is OTAP's analogue of OTLP's
+/// `ExportMetricsPartialSuccess.rejected_data_points`; `BatchStatus` has only
+/// the one `status_message` string to carry it.
+fn ack(batch_id: i64, tokens: &[CommitToken], dropped_points: usize) -> BatchStatus {
+    let tokens_joined = tokens
         .iter()
         .map(|token| token.encode())
         .collect::<Vec<_>>()
         .join(",");
+    let status_message = if dropped_points == 0 {
+        tokens_joined
+    } else {
+        format!(
+            "partial-success: {dropped_points} data points rejected (active-series cap); \
+             commit-tokens={tokens_joined}"
+        )
+    };
     BatchStatus {
         batch_id,
         status_code: StatusCode::Ok as i32,

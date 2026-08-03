@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
+use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
 use ravel_object_store::memory::MemoryStore;
 use ravel_remote_write::proto::prometheus::{
     Label as ProtoLabelV1, Sample as ProtoSampleV1, TimeSeries as ProtoTimeSeriesV1,
@@ -20,7 +21,7 @@ use ravel_remote_write::proto::write_v2::{
     BucketSpan, Histogram as ProtoHistogramV2, Request as ProtoRequestV2, Sample as ProtoSampleV2,
     TimeSeries as ProtoTimeSeriesV2,
 };
-use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_server::{FoldTaskConfig, LimitsConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
 const TOKEN: &str = "testtoken";
@@ -132,6 +133,79 @@ fn rw2_histogram_body(metric: &str, job: &str, ts_ms: i64) -> Vec<u8> {
     compress(&req.encode_to_vec())
 }
 
+/// An RW2 body carrying `metrics.len()` distinct series (distinct
+/// `__name__`, same job), one scalar sample each. Symbol table layout:
+/// `[0]=""`, `[1]="__name__"`, `[2]="job"`, `[3]=job value`, then one symbol
+/// per metric name starting at `[4]`.
+fn rw2_multi_series_body(metrics: &[&str], job: &str, value: f64, ts_ms: i64) -> Vec<u8> {
+    let mut symbols = vec![
+        String::new(),
+        "__name__".to_string(),
+        "job".to_string(),
+        job.to_string(),
+    ];
+    let timeseries = metrics
+        .iter()
+        .map(|metric| {
+            let name_ref = symbols.len() as u32;
+            symbols.push(metric.to_string());
+            ProtoTimeSeriesV2 {
+                labels_refs: vec![1, name_ref, 2, 3],
+                samples: vec![ProtoSampleV2 {
+                    value,
+                    timestamp: ts_ms,
+                    start_timestamp: 0,
+                }],
+                histograms: vec![],
+                exemplars: vec![],
+                metadata: None,
+            }
+        })
+        .collect();
+    let req = ProtoRequestV2 {
+        symbols,
+        timeseries,
+    };
+    compress(&req.encode_to_vec())
+}
+
+async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store = Arc::new(MemoryStore::new());
+    let mut tenants = HashMap::new();
+    tenants.insert(TenantId::new("acme"), tenant_limits);
+    let config = ServerConfig {
+        mode: Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        limits: LimitsConfig {
+            defaults: ravel_server::config::limits::shipped_defaults(),
+            tenants,
+        },
+    };
+    ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts")
+}
+
 async fn start_test_server() -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
@@ -153,6 +227,7 @@ async fn start_test_server() -> ravel_server::Running {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        limits: ravel_server::LimitsConfig::default(),
     };
     ravel_server::start(
         config,
@@ -468,6 +543,96 @@ async fn buffered_mode_header_is_refused_and_write_is_still_strict() {
     assert!(
         response.headers().get("x-ravel-commit-token").is_some(),
         "strict-mode commit token must be present even with the buffered-mode header set"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Layer 2 (ADR-0051 section 1): a tenant whose ingest byte-rate bucket
+/// starts (and stays) empty gets 429 with `Retry-After`, not the malformed-
+/// body 400 or the auth-failure 401 this file covers elsewhere.
+#[tokio::test]
+async fn byte_rate_exceeded_yields_429_with_retry_after() {
+    let running = start_test_server_with_limits(AdmissionLimits {
+        ingest_byte_rate: RateLimit::Bounded {
+            per_sec: 1,
+            burst: 1,
+        },
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = rw1_body("rate_limited_metric", "demo", 1.0, now_ms());
+    let response = client
+        .post(format!("{base}/api/v1/write"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header(
+            "content-type",
+            "application/x-protobuf;proto=prometheus.WriteRequest",
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("write request completes");
+
+    assert_eq!(
+        response.status(),
+        429,
+        "a byte-rate breach must reject the whole request"
+    );
+    assert!(
+        response.headers().get("retry-after").is_some(),
+        "429 must carry Retry-After"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Layer 4 (ADR-0051 section 1): an active-series-cap breach on Remote
+/// Write is pinned to 2xx with the true written count, never a 429 — 429 is
+/// reserved for the rate-limit rows only. One series is already active from
+/// a first write; the second distinct series in a follow-up request finds
+/// the cap full and is silently dropped from the written count, with no
+/// partial-success message (Remote Write has none).
+#[tokio::test]
+async fn series_cap_breach_is_still_2xx_with_reduced_written_count() {
+    let running = start_test_server_with_limits(AdmissionLimits {
+        max_active_series: CountLimit::Bounded(1),
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = rw2_multi_series_body(&["series_cap_a", "series_cap_b"], "demo", 1.0, now_ms());
+    let response = client
+        .post(format!("{base}/api/v1/write"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header(
+            "content-type",
+            "application/x-protobuf;proto=io.prometheus.write.v2.Request",
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("write request succeeds");
+
+    assert_eq!(
+        response.status(),
+        204,
+        "an active-series-cap breach must never be reported as a 4xx"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prometheus-remote-write-samples-written")
+            .expect("samples-written header present")
+            .to_str()
+            .expect("ascii"),
+        "1",
+        "only the series the cap admitted should be counted as written"
     );
 
     running.shutdown().await.expect("graceful shutdown");

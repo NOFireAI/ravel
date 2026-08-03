@@ -6,21 +6,29 @@
 //! durable, so the buffered-mode override honored by `otlp_http`/`otlp_grpc`
 //! is never read here.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
-use ravel_ingest::{IngestPoint, IngestRouter, WriteError, WriteMode};
+use ravel_ingest::{
+    AdmissionController, IngestPoint, IngestRouter, IngestValue, RequestRejection, WriteError,
+    WriteMode,
+};
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
 use ravel_remote_write::{Rw1DecodeError, Rw2DecodeError, RwNormalizeOutput, normalize_resolved};
-use ravel_types::TenantId;
+use ravel_types::{SeriesId, Signal, TenantId};
+
+/// Layer 1 (ADR-0051 section 2): the compressed-wire-body cap, ahead of
+/// [`MAX_DECOMPRESSED_PAYLOAD_BYTES`]'s existing post-Snappy cap.
+const MAX_COMPRESSED_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 const SAMPLES_WRITTEN_HEADER: &str = "x-prometheus-remote-write-samples-written";
 const HISTOGRAMS_WRITTEN_HEADER: &str = "x-prometheus-remote-write-histograms-written";
@@ -114,11 +122,19 @@ pub struct RemoteWriteState {
     pub limits: IngestLimits,
     pub ack_deadline: std::time::Duration,
     pub metrics: RemoteWriteMetrics,
+    /// Tenant admission (ADR-0051): byte-rate (layer 2) and
+    /// series-creation-rate/active-series-cap (layer 4). Remote Write's
+    /// partial-admission semantics are pinned: 429 is reserved for rate
+    /// limits (byte rate, series-creation rate), never for an active-series
+    /// cap breach, which instead reduces the written count in a 2xx (no
+    /// partial-success message on this surface).
+    pub admission: Arc<AdmissionController>,
 }
 
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
     Router::new()
         .route("/api/v1/write", post(remote_write))
+        .layer(DefaultBodyLimit::max(MAX_COMPRESSED_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -183,6 +199,25 @@ fn write_error_response(err: WriteError) -> Response {
     }
 }
 
+/// Layer 2/layer 4 rate-limit rejection (ADR-0051 section 1): 429 with
+/// `Retry-After` in whole seconds (rounded up, minimum 1). Never used for an
+/// active-series-cap breach, which is a per-series filter, not a whole-request
+/// rejection.
+fn admission_rejection_response(rejection: RequestRejection) -> Response {
+    let mut response =
+        (StatusCode::TOO_MANY_REQUESTS, rejection.reason.to_string()).into_response();
+    let retry_after_secs = retry_after_seconds(rejection.retry_after_ns);
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(RETRY_AFTER_HEADER, value);
+    }
+    response
+}
+
+fn retry_after_seconds(retry_after_ns: i64) -> u64 {
+    let ns = retry_after_ns.max(0) as u64;
+    ns.div_ceil(1_000_000_000).max(1)
+}
+
 async fn remote_write(
     State(state): State<Arc<RemoteWriteState>>,
     headers: HeaderMap,
@@ -195,6 +230,18 @@ async fn remote_write(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Layer 2 (ADR-0051 section 2): byte rate on the compressed wire body,
+    // before decode, whole-request rejection with no tokens consumed.
+    // Remote Write carries only metrics.
+    if let Err(rejection) =
+        state
+            .admission
+            .check_byte_rate(&tenant, Signal::Metrics, body.len() as u64, now_ns())
+    {
+        state.metrics.record_request_rejected();
+        return admission_rejection_response(rejection);
+    }
 
     let Some(version) = negotiate_version(&headers) else {
         state.metrics.record_request_rejected();
@@ -226,20 +273,9 @@ async fn remote_write(
     // Strict mode only: a Remote Write 2xx must mean durable, so the
     // buffered-mode header override is never consulted on this surface.
     let normalized = normalize_resolved(&tenant, resolved, &state.limits, now_ns());
-    let points_dropped = compute_points_dropped(&normalized);
+    let mut points_dropped = compute_points_dropped(&normalized);
     let metadata_dropped = normalized.metadata_dropped as u64;
     let created_timestamps_dropped = normalized.created_timestamps_dropped as u64;
-    // The RW2 stats headers count the two admitted point kinds separately
-    // (docs/ingest-breadth-plan.md section 2.1): a native histogram is one
-    // written histogram, not one written sample. Scalar samples and native
-    // histograms arrive in their own vectors from the normalizer, so each
-    // header reads its own count directly, and both kinds feed the same
-    // ingest write. Histograms became writable with RSEG v5
-    // (docs/rseg-v3-plan.md phase C8), so this is where the histograms-written
-    // header stops being a constant zero.
-    let samples_written = normalized.points.len() as u64;
-    let histograms_written = normalized.histograms_written as u64;
-    let points_accepted = samples_written + histograms_written;
 
     let mut ingest_points: Vec<IngestPoint> =
         Vec::with_capacity(normalized.points.len() + normalized.histogram_points.len());
@@ -250,6 +286,44 @@ async fn remote_write(
             .into_iter()
             .map(IngestPoint::from),
     );
+
+    // Layer 4 (ADR-0051 section 1), pinned semantics: series-creation-rate
+    // is the only whole-request rejection (429, no tokens consumed); the
+    // active-series cap that follows only ever reduces the written count in
+    // the eventual 2xx response, never producing a 4xx of its own.
+    let now = now_ns();
+    let candidate_series: Vec<SeriesId> = ingest_points.iter().map(|p| p.series_id).collect();
+    if let Err(rejection) =
+        state
+            .admission
+            .check_series_creation_rate(&tenant, &candidate_series, now)
+    {
+        state.metrics.record_request_rejected();
+        return admission_rejection_response(rejection);
+    }
+    let admission = state.admission.admit_series(&tenant, candidate_series, now);
+    if !admission.rejected.is_empty() {
+        let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();
+        ingest_points.retain(|p| admitted.contains(&p.series_id));
+        points_dropped += admission.rejected.len() as u64;
+    }
+
+    // The RW2 stats headers count the two admitted point kinds separately
+    // (docs/ingest-breadth-plan.md section 2.1): a native histogram is one
+    // written histogram, not one written sample. Computed from the
+    // admission-filtered points, so a series-cap rejection above is reflected
+    // in the written counts. Histograms became writable with RSEG v5
+    // (docs/rseg-v3-plan.md phase C8), so this is where the histograms-written
+    // header stops being a constant zero.
+    let samples_written = ingest_points
+        .iter()
+        .filter(|p| matches!(p.value, IngestValue::Scalar(_)))
+        .count() as u64;
+    let histograms_written = ingest_points
+        .iter()
+        .filter(|p| matches!(p.value, IngestValue::Histogram(_)))
+        .count() as u64;
+    let points_accepted = samples_written + histograms_written;
 
     let receipt = match state
         .router

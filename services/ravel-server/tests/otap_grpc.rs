@@ -19,11 +19,12 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
 use prost::Message;
+use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
 use ravel_object_store::memory::MemoryStore;
 use ravel_otap::encode::{DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder};
-use ravel_otap::proto::experimental::arrow::v1::StatusCode;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_client::ArrowMetricsServiceClient;
-use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
+use ravel_server::{FoldTaskConfig, LimitsConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
 const TOKEN: &str = "testtoken";
@@ -57,6 +58,46 @@ async fn start_test_server() -> ravel_server::Running {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: true,
+        limits: ravel_server::LimitsConfig::default(),
+    };
+    ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+    )
+    .await
+    .expect("server starts")
+}
+
+/// Like [`start_test_server`] but with `acme`'s admission limits overridden to
+/// `tenant_limits`; every other layer keeps this service's shipped defaults.
+async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store = Arc::new(MemoryStore::new());
+    let mut tenants = HashMap::new();
+    tenants.insert(TenantId::new("acme"), tenant_limits);
+    let config = ServerConfig {
+        mode: Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: true,
+        limits: LimitsConfig {
+            defaults: ravel_server::config::limits::shipped_defaults(),
+            tenants,
+        },
     };
     ravel_server::start(
         config,
@@ -113,6 +154,96 @@ fn otlp_gauge_request(metric_name: &str, ts_ns: i64) -> ExportMetricsServiceRequ
             ..Default::default()
         }],
     }
+}
+
+/// Encode a sequence of batches through one stateful [`MetricsStreamEncoder`],
+/// so batch N>0 references the schema/dictionaries batch 0 established -- i.e.
+/// the same IPC-stream statefulness the server-side decoder tracks. Each spec
+/// is the list of distinct gauge names (one point each) for that batch.
+fn otap_stream_batches(specs: &[&[&str]], ts_ns: i64) -> Vec<BatchArrowRecords> {
+    let mut encoder = MetricsStreamEncoder::new("otap-grpc-test").expect("new encoder");
+    specs
+        .iter()
+        .enumerate()
+        .map(|(i, names)| {
+            let metrics: Vec<MetricRow> = names
+                .iter()
+                .map(|name| MetricRow {
+                    name: (*name).to_string(),
+                    kind: MetricKind::Gauge,
+                    data_points: vec![DataPointRow {
+                        time_unix_nano: ts_ns,
+                        value: VALUE,
+                        flags: 0,
+                        attrs: vec![],
+                    }],
+                })
+                .collect();
+            encoder
+                .encode_batch(i as i64, &metrics)
+                .expect("encode batch")
+        })
+        .collect()
+}
+
+/// Encode a single-series gauge batch of `count` points onto `encoder` as
+/// batch `batch_id`. Timestamps and values are distinct per point so the batch
+/// does not compress away, letting the wire size scale with `count` -- used to
+/// build a batch that exceeds a byte-rate burst on size alone. One metric name
+/// keeps the name dictionary from overflowing its key type.
+fn encode_point_batch(
+    encoder: &mut MetricsStreamEncoder,
+    batch_id: i64,
+    name: &str,
+    count: usize,
+    ts_ns: i64,
+) -> BatchArrowRecords {
+    let data_points: Vec<DataPointRow> = (0..count)
+        .map(|i| DataPointRow {
+            time_unix_nano: ts_ns + i as i64,
+            value: VALUE + i as f64,
+            flags: 0,
+            attrs: vec![],
+        })
+        .collect();
+    encoder
+        .encode_batch(
+            batch_id,
+            &[MetricRow {
+                name: name.to_string(),
+                kind: MetricKind::Gauge,
+                data_points,
+            }],
+        )
+        .expect("encode batch")
+}
+
+/// Opens one `ArrowMetrics` stream, sends every batch in `batches`, and
+/// collects every `BatchStatus` the server replies with until the response
+/// stream ends. A shorter reply than `batches` means the server tore the
+/// stream down before consuming the rest.
+async fn open_stream_send(
+    grpc_addr: std::net::SocketAddr,
+    batches: Vec<BatchArrowRecords>,
+) -> Vec<BatchStatus> {
+    let mut client = ArrowMetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("connect to gRPC listener");
+    let mut request = tonic::Request::new(futures::stream::iter(batches));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("valid metadata"),
+    );
+    let mut inbound = client
+        .arrow_metrics(request)
+        .await
+        .expect("arrow_metrics stream opens")
+        .into_inner();
+    let mut statuses = Vec::new();
+    while let Some(status) = inbound.message().await.expect("read batch status") {
+        statuses.push(status);
+    }
+    statuses
 }
 
 /// Sends one OTAP batch over the bidirectional `ArrowMetrics` stream and
@@ -266,6 +397,138 @@ async fn otap_and_otlp_produce_identical_stored_series() {
         strip_name(otap_series["metric"].clone()),
         strip_name(otlp_series["metric"].clone()),
         "OTAP and OTLP series carry different labels"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Finding 1 (checkpoint review of #524): a byte-rate rejection mid-stream
+/// tears the gRPC stream down instead of keeping it alive. Keeping it alive
+/// would leave the stateful per-`DecoderKey` Arrow IPC decoder desynced,
+/// because the rejected (pre-decode) batch's Schema/DictionaryBatch messages
+/// never reached it. Proven two ways: the stream ends right after the
+/// rejection (a third queued batch never gets a status), and a fresh
+/// reconnect -- which gets a fresh `StreamState` -- ingests cleanly.
+#[tokio::test]
+async fn byte_rate_rejection_tears_down_stream_and_reconnect_is_clean() {
+    let ts = now_ns();
+
+    // One stateful encoder for the three in-stream batches: a small first
+    // batch, a big second batch, and a third that must never be processed.
+    // The big batch's wire size must exceed the burst so its rejection is a
+    // function of size alone (a request larger than the burst can never hold
+    // enough tokens, regardless of refill) -- no dependence on wall-clock
+    // refill timing. It rides the same encoder as the small first batch, so it
+    // carries no schema/dictionaries of its own; its point count alone must
+    // carry it past the burst.
+    let mut encoder = MetricsStreamEncoder::new("otap-grpc-test").expect("new encoder");
+    let small0 = encode_point_batch(&mut encoder, 0, "byte_rate_ok", 1, ts);
+    let big1 = encode_point_batch(&mut encoder, 1, "byte_rate_big", 20_000, ts);
+    let after2 = encode_point_batch(&mut encoder, 2, "byte_rate_after", 1, ts);
+    let small_len = small0.encoded_len() as u64;
+    let big_len = big1.encoded_len() as u64;
+    let batches = vec![small0, big1, after2];
+
+    // Burst admits two small batches (the first in-stream batch and, later, the
+    // reconnect batch) with headroom to spare, but is smaller than the big
+    // batch. per_sec is minimal so the outcome does not lean on refill.
+    let burst = small_len * 3;
+    assert!(
+        big_len > burst,
+        "big batch ({big_len}) must exceed the burst ({burst}) so its rejection is size-deterministic"
+    );
+
+    let running = start_test_server_with_limits(AdmissionLimits {
+        ingest_byte_rate: RateLimit::Bounded { per_sec: 1, burst },
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
+
+    let statuses = open_stream_send(grpc_addr, batches).await;
+    assert_eq!(
+        statuses.len(),
+        2,
+        "byte-rate rejection must tear the stream down: the third batch must never get a status, got {statuses:?}"
+    );
+    assert_eq!(
+        statuses[0].status_code,
+        StatusCode::Ok as i32,
+        "first (in-budget) batch acks OK: {}",
+        statuses[0].status_message
+    );
+    assert_eq!(
+        statuses[1].status_code,
+        StatusCode::ResourceExhausted as i32,
+        "over-rate batch is RESOURCE_EXHAUSTED, then ends the stream"
+    );
+
+    // Reconnect on a fresh stream: it gets a fresh `StreamState` decoder and
+    // ingests cleanly. The burst headroom (3x a small batch, only one consumed
+    // so far) covers this without waiting on refill.
+    let reconnect = open_stream_send(
+        grpc_addr,
+        otap_stream_batches(&[&["byte_rate_reconnect"]], ts),
+    )
+    .await;
+    assert_eq!(
+        reconnect.len(),
+        1,
+        "reconnect delivers one status: {reconnect:?}"
+    );
+    assert_eq!(
+        reconnect[0].status_code,
+        StatusCode::Ok as i32,
+        "a fresh reconnect must start clean: {}",
+        reconnect[0].status_message
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Finding 2 (checkpoint review of #524): when the active-series cap drops
+/// some of a batch's points, the ack stays OK (ADR-0051 layer 4 is "OK +
+/// partial success") but must signal the drop, not read as a clean ack. The
+/// `status_message` leads with a `partial-success:` line carrying the exact
+/// dropped-point count.
+#[tokio::test]
+async fn active_series_cap_partial_success_reports_drop_count() {
+    const CAP: usize = 2;
+    const FLOOD: usize = 5;
+
+    let running = start_test_server_with_limits(AdmissionLimits {
+        max_active_series: CountLimit::Bounded(CAP as u64),
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
+
+    let ts = now_ns();
+    let names: Vec<String> = (0..FLOOD).map(|i| format!("otap_cap_{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let batches = otap_stream_batches(&[&refs], ts);
+    let batch = batches.into_iter().next().expect("one batch");
+
+    let status = send_one_batch(grpc_addr, batch).await;
+
+    assert_eq!(
+        status.status_code,
+        StatusCode::Ok as i32,
+        "a cap breach is a partial success, still OK: {}",
+        status.status_message
+    );
+    let dropped = FLOOD - CAP;
+    assert!(
+        status.status_message.contains("partial-success"),
+        "ack must signal the drop rather than read as a fully-accepted batch: {:?}",
+        status.status_message
+    );
+    assert!(
+        status
+            .status_message
+            .contains(&format!("{dropped} data points rejected")),
+        "ack must report the dropped-point count ({dropped}): {:?}",
+        status.status_message
     );
 
     running.shutdown().await.expect("graceful shutdown");

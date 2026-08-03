@@ -229,6 +229,65 @@ folds metrics and logs only, so `catalog/s/HEAD` is never produced and there is
 no query path over span objects yet (ADR-0041 phases 3 and 5). Ingest
 durability does not depend on it.
 
+## Admission control (ADR-0051)
+
+`ravel-server` builds one `AdmissionController` (`crates/ravel-ingest/src/
+admission.rs`) at startup from `--limits-file` (validated at parse time
+regardless of mode; an unparseable file or unknown key fails startup) and
+threads the same `Arc` into every ingest path: OTLP HTTP and gRPC
+(metrics/logs/traces), OTAP, and Remote Write. `--limits-file` now has a
+runtime effect, not just a startup validation pass.
+
+Four layers, each enforced before the allocation it bounds, in this order:
+
+1. **Body size.** `DefaultBodyLimit` 16 MiB on `/v1/metrics`, `/v1/logs`,
+   `/v1/traces`, and `/api/v1/write`; `max_decoding_message_size` 16 MiB on
+   every tonic *ingest* service, OTAP's `ArrowMetricsServiceServer` included.
+   The Flight SQL query service (`services/ravel-server/src/flight.rs`) is
+   not an ingest path and is out of scope here; it still runs on tonic's
+   4 MiB default. Remote
+   Write additionally caps the *compressed* body at 16 MiB ahead of its
+   existing 64 MiB decompressed cap (`MAX_DECOMPRESSED_PAYLOAD_BYTES`).
+   OTAP's Arrow-stream decompression cap
+   (`StreamConfig::default().max_decompressed_payload_bytes == 16 MiB`) does
+   *not* bound the whole wire message: it is checked per
+   `ArrowPayload.record`, and a `BatchArrowRecords` message carries a vector
+   of payloads, so the decompressed bound it provides is 16 MiB times the
+   payload count, not a flat 16 MiB. The `max_decoding_message_size` cap on
+   the tonic service is therefore the explicit per-message bound for OTAP
+   too; tonic's own 4 MiB default is stricter than our 16 MiB cap today, but
+   the cap is set explicitly rather than left to that upstream default.
+2. **Byte rate.** `check_byte_rate`, on wire body bytes, after tenant
+   resolution and before decode. HTTP and gRPC each decode independently
+   before calling into the shared normalize/write path, so this check has
+   no single shared insertion point: it runs once per transport handler
+   (all three OTLP HTTP handlers, all three OTLP gRPC services, OTAP's
+   per-batch handler, and Remote Write), eight call sites in total. A gRPC
+   handler measures `request.get_ref().encoded_len()` since tonic has
+   already decoded the message by the time the handler runs.
+3. **Event-time skew.** Out of scope for this change; unchanged.
+4. **Series/stream admission**, metrics and logs only (spans excluded).
+   `check_series_creation_rate`/`check_stream_creation_rate` first (a
+   breach rejects the whole request); then `admit_series`/`admit_streams`,
+   which partially admits: rejected series/streams are dropped from the
+   write and folded into the signal's existing partial-success reporting
+   (`ExportMetricsPartialSuccess`/`ExportLogsPartialSuccess`).
+
+Rejection is per signal and per layer:
+
+| layer | HTTP | gRPC | Remote Write |
+|---|---|---|---|
+| body size | 413 | RESOURCE_EXHAUSTED | 413 |
+| byte rate | 429 + `Retry-After` | RESOURCE_EXHAUSTED | 429 + `Retry-After` |
+| series/stream creation rate | 429 + `Retry-After` | RESOURCE_EXHAUSTED | 429 + `Retry-After` |
+| active series/stream cap | 200 + partial success | OK + partial success | 200, no partial-success message, reduced `X-Prometheus-Remote-Write-Samples-Written` |
+
+Remote Write's partial-admission semantics are pinned and do not follow
+the other two signals' shape: it never emits a partial-success message,
+always answers 2xx with the true written count once body-size and rate
+checks pass, and reserves 429 for the rate-limit rows only, never for an
+active-series-cap breach.
+
 ## Modes
 
 `mode=strict` (default): ack after step 3 for every flush the request's

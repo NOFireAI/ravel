@@ -599,9 +599,9 @@ pub mod limits {
     /// The result of loading `--limits-file`: the resolved defaults (the
     /// shipped defaults when no file, or no `[defaults]` table, sets a given
     /// field) plus one resolved `AdmissionLimits` per configured tenant,
-    /// already overlaid on those defaults. A later wiring task feeds
-    /// `defaults` to `AdmissionController::new` and each `tenants` entry to
-    /// `AdmissionController::set_tenant_limits`; this crate does neither.
+    /// already overlaid on those defaults. `main.rs` feeds `defaults` to
+    /// `AdmissionController::new` and each `tenants` entry to
+    /// `AdmissionController::set_tenant_limits` at startup.
     #[derive(Debug, Clone)]
     pub struct LimitsConfig {
         pub defaults: AdmissionLimits,
