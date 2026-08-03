@@ -71,6 +71,11 @@
 //! bytes, and the decoded section bytes are recorded into `QueryAccounting`
 //! like any other fetch, and the whole request runs under the same wall
 //! deadline and `max_segments` budget as `/api/v1/query`.
+//!
+//! Those two bound the *input*. The result itself is bounded by
+//! [`DEFAULT_MAX_EXEMPLARS`], this endpoint's analogue of the engine's
+//! `max_series`/`max_samples`: a request that would materialize more is
+//! rejected with 422, never truncated to a partial 200.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -115,6 +120,31 @@ const SECTION_KIND_EXEMPLARS: u32 = 10;
 const NS_PER_SEC: f64 = 1_000_000_000.0;
 const NS_PER_MS: i64 = 1_000_000;
 
+/// Default cap on the exemplars one request may materialize, counted after
+/// cross-segment dedup, in the same spirit as the query engine's
+/// `max_series`/`max_samples` (`ravel_query::config`): a typed rejection, never
+/// a silent truncation (docs/query-engine.md "never silent partial results").
+///
+/// Without it this endpoint is bounded only by the deadline and
+/// `max_segments`: a broad selector can walk 1024 segments, each holding an
+/// `EXEMPLARS` section that may decode to
+/// `ReaderLimits::max_section_uncompressed_bytes` (1 GiB), and every kept
+/// record costs a cloned `LabelSet` on top of the record itself. That is an
+/// OOM of the whole process, which takes every co-tenant's in-flight request
+/// with it.
+///
+/// 100_000 is chosen from both ends. From above: a retained entry here is a
+/// `SeriesId`, a cloned `LabelSet`, and an `ExemplarRecord` with its
+/// attributes, on the order of a few hundred bytes, so the cap bounds peak
+/// accumulation at tens of megabytes -- roughly the envelope `max_samples`
+/// (10_000_000 samples at 16 bytes) allows the sample path, and four orders of
+/// magnitude below what one 1 GiB section alone could reach. From below: an
+/// exemplar is a sampled, illustrative signal by construction (ADR-0047
+/// decision 2) and the caller is a Grafana panel drawing one dot per exemplar,
+/// so a legitimate request lands in the hundreds or thousands; a request over
+/// this cap is a scrape-everything query, not a panel.
+const DEFAULT_MAX_EXEMPLARS: usize = 100_000;
+
 /// Shared state for the exemplars route. Holds its own `Catalog` and object
 /// store handles (the same instances the PromQL engine uses, so an exemplar
 /// query resolves byte-for-byte the snapshot a sample query would), plus the
@@ -132,6 +162,12 @@ pub struct ExemplarsState {
     /// `EngineConfig::max_segments`: the same snapshot-size ceiling
     /// `/api/v1/query` enforces after resolve.
     pub max_segments: usize,
+    /// Cap on the exemplars one request may materialize, enforced
+    /// incrementally so the accumulation never grows past it. Defaults to
+    /// [`DEFAULT_MAX_EXEMPLARS`]; `EngineConfig` has no exemplar knob to read
+    /// it from, so it is this endpoint's own budget rather than a mirrored
+    /// one.
+    pub max_exemplars: usize,
 }
 
 impl ExemplarsState {
@@ -154,6 +190,7 @@ impl ExemplarsState {
             clock,
             deadline: config.deadline,
             max_segments: config.max_segments,
+            max_exemplars: DEFAULT_MAX_EXEMPLARS,
         }
     }
 }
@@ -273,9 +310,14 @@ async fn collect_exemplars(
     // concurrency bound; here correctness and staying inside `ravel-server`'s
     // (non-`futures`) default dependency set win, and the wall deadline above
     // still bounds the total. Noted in the issue #475 report as a follow-up.
+    //
+    // Dedup runs here rather than after the walk so `max_exemplars` counts
+    // distinct exemplars (an overlap-window duplicate must not consume budget)
+    // and so neither `collected` nor `seen` can grow past the cap.
     let mut collected: Vec<(SeriesId, LabelSet, ExemplarRecord)> = Vec::new();
+    let mut seen: HashSet<(SeriesId, i64, [u8; 16])> = HashSet::new();
     for seg in &snapshot.segments {
-        let found = read_segment_exemplars(
+        read_segment_exemplars(
             state,
             tenant_hash,
             &seg.data_object_key,
@@ -283,18 +325,25 @@ async fn collect_exemplars(
             start_ns,
             end_ns,
             &accounting,
+            &mut seen,
+            &mut collected,
         )
-        .await
-        .map_err(ApiError::from_query)?;
-        collected.extend(found);
+        .await?;
     }
 
-    Ok(group_and_dedup(collected))
+    Ok(group_by_series(collected))
 }
 
-/// Reads one segment's exemplars for the matched series. Returns early with
-/// nothing when the object carries no `EXEMPLARS` section (the common case),
-/// after only the whole-object `GET` and footer parse.
+/// Reads one segment's exemplars for the matched series, appending the ones
+/// not already in `seen` to `collected`. Returns early with nothing when the
+/// object carries no `EXEMPLARS` section (the common case), after only the
+/// whole-object `GET` and footer parse.
+///
+/// Appending here rather than returning a per-segment vector is what keeps
+/// `state.max_exemplars` an actual memory bound: one object's decoded
+/// `EXEMPLARS` section can be far larger than the cap by itself, so the
+/// rejection has to fire mid-section, not after the segment is done.
+#[allow(clippy::too_many_arguments)]
 async fn read_segment_exemplars(
     state: &ExemplarsState,
     tenant_hash: TenantHash,
@@ -303,7 +352,9 @@ async fn read_segment_exemplars(
     start_ns: i64,
     end_ns: i64,
     accounting: &QueryAccounting,
-) -> Result<Vec<(SeriesId, LabelSet, ExemplarRecord)>, QueryError> {
+    seen: &mut HashSet<(SeriesId, i64, [u8; 16])>,
+    collected: &mut Vec<(SeriesId, LabelSet, ExemplarRecord)>,
+) -> Result<(), ApiError> {
     let _ = tenant_hash; // resolution already scoped the snapshot to the tenant.
     let limits = ReaderLimits::default();
 
@@ -329,7 +380,7 @@ async fn read_segment_exemplars(
         section_slice(&object, footer, SECTION_KIND_EXEMPLARS)
             .map_err(|e| corrupt(data_object_key, e))?
     else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     // LABEL_DICT is mandatory in a well-formed object; if it is somehow
     // absent, pass an empty slice and let `decode_exemplars_section` report
@@ -366,7 +417,6 @@ async fn read_segment_exemplars(
         .map_err(|source| corrupt(data_object_key, source))?;
     accounting.add_decompressed_bytes(exemplars_uncompressed);
 
-    let mut out = Vec::new();
     for rec in records {
         let idx = usize::try_from(rec.series_index).unwrap_or(usize::MAX);
         // A record's series_index is validated in range against the footer's
@@ -388,27 +438,35 @@ async fn read_segment_exemplars(
         if rec.ts_ns < start_ns || rec.ts_ns > end_ns {
             continue;
         }
-        out.push((entry.entry.series_id, entry.entry.labels.clone(), rec));
-    }
-    Ok(out)
-}
-
-/// Groups collected exemplars by series and deduplicates on `(series_id,
-/// ts_ns, trace_id)`, keeping the first occurrence (see the module doc, data
-/// fact 2). Output is deterministic: series ordered by id, exemplars within a
-/// series ordered by `(ts_ns, trace_id)`.
-fn group_and_dedup(
-    collected: Vec<(SeriesId, LabelSet, ExemplarRecord)>,
-) -> Vec<ExemplarSeriesJson> {
-    // Preserve first-seen order of series, but collapse duplicates.
-    let mut series_order: Vec<SeriesId> = Vec::new();
-    let mut by_series: HashMap<SeriesId, (LabelSet, Vec<ExemplarRecord>)> = HashMap::new();
-    let mut seen: HashSet<(SeriesId, i64, [u8; 16])> = HashSet::new();
-
-    for (series_id, labels, rec) in collected {
-        if !seen.insert((series_id, rec.ts_ns, rec.trace_id)) {
+        // Dedup on (series_id, ts_ns, trace_id), keeping the first occurrence
+        // (module doc, data fact 2). A duplicate costs no budget and no
+        // `LabelSet` clone.
+        if !seen.insert((entry.entry.series_id, rec.ts_ns, rec.trace_id)) {
             continue;
         }
+        // Reject before growing past the cap, the way the engine's
+        // `max_series` does: the accumulation never exceeds the budget it is
+        // being checked against.
+        if collected.len() >= state.max_exemplars {
+            return Err(too_many_exemplars(state.max_exemplars));
+        }
+        collected.push((entry.entry.series_id, entry.entry.labels.clone(), rec));
+    }
+    Ok(())
+}
+
+/// Groups collected exemplars by series. Deduplication on `(series_id, ts_ns,
+/// trace_id)` already happened during accumulation (see the module doc, data
+/// fact 2), where it also keeps the result cap counting distinct exemplars.
+/// Output is deterministic: series ordered by id, exemplars within a series
+/// ordered by `(ts_ns, trace_id)`.
+fn group_by_series(
+    collected: Vec<(SeriesId, LabelSet, ExemplarRecord)>,
+) -> Vec<ExemplarSeriesJson> {
+    let mut series_order: Vec<SeriesId> = Vec::new();
+    let mut by_series: HashMap<SeriesId, (LabelSet, Vec<ExemplarRecord>)> = HashMap::new();
+
+    for (series_id, labels, rec) in collected {
         let entry = by_series.entry(series_id).or_insert_with(|| {
             series_order.push(series_id);
             (labels, Vec::new())
@@ -545,18 +603,40 @@ fn section_slice<'a>(
 // Store/segment error mapping
 // ---------------------------------------------------------------------------
 
-fn fetch_store_error(key: &str, source: StoreError) -> QueryError {
-    QueryError::Fetch(ravel_query::FetchError::Store {
+fn fetch_store_error(key: &str, source: StoreError) -> ApiError {
+    ApiError::from_query(QueryError::Fetch(ravel_query::FetchError::Store {
         key: key.to_string(),
         source,
-    })
+    }))
 }
 
-fn corrupt(key: &str, source: ravel_segment::SegmentError) -> QueryError {
-    QueryError::Fetch(ravel_query::FetchError::Corrupt {
+fn corrupt(key: &str, source: ravel_segment::SegmentError) -> ApiError {
+    ApiError::from_query(QueryError::Fetch(ravel_query::FetchError::Corrupt {
         key: key.to_string(),
         source,
-    })
+    }))
+}
+
+/// The result-cap rejection: the shape `TooManySegments` and the engine's
+/// `TooManySeries`/`TooManySamples` use, an error rather than a truncated
+/// 200. `ravel-query`'s `QueryError` has no exemplar variant and adding one
+/// belongs to that crate, so the status contract (422, `errorType`
+/// `execution`) is sourced from the sibling `TooManySamples` budget class
+/// through the same shared mapping every other error here goes through, and
+/// only the message is exemplar-specific. `count` reads `max + 1` because the
+/// walk stops at the first exemplar over the line rather than counting the
+/// rest: the exact total is unknown, and materializing it is the thing the cap
+/// exists to prevent.
+fn too_many_exemplars(max: usize) -> ApiError {
+    let mut err = ApiError::from_query(QueryError::TooManySamples {
+        count: max.saturating_add(1),
+        max,
+    });
+    err.message = format!(
+        "query matched more than {max} exemplars, exceeding the limit of {max}; \
+         narrow the selector or the time range"
+    );
+    err
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,6 +1165,15 @@ mod tests {
         deadline: Duration,
         max_segments: usize,
     ) -> Router {
+        build_router_full(backend, deadline, max_segments, DEFAULT_MAX_EXEMPLARS)
+    }
+
+    fn build_router_full(
+        backend: Arc<dyn ObjectStoreBackend>,
+        deadline: Duration,
+        max_segments: usize,
+        max_exemplars: usize,
+    ) -> Router {
         let catalog =
             Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
         let mut tokens = HashMap::new();
@@ -1097,6 +1186,7 @@ mod tests {
             clock: Arc::new(FixedClock(NOW)),
             deadline,
             max_segments,
+            max_exemplars,
         };
         router(state)
     }
@@ -1521,6 +1611,116 @@ mod tests {
                 "{token} must never see the other tenant's trace id"
             );
         }
+    }
+
+    /// The result cap is a rejection, not a truncation: a query whose matched
+    /// exemplars exceed `max_exemplars` is a 422 carrying the same
+    /// `errorType` the other budget classes use, and no partial `data`.
+    #[tokio::test]
+    async fn max_exemplars_result_cap_is_enforced() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        // Three distinct exemplars (distinct trace ids, so dedup keeps all
+        // three) against a cap of two.
+        let exemplars = (0u8..3)
+            .map(|i| {
+                exemplar(
+                    sid,
+                    NOW - (30 + i64::from(i)) * NS_PER_SEC,
+                    1.0,
+                    [i + 1; 16],
+                    SPAN_ID,
+                    &[],
+                )
+            })
+            .collect();
+        publish_segment(&store, 1, vec![series], exemplars).await;
+
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let app = build_router_full(backend, Duration::from_secs(30), 1000, 2);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["errorType"], "execution");
+        assert!(
+            body["data"].is_null(),
+            "a capped query returns no partial data: {body}"
+        );
+    }
+
+    /// Exactly at the cap succeeds: the budget is a ceiling on what may be
+    /// materialized, not on what may be attempted (mirrors the engine's
+    /// `max_series_exactly_at_cap_succeeds`).
+    #[tokio::test]
+    async fn max_exemplars_exactly_at_cap_succeeds() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let exemplars = (0u8..2)
+            .map(|i| {
+                exemplar(
+                    sid,
+                    NOW - (30 + i64::from(i)) * NS_PER_SEC,
+                    1.0,
+                    [i + 1; 16],
+                    SPAN_ID,
+                    &[],
+                )
+            })
+            .collect();
+        publish_segment(&store, 1, vec![series], exemplars).await;
+
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let app = build_router_full(backend, Duration::from_secs(30), 1000, 2);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["data"][0]["exemplars"]
+                .as_array()
+                .expect("array")
+                .len(),
+            2
+        );
+    }
+
+    /// A duplicate must not consume result budget: the same exemplar read
+    /// twice out of the ADR-0018 overlap window is one exemplar, so a cap of
+    /// one still succeeds. Pins that dedup runs before the cap check.
+    #[tokio::test]
+    async fn overlap_duplicates_do_not_consume_the_result_cap() {
+        let store = Arc::new(MemoryStore::new());
+        let ts = NOW - 30 * NS_PER_SEC;
+        let (sid1, series1) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        publish_segment(
+            &store,
+            1,
+            vec![series1],
+            vec![exemplar(sid1, ts, 1.0, TRACE_ID, SPAN_ID, &[])],
+        )
+        .await;
+        let (sid2, series2) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        publish_segment(
+            &store,
+            2,
+            vec![series2],
+            vec![exemplar(sid2, ts, 1.0, TRACE_ID, SPAN_ID, &[])],
+        )
+        .await;
+
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let app = build_router_full(backend, Duration::from_secs(30), 1000, 1);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the overlap duplicate is one exemplar, not two: {body}"
+        );
+        assert_eq!(
+            body["data"][0]["exemplars"]
+                .as_array()
+                .expect("array")
+                .len(),
+            1
+        );
     }
 
     /// An unauthenticated request is a 401, not an empty 200. Without this,
