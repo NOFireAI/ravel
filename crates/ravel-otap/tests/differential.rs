@@ -21,6 +21,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::exemplar::Value as OtlpExemplarValue;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
     AggregationTemporality, DataPointFlags, Exemplar, Gauge, Histogram, HistogramDataPoint, Metric,
@@ -30,8 +31,9 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use proptest::prelude::*;
 
 use ravel_otap::encode::{
-    AttrRow, AttrValue, DataPointRow, HistogramMetricRow, HistogramPointRow, MetricKind, MetricRow,
-    MetricsStreamEncoder, SummaryMetricRow, SummaryPointRow,
+    AttrRow, AttrValue, DataPointRow, ExemplarRow, ExemplarValue, HistogramMetricRow,
+    HistogramPointRow, MetricKind, MetricRow, MetricsStreamEncoder, SummaryMetricRow,
+    SummaryPointRow,
 };
 use ravel_otap::normalize::{
     AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA,
@@ -639,6 +641,25 @@ struct WorkloadHistogramPoint {
     attrs: Vec<WorkloadAttr>,
 }
 
+/// The logical exemplars a workload point carries, as `(ts_ns, value,
+/// trace_id)` triples both paths build their wire form from. Timestamps are
+/// distinct per exemplar and values ascend from 0, so the admission cap and the
+/// bucket-attachment rule (an exemplar joins the bucket series whose `le` bound
+/// is the smallest at or above its value) are exercised with no ties to break:
+/// any disagreement in either rule shows up as a different
+/// `HistogramExemplarsDropped` count on one side.
+fn workload_exemplars(
+    point: &WorkloadHistogramPoint,
+) -> impl Iterator<Item = (i64, f64, [u8; 16])> + '_ {
+    (0..point.exemplar_count).map(move |i| {
+        (
+            INGEST_TS_NS + point.ts_offset_ns + i as i64,
+            i as f64,
+            [i as u8 + 1; 16],
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 struct WorkloadHistogramMetric {
     name: String,
@@ -810,7 +831,14 @@ fn build_otlp_histogram_request(
                     sum: p.sum,
                     bucket_counts: p.bucket_counts.clone(),
                     explicit_bounds: p.explicit_bounds.clone(),
-                    exemplars: (0..p.exemplar_count).map(|_| Exemplar::default()).collect(),
+                    exemplars: workload_exemplars(p)
+                        .map(|(ts_ns, value, trace_id)| Exemplar {
+                            time_unix_nano: ts_ns as u64,
+                            value: Some(OtlpExemplarValue::AsDouble(value)),
+                            trace_id: trace_id.to_vec(),
+                            ..Default::default()
+                        })
+                        .collect(),
                     flags: p.flags,
                     min: p.min,
                     max: p.max,
@@ -902,7 +930,15 @@ fn build_otap_histogram_batch(
                     flags: p.flags,
                     min: p.min,
                     max: p.max,
-                    exemplar_count: p.exemplar_count,
+                    exemplars: workload_exemplars(p)
+                        .map(|(ts_ns, value, trace_id)| ExemplarRow {
+                            time_unix_nano: ts_ns,
+                            value: ExemplarValue::Double(value),
+                            trace_id: Some(trace_id),
+                            span_id: None,
+                            attrs: vec![],
+                        })
+                        .collect(),
                     attrs: p.attrs.iter().map(otap_attr).collect(),
                 })
                 .collect();
