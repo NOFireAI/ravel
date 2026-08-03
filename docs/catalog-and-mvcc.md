@@ -290,17 +290,24 @@ Phase 1 listing on any index failure; min-token resolution and snapshot
 pinning are unchanged:
 
 1. Attempt snapshot read: GET HEAD (cached with a short TTL, default 30 s,
-   config `head_cache_ttl`). Decode, validate tenant/signal/shard_count
-   against the catalog's own config (a shard_count mismatch is a loud
-   error: ADR-0010 §9 makes changing it forbidden). Fetch parts not in the
-   decoded-part cache (immutable, keyed by part key, verified against
-   HEAD's blake3 before decode, bounded per tenant by
-   `snapshot_cache_parts`).
-2. On any failure in step 1 (HEAD absent, corrupt, part missing or
-   hash-mismatched): log, fall back to Phase 1 full listing for the whole
-   window. Queries never fail and never silently narrow because of index
-   state. A part GET NotFound races GC of a just-superseded part; re-read
-   HEAD once before falling back.
+   config `head_cache_ttl`). Decode, validate signal/shard_count against
+   the catalog's own config (a shard_count mismatch is a loud error:
+   ADR-0010 §9 makes changing it forbidden) and validate tenant_hash
+   against the requesting tenant (per ADR-0050 §2, a hard
+   `CatalogError::FieldMismatch`, never a fallback: an isolation breach,
+   not a performance event). Fetch parts not in the decoded-part cache
+   (immutable, keyed by part key, verified against HEAD's blake3 before
+   decode, bounded per tenant by `snapshot_cache_parts`); a postings
+   object's tenant_hash is checked the same hard-fail way before its
+   entries are trusted.
+2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
+   hash-mismatched, postings content-hash or entry-count mismatch): log,
+   fall back to Phase 1 full listing for the whole window. Queries never
+   fail and never silently narrow because of index state. A part GET
+   NotFound races GC of a just-superseded part; re-read HEAD once before
+   falling back. tenant_hash and shard_count mismatches are excluded from
+   this fallback: both fail the query instead (previous step, and ADR-0010
+   §9).
 3. With a snapshot at watermark W: for window buckets with `hour <= W`,
    take entries from the parts (hour-major sort makes this a contiguous
    range scan per part), filter by event-time overlap exactly as Phase 1
@@ -313,6 +320,19 @@ pinning are unchanged:
    records (ADR-0010 §7); dedup by data key across the snapshot/listing/
    token sources, sort by the dedup total order ("Cross-segment duplicate
    samples" below), return the pinned `Snapshot`.
+
+Every LIST call on the resolve path, in both phases, asserts that each
+returned key begins with the requesting tenant's prefix (per ADR-0050 §2,
+the same hard `CatalogError::FieldMismatch` as a tenant_hash mismatch): a
+backend or key-layout bug that hands back a foreign key is an isolation
+breach, never a silently dropped or served key. Both this and the HEAD/
+postings tenant_hash checks above increment
+`ravel_catalog_isolation_breach_total`, rendered at `/metrics` beside the
+existing `ravel_catalog_interlock_violations_total` and
+`ravel_catalog_compaction_input_set_conflicts_total` anomaly counters
+(default alert rule: docs/guides/operations.md). Unlike those two, which
+tally a harmless-overlap anomaly the query still resolves past, every
+increment of the isolation-breach counter corresponds to a failed query.
 
 Soundness rests entirely on the seal lemma above: for sealed buckets, the
 fold's LIST equals any later LIST, so serving them from the snapshot

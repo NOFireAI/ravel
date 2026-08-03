@@ -193,6 +193,25 @@ it on a schedule after you deploy or reconfigure seal margins. This is the
 cheapest way to catch the clock-skew failure mode before it is noticed at
 query time.
 
+### Catalog isolation-breach metric and alert
+
+`ravel_catalog_isolation_breach_total` (counter, labeled by `mode`, no
+`tenant_hash` label per ADR-0044) renders at the existing `GET /metrics`
+endpoint beside the `ravel_catalog_interlock_violations_total` and
+`ravel_catalog_compaction_input_set_conflicts_total` anomaly counters
+(docs/catalog-and-mvcc.md). It increments and fails the query, per ADR-0050
+section 2, on: a `tenant_hash` mismatch on a catalog HEAD or postings object,
+or a resolve-path listing result whose key does not begin with the
+requesting tenant's prefix. Unlike the two counters beside it, which tally a
+harmless-overlap anomaly the query still resolves past, every increment here
+is a query that failed with an explicit isolation-fault error.
+
+Default alert rule:
+
+| Condition | Query | Why |
+|---|---|---|
+| Isolation breach | `increase(ravel_catalog_isolation_breach_total[5m]) > 0` | Every increment already failed a query with a hard error; there is no sustained-condition or dilution case to wait out, unlike the mass-orphan breaker below. Any nonzero increase is a cross-tenant key-layout or hashing bug an operator needs to see immediately, not a rate to threshold. |
+
 ## Storage backend configuration
 
 **MinIO (local development):** see

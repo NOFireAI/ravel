@@ -2331,4 +2331,103 @@ mod tests {
             "invalidated cache: tombstoned bucket serves nothing on the token path"
         );
     }
+
+    /// Wraps a store, injecting one bogus foreign-tenant key into the final
+    /// page of the one `list()` call whose prefix matches `target_prefix`:
+    /// simulates a backend or key-layout bug a correctly behaving
+    /// `MemoryStore` can never itself produce, to exercise the ADR-0050 §2
+    /// LIST-prefix assertion in [`Catalog::guarded_list_all`]. Scoped to a
+    /// single target prefix, not every listing call, so the test's
+    /// `resolve` (which lists several (shard, hour) buckets to cover its
+    /// ingest-lag window) sees exactly one violation.
+    struct ForeignKeyInjectingStore<S> {
+        inner: S,
+        target_prefix: String,
+        foreign_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for ForeignKeyInjectingStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            let mut page = self.inner.list(prefix, page).await?;
+            if page.next.is_none() && prefix == self.target_prefix {
+                page.objects.push(ObjectMeta {
+                    key: self.foreign_key.clone(),
+                    size: 0,
+                    etag: ravel_object_store::Etag(String::new()),
+                    version: ravel_object_store::Version(String::new()),
+                    last_modified_unix_ms: 0,
+                });
+            }
+            Ok(page)
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_result_outside_tenant_prefix_is_hard_error() {
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        // The one (shard, hour) bucket `resolve`'s ingest-lag window is
+        // guaranteed to cover: matching on this exact prefix means the
+        // other buckets the window also lists stay untouched, so the test
+        // observes exactly one violation.
+        let target_prefix =
+            keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, 500_000).expect("prefix");
+        let store = Arc::new(ForeignKeyInjectingStore {
+            inner: MemoryStore::new(),
+            target_prefix,
+            foreign_key: "t/deadbeefdeadbeefdeadbeefdeadbeef/m/c/s0000/h00500000/foreign-key"
+                .to_string(),
+        });
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+
+        let err = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect_err("an out-of-prefix listing result must hard-fail");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "list_prefix"),
+            other => panic!("expected FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+    }
 }
