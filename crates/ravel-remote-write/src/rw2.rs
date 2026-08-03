@@ -140,6 +140,12 @@ fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest
     let mut created_timestamps_count = 0usize;
     let mut exemplars_dropped = 0usize;
     let mut resolved_label_bytes = 0usize;
+    // Exemplar labels charge a pool of their own, not the series pool. Series
+    // overflow rejects the request and exemplar overflow drops one exemplar, so
+    // a shared pool lets exemplar bytes decide whether an in-budget series
+    // survives, which loses a whole batch of samples over an illustrative
+    // signal.
+    let mut resolved_exemplar_label_bytes = 0usize;
     for (series_index, ts) in req.timeseries.into_iter().enumerate() {
         series.push(resolve_series(
             series_index,
@@ -149,6 +155,7 @@ fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest
             &mut created_timestamps_count,
             &mut exemplars_dropped,
             &mut resolved_label_bytes,
+            &mut resolved_exemplar_label_bytes,
             resolved_label_budget,
         )?);
     }
@@ -169,6 +176,7 @@ fn resolve_series(
     created_timestamps_count: &mut usize,
     exemplars_dropped: &mut usize,
     resolved_label_bytes: &mut usize,
+    resolved_exemplar_label_bytes: &mut usize,
     resolved_label_budget: usize,
 ) -> Result<ResolvedSeries, Rw2DecodeError> {
     let labels = resolve_label_refs(
@@ -191,7 +199,7 @@ fn resolve_series(
             exemplar_index,
             &exemplar.labels_refs,
             symbols,
-            resolved_label_bytes,
+            resolved_exemplar_label_bytes,
             resolved_label_budget,
         )? {
             Some(labels) => exemplars.push(ResolvedExemplar {
@@ -347,22 +355,26 @@ fn resolve_label_refs(
 
 /// Resolve one exemplar's `labels_refs` into labels, enforcing the same
 /// reference-shape rules as before ADR-0047 gave exemplars storage (even
-/// length, every index in range of `symbols`) and charging the resolved
-/// strings against the same cumulative budget series labels pay
-/// ([`Rw2DecodeError::ResolvedLabelBudgetExceeded`]): now that these strings
-/// are kept rather than discarded, an adversarial exemplar `labels_refs` list
-/// amplifies wire bytes into resident bytes exactly like a series one.
+/// length, every index in range of `symbols`). Now that these strings are kept
+/// rather than discarded, an adversarial exemplar `labels_refs` list amplifies
+/// wire bytes into resident bytes exactly like a series one, so exemplar labels
+/// carry a budget too.
 ///
-/// Returns `Ok(Some(labels))` when the exemplar fits the budget (and only then
-/// commits its bytes to the shared `resolved_label_bytes` counter), and
-/// `Ok(None)` when it does not: an over-budget exemplar is dropped and counted
-/// by the caller, never a reason to reject the series or the request. Unlike a
-/// series label set, whose overflow does reject the request via
-/// [`resolve_label_refs`], an exemplar is a decoration on the series data
-/// (ADR-0047 decision 1 carries its labels as filtered attributes), so losing
-/// the metric payload over it would trade the data for the decoration. A
-/// dropped exemplar charges nothing: its bytes are not resident, so a later
-/// series must not see the budget as if they were.
+/// The counter is a pool of the exemplars' own, sized by the same budget but
+/// separate from the series pool. The two pools cannot share, because they
+/// answer overflow differently: a series overflow rejects the whole request and
+/// an exemplar overflow drops one exemplar. On a shared pool, bytes charged by
+/// a kept exemplar decide whether a later, in-budget series survives, so one
+/// exemplar costs a whole batch of samples.
+///
+/// Returns `Ok(Some(labels))` when the exemplar fits the pool (and only then
+/// commits its bytes to `resolved_label_bytes`), and `Ok(None)` when it does
+/// not: an over-budget exemplar is dropped and counted by the caller, never a
+/// reason to reject the series or the request. An exemplar is a decoration on
+/// the series data (ADR-0047 decision 1 carries its labels as filtered
+/// attributes), so losing the metric payload over it would trade the data for
+/// the decoration. A dropped exemplar charges nothing: its bytes are not
+/// resident, so a later exemplar must not see the pool as if they were.
 ///
 /// `Err` is still returned for a genuinely malformed reference (odd length or
 /// an out-of-range symbol index): that is protocol corruption, not size, and
@@ -388,33 +400,41 @@ fn resolve_exemplar_label_refs(
             len: labels_refs.len(),
         });
     }
-    let mut labels = Vec::with_capacity(labels_refs.len() / 2);
-    // Charge against a local copy of the shared counter so a mid-way overflow
-    // leaves the shared counter untouched: a dropped exemplar must contribute
-    // no resident bytes.
+    let resolve = |position: usize, symbol_ref: u32| {
+        symbols
+            .get(symbol_ref as usize)
+            .ok_or(Rw2DecodeError::ExemplarLabelRefOutOfRange {
+                series_index,
+                exemplar_index,
+                position,
+                symbol_ref,
+                symbols_len: symbols.len(),
+            })
+    };
+
+    // Measure first, clone second. Resolving a `&String` and reading its length
+    // allocates nothing, so an exemplar that does not fit costs work
+    // proportional to its reference count, which the decompressed-body cap
+    // already bounds. Cloning as it went instead would let one request repeat a
+    // whole budget's worth of allocation for every dropped exemplar, and the
+    // wire cost of another dropped exemplar is a handful of varints.
     let mut tentative_bytes = *resolved_label_bytes;
     for (pair_index, pair) in labels_refs.chunks_exact(2).enumerate() {
         let name_position = pair_index * 2;
-        let resolve = |position: usize, symbol_ref: u32| {
-            symbols
-                .get(symbol_ref as usize)
-                .ok_or(Rw2DecodeError::ExemplarLabelRefOutOfRange {
-                    series_index,
-                    exemplar_index,
-                    position,
-                    symbol_ref,
-                    symbols_len: symbols.len(),
-                })
-        };
         let name = resolve(name_position, pair[0])?;
         let value = resolve(name_position + 1, pair[1])?;
         tentative_bytes = tentative_bytes.saturating_add(name.len() + value.len());
         if tentative_bytes > resolved_label_budget {
             return Ok(None);
         }
+    }
+
+    let mut labels = Vec::with_capacity(labels_refs.len() / 2);
+    for (pair_index, pair) in labels_refs.chunks_exact(2).enumerate() {
+        let name_position = pair_index * 2;
         labels.push(Label {
-            name: name.clone(),
-            value: value.clone(),
+            name: resolve(name_position, pair[0])?.clone(),
+            value: resolve(name_position + 1, pair[1])?.clone(),
         });
     }
     *resolved_label_bytes = tentative_bytes;
@@ -956,6 +976,115 @@ mod tests {
         // The over-budget exemplar is dropped, not carried, and counted.
         assert!(series.exemplars.is_empty());
         assert_eq!(resolved.exemplars_dropped, 1);
+    }
+
+    /// A kept exemplar's label bytes must not reject a later in-budget series.
+    /// Exemplar labels charge a pool of their own: on a shared pool the first
+    /// series' exemplar fills the budget, the second series overflows on its
+    /// own small label set, and `decode_request` returns
+    /// `ResolvedLabelBudgetExceeded`, losing every sample in the request over
+    /// one illustrative exemplar.
+    #[test]
+    fn a_kept_exemplar_does_not_reject_a_later_series() {
+        // Budget is 16 * 2_000 = 32_000 bytes. The exemplar resolves to
+        // 153 * ("trace_id" + 200 bytes) = 31_824, which fits and is kept. A
+        // shared pool would leave 176 bytes for every later series; series 1
+        // needs 208.
+        let big_value = "v".repeat(200);
+        let syms = symbols(&["__name__", "up", "trace_id", &big_value, "slow"]);
+        let mut exemplar_refs = Vec::with_capacity(306);
+        for _ in 0..153 {
+            exemplar_refs.push(3u32); // "trace_id"
+            exemplar_refs.push(4u32); // 200-byte value
+        }
+        let sample = |value: f64| ProtoSampleV2 {
+            value,
+            timestamp: 1_700_000_000_000,
+            start_timestamp: 0,
+        };
+        let req = request(
+            syms,
+            vec![
+                ProtoTimeSeriesV2 {
+                    labels_refs: vec![1, 2],
+                    samples: vec![sample(1.0)],
+                    histograms: vec![],
+                    exemplars: vec![ProtoExemplarV2 {
+                        labels_refs: exemplar_refs,
+                        value: 3.0,
+                        timestamp: 1_700_000_000_500,
+                    }],
+                    metadata: None,
+                },
+                ProtoTimeSeriesV2 {
+                    // "__name__" plus the 200-byte value: 208 bytes.
+                    labels_refs: vec![1, 4],
+                    samples: vec![sample(2.0)],
+                    histograms: vec![],
+                    exemplars: vec![],
+                    metadata: None,
+                },
+            ],
+        );
+        let body = compress(&req.encode_to_vec());
+
+        let resolved = decode_request(&body, 2_000).expect("request must decode, not reject");
+        assert_eq!(resolved.series.len(), 2, "both series must survive");
+        assert_eq!(resolved.series[1].samples.len(), 1);
+        assert_eq!(resolved.series[1].samples[0].value, 2.0);
+        // The exemplar fit, so it is kept and nothing is counted as dropped.
+        assert_eq!(resolved.series[0].exemplars.len(), 1);
+        assert_eq!(resolved.exemplars_dropped, 0);
+    }
+
+    /// Many over-budget exemplars in one request stay cheap. Each one is
+    /// measured against the budget before a single symbol is cloned, so the
+    /// work per dropped exemplar is proportional to its reference count, not to
+    /// the budget. Charging as it cloned instead let a few hundred wire bytes
+    /// buy a budget's worth of allocation, once per exemplar.
+    #[test]
+    fn many_dropped_exemplars_charge_nothing_and_keep_every_series() {
+        // One 8_000-byte symbol under a 16_000-byte decompressed cap, so the
+        // budget is 256_000. Each exemplar names that symbol 40 times for
+        // 40 * (8 + 8_000) = 320_320 resolved bytes, well past the budget, at a
+        // wire cost of about 80 bytes. That ratio is the shape the fix is
+        // about: a handful of wire bytes per exemplar, a budget's worth of
+        // cloning per exemplar if the code clones before it measures.
+        let big_value = "v".repeat(8_000);
+        let syms = symbols(&["__name__", "up", "trace_id", &big_value]);
+        let mut exemplar_refs = Vec::with_capacity(80);
+        for _ in 0..40 {
+            exemplar_refs.push(3u32);
+            exemplar_refs.push(4u32);
+        }
+        let exemplars: Vec<ProtoExemplarV2> = (0..64)
+            .map(|i| ProtoExemplarV2 {
+                labels_refs: exemplar_refs.clone(),
+                value: f64::from(i),
+                timestamp: 1_700_000_000_500,
+            })
+            .collect();
+        let req = request(
+            syms,
+            vec![ProtoTimeSeriesV2 {
+                labels_refs: vec![1, 2],
+                samples: vec![ProtoSampleV2 {
+                    value: 1.0,
+                    timestamp: 1_700_000_000_000,
+                    start_timestamp: 0,
+                }],
+                histograms: vec![],
+                exemplars,
+                metadata: None,
+            }],
+        );
+        let body = compress(&req.encode_to_vec());
+
+        let resolved = decode_request(&body, 16_000).expect("request must decode, not reject");
+        assert_eq!(resolved.series.len(), 1);
+        assert_eq!(resolved.series[0].samples.len(), 1);
+        assert!(resolved.series[0].exemplars.is_empty());
+        assert_eq!(resolved.exemplars_dropped, 64);
     }
 
     /// FINDING 2, other half: a series whose OWN labels blow the budget is
