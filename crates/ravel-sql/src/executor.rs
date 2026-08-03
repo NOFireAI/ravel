@@ -355,6 +355,7 @@ impl SqlExecutor {
             ))),
             TargetSignal::Logs => SessionTable::Logs(Arc::new(LogsTableProvider::new(
                 snapshot,
+                tenant_hash,
                 self.log_fetcher.clone(),
                 self.config,
                 accounting.clone(),

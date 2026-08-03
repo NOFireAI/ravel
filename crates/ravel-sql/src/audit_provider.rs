@@ -32,6 +32,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::audit_pushdown::{AuditPushdown, extract_audit};
@@ -44,6 +45,7 @@ use crate::error::SqlError;
 /// snapshot.
 pub struct AuditTableProvider {
     snapshot: Arc<Snapshot>,
+    tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
     config: SqlConfig,
     schema: SchemaRef,
@@ -58,12 +60,14 @@ impl AuditTableProvider {
     /// alone works), matching the `logs` provider's constructor shape.
     pub fn new(
         snapshot: Snapshot,
+        tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
         config: impl Into<SqlConfig>,
         accounting: QueryAccounting,
     ) -> Self {
         AuditTableProvider {
             snapshot: Arc::new(snapshot),
+            tenant_hash,
             fetcher,
             config: config.into(),
             schema: audit_schema(),
@@ -102,6 +106,7 @@ impl AuditTableProvider {
             .into());
         }
         let scan = AuditScanExec::new(
+            self.tenant_hash,
             self.fetcher.clone(),
             &segments,
             target_partitions,

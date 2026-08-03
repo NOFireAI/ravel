@@ -68,6 +68,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::{LogsTableProvider, has_word_udf};
+use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
@@ -912,6 +913,7 @@ async fn scan_rows(
     let fetcher = LogSegmentFetcher::new(store);
     let provider = LogsTableProvider::new(
         snapshot,
+        TenantHash([7u8; 16]),
         fetcher,
         EngineConfig::default(),
         QueryAccounting::new(),

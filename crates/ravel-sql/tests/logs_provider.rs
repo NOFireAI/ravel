@@ -44,6 +44,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::{LogsTableProvider, has_word_udf};
+use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
@@ -241,6 +242,7 @@ async fn scan_prunes_by_ts_and_word_returns_exact_rows() {
     let fetcher = LogSegmentFetcher::new(store);
     let provider = LogsTableProvider::new(
         snapshot,
+        TenantHash([7u8; 16]),
         fetcher,
         EngineConfig::default(),
         QueryAccounting::new(),
@@ -341,6 +343,7 @@ async fn stream_attr_equality_is_resolved_by_the_residual() {
     };
     let provider = LogsTableProvider::new(
         snapshot,
+        TenantHash([7u8; 16]),
         fetcher,
         EngineConfig::default(),
         QueryAccounting::new(),
@@ -526,6 +529,7 @@ async fn residual_recheck_keeps_resource_only_stream_attr_match() {
     };
     let provider = LogsTableProvider::new(
         snapshot,
+        TenantHash([7u8; 16]),
         fetcher,
         EngineConfig::default(),
         QueryAccounting::new(),
