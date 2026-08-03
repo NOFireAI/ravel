@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 ravel-types = { workspace = true }
 ravel-object-store = { workspace = true }
+ravel-cache = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }

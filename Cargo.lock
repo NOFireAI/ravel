@@ -4712,6 +4712,7 @@ dependencies = [
  "rand 0.10.2",
  "ravel-alerting",
  "ravel-analytics",
+ "ravel-cache",
  "ravel-catalog",
  "ravel-commit",
  "ravel-ingest",

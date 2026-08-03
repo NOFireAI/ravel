@@ -97,7 +97,10 @@ async fn main() -> anyhow::Result<()> {
     // `build_store` wraps the backend in (issue #272). Held for the whole
     // process lifetime and threaded into `start` below, which serves it at
     // `GET /metrics` (issue #423).
-    let (store, store_metrics) =
+    // Attached to the query fetchers in the next commit (ADR-0046); built
+    // here so `--cache-max-bytes`/`--disable-cache` are validated at the same
+    // startup point as every other flag.
+    let (store, store_metrics, _cache) =
         ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
     // Retention windows are validated at startup against the ADR-0019 floor,
