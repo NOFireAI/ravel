@@ -130,9 +130,10 @@ the same renderer (ADR-0048 decisions 4 and 6, issue #517):
 labeled by `signal`). These use only the existing `mode` and `signal`
 labels; ADR-0048 names `tenant_hash` on the orphan-breaker-trip counter,
 but ADR-0044's per-tenant label ban on this unauthenticated route holds
-until ADR-0051's `--metrics-tenant-labels` flag is actually implemented,
-which it is not yet. See docs/guides/operations.md for the default
-alert rules and the breaker runbook.
+for these families regardless: `--metrics-tenant-labels` (ADR-0051
+section 6) only affects the admission usage family, not the
+maintenance-safety family here. See docs/guides/operations.md for the
+default alert rules and the breaker runbook.
 
 Remote Write (ADR-0015) reuses this same gateway/router/shard pipeline: RW1
 and RW2 payloads decode and normalize to the same `NormalizedPoint` shape

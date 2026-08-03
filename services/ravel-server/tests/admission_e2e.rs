@@ -111,6 +111,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        metrics_tenant_labels: false,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,
