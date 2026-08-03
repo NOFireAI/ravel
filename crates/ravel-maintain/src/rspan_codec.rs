@@ -139,7 +139,7 @@ impl SegmentCodec for SpanCodec {
         config: &CompactorConfig,
         bucket: &Bucket,
         inputs: &[InputRecord],
-        catalogs: &[Self::Catalog],
+        catalogs: Vec<Self::Catalog>,
         input_set_hash: &[u8; 32],
     ) -> Result<Vec<BuiltPart>> {
         if inputs.len() != catalogs.len() {
@@ -157,7 +157,7 @@ impl SegmentCodec for SpanCodec {
         // raw bytes are resident at a time (module memory note).
         let cfg = RspanConfig::default();
         let mut by_trace: BTreeMap<[u8; 16], Vec<SpanRecord>> = BTreeMap::new();
-        for catalog in catalogs {
+        for catalog in &catalogs {
             let got = store.get(&catalog.object_key, GetRange::Full).await?;
             let reader = RspanReader::new(got.data.as_ref(), &cfg)?;
             // A full-range scan prunes nothing and returns every record.

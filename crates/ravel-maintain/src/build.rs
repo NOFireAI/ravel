@@ -83,12 +83,19 @@ pub struct BuiltPart {
 /// Merge all inputs into size-capped v5 parts (plan §3.3). `catalogs` MUST be
 /// aligned with `inputs` (both in canonical input order): the alignment is
 /// what makes run tie-breaking by canonical input position deterministic.
+///
+/// `catalogs` is taken by value, and this call is their last use, so the
+/// exemplar records are moved out of them (`std::mem::take` below) rather than
+/// cloned: the retained records exist in exactly one place at a time, which is
+/// what keeps them inside `read.rs`'s stated catalog-metadata memory bound
+/// (issue #557). Only the borrowed page-range metadata (`&SeriesPlan`,
+/// `object_key`) is read after the take.
 pub async fn build_parts(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
     bucket: &Bucket,
     inputs: &[InputRecord],
-    catalogs: &[InputCatalog],
+    mut catalogs: Vec<InputCatalog>,
     input_set_hash: &[u8; 32],
 ) -> Result<Vec<BuiltPart>> {
     if inputs.len() != catalogs.len() {
@@ -101,20 +108,23 @@ pub async fn build_parts(
 
     // Every input's exemplars, grouped by the series they name, in canonical
     // input order then each object's own stored order (ADR-0047 decision 3).
-    // Grouping is only how a part collects the exemplars of the series it
-    // carries: nothing here merges, deduplicates, re-caps, or re-sorts them,
-    // and two inputs each carrying an exemplar for the same (series, ts) both
-    // stay. `exemplar_total` is what the per-part assignment below must
-    // conserve.
+    // The records are MOVED out of the catalogs (`std::mem::take`), not cloned:
+    // `read.rs` argues the retained exemplars fit the catalog-metadata memory
+    // bound, and that holds for one copy, not the originals plus a full clone
+    // set live at once (issue #557). Grouping is only how a part collects the
+    // exemplars of the series it carries: nothing here merges, deduplicates,
+    // re-caps, or re-sorts them, and two inputs each carrying an exemplar for
+    // the same (series, ts) both stay. `exemplar_total` is what the per-part
+    // assignment below must conserve.
     let mut exemplars_by_series: BTreeMap<[u8; 16], Vec<ExemplarInput>> = BTreeMap::new();
     let mut exemplar_total = 0usize;
-    for catalog in catalogs {
-        for e in &catalog.exemplars {
+    for catalog in &mut catalogs {
+        for e in std::mem::take(&mut catalog.exemplars) {
             exemplar_total += 1;
             exemplars_by_series
                 .entry(e.series_id.0)
                 .or_default()
-                .push(e.clone());
+                .push(e);
         }
     }
 

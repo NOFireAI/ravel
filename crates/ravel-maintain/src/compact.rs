@@ -117,7 +117,7 @@ async fn run_pipeline<C: SegmentCodec>(
         catalogs.push(C::load_input_catalog(store, config, input).await?);
     }
 
-    let parts = C::build_parts(store, config, bucket, &inputs, &catalogs, &hash).await?;
+    let parts = C::build_parts(store, config, bucket, &inputs, catalogs, &hash).await?;
 
     let publish = publish_record(
         store, config, clock, bucket, &inputs, &hash, &parts, start_ns,
@@ -596,5 +596,81 @@ mod tests {
             sorted.sort();
             assert_eq!(keys, sorted, "records ascending by (series_index, ts_ns)");
         }
+    }
+
+    /// Issue #558: exemplars on the sparse-catalog decode path.
+    ///
+    /// `read.rs` routes an input with `series_count >= V5_SPARSE_THRESHOLD`
+    /// (4096) to the whole-object `decode_catalog_v5`, and every other test
+    /// here (and `ravel-ingest`'s `exemplar_flush.rs`) stays far below that, so
+    /// the chunked decoder is the only one exercised for exemplars. Exemplar
+    /// `series_index` resolution depends on the decoder returning entries in
+    /// SERIES_IDS order; if a future change to the sparse decoder broke that,
+    /// every exemplar here would resolve to the wrong series while the smaller
+    /// tests still passed. This drives two inputs that each cross the threshold
+    /// (4096 distinct series, one exemplar apiece) and asserts the L1 output's
+    /// exemplars are the exact multiset of the inputs', which pins the resolved
+    /// series ids on both the sparse input decode and the merge remap.
+    #[tokio::test]
+    async fn sparse_catalog_path_exemplars_resolve_to_same_series() {
+        // At the threshold exactly, so each input's own catalog decodes through
+        // the sparse (whole-object) path, not the chunked one.
+        const N: usize = ravel_segment::V5_SPARSE_THRESHOLD as usize;
+
+        let start = std::time::Instant::now();
+        let store = MemoryStore::new();
+
+        // Two inputs carrying disjoint series ranges, so the merged output's
+        // SERIES_IDS ordering differs from either input's local ordering and the
+        // per-part remap is non-trivial (not the identity).
+        let mut seeded = Vec::new();
+        for seq in 1..=2u64 {
+            let base = (seq as usize - 1) * N;
+            let mut batch = Vec::with_capacity(N);
+            let mut exemplars = Vec::with_capacity(N);
+            for i in 0..N {
+                let n = base + i;
+                let metric = format!("m{n:05}");
+                let ts = n as i64 + 1;
+                batch.push(series(&metric, &[(ts, n as f64)]));
+                exemplars.push(exemplar(&metric, ts, n as f64, (n % 251) as u8));
+            }
+            seeded.push(seed(&store, seq, batch, exemplars).await);
+        }
+
+        // Each seeded input really is on the sparse branch.
+        for obj in &seeded {
+            let loc = ravel_segment::open_from_full(obj, ReaderLimits::default()).expect("open");
+            assert!(
+                loc.footer.series_count >= ravel_segment::V5_SPARSE_THRESHOLD,
+                "input must cross the sparse threshold to exercise the sparse decode"
+            );
+        }
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_, parts) = read_output(&store).await;
+
+        let expected = canon_multiset(&seeded);
+        assert_eq!(
+            expected.len(),
+            2 * N,
+            "inputs carry one exemplar per series"
+        );
+        assert_eq!(
+            canon_multiset(&parts),
+            expected,
+            "L1 exemplars from a sparse-catalog input must resolve to the same \
+             series ids as the inputs'"
+        );
+
+        eprintln!(
+            "sparse_catalog_path_exemplars_resolve_to_same_series: {} series, {} exemplars, {:?}",
+            2 * N,
+            2 * N,
+            start.elapsed()
+        );
     }
 }
