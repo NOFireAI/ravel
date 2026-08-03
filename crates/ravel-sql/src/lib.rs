@@ -48,6 +48,7 @@ mod audit_scan;
 mod audit_schema;
 mod avg;
 mod config;
+mod cost;
 pub mod conformance;
 mod dedup;
 mod error;
