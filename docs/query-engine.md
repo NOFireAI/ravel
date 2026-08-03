@@ -676,11 +676,21 @@ oversights.
    the merged view is the ADR-0049 amendment (2026-08-03, issue #547), a change
    to the POSTINGS grammar version only, not the trailer version.
 
-   The reader channel and the SQL extractor land in issue #538. The log fetch
-   plumbing that carries `LogsPushdown::prune` to `RlogReader::scan_pruned` (a
-   `prune` field on `ravel_query::LogQuery` and the fetch that applies it) is a
-   follow-up in `ravel-query`, so no live query prunes through this channel
-   yet.
+   The reader channel and the SQL extractor landed in issue #538, the fetch
+   plumbing in issue #544: `ravel_query::LogQuery` carries a `prune` field (with
+   a `with_prune` builder) that the fetch hands to `RlogReader::scan_pruned`,
+   and `LogsScanExec` fills it from `LogsPushdown::prune`. A live
+   `SELECT ... FROM logs WHERE attrs['k'] = 'v'` now prunes blocks through
+   POSTINGS. A `LogQuery` with an empty `prune` reads exactly what it read
+   before the channel existed.
+
+   What an operator sees change is cost, not answers. `LogsScanExec` publishes
+   `blocks_total`, `blocks_scanned`, and `blocks_pruned_by_postings` per
+   partition, so `EXPLAIN ANALYZE` shows whether a query pruned; a selective
+   equality on an indexed key reads a fraction of the blocks it read before, and
+   returns the same rows. A key the object does not index reports
+   `blocks_pruned_by_postings=0` and reads everything, which is the widen-only
+   fallback, not a failure.
 
 ## Caching note
 
