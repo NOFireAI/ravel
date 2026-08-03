@@ -974,28 +974,48 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Human-readable name for a known RSPAN section kind
-/// (docs/span-segment-format.md).
-/// Readable names for an RSPAN v2 block `status_mask`. Bit 0 Unset, bit 1 Ok,
-/// bit 2 Error; an empty mask on a non-empty block would be a writer bug, so
-/// it is rendered as `none` rather than silently as an empty string.
+/// Readable flag names for an RSPAN v2 block `status_mask`
+/// (docs/span-segment-format.md "SKIP_IDX"). The bit values come from
+/// `ravel_rspan::skip_index`'s `STATUS_BIT_*` constants rather than being
+/// respelled here, so this rendering cannot drift from the stored flag
+/// definitions; the names mirror the `StatusCode` variants those bits
+/// summarize (Unset/Ok/Error). A set bit the table does not name is printed
+/// as `bit<n>` (its zero-based position), never dropped: an inspector that
+/// silently hid an unrecognized bit would make "not understood"
+/// indistinguishable from "not set", which is worse than showing a number.
+/// An all-zero mask on a non-empty block would be a writer bug, so it renders
+/// as `none` rather than an empty string.
 fn rspan_status_mask_names(mask: u8) -> String {
-    let mut names = Vec::new();
-    if mask & 0b001 != 0 {
-        names.push("unset");
-    }
-    if mask & 0b010 != 0 {
-        names.push("ok");
-    }
-    if mask & 0b100 != 0 {
-        names.push("error");
-    }
-    if names.is_empty() {
+    use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
+
+    if mask == 0 {
         return "none".to_string();
+    }
+    let mut names = Vec::new();
+    let mut named = 0u8;
+    for (bit, name) in [
+        (STATUS_BIT_UNSET, "unset"),
+        (STATUS_BIT_OK, "ok"),
+        (STATUS_BIT_ERROR, "error"),
+    ] {
+        if mask & bit != 0 {
+            names.push(name.to_string());
+            named |= bit;
+        }
+    }
+    // Whatever bits remain are ones the flag table does not name; surface each
+    // by position instead of dropping it.
+    let mut unknown = mask & !named;
+    while unknown != 0 {
+        let bit = unknown.trailing_zeros();
+        names.push(format!("bit{bit}"));
+        unknown &= unknown - 1;
     }
     names.join("|")
 }
 
+/// Human-readable name for a known RSPAN section kind
+/// (docs/span-segment-format.md).
 fn rspan_section_kind_name(kind: u32) -> &'static str {
     match kind {
         ravel_rspan::footer::kind::BLOCKS => "BLOCKS",
@@ -1155,4 +1175,43 @@ async fn catalog_list(
     }
     println!("{} segment(s)", snapshot.segments.len());
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::rspan_status_mask_names;
+    use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
+
+    #[test]
+    fn status_mask_names_known_bits() {
+        assert_eq!(rspan_status_mask_names(0), "none");
+        assert_eq!(rspan_status_mask_names(STATUS_BIT_UNSET), "unset");
+        assert_eq!(
+            rspan_status_mask_names(STATUS_BIT_UNSET | STATUS_BIT_OK),
+            "unset|ok"
+        );
+        assert_eq!(
+            rspan_status_mask_names(STATUS_BIT_OK | STATUS_BIT_ERROR),
+            "ok|error"
+        );
+    }
+
+    /// A bit the flag table does not name must still print, by position, so an
+    /// operator can tell "not understood" from "not set". The RSPAN reader
+    /// rejects a reserved bit before an object ever reaches the inspector
+    /// (docs/span-segment-format.md "SKIP_IDX"), so this defensive rendering is
+    /// exercised directly rather than through a crafted object.
+    #[test]
+    fn status_mask_names_unknown_bit_prints_position() {
+        // Bit 5 is reserved and unnamed; bit 5 alone must render as `bit5`.
+        let out = rspan_status_mask_names(0b0010_0000);
+        assert_eq!(out, "bit5");
+
+        // A known bit mixed with an unnamed one keeps the name and appends the
+        // unknown bit's position; neither is dropped.
+        let out = rspan_status_mask_names(STATUS_BIT_ERROR | 0b0000_1000);
+        assert_eq!(out, "error|bit3");
+        assert!(out.contains("bit3"), "unnamed bit position must appear");
+    }
 }
