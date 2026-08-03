@@ -15,9 +15,10 @@ use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
+    ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3,
+    SeriesValues,
 };
-use ravel_types::{CommitToken, LabelSet, Sample, SeriesId, Signal, TenantId};
+use ravel_types::{CommitToken, ExemplarCap, LabelSet, Sample, SeriesId, Signal, TenantId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -26,7 +27,7 @@ use crate::clock::Clock;
 use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
-use crate::value::{IngestPoint, IngestValue, ValueKind};
+use crate::value::{IngestExemplar, IngestPoint, IngestValue, ValueKind};
 
 pub(crate) type Ack = oneshot::Sender<Result<CommitToken, WriteError>>;
 
@@ -34,6 +35,11 @@ pub(crate) enum ShardMsg {
     Write {
         tenant: TenantId,
         points: Vec<IngestPoint>,
+        /// Exemplars for series routed to this shard (ADR-0047). Routed by the
+        /// same `shard_for(series_id)` their samples are, so an exemplar and
+        /// the sample it illustrates always land in the same actor's buffer
+        /// and therefore in the same flushed object.
+        exemplars: Vec<IngestExemplar>,
         ack: Option<Ack>,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
@@ -109,6 +115,12 @@ struct SeriesAccum {
 #[derive(Default)]
 struct TenantBuf {
     series: HashMap<SeriesId, SeriesAccum>,
+    /// Exemplars buffered alongside the samples they illustrate (ADR-0047
+    /// decision 1), in arrival order. Not keyed by series: the flush needs
+    /// them ordered newest-first across the whole buffer before offering them
+    /// to the flush-scoped cap, and the sample-side `HashMap` would lose the
+    /// arrival order that breaks ties.
+    exemplars: Vec<IngestExemplar>,
     est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
@@ -201,6 +213,27 @@ impl TenantBuf {
         self.est_bytes += bytes_added;
         Ok(bytes_added)
     }
+
+    /// Buffers `exemplars` and returns the estimated byte cost added. Called
+    /// after [`TenantBuf::merge`] accepted the same request's points, so a
+    /// batch rejected for a series-id collision leaves no exemplars behind
+    /// either.
+    ///
+    /// No admission decision happens here: the cap is flush-scoped
+    /// (`flush_tenant`), because a cap that outlived a flush would hold an
+    /// unbounded per-series map for the shard's lifetime. Buffering an
+    /// exemplar the flush will drop costs its record width once; keeping the
+    /// cap costs a map entry per series forever.
+    fn absorb_exemplars(&mut self, exemplars: Vec<IngestExemplar>) -> usize {
+        let mut bytes_added = 0usize;
+        self.exemplars.reserve(exemplars.len());
+        for e in exemplars {
+            bytes_added += e.est_bytes();
+            self.exemplars.push(e);
+        }
+        self.est_bytes += bytes_added;
+        bytes_added
+    }
 }
 
 pub(crate) struct ShardActor {
@@ -267,8 +300,8 @@ impl ShardActor {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(ShardMsg::Write { tenant, points, ack }) => {
-                            self.handle_write(tenant, points, ack).await;
+                        Some(ShardMsg::Write { tenant, points, exemplars, ack }) => {
+                            self.handle_write(tenant, points, exemplars, ack).await;
                         }
                         Some(ShardMsg::FlushNow { done }) => {
                             self.flush_all(FlushTrigger::Manual).await;
@@ -314,8 +347,14 @@ impl ShardActor {
         }
     }
 
-    async fn handle_write(&mut self, tenant: TenantId, points: Vec<IngestPoint>, ack: Option<Ack>) {
-        if points.is_empty() && ack.is_none() {
+    async fn handle_write(
+        &mut self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        ack: Option<Ack>,
+    ) {
+        if points.is_empty() && exemplars.is_empty() && ack.is_none() {
             return;
         }
         let arrival_ns = self.clock.now_ns();
@@ -327,7 +366,7 @@ impl ShardActor {
         // the whole batch fail-loud (ADR-0005) and leaves the buffer
         // untouched, so its ack must carry the error rather than ride the
         // next flush of the surviving series.
-        let bytes_added = match buf.merge(points, arrival_ns) {
+        let mut bytes_added = match buf.merge(points, arrival_ns) {
             Ok(bytes_added) => bytes_added,
             Err(err) => {
                 self.metrics.record_series_id_collision();
@@ -337,6 +376,7 @@ impl ShardActor {
                 return;
             }
         };
+        bytes_added += buf.absorb_exemplars(exemplars);
         if let Some(ack) = ack {
             buf.waiters.push(ack);
         }
@@ -418,12 +458,19 @@ impl ShardActor {
     async fn flush_tenant(&mut self, tenant: TenantId, buf: TenantBuf, trigger: FlushTrigger) {
         let TenantBuf {
             series,
+            exemplars,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
             ..
         } = buf;
         if series.is_empty() {
+            // Nothing to write. Exemplars without any buffered sample cannot
+            // be written at all (an exemplar points at a measurement), so they
+            // are dropped, and counted so the drop stays visible.
+            if !exemplars.is_empty() {
+                self.metrics.record_exemplars(0, exemplars.len() as u64);
+            }
             return;
         }
         self.metrics.record_flush(trigger);
@@ -457,6 +504,8 @@ impl ShardActor {
             max_ingest_ts_ns,
         };
 
+        let exemplar_inputs = self.admit_exemplars(exemplars, &series);
+
         // ADR-0027: every flush emits v5, scalar and histogram batches alike.
         // The raw-sample adapter frames each series into a single run, so the
         // writer choice is no longer version- or content-driven; the buffer's
@@ -472,7 +521,12 @@ impl ShardActor {
             })
             .collect();
         let segment_version = SEGMENT_FORMAT_VERSION;
-        let written = SegmentWriter::write_histograms(series_inputs, identity, ingest_bounds);
+        let written = SegmentWriter::write_histograms_with_exemplars(
+            series_inputs,
+            identity,
+            ingest_bounds,
+            exemplar_inputs,
+        );
         let written = match written {
             Ok(w) => w,
             Err(e) => {
@@ -555,6 +609,58 @@ impl ShardActor {
                 );
             }
         }
+    }
+
+    /// Turn one flush's buffered exemplars into the writer's batch, dropping
+    /// those the object cannot carry and counting every drop (ADR-0047
+    /// decision 2).
+    ///
+    /// Two filters, in this order:
+    ///
+    /// 1. An exemplar whose parent sample is not in this flush is dropped.
+    ///    The object carries no measurement for it, and the writer treats such
+    ///    an exemplar as an error rather than a silent drop
+    ///    (docs/segment-format.md "Writer edge rules"), so the flush site owes
+    ///    it this check. It runs *before* the cap so a parentless candidate
+    ///    never claims a window a writable one could have used.
+    /// 2. `ExemplarCap` keeps at most one exemplar per series per window. The
+    ///    cap is built here, per flush, and dropped with this call: its
+    ///    per-series map is unbounded, so a shard-lived cap would be a
+    ///    memory-growth vector.
+    ///
+    /// Candidates are offered to the cap newest-first, because
+    /// [`ExemplarCap::admit`] is first-wins and never retracts: "keep the
+    /// newest in a window" is the caller's ordering duty, exactly as
+    /// `ravel_otlp::normalize`'s own call site does it. The sort is stable, so
+    /// two candidates sharing a timestamp keep their arrival order and the
+    /// choice does not depend on a sort implementation detail.
+    fn admit_exemplars(
+        &self,
+        mut exemplars: Vec<IngestExemplar>,
+        series: &HashMap<SeriesId, SeriesAccum>,
+    ) -> Vec<ExemplarInput> {
+        if exemplars.is_empty() {
+            return Vec::new();
+        }
+        exemplars.sort_by_key(|e| std::cmp::Reverse(e.exemplar.ts_ns));
+
+        let mut cap = ExemplarCap::new(self.config.exemplar_cap_window_ns);
+        let mut admitted = Vec::with_capacity(exemplars.len());
+        let mut dropped = 0u64;
+        for candidate in exemplars {
+            if !series.contains_key(&candidate.series_id) {
+                dropped += 1;
+                continue;
+            }
+            if !cap.admit(candidate.series_id, candidate.exemplar.ts_ns) {
+                dropped += 1;
+                continue;
+            }
+            admitted.push(candidate.into_exemplar_input());
+        }
+        self.metrics
+            .record_exemplars(admitted.len() as u64, dropped);
+        admitted
     }
 
     fn ack_waiters(&self, waiters: Vec<Ack>, result: Result<CommitToken, WriteError>) {

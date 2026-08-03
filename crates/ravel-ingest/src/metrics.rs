@@ -86,6 +86,17 @@ pub struct IngestMetrics {
     /// Batches rejected because two points shared a `series_id` under
     /// distinct canonical label sets (ADR-0005 fail-loud collision check).
     series_id_collisions: AtomicU64,
+    /// Exemplars written into a flushed object's EXEMPLARS section
+    /// (ADR-0047). Attempt-time, like `flushes_by_*`: counted when the flush
+    /// is built, so a flush later abandoned counts here too.
+    exemplars_written_total: AtomicU64,
+    /// Exemplars discarded at flush rather than written: either their parent
+    /// sample was not in this flush (so the object carries no measurement for
+    /// them, and the writer would reject them) or they lost the flush-scoped
+    /// per-series window cap. Keeps the drop visible now that some exemplars
+    /// are kept (ADR-0047 decision 2), alongside the wire-side drop counters
+    /// the normalize paths already report.
+    exemplars_dropped_total: AtomicU64,
     /// Distinct shard actors observed dead by the router: its send half or a
     /// strict-mode ack found the shard channel closed, meaning the actor task
     /// ended (e.g. panicked) without the router shutting it down. Counted
@@ -111,6 +122,8 @@ pub struct IngestMetricsSnapshot {
     pub acks_err: u64,
     pub series_id_collisions: u64,
     pub shard_deaths: u64,
+    pub exemplars_written_total: u64,
+    pub exemplars_dropped_total: u64,
 }
 
 impl IngestMetrics {
@@ -157,6 +170,16 @@ impl IngestMetrics {
         self.series_id_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush's exemplar outcome: `written` reached the object's EXEMPLARS
+    /// section, `dropped` did not (no parent sample in the flush, or lost the
+    /// flush-scoped window cap).
+    pub(crate) fn record_exemplars(&self, written: u64, dropped: u64) {
+        self.exemplars_written_total
+            .fetch_add(written, Ordering::Relaxed);
+        self.exemplars_dropped_total
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_shard_death(&self) {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
@@ -175,6 +198,8 @@ impl IngestMetrics {
             acks_err: self.acks_err.load(Ordering::Relaxed),
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
+            exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -197,8 +222,11 @@ mod tests {
         metrics.record_acks(1, false);
         metrics.record_series_id_collision();
         metrics.record_shard_death();
+        metrics.record_exemplars(2, 5);
 
         let snap = metrics.snapshot();
+        assert_eq!(snap.exemplars_written_total, 2);
+        assert_eq!(snap.exemplars_dropped_total, 5);
         assert_eq!(snap.flushes_by_size, 1);
         assert_eq!(snap.flushes_by_age, 2);
         assert_eq!(snap.flushes_manual, 1);
