@@ -337,9 +337,18 @@ impl DiskCache {
     fn read_and_verify(&self, key: &CacheKey, path: &Path) -> Option<Bytes> {
         let mut file = match fs::File::open(path) {
             Ok(file) => file,
-            Err(_) => {
-                // Missing, permission-denied, or otherwise unopenable:
-                // forget any accounting for this key so a later insert of
+            Err(err) => {
+                // A clean "nothing at this path" miss (the common case: the
+                // key was never cached, or a prior `discard` already removed
+                // it) is not a disk error. Anything else opening a path this
+                // cache's own layout produced -- permission denied, a broken
+                // mount, too many open files -- is the disk tier being
+                // unhealthy, not the cache being cold, so it is counted
+                // separately (see `CacheMetrics::record_disk_error`).
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    self.metrics.record_disk_error();
+                }
+                // Forget any accounting for this key so a later insert of
                 // the identical key is not refused as "already resident"
                 // forever (the scenario ADR-0046 requires a query to
                 // survive -- the cache directory disappearing mid-flight).
@@ -350,12 +359,14 @@ impl DiskCache {
         let mut header_buf = [0u8; HEADER_LEN];
         if file.read_exact(&mut header_buf).is_err() {
             // Shorter than even a header: cannot be a complete entry.
+            self.metrics.record_disk_error();
             self.discard(key, path);
             return None;
         }
         let Some(header) = decode_header(&header_buf) else {
             // Bad magic/version: a previous release's format, or a file
             // this cache never wrote at all.
+            self.metrics.record_disk_error();
             self.discard(key, path);
             return None;
         };
@@ -367,12 +378,14 @@ impl DiskCache {
             // Parses, but names a different key: never something a correct
             // writer of this format would produce at this path, since the
             // path is derived from the same fields.
+            self.metrics.record_disk_error();
             self.discard(key, path);
             return None;
         }
         if header.len > self.limits.max_entry_bytes {
             // Admitted under looser limits before a config change, or hand
             // -placed by a test: never served past the current maximum.
+            self.metrics.record_disk_error();
             self.discard(key, path);
             return None;
         }
@@ -381,11 +394,13 @@ impl DiskCache {
             // Header is intact but the payload is short: truncated, either
             // by a crash this format's rename discipline should have
             // prevented, or by damage after the rename.
+            self.metrics.record_disk_error();
             drop(file);
             self.discard(key, path);
             return None;
         }
         if crc32c::crc32c(&payload) != header.crc32c {
+            self.metrics.record_disk_error();
             drop(file);
             self.discard(key, path);
             return None;
@@ -838,6 +853,56 @@ mod tests {
         assert_eq!(cache.total_bytes(), 0);
         assert_eq!(cache.metrics().snapshot().admissions_rejected_size, 1);
         assert_eq!(cache.metrics().snapshot().bytes_admitted, 0);
+    }
+
+    /// A key that was simply never cached is a clean miss: no entry ever
+    /// existed at its canonical path, so nothing is unhealthy about the
+    /// disk tier and `record_disk_error` must not fire.
+    #[test]
+    fn get_on_never_cached_key_is_a_clean_miss_not_a_disk_error() {
+        let tmp = TempDir::new().unwrap();
+        let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+
+        assert!(cache.get(&test_key(1)).is_none());
+        let snapshot = cache.metrics().snapshot();
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(
+            snapshot.disk_errors_degraded_to_misses, 0,
+            "a key that was never cached is not a disk error"
+        );
+    }
+
+    /// A payload that fails its crc32c check on read (bit rot, a partial
+    /// write outside this crate's own rename discipline) must degrade to a
+    /// miss, per this module's doc, but that degraded miss is distinct from
+    /// the plain "nothing at this path" case above: it is what
+    /// `disk_errors_degraded_to_misses` exists to surface to an operator.
+    #[test]
+    fn get_on_corrupted_payload_is_a_disk_error_not_a_clean_miss() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let cache = DiskCache::new(dir.clone(), generous_limits());
+
+        let key = test_key_with_len(1, 64);
+        let payload = vec![7u8; 64];
+        cache.insert(key, &payload);
+        assert!(cache.get(&key).is_some(), "precondition: entry is live");
+
+        let path = path_for(&dir, &key);
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            cache.get(&key).is_none(),
+            "a corrupted entry must degrade to a miss, never an error"
+        );
+        let snapshot = cache.metrics().snapshot();
+        assert_eq!(
+            snapshot.disk_errors_degraded_to_misses, 1,
+            "a corrupted payload is a disk error, not a clean miss"
+        );
     }
 
     /// Finding 6: a well-formed entry file living at a path other than

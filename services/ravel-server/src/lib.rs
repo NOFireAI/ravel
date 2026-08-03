@@ -431,6 +431,7 @@ pub async fn start(
         catalog: catalog.clone(),
         tenant_discovery: tenant_discovery_metrics.clone(),
         maintenance_safety: maintenance_safety_metrics.clone(),
+        cache_metrics: cache.as_ref().map(|c| c.metrics()),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 

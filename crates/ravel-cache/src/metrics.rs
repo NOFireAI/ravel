@@ -20,6 +20,7 @@ pub struct CacheMetrics {
     admissions_rejected_size: AtomicU64,
     evictions: AtomicU64,
     single_flight_collapses: AtomicU64,
+    disk_errors_degraded_to_misses: AtomicU64,
 }
 
 impl CacheMetrics {
@@ -49,6 +50,17 @@ impl CacheMetrics {
         self.single_flight_collapses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A disk-tier read found an entry at its canonical path but discarded it
+    /// (short read, bad header, key mismatch, oversize, truncated payload, or
+    /// a failed crc32c check) rather than a clean "nothing at this path"
+    /// miss. Distinct from [`Self::record_miss`], which every discarded read
+    /// still also records: this counter exists to separate "the cache never
+    /// had it" from "the disk tier is unhealthy," the latter being operable.
+    pub(crate) fn record_disk_error(&self) {
+        self.disk_errors_degraded_to_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Point-in-time copy of every counter. Not atomic across fields:
     /// concurrent calls may land between two loads, so a snapshot can show
     /// `hits` from a hair later than `misses`. It is a scrape, not a
@@ -62,6 +74,9 @@ impl CacheMetrics {
             admissions_rejected_size: self.admissions_rejected_size.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             single_flight_collapses: self.single_flight_collapses.load(Ordering::Relaxed),
+            disk_errors_degraded_to_misses: self
+                .disk_errors_degraded_to_misses
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -77,4 +92,5 @@ pub struct CacheMetricsSnapshot {
     pub admissions_rejected_size: u64,
     pub evictions: u64,
     pub single_flight_collapses: u64,
+    pub disk_errors_degraded_to_misses: u64,
 }
