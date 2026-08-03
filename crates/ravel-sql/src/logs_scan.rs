@@ -21,12 +21,23 @@
 //!
 //! # Correctness: the merged `attrs` column plus DataFusion's residual
 //!
-//! This scan pushes only two predicate kinds into [`LogSegmentFetcher::fetch`]:
-//! the ts range (a segment-level and reader-level prune, exact) and content
+//! This scan pushes three predicate kinds into [`LogSegmentFetcher::fetch`]:
+//! the ts range (a segment-level and reader-level prune, exact), content
 //! predicates (`has_word`, whose SQL semantics equal the reader's exact filter,
-//! [`crate::logs_pushdown`]). It does **not** push stream-attribute equalities,
-//! and it performs no per-record re-verification: it emits every record the
-//! fetcher returns. Attribute filtering is entirely DataFusion's job.
+//! [`crate::logs_pushdown`]), and the prune-only channel
+//! ([`crate::logs_pushdown::LogsPushdown::prune`], attribute equalities that
+//! drive POSTINGS block pruning and are never evaluated per row). It does
+//! **not** push stream-attribute equalities, and it performs no per-record
+//! re-verification: it emits every record the fetcher returns. Attribute
+//! filtering is entirely DataFusion's job.
+//!
+//! The prune channel changes only how much of an object the fetch decodes. An
+//! arm proves a block holds no record carrying the term, so dropping that block
+//! cannot drop a row the query needs, and an arm the object's POSTINGS index
+//! does not cover prunes nothing (ADR-0049 decision 5, ADR-0013's widen-only
+//! rule). What it costs is visible: the `blocks_total`,
+//! `blocks_scanned`, and `blocks_pruned_by_postings` DataFusion metrics below
+//! report it per partition, so `EXPLAIN ANALYZE` shows whether a query pruned.
 //!
 //! The reason is the ADR-0033 merge. `attrs` is the resource + scope + record
 //! attributes merged into one map with the record winning on a key collision, so
@@ -70,13 +81,16 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
 };
 use futures::Stream;
 use ravel_catalog::SegmentRef;
-use ravel_logseg::{LogRecord, Predicate};
+use ravel_logseg::{LogRecord, Predicate, ScanStats};
 use ravel_query::{LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -99,24 +113,74 @@ pub struct LogsScanExec {
     /// Inclusive ts bounds for the fetch's [`LogQuery`].
     ts_min: i64,
     ts_max: i64,
-    /// Content predicates (`has_word`) handed to `RlogReader::scan`, applied
-    /// exactly there.
+    /// Content predicates (`has_word`) handed to `RlogReader::scan_pruned` as
+    /// its exact per-row filter.
     content: Arc<Vec<Predicate>>,
+    /// Prune-only predicates (attribute equalities) handed to the fetch as
+    /// `LogQuery::prune`. They drive POSTINGS block pruning inside the reader
+    /// and are never evaluated per row, so they cannot change which records the
+    /// fetch returns for a block it reads, only which blocks it reads.
+    prune: Arc<Vec<Predicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
     /// per-partition fetch so log fetches are recorded like every other
     /// funnel.
     accounting: QueryAccounting,
+    /// Block-level pruning counters, reported through `EXPLAIN ANALYZE`.
+    metrics: ExecutionPlanMetricsSet,
+}
+
+/// The per-partition block counters this scan publishes as DataFusion metrics.
+///
+/// They are the only externally visible difference the prune channel makes:
+/// `blocks_total` is what the fetched objects hold, `blocks_scanned` is what the
+/// reader actually decoded, and `blocks_pruned_by_postings` is how many
+/// candidate blocks POSTINGS removed. Rows are unaffected either way, so an
+/// operator watching a prune land watches these, not the result.
+#[derive(Clone)]
+struct BlockMetrics {
+    total: Count,
+    scanned: Count,
+    pruned_by_postings: Count,
+}
+
+impl BlockMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        BlockMetrics {
+            total: MetricBuilder::new(metrics).counter("blocks_total", partition),
+            scanned: MetricBuilder::new(metrics).counter("blocks_scanned", partition),
+            pruned_by_postings: MetricBuilder::new(metrics)
+                .counter("blocks_pruned_by_postings", partition),
+        }
+    }
+
+    /// Accumulates one segment's [`ScanStats`]. `blocks_pruned_by_postings` is
+    /// the drop across the postings step alone (`blocks_after_skip` minus
+    /// `blocks_after_postings`), so it credits POSTINGS with nothing the skip
+    /// index or the bloom did. `saturating_sub` because a degraded postings
+    /// section leaves the two counts equal rather than ordered by construction.
+    fn record(&self, stats: &ScanStats) {
+        self.total.add(stats.blocks_total as usize);
+        self.scanned.add(stats.blocks_scanned as usize);
+        self.pruned_by_postings.add(
+            stats
+                .blocks_after_skip
+                .saturating_sub(stats.blocks_after_postings) as usize,
+        );
+    }
 }
 
 impl LogsScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given ts
-    /// bounds and content predicates. Stream-attribute equalities are
-    /// deliberately not accepted: they are not pushed into the fetch, because a
-    /// stream-level prune is unsound against the merged `attrs` column (see the
-    /// module doc). DataFusion's residual filters attributes.
+    /// bounds, content predicates, and prune-only predicates. Stream-attribute
+    /// equalities are deliberately not accepted: they are not pushed into the
+    /// fetch, because a stream-level prune is unsound against the merged `attrs`
+    /// column (see the module doc). DataFusion's residual filters attributes.
+    ///
+    /// `prune` is the POSTINGS channel, not a filter. An empty `prune` makes
+    /// this scan read and emit exactly what it did before the channel existed.
     // `tenant_hash` widened this past clippy\'s 7-argument
     // threshold; the codebase allows it at the equivalent sites
     // (scan.rs, ravel-query\'s fetcher.rs).
@@ -129,6 +193,7 @@ impl LogsScanExec {
         ts_min: i64,
         ts_max: i64,
         content: Arc<Vec<Predicate>>,
+        prune: Arc<Vec<Predicate>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -145,9 +210,11 @@ impl LogsScanExec {
             ts_min,
             ts_max,
             content,
+            prune,
             schema,
             properties,
             accounting,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -183,9 +250,10 @@ impl DisplayAs for LogsScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "LogsScanExec: partitions={}, content={}",
+            "LogsScanExec: partitions={}, content={}, prune={}",
             self.partitions.len(),
-            self.content.len()
+            self.content.len(),
+            self.prune.len()
         )
     }
 }
@@ -210,6 +278,10 @@ impl ExecutionPlan for LogsScanExec {
         Ok(self)
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -219,7 +291,9 @@ impl ExecutionPlan for LogsScanExec {
         let fetcher = self.fetcher.clone();
         let tenant_hash = self.tenant_hash;
         let content = Arc::clone(&self.content);
+        let prune = Arc::clone(&self.prune);
         let schema = Arc::clone(&self.schema);
+        let blocks = BlockMetrics::new(&self.metrics, partition);
 
         let reservation = MemoryConsumer::new(format!("LogsScanExec[{partition}]"))
             .register(context.memory_pool());
@@ -231,7 +305,9 @@ impl ExecutionPlan for LogsScanExec {
             self.ts_min,
             self.ts_max,
             content,
+            prune,
             self.accounting.clone(),
+            blocks,
         ));
         Ok(Box::pin(LogScanStream {
             schema,
@@ -242,9 +318,12 @@ impl ExecutionPlan for LogsScanExec {
 }
 
 /// Fetch every segment in this partition and return its records sorted by `ts`
-/// ascending. Only the ts range and content predicates prune the fetch;
-/// attribute filtering is DataFusion's residual over [`build_batch`]'s merged
-/// `attrs` column (see the module doc). Every fetched record is emitted.
+/// ascending. The ts range and content predicates prune the fetch and the
+/// attribute equalities in `prune` drive POSTINGS block pruning inside the
+/// reader; neither filters attributes, which is DataFusion's residual over
+/// [`build_batch`]'s merged `attrs` column (see the module doc). Every fetched
+/// record is emitted.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: LogSegmentFetcher,
     tenant_hash: TenantHash,
@@ -252,11 +331,19 @@ async fn prepare_partition(
     ts_min: i64,
     ts_max: i64,
     content: Arc<Vec<Predicate>>,
+    prune: Arc<Vec<Predicate>>,
     accounting: QueryAccounting,
+    blocks: BlockMetrics,
 ) -> DFResult<Vec<LogRecord>> {
     let mut query = LogQuery::new(ts_min, ts_max);
     for c in content.iter() {
         query = query.with_content(c.clone());
+    }
+    // The prune channel, kept out of `content` on purpose: the reader evaluates
+    // a content arm exactly per row against per-record attributes only, which
+    // would drop a resource/scope-only match the merged residual must keep.
+    for p in prune.iter() {
+        query = query.with_prune(p.clone());
     }
 
     let mut out: Vec<LogRecord> = Vec::new();
@@ -268,6 +355,7 @@ async fn prepare_partition(
         else {
             continue;
         };
+        blocks.record(&output.stats);
         // Emit every fetched record: stream-attribute equalities are not pushed
         // (a stream-level prune is unsound against the merged `attrs` column),
         // so nothing here narrows below what DataFusion's residual keeps.

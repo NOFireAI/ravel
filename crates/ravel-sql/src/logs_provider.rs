@@ -11,10 +11,14 @@
 //!
 //! `supports_filters_pushdown` returns `Inexact` for every filter, exactly like
 //! the metrics provider: DataFusion always re-applies the originals above the
-//! scan, so pruning may only widen. Attribute predicates (`attrs['k']='v'`) are
-//! not pushed at all — a stream-level prune is unsound against the merged `attrs`
-//! column (crate::logs_pushdown, crate::logs_scan) — so they are evaluated
-//! entirely by DataFusion's residual over the merged column.
+//! scan, so pruning may only widen. An attribute predicate (`attrs['k']='v'`) is
+//! pushed only into the prune-only channel ([`LogsPushdown::prune`]), which
+//! drives POSTINGS block pruning inside the reader and is never evaluated per
+//! row: a stream-level or per-record prune used as a filter would be unsound
+//! against the merged `attrs` column (crate::logs_pushdown, crate::logs_scan).
+//! The equality itself is still evaluated entirely by DataFusion's residual over
+//! the merged column, so the channel changes which blocks the fetch reads and
+//! never which rows the query returns.
 
 use std::fmt;
 use std::sync::Arc;
@@ -111,6 +115,7 @@ impl LogsTableProvider {
             pushdown.ts_min(),
             pushdown.ts_max(),
             Arc::new(pushdown.content.clone()),
+            Arc::new(pushdown.prune.clone()),
             self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
@@ -252,7 +257,22 @@ mod tests {
     /// Write one RLOG object from `records`, put it at `key`, and return a
     /// matching L0 `SegmentRef` carrying the object's true ts span.
     async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> SegmentRef {
-        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        write_object_with(store, key, records, RlogConfig::default(), &[]).await
+    }
+
+    /// [`write_object`] with an explicit writer config and POSTINGS indexed
+    /// field list (ADR-0049 decision 3: indexing is opt-in per field, so an
+    /// object written with an empty list has no POSTINGS section at all and the
+    /// prune channel has nothing to probe).
+    async fn write_object_with(
+        store: &MemoryStore,
+        key: &str,
+        records: &[LogRecord],
+        cfg: RlogConfig,
+        indexed: &[&str],
+    ) -> SegmentRef {
+        let mut w = RlogWriter::new(cfg, identity())
+            .with_indexed_fields(indexed.iter().map(|s| s.to_string()).collect());
         for r in records {
             w.push(r.clone()).expect("push");
         }
@@ -315,6 +335,298 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The `LogsScanExec` leaf of a physical plan, whose DataFusion metrics
+    /// carry the block counters. The plan above it is whatever the optimizer
+    /// built (a `FilterExec` for the residual, a `ProjectionExec`, possibly a
+    /// repartition), so the leaf is found by walking rather than by shape.
+    fn find_logs_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.name() == "LogsScanExec" {
+            return Some(Arc::clone(plan));
+        }
+        plan.children().iter().find_map(|c| find_logs_scan(c))
+    }
+
+    /// What one executed query read at block granularity.
+    #[derive(Debug, PartialEq)]
+    struct ScanCounts {
+        total: usize,
+        scanned: usize,
+        pruned_by_postings: usize,
+    }
+
+    /// Run `sql` end to end through the session and return both its rows and the
+    /// scan's block counters. Asserting on the counters is the point: rows alone
+    /// cannot distinguish "the prune worked" from "the residual saved us".
+    async fn run_counted(
+        ctx: &datafusion::prelude::SessionContext,
+        sql: &str,
+    ) -> (BTreeSet<(i64, String)>, ScanCounts) {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        let metrics = find_logs_scan(&plan)
+            .expect("a LogsScanExec leaf")
+            .metrics()
+            .expect("the scan publishes metrics");
+        let count = |name: &str| {
+            metrics
+                .sum_by_name(name)
+                .map(|v| v.as_usize())
+                .unwrap_or_else(|| panic!("metric {name} missing"))
+        };
+        (
+            rows(&batches),
+            ScanCounts {
+                total: count("blocks_total"),
+                scanned: count("blocks_scanned"),
+                pruned_by_postings: count("blocks_pruned_by_postings"),
+            },
+        )
+    }
+
+    /// One record per block, so block counts in the tests below are exact and
+    /// legible rather than a function of the default 8192-record target.
+    fn one_record_per_block() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Twelve records on one stream, ts 1..=12, each carrying a per-record
+    /// `request.id = "r<ts>"` and a per-record `other.key = "same"`. Both keys
+    /// are per-record only, which is what the prune can actually act on: a key
+    /// that also appears at resource level is declined on a version 1 object,
+    /// and a resource-only key has no FIELD_DIR column to key a posting by
+    /// (issue #552).
+    fn per_record_key_records() -> Vec<LogRecord> {
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        (1..=12)
+            .map(|ts| {
+                record(
+                    &worker,
+                    &[
+                        ("request.id".to_string(), s(&format!("r{ts}"))),
+                        ("other.key".to_string(), s("same")),
+                    ],
+                    ts,
+                    &format!("body {ts}"),
+                )
+            })
+            .collect()
+    }
+
+    /// Issue #544's acceptance test: the same SQL query, with and without an
+    /// extractable prune arm, returns identical rows while reading a different
+    /// number of blocks.
+    ///
+    /// The two queries are `attrs['request.id'] = 'r5'` (extracted into
+    /// `LogsPushdown::prune`, so it reaches POSTINGS) and the same equality
+    /// OR-ed with an equality on a key no record carries. The second shape is
+    /// deliberately unextractable: `extract_logs` recognizes no disjunction, so
+    /// its prune channel is empty. Its rows are the same, because
+    /// `attrs['absent.key']` is NULL on every row and `FALSE OR NULL` is NULL
+    /// (filtered) while `TRUE OR NULL` is TRUE (kept). So the pair differs in
+    /// exactly one thing: whether the prune reached the index.
+    #[tokio::test]
+    async fn attrs_equality_prunes_blocks_on_the_sql_path() {
+        let store = MemoryStore::new();
+        let records = per_record_key_records();
+        let seg = write_object_with(
+            &store,
+            "logs/postings.rlog",
+            &records,
+            one_record_per_block(),
+            &["request.id"],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+
+        let (pruned_rows, pruned) = run_counted(
+            &ctx,
+            "SELECT ts, body FROM logs WHERE attrs['request.id'] = 'r5'",
+        )
+        .await;
+        let (plain_rows, plain) = run_counted(
+            &ctx,
+            "SELECT ts, body FROM logs \
+             WHERE attrs['request.id'] = 'r5' OR attrs['absent.key'] = 'zzz'",
+        )
+        .await;
+
+        // Identical rows. This is the invariant the prune may never touch.
+        let expected = BTreeSet::from([(5, "body 5".to_string())]);
+        assert_eq!(pruned_rows, expected);
+        assert_eq!(plain_rows, expected);
+        assert_eq!(pruned_rows, plain_rows, "the prune changed no row");
+
+        // Strictly fewer blocks read, and the difference is POSTINGS' work.
+        assert_eq!(
+            plain,
+            ScanCounts {
+                total: 12,
+                scanned: 12,
+                pruned_by_postings: 0,
+            },
+            "with no prune arm the scan decodes every block"
+        );
+        assert_eq!(
+            pruned,
+            ScanCounts {
+                total: 12,
+                scanned: 1,
+                pruned_by_postings: 11,
+            },
+            "the prune arm reached POSTINGS and left one block"
+        );
+        assert!(
+            pruned.scanned < plain.scanned,
+            "the whole point: {} blocks read instead of {}",
+            pruned.scanned,
+            plain.scanned
+        );
+    }
+
+    /// An equality on a per-record key that exists but was never named as an
+    /// indexed field prunes nothing, and still returns every matching row. The
+    /// probe reports "no information" for a field POSTINGS does not cover, which
+    /// is widen-only (ADR-0013): the fetch reads the whole object and the
+    /// residual answers, exactly as before this channel existed.
+    #[tokio::test]
+    async fn prune_arm_on_unindexed_field_prunes_nothing_on_the_sql_path() {
+        let store = MemoryStore::new();
+        let records = per_record_key_records();
+        let seg = write_object_with(
+            &store,
+            "logs/unindexed.rlog",
+            &records,
+            one_record_per_block(),
+            // `request.id` is indexed; `other.key` deliberately is not.
+            &["request.id"],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+
+        let (rows_got, counts) = run_counted(
+            &ctx,
+            "SELECT ts, body FROM logs WHERE attrs['other.key'] = 'same'",
+        )
+        .await;
+
+        let expected: BTreeSet<(i64, String)> =
+            (1..=12).map(|ts| (ts, format!("body {ts}"))).collect();
+        assert_eq!(rows_got, expected, "every matching record is returned");
+        assert_eq!(
+            counts,
+            ScanCounts {
+                total: 12,
+                scanned: 12,
+                pruned_by_postings: 0,
+            },
+            "an unindexed prune arm prunes nothing"
+        );
+    }
+
+    /// The soundness canary with the index actually loaded: `service.name` is
+    /// indexed here, and one record carries it only as a resource attribute. A
+    /// version 2 POSTINGS section indexes the merged view (ADR-0049 amendment),
+    /// so the prune both bites (fewer blocks) and keeps that resource-only row.
+    /// If the prune ever reached the per-record layer alone, ts=4 would vanish.
+    #[tokio::test]
+    async fn prune_on_an_indexed_resource_level_key_keeps_the_resource_only_row() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records = vec![
+            // Resource `worker`, overridden per-record to `api`: record wins.
+            record(
+                &worker,
+                &[("service.name".to_string(), s("api"))],
+                1,
+                "override",
+            ),
+            record(&worker, &[], 2, "worker only"),
+            record(&worker, &[], 3, "worker only again"),
+            // `api` as a genuine resource attribute, no per-record attrs at all.
+            record(&[("service.name".to_string(), s("api"))], &[], 4, "resource"),
+        ];
+        let seg = write_object_with(
+            &store,
+            "logs/resource-level.rlog",
+            &records,
+            one_record_per_block(),
+            &["service.name"],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+
+        let (rows_got, counts) = run_counted(
+            &ctx,
+            "SELECT ts, body FROM logs WHERE attrs['service.name'] = 'api'",
+        )
+        .await;
+
+        assert_eq!(
+            rows_got,
+            BTreeSet::from([(1, "override".to_string()), (4, "resource".to_string())]),
+            "the resource-only match (ts=4) must survive the prune"
+        );
+        assert_eq!(
+            counts,
+            ScanCounts {
+                total: 4,
+                scanned: 2,
+                pruned_by_postings: 2,
+            },
+            "the merged-view index prunes the two worker-only blocks"
+        );
     }
 
     /// Issue #507's acceptance test: `attrs['k'] = 'v'` must plan (the whole
