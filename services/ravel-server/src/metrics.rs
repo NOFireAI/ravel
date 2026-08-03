@@ -41,6 +41,7 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use ravel_cache::CacheMetricsSnapshot;
 use ravel_catalog::Catalog;
 use ravel_ingest::{
     IngestMetricsSnapshot, IngestRouter, LogIngestMetricsSnapshot, LogIngestRouter,
@@ -902,6 +903,99 @@ fn render_maintain_safety_family(
     }
 }
 
+/// The ADR-0046 read cache's counters (issues #445, #502), one process-wide
+/// `Cache` shared by the PromQL and SQL fetchers (`ravel_server::query`), so
+/// this family carries only `mode`, no `signal` split -- the same discipline
+/// `render_store_family` uses (separate metric names per outcome, e.g.
+/// `calls_total`/`ok_total`/`errors_total`, rather than an unlisted "result"
+/// label). Request hit rate is `hits / (hits + misses)`; byte hit rate is
+/// `bytes_served / (bytes_served + bytes_admitted)`; both are left for
+/// PromQL to compute from the raw counters, not baked in here. Deliberately
+/// omits `single_flight_collapses`: issue #503 is its own fleet-wide
+/// collapse-rate metric, not this one, and this family must not preempt that
+/// decision by shipping a shape it did not choose.
+fn render_cache_family(out: &mut String, mode: Mode, snapshot: &CacheMetricsSnapshot) {
+    write_header(
+        out,
+        "ravel_cache_hits_total",
+        "Read-cache lookups served from the cache.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_cache_hits_total",
+        &[Label::Mode(mode)],
+        snapshot.hits,
+    );
+
+    write_header(
+        out,
+        "ravel_cache_misses_total",
+        "Read-cache lookups not found in the cache.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_cache_misses_total",
+        &[Label::Mode(mode)],
+        snapshot.misses,
+    );
+
+    write_header(
+        out,
+        "ravel_cache_bytes_served_total",
+        "Bytes served from the cache on a hit.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_cache_bytes_served_total",
+        &[Label::Mode(mode)],
+        snapshot.bytes_served,
+    );
+
+    write_header(
+        out,
+        "ravel_cache_bytes_admitted_total",
+        "Bytes admitted into the cache after a miss.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_cache_bytes_admitted_total",
+        &[Label::Mode(mode)],
+        snapshot.bytes_admitted,
+    );
+
+    write_header(
+        out,
+        "ravel_cache_evictions_total",
+        "Entries evicted from the read cache by its S3-FIFO policy.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_cache_evictions_total",
+        &[Label::Mode(mode)],
+        snapshot.evictions,
+    );
+
+    write_header(
+        out,
+        "ravel_cache_disk_errors_degraded_to_misses_total",
+        "Disk-tier reads that found an entry at its canonical path but discarded it (short \
+         read, bad header, key mismatch, or a failed crc32c check) rather than a clean miss. \
+         Nonzero here means the disk tier is unhealthy, not merely cold.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_cache_disk_errors_degraded_to_misses_total",
+        &[Label::Mode(mode)],
+        snapshot.disk_errors_degraded_to_misses,
+    );
+}
+
 /// Render every source this module knows about into one Prometheus text
 /// exposition document. `ingest` is empty in a mode that builds no ingest
 /// router (`Mode::Query`, `Mode::Maintain`): those families are omitted
@@ -917,6 +1011,7 @@ pub fn render(
     catalog: &CatalogCountersSnapshot,
     maintain: Option<&MaintenanceDiscoverySnapshot>,
     maintain_safety: Option<&MaintenanceSafetySnapshot>,
+    cache: Option<&CacheMetricsSnapshot>,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -929,6 +1024,9 @@ pub fn render(
     }
     if let Some(snapshot) = maintain_safety {
         render_maintain_safety_family(&mut out, mode, snapshot);
+    }
+    if let Some(snapshot) = cache {
+        render_cache_family(&mut out, mode, snapshot);
     }
     out
 }
@@ -951,6 +1049,9 @@ pub struct MetricsState {
     /// `Some` only in [`Mode::Maintain`], alongside `tenant_discovery` above
     /// (ADR-0048 decisions 1, 4, 6; issue #517).
     pub maintenance_safety: Option<Arc<crate::maintain::MaintenanceSafetyMetrics>>,
+    /// The ADR-0046 read cache's counters handle (issues #445, #502), or
+    /// `None` when `--disable-cache` leaves no cache constructed at all.
+    pub cache_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -1010,6 +1111,11 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                     .collect(),
             });
 
+    let cache_snapshot = state
+        .cache_metrics
+        .as_ref()
+        .map(|metrics| metrics.snapshot());
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -1017,6 +1123,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &catalog_snapshot,
         maintain_snapshot.as_ref(),
         maintain_safety_snapshot.as_ref(),
+        cache_snapshot.as_ref(),
     );
     (
         StatusCode::OK,
@@ -1075,6 +1182,7 @@ mod tests {
             &snapshot,
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
         );
@@ -1179,7 +1287,7 @@ mod tests {
             compaction_input_set_conflicts: 2,
             isolation_breaches: 3,
         };
-        let body = render(Mode::Gateway, &store, &ingest, &catalog, None, None);
+        let body = render(Mode::Gateway, &store, &ingest, &catalog, None, None, None);
 
         let mut declared_types: HashSet<String> = HashSet::new();
         let mut bucket_state: std::collections::HashMap<String, (Vec<u64>, u64)> =
@@ -1341,6 +1449,7 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             None,
+            None,
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -1390,6 +1499,7 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             Some(&snapshot),
             None,
+            None,
         );
 
         assert!(
@@ -1423,6 +1533,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &ingest,
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
         );
@@ -1468,6 +1579,7 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
         );
 
         assert!(
@@ -1530,6 +1642,7 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
         );
 
         for line in body.lines() {
@@ -1555,5 +1668,77 @@ mod tests {
                 "maintain-safety sample carries an unexpected label set: {line}"
             );
         }
+    }
+
+    #[test]
+    fn cache_family_renders_when_present_and_omits_single_flight_collapses() {
+        let snapshot = CacheMetricsSnapshot {
+            hits: 10,
+            misses: 4,
+            bytes_served: 2048,
+            bytes_admitted: 1024,
+            admissions_rejected_size: 1,
+            evictions: 2,
+            single_flight_collapses: 99,
+            disk_errors_degraded_to_misses: 3,
+        };
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            Some(&snapshot),
+        );
+
+        assert!(
+            body.contains("ravel_cache_hits_total{mode=\"gateway\"} 10"),
+            "missing cache hits sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_misses_total{mode=\"gateway\"} 4"),
+            "missing cache misses sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_bytes_served_total{mode=\"gateway\"} 2048"),
+            "missing cache bytes_served sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_bytes_admitted_total{mode=\"gateway\"} 1024"),
+            "missing cache bytes_admitted sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_evictions_total{mode=\"gateway\"} 2"),
+            "missing cache evictions sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_disk_errors_degraded_to_misses_total{mode=\"gateway\"} 3"),
+            "missing cache disk_errors_degraded_to_misses sample:\n{body}"
+        );
+        assert!(
+            !body.contains("single_flight_collapse"),
+            "issue #503: fleet-wide single-flight collapse rate must never be \
+             emitted on /metrics, found in:\n{body}"
+        );
+    }
+
+    #[test]
+    fn cache_family_omitted_entirely_when_no_cache_is_attached() {
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            !body.contains("ravel_cache_"),
+            "a server run with --disable-cache must not render any cache \
+             family at all:\n{body}"
+        );
     }
 }
