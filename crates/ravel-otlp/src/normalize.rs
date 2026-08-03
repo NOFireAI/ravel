@@ -175,7 +175,20 @@ pub fn normalize_metrics(
     ingest_ts_ns: i64,
 ) -> NormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    normalize_metrics_with_exemplars(tenant, req, limits, ingest_ts_ns, &mut cap).output
+    let result = normalize_metrics_with_exemplars(tenant, req, limits, ingest_ts_ns, &mut cap);
+    let mut output = result.output;
+    // The cap admitted these, but this entry point has nowhere to store them and
+    // discards them. A discarded admission is still a dropped exemplar and must
+    // be counted, or an operator watching the dropped-data counter sees it read
+    // zero while the same exemplars are lost (ADR-0047 decision 2: an exemplar
+    // that is not stored is dropped and counted, never silent). Matches the
+    // OTAP and Remote Write wrappers.
+    if !result.exemplars.is_empty() {
+        output.rejected.push(Rejection::HistogramExemplarsDropped {
+            count: result.exemplars.len(),
+        });
+    }
+    output
 }
 
 /// Decode and normalize gauge and sum data points from `req`, admitting
@@ -197,14 +210,31 @@ pub fn normalize_metrics_with_exemplars(
 ) -> MetricsNormalizeResult {
     let total_points = count_data_points(&req);
     if total_points > limits.max_data_points_per_request {
+        let mut rejected = vec![Rejection::TooManyDataPoints {
+            count: total_points,
+            max: limits.max_data_points_per_request,
+        }];
+        // The whole request is rejected before any data point is inspected, so
+        // every exemplar it carried is dropped with it. Count them, matching the
+        // Remote Write twin, so the dropped-data counter does not read zero
+        // while exemplars are lost (ADR-0047 decision 2). Remote Write can count
+        // here because its exemplars are already decoded into the resolved
+        // request; OTLP can because they ride inline on the decoded request.
+        // OTAP deliberately does not count here: its exemplar payloads are not
+        // decoded at the point-count check, a genuine structural difference, so
+        // the OTAP/OTLP differential gate compares this path at the
+        // exemplar-carrying layer rather than at the wrapper.
+        let dropped_exemplars = count_exemplars(&req);
+        if dropped_exemplars > 0 {
+            rejected.push(Rejection::HistogramExemplarsDropped {
+                count: dropped_exemplars,
+            });
+        }
         return MetricsNormalizeResult {
             output: NormalizeOutput {
                 points: Vec::new(),
                 histogram_points: Vec::new(),
-                rejected: vec![Rejection::TooManyDataPoints {
-                    count: total_points,
-                    max: limits.max_data_points_per_request,
-                }],
+                rejected,
             },
             exemplars: Vec::new(),
         };
@@ -262,6 +292,30 @@ fn metric_data_point_count(metric: &Metric) -> usize {
         Some(MetricData::ExponentialHistogram(h)) => h.data_points.len(),
         Some(MetricData::Summary(s)) => s.data_points.len(),
         None => 0,
+    }
+}
+
+/// Total exemplars carried on every data point in `req`, used only by the
+/// `TooManyDataPoints` early return to count what the whole-request rejection
+/// drops. Summary data points carry no exemplars in OTLP.
+fn count_exemplars(req: &ExportMetricsServiceRequest) -> usize {
+    req.resource_metrics
+        .iter()
+        .flat_map(|rm| rm.scope_metrics.iter())
+        .flat_map(|sm| sm.metrics.iter())
+        .map(metric_exemplar_count)
+        .sum()
+}
+
+fn metric_exemplar_count(metric: &Metric) -> usize {
+    match &metric.data {
+        Some(MetricData::Gauge(g)) => g.data_points.iter().map(|dp| dp.exemplars.len()).sum(),
+        Some(MetricData::Sum(s)) => s.data_points.iter().map(|dp| dp.exemplars.len()).sum(),
+        Some(MetricData::Histogram(h)) => h.data_points.iter().map(|dp| dp.exemplars.len()).sum(),
+        Some(MetricData::ExponentialHistogram(h)) => {
+            h.data_points.iter().map(|dp| dp.exemplars.len()).sum()
+        }
+        Some(MetricData::Summary(_)) | None => 0,
     }
 }
 
@@ -599,7 +653,12 @@ fn admit_exemplars<F>(
             None => dropped += 1,
         }
     }
-    candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.ts_ns));
+    // Stable, not unstable: candidates are built in wire order, so a stable
+    // descending sort makes the first exemplar in wire order win a tie among
+    // equal `ts_ns` (ExemplarCap::admit is first-wins). An unstable sort would
+    // leave the tie winner implementation-defined rather than a property of the
+    // input (ADR-0047 amendment: encoded bytes are a function of input order).
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.ts_ns));
 
     for candidate in candidates {
         let series_id = series_id_for(&candidate);
@@ -3392,6 +3451,136 @@ mod tests {
             value: Some(OtlpExemplarValue::AsDouble(value)),
             filtered_attributes,
         }
+    }
+
+    /// #551: two exemplars on one series with identical `ts_ns` must break the
+    /// tie deterministically. Candidates are sorted descending by `ts_ns` with a
+    /// stable sort, so the first in wire order wins the tie and is offered to the
+    /// cap first. Distinguishable values let the assertion name the survivor; an
+    /// unstable sort could keep either.
+    ///
+    /// 300 exemplars over 5 timestamps, all inside one cap window, so the cap
+    /// admits exactly one. The size and the mixed timestamps are the point:
+    /// `sort_unstable` insertion-sorts a short slice, which preserves input
+    /// order, so a two-element or all-equal input cannot tell a stable sort from
+    /// an unstable one. At this length, with duplicates among distinct keys,
+    /// swapping `sort_by_key` for `sort_unstable_by_key` does fail it.
+    #[test]
+    fn identical_timestamp_exemplars_keep_the_first_in_wire_order() {
+        let timestamps_ns = [3_000i64, 9_000, 1_000, 9_000, 5_000];
+        let mut exemplars = Vec::with_capacity(300);
+        for round in 0..60i64 {
+            for (slot, ts_ns) in timestamps_ns.iter().enumerate() {
+                // Value encodes wire position, so the assertion names one
+                // exemplar exactly.
+                let position = round * 5 + slot as i64;
+                exemplars.push(otlp_exemplar(
+                    *ts_ns,
+                    position as f64,
+                    vec![],
+                    vec![],
+                    vec![],
+                ));
+            }
+        }
+        // The newest timestamp is 9_000 ns, and its first appearance in wire
+        // order is position 1.
+        let expected_position = 1.0f64;
+
+        let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(42.0));
+        dp.exemplars = exemplars;
+        let rm = resource_metrics(vec![], vec![gauge_metric("request_latency", vec![dp])]);
+
+        // 10 s window: every timestamp above lands in the window starting at 0.
+        let mut cap = ExemplarCap::new(10_000_000_000);
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+            &mut cap,
+        );
+
+        assert_eq!(result.exemplars.len(), 1);
+        assert_eq!(
+            result.exemplars[0].exemplar.ts_ns, 9_000,
+            "the newest timestamp in the window must win"
+        );
+        assert_eq!(
+            result.exemplars[0].exemplar.value_bits,
+            expected_position.to_bits(),
+            "among equal timestamps the first in wire order must win"
+        );
+        assert_eq!(
+            result.output.rejected,
+            vec![Rejection::HistogramExemplarsDropped { count: 299 }]
+        );
+    }
+
+    /// #540: one series, one exemplar, through the production entry point
+    /// (`normalize_metrics`, the throwaway-cap wrapper). The exemplar is admitted
+    /// by the cap but discarded by the wrapper, since nothing stores exemplars on
+    /// this path yet; it must still be counted as dropped. Before the fix this
+    /// counter read 0 while the exemplar was silently thrown away.
+    #[test]
+    fn one_admitted_then_discarded_exemplar_is_counted_as_dropped() {
+        let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(1.0));
+        dp.exemplars = vec![otlp_exemplar(1_000, 1.0, vec![7; 16], vec![3; 8], vec![])];
+        let rm = resource_metrics(vec![], vec![gauge_metric("m", vec![dp])]);
+
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+
+        assert!(out.points.len() == 1);
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::HistogramExemplarsDropped { count: 1 }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 0);
+    }
+
+    /// #540, second half: a request over the data-point limit is rejected whole,
+    /// before any point is inspected. Every exemplar it carried is dropped with
+    /// it and must be counted, matching the Remote Write twin's
+    /// `TooManyDataPoints` early return, so the dropped-data counter does not
+    /// read zero while exemplars are lost.
+    #[test]
+    fn too_many_data_points_counts_the_requests_exemplars_as_dropped() {
+        let limits = IngestLimits {
+            max_data_points_per_request: 2,
+            ..IngestLimits::default()
+        };
+        let mut dp1 = number_point(vec![], 1_000, NumberValue::AsDouble(1.0));
+        dp1.exemplars = vec![otlp_exemplar(1_000, 1.0, vec![], vec![], vec![])];
+        let mut dp2 = number_point(vec![], 1_000, NumberValue::AsDouble(2.0));
+        dp2.exemplars = vec![
+            otlp_exemplar(1_000, 2.0, vec![], vec![], vec![]),
+            otlp_exemplar(1_000, 3.0, vec![], vec![], vec![]),
+        ];
+        let dp3 = number_point(vec![], 1_000, NumberValue::AsDouble(4.0));
+        let rm = resource_metrics(vec![], vec![gauge_metric("m", vec![dp1, dp2, dp3])]);
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_metrics_with_exemplars(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            1_000,
+            &mut cap,
+        );
+
+        assert!(result.exemplars.is_empty());
+        assert_eq!(
+            result.output.rejected,
+            vec![
+                Rejection::TooManyDataPoints { count: 3, max: 2 },
+                Rejection::HistogramExemplarsDropped { count: 3 },
+            ]
+        );
     }
 
     #[test]
