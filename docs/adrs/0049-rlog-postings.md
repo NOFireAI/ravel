@@ -156,10 +156,26 @@ from SQL, and it is named here rather than assumed.
 ## Consequences
 
 - One frozen-format change to RLOG, following the format-change procedure
-  in full: version bump, `docs/log-segment-format.md` amended in the same
-  change, checksum coverage reviewed for the new section, fuzz and
-  property tests extended to the new grammar plus corrupt and truncated
-  inputs, and the inspector taught to print it.
+  in full: `docs/log-segment-format.md` amended in the same change,
+  checksum coverage reviewed for the new section, fuzz and property tests
+  extended to the new grammar plus corrupt and truncated inputs, and the
+  inspector taught to print it.
+
+  **Amended 2026-08-03: no trailer version bump.** This consequence
+  originally required one. It was wrong. ADR-0029 already carves out new
+  section kinds: RLOG readers MUST skip an unknown kind, and an absent
+  section is legal, so adding one is purely additive in both directions.
+  A new object carrying POSTINGS is readable by an old reader, which skips
+  it, and an old object without one is readable by a new reader, for which
+  absence is legal by decision 5 above.
+
+  The correction matters beyond tidiness. Every trailer bump in this
+  program triggered a cascade of downstream breakage from version literals
+  mirrored by hand across crates, sixteen sites across three tasks for the
+  RSEG bump alone. Requiring a bump that the format does not need would
+  have bought that cost for nothing. The rule this leaves behind: a new
+  section kind is additive and needs no bump; a change to an existing
+  section's grammar, or to the trailer, does.
 - Object size grows only for tenants that configure indexed fields.
   Indicative: 5 to 15% of object size for a four-field list, to be
   measured before the default list is set.
