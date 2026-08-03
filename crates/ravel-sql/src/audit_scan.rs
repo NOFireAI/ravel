@@ -40,6 +40,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::LogRecord;
 use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::audit_schema::audit_schema;
@@ -52,6 +53,7 @@ const BATCH_ROWS: usize = 8192;
 /// Audit segment scan producing per-partition ts-ascending batches over the
 /// public `audit` schema.
 pub struct AuditScanExec {
+    tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
     /// Round-robin segment assignment; `partitions[k]` runs as DataFusion
     /// partition `k`.
@@ -71,6 +73,7 @@ impl AuditScanExec {
     /// `min(target_partitions, segments.len())` partitions, with the given ts
     /// bounds.
     pub fn new(
+        tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
         segments: &[SegmentRef],
         target_partitions: usize,
@@ -86,6 +89,7 @@ impl AuditScanExec {
         let schema = audit_schema();
         let properties = Arc::new(Self::compute_properties(&schema, n)?);
         Ok(AuditScanExec {
+            tenant_hash,
             fetcher,
             partitions,
             ts_min,
@@ -157,6 +161,7 @@ impl ExecutionPlan for AuditScanExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let segs = self.partitions.get(partition).cloned().unwrap_or_default();
         let fetcher = self.fetcher.clone();
+        let tenant_hash = self.tenant_hash;
         let schema = Arc::clone(&self.schema);
 
         let reservation = MemoryConsumer::new(format!("AuditScanExec[{partition}]"))
@@ -164,6 +169,7 @@ impl ExecutionPlan for AuditScanExec {
 
         let fut = Box::pin(prepare_partition(
             fetcher,
+            tenant_hash,
             segs,
             self.ts_min,
             self.ts_max,
@@ -182,6 +188,7 @@ impl ExecutionPlan for AuditScanExec {
 /// re-applies everything above.
 async fn prepare_partition(
     fetcher: LogSegmentFetcher,
+    tenant_hash: TenantHash,
     segs: Vec<SegmentRef>,
     ts_min: i64,
     ts_max: i64,
@@ -189,10 +196,11 @@ async fn prepare_partition(
 ) -> DFResult<Vec<LogRecord>> {
     let query = LogQuery::new(ts_min, ts_max);
 
+    let accounting = QueryAccounting::new();
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher
-            .fetch_accounted(seg, &query, &accounting)
+            .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
             .await
             .map_err(SqlError::from)?
         else {

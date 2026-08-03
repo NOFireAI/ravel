@@ -46,6 +46,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{AttrValue, LogRecord, Predicate};
 use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::alerts_schema::{ALERT_ID_KEY, GENERATION_KEY, RULE_ID_KEY, STATE_KEY, alerts_schema};
@@ -58,6 +59,7 @@ const BATCH_ROWS: usize = 8192;
 /// Alert segment scan producing per-partition ts-ascending batches over the
 /// public `alerts` schema.
 pub struct AlertsScanExec {
+    tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
     /// Round-robin segment assignment; `partitions[k]` runs as DataFusion
     /// partition `k`.
@@ -80,6 +82,7 @@ impl AlertsScanExec {
     /// `min(target_partitions, segments.len())` partitions, with the given ts
     /// bounds and content predicates.
     pub fn new(
+        tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
         segments: &[SegmentRef],
         target_partitions: usize,
@@ -96,6 +99,7 @@ impl AlertsScanExec {
         let schema = alerts_schema();
         let properties = Arc::new(Self::compute_properties(&schema, n)?);
         Ok(AlertsScanExec {
+            tenant_hash,
             fetcher,
             partitions,
             ts_min,
@@ -173,6 +177,7 @@ impl ExecutionPlan for AlertsScanExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let segs = self.partitions.get(partition).cloned().unwrap_or_default();
         let fetcher = self.fetcher.clone();
+        let tenant_hash = self.tenant_hash;
         let content = Arc::clone(&self.content);
         let schema = Arc::clone(&self.schema);
 
@@ -181,6 +186,7 @@ impl ExecutionPlan for AlertsScanExec {
 
         let fut = Box::pin(prepare_partition(
             fetcher,
+            tenant_hash,
             segs,
             self.ts_min,
             self.ts_max,
@@ -200,6 +206,7 @@ impl ExecutionPlan for AlertsScanExec {
 /// the fetch exactly; the residual re-applies everything above.
 async fn prepare_partition(
     fetcher: LogSegmentFetcher,
+    tenant_hash: TenantHash,
     segs: Vec<SegmentRef>,
     ts_min: i64,
     ts_max: i64,
@@ -211,10 +218,11 @@ async fn prepare_partition(
         query = query.with_content(c.clone());
     }
 
+    let accounting = QueryAccounting::new();
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher
-            .fetch_accounted(seg, &query, &accounting)
+            .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
             .await
             .map_err(SqlError::from)?
         else {

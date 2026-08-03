@@ -42,6 +42,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::AlertsTableProvider;
+use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
@@ -221,6 +222,7 @@ fn provider(store: MemoryStore, segments: Vec<SegmentRef>) -> AlertsTableProvide
     };
     AlertsTableProvider::new(
         snapshot,
+        TenantHash([7u8; 16]),
         fetcher,
         EngineConfig::default(),
         QueryAccounting::new(),
