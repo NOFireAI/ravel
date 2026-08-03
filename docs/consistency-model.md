@@ -125,14 +125,69 @@ rejected point counts and reasons.
 ## Duplicates and idempotency
 
 - Delivery model is at-least-once. A client retry after a lost ack re-ingests
-  the batch; both copies are stored and queries see duplicate samples exactly
-  as Prometheus would if scraped twice (PromQL takes the last value at a
-  timestamp; identical duplicates are harmless, differing values at the same
-  timestamp are last-write-wins per evaluation order and documented as such).
+  the batch; both copies are stored.
+- For **metrics**, this is harmless: queries dedup by `(series_id, ts)`, so a
+  retried sample collapses exactly as Prometheus would if scraped twice
+  (PromQL takes the last value at a timestamp; identical duplicates are
+  harmless, differing values at the same timestamp are last-write-wins per
+  evaluation order and documented as such).
+- For **logs and spans**, there is no query-time dedup: a retry after a lost
+  ack is *user-visible* duplication (extra rows / spans). The
+  "identical duplicates are harmless" framing above is true for metrics only
+  and must not be over-read to cover logs and spans (ADR-0051 §5).
 - Writer-side retries of the same flush are idempotent by construction:
   same commit key, content-hash-verified (ADR-0002).
-- A client idempotency key window (S3-backed) is planned; until it exists,
-  Ravel does not claim exactly-once ingestion. Tracked in issues.
+
+### Opt-in client idempotency key (logs and spans)
+
+Log and span ingest accept an optional, opaque `x-ravel-idempotency-key`
+(HTTP header or gRPC metadata, `≤128` bytes; a longer key is rejected with
+HTTP 400 / gRPC `InvalidArgument`, never truncated). The OTLP protobuf
+schemas are untouched: the key travels only as transport metadata.
+
+**Ordering guarantee.** For a keyed request the gateway writes the
+idempotency marker *after* the data is durably committed and *before* the
+response returns, so the client can never observe an ack for data whose
+marker was not yet written:
+
+```
+data PUT -> commit PUT -> marker PUT (CreateIfAbsent) -> ack
+```
+
+The marker records the original request's written row/span count and its
+`x-ravel-commit-token` header value verbatim. A marker is written only for a
+request that produced a durable commit (strict mode with at least one flushed
+shard); buffered-mode and fully-rejected requests commit no durable data and
+write no marker.
+
+**Replay contract.** A retry that supplies the same key first consults the
+marker (one prefix LIST over the dedup window, default 24 h, shared with
+`ravel-maintain`'s sweep so the read path and the sweep agree on the window).
+On a hit inside the window the retry skips layer-3/4 admission (structural
+bounds and active-series/stream caps), normalization, and the router write
+entirely, and replays the stored receipt: the original commit-token header
+value byte-for-byte, and `rejected_log_records` / `rejected_spans` of 0 with
+no partial-success (the original request already accounted for its own
+rejections at write time). No new rows or spans are written, and no
+layer-3/4 admission usage is charged. The layer-1 body-size cap and layer-2
+byte-rate token bucket still apply to a replayed request exactly as they do
+to any other: a replay still costs wire bytes, and a tenant well over its
+byte-rate budget can still see a replayed retry rejected at layer 2 before
+the marker lookup ever runs.
+
+**Fail-open, never a lost ack.** A corrupt or unparseable marker, or a store
+error on the lookup, is treated as a miss: the request proceeds down the
+normal path (at-least-once), it is never surfaced as an error to the caller.
+A `write_marker` failure after a durable commit is logged and the request
+still acks success, because the data is already committed; the retry then
+simply reingests (at-least-once) since no marker exists.
+
+**Honest residuals** (unchanged from ADR-0051 §5): a crash after the commit
+PUT but before the marker PUT still yields a duplicate on retry; two
+concurrent requests with the same key can both ingest (the window targets
+sequential retry after a lost ack, the actual failure mode); and unkeyed
+requests get plain at-least-once. Ravel does not claim exactly-once
+ingestion.
 
 ## Late and skewed data
 
@@ -152,7 +207,7 @@ rejected point counts and reasons.
 |---|---|---|---|---|
 | Before data PUT | absent | absent | no | client retries; nothing stored |
 | After data PUT, before commit PUT | present (orphan) | absent | no | invisible; GC after grace; client retries |
-| After commit PUT, before ack | present | present | no | visible; client retry stores a duplicate (see above) |
+| After commit PUT, before ack | present | present | no | visible; unkeyed client retry stores a duplicate (see above); a keyed retry replays the marker and stores nothing new, since the marker PUT precedes the ack |
 | After ack | present | present | yes | durable and visible |
 
 ## Deletion and GC

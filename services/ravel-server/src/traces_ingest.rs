@@ -7,19 +7,86 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
-use ravel_ingest::{SpanIngestRouter, SpanWriteError, WriteMode};
+use ravel_ingest::{
+    IdempotencyReceipt, LookupOutcome, SpanIngestRouter, SpanWriteError, WriteMode, read_marker,
+    write_marker,
+};
+use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
+use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::{SpanIngestLimits, SpanRejection, normalize_traces};
-use ravel_types::{CommitToken, TenantId};
+use ravel_types::{CommitToken, Signal, TenantId};
+
+use crate::otlp_http::{
+    MAX_IDEMPOTENCY_KEY_BYTES, encode_commit_tokens, request_ingest_hour_bucket,
+};
 
 pub struct SpanIngestState {
     pub router: Arc<SpanIngestRouter>,
     pub limits: SpanIngestLimits,
     pub ack_deadline: Duration,
+    /// Object store, for the idempotency marker read/write (ADR-0051 section
+    /// 5), the span-pipeline counterpart of
+    /// [`crate::logs_ingest::LogIngestState::store`].
+    pub store: Arc<dyn ObjectStoreBackend>,
 }
 
 pub struct SpanIngestOutcome {
     pub response: ExportTraceServiceResponse,
     pub tokens: Vec<CommitToken>,
+    /// Set only on an idempotency replay: the original request's
+    /// `x-ravel-commit-token` header value, replayed verbatim. See
+    /// [`crate::logs_ingest::LogIngestOutcome::commit_token_header`].
+    pub replayed_commit_token: Option<String>,
+}
+
+impl SpanIngestOutcome {
+    /// The `x-ravel-commit-token` header value: the verbatim replayed value on
+    /// a dedup hit, otherwise this request's own encoded tokens.
+    pub fn commit_token_header(&self) -> Option<String> {
+        self.replayed_commit_token
+            .clone()
+            .or_else(|| encode_commit_tokens(&self.tokens))
+    }
+}
+
+/// Failure from [`handle_export_traces`]. Spans get no layer-4 admission
+/// (ADR-0051 excludes them), so unlike [`crate::logs_ingest`] the only
+/// non-write failure is an invalid idempotency key.
+#[derive(Debug, Clone)]
+pub enum SpanIngestRequestError {
+    /// The supplied `x-ravel-idempotency-key` exceeds
+    /// [`crate::otlp_http::MAX_IDEMPOTENCY_KEY_BYTES`]; mapped to HTTP 400 /
+    /// gRPC `InvalidArgument`. Rejected rather than truncated.
+    InvalidIdempotencyKey {
+        len: usize,
+    },
+    Write(SpanWriteError),
+}
+
+impl std::fmt::Display for SpanIngestRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpanIngestRequestError::InvalidIdempotencyKey { len } => write!(
+                f,
+                "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
+            ),
+            SpanIngestRequestError::Write(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for SpanIngestRequestError {}
+
+impl SpanIngestRequestError {
+    /// Whether a client may reasonably retry the whole request. An over-long
+    /// key cannot succeed on retry unchanged; a write error defers to
+    /// [`SpanWriteError::is_retryable`].
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            SpanIngestRequestError::InvalidIdempotencyKey { .. } => false,
+            SpanIngestRequestError::Write(err) => err.is_retryable(),
+        }
+    }
 }
 
 /// Upper bound on the assembled `error_message` byte length, the same cap and
@@ -35,7 +102,61 @@ pub async fn handle_export_traces(
     mode: WriteMode,
     request: ExportTraceServiceRequest,
     ingest_ts_ns: i64,
-) -> Result<SpanIngestOutcome, SpanWriteError> {
+    idempotency_key: Option<Vec<u8>>,
+) -> Result<SpanIngestOutcome, SpanIngestRequestError> {
+    // Validate the opt-in idempotency key up front; an over-long key is a
+    // typed rejection, never truncated.
+    if let Some(key) = &idempotency_key
+        && key.len() > MAX_IDEMPOTENCY_KEY_BYTES
+    {
+        return Err(SpanIngestRequestError::InvalidIdempotencyKey { len: key.len() });
+    }
+    // One hour-bucket computation shared by the lookup and the marker write.
+    let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
+
+    // Replay (ADR-0051 section 5): a keyed retry whose marker is still inside
+    // the dedup window skips normalize and the router write and returns the
+    // stored receipt directly. The lookup runs before any of that work.
+    if let (Some(key), Some(bucket)) = (idempotency_key.as_deref(), hour_bucket) {
+        match read_marker(
+            state.store.as_ref(),
+            &tenant,
+            Signal::Spans,
+            key,
+            bucket,
+            DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
+        )
+        .await
+        {
+            Ok(LookupOutcome::Hit(receipt)) => {
+                // A replay reports the original outcome, not a fresh rejection
+                // count.
+                return Ok(SpanIngestOutcome {
+                    response: ExportTraceServiceResponse {
+                        partial_success: None,
+                    },
+                    tokens: Vec::new(),
+                    replayed_commit_token: Some(receipt.commit_token),
+                });
+            }
+            // Miss and Corrupt both fail open to the normal write path
+            // (ADR-0051 section 5); Corrupt is a miss, never a caller error.
+            // Corrupt still gets a signal: it means bytes in object storage
+            // failed to decode, unlike a plain Miss which is the expected
+            // common case.
+            Ok(LookupOutcome::Miss) => {}
+            Ok(LookupOutcome::Corrupt) => {
+                tracing::warn!("idempotency marker found but failed to decode; treating as a miss");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "idempotency marker lookup failed; proceeding as a normal write"
+                );
+            }
+        }
+    }
+
     let normalized = normalize_traces(request, &state.limits, ingest_ts_ns);
     // `rejected_spans` counts only spans that never reached storage. An
     // attribute-level rejection (one oversized/malformed attribute, an
@@ -44,10 +165,14 @@ pub async fn handle_export_traces(
     // for it, so it does not inflate this total (#364).
     let rejected_spans: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
+    // Spans this request actually writes, captured before `spans` is moved.
+    let written_count = normalized.spans.len() as u64;
+
     let receipt = state
         .router
-        .write(tenant, normalized.spans, mode, state.ack_deadline)
-        .await?;
+        .write(tenant.clone(), normalized.spans, mode, state.ack_deadline)
+        .await
+        .map_err(SpanIngestRequestError::Write)?;
 
     // Emit partial-success whenever anything was rejected, not only when a
     // whole span was lost: an attribute-only drop must still be surfaced to the
@@ -64,9 +189,40 @@ pub async fn handle_export_traces(
         })
     };
 
+    // Ordering (ADR-0051 section 5, experiment L6): write the marker after the
+    // durable commit and before returning, so a retry of this keyed request
+    // finds it. Only a real commit (tokens present) gets a marker.
+    if let (Some(key), Some(bucket)) = (idempotency_key.as_deref(), hour_bucket)
+        && let Some(commit_token) = encode_commit_tokens(&receipt.tokens)
+    {
+        let marker = IdempotencyReceipt {
+            written_count,
+            commit_token,
+        };
+        if let Err(err) = write_marker(
+            state.store.as_ref(),
+            &tenant,
+            Signal::Spans,
+            key,
+            bucket,
+            &marker,
+        )
+        .await
+        {
+            // The data is already durable; a marker-write failure must not
+            // fail the response. Log and ack; the retry reingests
+            // (at-least-once) since no marker exists.
+            tracing::warn!(
+                %err,
+                "idempotency marker write failed after a durable commit; acking anyway"
+            );
+        }
+    }
+
     Ok(SpanIngestOutcome {
         response: ExportTraceServiceResponse { partial_success },
         tokens: receipt.tokens,
+        replayed_commit_token: None,
     })
 }
 
@@ -143,13 +299,14 @@ mod tests {
                 shard_count: 1,
                 ..IngestConfig::default()
             },
-            store,
+            store.clone(),
             Arc::new(SystemClock),
         ));
         SpanIngestState {
             router,
             limits: SpanIngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
+            store,
         }
     }
 
@@ -206,6 +363,7 @@ mod tests {
             WriteMode::Strict,
             request,
             1_000,
+            None,
         )
         .await
         .expect("strict write publishes");
@@ -249,6 +407,7 @@ mod tests {
             WriteMode::Strict,
             request,
             1_000,
+            None,
         )
         .await
         .expect("strict write publishes");
@@ -292,6 +451,7 @@ mod tests {
             WriteMode::Strict,
             request,
             1_000,
+            None,
         )
         .await
         .expect("strict write publishes");
@@ -329,6 +489,7 @@ mod tests {
             WriteMode::Strict,
             request(vec![bad]),
             1_000,
+            None,
         )
         .await
         .expect("a write with zero admitted spans never fails");
@@ -350,6 +511,7 @@ mod tests {
             WriteMode::Buffered,
             request(vec![span("GET /checkout", vec![string_kv("k", "v")])]),
             1_000,
+            None,
         )
         .await
         .expect("buffered write never blocks past enqueue");
@@ -381,10 +543,16 @@ mod tests {
             });
         }
 
-        let outcome =
-            handle_export_traces(&state, TenantId::new("acme"), WriteMode::Strict, req, 1_000)
-                .await
-                .expect("strict write publishes");
+        let outcome = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            req,
+            1_000,
+            None,
+        )
+        .await
+        .expect("strict write publishes");
         assert_eq!(outcome.tokens.len(), 1, "the span still commits");
         let partial_success = outcome
             .response
@@ -400,6 +568,81 @@ mod tests {
                 .contains("nested array or map"),
             "the attribute drop is still surfaced through error_message: {}",
             partial_success.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_marker_falls_through_to_a_normal_write_not_an_error() {
+        use ravel_ingest::marker_key;
+        use ravel_object_store::{GetRange, PutMode, PutOptions};
+
+        let state = state();
+        let tenant = TenantId::new("acme");
+        // Matches the span helper's start/end (1_000/2_000), so the event-time
+        // skew bounds admit it; the hour bucket is 0.
+        let ingest_ts_ns: i64 = 2_000;
+        let key = b"corrupt-key".to_vec();
+        let bucket = request_ingest_hour_bucket(ingest_ts_ns).expect("valid bucket");
+
+        // Seed a marker, then flip a byte so it fails checksum: a later keyed
+        // read must see LookupOutcome::Corrupt.
+        let seed = IdempotencyReceipt {
+            written_count: 99,
+            commit_token: "stale".to_string(),
+        };
+        write_marker(
+            state.store.as_ref(),
+            &tenant,
+            Signal::Spans,
+            &key,
+            bucket,
+            &seed,
+        )
+        .await
+        .expect("seed marker");
+        let marker = marker_key(&tenant, Signal::Spans, &key, bucket);
+        let mut bytes = state
+            .store
+            .get(&marker, GetRange::Full)
+            .await
+            .expect("marker exists")
+            .data
+            .to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        state
+            .store
+            .put(
+                &marker,
+                bytes.into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("overwrite with corrupt bytes");
+
+        // The corrupt marker must be treated as a miss: a fresh normal write,
+        // not the stale receipt and not an error.
+        let outcome = handle_export_traces(
+            &state,
+            tenant,
+            WriteMode::Strict,
+            request(vec![span("GET /x", vec![string_kv("k", "v")])]),
+            ingest_ts_ns,
+            Some(key),
+        )
+        .await
+        .expect("a corrupt marker is fail-open, never an error to the caller");
+        assert!(
+            outcome.replayed_commit_token.is_none(),
+            "the stale/corrupt receipt must not be replayed"
+        );
+        assert_eq!(
+            outcome.tokens.len(),
+            1,
+            "the request wrote fresh data through the normal path"
         );
     }
 
