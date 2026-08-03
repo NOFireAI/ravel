@@ -19,9 +19,11 @@
 //! second, redundant argument.
 //!
 //! The marker body is versioned and checksummed (`RIDM` magic, u16 version,
-//! crc32c over the payload); a corrupt or truncated marker decodes to a typed
-//! [`MarkerError`], never a panic, and callers treat that as a miss
-//! (fail-open to at-least-once, ADR-0051 section 5).
+//! crc32c over `magic || version || payload`, so a bit flip in the header is
+//! caught exactly like one in the payload); a corrupt or truncated marker
+//! decodes to a typed [`MarkerError`], never a panic, and callers treat that
+//! as a miss (fail-open to at-least-once, ADR-0051 section 5). Byte layout
+//! and checksum coverage are documented in docs/catalog-and-mvcc.md.
 //!
 //! There is no dual-reader question: the `idem/` prefix is new, no old data
 //! exists under it, and no existing read, resolve, or sweep path lists it.
@@ -29,7 +31,7 @@
 use blake3::Hasher;
 use bytes::Bytes;
 use ravel_commit::keys::{ingest_hour_string, parse_ingest_hour_string};
-use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, list_all};
+use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all};
 use ravel_types::{Signal, TenantId};
 
 /// Domain-separation prefix for the keyhash, distinct from `TenantId::hash`'s
@@ -52,10 +54,12 @@ const RECEIPT_HEADER_LEN: usize = 8 + 2;
 pub struct IdempotencyReceipt {
     /// Rows (logs) or spans written by the original request.
     pub written_count: u64,
-    /// `CommitToken::encode()` output of the commit the original flush
-    /// produced. Stored as its already-opaque encoded string rather than the
-    /// parsed struct: this module has no reason to interpret it, only to
-    /// round-trip it back to the caller on replay.
+    /// The `x-ravel-commit-token` header value the original flush produced:
+    /// one comma-separated, already-`CommitToken::encode()`-d token per
+    /// shard the request's points flushed through (docs/consistency-
+    /// model.md), not a single token. Stored as that opaque encoded string
+    /// rather than parsed tokens: this module has no reason to interpret
+    /// it, only to round-trip it back to the caller on replay.
     pub commit_token: String,
 }
 
@@ -196,14 +200,19 @@ fn decode_receipt(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
     })
 }
 
-/// Encode a marker body: `RIDM` magic, u16 version, crc32c over the payload,
-/// then the payload (the serialized receipt).
+/// Encode a marker body: `RIDM` magic, u16 version, crc32c over
+/// `magic || version || payload`, then the payload (the serialized receipt).
+/// Folding the header into the checksum means a bit flip in `magic` or
+/// `version` is caught here rather than surfacing as a misdecode under a
+/// future version's body layout.
 fn encode_marker(receipt: &IdempotencyReceipt) -> Result<Vec<u8>, MarkerError> {
     let payload = encode_receipt(receipt)?;
-    let crc = crc32c::crc32c(&payload);
+    let mut prefix = Vec::with_capacity(MAGIC.len() + 2);
+    prefix.extend_from_slice(MAGIC);
+    prefix.extend_from_slice(&VERSION.to_le_bytes());
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&prefix), &payload);
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&prefix);
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
@@ -228,7 +237,10 @@ fn decode_marker(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
         return Err(MarkerError::UnsupportedVersion(version));
     }
     let stored_crc = u32::from_le_bytes(header[6..10].try_into().unwrap_or([0; 4]));
-    let computed_crc = crc32c::crc32c(payload);
+    // Coverage is magic || version || payload, matching encode_marker: the
+    // crc field itself (header[6..10]) is excluded, same as any self-
+    // describing checksum has to exclude its own bytes.
+    let computed_crc = crc32c::crc32c_append(crc32c::crc32c(&header[0..6]), payload);
     if stored_crc != computed_crc {
         return Err(MarkerError::ChecksumMismatch {
             stored: stored_crc,
@@ -277,8 +289,13 @@ pub async fn write_marker(
 ) -> Result<WriteOutcome, MarkerWriteError> {
     let key = marker_key(tenant_id, signal, client_key, ingest_hour_bucket);
     let body = encode_marker(receipt)?;
+    let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&body));
     match store
-        .put(&key, Bytes::from(body), PutOptions::create_if_absent())
+        .put(
+            &key,
+            Bytes::from(body),
+            PutOptions::create_if_absent().with_checksum(checksum),
+        )
         .await
     {
         Ok(_) => Ok(WriteOutcome::Written),
@@ -324,7 +341,12 @@ pub async fn read_marker(
         let Ok(hour) = parse_ingest_hour_string(hour_text) else {
             continue;
         };
-        if hour < min_hour || hour > now_ingest_hour_bucket {
+        // Upper bound tolerates one hour of forward clock skew (a writer
+        // whose clock ran slightly ahead across an hour boundary), while
+        // still bounding the LIST window: this is not the sweep-safety
+        // bound itself, just enough slack that a marker isn't dropped for
+        // having been pinned an hour ahead of this reader's clock.
+        if hour < min_hour || hour > now_ingest_hour_bucket.saturating_add(1) {
             continue;
         }
         if best.as_ref().is_none_or(|(best_hour, _)| hour > *best_hour) {
@@ -361,7 +383,9 @@ mod tests {
     async fn marker_replay_returns_stored_receipt() {
         let store = MemoryStore::new();
         let tenant = tenant("acme");
-        let receipt = receipt(42, "v2:token-abc");
+        // A representative multi-shard ack: the x-ravel-commit-token header
+        // carries one token per shard, comma-separated, not a single token.
+        let receipt = receipt(42, "v2:token-abc,v2:token-def,v2:token-ghi");
 
         let outcome = write_marker(
             &store,
@@ -521,6 +545,55 @@ mod tests {
         assert_eq!(stored, LookupOutcome::Hit(winning_receipt));
     }
 
+    #[tokio::test]
+    async fn write_marker_race_loser_surfaces_readback_failure() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+        let tenant = tenant("acme");
+        let ingest_hour_bucket = 495_972;
+        let key = marker_key(&tenant, Signal::Logs, b"race-key", ingest_hour_bucket);
+
+        // The Get rule only fires once the winner's marker already exists at
+        // `key`, modeling: this call loses the CreateIfAbsent race, then the
+        // mandatory read-back of the winner's marker itself fails.
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::Timeout).with_key_contains(key.clone()));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+
+        let winner = receipt(10, "v2:token-first");
+        store
+            .inner()
+            .put(
+                &key,
+                Bytes::from(encode_marker(&winner).expect("encode must succeed")),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seeding the winner's marker must succeed");
+
+        let loser = receipt(20, "v2:token-second");
+        let err = write_marker(
+            &store,
+            &tenant,
+            Signal::Logs,
+            b"race-key",
+            ingest_hour_bucket,
+            &loser,
+        )
+        .await
+        .expect_err("the loser's read-back must surface the fault, not a receipt");
+
+        assert!(
+            matches!(err, MarkerWriteError::Store(StoreError::Timeout)),
+            "expected the read-back's fault to propagate untouched, got {err:?}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::Timeout),
+            1,
+            "the fault must actually have fired, not passed through"
+        );
+    }
+
     proptest! {
         #[test]
         fn receipt_codec_round_trips(
@@ -533,9 +606,53 @@ mod tests {
             prop_assert_eq!(decoded, original);
         }
 
+        // Uniform-random bytes almost never clear the magic check, so that
+        // alone barely exercises decode_marker past its first branch.
+        // Instead start from a valid encoded frame and tamper it three
+        // distinct ways, still asserting only "never panics": truncation,
+        // a single flipped byte anywhere (header or payload), and a
+        // token-length prefix set independently of what actually follows
+        // it (the one field decode_receipt trusts most).
         #[test]
-        fn decode_never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..300)) {
-            let _ = decode_marker(&bytes);
+        fn decode_never_panics_on_truncated_frame(
+            written_count in any::<u64>(),
+            commit_token in "[a-zA-Z0-9:_-]{0,64}",
+            cut_at in any::<usize>(),
+        ) {
+            let original = IdempotencyReceipt { written_count, commit_token };
+            let encoded = encode_marker(&original).expect("encode must succeed for a reasonable token");
+            let cut = cut_at % (encoded.len() + 1);
+            let _ = decode_marker(&encoded[..cut]);
+        }
+
+        #[test]
+        fn decode_never_panics_on_single_bit_flip(
+            written_count in any::<u64>(),
+            commit_token in "[a-zA-Z0-9:_-]{0,64}",
+            flip_at in any::<usize>(),
+            flip_bit in 0u8..8,
+        ) {
+            let original = IdempotencyReceipt { written_count, commit_token };
+            let mut encoded = encode_marker(&original).expect("encode must succeed for a reasonable token");
+            let idx = flip_at % encoded.len();
+            encoded[idx] ^= 1 << flip_bit;
+            let _ = decode_marker(&encoded);
+        }
+
+        // Tamper the length prefix directly against decode_receipt (below
+        // the crc, which would otherwise catch the mismatch first and mask
+        // this branch): the length prefix must never be trusted past what
+        // actually remains in the payload.
+        #[test]
+        fn decode_never_panics_on_tampered_token_length(
+            written_count in any::<u64>(),
+            commit_token in "[a-zA-Z0-9:_-]{0,64}",
+            bogus_len in any::<u16>(),
+        ) {
+            let original = IdempotencyReceipt { written_count, commit_token };
+            let mut payload = encode_receipt(&original).expect("encode must succeed for a reasonable token");
+            payload[8..10].copy_from_slice(&bogus_len.to_le_bytes());
+            let _ = decode_receipt(&payload);
         }
     }
 }

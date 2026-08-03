@@ -45,8 +45,11 @@ guarantee beyond the run that created them.
   read, resolve, or sweep path lists it (commit resolution lists `c/…`, the
   orphan sweep lists `l0/…`; the fail-loud unknown-key rule below applies
   only to the `c/` prefix), and markers older than the dedup window
-  (default 24h, from the `ingest_hour` in the file name) are deleted by a
-  stateless sweep rule in `ravel-maintain`, not by this crate.
+  (default 24h, from the `ingest_hour` in the file name) will be deleted by
+  a stateless sweep rule in `ravel-maintain` (ADR-0051 §5; not yet
+  implemented, see epic #452 EB-9), not by this crate.
+- Marker body byte layout and checksum coverage: see "Idempotency marker
+  body layout" below.
 - `input_set_hash16`: first 16 hex chars of the blake3 digest over the
   compaction record's sorted `inputs` list (canonical encoding, sorted by
   `(writer_id, writer_epoch, writer_seq)`). `hash16` on an L1 part is the
@@ -96,6 +99,31 @@ guarantee beyond the run that created them.
   fold the same input independently write the same key and
   `PutMode::CreateIfAbsent` `AlreadyExists` is idempotent success, exactly
   like data objects (ADR-0010 §7).
+
+### Idempotency marker body layout
+
+The object at an `idem/<keyhash32>.<ingest_hour>.idm` key (ADR-0051 §5,
+`crates/ravel-ingest/src/idempotency.rs`) is a small versioned, checksummed
+frame, header then payload:
+
+| bytes | field | encoding |
+|---|---|---|
+| 0..4 | magic | `RIDM`, fixed |
+| 4..6 | version | u16 LE, currently `1` |
+| 6..10 | crc32c | u32 LE |
+| 10..18 | `written_count` | u64 LE |
+| 18..20 | token-set length | u16 LE, byte length of the field below |
+| 20.. | token set | UTF-8, the `x-ravel-commit-token` header value: one `CommitToken::encode()` output per shard the request's points flushed through, comma-separated |
+
+Checksum coverage: the crc32c at bytes 6..10 covers `magic || version ||
+payload` (bytes 0..6 followed by everything from byte 10 onward) — the crc
+field itself is excluded, same as any self-describing checksum has to
+exclude its own bytes. Folding the header into the checksum means a
+corrupted `magic` or `version` byte is caught here rather than surfacing
+later as a misdecode under a future version's body layout. A checksum
+mismatch, truncation, bad magic, or malformed payload are all typed decode
+errors; the caller treats every one of them as a marker miss (fail-open to
+at-least-once, ADR-0051 §5), never a panic.
 
 ## Pinned flush identity
 
