@@ -174,30 +174,46 @@ fn two_exemplars_for_one_series_in_one_window_admit_the_newest_and_count_one_dro
     assert_eq!(dropped_counts(&result.output.rejected), vec![1]);
 }
 
-/// FINDING 4: two exemplars on one series with identical `ts_ns` must break
-/// the tie deterministically. A bounds-less histogram gives one `+Inf` bucket,
-/// so both exemplars attach to the same series; the stable descending sort
-/// keeps the first in wire order, which is offered to the cap first and wins.
-/// Distinguishable values (1.0 then 2.0) name the survivor; an unstable sort
-/// could keep either.
+/// FINDING 4: exemplars on one series that share a `ts_ns` must break the tie
+/// deterministically. A bounds-less histogram gives one `+Inf` bucket, so every
+/// exemplar attaches to the same series; the stable descending sort keeps the
+/// first in wire order, which is offered to the cap first and wins.
+///
+/// 300 rows over 5 timestamps, all in one window. The size and the mixed
+/// timestamps are the point. `sort_unstable` insertion-sorts a short slice,
+/// which preserves input order, so a two-row input cannot tell a stable sort
+/// from an unstable one: an earlier version of this test passed against the
+/// unfixed code. At this length, with duplicates among distinct keys, swapping
+/// `sort_by_key` for `sort_unstable_by_key` does fail it.
 #[test]
 fn identical_timestamp_exemplars_keep_the_first_in_wire_order() {
+    let offsets_ns = [3i64, 9, 1, 9, 5];
+    let mut rows = Vec::with_capacity(300);
+    for round in 0..60i64 {
+        for (slot, offset) in offsets_ns.iter().enumerate() {
+            // Value encodes wire position, so the assertion names one row.
+            let position = round * 5 + slot as i64;
+            rows.push(exemplar_row(INGEST_TS_NS + offset, position as f64, None));
+        }
+    }
+    // The newest timestamp is `INGEST_TS_NS + 9`, first seen at position 1.
+    let expected_position = 1.0f64;
+
     let mut cap = ExemplarCap::default();
-    let result = normalize(
-        &histogram_with(
-            vec![],
-            vec![
-                exemplar_row(INGEST_TS_NS, 1.0, Some(TRACE_ID)),
-                exemplar_row(INGEST_TS_NS, 2.0, None),
-            ],
-        ),
-        &mut cap,
-    );
+    let result = normalize(&histogram_with(vec![], rows), &mut cap);
 
     assert_eq!(result.exemplars.len(), 1);
-    // The first exemplar in wire order (value 1.0) survives the tie.
-    assert_eq!(result.exemplars[0].exemplar.value_bits, 1.0f64.to_bits());
-    assert_eq!(dropped_counts(&result.output.rejected), vec![1]);
+    assert_eq!(
+        result.exemplars[0].exemplar.ts_ns,
+        INGEST_TS_NS + 9,
+        "the newest timestamp in the window must win"
+    );
+    assert_eq!(
+        result.exemplars[0].exemplar.value_bits,
+        expected_position.to_bits(),
+        "among equal timestamps the first in wire order must win"
+    );
+    assert_eq!(dropped_counts(&result.output.rejected), vec![299]);
 }
 
 #[test]

@@ -1893,10 +1893,31 @@ mod tests {
     /// assertion name the survivor; an unstable sort could keep either.
     #[test]
     fn identical_timestamp_exemplars_keep_the_first_in_wire_order() {
-        let s = series_with_exemplars(vec![
-            exemplar(1_000, 1.0, vec![]),
-            exemplar(1_000, 2.0, vec![]),
-        ]);
+        // 300 exemplars over 5 timestamps, all inside the first 10 s window, so
+        // the cap admits exactly one. The winner must be the first in wire
+        // order among those at the newest timestamp.
+        //
+        // The size and the mixed timestamps are the point. `sort_unstable`
+        // insertion-sorts a short slice, which preserves input order, so a
+        // two-element or all-equal input cannot tell a stable sort from an
+        // unstable one: an earlier version of this test passed against the
+        // unfixed code. At this length, with duplicates among distinct keys,
+        // swapping `sort_by_key` for `sort_unstable_by_key` does fail it.
+        let timestamps_ms = [3_000i64, 9_000, 1_000, 9_000, 5_000];
+        let mut exemplars = Vec::with_capacity(300);
+        for round in 0..60i64 {
+            for (slot, ts_ms) in timestamps_ms.iter().enumerate() {
+                // Value encodes wire position, so the assertion names one
+                // exemplar exactly.
+                let position = round * 5 + slot as i64;
+                exemplars.push(exemplar(*ts_ms, position as f64, vec![]));
+            }
+        }
+        // The newest timestamp is 9 s, and its first appearance in wire order
+        // is position 1.
+        let expected_position = 1.0f64;
+
+        let s = series_with_exemplars(exemplars);
         let mut cap = ExemplarCap::default();
         let result = normalize_with_exemplars(
             &tenant(),
@@ -1907,9 +1928,16 @@ mod tests {
         );
 
         assert_eq!(result.exemplars.len(), 1);
-        // The first exemplar in wire order (value 1.0) survives the tie.
-        assert_eq!(result.exemplars[0].exemplar.value_bits, 1.0f64.to_bits());
-        assert_eq!(result.output.exemplars_dropped, 1);
+        assert_eq!(
+            result.exemplars[0].exemplar.ts_ns, 9_000_000_000,
+            "the newest timestamp in the window must win"
+        );
+        assert_eq!(
+            result.exemplars[0].exemplar.value_bits,
+            expected_position.to_bits(),
+            "among equal timestamps the first in wire order must win"
+        );
+        assert_eq!(result.output.exemplars_dropped, 299);
     }
 
     #[test]
