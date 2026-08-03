@@ -205,14 +205,22 @@ impl IngestRouter {
         let mut ack_rxs = Vec::with_capacity(shard_ids.len());
         for shard in shard_ids {
             let points = by_shard.remove(&shard).unwrap_or_default();
+            // Strict mode acknowledges the points this request sent. A shard
+            // that received only exemplars gets no ack: an exemplar is a
+            // decoration on a measurement (ADR-0047 decision 1), its loss is
+            // counted and visible rather than acknowledged, and its flush may
+            // write nothing at all when the parent samples are not buffered.
+            // Minting an ack for that shard would leave a waiter its flush
+            // path has no token to answer with, and a dropped oneshot reads as
+            // a dead shard.
             let ack = match mode {
-                WriteMode::Strict => {
+                WriteMode::Strict if !points.is_empty() => {
                     let (tx, rx) = oneshot::channel();
                     ack_shards.push(shard);
                     ack_rxs.push(rx);
                     Some(tx)
                 }
-                WriteMode::Buffered => None,
+                WriteMode::Strict | WriteMode::Buffered => None,
             };
             let msg = ShardMsg::Write {
                 tenant: tenant.clone(),

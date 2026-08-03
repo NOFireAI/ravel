@@ -333,3 +333,65 @@ async fn exemplar_values_round_trip_by_bit_pattern() {
 
     router.shutdown().await;
 }
+
+/// A strict-mode write whose exemplars route to a shard that receives no
+/// points must still succeed, and must not bury that shard as dead.
+///
+/// The router messages a shard that owns only an exemplar's series, because
+/// that shard's buffer may already hold the parent samples from an earlier
+/// request in this flush window. When it does not, the flush writes nothing and
+/// returns early. Minting a strict ack for such a shard would leave a waiter its
+/// flush path has no commit token to answer with, and a dropped oneshot reads to
+/// the router as a dead actor: `mark_shard_dead` plus `ShardUnavailable`, so a
+/// healthy shard is counted dead forever and the caller sees an error for a
+/// write that committed elsewhere. Strict mode acknowledges the points a request
+/// sent, and this request sent none to that shard.
+///
+/// This needs more than one shard, so it builds its own router rather than
+/// using `router_with`, whose `shard_count` is 1 and under which the case
+/// cannot arise at all.
+#[tokio::test]
+async fn an_exemplar_only_shard_does_not_fail_a_strict_write() {
+    let store: Arc<dyn ObjectStoreBackend> =
+        Arc::new(ravel_object_store::memory::MemoryStore::new());
+    let router = IngestRouter::new(
+        IngestConfig {
+            shard_count: 4,
+            ..flush_on_first_point()
+        },
+        Arc::clone(&store),
+        Signal::Metrics,
+        TestClock::new(BASE_NS),
+    );
+    let t = tenant("acme");
+
+    let shards = router.shard_count();
+    let alpha_shard = ravel_types::shard_for(&series_id_of(&t, "alpha"), shards);
+    let other = (0..500)
+        .map(|i| format!("beta{i}"))
+        .find(|m| ravel_types::shard_for(&series_id_of(&t, m), shards) != alpha_shard)
+        .expect("a metric on a different shard");
+
+    let receipt = router
+        .write_values_with_exemplars(
+            t.clone(),
+            vec![scalar_point(&t, "alpha", 1_000, 1.0)],
+            vec![
+                exemplar(&t, "alpha", 1_000, 1.0, 1),
+                exemplar(&t, &other, 1_000, 9.0, 9),
+            ],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the write must succeed, not report the shard unavailable");
+
+    assert_eq!(receipt.tokens.len(), 1, "only the shard that took points");
+    assert_eq!(
+        router.metrics().snapshot().shard_deaths,
+        0,
+        "no healthy shard may be counted dead"
+    );
+
+    router.shutdown().await;
+}
