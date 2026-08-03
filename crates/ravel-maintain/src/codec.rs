@@ -81,7 +81,9 @@ pub trait SegmentCodec {
 
     /// Stream-merge every input into size-capped [`BuiltPart`]s and PUT each
     /// one `CreateIfAbsent` (build.rs's job). `catalogs` is aligned one-to-one
-    /// with `inputs` in canonical input order. RSEG and RLOG fetch page/block
+    /// with `inputs` in canonical input order and is taken by value: this is
+    /// the catalogs' last use, so a codec may move records out of them rather
+    /// than clone (RSEG moves exemplars, issue #557). RSEG and RLOG fetch page/block
     /// bytes lazily by range, bounding peak *decoded* memory to catalog
     /// metadata plus one in-flight part, and additionally bound raw fetched
     /// bytes via their ranged readers (RSEG's `open_from_suffix`, RLOG's
@@ -95,7 +97,7 @@ pub trait SegmentCodec {
         config: &CompactorConfig,
         bucket: &Bucket,
         inputs: &[InputRecord],
-        catalogs: &[Self::Catalog],
+        catalogs: Vec<Self::Catalog>,
         input_set_hash: &[u8; 32],
     ) -> Result<Vec<BuiltPart>>;
 }
@@ -122,7 +124,7 @@ impl SegmentCodec for RsegCodec {
         config: &CompactorConfig,
         bucket: &Bucket,
         inputs: &[InputRecord],
-        catalogs: &[Self::Catalog],
+        catalogs: Vec<Self::Catalog>,
         input_set_hash: &[u8; 32],
     ) -> Result<Vec<BuiltPart>> {
         crate::build::build_parts(store, config, bucket, inputs, catalogs, input_set_hash).await

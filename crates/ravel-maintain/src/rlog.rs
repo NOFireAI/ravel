@@ -194,7 +194,7 @@ impl SegmentCodec for RlogCodec {
         config: &CompactorConfig,
         bucket: &Bucket,
         inputs: &[InputRecord],
-        catalogs: &[Self::Catalog],
+        catalogs: Vec<Self::Catalog>,
         input_set_hash: &[u8; 32],
     ) -> Result<Vec<BuiltPart>> {
         if inputs.len() != catalogs.len() {
@@ -209,7 +209,7 @@ impl SegmentCodec for RlogCodec {
         // per part, so we need only the ordering here). Two inputs claiming the
         // same stream_id with different blobs is a fatal invariant breach.
         let mut merged: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
-        for catalog in catalogs {
+        for catalog in &catalogs {
             for entry in catalog.reader.stream_dir().entries() {
                 match merged.entry(entry.stream_id) {
                     std::collections::btree_map::Entry::Vacant(slot) => {
@@ -236,7 +236,7 @@ impl SegmentCodec for RlogCodec {
         // The output's indexed-field list: the union of the inputs' (issue #509,
         // and see `input_indexed_fields`). Every part of this compaction gets
         // the same list, so a field is indexed uniformly across the output.
-        let indexed_fields = merged_indexed_fields(catalogs);
+        let indexed_fields = merged_indexed_fields(&catalogs);
         let mut parts = Vec::new();
         let mut part_index: u32 = 0;
         let mut batch: Vec<LogRecord> = Vec::new();
@@ -248,7 +248,7 @@ impl SegmentCodec for RlogCodec {
         // it reaches the size cap (so a stream never straddles two parts, the
         // log analogue of RSEG's series-boundary split).
         for stream_id in merged.keys() {
-            let mut recs = gather_stream(store, catalogs, stream_id).await?;
+            let mut recs = gather_stream(store, &catalogs, stream_id).await?;
             // Stable sort by ts: within one stream this is the format's
             // (stream_ref, ts) order, and ts ties keep canonical input order
             // (readers are iterated in the inputs' canonical order). No dedup:

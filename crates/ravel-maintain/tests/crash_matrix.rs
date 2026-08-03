@@ -194,7 +194,7 @@ async fn row10_racing_compactors_loser_converges_and_repairs() {
     for i in &inputs {
         catalogs.push(read::load_input_catalog(&store, &cfg(), i).await.unwrap());
     }
-    let parts = build::build_parts(&store, &cfg(), &bucket, &inputs, &catalogs, &hash)
+    let parts = build::build_parts(&store, &cfg(), &bucket, &inputs, catalogs, &hash)
         .await
         .unwrap();
 
@@ -287,7 +287,7 @@ async fn row11_already_exists_different_hash_alarms() {
     for i in &inputs {
         catalogs.push(read::load_input_catalog(&store, &cfg(), i).await.unwrap());
     }
-    let parts = build::build_parts(&store, &cfg(), &bucket, &inputs, &catalogs, &our_hash)
+    let parts = build::build_parts(&store, &cfg(), &bucket, &inputs, catalogs, &our_hash)
         .await
         .unwrap();
     let err = publish::publish_record(
@@ -339,7 +339,7 @@ async fn row13_past_deadline_abandons_without_publishing() {
     for i in &inputs {
         catalogs.push(read::load_input_catalog(&store, &config, i).await.unwrap());
     }
-    let parts = build::build_parts(&store, &config, &bucket, &inputs, &catalogs, &hash)
+    let parts = build::build_parts(&store, &config, &bucket, &inputs, catalogs, &hash)
         .await
         .unwrap();
     let outcome = publish::publish_record(

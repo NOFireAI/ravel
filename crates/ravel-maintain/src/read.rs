@@ -250,8 +250,10 @@ pub struct InputCatalog {
 /// Footer is located by a suffix probe (one GET, growing to a second GET only
 /// if the probe missed the footer). The catalog sections are then read: a
 /// sparse v5 object (series_count at or above the threshold) needs the whole
-/// object for the sparse decode, but an L0-shaped object below the threshold
-/// needs only its three catalog sections, fetched by range.
+/// object for the sparse decode, but an object below the threshold needs only
+/// its three catalog sections, fetched by range. Either shape occurs at L0: a
+/// busy shard flushes 4096+ series in one object, so the sparse branch is a
+/// routine L0 input, not just a compacted output.
 pub async fn load_input_catalog(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -286,7 +288,11 @@ pub async fn load_input_catalog(
     let sparse =
         loc.version == VERSION_V6 && footer.series_count >= ravel_segment::V5_SPARSE_THRESHOLD;
     let entries = if sparse {
-        // Sparse decode needs the whole object; L0 inputs rarely reach here.
+        // Sparse decode needs the whole object. An L0 flush of 4096+ series is
+        // ordinary (a busy shard reaches it in one flush), so this branch is a
+        // routine input shape, not a rare one; the whole-object GET is the
+        // stated cost of the sparse catalog decode, not evidence of a corner
+        // case.
         let whole = store.get(&object_key, GetRange::Full).await?;
         decode_catalog_v5(footer, &whole.data, limits)?
     } else {
