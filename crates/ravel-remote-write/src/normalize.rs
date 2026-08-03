@@ -264,7 +264,12 @@ pub fn normalize_with_exemplars(
     if total_points > limits.max_data_points_per_request {
         // Nothing in the request is looked at past this point, so no exemplar
         // reaches the cap; the whole request's exemplars are dropped with it.
-        let exemplars_dropped = resolved.series.iter().map(|s| s.exemplars.len()).sum();
+        let exemplars_dropped = resolved.exemplars_dropped
+            + resolved
+                .series
+                .iter()
+                .map(|s| s.exemplars.len())
+                .sum::<usize>();
         return RwMetricsNormalizeResult {
             output: RwNormalizeOutput {
                 points: Vec::new(),
@@ -291,7 +296,9 @@ pub fn normalize_with_exemplars(
     let mut rejected = Vec::new();
     let mut counts = HistogramTallies::default();
     let mut exemplars = Vec::new();
-    let mut exemplars_dropped = 0usize;
+    // Exemplars dropped at decode time (RW2 budget overflow) are already
+    // counted; the per-series admission pass below adds to this.
+    let mut exemplars_dropped = resolved.exemplars_dropped;
 
     for series in &resolved.series {
         normalize_series(
@@ -1031,6 +1038,7 @@ mod tests {
             series,
             metadata_count: 0,
             created_timestamps_count: 0,
+            exemplars_dropped: 0,
         }
     }
 

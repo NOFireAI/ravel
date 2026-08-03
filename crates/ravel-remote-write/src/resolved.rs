@@ -123,9 +123,19 @@ pub struct ResolvedSeries {
 /// (RW2's `Sample.start_timestamp` and `Histogram.start_timestamp`; RW1's
 /// `prometheus.Sample` has no such field, so RW1 always resolves this to
 /// 0).
+///
+/// `exemplars_dropped` counts exemplars dropped during decode itself, before
+/// normalization: an RW2 exemplar whose resolved label bytes would carry the
+/// request past the cumulative resolved-label budget is dropped here rather
+/// than rejecting the whole request (an exemplar is a decoration on the series
+/// data, never a reason to lose it). Always 0 for RW1, which resolves no
+/// symbol table and charges no budget. Normalization folds this into its own
+/// [`RwNormalizeOutput::exemplars_dropped`] tally so the operator-visible
+/// count reflects it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedRequest {
     pub series: Vec<ResolvedSeries>,
     pub metadata_count: usize,
     pub created_timestamps_count: usize,
+    pub exemplars_dropped: usize,
 }
