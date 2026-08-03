@@ -524,7 +524,10 @@ impl<'a> PostingsSection<'a> {
         // term this block decodes to must sort strictly below it, or the
         // block's actual contents disagree with the header range `probe`
         // picked it by.
-        let upper_bound = field.blocks.get(block_idx + 1).map(|b| b.first_term.as_slice());
+        let upper_bound = field
+            .blocks
+            .get(block_idx + 1)
+            .map(|b| b.first_term.as_slice());
         let stored = self
             .bytes
             .get(block.offset..block.offset + block.stored_len)

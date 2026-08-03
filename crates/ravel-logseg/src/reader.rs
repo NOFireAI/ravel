@@ -151,7 +151,10 @@ impl<'a> RlogReader<'a> {
         if let Some(desc) = &self.postings {
             let postings_arms = self.postings_arms(&arms);
             if !postings_arms.is_empty() {
-                match self.postings_section_verified(desc).and_then(PostingsSection::parse) {
+                match self
+                    .postings_section_verified(desc)
+                    .and_then(PostingsSection::parse)
+                {
                     Ok(section) => {
                         for (cid, term) in &postings_arms {
                             match section.probe(*cid, term) {
