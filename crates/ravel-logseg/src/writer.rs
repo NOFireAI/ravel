@@ -19,6 +19,7 @@ use crate::bloom_section::encode_bloom_section;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
 use crate::footer::{COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer};
+use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
 use crate::record::{
     COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord, ResolvedRow,
     resolve_value,
@@ -36,6 +37,16 @@ pub struct RlogConfig {
     pub zstd_level: i32,
     pub bloom_seed: u64,
     pub max_uncomp_section: u64,
+    /// Per-field cap on distinct values a POSTINGS term dictionary may carry
+    /// for one object. A field named via [`RlogWriter::with_indexed_fields`]
+    /// that exceeds this in one object has its postings dropped for that
+    /// object and `WriteStats::postings_capped_fields` incremented; the field
+    /// stays queryable through BLOOM plus the exact scan
+    /// (docs/adrs/0049-rlog-postings.md decision 4).
+    pub postings_max_distinct: usize,
+    /// Terms per POSTINGS term block (docs/adrs/0049-rlog-postings.md
+    /// decision 2). Must be nonzero.
+    pub postings_stride: u32,
 }
 
 impl Default for RlogConfig {
@@ -47,6 +58,8 @@ impl Default for RlogConfig {
             zstd_level: 3,
             bloom_seed: 0,
             max_uncomp_section: 1 << 30,
+            postings_max_distinct: 10_000,
+            postings_stride: DEFAULT_STRIDE,
         }
     }
 }
@@ -66,6 +79,17 @@ pub struct RlogWriter {
     cfg: RlogConfig,
     identity: ObjectIdentity,
     records: Vec<LogRecord>,
+    indexed_fields: Vec<String>,
+}
+
+/// Counters describing one write beyond what the object bytes themselves
+/// already record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteStats {
+    /// Indexed fields dropped from POSTINGS in this object for exceeding
+    /// `RlogConfig::postings_max_distinct`
+    /// (docs/adrs/0049-rlog-postings.md decision 4).
+    pub postings_capped_fields: u32,
 }
 
 /// The maximum byte length of a string value inserted into the bloom by exact
@@ -78,7 +102,21 @@ impl RlogWriter {
             cfg,
             identity,
             records: Vec::new(),
+            indexed_fields: Vec::new(),
         }
+    }
+
+    /// Configures which dynamic attribute names get a POSTINGS entry
+    /// (docs/adrs/0049-rlog-postings.md decision 3: opt-in per field, never
+    /// automatic). A name with no matching dynamic column in this object
+    /// (never seen, or folded into `attrs_raw` overflow past the
+    /// `max_dynamic_columns` budget) simply has no postings -- always-legal
+    /// degradation, not an error. A separate `[Type Str]` and `[Type I64]`
+    /// column sharing this name (see `field_dir_splits_types`) both get
+    /// postings, since they are distinct columns.
+    pub fn with_indexed_fields(mut self, fields: Vec<String>) -> Self {
+        self.indexed_fields = fields;
+        self
     }
 
     /// Buffers one record.
@@ -92,6 +130,12 @@ impl RlogWriter {
     /// `input_set_hash`, `part_index = 0`). Empty input is rejected: the flush
     /// layer never writes empty objects (matches RSEG's zero-sample rule).
     pub fn finish(self) -> Result<Vec<u8>, LogSegError> {
+        self.finish_with_stats().map(|(bytes, _)| bytes)
+    }
+
+    /// Like [`RlogWriter::finish`], but also returns counters
+    /// ([`WriteStats`]) not otherwise recoverable from the object bytes.
+    pub fn finish_with_stats(self) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         self.build_object(0, Vec::new(), 0)
     }
 
@@ -115,6 +159,18 @@ impl RlogWriter {
         input_set_hash: Vec<u8>,
         part_index: u32,
     ) -> Result<Vec<u8>, LogSegError> {
+        self.finish_compacted_with_stats(level, input_set_hash, part_index)
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// Like [`RlogWriter::finish_compacted`], but also returns counters
+    /// ([`WriteStats`]) not otherwise recoverable from the object bytes.
+    pub fn finish_compacted_with_stats(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+    ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         self.build_object(level, input_set_hash, part_index)
     }
 
@@ -128,7 +184,7 @@ impl RlogWriter {
         level: u32,
         input_set_hash: Vec<u8>,
         part_index: u32,
-    ) -> Result<Vec<u8>, LogSegError> {
+    ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         if self.records.is_empty() {
             return Err(LogSegError::LimitExceeded("empty object".into()));
         }
@@ -185,6 +241,18 @@ impl RlogWriter {
         let ty_of_column: HashMap<u32, FieldType> =
             columns.iter().map(|(_, ty, id)| (*id, *ty)).collect();
 
+        // Columns whose name is in the caller's indexed-field list
+        // (docs/adrs/0049-rlog-postings.md decision 3): a name past the
+        // dynamic-column budget above simply has no matching column_id here,
+        // so it has no postings -- legal degradation, not an error.
+        let indexed_names: std::collections::HashSet<&str> =
+            self.indexed_fields.iter().map(String::as_str).collect();
+        let indexed_column_ids: BTreeSet<u32> = columns
+            .iter()
+            .filter(|(name, _, _)| indexed_names.contains(name.as_str()))
+            .map(|(_, _, cid)| *cid)
+            .collect();
+
         // Resolve every record into storage form, then sort by (stream_ref, ts).
         let mut rows: Vec<ResolvedRow> = self
             .records
@@ -210,6 +278,13 @@ impl RlogWriter {
         let mut blocks_bytes: Vec<u8> = Vec::new();
         let mut l0: Vec<Level0Entry> = Vec::new();
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
+
+        // POSTINGS accumulation: per indexed column, term -> sorted block
+        // indices. `BTreeMap`/`BTreeSet` throughout, never `HashMap`, so
+        // output stays byte-identical for identical input (the same
+        // determinism rule as everything else in this pipeline).
+        let mut postings_terms: BTreeMap<u32, BTreeMap<Vec<u8>, BTreeSet<u32>>> = BTreeMap::new();
+        let mut postings_capped: BTreeSet<u32> = BTreeSet::new();
 
         let mut min_ts = i64::MAX;
         let mut max_ts = i64::MIN;
@@ -249,6 +324,17 @@ impl RlogWriter {
                 for (cid, v) in &row.columns {
                     if let ColumnValue::Str(bytes) = v {
                         insert_text(&mut builder, *cid, bytes);
+                    }
+                    if indexed_column_ids.contains(cid) && !postings_capped.contains(cid) {
+                        let field_map = postings_terms.entry(*cid).or_default();
+                        field_map
+                            .entry(term_key(v))
+                            .or_default()
+                            .insert(blk_idx_u32);
+                        if field_map.len() > self.cfg.postings_max_distinct {
+                            postings_terms.remove(cid);
+                            postings_capped.insert(*cid);
+                        }
                     }
                 }
             }
@@ -326,6 +412,23 @@ impl RlogWriter {
 
         let skip = SkipIndex::build(l0);
 
+        // Final per-field postings verdict: capped fields get `Capped`
+        // (their term map was already dropped above), everything else in
+        // `indexed_column_ids` gets its accumulated map (empty if the field
+        // never appeared in this object -- also always-legal).
+        let postings_capped_fields = postings_capped.len() as u32;
+        let mut postings_fields: BTreeMap<u32, FieldTerms> = BTreeMap::new();
+        for &cid in &indexed_column_ids {
+            if postings_capped.contains(&cid) {
+                postings_fields.insert(cid, FieldTerms::Capped);
+            } else {
+                postings_fields.insert(
+                    cid,
+                    FieldTerms::Terms(postings_terms.remove(&cid).unwrap_or_default()),
+                );
+            }
+        }
+
         // Assemble sections in kind order.
         let mut object = Vec::new();
         let mut sections: Vec<SectionDesc> = Vec::new();
@@ -360,6 +463,19 @@ impl RlogWriter {
             kind::BLOOM,
             &Stored::raw(encode_bloom_section(&bloom_entries)),
         );
+        if !indexed_column_ids.is_empty() {
+            let postings_bytes = encode_postings_section(
+                &postings_fields,
+                self.cfg.postings_stride,
+                self.cfg.zstd_level,
+            )?;
+            push_section(
+                &mut object,
+                &mut sections,
+                kind::POSTINGS,
+                &Stored::raw(postings_bytes),
+            );
+        }
 
         let footer = LogFooter {
             tenant_hash: self.identity.tenant_hash,
@@ -384,7 +500,12 @@ impl RlogWriter {
             part_index,
         };
         write_footer_and_trailer(&mut object, &footer);
-        Ok(object)
+        Ok((
+            object,
+            WriteStats {
+                postings_capped_fields,
+            },
+        ))
     }
 }
 
@@ -832,5 +953,123 @@ mod tests {
             .expect("decompress");
         let fd = FieldDir::decode(&raw, 10_000).expect("decode");
         assert_eq!(fd.len(), 1000);
+    }
+
+    #[test]
+    fn no_indexed_fields_omits_postings_section() {
+        // No `with_indexed_fields` call: absence is always legal
+        // (docs/adrs/0049-rlog-postings.md decision 5), so the section is
+        // omitted entirely rather than written empty.
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.push(base_record(0, 0)).expect("push");
+        let obj = w.finish().expect("finish");
+        let footer = open(&obj).expect("open");
+        assert!(footer.section(kind::POSTINGS).is_none());
+    }
+
+    /// Decodes FIELD_DIR from a written object.
+    fn read_field_dir(obj: &[u8], footer: &LogFooter) -> FieldDir {
+        let fd_desc = footer.section(kind::FIELD_DIR).expect("field_dir");
+        let start = fd_desc.offset as usize;
+        let end = start + fd_desc.len as usize;
+        let raw = zstd::bulk::decompress(&obj[start..end], fd_desc.uncomp_len as usize)
+            .expect("decompress");
+        FieldDir::decode(&raw, 1 << 20).expect("decode")
+    }
+
+    #[test]
+    fn indexed_field_postings_round_trip() {
+        // 4 records per block, 5 distinct "svc" values cycling every record:
+        // record i lands in block i / 4 and carries value "s{i % 5}".
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity()).with_indexed_fields(vec!["svc".to_string()]);
+        for i in 0..20i64 {
+            let mut r = base_record(0, i);
+            r.attrs
+                .push(("svc".into(), AttrValue::Str(format!("s{}", i % 5))));
+            w.push(r).expect("push");
+        }
+        let obj = w.finish().expect("finish");
+        let footer = open(&obj).expect("open");
+
+        let fd = read_field_dir(&obj, &footer);
+        let cid = fd
+            .column("svc", FieldType::Str)
+            .expect("svc column present")
+            .column_id;
+
+        let pd_desc = footer
+            .section(kind::POSTINGS)
+            .expect("postings section present");
+        let pd_bytes = &obj[pd_desc.offset as usize..(pd_desc.offset + pd_desc.len) as usize];
+        let section = crate::postings::PostingsSection::parse(pd_bytes).expect("parse postings");
+
+        for v in 0..5i64 {
+            let term = format!("s{v}").into_bytes();
+            let blocks: BTreeSet<u32> = section
+                .probe(cid, &term)
+                .expect("probe")
+                .expect("field is indexed")
+                .into_iter()
+                .collect();
+            let expected: BTreeSet<u32> = (0..20i64)
+                .filter(|i| i % 5 == v)
+                .map(|i| (i / 4) as u32)
+                .collect();
+            assert_eq!(blocks, expected, "value s{v}");
+        }
+    }
+
+    #[test]
+    fn postings_cap_drops_field_and_raises_counter() {
+        // 50 distinct values, cap of 2: the field must be dropped, the
+        // counter must fire, and the field must read back as "not indexed"
+        // (Ok(None)), never as a narrowed or wrong result
+        // (docs/adrs/0049-rlog-postings.md decision 4 and 5).
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            postings_max_distinct: 2,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity()).with_indexed_fields(vec!["svc".to_string()]);
+        for i in 0..50i64 {
+            let mut r = base_record(0, i);
+            r.attrs
+                .push(("svc".into(), AttrValue::Str(format!("s{i}"))));
+            w.push(r).expect("push");
+        }
+        let (obj, stats) = w.finish_with_stats().expect("finish");
+        assert_eq!(stats.postings_capped_fields, 1);
+
+        let footer = open(&obj).expect("open");
+        let fd = read_field_dir(&obj, &footer);
+        let cid = fd
+            .column("svc", FieldType::Str)
+            .expect("svc column present")
+            .column_id;
+        let pd_desc = footer
+            .section(kind::POSTINGS)
+            .expect("postings section still present (other fields could exist)");
+        let pd_bytes = &obj[pd_desc.offset as usize..(pd_desc.offset + pd_desc.len) as usize];
+        let section = crate::postings::PostingsSection::parse(pd_bytes).expect("parse postings");
+        assert_eq!(
+            section.probe(cid, b"s0").expect("probe"),
+            None,
+            "capped field must read back as not-indexed, not as an empty/wrong result"
+        );
+
+        // The field is still fully queryable via the exact scan: every
+        // record with "svc" = "s7" is still found, capped postings or not.
+        let reader = RlogReader::new(&obj, &cfg).expect("open reader");
+        let (rows, _) = reader
+            .scan(&Predicate::Equals {
+                field: crate::record::FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("s7".into()),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 1);
     }
 }
