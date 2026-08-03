@@ -37,13 +37,16 @@ pub const COMP_ZSTD: u8 = 2;
 pub const DEFAULT_MAX_SECTION_UNCOMP: u64 = 1 << 30;
 
 /// Section kinds (docs/log-segment-format.md). The five v1 kinds are mandatory;
-/// any other kind is skipped.
+/// any other kind is skipped. POSTINGS (added by ADR-0049) is optional: absent
+/// is always legal, so it is validated separately from the mandatory-five loop
+/// below rather than added to `known`.
 pub mod kind {
     pub const STREAM_DIR: u32 = 1;
     pub const FIELD_DIR: u32 = 2;
     pub const BLOCKS: u32 = 3;
     pub const SKIP_IDX: u32 = 4;
     pub const BLOOM: u32 = 5;
+    pub const POSTINGS: u32 = 6;
 }
 
 /// One section table entry (mirrors `ravel.logseg.v1.Section`).
@@ -337,6 +340,18 @@ pub fn validate_sections(
                 s.comp
             )));
         }
+    }
+    // POSTINGS (ADR-0049) is optional: 0 or 1 occurrences, never mandatory.
+    // Absent is always legal (docs/adrs/0049-rlog-postings.md decision 5).
+    let postings_count = footer
+        .sections
+        .iter()
+        .filter(|s| s.kind == kind::POSTINGS)
+        .count();
+    if postings_count > 1 {
+        return Err(LogSegError::Corrupted(
+            "duplicate section kind POSTINGS".into(),
+        ));
     }
     Ok(())
 }
