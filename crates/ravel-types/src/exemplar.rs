@@ -41,7 +41,21 @@ pub struct Exemplar {
 
 #[derive(Debug, Clone, Copy)]
 struct KeptWindow {
-    window_start_ns: i64,
+    /// The window's index, `floor(ts_ns / window_ns)`, not its start
+    /// timestamp.
+    ///
+    /// This field held `window_start_ns` (the index multiplied back by
+    /// `window_ns`) until that multiply was found to overflow `i64` for
+    /// `ts_ns` at or near `i64::MIN`: it panics under the dev, test, and CI
+    /// profiles and wraps to a garbage window under release. The index is
+    /// what the comparison actually needs, and `div_euclid` by a positive
+    /// divisor cannot overflow, so dropping the multiply removes the
+    /// failure rather than guarding it.
+    ///
+    /// Two timestamps land in the same window exactly when their indices
+    /// are equal, so admission decisions are unchanged for every input that
+    /// did not overflow before.
+    window_index: i64,
 }
 
 /// Per-series, per-window exemplar admission cap (ADR-0047 decision 2): a
@@ -94,11 +108,11 @@ impl ExemplarCap {
     /// inside one collection interval) and wanting "keep the newest" per
     /// decision 2 must offer them in descending `ts_ns` order.
     pub fn admit(&mut self, series_id: SeriesId, candidate_ts_ns: i64) -> bool {
-        let window_start_ns = candidate_ts_ns.div_euclid(self.window_ns) * self.window_ns;
+        let window_index = candidate_ts_ns.div_euclid(self.window_ns);
         match self.kept.get(&series_id) {
-            Some(kept) if kept.window_start_ns == window_start_ns => false,
+            Some(kept) if kept.window_index == window_index => false,
             _ => {
-                self.kept.insert(series_id, KeptWindow { window_start_ns });
+                self.kept.insert(series_id, KeptWindow { window_index });
                 true
             }
         }
@@ -115,6 +129,7 @@ impl Default for ExemplarCap {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn series(byte: u8) -> SeriesId {
         SeriesId([byte; 16])
@@ -151,5 +166,66 @@ mod tests {
     fn default_window_is_ten_seconds() {
         assert_eq!(ExemplarCap::DEFAULT_WINDOW_NS, 10_000_000_000);
         assert_eq!(ExemplarCap::default().window_ns(), 10_000_000_000);
+    }
+
+    /// `i64::MIN` reaches `admit` from OTAP, whose wire timestamp is a
+    /// signed 64-bit column that no earlier stage bounds. The previous
+    /// implementation multiplied the window index back into a start
+    /// timestamp, which overflows here: a panic under this profile, a
+    /// garbage window under release. Ingest must never panic on hostile
+    /// input.
+    #[test]
+    fn extreme_timestamps_do_not_overflow() {
+        let mut cap = ExemplarCap::new(10_000_000_000);
+        assert!(cap.admit(series(1), i64::MIN));
+        assert!(cap.admit(series(2), i64::MAX));
+        // A window-1 cap is the smallest legal one, so it maximizes the
+        // index and is the worst case for any arithmetic on it.
+        let mut narrow = ExemplarCap::new(1);
+        assert!(narrow.admit(series(3), i64::MIN));
+        assert!(narrow.admit(series(4), i64::MAX));
+    }
+
+    /// The same series at `i64::MIN` twice is still one window, so the
+    /// second candidate is rejected. Without this, "does not panic" could
+    /// be satisfied by an implementation that stopped capping at the
+    /// extremes.
+    #[test]
+    fn the_cap_still_applies_at_extreme_timestamps() {
+        let mut cap = ExemplarCap::new(10_000_000_000);
+        assert!(cap.admit(series(1), i64::MIN));
+        assert!(!cap.admit(series(1), i64::MIN));
+        assert!(!cap.admit(series(1), i64::MIN + 1));
+        assert!(cap.admit(series(1), i64::MAX));
+        assert!(!cap.admit(series(1), i64::MAX));
+    }
+
+    proptest! {
+        /// No timestamp, and no legal window width, may panic.
+        #[test]
+        fn admit_never_panics(
+            ts in any::<i64>(),
+            window in 1i64..=i64::MAX,
+            byte in any::<u8>(),
+        ) {
+            let mut cap = ExemplarCap::new(window);
+            let _ = cap.admit(series(byte), ts);
+        }
+
+        /// Two timestamps are in the same window exactly when their
+        /// `div_euclid` indices match. This is the property the whole cap
+        /// rests on, asserted against the definition rather than against
+        /// the implementation's own arithmetic.
+        #[test]
+        fn admission_agrees_with_the_window_index(
+            a in any::<i64>(),
+            b in any::<i64>(),
+            window in 1i64..=i64::MAX,
+        ) {
+            let mut cap = ExemplarCap::new(window);
+            prop_assert!(cap.admit(series(1), a));
+            let same_window = a.div_euclid(window) == b.div_euclid(window);
+            prop_assert_eq!(cap.admit(series(1), b), !same_window);
+        }
     }
 }
