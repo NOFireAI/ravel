@@ -232,9 +232,35 @@ impl SegmentWriter {
     /// Series with zero samples are dropped; duplicate `series_id`s and
     /// over-large label sets are rejected by [`SegmentWriter::write_v5`].
     pub fn write_histograms(
+        series: Vec<SeriesInputV3>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+    ) -> Result<WrittenSegment, WriteError> {
+        Self::write_histograms_with_exemplars(series, identity, ingest_bounds, Vec::new())
+    }
+
+    /// Same as [`SegmentWriter::write_histograms`], additionally emitting the
+    /// EXEMPLARS section (kind 10, ADR-0047) when `exemplars` is non-empty.
+    /// This is the flush-path entry point for an ingest shard that buffered
+    /// exemplars alongside its samples (issue #474): exemplars are independent
+    /// of run/sample framing, so the adapter passes them straight through to
+    /// [`SegmentWriter::write_v5_with_exemplars`].
+    ///
+    /// Every [`ExemplarInput::series_id`] must name a series that survives
+    /// into the object, or the write fails with
+    /// `WriteError::ExemplarUnknownSeries`. Zero-sample series are dropped
+    /// here (as in `write_histograms`), so a caller that buffers exemplars
+    /// must offer only exemplars whose parent samples are in this same batch
+    /// (docs/segment-format.md "Writer edge rules").
+    ///
+    /// An empty `exemplars` emits no EXEMPLARS section at all rather than a
+    /// zero-count one: absence is the only legal representation of "no
+    /// exemplars" (ADR-0047 decision 1).
+    pub fn write_histograms_with_exemplars(
         mut series: Vec<SeriesInputV3>,
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
+        exemplars: Vec<ExemplarInput>,
     ) -> Result<WrittenSegment, WriteError> {
         for s in &mut series {
             s.values.sort_by_ts();
@@ -286,7 +312,7 @@ impl SegmentWriter {
             part_index: 0,
             level: 0,
         };
-        Self::write_v5(v4_series, identity, ingest_bounds, meta)
+        Self::write_v5_with_exemplars(v4_series, identity, ingest_bounds, meta, exemplars)
     }
 
     /// Builds the v4-grammar object (multi-run, run-major SERIES_META, the
@@ -1237,7 +1263,7 @@ fn zstd_compress_v4(data: &[u8]) -> Result<Vec<u8>, WriteError> {
 #[allow(clippy::expect_used)]
 mod v4_tests {
     use proptest::prelude::*;
-    use ravel_types::Label;
+    use ravel_types::{Label, Sample};
 
     use super::*;
     use crate::ReaderLimits;
@@ -1630,6 +1656,169 @@ mod v4_tests {
         assert_eq!(footer.base_created_unix_ns, 0);
         assert!(section_desc(&footer, section_kind::VAL_PAGES).is_none());
         assert!(section_desc(&footer, section_kind::HIST_PAGES).is_none());
+    }
+
+    /// The L0 flush adapter (`write_histograms_with_exemplars`, the ingest
+    /// shard's entry point, issue #474) carries exemplars into the EXEMPLARS
+    /// section with `series_index` resolved against the output's sorted
+    /// SERIES_IDS, and leaves the records ascending by `(series_index, ts_ns)`
+    /// with duplicates intact (ADR-0047 amendment 2026-08-03).
+    #[test]
+    fn l0_flush_adapter_writes_exemplars_in_ascending_key_order() {
+        // Ids chosen so `high` sorts after `low`: the adapter must resolve
+        // series_index against the sorted output, not the input order.
+        let high = SeriesId([0xF0; 16]);
+        let low = SeriesId([0x0F; 16]);
+        let series = vec![
+            SeriesInputV3 {
+                series_id: high,
+                labels: labels("high"),
+                values: SeriesValues::Scalar(vec![
+                    Sample {
+                        ts_ns: 1_000,
+                        value: 1.0,
+                    },
+                    Sample {
+                        ts_ns: 2_000,
+                        value: 2.0,
+                    },
+                ]),
+            },
+            SeriesInputV3 {
+                series_id: low,
+                labels: labels("low"),
+                values: SeriesValues::Scalar(vec![Sample {
+                    ts_ns: 1_500,
+                    value: 3.0,
+                }]),
+            },
+        ];
+        // Offered out of key order, and two records share `(low, 1_500)`:
+        // both must survive, in the caller's order (stable sort).
+        let exemplars = vec![
+            ExemplarInput {
+                series_id: high,
+                ts_ns: 2_000,
+                value: -0.0,
+                trace_id: [0x11; 16],
+                span_id: [0x22; 8],
+                attrs: vec![("svc".to_string(), "checkout".to_string())],
+            },
+            ExemplarInput {
+                series_id: low,
+                ts_ns: 1_500,
+                value: f64::NAN,
+                trace_id: [0x33; 16],
+                span_id: [0x44; 8],
+                attrs: Vec::new(),
+            },
+            ExemplarInput {
+                series_id: low,
+                ts_ns: 1_500,
+                value: 7.5,
+                trace_id: [0x55; 16],
+                span_id: [0u8; 8],
+                attrs: Vec::new(),
+            },
+        ];
+        let written = SegmentWriter::write_histograms_with_exemplars(
+            series,
+            test_identity(),
+            test_bounds(),
+            exemplars,
+        )
+        .expect("writes");
+
+        let obj = written.bytes.as_ref();
+        let footer = decode_footer(obj, VERSION_V6);
+        assert!(section_desc(&footer, section_kind::EXEMPLARS).is_some());
+        let records = crate::exemplars::decode_exemplars_section(
+            &footer,
+            section(obj, &footer, section_kind::LABEL_DICT),
+            section(obj, &footer, section_kind::EXEMPLARS),
+            ReaderLimits::default(),
+        )
+        .expect("decodes");
+        assert_eq!(records.len(), 3);
+        // `low` (0x0F..) is series_index 0, `high` (0xF0..) is 1.
+        let keys: Vec<(u64, i64)> = records.iter().map(|r| (r.series_index, r.ts_ns)).collect();
+        assert_eq!(keys, vec![(0, 1_500), (0, 1_500), (1, 2_000)]);
+        // Bit patterns, never `==`: NaN and -0.0 are significant.
+        assert_eq!(records[0].value.to_bits(), f64::NAN.to_bits());
+        assert_eq!(records[1].value.to_bits(), 7.5f64.to_bits());
+        assert_eq!(records[2].value.to_bits(), (-0.0f64).to_bits());
+        assert_eq!(records[2].trace_id, [0x11; 16]);
+        assert_eq!(
+            records[2].attrs,
+            vec![("svc".to_string(), "checkout".to_string())]
+        );
+    }
+
+    /// A flush with no exemplars emits no EXEMPLARS section at all: absence,
+    /// not a zero-count section, is how "no exemplars" is represented
+    /// (ADR-0047 decision 1, docs/segment-format.md).
+    #[test]
+    fn l0_flush_adapter_without_exemplars_emits_no_section() {
+        let series = vec![SeriesInputV3 {
+            series_id: SeriesId([0x07; 16]),
+            labels: labels("m"),
+            values: SeriesValues::Scalar(vec![Sample {
+                ts_ns: 10,
+                value: 1.0,
+            }]),
+        }];
+        let written = SegmentWriter::write_histograms(series, test_identity(), test_bounds())
+            .expect("writes");
+        let footer = decode_footer(written.bytes.as_ref(), VERSION_V6);
+        assert!(
+            section_desc(&footer, section_kind::EXEMPLARS).is_none(),
+            "a flush with no exemplars must emit no EXEMPLARS section"
+        );
+    }
+
+    /// An exemplar naming a series the output does not carry is a writer
+    /// error, never a silent drop (docs/segment-format.md "Writer edge
+    /// rules"). Reachable from the flush path because a zero-sample series is
+    /// dropped, so the ingest shard must filter such exemplars itself.
+    #[test]
+    fn l0_flush_adapter_rejects_an_exemplar_for_a_dropped_series() {
+        let present = SeriesId([0x01; 16]);
+        let absent = SeriesId([0x02; 16]);
+        let series = vec![
+            SeriesInputV3 {
+                series_id: present,
+                labels: labels("present"),
+                values: SeriesValues::Scalar(vec![Sample {
+                    ts_ns: 10,
+                    value: 1.0,
+                }]),
+            },
+            // Zero samples: dropped by the adapter.
+            SeriesInputV3 {
+                series_id: absent,
+                labels: labels("absent"),
+                values: SeriesValues::Scalar(Vec::new()),
+            },
+        ];
+        let exemplars = vec![ExemplarInput {
+            series_id: absent,
+            ts_ns: 10,
+            value: 1.0,
+            trace_id: [0u8; 16],
+            span_id: [0u8; 8],
+            attrs: Vec::new(),
+        }];
+        // `WrittenSegment` is not `Debug`, so match rather than `expect_err`.
+        match SegmentWriter::write_histograms_with_exemplars(
+            series,
+            test_identity(),
+            test_bounds(),
+            exemplars,
+        ) {
+            Err(WriteError::ExemplarUnknownSeries) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("an exemplar for a dropped series must not be silently dropped"),
+        }
     }
 
     #[test]
