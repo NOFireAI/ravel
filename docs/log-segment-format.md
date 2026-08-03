@@ -26,6 +26,7 @@ encodings.
 | BLOCKS       row blocks (column pages)            |  kind 3
 | SKIP_IDX     multi-level min/max index            |  kind 4
 | BLOOM        per-block token blooms               |  kind 5
+| POSTINGS     per-field term -> block postings     |  kind 6 (optional)
 | footer: LogFooter protobuf bytes                  |
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
@@ -37,7 +38,7 @@ encodings.
 +---------------------------------------------------+
 ```
 
-Writers emit the sections physically in kind order (1..5); readers rely
+Writers emit the sections physically in kind order (1..6); readers rely
 only on the footer's section offsets, never on adjacency. Bytes between
 sections are permitted and MUST be `0x00`; readers never interpret them.
 
@@ -98,13 +99,16 @@ they need no separate checksum.
 Validation (all violations `Corrupted`, never panics):
 
 - At most one section per known kind. All five v1 kinds
-  (STREAM_DIR, FIELD_DIR, BLOCKS, SKIP_IDX, BLOOM) are mandatory.
+  (STREAM_DIR, FIELD_DIR, BLOCKS, SKIP_IDX, BLOOM) are mandatory. POSTINGS
+  (kind 6, ADR-0049) is optional: present only when the writer was given
+  one or more indexed field names (`RlogWriter::with_indexed_fields`);
+  absence is legal and never treated as corruption.
 - Every section `[offset, offset+len)` lies within
   `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
 - `uncompressed_len` is capped by config (default 1 GiB per section) and
   the decompressed length must equal it exactly.
 
-### Section kinds v1
+### Section kinds
 
 | kind | name | content | comp |
 |---|---|---|---|
@@ -113,11 +117,13 @@ Validation (all violations `Corrupted`, never panics):
 | 3 | BLOCKS | row blocks, per-column pages | none (per-page) |
 | 4 | SKIP_IDX | skip index levels 0 and 1 | zstd |
 | 5 | BLOOM | per-block token bloom filters | none (per-entry) |
+| 6 | POSTINGS | per-field term -> block-index postings (optional) | none (per-block, zstd inside) |
 
 STREAM_DIR, FIELD_DIR, and SKIP_IDX are compressed as whole sections
-(zstd level 3 default) and always read whole. BLOCKS and BLOOM are
-containers: not compressed as a unit, their entries individually
-addressable so one block or one bloom is readable alone.
+(zstd level 3 default) and always read whole. BLOCKS, BLOOM, and
+POSTINGS are containers: not compressed as a unit, their entries
+individually addressable so one block, one bloom entry, or one term
+block is readable alone.
 
 ## STREAM_DIR (uncompressed form)
 
@@ -452,6 +458,105 @@ Readers reject a truncated entry, an `m_bits` that is not a power of two
 or is below 512, a `k` of 0, a `bits` length that is not `m_bits / 8`,
 and an entry index outside `[0, count)`.
 
+## POSTINGS
+
+Optional (ADR-0049, issue #508). Exact block-level pruning for equality
+predicates on dynamic attribute fields the writer was told to index
+(`RlogWriter::with_indexed_fields`), a stronger complement to BLOOM: a
+bloom probe can only prove absence with a false-positive rate, but a
+POSTINGS probe returns the exact set of blocks containing a value, so it
+can prune all the way to zero blocks. Absence of the section, or of a
+given field within it, is always legal: unindexed fields, fields never
+seen by the writer, and fields dropped for exceeding their distinct-value
+cap all fall back to bloom pruning plus an exact scan, with identical
+query results to an object that never had POSTINGS at all.
+
+Per indexed field, a sorted term dictionary maps each distinct value to
+the sorted set of block indices holding a row with that value. The
+dictionary is split into fixed-stride term blocks (`postings_stride` in
+`RlogConfig`, default 128 terms), each independently zstd-compressed and
+crc32c-verified, addressed through a sparse index holding every block's
+first term -- the same two-piece sparse-index-plus-data-blocks shape as
+RSEG's `SERIES_IDX`, collapsed into one section here since POSTINGS has
+no separate whole-object summary to keep apart from its per-field detail.
+
+```
+version: u8            (this section's own grammar version, currently 1;
+                         independent of the trailer version -- see "Version")
+field_count: u32 LE
+repeat field_count, ascending column_id:
+  column_id: uvarint
+  capped: u8                     (0 = postings present, 1 = dropped: over cap)
+  if capped == 0:
+    stride: uvarint              (terms per term block)
+    term_count: uvarint          (total distinct terms for this field)
+    block_count: uvarint
+    repeat block_count, ascending first_term:
+      first_term_len: uvarint
+      first_term_bytes: [first_term_len]u8
+      block_offset: u64 LE       (absolute offset from section start)
+      block_stored_len: u64 LE   (compressed byte length)
+      block_uncompressed_len: u64 LE
+      block_crc32c: u32 LE       (over the stored/compressed bytes)
+term_blocks: [remaining bytes]   (concatenated zstd frames, field then block
+                                  order, exactly at the offsets above)
+```
+
+`column_id`, `capped`, `stride`, `term_count`, `block_count`, and
+`first_term` fields are read eagerly when the section is opened, so a
+probe only needs to decompress and crc-verify the one term block a
+binary search over `first_term` lands on. Offset/length fields are
+fixed-width `u64`/`u32` rather than varint so the header's total byte
+length -- and therefore every block's absolute offset -- is computable in
+one pass, with no fixed-point dependency on the offsets' own encoded size
+(the same reasoning as RSEG's `SERIES_IDX`). A term's sort/equality key
+(`ravel_logseg::postings::term_key`) is `Str`/`Bytes` verbatim, `I64` as
+big-endian bytes, `F64` as its big-endian bit pattern (bit-exact, matching
+the reader's `-0.0`/NaN-payload equality convention), and `Bool` as one
+byte -- POSTINGS only ever serves equality/`IN` probes, never a range
+scan, so the encoding only needs a consistent total order, not numeric
+meaning.
+
+One term block's payload, before compression:
+
+```
+term_count_in_block: uvarint     (<= stride)
+repeat term_count_in_block, ascending term:
+  term_len: uvarint
+  term_bytes: [term_len]u8
+  posting_count: uvarint
+  repeat posting_count: delta-uvarint block index (first absolute, then
+                                                    strictly increasing deltas)
+```
+
+Parse-time validation additionally requires each field's declared blocks
+to tile the bytes following the header exactly: walking fields and blocks
+in declaration order, the first block's `block_offset` must equal the
+header's own length and every next block's `block_offset` must equal the
+previous block's `block_offset + block_stored_len`, with the last block
+ending exactly at the section's end. This catches a corrupted offset or
+a gap/overlap between blocks, not just an offset past the section.
+
+### Per-field distinct-value cap
+
+A writer bounds per-field cardinality with `RlogConfig.postings_max_distinct`
+(default 10,000): if one object's indexed field exceeds it, that field's
+postings are dropped for the whole object (`capped = 1`) rather than
+failing the write, and `WriteStats.postings_capped_fields` (from
+`RlogWriter::finish_with_stats` / `finish_compacted_with_stats`) counts
+how many fields this happened to. A capped field is queried exactly as an
+unindexed one: bloom pruning plus an exact scan, never a narrowed or
+missing result.
+
+### Version
+
+Adding POSTINGS did not bump the trailer `version` (still 2): ADR-0029's
+versioning carve-out excepts a new section kind, since unknown kinds are
+already skipped by old readers and an absent kind is already legal --
+exactly POSTINGS's own fallback behavior. Only a change to an *existing*
+section's grammar, or to a mandatory/optional kind's legality, needs a
+version bump and an ADR.
+
 ## Compaction (L0 → L1)
 
 Compaction (ADR-0032, issue #231) rewrites many small L0 `.rlog` flush
@@ -533,16 +638,22 @@ its access path (ADR-0010 §4):
 | SKIP_IDX stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | one BLOCKS block's stored bytes | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block |
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
+| one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |
 
-BLOCKS and BLOOM have no whole-section crc because they are never read
-whole: a selective scan touches a handful of blocks and their blooms, and
-a whole-section crc could not be verified without fetching the whole
-section, defeating the point. Their per-block and per-entry crc32c are the
-access-path-verifiable equivalents. The `enc`/`comp` bytes of a page are
-covered by the enclosing block's crc, so a flipped tag fails the crc
-rather than causing a silent misdecode. Pad bytes between sections are
-never interpreted and fall under the whole-object BLAKE3 in the commit
-record.
+BLOCKS, BLOOM, and POSTINGS have no whole-section crc because they are
+never read whole: a selective scan touches a handful of blocks, blooms,
+or term blocks, and a whole-section crc could not be verified without
+fetching the whole section, defeating the point. Their per-block and
+per-entry crc32c are the access-path-verifiable equivalents. The
+POSTINGS header fields themselves (`column_id`, `capped`, `stride`,
+counts, `first_term`, offsets) carry no separate checksum: they are
+validated structurally at parse time (ascending order, cap checks, exact
+block tiling) rather than by crc, the same way FIELD_DIR's and
+STREAM_DIR's framing is validated structurally under their one
+whole-section crc. The `enc`/`comp` bytes of a page are covered by the
+enclosing block's crc, so a flipped tag fails the crc rather than causing
+a silent misdecode. Pad bytes between sections are never interpreted and
+fall under the whole-object BLAKE3 in the commit record.
 
 ## Pruning soundness (invariant)
 
@@ -551,6 +662,13 @@ proves absent.
 
 - Skip-index min/max: a block is dropped only when its bounds prove no
   record matches the ts/stream/numeric predicate.
+- POSTINGS is exact, not probabilistic: for an indexed field, a probed
+  term's block list is the complete truth, so it may prune all the way to
+  zero blocks. An unindexed or capped field's probe reports "no
+  information" (not "term absent"), same as a field POSTINGS never heard
+  of, and prunes nothing. `RlogReader::scan` applies it between skip-index
+  and bloom pruning, so bloom only has to consider whatever POSTINGS
+  could not already rule out.
 - Bloom negative is proof of absence: skip the block. Bloom positive is
   no information: scan the block and evaluate the predicate exactly on
   decoded values.
@@ -558,11 +676,14 @@ proves absent.
   extract word literals that any match must contain; otherwise only
   time/stream/min-max pruning applies and the scan evaluates exactly.
 - A missing or corrupt BLOOM section degrades to scanning without bloom
-  pruning and surfaces a counter, never wrong results. A corrupt or
-  undecodable SKIP_IDX is a loud `Corrupted` error, not a degrade: its
-  level-0 entries are the only source of block byte ranges and per-block
-  checksums, so without it blocks cannot be located at all. Corrupt
-  BLOCKS data is likewise a loud `Corrupted` error.
+  pruning and surfaces a counter, never wrong results. A missing POSTINGS
+  section, a missing per-field entry, or a corrupt section/entry likewise
+  degrades to no postings pruning for the affected arm (`ScanStats`'
+  `postings_degraded`), never wrong results. A corrupt or undecodable
+  SKIP_IDX is a loud `Corrupted` error, not a degrade: its level-0 entries
+  are the only source of block byte ranges and per-block checksums, so
+  without it blocks cannot be located at all. Corrupt BLOCKS data is
+  likewise a loud `Corrupted` error.
 
 ## Validation summary
 
@@ -583,4 +704,13 @@ All violations are `Corrupted`, never panics:
   consuming exactly its bytes.
 - bloom: `m_bits` not a power of two or below 512; `k = 0`; `bits` length
   wrong; entry crc mismatch; entry index out of range.
+- postings: unknown section grammar version; field count or one field's
+  term/block count over its cap; non-ascending `column_id` across fields
+  or `first_term` within a field; a term block's declared
+  `uncompressed_len` over its cap; a `block_offset` that does not exactly
+  continue the running cursor (catches both an offset past the section
+  and a gap or overlap between blocks); a term block's crc mismatch or a
+  decompressed length not equal to its declared `uncompressed_len`; terms
+  within a decompressed block not ascending; a declared term or posting
+  count the block's remaining bytes cannot support.
 - block crc mismatch.
