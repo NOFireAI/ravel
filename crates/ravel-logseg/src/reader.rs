@@ -92,16 +92,55 @@ impl<'a> RlogReader<'a> {
         column_plans(&self.field_dir)
     }
 
-    /// Scans the object for records matching `pred`.
+    /// Scans the object for records matching `pred`, evaluated exactly per row.
+    ///
+    /// Equivalent to [`RlogReader::scan_pruned`] with an empty prune channel.
     pub fn scan(&self, pred: &Predicate) -> Result<(Vec<LogRecord>, ScanStats), LogSegError> {
+        self.scan_pruned(pred, &[])
+    }
+
+    /// Scans for records matching `content` exactly, with `prune` an additional
+    /// prune-only predicate channel.
+    ///
+    /// `content` is the sole exact filter: every surviving block's rows are
+    /// re-evaluated against it, exactly as [`RlogReader::scan`] does, and only
+    /// matches are returned. `prune` never contributes to that per-row filter.
+    /// Its arms drive POSTINGS block pruning and nothing else: an `Equals` on an
+    /// indexed attribute field intersects the candidate blocks with that term's
+    /// exact block list, and an arm whose field the POSTINGS index does not
+    /// cover contributes no pruning at all (the `Ok(None)` path). Postings are
+    /// exact sets, never sketches, so this channel only ever drops blocks proven
+    /// to hold no record carrying the term; it is widen-only by construction
+    /// (docs/adrs/0013, docs/adrs/0049 decision 7).
+    ///
+    /// The separation is deliberate and load-bearing. A `prune` `Equals` on
+    /// `FieldSel::Attr` resolves against a record's own dynamic column and
+    /// `attrs_raw` overflow only (see [`RlogReader::equals`]), never against
+    /// resource or scope stream attributes, so the per-record equality is a
+    /// strict subset of a merged-view SQL equality (`ravel_sql::rlog_attrs`).
+    /// Evaluating it per row would silently drop a record whose match lives only
+    /// in its resource or scope attributes; driving only block pruning does not.
+    /// The exact residual over the merged view stays the SQL layer's job.
+    pub fn scan_pruned(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+    ) -> Result<(Vec<LogRecord>, ScanStats), LogSegError> {
         let mut stats = ScanStats {
             blocks_total: self.skip.l0.len() as u32,
             ..ScanStats::default()
         };
 
-        // Collect the And-flattened arms.
+        // Collect the And-flattened arms of the exact `content` predicate.
         let mut arms: Vec<&Predicate> = Vec::new();
-        flatten(pred, &mut arms);
+        flatten(content, &mut arms);
+
+        // Prune-only arms: flattened. They feed POSTINGS pruning below and
+        // nothing else -- never the ts/stream/bloom bounds, never per-row eval.
+        let mut prune_arms: Vec<&Predicate> = Vec::new();
+        for p in prune {
+            flatten(p, &mut prune_arms);
+        }
 
         // Coarse ts range: intersect every TsRange arm.
         let mut ts_min = i64::MIN;
@@ -149,7 +188,11 @@ impl<'a> RlogReader<'a> {
         // (falls through to bloom + exact scan); a corrupt section or entry
         // degrades the same way and sets `postings_degraded`.
         if let Some(desc) = &self.postings {
-            let postings_arms = self.postings_arms(&arms);
+            // Both the exact `content` Equals arms and the prune-only arms drive
+            // postings pruning; an unindexed or capped field on either falls
+            // through to bloom + exact scan via the `Ok(None)` path below.
+            let mut postings_arms = self.postings_arms(&arms);
+            postings_arms.extend(self.postings_arms(&prune_arms));
             if !postings_arms.is_empty() {
                 match self
                     .postings_section_verified(desc)
@@ -204,7 +247,7 @@ impl<'a> RlogReader<'a> {
             let block_bytes = self.block_bytes(entry.block_offset, entry.block_len)?;
             let decoded = read_block(block_bytes, entry.block_crc32c, &plans, DEFAULT_MAX_UNCOMP)?;
             for row in 0..decoded.record_count() {
-                if self.eval(pred, &decoded, row)? {
+                if self.eval(content, &decoded, row)? {
                     out.push(self.rebuild_record(&decoded, row)?);
                 }
             }
@@ -1289,5 +1332,127 @@ mod tests {
             1,
             "degraded pruning must fall back to bloom + exact scan, never silently drop the row"
         );
+    }
+
+    /// Soundness (issue #538): a prune equality whose per-record resolution does
+    /// NOT match, on a record whose match lives only in its resource/scope
+    /// stream attributes, must still return that record. The prune-only channel
+    /// drives block pruning alone, so a `service.name` that is a resource
+    /// attribute (not a per-record column) resolves to no postings arm and
+    /// prunes nothing. Wiring the same equality into `content` -- the exact
+    /// per-row filter -- drops the record, because `equals(FieldSel::Attr(..))`
+    /// reads only the per-record column plus `attrs_raw`, never the
+    /// resource/scope blob. This test proves the two channels diverge there.
+    #[test]
+    fn prune_channel_keeps_resource_only_match_that_content_would_drop() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        // 20 records on stream 0: resource `service.name = "svc0"` for every
+        // record (see `rec`), each also carrying an indexed per-record `svc`.
+        let recs: Vec<LogRecord> = (0..20).map(|i| rec_with_svc(i, "s0")).collect();
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // service.name lives only in the resource stream attrs; it is not a
+        // per-record column, so the prune arm resolves to no postings entry and
+        // prunes nothing. content is match-all, so every record is returned.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(rows.len(), 20, "resource-only match must survive the prune");
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+
+        // The same equality wired into `content` drops every record: `equals`
+        // never reads the resource blob. This is the unsound coupling the
+        // prune-only channel exists to avoid.
+        let (wrong, _) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("service.name".into()),
+                value: AttrValue::Str("svc0".into()),
+            })
+            .expect("scan");
+        assert_eq!(
+            wrong.len(),
+            0,
+            "content wiring drops the resource-only match (the bug #538 fixes)"
+        );
+    }
+
+    /// The prune-only channel actually skips blocks. 12 blocks of 5 records, an
+    /// indexed per-record `svc` cycling through 3 values, so a prune for one
+    /// value proves the other 8 blocks absent through POSTINGS. Asserted on
+    /// ScanStats, not on the rows, so the test proves pruning happened rather
+    /// than merely that the answer is right.
+    #[test]
+    fn prune_channel_skips_blocks_via_postings() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("s0".into()),
+        }];
+        let (_rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        // "s0" occupies blocks 0,3,6,9 -- 4 of 12; postings proves the other 8
+        // absent before bloom or BLOCKS. A 3:1 block-prune ratio.
+        assert_eq!(stats.blocks_total, 12);
+        assert_eq!(stats.blocks_after_skip, 12);
+        assert_eq!(stats.blocks_after_postings, 4);
+        assert_eq!(stats.blocks_scanned, 4);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// An attribute the POSTINGS index does not cover prunes nothing. `region`
+    /// is a real per-record column but is not in the indexed-field list, so it
+    /// has no POSTINGS entry: the probe reports "not indexed" (`Ok(None)`) and
+    /// no block is dropped, so every matching record is returned.
+    #[test]
+    fn prune_channel_uncovered_field_prunes_nothing() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..20i64 {
+            let mut r = rec(0, i, "msg");
+            r.attrs.push(("region".into(), AttrValue::Str("us".into())));
+            recs.push(r);
+        }
+        // Index "svc" (absent here), never "region": region has a column but no
+        // postings entry, so a probe on it prunes nothing.
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("region".into()),
+            value: AttrValue::Str("us".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            20,
+            "an uncovered field must not prune any match"
+        );
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+        assert!(!stats.postings_degraded);
     }
 }
