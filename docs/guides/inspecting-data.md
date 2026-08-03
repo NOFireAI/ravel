@@ -307,3 +307,34 @@ should never share a `(writer_id, epoch, seq)`). `signal` is the
 numeric signal code (`1` = metrics). `ingest_hour_bucket` is the same hour
 encoded in the object's own key, and it is what the catalog groups listings
 by.
+
+## `idem inspect`: what an idempotency marker says
+
+```sh
+cargo run -p ravel-cli -- idem inspect \
+  "t/3f2a.../l/idem/9a1c....0495972.idm"
+```
+
+```
+magic: valid (RIDM)
+version: valid
+crc32c: valid
+written_count: 42
+commit_tokens: [v2:token-abc, v2:token-def]
+```
+
+An idempotency marker (ADR-0051 section 5) is the receipt a keyed log or
+span ingest request writes after a successful flush, so a retry of the same
+request replays this receipt instead of re-ingesting. `written_count` is the
+row or span count the original request wrote; `commit_tokens` is the full
+`x-ravel-commit-token` set the ack carried, one token per shard the
+request's points flushed through.
+
+A truncated, bad-magic, wrong-version, checksum-mismatched, or malformed
+marker fails with the specific reason instead of a generic error or a
+silent `valid`-looking report -- this command decodes through the same
+function the ingest path itself uses to interpret a marker (there is
+exactly one decoder for this format), so its verdict always matches what a
+retried request would actually experience: a marker this command reports as
+corrupt is a marker the ingest path also treats as a miss (fail-open to
+at-least-once), never the reverse.
