@@ -260,6 +260,8 @@ mod tests {
     use ravel_catalog::Snapshot;
     use ravel_object_store::memory::MemoryStore;
 
+    use ravel_types::accounting::QueryAccounting;
+
     use super::*;
     use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
     use crate::spans_fetcher::SpanSegmentFetcher;
@@ -267,7 +269,15 @@ mod tests {
     fn test_pool() -> Arc<dyn MemoryPool> {
         let tenant = TenantMemoryAccountant::new(1 << 30);
         let breach = CeilingBreach::new();
-        Arc::new(TenantDelegatingPool::new(1 << 30, tenant, breach))
+        // The pool reports its reserved high-water mark into per-query
+        // accounting (ADR-0044 decision 1's `peak_intermediate_bytes`), so it
+        // takes a handle. These session tests do not assert on it.
+        Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            tenant,
+            breach,
+            QueryAccounting::new(),
+        ))
     }
 
     /// Collect every `WHERE`/`HAVING` predicate in `plan` as a top-level AND
