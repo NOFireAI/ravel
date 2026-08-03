@@ -7,7 +7,7 @@
 
 use proptest::prelude::*;
 use ravel_logseg::{
-    AttrValue, LogRecord, LogStreamId, ObjectIdentity, Predicate, RlogConfig, RlogReader,
+    AttrValue, FieldSel, LogRecord, LogStreamId, ObjectIdentity, Predicate, RlogConfig, RlogReader,
     RlogWriter, stream_attrs_bytes,
 };
 
@@ -84,12 +84,26 @@ fn fixture() -> (Vec<LogRecord>, Vec<u8>) {
         writer_epoch: 2,
         writer_seq: 3,
     };
-    let mut w = RlogWriter::new(cfg, identity);
+    let mut w = RlogWriter::new(cfg, identity).with_indexed_fields(vec!["svc".to_string()]);
     for r in &corpus {
         w.push(r.clone()).expect("push");
     }
     let object = w.finish().expect("finish");
     (corpus, object)
+}
+
+/// The `svc == "s0"` subset of a fixture corpus, for checking POSTINGS-pruned
+/// scans against the same ground truth the match-all scan uses.
+fn svc0(corpus: &[LogRecord]) -> Vec<LogRecord> {
+    corpus
+        .iter()
+        .filter(|r| {
+            r.attrs
+                .iter()
+                .any(|(k, v)| k == "svc" && *v == AttrValue::Str("s0".to_string()))
+        })
+        .cloned()
+        .collect()
 }
 
 // --- order-insensitive record keys (f64 by bits) --------------------------
@@ -215,16 +229,29 @@ proptest! {
 
         let cfg = RlogConfig::default();
         let match_all = Predicate::And(Vec::new());
-        if let Ok(reader) = RlogReader::new(&mutated, &cfg)
-            && let Ok((got, _stats)) = reader.scan(&match_all)
-        {
-            // A successful scan of a mutated object must still yield exactly
-            // the original data (the damage hit unread/unverified bytes).
-            prop_assert_eq!(normalize(&got), normalize(&corpus));
+        if let Ok(reader) = RlogReader::new(&mutated, &cfg) {
+            if let Ok((got, _stats)) = reader.scan(&match_all) {
+                // A successful scan of a mutated object must still yield
+                // exactly the original data (the damage hit unread/unverified
+                // bytes).
+                prop_assert_eq!(normalize(&got), normalize(&corpus));
+            }
+            // Same invariant through the POSTINGS probe path: an Equals arm
+            // on the indexed `svc` field either returns exactly the true
+            // subset (mutation missed or was absorbed by a degrade) or a
+            // typed error, never a wrong or narrowed result.
+            let by_svc = Predicate::Equals {
+                field: FieldSel::Attr("svc".to_string()),
+                value: AttrValue::Str("s0".to_string()),
+            };
+            if let Ok((got, _stats)) = reader.scan(&by_svc) {
+                prop_assert_eq!(normalize(&got), normalize(&svc0(&corpus)));
+            }
         }
     }
 
-    /// The unmutated object always scans back to the full corpus.
+    /// The unmutated object always scans back to the full corpus, and a
+    /// POSTINGS-pruned Equals scan back to exactly its true subset.
     #[test]
     fn identity_roundtrip(_n in 0u8..1) {
         let (corpus, object) = fixture();
@@ -232,5 +259,14 @@ proptest! {
         let reader = RlogReader::new(&object, &cfg).expect("open");
         let (got, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
         prop_assert_eq!(normalize(&got), normalize(&corpus));
+
+        let (got, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".to_string()),
+                value: AttrValue::Str("s0".to_string()),
+            })
+            .expect("scan");
+        prop_assert_eq!(normalize(&got), normalize(&svc0(&corpus)));
+        prop_assert!(!stats.postings_degraded);
     }
 }
