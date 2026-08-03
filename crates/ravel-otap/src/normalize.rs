@@ -470,10 +470,14 @@ pub fn normalize_decoded_with_exemplars(
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
         // No payload past the count is decoded, so no exemplar is even read,
-        // let alone offered to the cap. The OTLP surface's own too-many-points
-        // return reports the same way (one `TooManyDataPoints`, no exemplar
-        // accounting), and the differential gate holds the two to identical
-        // rejection sets.
+        // let alone offered to the cap. This is where OTAP differs from the
+        // other two surfaces: OTLP and Remote Write both hold their exemplars
+        // in memory at the count check, so both count the request's exemplars
+        // as dropped here, and a counter that ignored them would under-report a
+        // whole-request rejection. OTAP cannot count what it never decoded.
+        // The difference is structural, not an oversight, and the differential
+        // gate compares rejection classes at the shared admission layer rather
+        // than at this return for exactly that reason.
         return MetricsNormalizeResult {
             output: NormalizeOutput {
                 points: Vec::new(),
