@@ -747,10 +747,16 @@ async fn sql_query_against_logs_table_returns_rows() {
 
 /// A planning failure on a `logs` query returns the shared, redacted planning
 /// message -- and that message must not tell the client the problem is about
-/// the `samples` table (it named only `samples` before this fix). The
-/// `attrs['k']` subscript form is the documented logs planning gap (ADR-0033:
-/// no nested-expression `ExprPlanner` is registered, so it fails to plan
-/// loudly rather than answering wrong).
+/// the `samples` table (it named only `samples` before that fix).
+///
+/// The vehicle is an unregistered function, not the `attrs['k']` subscript
+/// this change makes plannable. `attrs['k']` was the vehicle while it was
+/// the documented logs planning gap; it is now the feature under test in
+/// `a_logs_attrs_subscript_query_succeeds_over_http` below, and a test that
+/// asserts a query fails is worthless once the query is meant to succeed.
+/// What this test actually protects -- a `logs` planning failure not blaming
+/// `samples` -- is independent of which construct failed, so it keeps its
+/// value with any unplannable query.
 #[tokio::test]
 async fn a_logs_plan_error_does_not_blame_the_samples_table() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -764,8 +770,12 @@ async fn a_logs_plan_error_does_not_blame_the_samples_table() {
     .await;
     let app = build_router(store, tokens(&[("acme-token", "acme")]));
 
-    let (status, value) =
-        post_json(&app, "acme-token", "SELECT attrs['service.name'] FROM logs").await;
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT no_such_function(body) FROM logs",
+    )
+    .await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
     assert_eq!(value["errorType"], "execution");
@@ -780,6 +790,60 @@ async fn a_logs_plan_error_does_not_blame_the_samples_table() {
     assert!(
         !error.contains("samples table"),
         "planning message must not blame the samples table: {error}"
+    );
+}
+
+/// `attrs['k']` plans and answers over HTTP, which is the whole point of
+/// registering the `ExprPlanner`: the crate-level tests in
+/// `ravel_sql::logs_provider` prove the planner works against a session they
+/// build themselves, and this proves the planner is actually reachable from
+/// the endpoint a user posts SQL to.
+///
+/// That distinction has bitten this codebase repeatedly: a feature can be
+/// complete, tested, and registered nowhere. Asserting the returned value
+/// (not merely a 200) is what makes this a end-to-end proof.
+#[tokio::test]
+async fn a_logs_attrs_subscript_query_succeeds_over_http() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_log_segment(
+        store.as_ref(),
+        &tenant,
+        0,
+        &[log_record("api", 100, "hello world")],
+    )
+    .await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts FROM logs WHERE attrs['service.name'] = 'api'",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the one record whose service.name is api: {value}"
+    );
+    assert_eq!(rows[0][0], serde_json::json!(100));
+
+    // A key that no record carries returns zero rows, not an error: an absent
+    // attribute is a normal query result, not a planning failure.
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts FROM logs WHERE attrs['no.such.key'] = 'x'",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(
+        value["data"]["rows"].as_array().expect("rows").is_empty(),
+        "a missing attribute key yields no rows: {value}"
     );
 }
 
