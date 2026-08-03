@@ -4,6 +4,7 @@
 pub mod alert_sink;
 pub mod alerting;
 pub mod analytics;
+pub mod cache_warm;
 pub mod config;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
@@ -534,6 +535,20 @@ pub async fn start(
             mtls_router = mtls_router.merge(ravel_query::http::router(mtls_app_state));
         }
         http_router = http_router.merge(ravel_query::http::router(app_state));
+
+        // ADR-0046 warmup: populate the read cache with each tenant's most
+        // recent parts before this process advertises readiness, so the
+        // first real query after a restart is not the one paying every
+        // cold-fetch cost. A no-op when the cache is disabled (`cache` is
+        // `None`); every internal failure degrades to "warmed less than
+        // planned," never to a startup failure (see `cache_warm`'s module
+        // doc). Uses the same `catalog`/`store`/`cache` handles just
+        // attached to the query paths above, cloned before `catalog` is
+        // moved into `fold::spawn` below.
+        if let Some(cache) = &cache {
+            cache_warm::warm_cache(store.clone(), catalog.clone(), cache.clone(), &SystemClock)
+                .await;
+        }
     }
 
     // Fold optimizes query-resolve cost; a maintain-only process serves no
