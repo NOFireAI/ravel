@@ -45,4 +45,4 @@ pub use router::{IngestRouter, WriteMode, WriteReceipt};
 pub use span_error::SpanWriteError;
 pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
 pub use span_router::{SpanIngestRouter, SpanWriteReceipt, shard_for_span};
-pub use value::{IngestPoint, IngestValue};
+pub use value::{IngestExemplar, IngestPoint, IngestValue};

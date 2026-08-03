@@ -6,8 +6,8 @@
 //! reach the same RSEG v5 writer regardless of which wire path decoded the
 //! point.
 
-use ravel_segment::HistogramSample;
-use ravel_types::{LabelSet, Sample, SeriesId};
+use ravel_segment::{ExemplarInput, HistogramSample};
+use ravel_types::{Exemplar, LabelSet, Sample, SeriesId};
 
 /// One point's value: scalar or native histogram.
 #[derive(Debug, Clone)]
@@ -42,6 +42,65 @@ impl From<ravel_otlp::NormalizedHistogramPoint> for IngestPoint {
             series_id: p.series_id,
             labels: p.labels,
             value: IngestValue::Histogram(p.sample),
+        }
+    }
+}
+
+/// One exemplar and the series whose sample it illustrates (ADR-0047
+/// decision 1), as a wire surface hands it to ingest. Already through the
+/// caller's [`ravel_types::ExemplarCap`] on the normalize path
+/// (`ravel_otlp::normalize::NormalizedExemplar`); the shard applies its own
+/// flush-scoped cap again on top, since a flush is the unit that has to fit
+/// in one object.
+#[derive(Debug, Clone)]
+pub struct IngestExemplar {
+    pub series_id: SeriesId,
+    pub exemplar: Exemplar,
+}
+
+impl From<ravel_otlp::normalize::NormalizedExemplar> for IngestExemplar {
+    fn from(e: ravel_otlp::normalize::NormalizedExemplar) -> Self {
+        IngestExemplar {
+            series_id: e.series_id,
+            exemplar: e.exemplar,
+        }
+    }
+}
+
+impl IngestExemplar {
+    /// Estimated buffered byte cost, for the shard's `est_bytes` flush
+    /// trigger: the EXEMPLARS record's fixed fields (series index, ts delta,
+    /// value, trace id, span id, attr count) plus each attribute's two
+    /// dictionary ordinals and the strings the dictionary interns
+    /// (docs/segment-format.md EXEMPLARS, ADR-0047's "roughly 40 bytes plus
+    /// attributes per kept exemplar").
+    pub(crate) fn est_bytes(&self) -> usize {
+        let attrs: usize = self
+            .exemplar
+            .filtered_attributes
+            .iter()
+            .map(|l| l.name.len() + l.value.len() + 2)
+            .sum();
+        40 + attrs
+    }
+
+    /// The writer-facing shape: the sample value comes back from its stored
+    /// bit pattern (never a decimal round trip, so a NaN payload and -0.0
+    /// survive), and attributes flatten to the `(name, value)` pairs the
+    /// writer interns into LABEL_DICT.
+    pub(crate) fn into_exemplar_input(self) -> ExemplarInput {
+        ExemplarInput {
+            series_id: self.series_id,
+            ts_ns: self.exemplar.ts_ns,
+            value: f64::from_bits(self.exemplar.value_bits),
+            trace_id: self.exemplar.trace_id,
+            span_id: self.exemplar.span_id,
+            attrs: self
+                .exemplar
+                .filtered_attributes
+                .into_iter()
+                .map(|l| (l.name, l.value))
+                .collect(),
         }
     }
 }

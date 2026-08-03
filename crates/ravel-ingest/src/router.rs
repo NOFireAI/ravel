@@ -18,7 +18,7 @@ use crate::config::IngestConfig;
 use crate::error::WriteError;
 use crate::metrics::IngestMetrics;
 use crate::shard::{ShardActor, ShardMsg};
-use crate::value::IngestPoint;
+use crate::value::{IngestExemplar, IngestPoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
@@ -121,6 +121,7 @@ impl IngestRouter {
         self.write_points(
             tenant,
             points.into_iter().map(IngestPoint::from).collect(),
+            Vec::new(),
             mode,
             ack_deadline,
         )
@@ -140,13 +141,33 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<WriteReceipt, WriteError> {
-        self.write_points(tenant, points, mode, ack_deadline).await
+        self.write_points(tenant, points, Vec::new(), mode, ack_deadline)
+            .await
+    }
+
+    /// Like [`Self::write_values`], additionally carrying the exemplars a
+    /// normalize path admitted for these points (ADR-0047 decision 1). Each
+    /// exemplar routes to `shard_for(series_id)`, the same shard its series'
+    /// samples route to, so it lands in the buffer that will flush the object
+    /// holding its parent sample. An exemplar whose parent sample is not in
+    /// that flush is dropped and counted there, never written.
+    pub async fn write_values_with_exemplars(
+        &self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<WriteReceipt, WriteError> {
+        self.write_points(tenant, points, exemplars, mode, ack_deadline)
+            .await
     }
 
     async fn write_points(
         &self,
         tenant: TenantId,
         points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<WriteReceipt, WriteError> {
@@ -156,12 +177,26 @@ impl IngestRouter {
             let shard = shard_for(&point.series_id, shard_count);
             by_shard.entry(shard).or_default().push(point);
         }
-        if by_shard.is_empty() {
+        // Exemplars route by their own series id, which is the same shard
+        // their samples took. A shard that got exemplars but no points is
+        // still involved: its buffer may already hold the parent samples from
+        // an earlier request in this flush window.
+        let mut exemplars_by_shard: HashMap<u32, Vec<IngestExemplar>> = HashMap::new();
+        for exemplar in exemplars {
+            let shard = shard_for(&exemplar.series_id, shard_count);
+            exemplars_by_shard.entry(shard).or_default().push(exemplar);
+        }
+        if by_shard.is_empty() && exemplars_by_shard.is_empty() {
             return Ok(WriteReceipt::default());
         }
 
-        let mut shard_ids: Vec<u32> = by_shard.keys().copied().collect();
+        let mut shard_ids: Vec<u32> = by_shard
+            .keys()
+            .chain(exemplars_by_shard.keys())
+            .copied()
+            .collect();
         shard_ids.sort_unstable();
+        shard_ids.dedup();
 
         // Parallel to `ack_rxs`: the shard each receiver belongs to, so a
         // closed ack channel can be attributed to the right shard and counted
@@ -182,6 +217,7 @@ impl IngestRouter {
             let msg = ShardMsg::Write {
                 tenant: tenant.clone(),
                 points,
+                exemplars: exemplars_by_shard.remove(&shard).unwrap_or_default(),
                 ack,
             };
             if self.shards[shard as usize].tx.send(msg).await.is_err() {

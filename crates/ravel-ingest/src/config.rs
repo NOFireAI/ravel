@@ -94,6 +94,19 @@ pub struct IngestConfig {
     /// A flush that cannot complete within this long after it opened is
     /// abandoned: never published, waiters errored (ADR-0010 §1/§11).
     pub max_flush_lifetime: Duration,
+    /// Window width of the flush-scoped exemplar admission cap (ADR-0047
+    /// decision 2): at most one exemplar per series per window reaches the
+    /// EXEMPLARS section of one object. A security control, not a tuning
+    /// knob: a trace id is high-entropy, so an uncapped path lets a client
+    /// multiply object size at will.
+    ///
+    /// The shard builds a fresh [`ravel_types::ExemplarCap`] per flush rather
+    /// than holding one for its lifetime: the cap's per-series map is
+    /// unbounded, so a shard-lived cap grows with the shard's series
+    /// cardinality forever. The wire-side cap (`ravel_otlp`'s, which does
+    /// outlive a request) already carries the cross-request window; this one
+    /// bounds what one object can hold.
+    pub exemplar_cap_window_ns: i64,
 }
 
 impl Default for IngestConfig {
@@ -110,6 +123,7 @@ impl Default for IngestConfig {
             put_retry_base_delay: Duration::from_millis(100),
             put_retry_max_delay: Duration::from_secs(2),
             max_flush_lifetime: Duration::from_secs(3600),
+            exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
         }
     }
 }
@@ -132,6 +146,12 @@ mod tests {
         assert_eq!(cfg.put_retry_base_delay, Duration::from_millis(100));
         assert_eq!(cfg.put_retry_max_delay, Duration::from_secs(2));
         assert_eq!(cfg.max_flush_lifetime, Duration::from_secs(3600));
+        // Asserted against the shared cap's own constant, never a literal:
+        // ADR-0047's default window lives in ravel-types.
+        assert_eq!(
+            cfg.exemplar_cap_window_ns,
+            ravel_types::ExemplarCap::DEFAULT_WINDOW_NS
+        );
     }
 
     #[test]
