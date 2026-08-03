@@ -151,7 +151,7 @@ impl<'a> RlogReader<'a> {
         if let Some(desc) = &self.postings {
             let postings_arms = self.postings_arms(&arms);
             if !postings_arms.is_empty() {
-                match self.section_stored(desc).and_then(PostingsSection::parse) {
+                match self.postings_section_verified(desc).and_then(PostingsSection::parse) {
                     Ok(section) => {
                         for (cid, term) in &postings_arms {
                             match section.probe(*cid, term) {
@@ -297,6 +297,30 @@ impl<'a> RlogReader<'a> {
             }
         }
         false
+    }
+
+    /// Slices and crc-verifies the POSTINGS section's stored bytes before
+    /// [`PostingsSection::parse`] sees them. Unlike BLOOM and BLOCKS, whose
+    /// per-entry/per-block crc is the only checksum ever consulted (a
+    /// selective scan never reads them whole), the POSTINGS sparse-index
+    /// header sits in front of every probe and is otherwise unchecksummed on
+    /// this access path: `desc.crc32c` is computed and stored by the writer
+    /// over the whole section (same as STREAM_DIR/FIELD_DIR/SKIP_IDX) but was
+    /// never consulted here, so a single corrupted header byte that
+    /// redirects a probe to a different, still crc-valid term block passed
+    /// silently. Checking it costs nothing extra: the whole object is
+    /// already resident. [`PostingsSection::probe`]'s own structural check
+    /// (a decoded block's first term must match the sparse entry that
+    /// pointed at it) is the complementary guard that still holds under a
+    /// future ranged reader that fetches less than the whole section.
+    fn postings_section_verified(&self, desc: &SectionDesc) -> Result<&'a [u8], LogSegError> {
+        let stored = self.section_stored(desc)?;
+        if crc32c::crc32c(stored) != desc.crc32c {
+            return Err(LogSegError::Corrupted(
+                "postings section crc mismatch".into(),
+            ));
+        }
+        Ok(stored)
     }
 
     /// Absolute slice of a section's stored bytes.
@@ -1199,5 +1223,68 @@ mod tests {
         // Falls back to bloom + exact scan: still the exact right answer.
         assert_eq!(rows.len(), 20);
         assert!(rows.iter().all(|r| (r.ts_ns / 5) % 3 == 0));
+    }
+
+    /// End-to-end reproduction (fix-task on epic #479, issue #508 follow-up):
+    /// a one-byte flip of a POSTINGS sparse-index `first_term`, corrupting no
+    /// term block, used to reach `scan` as `postings_degraded == false` and a
+    /// silently narrowed (wrong) result. Four terms `aa, bz, ca, cz` with
+    /// `postings_stride: 2` (one per its own physical block, so a probe hit
+    /// is exactly one row) split into term blocks `B0 = [aa, bz]` and
+    /// `B1 = [ca, cz]`; flipping `B1`'s declared `first_term` from `"ca"` to
+    /// `"ba"` preserves ascending order and every term-block crc, so before
+    /// this fix `RlogReader::new` and `PostingsSection::parse` both accepted
+    /// it and a probe for `"bz"` landed on `B1`, missed, and reported the
+    /// term absent -- baseline 1 row, mutated 0 rows, no error, no counter.
+    /// The whole-section `crc32c` this fix now verifies before `parse`
+    /// catches the flip regardless of which term is probed, degrading to
+    /// bloom + exact scan instead.
+    #[test]
+    fn corrupted_first_term_header_byte_degrades_instead_of_narrowing() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            postings_stride: 2,
+            ..RlogConfig::default()
+        };
+        let recs = vec![
+            rec_with_svc(0, "aa"),
+            rec_with_svc(1, "bz"),
+            rec_with_svc(2, "ca"),
+            rec_with_svc(3, "cz"),
+        ];
+        let mut obj = build_indexed(cfg, recs, &["svc"]);
+
+        let pred = Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("bz".into()),
+        };
+
+        let baseline_reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = baseline_reader.scan(&pred).expect("baseline scan");
+        assert_eq!(rows.len(), 1, "baseline: exactly the one \"bz\" row");
+        assert!(!stats.postings_degraded);
+
+        let footer = crate::footer::open(&obj).expect("open footer");
+        let desc = *footer
+            .section(crate::footer::kind::POSTINGS)
+            .expect("postings section present");
+        // Same header-layout offset as postings::tests:
+        // corrupted_first_term_header_byte_is_caught_not_silently_narrowed --
+        // B1's declared first_term "ca" at [42, 44) relative to the section.
+        let corrupt_at = desc.offset as usize + 42;
+        assert_eq!(&obj[corrupt_at..corrupt_at + 2], b"ca");
+        obj[corrupt_at] = b'b';
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader.scan(&pred).expect("scan degrades, not errors");
+        assert!(
+            stats.postings_degraded,
+            "the whole-section crc must catch the corrupted header"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "degraded pruning must fall back to bloom + exact scan, never silently drop the row"
+        );
     }
 }
