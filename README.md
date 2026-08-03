@@ -311,8 +311,8 @@ Pull the published image, or build natively on an amd64 host, instead.
   specification (ADR-0029)
 - [docs/span-segment-format.md](docs/span-segment-format.md): the RSPAN
   v1 specification (ADR-0041)
-- [docs/guides/](docs/guides/): getting started, ingest, query,
-  operations, inspecting data, Kubernetes
+- [docs/guides/](docs/guides/): getting started, ingest, admission limits,
+  query, operations, inspecting data, Kubernetes
 - [docs/adrs/](docs/adrs/): one decision record per architectural choice
 - [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
   conformance table, classifying every construct as supported,
