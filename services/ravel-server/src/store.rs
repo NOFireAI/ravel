@@ -167,13 +167,15 @@ pub fn check_mandatory_capabilities(
 /// returned so the caller can hold it for that later work. The cache is
 /// exposed: the caller attaches it to the query fetchers via their existing
 /// `with_cache` builders.
-pub fn build_store(
-    cli: &Cli,
-) -> anyhow::Result<(
+/// Backend, its metrics handle, and the optional ADR-0046 read cache, as
+/// built by [`build_store`].
+pub type BuiltStore = (
     Arc<dyn ObjectStoreBackend>,
     Arc<StoreMetrics>,
     Option<Arc<Cache<CacheFetchError>>>,
-)> {
+);
+
+pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
     let (store, metrics): (Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>) = match cli.store {
         StoreKind::Memory => {
             let instrumented = InstrumentedStore::new(MemoryStore::new());
