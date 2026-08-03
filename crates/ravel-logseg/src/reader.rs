@@ -16,9 +16,10 @@ use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
 use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open};
 use crate::page::DEFAULT_MAX_UNCOMP;
+use crate::postings::{PostingsSection, term_key};
 use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
-    COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate,
+    COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
 };
 use crate::skip_index::SkipIndex;
 use crate::stream_dir::StreamDir;
@@ -34,11 +35,16 @@ pub(crate) const MAX_BLOCKS: u64 = 1 << 24;
 pub struct ScanStats {
     pub blocks_total: u32,
     pub blocks_after_skip: u32,
+    pub blocks_after_postings: u32,
     pub blocks_after_bloom: u32,
     pub blocks_scanned: u32,
     /// Set when the BLOOM section could not be parsed and bloom pruning was
     /// skipped (the scan still returns correct results).
     pub bloom_degraded: bool,
+    /// Set when the POSTINGS section (or a probed entry within it) could not
+    /// be parsed and postings pruning was skipped for that arm (the scan
+    /// still returns correct results via bloom + exact scan).
+    pub postings_degraded: bool,
 }
 
 /// An opened RLOG object ready to scan.
@@ -49,6 +55,9 @@ pub struct RlogReader<'a> {
     skip: SkipIndex,
     blocks_offset: u64,
     bloom: SectionDesc,
+    /// Absent when the object was written with no indexed fields
+    /// (docs/log-segment-format.md: POSTINGS is an optional section).
+    postings: Option<SectionDesc>,
 }
 
 impl<'a> RlogReader<'a> {
@@ -66,6 +75,7 @@ impl<'a> RlogReader<'a> {
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
         let blocks = *section(&footer, kind::BLOCKS)?;
         let bloom = *section(&footer, kind::BLOOM)?;
+        let postings = footer.section(kind::POSTINGS).copied();
         Ok(RlogReader {
             bytes,
             stream_dir,
@@ -73,6 +83,7 @@ impl<'a> RlogReader<'a> {
             skip,
             blocks_offset: blocks.offset,
             bloom,
+            postings,
         })
     }
 
@@ -126,10 +137,39 @@ impl<'a> RlogReader<'a> {
         }
 
         // Skip-index pruning.
-        let candidates = self
+        let mut candidates = self
             .skip
             .candidate_blocks(ts_min, ts_max, stream_refs.as_deref());
         stats.blocks_after_skip = candidates.len() as u32;
+
+        // Postings pruning. Exact (not probabilistic): a probed term's block
+        // list is the whole truth for that field, so it can prune down to
+        // zero (docs/log-segment-format.md "Pruning soundness"). An arm whose
+        // field is unindexed or capped returns `Ok(None)` and is skipped
+        // (falls through to bloom + exact scan); a corrupt section or entry
+        // degrades the same way and sets `postings_degraded`.
+        if let Some(desc) = &self.postings {
+            let postings_arms = self.postings_arms(&arms);
+            if !postings_arms.is_empty() {
+                match self.section_stored(desc).and_then(PostingsSection::parse) {
+                    Ok(section) => {
+                        for (cid, term) in &postings_arms {
+                            match section.probe(*cid, term) {
+                                Ok(Some(blocks)) => {
+                                    let allowed: std::collections::HashSet<usize> =
+                                        blocks.iter().map(|&b| b as usize).collect();
+                                    candidates.retain(|b| allowed.contains(b));
+                                }
+                                Ok(None) => {}
+                                Err(_) => stats.postings_degraded = true,
+                            }
+                        }
+                    }
+                    Err(_) => stats.postings_degraded = true,
+                }
+            }
+        }
+        stats.blocks_after_postings = candidates.len() as u32;
 
         // Bloom pruning. A parse failure degrades to no bloom pruning.
         let bloom_bytes = self.section_stored(&self.bloom)?;
@@ -196,6 +236,29 @@ impl<'a> RlogReader<'a> {
                     }
                 }
                 _ => {}
+            }
+        }
+        out
+    }
+
+    /// The postings-eligible arms: `Equals` on an attribute field that has a
+    /// dynamic column, paired with its term-key bytes. A field with no such
+    /// column (unindexed, overflowed, or not yet seen by FIELD_DIR) is
+    /// omitted; [`PostingsSection::probe`] separately reports "not indexed or
+    /// capped" for a column that has no POSTINGS entry, so both cases fall
+    /// through to bloom + exact scan without narrowing results.
+    fn postings_arms(&self, arms: &[&Predicate]) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for a in arms {
+            if let Predicate::Equals {
+                field: FieldSel::Attr(name),
+                value,
+            } = a
+            {
+                let (ty, cv) = resolve_value(value);
+                if let Some(entry) = self.field_dir.column(name, ty) {
+                    out.push((entry.column_id, term_key(&cv)));
+                }
             }
         }
         out
@@ -352,7 +415,7 @@ impl<'a> RlogReader<'a> {
                 })
             }
             FieldSel::Attr(name) => {
-                let (ty, _) = crate::record::resolve_value(value);
+                let (ty, _) = resolve_value(value);
                 if let Some(entry) = self.field_dir.column(name, ty) {
                     Ok(attr_equals(block, entry.column_id, ty, value, row))
                 } else {
@@ -1018,5 +1081,123 @@ mod tests {
             assert_eq!(ka, kb);
             assert!(attr_value_eq(va, vb));
         }
+    }
+
+    fn rec_with_svc(ts: i64, svc: &str) -> LogRecord {
+        let mut r = rec(0, ts, "msg");
+        r.attrs
+            .push(("svc".to_string(), AttrValue::Str(svc.to_string())));
+        r
+    }
+
+    fn build_indexed(cfg: RlogConfig, recs: Vec<LogRecord>, fields: &[&str]) -> Vec<u8> {
+        let mut w = RlogWriter::new(cfg, identity())
+            .with_indexed_fields(fields.iter().map(|s| s.to_string()).collect());
+        for r in recs {
+            w.push(r).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    /// The exact-postings acceptance test (issue #508): every block containing
+    /// a matching record survives postings pruning (soundness), and blocks
+    /// proven not to contain the term are pruned before bloom or exact scan
+    /// (pruning). 12 blocks of 5 records each, `svc` constant within a block
+    /// and cycling through 3 values across blocks, so a probe for one value
+    /// prunes to exactly the 4 blocks that carry it.
+    #[test]
+    fn postings_prune_exactly_and_absent_is_legal() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // Pruning: "s0" only appears in blocks 0,3,6,9 (4 of 12); postings
+        // proves the other 8 absent without touching bloom or BLOCKS.
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("s0".into()),
+            })
+            .expect("scan");
+        assert_eq!(stats.blocks_total, 12);
+        assert_eq!(stats.blocks_after_postings, 4);
+        assert_eq!(stats.blocks_scanned, 4);
+        // Soundness: every one of the 20 matching records is present, i.e. no
+        // block that actually contains a match was pruned.
+        assert_eq!(rows.len(), 20);
+        assert!(rows.iter().all(|r| (r.ts_ns / 5) % 3 == 0));
+
+        // A term proven absent everywhere prunes to zero blocks outright.
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("nope".into()),
+            })
+            .expect("scan");
+        assert_eq!(stats.blocks_after_postings, 0);
+        assert_eq!(rows.len(), 0);
+        assert!(!stats.postings_degraded);
+    }
+
+    #[test]
+    fn no_postings_section_scans_correctly() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let recs: Vec<LogRecord> = (0..20).map(|i| rec_with_svc(i, "s0")).collect();
+        // No with_indexed_fields: object has no POSTINGS section at all.
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("s0".into()),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 20);
+        assert!(!stats.postings_degraded);
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+    }
+
+    #[test]
+    fn corrupt_postings_section_degrades_to_exact_scan() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let mut obj = build_indexed(cfg, recs, &["svc"]);
+
+        let footer = crate::footer::open(&obj).expect("open footer");
+        let desc = *footer
+            .section(crate::footer::kind::POSTINGS)
+            .expect("postings section present");
+        let at = desc.offset as usize;
+        obj[at] ^= 0xFF; // corrupt the POSTINGS version byte
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("s0".into()),
+            })
+            .expect("scan degrades, not errors");
+        assert!(stats.postings_degraded);
+        // Falls back to bloom + exact scan: still the exact right answer.
+        assert_eq!(rows.len(), 20);
+        assert!(rows.iter().all(|r| (r.ts_ns / 5) % 3 == 0));
     }
 }
