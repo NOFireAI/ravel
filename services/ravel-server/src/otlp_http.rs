@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
@@ -17,15 +17,20 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
-use ravel_ingest::WriteMode;
+use ravel_ingest::{AdmissionController, RequestRejection, WriteMode};
 use ravel_query::http::TenantResolver;
+use ravel_types::Signal;
 
-use crate::ingest::IngestState;
-use crate::logs_ingest::LogIngestState;
+use crate::ingest::{IngestRequestError, IngestState};
+use crate::logs_ingest::{LogIngestRequestError, LogIngestState};
 use crate::traces_ingest::SpanIngestState;
 
 pub const INGEST_MODE_HEADER: &str = "x-ravel-ingest-mode";
 pub const COMMIT_TOKEN_HEADER: &str = "x-ravel-commit-token";
+
+/// Layer 1 (ADR-0051 section 2): the wire-body cap on every OTLP HTTP
+/// endpoint, ahead of protobuf decode.
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct GatewayState {
     pub tenant_resolver: Arc<dyn TenantResolver>,
@@ -37,6 +42,9 @@ pub struct GatewayState {
     /// The span pipeline's counterpart, on the same terms: RSPAN objects under
     /// the `s` keyspace, its own router and its own limits (ADR-0041).
     pub traces_ingest: SpanIngestState,
+    /// Tenant admission (ADR-0051): shared by all three signals for the
+    /// layer-2 byte-rate check, done here on wire bytes before decode.
+    pub admission: Arc<AdmissionController>,
 }
 
 pub fn router(state: Arc<GatewayState>) -> Router {
@@ -44,7 +52,26 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/v1/metrics", post(export_metrics))
         .route("/v1/logs", post(export_logs))
         .route("/v1/traces", post(export_traces))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
+}
+
+/// Turn a layer-2/layer-4 whole-request rejection into the ADR-0051 HTTP
+/// response: 429 with `Retry-After` in whole seconds (rounded up, minimum
+/// 1), the reason as the body.
+fn admission_rejection_response(rejection: RequestRejection) -> Response {
+    let mut response =
+        (StatusCode::TOO_MANY_REQUESTS, rejection.reason.to_string()).into_response();
+    let retry_after_secs = retry_after_seconds(rejection.retry_after_ns);
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn retry_after_seconds(retry_after_ns: i64) -> u64 {
+    let ns = retry_after_ns.max(0) as u64;
+    ns.div_ceil(1_000_000_000).max(1)
 }
 
 /// Attaches the encoded protobuf `body` as an OTLP response, plus the
@@ -101,6 +128,16 @@ async fn export_metrics(
 
     let mode = write_mode_from_headers(&headers);
 
+    // Layer 2 (ADR-0051 section 2): byte rate on the wire body, before
+    // decode, whole-request rejection with no tokens consumed.
+    if let Err(rejection) =
+        state
+            .admission
+            .check_byte_rate(&tenant, Signal::Metrics, body.len() as u64, now_ns())
+    {
+        return admission_rejection_response(rejection);
+    }
+
     let request = match ExportMetricsServiceRequest::decode(body.as_ref()) {
         Ok(request) => request,
         Err(err) => {
@@ -114,7 +151,10 @@ async fn export_metrics(
 
     match crate::ingest::handle_export(&state.ingest, tenant, mode, request, now_ns()).await {
         Ok(outcome) => otlp_response(outcome.response.encode_to_vec(), &outcome.tokens),
-        Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
+        Err(IngestRequestError::Admission(rejection)) => admission_rejection_response(rejection),
+        Err(err @ IngestRequestError::Write(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
     }
 }
 
@@ -132,6 +172,16 @@ async fn export_logs(
     };
 
     let mode = write_mode_from_headers(&headers);
+
+    // Layer 2 (ADR-0051 section 2): byte rate on the wire body, before
+    // decode, whole-request rejection with no tokens consumed.
+    if let Err(rejection) =
+        state
+            .admission
+            .check_byte_rate(&tenant, Signal::Logs, body.len() as u64, now_ns())
+    {
+        return admission_rejection_response(rejection);
+    }
 
     let request = match ExportLogsServiceRequest::decode(body.as_ref()) {
         Ok(request) => request,
@@ -154,7 +204,10 @@ async fn export_logs(
     .await
     {
         Ok(outcome) => otlp_response(outcome.response.encode_to_vec(), &outcome.tokens),
-        Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
+        Err(LogIngestRequestError::Admission(rejection)) => admission_rejection_response(rejection),
+        Err(err @ LogIngestRequestError::Write(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
     }
 }
 
@@ -172,6 +225,17 @@ async fn export_traces(
     };
 
     let mode = write_mode_from_headers(&headers);
+
+    // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every
+    // signal including spans, even though spans get no layer-4 admission
+    // (ADR-0051 excludes spans from series/stream admission).
+    if let Err(rejection) =
+        state
+            .admission
+            .check_byte_rate(&tenant, Signal::Spans, body.len() as u64, now_ns())
+    {
+        return admission_rejection_response(rejection);
+    }
 
     let request = match ExportTraceServiceRequest::decode(body.as_ref()) {
         Ok(request) => request,

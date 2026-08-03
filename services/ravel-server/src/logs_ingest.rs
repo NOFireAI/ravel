@@ -1,25 +1,65 @@
 //! OTLP-transport-agnostic log ingest logic shared by the HTTP and gRPC
 //! handlers, the log-pipeline counterpart of [`crate::ingest`].
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
-use ravel_ingest::{LogIngestRouter, LogWriteError, WriteMode};
+use ravel_ingest::{
+    AdmissionController, LogIngestRouter, LogWriteError, RequestRejection, WriteMode,
+};
 use ravel_otlp::{LogIngestLimits, LogRejection, normalize_logs};
+use ravel_types::logstream::LogStreamId;
 use ravel_types::{CommitToken, TenantId};
 
 pub struct LogIngestState {
     pub router: Arc<LogIngestRouter>,
     pub limits: LogIngestLimits,
     pub ack_deadline: Duration,
+    /// Tenant admission (ADR-0051): stream-creation-rate and active-stream
+    /// cap (layer 4), the log-pipeline counterpart of
+    /// [`crate::ingest::IngestState::admission`].
+    pub admission: Arc<AdmissionController>,
 }
 
 pub struct LogIngestOutcome {
     pub response: ExportLogsServiceResponse,
     pub tokens: Vec<CommitToken>,
+}
+
+/// Failure from [`handle_export_logs`], the log-pipeline counterpart of
+/// [`crate::ingest::IngestRequestError`].
+#[derive(Debug, Clone)]
+pub enum LogIngestRequestError {
+    /// A whole-request, retryable-later rejection: stream-creation-rate
+    /// exceeded. No tokens are consumed on rejection.
+    Admission(RequestRejection),
+    Write(LogWriteError),
+}
+
+impl std::fmt::Display for LogIngestRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogIngestRequestError::Admission(rejection) => write!(f, "{}", rejection.reason),
+            LogIngestRequestError::Write(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for LogIngestRequestError {}
+
+impl LogIngestRequestError {
+    /// Whether a client may reasonably retry the whole request; mirrors
+    /// [`crate::ingest::IngestRequestError::is_retryable`].
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            LogIngestRequestError::Admission(_) => true,
+            LogIngestRequestError::Write(err) => err.is_retryable(),
+        }
+    }
 }
 
 /// Upper bound on the assembled `error_message` byte length, the same cap and
@@ -35,17 +75,38 @@ pub async fn handle_export_logs(
     mode: WriteMode,
     request: ExportLogsServiceRequest,
     ingest_ts_ns: i64,
-) -> Result<LogIngestOutcome, LogWriteError> {
+) -> Result<LogIngestOutcome, LogIngestRequestError> {
     let normalized = normalize_logs(request, &state.limits, ingest_ts_ns);
-    let rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    let mut records = normalized.records;
+
+    // Layer 4 (ADR-0051 section 1): stream-creation-rate is a whole-request
+    // rate limit checked first (breach rejects the whole request, no tokens
+    // consumed); the active-stream cap that follows is per-record partial
+    // success, never a whole-request rejection.
+    let candidate_streams: Vec<LogStreamId> = records.iter().map(|r| r.stream_id).collect();
+    state
+        .admission
+        .check_stream_creation_rate(&tenant, &candidate_streams, ingest_ts_ns)
+        .map_err(LogIngestRequestError::Admission)?;
+    let admission = state
+        .admission
+        .admit_streams(&tenant, candidate_streams, ingest_ts_ns);
+    let stream_cap_rejected = admission.rejected.len();
+    if stream_cap_rejected > 0 {
+        let admitted: HashSet<LogStreamId> = admission.admitted.into_iter().collect();
+        records.retain(|r| admitted.contains(&r.stream_id));
+        rejected_count += stream_cap_rejected;
+    }
 
     let receipt = state
         .router
-        .write(tenant, normalized.records, mode, state.ack_deadline)
-        .await?;
+        .write(tenant, records, mode, state.ack_deadline)
+        .await
+        .map_err(LogIngestRequestError::Write)?;
 
     let partial_success = if rejected_count > 0 {
-        let error_message = build_error_message(&normalized.rejected);
+        let error_message = build_error_message(&normalized.rejected, stream_cap_rejected);
         Some(ExportLogsPartialSuccess {
             rejected_log_records: rejected_count as i64,
             error_message,
@@ -69,7 +130,11 @@ pub async fn handle_export_logs(
 /// not touch. The assembled message is capped at [`MAX_ERROR_MESSAGE_BYTES`];
 /// if more distinct reasons exist than fit, the message is truncated with a
 /// count of how many were omitted.
-fn build_error_message(rejected: &[LogRejection]) -> String {
+///
+/// `stream_cap_rejected` folds in the layer-4 active-stream-cap count (0
+/// when nothing was capped) as one more reason, the same way
+/// [`crate::ingest`]'s equivalent folds in its series-cap count.
+fn build_error_message(rejected: &[LogRejection], stream_cap_rejected: usize) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for r in rejected {
@@ -81,6 +146,16 @@ fn build_error_message(rejected: &[LogRejection]) -> String {
             .or_insert_with(|| {
                 order.push(key);
                 n
+            });
+    }
+    if stream_cap_rejected > 0 {
+        let key = "active stream cap exceeded".to_string();
+        counts
+            .entry(key.clone())
+            .and_modify(|count| *count += stream_cap_rejected)
+            .or_insert_with(|| {
+                order.push(key);
+                stream_cap_rejected
             });
     }
 
@@ -122,7 +197,7 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
-    use ravel_ingest::{IngestConfig, SystemClock};
+    use ravel_ingest::{AdmissionController, AdmissionLimits, IngestConfig, SystemClock};
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
@@ -140,6 +215,10 @@ mod tests {
             router,
             limits: LogIngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
         }
     }
 
@@ -277,7 +356,7 @@ mod tests {
             }),
             count: 50_000,
         }];
-        let message = build_error_message(&rejected);
+        let message = build_error_message(&rejected, 0);
         assert!(message.contains("x50000"), "got: {message}");
         assert!(message.len() < 500);
     }
@@ -291,7 +370,7 @@ mod tests {
                 key: format!("key_{i}"),
             })
             .collect();
-        let message = build_error_message(&rejected);
+        let message = build_error_message(&rejected, 0);
         assert!(
             message.len() <= MAX_ERROR_MESSAGE_BYTES + 128,
             "message not bounded: {} bytes",

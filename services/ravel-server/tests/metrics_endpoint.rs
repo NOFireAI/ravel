@@ -37,6 +37,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        limits: ravel_server::LimitsConfig::default(),
     };
     ravel_server::start(config, store, Arc::new(StoreMetrics::default()))
         .await

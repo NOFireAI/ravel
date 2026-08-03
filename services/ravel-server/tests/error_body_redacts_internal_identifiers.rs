@@ -133,6 +133,7 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        limits: ravel_server::LimitsConfig::default(),
     };
     let running = ravel_server::start(
         config,

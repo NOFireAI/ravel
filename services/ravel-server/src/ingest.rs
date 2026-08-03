@@ -3,22 +3,64 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashSet;
+
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use ravel_ingest::{IngestPoint, IngestRouter, WriteError, WriteMode};
+use ravel_ingest::{
+    AdmissionController, IngestPoint, IngestRouter, RequestRejection, WriteError, WriteMode,
+};
 use ravel_otlp::{IngestLimits, Rejection, normalize_metrics};
-use ravel_types::{CommitToken, TenantId};
+use ravel_types::{CommitToken, SeriesId, TenantId};
 
 pub struct IngestState {
     pub router: Arc<IngestRouter>,
     pub limits: IngestLimits,
     pub ack_deadline: Duration,
+    /// Tenant admission (ADR-0051): series-creation-rate and active-series
+    /// cap (layer 4). Body size and byte rate (layers 1-2) are enforced
+    /// upstream of `handle_export`, at the transport handler, on undecoded
+    /// wire bytes.
+    pub admission: Arc<AdmissionController>,
 }
 
 pub struct IngestOutcome {
     pub response: ExportMetricsServiceResponse,
     pub tokens: Vec<CommitToken>,
+}
+
+/// Failure from [`handle_export`]: either the tenant's admission limits
+/// rejected the request (layer 4, ADR-0051) or the write itself failed.
+#[derive(Debug, Clone)]
+pub enum IngestRequestError {
+    /// A whole-request, retryable-later rejection: series-creation-rate
+    /// exceeded. No tokens are consumed on rejection.
+    Admission(RequestRejection),
+    Write(WriteError),
+}
+
+impl std::fmt::Display for IngestRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IngestRequestError::Admission(rejection) => write!(f, "{}", rejection.reason),
+            IngestRequestError::Write(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for IngestRequestError {}
+
+impl IngestRequestError {
+    /// Whether a client may reasonably retry the whole request. An
+    /// admission rejection is always retryable later, once the tenant's
+    /// bucket refills; delegates to [`WriteError::is_retryable`] otherwise.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            IngestRequestError::Admission(_) => true,
+            IngestRequestError::Write(err) => err.is_retryable(),
+        }
+    }
 }
 
 /// Upper bound on the assembled `error_message` byte length. Without a cap,
@@ -36,9 +78,9 @@ pub async fn handle_export(
     mode: WriteMode,
     request: ExportMetricsServiceRequest,
     ingest_ts_ns: i64,
-) -> Result<IngestOutcome, WriteError> {
+) -> Result<IngestOutcome, IngestRequestError> {
     let normalized = normalize_metrics(&tenant, request, &state.limits, ingest_ts_ns);
-    let rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
     // Scalar and native-histogram points arrive in separate vectors; both
     // feed one ingest write so a request's points share a single receipt.
@@ -52,13 +94,33 @@ pub async fn handle_export(
             .map(IngestPoint::from),
     );
 
+    // Layer 4 (ADR-0051 section 1): series-creation-rate is a whole-request
+    // rate limit checked first (breach rejects the whole request, no tokens
+    // consumed); the active-series cap that follows is per-series partial
+    // success, never a whole-request rejection.
+    let candidate_series: Vec<SeriesId> = points.iter().map(|p| p.series_id).collect();
+    state
+        .admission
+        .check_series_creation_rate(&tenant, &candidate_series, ingest_ts_ns)
+        .map_err(IngestRequestError::Admission)?;
+    let admission = state
+        .admission
+        .admit_series(&tenant, candidate_series, ingest_ts_ns);
+    let series_cap_rejected = admission.rejected.len();
+    if series_cap_rejected > 0 {
+        let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();
+        points.retain(|p| admitted.contains(&p.series_id));
+        rejected_count += series_cap_rejected;
+    }
+
     let receipt = state
         .router
         .write_values(tenant, points, mode, state.ack_deadline)
-        .await?;
+        .await
+        .map_err(IngestRequestError::Write)?;
 
     let partial_success = if rejected_count > 0 {
-        let error_message = build_error_message(&normalized.rejected);
+        let error_message = build_error_message(&normalized.rejected, series_cap_rejected);
         Some(ExportMetricsPartialSuccess {
             rejected_data_points: rejected_count as i64,
             error_message,
@@ -82,7 +144,11 @@ pub async fn handle_export(
 /// The assembled message is capped at [`MAX_ERROR_MESSAGE_BYTES`]; if more
 /// distinct reasons exist than fit, the message is truncated with a count of
 /// how many were omitted.
-fn build_error_message(rejected: &[Rejection]) -> String {
+///
+/// `series_cap_rejected` folds in the layer-4 active-series-cap count (0
+/// when nothing was capped) as one more reason, aggregated the same way as
+/// every normalization rejection.
+fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for r in rejected {
@@ -94,6 +160,16 @@ fn build_error_message(rejected: &[Rejection]) -> String {
             .or_insert_with(|| {
                 order.push(key);
                 n
+            });
+    }
+    if series_cap_rejected > 0 {
+        let key = "active series cap exceeded".to_string();
+        counts
+            .entry(key.clone())
+            .and_modify(|count| *count += series_cap_rejected)
+            .or_insert_with(|| {
+                order.push(key);
+                series_cap_rejected
             });
     }
 
@@ -132,7 +208,7 @@ fn build_error_message(rejected: &[Rejection]) -> String {
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-    use ravel_ingest::{IngestConfig, SystemClock};
+    use ravel_ingest::{AdmissionLimits, IngestConfig, SystemClock};
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;
@@ -149,6 +225,10 @@ mod tests {
             router,
             limits: IngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
         }
     }
 
@@ -164,7 +244,7 @@ mod tests {
             reason: Box::new(Rejection::ComplexAttributeValue),
             count: 50_000,
         }];
-        let message = build_error_message(&rejected);
+        let message = build_error_message(&rejected, 0);
         assert!(message.contains("x50000"), "got: {message}");
         assert!(message.len() < 500);
     }
@@ -177,7 +257,7 @@ mod tests {
         let rejected: Vec<Rejection> = (0..10_000)
             .map(|i| Rejection::DuplicateLabelName(format!("label_{i}")))
             .collect();
-        let message = build_error_message(&rejected);
+        let message = build_error_message(&rejected, 0);
         assert!(
             message.len() <= MAX_ERROR_MESSAGE_BYTES + 128,
             "message not bounded: {} bytes",

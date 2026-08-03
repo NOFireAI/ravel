@@ -76,6 +76,7 @@ async fn start_with_mtls(
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        limits: ravel_server::LimitsConfig::default(),
     };
     ravel_server::start(
         config,

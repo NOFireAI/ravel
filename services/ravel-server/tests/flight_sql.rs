@@ -454,6 +454,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        limits: ravel_server::LimitsConfig::default(),
     };
     let running = ravel_server::start(
         config,

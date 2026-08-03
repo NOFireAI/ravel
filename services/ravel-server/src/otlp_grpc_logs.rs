@@ -9,10 +9,13 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
+use prost::Message;
+use ravel_types::Signal;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
-use crate::otlp_grpc::metadata_to_headers;
+use crate::logs_ingest::LogIngestRequestError;
+use crate::otlp_grpc::{admission_rejection_status, metadata_to_headers};
 use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, now_ns, write_mode_from_headers};
 
 pub struct GrpcLogsService {
@@ -39,6 +42,18 @@ impl LogsService for GrpcLogsService {
             .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
         let mode = write_mode_from_headers(&headers);
 
+        // Layer 2 (ADR-0051 section 2): byte rate on the decoded message's
+        // encoded length as a proxy for wire bytes, before this request
+        // reaches `handle_export_logs`.
+        let request_bytes = request.get_ref().encoded_len() as u64;
+        if let Err(rejection) =
+            self.state
+                .admission
+                .check_byte_rate(&tenant, Signal::Logs, request_bytes, now_ns())
+        {
+            return Err(admission_rejection_status(rejection));
+        }
+
         let outcome = crate::logs_ingest::handle_export_logs(
             &self.state.logs_ingest,
             tenant,
@@ -47,12 +62,12 @@ impl LogsService for GrpcLogsService {
             now_ns(),
         )
         .await
-        .map_err(|err| {
-            if err.is_retryable() {
-                Status::unavailable(err.to_string())
-            } else {
-                Status::internal(err.to_string())
+        .map_err(|err| match err {
+            LogIngestRequestError::Admission(rejection) => admission_rejection_status(rejection),
+            LogIngestRequestError::Write(write_err) if write_err.is_retryable() => {
+                Status::unavailable(write_err.to_string())
             }
+            LogIngestRequestError::Write(write_err) => Status::internal(write_err.to_string()),
         })?;
 
         let mut response = Response::new(outcome.response);

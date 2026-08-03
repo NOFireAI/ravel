@@ -37,7 +37,9 @@ use axum::Router;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
-use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, SystemClock};
+use ravel_ingest::{
+    AdmissionController, IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, SystemClock,
+};
 use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
 #[cfg(feature = "otap")]
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsServiceServer;
@@ -150,6 +152,11 @@ pub struct ServerConfig {
     /// the service. Has no effect at all when built without the `otap`
     /// feature. `main` sets it from the `--otap` flag (`config::Cli::otap`).
     pub otap: bool,
+    /// Tenant admission limits resolved from `--limits-file` (ADR-0051
+    /// section 3), fed into the single shared `AdmissionController` [`start`]
+    /// constructs: `defaults` becomes the controller's baseline and each
+    /// `tenants` entry overrides it per tenant via `set_tenant_limits`.
+    pub limits: LimitsConfig,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -246,6 +253,7 @@ fn gateway_state(
     log_ingest_router: &Arc<LogIngestRouter>,
     span_ingest_router: &Arc<SpanIngestRouter>,
     tenant_resolver: Arc<dyn TenantResolver>,
+    admission: &Arc<AdmissionController>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -253,23 +261,27 @@ fn gateway_state(
             router: ingest_router.clone(),
             limits: IngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
+            admission: admission.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
             limits: LogIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
+            admission: admission.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
             limits: SpanIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
         },
+        admission: admission.clone(),
     })
 }
 
 fn remote_write_state(
     ingest_router: &Arc<IngestRouter>,
     tenant_resolver: Arc<dyn TenantResolver>,
+    admission: &Arc<AdmissionController>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -277,6 +289,7 @@ fn remote_write_state(
         limits: IngestLimits::default(),
         ack_deadline: DEFAULT_ACK_DEADLINE,
         metrics: remote_write::RemoteWriteMetrics::default(),
+        admission: admission.clone(),
     })
 }
 
@@ -336,6 +349,17 @@ pub async fn start(
         None
     };
 
+    // Tenant admission (ADR-0051): one controller per process, shared by
+    // every ingest path below. `defaults` seeds the baseline and each
+    // `--limits-file` tenant override replaces it via `set_tenant_limits`.
+    let admission = Arc::new(AdmissionController::new(
+        Arc::new(SystemClock),
+        config.limits.defaults,
+    ));
+    for (tenant, limits) in &config.limits.tenants {
+        admission.set_tenant_limits(tenant.clone(), *limits);
+    }
+
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
     // and is latched to true below, once both listeners are bound and the
@@ -359,14 +383,21 @@ pub async fn start(
             log_router,
             span_router,
             config.tenant_resolver.clone(),
+            &admission,
         );
         http_router = http_router.merge(otlp_http::router(state));
-        let rw_state = remote_write_state(router, config.tenant_resolver.clone());
+        let rw_state = remote_write_state(router, config.tenant_resolver.clone(), &admission);
         http_router = http_router.merge(remote_write::router(rw_state));
 
         if let Some(mtls) = &config.mtls_listener {
-            let mtls_state = gateway_state(router, log_router, span_router, mtls.resolver.clone());
-            let mtls_rw_state = remote_write_state(router, mtls.resolver.clone());
+            let mtls_state = gateway_state(
+                router,
+                log_router,
+                span_router,
+                mtls.resolver.clone(),
+                &admission,
+            );
+            let mtls_rw_state = remote_write_state(router, mtls.resolver.clone(), &admission);
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
                 .merge(remote_write::router(mtls_rw_state));
@@ -551,17 +582,25 @@ pub async fn start(
             log_router,
             span_router,
             config.tenant_resolver.clone(),
+            &admission,
         )),
         _ => None,
     };
-    let metrics_service = otlp_grpc_state
-        .as_ref()
-        .map(|state| MetricsServiceServer::new(otlp_grpc::GrpcMetricsService::new(state.clone())));
-    let logs_service = otlp_grpc_state
-        .as_ref()
-        .map(|state| LogsServiceServer::new(otlp_grpc_logs::GrpcLogsService::new(state.clone())));
+    // 16 MiB matches the HTTP `DefaultBodyLimit` (layer 1, ADR-0051 section
+    // 2): the cap is on the wire message, before OTLP protobuf decode, on
+    // every service equally regardless of transport.
+    const MAX_DECODED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+    let metrics_service = otlp_grpc_state.as_ref().map(|state| {
+        MetricsServiceServer::new(otlp_grpc::GrpcMetricsService::new(state.clone()))
+            .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
+    });
+    let logs_service = otlp_grpc_state.as_ref().map(|state| {
+        LogsServiceServer::new(otlp_grpc_logs::GrpcLogsService::new(state.clone()))
+            .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
+    });
     let traces_service = otlp_grpc_state.as_ref().map(|state| {
         TraceServiceServer::new(otlp_grpc_traces::GrpcTraceService::new(state.clone()))
+            .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
     });
 
     // OTAP metrics ride the same gRPC listener and share the same
@@ -577,7 +616,15 @@ pub async fn start(
         .as_ref()
         .filter(|_| config.otap)
         .map(|state| {
+            // Layer 1 (ADR-0051): the wire-message cap applies to every tonic
+            // service, OTAP included. OTAP's per-`ArrowPayload.record`
+            // decompression cap (16 MiB) does not bound the whole
+            // `BatchArrowRecords` message, which carries a vector of payloads;
+            // tonic's own 4 MiB default happens to be stricter today, but the
+            // cap must be explicit here rather than relying on that default
+            // silently doing our job.
             ArrowMetricsServiceServer::new(otap_grpc::GrpcArrowMetricsService::new(state.clone()))
+                .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
         });
 
     // The gRPC listener carries OTLP ingest, so gateway modes always bind it.
