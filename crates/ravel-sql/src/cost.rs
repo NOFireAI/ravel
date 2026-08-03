@@ -106,5 +106,11 @@ pub fn estimate_logs_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEst
         .map(|seg| seg.object_size)
         .fold(0u64, |acc, size| acc.saturating_add(size));
 
-    CostEstimate::new(estimated_requests, estimated_store_bytes, 0, segments, series)
+    CostEstimate::new(
+        estimated_requests,
+        estimated_store_bytes,
+        0,
+        segments,
+        series,
+    )
 }

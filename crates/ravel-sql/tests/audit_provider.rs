@@ -159,7 +159,12 @@ fn provider(store: MemoryStore, segments: Vec<SegmentRef>) -> AuditTableProvider
         segments,
         segments_pruned: 0,
     };
-    AuditTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new())
+    AuditTableProvider::new(
+        snapshot,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    )
 }
 
 /// A ts range returns exactly the surviving generic rows across several objects,

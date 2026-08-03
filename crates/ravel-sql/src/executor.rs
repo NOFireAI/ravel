@@ -404,7 +404,9 @@ impl SqlExecutor {
             TargetSignal::Metrics => self.pushed_down_name_filter(tenant_hash, &req.sql).await,
             TargetSignal::Logs => None,
         };
-        let catalog_requests = self.catalog.estimated_catalog_requests(req.window, req.now_ns);
+        let catalog_requests = self
+            .catalog
+            .estimated_catalog_requests(req.window, req.now_ns);
         let snapshot = self
             .catalog
             .resolve_pruned_with_accounting(
@@ -511,7 +513,10 @@ impl SqlExecutor {
         snapshot: Snapshot,
         accounting: &QueryAccounting,
     ) -> (Result<QueryOutput, SqlError>, usize) {
-        let planned = match self.plan_pinned(tenant_hash, snapshot, &req.sql, accounting).await {
+        let planned = match self
+            .plan_pinned(tenant_hash, snapshot, &req.sql, accounting)
+            .await
+        {
             Ok(planned) => planned,
             Err(e) => return (Err(e), 0),
         };
@@ -1009,5 +1014,144 @@ mod tests {
         let err = execution_error(df);
         assert!(matches!(err, SqlError::ResourcesExhausted(_)));
         assert!(err.client_message().contains("limit 8"));
+    }
+
+    /// ADR-0044 acceptance test (issue #424): one `execute` call, checked
+    /// against an `InstrumentedStore`'s own before/after deltas, the same
+    /// cross-check `Catalog::resolve_with_accounting`'s own test uses
+    /// (crates/ravel-catalog/src/catalog.rs). Proves the SQL path now
+    /// contributes to per-query accounting end to end, including the
+    /// `peak_intermediate_bytes` high-water mark deliverable 2 adds.
+    #[tokio::test]
+    async fn sql_execute_records_requests_bytes_and_peak_memory() {
+        use ravel_catalog::CatalogConfig;
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::instrument::InstrumentedStore;
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{ObjectStoreBackend, PutOptions};
+        use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+        use ravel_types::accounting::AccountedOp;
+        use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+        use uuid::Uuid;
+
+        let tenant = TenantId::new("acceptance-424".to_string());
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "m".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant, "m", &labels).expect("series id");
+        let samples: Vec<Sample> = (0..1_000)
+            .map(|i| Sample {
+                ts_ns: i,
+                value: i as f64,
+            })
+            .collect();
+
+        let writer_id = Uuid::from_u128(4_240);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id,
+                labels,
+                samples,
+            }],
+            identity,
+            bounds,
+        )
+        .expect("write segment");
+
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 1,
+            ingest_hour_bucket: 0,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+
+        let inner = MemoryStore::new();
+        inner
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(&inner, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        let store = Arc::new(InstrumentedStore::new(inner));
+
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let fetcher = SegmentFetcher::new(store.clone());
+        let log_fetcher = LogSegmentFetcher::new(store.clone());
+        let executor =
+            SqlExecutor::new(catalog, fetcher, log_fetcher, SqlConfig::default(), 1 << 30);
+
+        let request = SqlRequest {
+            sql: "SELECT ts, value FROM samples".to_string(),
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+            min_tokens: Vec::new(),
+            now_ns: 2_000,
+            deadline: Duration::from_secs(30),
+        };
+
+        let before = store.metrics().snapshot();
+        let outcome = executor
+            .execute(tenant_hash, &request)
+            .await
+            .expect("accounted execute");
+        let after = store.metrics().snapshot();
+
+        let get_calls_diff = after.get.calls - before.get.calls;
+        let list_calls_diff = after.list.calls - before.list.calls;
+        let head_calls_diff = after.head.calls - before.head.calls;
+        let get_bytes_diff = after.get.bytes - before.get.bytes;
+
+        assert_eq!(head_calls_diff, 0, "the SQL path issues no HEAD request");
+
+        let acc = outcome.accounting;
+        assert_eq!(acc.s3_requests(AccountedOp::Get), get_calls_diff);
+        assert_eq!(acc.s3_requests(AccountedOp::List), list_calls_diff);
+        assert_eq!(acc.s3_requests(AccountedOp::Head), 0);
+        assert_eq!(acc.s3_bytes(AccountedOp::Get), get_bytes_diff);
+        assert_eq!(
+            acc.total_s3_requests(),
+            get_calls_diff + list_calls_diff + head_calls_diff
+        );
+        assert!(
+            acc.peak_intermediate_bytes > 0,
+            "the tenant accountant's reserved high-water mark must feed \
+             observe_intermediate_bytes (issue #424 deliverable 2), so this \
+             is no longer always zero"
+        );
     }
 }
