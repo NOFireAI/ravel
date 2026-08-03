@@ -1432,6 +1432,7 @@ mod tests {
             &catalog,
             None,
             None,
+            None,
         );
 
         assert!(
