@@ -142,6 +142,18 @@ piece, see [docs/adrs/](docs/adrs/).
   Labels come from a closed allowlist, so Ravel's own telemetry cannot
   grow unbounded. The route is unauthenticated, like the health routes:
   do not expose the listener to untrusted networks.
+- **A read cache** ([ADR-0046](docs/adrs/0046-read-cache-tier.md)), in front of
+  both the PromQL/metric-SQL fetcher and the log fetcher: recently read
+  segment and log byte ranges are kept in a RAM tier so a repeat read of
+  the same data does not go back to object storage. Optimization only,
+  never changes a query result. Sized with `--cache-max-bytes`, turned off
+  with `--disable-cache`; warmed with each tenant's most recent parts at
+  startup, before `/readyz` latches, on a best-effort budget. Its hit/miss,
+  byte, and eviction counters render on `/metrics` under the same
+  allowlist as above. See
+  [docs/guides/caching.md](docs/guides/caching.md), including its known
+  gaps (no disk tier yet, no span or `alerts`/`audit` query surface to
+  cache).
 
 Two gaps worth knowing about: PromQL subqueries over native histograms
 return a typed error rather than a wrong answer (issue #220), and native
