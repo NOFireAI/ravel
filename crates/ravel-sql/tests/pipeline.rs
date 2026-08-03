@@ -32,6 +32,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::RavelTableProvider;
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -220,7 +221,7 @@ async fn run_pipeline(
     config: EngineConfig,
 ) -> Reduced {
     let fetcher = SegmentFetcher::new(store);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(target_partitions).expect("build plan");
     let batches = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -394,7 +395,13 @@ async fn optimizer_path_preserves_sort_preserving_merge_and_full_rows() {
     let config = SessionConfig::new().with_target_partitions(4);
     let ctx = SessionContext::new_with_config(config);
     let fetcher = SegmentFetcher::new(Arc::clone(&backend));
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
+    let provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
     ctx.register_table("samples", Arc::new(provider))
         .expect("register table");
 
@@ -527,7 +534,7 @@ async fn max_samples_budget_trips_on_yielded_rows() {
         ..EngineConfig::default()
     };
     let fetcher = SegmentFetcher::new(backend);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config);
+    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -576,7 +583,13 @@ async fn mid_scan_get_failure_is_typed_error_and_fault_fires() {
     let fetcher = SegmentFetcher::new(backend)
         .with_whole_object_threshold(0)
         .with_suffix_len(64);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
+    let provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, Arc::new(TaskContext::default()))
         .await

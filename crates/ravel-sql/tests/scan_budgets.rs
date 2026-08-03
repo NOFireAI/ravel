@@ -30,6 +30,7 @@ use ravel_object_store::{
 use ravel_query::{EngineConfig, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{RavelTableProvider, SqlConfig, TenantMemoryAccountant};
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -236,8 +237,13 @@ async fn max_series_rejects_before_every_segment_is_fetched() {
         max_series: 100,
         ..EngineConfig::default()
     };
-    let baseline_provider =
-        RavelTableProvider::new(snapshot.clone(), TENANT, baseline_fetcher, baseline_config);
+    let baseline_provider = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        baseline_fetcher,
+        baseline_config,
+        QueryAccounting::new(),
+    );
     let baseline_plan = baseline_provider.plan(1).expect("plan");
     collect(baseline_plan, Arc::new(TaskContext::default()))
         .await
@@ -259,7 +265,13 @@ async fn max_series_rejects_before_every_segment_is_fetched() {
         max_series: 3,
         ..EngineConfig::default()
     };
-    let capped_provider = RavelTableProvider::new(snapshot, TENANT, capped_fetcher, capped_config);
+    let capped_provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        capped_fetcher,
+        capped_config,
+        QueryAccounting::new(),
+    );
     let capped_plan = capped_provider.plan(1).expect("plan");
     let err = collect(capped_plan, Arc::new(TaskContext::default()))
         .await
@@ -281,7 +293,7 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         max_query_bytes,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
-    let (pool, _breach) = config.query_pool(tenant);
+    let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
     let rt = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .build_arc()
@@ -314,7 +326,13 @@ async fn byte_budget_rejects_during_fetch_decode_not_only_after_batches() {
     let task_ctx = task_ctx_with_query_bytes(200_000);
 
     let fetcher = SegmentFetcher::new(Arc::clone(&counting_store) as Arc<dyn ObjectStoreBackend>);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, EngineConfig::default());
+    let provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
     let plan = provider.plan(1).expect("plan");
     let mut stream = plan.execute(0, task_ctx).expect("execute");
 

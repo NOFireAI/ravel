@@ -13,6 +13,7 @@ use std::sync::Arc;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{CeilingBreach, SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant};
+use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
 /// sql3-F01 (S1, MEM). `MemoryPool::grow` is infallible and checks no
@@ -36,6 +37,7 @@ fn sql3_f01_grow_bypasses_the_query_and_tenant_ceiling() {
         1024,
         Arc::clone(&tenant),
         CeilingBreach::new(),
+        QueryAccounting::new(),
     ));
 
     let res = MemoryConsumer::new("audit-sql3-f01").register(&pool);
