@@ -46,6 +46,9 @@ fn resolve(req: WriteRequest) -> ResolvedRequest {
         metadata_count: req.metadata.len(),
         // prometheus.Sample carries no start_timestamp field on the wire.
         created_timestamps_count: 0,
+        // RW1 resolves no symbol table and charges no resolved-label budget, so
+        // no exemplar is ever dropped at decode time.
+        exemplars_dropped: 0,
     }
 }
 

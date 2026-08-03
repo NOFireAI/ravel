@@ -138,6 +138,7 @@ fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest
     let mut series = Vec::with_capacity(req.timeseries.len());
     let mut metadata_count = 0usize;
     let mut created_timestamps_count = 0usize;
+    let mut exemplars_dropped = 0usize;
     let mut resolved_label_bytes = 0usize;
     for (series_index, ts) in req.timeseries.into_iter().enumerate() {
         series.push(resolve_series(
@@ -146,6 +147,7 @@ fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest
             &symbols,
             &mut metadata_count,
             &mut created_timestamps_count,
+            &mut exemplars_dropped,
             &mut resolved_label_bytes,
             resolved_label_budget,
         )?);
@@ -154,6 +156,7 @@ fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest
         series,
         metadata_count,
         created_timestamps_count,
+        exemplars_dropped,
     })
 }
 
@@ -164,6 +167,7 @@ fn resolve_series(
     symbols: &[String],
     metadata_count: &mut usize,
     created_timestamps_count: &mut usize,
+    exemplars_dropped: &mut usize,
     resolved_label_bytes: &mut usize,
     resolved_label_budget: usize,
 ) -> Result<ResolvedSeries, Rw2DecodeError> {
@@ -177,19 +181,26 @@ fn resolve_series(
 
     let mut exemplars = Vec::with_capacity(ts.exemplars.len());
     for (exemplar_index, exemplar) in ts.exemplars.iter().enumerate() {
-        let labels = resolve_exemplar_label_refs(
+        // An exemplar whose labels would carry the request past the budget is
+        // dropped and counted, never a reason to reject the series that carries
+        // it or the request as a whole (the `?` here still propagates a
+        // genuinely malformed reference: an odd length or an out-of-range
+        // symbol index, which is protocol corruption rather than size).
+        match resolve_exemplar_label_refs(
             series_index,
             exemplar_index,
             &exemplar.labels_refs,
             symbols,
             resolved_label_bytes,
             resolved_label_budget,
-        )?;
-        exemplars.push(ResolvedExemplar {
-            ts_ms: exemplar.timestamp,
-            value: exemplar.value,
-            labels,
-        });
+        )? {
+            Some(labels) => exemplars.push(ResolvedExemplar {
+                ts_ms: exemplar.timestamp,
+                value: exemplar.value,
+                labels,
+            }),
+            None => *exemplars_dropped += 1,
+        }
     }
 
     if let Some(meta) = &ts.metadata {
@@ -342,6 +353,21 @@ fn resolve_label_refs(
 /// are kept rather than discarded, an adversarial exemplar `labels_refs` list
 /// amplifies wire bytes into resident bytes exactly like a series one.
 ///
+/// Returns `Ok(Some(labels))` when the exemplar fits the budget (and only then
+/// commits its bytes to the shared `resolved_label_bytes` counter), and
+/// `Ok(None)` when it does not: an over-budget exemplar is dropped and counted
+/// by the caller, never a reason to reject the series or the request. Unlike a
+/// series label set, whose overflow does reject the request via
+/// [`resolve_label_refs`], an exemplar is a decoration on the series data
+/// (ADR-0047 decision 1 carries its labels as filtered attributes), so losing
+/// the metric payload over it would trade the data for the decoration. A
+/// dropped exemplar charges nothing: its bytes are not resident, so a later
+/// series must not see the budget as if they were.
+///
+/// `Err` is still returned for a genuinely malformed reference (odd length or
+/// an out-of-range symbol index): that is protocol corruption, not size, and
+/// keeps the pre-existing shape validation intact.
+///
 /// Unlike [`resolve_label_refs`], an empty label *name* is not rejected here.
 /// Exemplar labels are not series identity (ADR-0047 decision 1 carries them
 /// as an exemplar's filtered attributes), so an odd name cannot alias one
@@ -354,7 +380,7 @@ fn resolve_exemplar_label_refs(
     symbols: &[String],
     resolved_label_bytes: &mut usize,
     resolved_label_budget: usize,
-) -> Result<Vec<Label>, Rw2DecodeError> {
+) -> Result<Option<Vec<Label>>, Rw2DecodeError> {
     if !labels_refs.len().is_multiple_of(2) {
         return Err(Rw2DecodeError::OddExemplarLabelRefsLength {
             series_index,
@@ -363,6 +389,10 @@ fn resolve_exemplar_label_refs(
         });
     }
     let mut labels = Vec::with_capacity(labels_refs.len() / 2);
+    // Charge against a local copy of the shared counter so a mid-way overflow
+    // leaves the shared counter untouched: a dropped exemplar must contribute
+    // no resident bytes.
+    let mut tentative_bytes = *resolved_label_bytes;
     for (pair_index, pair) in labels_refs.chunks_exact(2).enumerate() {
         let name_position = pair_index * 2;
         let resolve = |position: usize, symbol_ref: u32| {
@@ -378,19 +408,17 @@ fn resolve_exemplar_label_refs(
         };
         let name = resolve(name_position, pair[0])?;
         let value = resolve(name_position + 1, pair[1])?;
-        *resolved_label_bytes += name.len() + value.len();
-        if *resolved_label_bytes > resolved_label_budget {
-            return Err(Rw2DecodeError::ResolvedLabelBudgetExceeded {
-                resolved_bytes: *resolved_label_bytes,
-                budget_bytes: resolved_label_budget,
-            });
+        tentative_bytes = tentative_bytes.saturating_add(name.len() + value.len());
+        if tentative_bytes > resolved_label_budget {
+            return Ok(None);
         }
         labels.push(Label {
             name: name.clone(),
             value: value.clone(),
         });
     }
-    Ok(labels)
+    *resolved_label_bytes = tentative_bytes;
+    Ok(Some(labels))
 }
 
 #[cfg(test)]
@@ -865,6 +893,107 @@ mod tests {
         );
 
         let err = decode_request(&body, 2_000).expect_err("resolved label budget must reject");
+        assert!(matches!(
+            err,
+            Rw2DecodeError::ResolvedLabelBudgetExceeded { .. }
+        ));
+    }
+
+    /// FINDING 2: an exemplar whose labels alone blow the budget is dropped and
+    /// counted, leaving the in-budget series payload (its samples) fully
+    /// intact. Before the fix the shared cumulative counter carried the
+    /// exemplar bytes past the budget and the `?` propagated a
+    /// `ResolvedLabelBudgetExceeded` out through decode, losing every sample in
+    /// the batch.
+    #[test]
+    fn exemplar_only_overflow_drops_the_exemplar_and_keeps_the_series() {
+        // A tiny series (refs 1,2) plus one exemplar whose 200 (name,value)
+        // pairs resolve to 200 * (1 + 200) = 40_200 bytes, past the 32_000-byte
+        // budget derived from a 2_000-byte decompressed cap. The series bytes
+        // (a 8-byte name plus a 2-byte value) are well within budget.
+        let big_value = "v".repeat(200);
+        let syms = symbols(&["__name__", "up", "trace_id", &big_value]);
+        let mut exemplar_refs = Vec::with_capacity(400);
+        for _ in 0..200 {
+            exemplar_refs.push(3u32); // "trace_id"
+            exemplar_refs.push(4u32); // 200-byte value
+        }
+        let req = request(
+            syms,
+            vec![ProtoTimeSeriesV2 {
+                labels_refs: vec![1, 2],
+                samples: vec![
+                    ProtoSampleV2 {
+                        value: 1.0,
+                        timestamp: 1_700_000_000_000,
+                        start_timestamp: 0,
+                    },
+                    ProtoSampleV2 {
+                        value: 2.0,
+                        timestamp: 1_700_000_001_000,
+                        start_timestamp: 0,
+                    },
+                ],
+                histograms: vec![],
+                exemplars: vec![ProtoExemplarV2 {
+                    labels_refs: exemplar_refs,
+                    value: 3.0,
+                    timestamp: 1_700_000_000_500,
+                }],
+                metadata: None,
+            }],
+        );
+        let body = compress(&req.encode_to_vec());
+
+        let resolved = decode_request(&body, 2_000).expect("request must decode, not reject");
+        // The series survives whole: both samples present, the metric name
+        // resolved.
+        assert_eq!(resolved.series.len(), 1);
+        let series = &resolved.series[0];
+        assert_eq!(series.samples.len(), 2);
+        assert_eq!(series.samples[0].value, 1.0);
+        assert_eq!(series.samples[1].value, 2.0);
+        // The over-budget exemplar is dropped, not carried, and counted.
+        assert!(series.exemplars.is_empty());
+        assert_eq!(resolved.exemplars_dropped, 1);
+    }
+
+    /// FINDING 2, other half: a series whose OWN labels blow the budget is
+    /// still rejected outright, even when it also carries an exemplar. The
+    /// exemplar-drop path must not weaken the series-label control.
+    #[test]
+    fn series_label_overflow_still_rejects_the_request() {
+        let big_value = "v".repeat(200);
+        let syms = symbols(&["__name__", &big_value, "trace_id"]);
+        // The series labels_refs alone resolve to 200 * (8 + 200) far past the
+        // 32_000-byte budget: (name "__name__" = 8 bytes, value = 200 bytes).
+        let mut labels_refs = Vec::with_capacity(400);
+        for _ in 0..200 {
+            labels_refs.push(1u32); // "__name__"
+            labels_refs.push(2u32); // 200-byte value
+        }
+        let req = request(
+            syms,
+            vec![ProtoTimeSeriesV2 {
+                labels_refs,
+                samples: vec![ProtoSampleV2 {
+                    value: 1.0,
+                    timestamp: 1_700_000_000_000,
+                    start_timestamp: 0,
+                }],
+                histograms: vec![],
+                exemplars: vec![ProtoExemplarV2 {
+                    labels_refs: vec![3, 1],
+                    value: 3.0,
+                    timestamp: 1_700_000_000_500,
+                }],
+                metadata: None,
+            }],
+        );
+        let body = compress(&req.encode_to_vec());
+
+        let err = decode_request(&body, 2_000)
+            .expect_err("series label budget overflow must still reject");
         assert!(matches!(
             err,
             Rw2DecodeError::ResolvedLabelBudgetExceeded { .. }

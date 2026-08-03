@@ -112,6 +112,7 @@ fn rw_series_id(mut labels: Vec<Label>) -> SeriesId {
         }],
         metadata_count: 0,
         created_timestamps_count: 0,
+        exemplars_dropped: 0,
     };
     let out = normalize_resolved(
         &TenantId::new(TENANT),
