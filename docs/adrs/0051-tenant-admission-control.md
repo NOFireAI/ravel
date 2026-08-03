@@ -256,17 +256,28 @@ Two-part decision:
 
    docs/catalog-and-mvcc.md is amended in the same change that adds the
    key builder. The marker body is versioned and checksummed (`RIDM`
-   magic, u16 version = 1, crc32c over the payload, payload = the
-   serialized write receipt); a corrupt or truncated marker is a typed
-   error treated as a miss (fail-open to at-least-once, never a lost
-   ack), counted and exported. There is no dual-reader question: the
-   prefix is new, no old data exists under it, and no existing read,
-   resolve, or sweep path lists it (commit resolution lists `c/…`, the
-   orphan sweep lists `l0/…`; the fail-loud unknown-key rule applies to
-   the `c/` prefix only). Markers older than the dedup window (default
-   24 h, from the `ingest_hour` in the file name) are deleted by a new
-   stateless sweep rule in `ravel-maintain`; `ravel-cli` gets an
-   inspector for the new object class.
+   magic, u16 version = 1, crc32c over magic || version || the payload,
+   payload = the serialized write receipt); a corrupt or truncated
+   marker is a typed error treated as a miss (fail-open to at-least-once,
+   never a lost ack), counted and exported. There is no dual-reader
+   question: the prefix is new, no old data exists under it, and no
+   existing read, resolve, or sweep path lists it (commit resolution
+   lists `c/…`, the orphan sweep lists `l0/…`; the fail-loud unknown-key
+   rule applies to the `c/` prefix only). Markers older than the dedup
+   window (default 24 h, from the `ingest_hour` in the file name) will be
+   deleted by a stateless sweep rule in `ravel-maintain` (epic #452,
+   EB-9; not yet implemented); `ravel-cli` will get an inspector for the
+   new object class (EB-12; not yet implemented).
+
+   **Amendment (2026-08-03):** the checksum coverage above was
+   implemented as `crc32c(magic || version || payload)`, not
+   `crc32c(payload)` as an earlier draft of this section stated — the
+   header fields a reader branches on (magic, version) must be under the
+   same checksum as the payload, or a corrupted or forged header byte
+   passes verification silently (the precedent: ADR-0010 §4). Version
+   stays 1; no marker has ever been written under the payload-only
+   scheme, since this format is new in the same change, so there is no
+   dual-reader question and no version bump.
 
    Honest residuals, documented with the feature: a crash after the
    commit PUT but before the marker PUT still yields a duplicate on

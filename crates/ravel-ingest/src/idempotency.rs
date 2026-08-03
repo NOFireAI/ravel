@@ -312,7 +312,10 @@ pub async fn write_marker(
 /// original request pinned), so this lists every marker under
 /// [`marker_prefix`] and considers only those whose `ingest_hour` falls in
 /// the closed window `[now_ingest_hour_bucket - dedup_window_hours,
-/// now_ingest_hour_bucket]`, picking the most recent in-window hit.
+/// now_ingest_hour_bucket + 1]`, picking the most recent in-window hit. The
+/// one-hour forward tolerance absorbs the original writer's clock running
+/// slightly ahead of the reader's across an hour boundary; a marker further
+/// in the future than that is never in-window and is left for the sweep.
 ///
 /// Returns [`LookupOutcome::Miss`] if nothing in-window is found (or
 /// everything found there has already been swept), and
