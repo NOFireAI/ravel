@@ -29,6 +29,11 @@
 //! rather than emitted as zeros (W3C Trace Context reserves the all-zero id
 //! as invalid, so the two cases are indistinguishable anyway).
 //!
+//! Alongside `data`, a `stats` object carries this request's segment counters
+//! and cost accounting (ADR-0044), with the same field names
+//! `/api/v1/query`'s `data.stats` uses. It sits next to `data` rather than
+//! inside it only because Prometheus fixes this endpoint's `data` as an array.
+//!
 //! # Two data facts and how this endpoint decides them
 //!
 //! Both were found reviewing #474 and are called out in the issue.
@@ -97,7 +102,7 @@ use ravel_segment::{
     ExemplarRecord, ReaderLimits, SeriesEntryV4, decode_catalog_v5, decode_exemplars_section,
     open_from_full,
 };
-use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TimeRange,
 };
@@ -243,19 +248,20 @@ async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, ApiE
     // The whole request runs under one wall deadline, exactly as the query
     // engine wraps its own evaluation: an elapsed timeout is the same
     // `DeadlineExceeded` (504) a sample query would surface.
-    let series = tokio::time::timeout(
+    let (series, stats) = tokio::time::timeout(
         deadline,
         collect_exemplars(&state, tenant_hash, &query, start_ns, end_ns, &min_tokens),
     )
     .await
     .map_err(|_| ApiError::from_query(QueryError::DeadlineExceeded { deadline }))??;
 
-    Ok((StatusCode::OK, axum::Json(Envelope::success(series))).into_response())
+    Ok((StatusCode::OK, axum::Json(Envelope::success(series, stats))).into_response())
 }
 
 /// Resolves the snapshot the equivalent sample query would, reads exemplars
 /// from each matched segment, filters and deduplicates them, and groups them
-/// by series into the Prometheus response shape.
+/// by series into the Prometheus response shape, alongside this request's
+/// cost counters (ADR-0044).
 async fn collect_exemplars(
     state: &ExemplarsState,
     tenant_hash: TenantHash,
@@ -263,7 +269,7 @@ async fn collect_exemplars(
     start_ns: i64,
     end_ns: i64,
     min_tokens: &[CommitToken],
-) -> Result<Vec<ExemplarSeriesJson>, ApiError> {
+) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), ApiError> {
     // Parse the query into its selectors exactly as the engine's prefetch
     // does (`plan_selectors`), so the matcher sets and the equality-`__name__`
     // pruning line up with what a sample query over the same text would use. A
@@ -276,8 +282,9 @@ async fn collect_exemplars(
     let matcher_sets: Vec<Vec<LabelMatcher>> = plans.into_iter().map(|p| p.matchers).collect();
     if matcher_sets.is_empty() {
         // A query with no selectors (a bare scalar or string literal) can
-        // match no series and therefore carries no exemplars.
-        return Ok(Vec::new());
+        // match no series and therefore carries no exemplars. It also resolved
+        // no snapshot and touched no object, so its cost is genuinely zero.
+        return Ok((Vec::new(), QueryStatsJson::default()));
     }
     let name_filter = shared_equality_name_filter(&matcher_sets);
 
@@ -331,7 +338,12 @@ async fn collect_exemplars(
         .await?;
     }
 
-    Ok(group_by_series(collected))
+    let stats = QueryStatsJson {
+        segments_fetched: snapshot.segments.len() as u64,
+        segments_pruned: snapshot.segments_pruned,
+        accounting: QueryAccountingJson::from_snapshot(&accounting.snapshot()),
+    };
+    Ok((group_by_series(collected), stats))
 }
 
 /// Reads one segment's exemplars for the matched series, appending the ones
@@ -396,7 +408,6 @@ async fn read_segment_exemplars(
     // records reference.
     let entries: Vec<SeriesEntryV4> = decode_catalog_v5(footer, &object, limits)
         .map_err(|source| corrupt(data_object_key, source))?;
-    accounting.add_series_matched(entries.len() as u64);
 
     // Precompute which series indices any selector matches, so each exemplar
     // record is a single set lookup rather than a re-match.
@@ -408,6 +419,12 @@ async fn read_segment_exemplars(
                 .any(|matchers| matches_series(matchers, &e.entry.labels))
         })
         .collect();
+    // `series_matched` counts the series the selectors matched, not every
+    // series the object happens to carry: the latter is a property of how
+    // ingest packed the segment, not of what this query asked for, and
+    // reporting it would inflate the ADR-0044 cost surface by the object's
+    // whole cardinality on every fetch.
+    accounting.add_series_matched(matched.iter().filter(|m| **m).count() as u64);
 
     // Whole-section decode: query_exemplars matches a *set* of series, and one
     // pass over the section filtered by `matched` is strictly fewer passes
@@ -785,18 +802,99 @@ fn parse_duration_ms(name: &'static str, s: &str) -> Result<i64, ApiError> {
 
 /// The response envelope: Prometheus renders `data` as a bare array for
 /// `/api/v1/query_exemplars` (unlike `/api/v1/query`, whose `data` is an
-/// object with `resultType`/`result`).
+/// object with `resultType`/`result`), so this query's cost counters ride as a
+/// sibling
+/// `stats` object rather than inside `data` (where `/api/v1/query` puts
+/// theirs, its `data` being an object). Additive: a client that reads only
+/// `status` and `data`, which is every Prometheus-shaped client including
+/// Grafana, is unaffected.
 #[derive(Debug, Serialize)]
 struct Envelope {
     status: &'static str,
     data: Vec<ExemplarSeriesJson>,
+    stats: QueryStatsJson,
 }
 
 impl Envelope {
-    fn success(data: Vec<ExemplarSeriesJson>) -> Self {
+    fn success(data: Vec<ExemplarSeriesJson>, stats: QueryStatsJson) -> Self {
         Envelope {
             status: "success",
             data,
+            stats,
+        }
+    }
+}
+
+/// This request's segment counters and cost accounting (ADR-0044 decision 1).
+/// Mirrors `ravel_query::http`'s private `json::QueryStatsJson` field for
+/// field, minus the two parts that do not exist on this path: `estimate`
+/// (`estimate_cost` is private to `ravel-query`, and an estimate is only ever
+/// computed from a real resolved snapshot, never assumed) and the
+/// `rawF64Pages`/`rawF64Bytes` page counters (this endpoint reads whole
+/// objects and decodes one `EXEMPLARS` section, never a value page, so they
+/// would be a permanently-zero field, which `ravel-query`'s own accounting
+/// JSON explicitly refuses to carry).
+#[derive(Debug, Default, Serialize)]
+struct QueryStatsJson {
+    #[serde(rename = "segmentsFetched")]
+    segments_fetched: u64,
+    #[serde(rename = "segmentsPruned")]
+    segments_pruned: u64,
+    accounting: QueryAccountingJson,
+}
+
+/// Actual per-request store/decode counters, the ADR-0044 cost surface. Field
+/// names match `/api/v1/query`'s `stats.accounting` exactly, so one collector
+/// reads both endpoints.
+#[derive(Debug, Default, Serialize)]
+struct QueryAccountingJson {
+    #[serde(rename = "s3GetRequests")]
+    s3_get_requests: u64,
+    #[serde(rename = "s3GetBytes")]
+    s3_get_bytes: u64,
+    #[serde(rename = "s3ListRequests")]
+    s3_list_requests: u64,
+    #[serde(rename = "s3ListBytes")]
+    s3_list_bytes: u64,
+    #[serde(rename = "s3HeadRequests")]
+    s3_head_requests: u64,
+    #[serde(rename = "s3HeadBytes")]
+    s3_head_bytes: u64,
+    #[serde(rename = "cacheHits")]
+    cache_hits: u64,
+    #[serde(rename = "cacheMisses")]
+    cache_misses: u64,
+    #[serde(rename = "cacheBytes")]
+    cache_bytes: u64,
+    #[serde(rename = "decompressedBytes")]
+    decompressed_bytes: u64,
+    #[serde(rename = "segmentsOpened")]
+    segments_opened: u64,
+    #[serde(rename = "seriesMatched")]
+    series_matched: u64,
+    #[serde(rename = "bytesReused")]
+    bytes_reused: u64,
+    #[serde(rename = "peakIntermediateBytes")]
+    peak_intermediate_bytes: u64,
+}
+
+impl QueryAccountingJson {
+    fn from_snapshot(snapshot: &QueryAccountingSnapshot) -> Self {
+        QueryAccountingJson {
+            s3_get_requests: snapshot.s3_requests(AccountedOp::Get),
+            s3_get_bytes: snapshot.s3_bytes(AccountedOp::Get),
+            s3_list_requests: snapshot.s3_requests(AccountedOp::List),
+            s3_list_bytes: snapshot.s3_bytes(AccountedOp::List),
+            s3_head_requests: snapshot.s3_requests(AccountedOp::Head),
+            s3_head_bytes: snapshot.s3_bytes(AccountedOp::Head),
+            cache_hits: snapshot.cache_hits,
+            cache_misses: snapshot.cache_misses,
+            cache_bytes: snapshot.cache_bytes,
+            decompressed_bytes: snapshot.decompressed_bytes,
+            segments_opened: snapshot.segments_opened,
+            series_matched: snapshot.series_matched,
+            bytes_reused: snapshot.bytes_reused,
+            peak_intermediate_bytes: snapshot.peak_intermediate_bytes,
         }
     }
 }
@@ -1611,6 +1709,62 @@ mod tests {
                 "{token} must never see the other tenant's trace id"
             );
         }
+    }
+
+    /// The accounting filled during the request reaches the client: `stats`
+    /// reports the segment counters and the real store/decode cost, rather
+    /// than being dropped when the handler returns (ADR-0044 decision 1).
+    /// `seriesMatched` counts the series the selector matched, not every
+    /// series the fetched object carries.
+    #[tokio::test]
+    async fn response_carries_query_accounting_stats() {
+        let store = Arc::new(MemoryStore::new());
+        // Two series in one object; the query matches exactly one of them, so
+        // a seriesMatched of 2 would be counting the object, not the query.
+        let (sid, wanted) = scalar_series(
+            &tenant(),
+            "m",
+            &[("keep", "yes")],
+            &[(NOW - 60 * NS_PER_SEC, 1.0)],
+        );
+        let (_other_sid, other) = scalar_series(
+            &tenant(),
+            "m",
+            &[("keep", "no")],
+            &[(NOW - 60 * NS_PER_SEC, 2.0)],
+        );
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&store, 1, vec![wanted, other], vec![ex]).await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m{keep=\"yes\"}").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let stats = &body["stats"];
+        assert_eq!(stats["segmentsFetched"], 1);
+        assert_eq!(
+            stats["accounting"]["segmentsOpened"], 1,
+            "the one whole-object GET is accounted: {body}"
+        );
+        assert!(
+            stats["accounting"]["s3GetRequests"].as_u64().expect("u64") >= 1,
+            "the object GET is counted"
+        );
+        assert!(
+            stats["accounting"]["s3GetBytes"].as_u64().expect("u64") > 0,
+            "the transferred bytes are counted"
+        );
+        assert!(
+            stats["accounting"]["decompressedBytes"]
+                .as_u64()
+                .expect("u64")
+                > 0,
+            "the decoded EXEMPLARS section bytes are counted"
+        );
+        assert_eq!(
+            stats["accounting"]["seriesMatched"], 1,
+            "seriesMatched counts the matched series, not the object's two"
+        );
     }
 
     /// The result cap is a rejection, not a truncation: a query whose matched
