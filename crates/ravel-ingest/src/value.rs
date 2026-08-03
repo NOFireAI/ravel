@@ -7,7 +7,7 @@
 //! point.
 
 use ravel_segment::{ExemplarInput, HistogramSample};
-use ravel_types::{Exemplar, LabelSet, Sample, SeriesId};
+use ravel_types::{Exemplar, Label, LabelSet, Sample, SeriesId};
 
 /// One point's value: scalar or native histogram.
 #[derive(Debug, Clone)]
@@ -69,19 +69,25 @@ impl From<ravel_otlp::normalize::NormalizedExemplar> for IngestExemplar {
 
 impl IngestExemplar {
     /// Estimated buffered byte cost, for the shard's `est_bytes` flush
-    /// trigger: the EXEMPLARS record's fixed fields (series index, ts delta,
-    /// value, trace id, span id, attr count) plus each attribute's two
-    /// dictionary ordinals and the strings the dictionary interns
-    /// (docs/segment-format.md EXEMPLARS, ADR-0047's "roughly 40 bytes plus
-    /// attributes per kept exemplar").
+    /// trigger.
+    ///
+    /// This measures what the exemplar occupies in memory while it waits, not
+    /// what it will occupy in the object. Those differ by more than an order
+    /// of magnitude and the trigger bounds the former: a `Label` is two
+    /// `String` headers (24 bytes each) whatever the strings hold, and
+    /// `ravel-otlp` admits up to 64 filtered attributes per exemplar. Counting
+    /// only the stored form (ADR-0047's "roughly 40 bytes plus attributes")
+    /// undercounts an exemplar with 64 one-character attributes by more than
+    /// 10x, and exemplars are buffered before the cap runs, so the excess is
+    /// client-controlled.
     pub(crate) fn est_bytes(&self) -> usize {
         let attrs: usize = self
             .exemplar
             .filtered_attributes
             .iter()
-            .map(|l| l.name.len() + l.value.len() + 2)
+            .map(|l| size_of::<Label>() + l.name.len() + l.value.len())
             .sum();
-        40 + attrs
+        size_of::<Self>() + attrs
     }
 
     /// The writer-facing shape: the sample value comes back from its stored

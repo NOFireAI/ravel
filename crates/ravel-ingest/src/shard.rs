@@ -471,6 +471,12 @@ impl ShardActor {
             if !exemplars.is_empty() {
                 self.metrics.record_exemplars(0, exemplars.len() as u64);
             }
+            // `waiters` is empty here by construction: the router mints a
+            // strict-mode ack only for a shard that received points, so a
+            // shard holding nothing but exemplars has nobody to answer. If
+            // that ever changes, this returns without acking and the router
+            // reads the dropped oneshot as a dead shard.
+            debug_assert!(waiters.is_empty());
             return;
         }
         self.metrics.record_flush(trigger);
