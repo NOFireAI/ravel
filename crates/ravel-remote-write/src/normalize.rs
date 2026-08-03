@@ -217,14 +217,16 @@ pub struct RwMetricsNormalizeResult {
 /// Kept with its original signature and return type for existing callers;
 /// internally a thin wrapper around [`normalize_with_exemplars`] with a
 /// throwaway, request-scoped [`ExemplarCap`], exactly as
-/// `ravel_otlp::normalize_metrics` wraps its own exemplar-carrying twin. One
-/// consequence is worth stating plainly: with a request-scoped cap the
-/// admitted exemplars this discards are not added to
-/// [`RwNormalizeOutput::exemplars_dropped`] either, so that counter reports
-/// what the cap rejected and not what this wrapper threw away afterwards.
-/// Callers with somewhere to put admitted exemplars (issue #474) should call
-/// [`normalize_with_exemplars`] with a cap that outlives one request, which is
-/// the only way the per-series window means anything.
+/// `ravel_otlp::normalize_metrics` wraps its own exemplar-carrying twin. This
+/// wrapper has nowhere to store the exemplars the cap admits, so every one of
+/// them is dropped here; each is added to
+/// [`RwNormalizeOutput::exemplars_dropped`] (ADR-0047 decision 2: an exemplar
+/// that is not stored is dropped and counted, never silently discarded). The
+/// counter therefore reports the cap's rejections plus whatever this wrapper
+/// threw away afterwards. Callers with somewhere to put admitted exemplars
+/// (issue #474) should call [`normalize_with_exemplars`] with a cap that
+/// outlives one request, which is the only way the per-series window means
+/// anything.
 pub fn normalize_resolved(
     tenant: &TenantId,
     resolved: ResolvedRequest,
@@ -232,7 +234,15 @@ pub fn normalize_resolved(
     ingest_ts_ns: i64,
 ) -> RwNormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    normalize_with_exemplars(tenant, resolved, limits, ingest_ts_ns, &mut cap).output
+    let result = normalize_with_exemplars(tenant, resolved, limits, ingest_ts_ns, &mut cap);
+    let mut output = result.output;
+    // The cap admitted these, but this entry point discards them (nothing
+    // stores exemplars on the RW path yet). A discarded admission is still a
+    // dropped exemplar and must be counted, or an operator watching the
+    // points-dropped counter sees the number fall while the same data is still
+    // being dropped.
+    output.exemplars_dropped += result.exemplars.len();
+    output
 }
 
 /// Normalize a resolved Remote Write request into Ravel canonical points,
@@ -1063,6 +1073,37 @@ mod tests {
         assert_eq!(out.points[0].sample.ts_ns, 1_700_000_000_000_000_000);
         assert_eq!(out.points[0].sample.value, 1.0);
         assert!(!out.points[0].is_monotonic_sum);
+    }
+
+    /// FINDING 3: one series, one exemplar, through the production entry point
+    /// (`normalize_resolved`, the throwaway-cap wrapper). The cap admits the
+    /// exemplar, but this wrapper has nowhere to store it and discards it; a
+    /// discarded admission must still be counted as dropped. Before the fix
+    /// `exemplars_dropped` read 0 here while the exemplar was silently thrown
+    /// away, so an operator watching the points-dropped counter saw the number
+    /// improve while the same data was still being dropped (ADR-0047 decision
+    /// 2).
+    #[test]
+    fn one_admitted_then_discarded_exemplar_is_counted_as_dropped() {
+        let mut s = series(
+            vec![label("__name__", "up")],
+            vec![sample(1_700_000_000_000, 1.0)],
+        );
+        s.exemplars = vec![ResolvedExemplar {
+            ts_ms: 1_700_000_000_000,
+            value: 1.0,
+            labels: vec![label("trace_id", "abcdef")],
+        }];
+        let out = normalize_resolved(
+            &tenant(),
+            request(vec![s]),
+            &IngestLimits::default(),
+            1_700_000_001_000_000_000,
+        );
+        // The sample is admitted whole.
+        assert_eq!(out.points.len(), 1, "{:?}", out.rejected);
+        // The exemplar, admitted by the cap but discarded here, is counted.
+        assert_eq!(out.exemplars_dropped, 1);
     }
 
     #[test]
@@ -2007,9 +2048,9 @@ mod tests {
         assert_eq!(result.output.points.len(), 1);
     }
 
-    /// The legacy entry point keeps working and keeps reporting a cap-based
-    /// drop count. It cannot report the exemplars it discards itself, since it
-    /// has nowhere to put an admitted one (see `normalize_resolved`).
+    /// The legacy entry point keeps working and now counts every exemplar it
+    /// drops, including the ones the cap admits but this wrapper discards
+    /// (nothing stores exemplars on this path yet; see `normalize_resolved`).
     #[test]
     fn exemplars_of_a_rejected_series_are_counted_dropped() {
         let admitted = series_with_exemplars(vec![
@@ -2025,9 +2066,11 @@ mod tests {
             &IngestLimits::default(),
             1_000_000,
         );
-        // One of the admitted series' two same-window exemplars loses the cap,
-        // and the rejected series has no `SeriesId` to attach its one to.
-        assert_eq!(out.exemplars_dropped, 2);
+        // The admitted series' two same-window exemplars: one loses the cap and
+        // one is admitted-then-discarded by this wrapper. The rejected series
+        // has no `SeriesId` to attach its one to. All three are dropped, so all
+        // three are counted (FINDING 3: a discarded admission is still a drop).
+        assert_eq!(out.exemplars_dropped, 3);
     }
 
     #[test]

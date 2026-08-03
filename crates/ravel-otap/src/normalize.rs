@@ -423,6 +423,12 @@ fn decode_quasi_delta_column(
 /// [`Rejection::HistogramExemplarsDropped`] count is cap-based rather than
 /// "every exemplar, always" (exactly how `ravel_otlp::normalize_metrics` wraps
 /// its own exemplar-carrying twin).
+///
+/// This wrapper has nowhere to store the exemplars the cap admits, so it
+/// discards them; each discarded admission is counted into
+/// [`Rejection::HistogramExemplarsDropped`] (ADR-0047 decision 2: an exemplar
+/// that is not stored is dropped and counted, never silent), on top of the
+/// ones the cap itself turned away.
 pub fn normalize_decoded(
     tenant: &TenantId,
     batch: &DecodedBatch,
@@ -430,7 +436,18 @@ pub fn normalize_decoded(
     ingest_ts_ns: i64,
 ) -> NormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    normalize_decoded_with_exemplars(tenant, batch, limits, ingest_ts_ns, &mut cap).output
+    let result = normalize_decoded_with_exemplars(tenant, batch, limits, ingest_ts_ns, &mut cap);
+    let mut output = result.output;
+    // The cap admitted these, but this entry point drops them (nothing stores
+    // exemplars on the OTAP path yet). A discarded admission is still a dropped
+    // exemplar and must be counted, or an operator watching the points-dropped
+    // counter sees the number fall while the same data is still being dropped.
+    if !result.exemplars.is_empty() {
+        output.rejected.push(Rejection::HistogramExemplarsDropped {
+            count: result.exemplars.len(),
+        });
+    }
+    output
 }
 
 /// Decode and normalize one decoded OTAP `BatchArrowRecords` message,

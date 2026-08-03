@@ -330,7 +330,7 @@ fn the_cap_spans_batches_when_the_caller_owns_it() {
 }
 
 #[test]
-fn the_legacy_entry_point_still_reports_a_cap_based_drop_count() {
+fn the_legacy_entry_point_counts_every_exemplar_it_drops() {
     let histograms = histogram_with(
         vec![],
         vec![
@@ -346,9 +346,35 @@ fn the_legacy_entry_point_still_reports_a_cap_based_drop_count() {
     let decoded = state.decode(raw).expect("decode batch");
     let out = normalize_decoded(&tenant(), &decoded, &IngestLimits::default(), INGEST_TS_NS);
 
-    // Two same-window exemplars, one admitted (and then discarded, since this
-    // entry point has nowhere to put it) and one turned away by the cap.
-    assert_eq!(dropped_counts(&out.rejected), vec![1]);
+    // FINDING 3: two same-window exemplars, one turned away by the cap and one
+    // admitted-then-discarded (this entry point has nowhere to store it). Both
+    // are dropped, so both are counted: an admitted-but-discarded exemplar is
+    // no less dropped than a cap-rejected one.
+    let total: usize = dropped_counts(&out.rejected).iter().sum();
+    assert_eq!(total, 2);
+}
+
+/// FINDING 3: one series, one exemplar, through the production entry point
+/// (`normalize_decoded`, the throwaway-cap wrapper). The exemplar is admitted
+/// by the cap but discarded by the wrapper, since nothing stores exemplars on
+/// this path yet; it must still be counted as dropped. Before the fix this
+/// counter read 0 while the exemplar was silently thrown away.
+#[test]
+fn one_admitted_then_discarded_exemplar_is_counted_as_dropped() {
+    let histograms = histogram_with(
+        vec![],
+        vec![exemplar_row(INGEST_TS_NS, 1.0, Some(TRACE_ID))],
+    );
+    let mut encoder = MetricsStreamEncoder::new("exemplars-f3").expect("new encoder");
+    let raw = encoder
+        .encode_batch_ext(0, &[], &histograms, &[])
+        .expect("encode batch");
+    let mut state = StreamState::new(StreamConfig::default());
+    let decoded = state.decode(raw).expect("decode batch");
+    let out = normalize_decoded(&tenant(), &decoded, &IngestLimits::default(), INGEST_TS_NS);
+
+    let total: usize = dropped_counts(&out.rejected).iter().sum();
+    assert_eq!(total, 1);
 }
 
 // --- hand-built batches: shapes the encoder's fixed schema cannot express ---
