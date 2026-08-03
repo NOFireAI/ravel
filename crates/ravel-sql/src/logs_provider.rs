@@ -385,6 +385,118 @@ mod tests {
         );
     }
 
+    /// Predicate shapes that must NOT be extracted into a fetch prune
+    /// (issue #510 deliverable 3): an inequality, an `OR` across different
+    /// keys, a `NOT`, and a comparison against a non-literal. `extract_logs`
+    /// emits nothing for any of them (see
+    /// `crate::logs_pushdown::tests::non_extractable_attribute_shapes_contribute_nothing`),
+    /// so each must still return correct results purely from DataFusion's
+    /// residual over the merged `attrs` column. This is the end-to-end proof
+    /// that leaving them to the residual is correct.
+    ///
+    /// Three records on distinct streams:
+    /// - ts=1: resource `service.name=api`, `region=us`.
+    /// - ts=2: resource `service.name=worker`, `region=eu`.
+    /// - ts=3: resource `service.name=api`, `region=eu`, per-record override
+    ///   `service.name=cron` (record wins in the merged map).
+    #[tokio::test]
+    async fn residual_handles_non_pushed_attribute_shapes() {
+        let store = MemoryStore::new();
+        let records = vec![
+            record(
+                &[
+                    ("service.name".to_string(), s("api")),
+                    ("region".to_string(), s("us")),
+                ],
+                &[],
+                1,
+                "one",
+            ),
+            record(
+                &[
+                    ("service.name".to_string(), s("worker")),
+                    ("region".to_string(), s("eu")),
+                ],
+                &[],
+                2,
+                "two",
+            ),
+            record(
+                &[
+                    ("service.name".to_string(), s("api")),
+                    ("region".to_string(), s("eu")),
+                ],
+                &[("service.name".to_string(), s("cron"))],
+                3,
+                "three",
+            ),
+        ];
+        let seg = write_object(&store, "logs/shapes.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+
+        async fn bodies(ctx: &datafusion::prelude::SessionContext, sql: &str) -> BTreeSet<String> {
+            let df = ctx.sql(sql).await.expect("plan");
+            let batches = df.collect().await.expect("collect");
+            rows(&batches).into_iter().map(|(_, b)| b).collect()
+        }
+
+        // Inequality: merged service.name is api / worker / cron; != 'api'
+        // keeps worker (ts=2) and the record-wins cron (ts=3).
+        assert_eq!(
+            bodies(
+                &ctx,
+                "SELECT ts, body FROM logs WHERE attrs['service.name'] != 'api'"
+            )
+            .await,
+            BTreeSet::from(["two".to_string(), "three".to_string()]),
+        );
+
+        // OR across different keys: service.name='api' (ts=1) OR region='eu'
+        // (ts=2, ts=3) covers all three.
+        assert_eq!(
+            bodies(
+                &ctx,
+                "SELECT ts, body FROM logs \
+                 WHERE attrs['service.name'] = 'api' OR attrs['region'] = 'eu'",
+            )
+            .await,
+            BTreeSet::from(["one".to_string(), "two".to_string(), "three".to_string()]),
+        );
+
+        // NOT an equality: everything whose merged service.name is not worker.
+        assert_eq!(
+            bodies(
+                &ctx,
+                "SELECT ts, body FROM logs WHERE NOT attrs['service.name'] = 'worker'",
+            )
+            .await,
+            BTreeSet::from(["one".to_string(), "three".to_string()]),
+        );
+
+        // Comparison against a non-literal (attr vs attr): no record has
+        // service.name equal to its region.
+        assert!(
+            bodies(
+                &ctx,
+                "SELECT ts, body FROM logs WHERE attrs['service.name'] = attrs['region']",
+            )
+            .await
+            .is_empty(),
+        );
+    }
+
     /// A subscript on a key that exists nowhere in the merged map returns no
     /// rows, not a planning or execution error.
     #[tokio::test]
