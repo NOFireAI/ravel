@@ -23,6 +23,7 @@ zstd = { workspace = true }
 crc32c = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

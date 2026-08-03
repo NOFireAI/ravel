@@ -4,9 +4,14 @@
 //! per-key cache, serves window hours at or below the watermark from part
 //! entries, and leaves hours above the watermark to Phase 1 listing. Every
 //! failure (HEAD absent or corrupt, part missing, hash mismatch, decode
-//! error, shard_count mismatch aside) degrades to `Ok(None)`, telling the
-//! caller to fall back to full listing: this module can only ever make a
-//! query faster, never make it fail or return wrong data.
+//! error) degrades to `Ok(None)`, telling the caller to fall back to full
+//! listing: this module can only ever make a query faster, never make it
+//! return wrong data. Two mismatches are the loud exception, surfaced as a
+//! hard `CatalogError::FieldMismatch` instead of a degrade: `shard_count`
+//! (this catalog's own config disagrees with the index it is about to
+//! trust), and, per ADR-0050 §2, `tenant_hash` on the HEAD or a postings
+//! object (an isolation breach, never silently absorbed into a fallback
+//! that could serve or reference foreign bytes).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -183,7 +188,7 @@ impl Catalog {
             PartLoadOutcome::Loaded(parts) => {
                 let postings = if want_postings {
                     self.load_snapshot_postings(tenant, &head, &parts, accounting)
-                        .await
+                        .await?
                 } else {
                     None
                 };
@@ -211,7 +216,7 @@ impl Catalog {
                     PartLoadOutcome::Loaded(parts) => {
                         let postings = if want_postings {
                             self.load_snapshot_postings(tenant, &fresh_head, &parts, accounting)
-                                .await
+                                .await?
                         } else {
                             None
                         };
@@ -229,31 +234,38 @@ impl Catalog {
 
     /// Load and verify this HEAD's name postings through the immutable
     /// postings cache (P5b, docs/metric-index-plan.md 5.4). Every failure
-    /// mode (no postings ref, GET error, hash mismatch, decode error,
-    /// tenant/part-binding mismatch, entry-count mismatch) degrades to
-    /// `None`: postings are a pure pruning optimization, never surfaced as
-    /// an error and never allowed to make the snapshot window itself
-    /// unusable.
+    /// mode short of a `tenant_hash` mismatch (no postings ref, GET error,
+    /// hash mismatch, decode error, part-binding mismatch, entry-count
+    /// mismatch) degrades to `Ok(None)`: postings are a pure pruning
+    /// optimization, never surfaced as an error and never allowed to make
+    /// the snapshot window itself unusable. A `tenant_hash` mismatch is the
+    /// one loud exception (ADR-0050 §2): a postings object naming a
+    /// different tenant is an isolation breach, not a degrade-and-continue
+    /// case, so it is a hard `CatalogError::FieldMismatch` with no fallback.
     async fn load_snapshot_postings(
         &self,
         tenant: &TenantHash,
         head: &SnapshotHead,
         parts: &[Arc<DecodedPart>],
         accounting: &QueryAccounting,
-    ) -> Option<Arc<DecodedPostings>> {
-        let postings_ref = head.postings.as_ref()?;
-        let expected_part_blake3: Vec<[u8; 32]> = head
+    ) -> Result<Option<Arc<DecodedPostings>>, CatalogError> {
+        let Some(postings_ref) = head.postings.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(expected_part_blake3) = head
             .parts
             .iter()
             .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
-            .collect::<Result<_, _>>()
-            .ok()?;
+            .collect::<Result<Vec<[u8; 32]>, _>>()
+        else {
+            return Ok(None);
+        };
 
         if let Some(cached) = self
             .postings_cache()
             .get(tenant, &postings_ref.key, accounting)
         {
-            return Some(cached);
+            return Ok(Some(cached));
         }
 
         let data = match self
@@ -269,13 +281,13 @@ impl Catalog {
             Ok(data) => data,
             Err(err) => {
                 tracing::warn!(error = %err, key = %postings_ref.key, "postings GET failed, pruning disabled");
-                return None;
+                return Ok(None);
             }
         };
         let digest = blake3::hash(&data);
         if digest.as_bytes().as_slice() != postings_ref.blake3.as_slice() {
             tracing::warn!(key = %postings_ref.key, "postings hash mismatch, pruning disabled");
-            return None;
+            return Ok(None);
         }
         let limits = PostingsLimits {
             max_postings_bytes: self.config().max_postings_bytes,
@@ -285,17 +297,22 @@ impl Catalog {
             Ok(decoded) => decoded,
             Err(err) => {
                 tracing::warn!(error = %err, key = %postings_ref.key, "postings failed to decode, pruning disabled");
-                return None;
+                return Ok(None);
             }
         };
         if decoded.header.tenant_hash.as_slice() != tenant.0.as_slice() {
-            tracing::warn!(key = %postings_ref.key, "postings tenant_hash mismatch, pruning disabled");
-            return None;
+            self.record_isolation_breach();
+            return Err(CatalogError::FieldMismatch {
+                key: postings_ref.key.clone(),
+                field: "tenant_hash",
+                expected: tenant.to_hex(),
+                actual: hex::encode(&decoded.header.tenant_hash),
+            });
         }
         let total_entries: u64 = parts.iter().map(|p| p.entries.len() as u64).sum();
         if decoded.header.entry_count != total_entries {
             tracing::warn!(key = %postings_ref.key, "postings entry_count mismatch, pruning disabled");
-            return None;
+            return Ok(None);
         }
 
         let decoded = Arc::new(decoded);
@@ -306,15 +323,19 @@ impl Catalog {
             data.len() as u64,
             self.config().postings_cache_entries,
         );
-        Some(decoded)
+        Ok(Some(decoded))
     }
 
     /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure
-    /// short of a `shard_count` mismatch is logged and folded into `None`
-    /// (fall back to listing); a `shard_count` mismatch is the one loud
-    /// error (docs/metric-index-plan.md 5.1 step 1: "shard_count mismatch
-    /// is a loud/hard error"), since it means this catalog's own config
-    /// disagrees with the index it is about to trust.
+    /// short of a `shard_count` or `tenant_hash` mismatch is logged and
+    /// folded into `None` (fall back to listing). A `shard_count` mismatch
+    /// is a loud error (docs/metric-index-plan.md 5.1 step 1: "shard_count
+    /// mismatch is a loud/hard error"), since it means this catalog's own
+    /// config disagrees with the index it is about to trust. A
+    /// `tenant_hash` mismatch is likewise loud (ADR-0050 §2): a HEAD naming
+    /// a different tenant is an isolation breach, so it hard-fails instead
+    /// of silently falling back to a listing pass that could still be
+    /// influenced by the wrong index.
     #[allow(clippy::too_many_arguments)]
     async fn read_head(
         &self,
@@ -353,8 +374,13 @@ impl Catalog {
             }
         };
         if head.tenant_hash.as_slice() != tenant.0.as_slice() {
-            tracing::warn!(key = %head_key, "HEAD tenant_hash mismatch, falling back to listing");
-            return Ok(None);
+            self.record_isolation_breach();
+            return Err(CatalogError::FieldMismatch {
+                key: head_key.to_string(),
+                field: "tenant_hash",
+                expected: tenant.to_hex(),
+                actual: hex::encode(&head.tenant_hash),
+            });
         }
         if signal::from_proto(head.signal as i32) != Ok(signal) {
             tracing::warn!(key = %head_key, "HEAD signal mismatch, falling back to listing");
