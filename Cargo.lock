@@ -4470,6 +4470,7 @@ dependencies = [
  "proptest",
  "prost",
  "ravel-commit",
+ "ravel-ingest",
  "ravel-logseg",
  "ravel-object-store",
  "ravel-proto",

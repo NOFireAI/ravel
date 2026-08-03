@@ -13,6 +13,7 @@ ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
 ravel-rspan = { workspace = true }
 ravel-commit = { workspace = true }
+ravel-ingest = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

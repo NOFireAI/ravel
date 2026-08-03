@@ -160,13 +160,16 @@ rejected point counts and reasons.
 Deletion is always a durable transaction first (tombstone or compaction
 record), then logical exclusion from new snapshots, then physical removal
 via a sweeper. One sweeper component implements all rules below; all are
-stateless per pass, restartable from zero, anchored on durable timestamps
-(never wall-clock at sweep time), and every delete is idempotent. Reader
-leases are not implemented: the "not lease-protected" precondition is
-vacuously satisfied everywhere below, via a `LeaseCheck` hook that is a
-constant "unprotected" (a seam for future slow-consumer work, not a
-correctness dependency today). `protection_horizon >= max_query_duration +
-grace` and `grace` (default 24 h) are shared across all four rules.
+stateless per pass and restartable from zero, and every delete is
+idempotent. Reader leases are not implemented: the "not lease-protected"
+precondition is vacuously satisfied everywhere below, via a `LeaseCheck`
+hook that is a constant "unprotected" (a seam for future slow-consumer
+work, not a correctness dependency today). The first four rules anchor on
+durable timestamps (never wall-clock at sweep time); `protection_horizon
+>= max_query_duration + grace` and `grace` (default 24 h) are shared
+across those four. The fifth rule (idempotency marker) anchors on the
+marker's own `<ingest_hour>` instead, and its own age gate carries a
+forward-skew tolerance the other four don't need (see below the table).
 
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
@@ -174,6 +177,14 @@ grace` and `grace` (default 24 h) are shared across all four rules.
 | superseded input (ADR-0018) | L0 commit records + data objects named in a compaction record's input list | now >= record.created_unix_ns + protection_horizon | compaction record created_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced; issue #273); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
+| idempotency marker (ADR-0051 §5, EB-9; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
+
+The idempotency-marker rule's age gate subtracts
+`IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` (1 h) from its lower bound, the
+same tolerance `ravel_ingest::idempotency::read_marker` grants on its own
+upper bound: this protects a reader whose clock lags the sweeper's by up
+to that much from ever finding a marker gone that `read_marker`'s own
+window would still call a Hit.
 
 - Orphan GC (data objects with no commit record) considers only objects
   with last_modified age > grace + max_flush_lifetime. Writers abandon any

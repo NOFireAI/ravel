@@ -45,9 +45,16 @@ guarantee beyond the run that created them.
   read, resolve, or sweep path lists it (commit resolution lists `c/…`, the
   orphan sweep lists `l0/…`; the fail-loud unknown-key rule below applies
   only to the `c/` prefix), and markers older than the dedup window
-  (default 24h, from the `ingest_hour` in the file name) will be deleted by
-  a stateless sweep rule in `ravel-maintain` (ADR-0051 §5; not yet
-  implemented, see epic #452 EB-9), not by this crate.
+  (default 24h, from the `ingest_hour` in the file name) are deleted by
+  `ravel_maintain::sweep::sweep_idempotency_markers` (ADR-0051 §5, epic
+  #452 EB-9), not by this crate: it LISTs the coarser
+  `t/<tenant_hash>/<signal>/idem/` prefix (no `keyhash32`, since the sweep
+  has no client key to scope by), deletes every marker whose `ingest_hour`
+  is more than `CompactorConfig::idem_dedup_window_hours` (default 24h)
+  behind the sweep's current ingest-hour bucket, and skips (rather than
+  errors on) any key under the prefix that fails to parse as
+  `<keyhash32>.<ingest_hour>.idm`. Under `CompactorConfig::dry_run` it counts
+  what it would delete without calling `delete`.
 - Marker body byte layout and checksum coverage: see "Idempotency marker
   body layout" below.
 - `input_set_hash16`: first 16 hex chars of the blake3 digest over the

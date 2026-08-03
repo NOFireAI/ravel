@@ -1,4 +1,4 @@
-//! The sweeper: one component, three eligibility rules
+//! The sweeper: one component, four eligibility rules
 //! (docs/compaction-retention-plan.md §5, docs/consistency-model.md "Deletion
 //! and GC"). This is the first implementation of any deletion in Ravel.
 //!
@@ -34,16 +34,30 @@
 //!    set will republish the identical keys and name them. The exact branch
 //!    condition is re-verified with a fresh strongly consistent LIST
 //!    immediately before each delete.
+//! 4. **Idempotency marker sweep** (ADR-0051 §5): a `t/<tenant_hash>/<signal>/
+//!    idem/` marker (logs and spans only, ravel-ingest's post-flush dedup
+//!    cache) whose `<ingest_hour>` -- encoded in the key name itself, not read
+//!    from `last_modified` -- is more than `idem_dedup_window_hours` behind
+//!    the clock's current ingest-hour bucket. Stateless and signal-generic
+//!    like the other three, but its age signal is the pinned ingest hour a
+//!    retry could still land in, not object age, because a marker's whole
+//!    purpose is keyed to that hour, not to when it happened to get written.
+//!    A key under the prefix that fails to parse as
+//!    `<keyhash32>.<ingest_hour>.idm` is logged and skipped, never deleted and
+//!    never fatal: the prefix is additive, so the `c/`-prefix fail-loud
+//!    unknown-shape rule (rules 1-3) does not apply to it.
 //!
-//! All three are **signal-generic**: they operate only on commit-record,
-//! compaction-record, and object *keys* plus store `last_modified`, never on a
-//! segment byte, so nothing here needs to know RSEG from RLOG. All three are
-//! stateless per pass, restartable from zero, and every delete is idempotent
-//! (the object-store contract makes deleting a missing key a success). The
-//! clock is always injected; object age is read from `last_modified`, which
-//! the object-store contract restricts to exactly GC age checks.
+//! All four are **signal-generic**: rules 1-3 operate only on commit-record,
+//! compaction-record, and object *keys* plus store `last_modified`, and rule 4
+//! only on marker keys, never on a segment byte, so nothing here needs to know
+//! RSEG from RLOG. All four are stateless per pass, restartable from zero, and
+//! every delete is idempotent (the object-store contract makes deleting a
+//! missing key a success). The clock is always injected; rules 1-3 read object
+//! age from `last_modified` (which the object-store contract restricts to
+//! exactly GC age checks), while rule 4 reads it from the ingest hour encoded
+//! in the marker's own key.
 //!
-//! The [`LeaseCheck`] hook is consulted before every delete in all three
+//! The [`LeaseCheck`] hook is consulted before every delete in all four
 //! rules. It ships as the no-op [`NoLeases`] ("nothing is ever protected"):
 //! the consistency-model's "not lease-protected" precondition is then
 //! vacuously satisfied everywhere. It is a seam for future slow-consumer work
@@ -52,7 +66,7 @@
 use std::collections::{HashMap, HashSet};
 
 use prost::Message;
-use ravel_commit::keys::{self, BucketEntry, KeyError};
+use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::CompactionRecord;
@@ -60,9 +74,11 @@ use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::clock::Clock;
-use crate::config::CompactorConfig;
+use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::read::verify_commit_key;
+
+use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
 
 /// A hook the sweeper consults before every delete, in all three rules. The
 /// only implementation today is [`NoLeases`] (nothing is ever protected); this
@@ -516,6 +532,132 @@ async fn bucket_reference_map(
     Ok((referenced, tombstoned))
 }
 
+// --- Rule 4: idempotency marker sweep (ADR-0051 §5) ------------------------
+
+/// What one idempotency-marker sweep pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdemSweepOutcome {
+    /// Markers past the dedup window, deleted (or, under `dry_run`, that
+    /// would have been).
+    pub deleted: usize,
+    /// Markers within the dedup window, left alone.
+    pub kept: usize,
+    /// Keys under the `idem/` prefix that did not parse as
+    /// `<keyhash32>.<ingest_hour>.idm` and were skipped without deleting or
+    /// erroring (the `idem/` prefix is additive and not subject to the
+    /// fail-loud unknown-key rule the `c/` prefix uses, ADR-0051 §5 /
+    /// docs/catalog-and-mvcc.md).
+    pub skipped_malformed: usize,
+}
+
+/// Delete every idempotency marker under `t/<tenant_hash>/<signal>/idem/`
+/// (ADR-0051 §5) whose `<ingest_hour>` is more than
+/// `config.idem_dedup_window_hours` plus [`IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`]
+/// behind the clock's current ingest-hour bucket. The extra margin mirrors
+/// `ravel_ingest::idempotency::read_marker`'s own forward-skew tolerance on
+/// the read side: without it, a sweeper process whose clock leads an ingest
+/// node's by up to that many hours could reap a marker the read path would
+/// still honor, ahead of a legitimate retry replaying it (fail-open per
+/// ADR-0051, not data loss, but a real gap against this rule's promise that
+/// a marker the read path would still honor is never swept out from under
+/// it). One LIST of the coarse `idem/` prefix -- coarser than
+/// `ravel_ingest::idempotency::read_marker`'s per-key-hash prefix, since the
+/// sweep has no client key to scope by and must cover every marker in the
+/// signal -- then a per-key age check and delete. A key that does not parse
+/// as `<keyhash32>.<ingest_hour>.idm` is logged and skipped, never deleted and
+/// never a fatal error: the prefix is additive and no dual-reader question
+/// exists for it (unlike the `c/` prefix's fail-loud unknown-shape rule).
+pub async fn sweep_idempotency_markers(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<IdemSweepOutcome> {
+    let now = clock.now_ns();
+    let now_hour = u32::try_from(now.div_euclid(NS_PER_HOUR)).map_err(|_| {
+        MaintainError::Invariant(format!("clock reading {now} out of hour-bucket range"))
+    })?;
+    let min_hour = now_hour
+        .saturating_sub(config.idem_dedup_window_hours)
+        .saturating_sub(IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS);
+
+    let prefix = idem_prefix(tenant, signal);
+    let objects = list_all(store, &prefix).await?;
+
+    let mut deleted = 0usize;
+    let mut kept = 0usize;
+    let mut skipped_malformed = 0usize;
+    for meta in objects {
+        let Some(hour) = parse_marker_hour(&meta.key, &prefix) else {
+            tracing::warn!(
+                key = %meta.key,
+                "idempotency sweep: marker key does not parse as <keyhash32>.<ingest_hour>.idm, skipping"
+            );
+            skipped_malformed += 1;
+            continue;
+        };
+
+        if hour >= min_hour {
+            kept += 1;
+            continue;
+        }
+        if lease.is_protected(&meta.key) {
+            kept += 1;
+            continue;
+        }
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+        deleted += 1;
+    }
+
+    Ok(IdemSweepOutcome {
+        deleted,
+        kept,
+        skipped_malformed,
+    })
+}
+
+/// `t/<tenant_hash_hex>/<signal>/idem/` -- the prefix covering every
+/// idempotency marker for one `(tenant, signal)`, across every client key and
+/// ingest hour (ADR-0051 §5, docs/catalog-and-mvcc.md). Coarser than
+/// `ravel_ingest::idempotency`'s own (private) per-key-hash prefix builder,
+/// which this sweep cannot call (it has no client key to scope by) and does
+/// not need to: it reconstructs the same key-layout convention directly.
+fn idem_prefix(tenant: &TenantHash, signal: Signal) -> String {
+    format!("t/{}/{}/idem/", tenant.to_hex(), signal.key_prefix())
+}
+
+/// Parse a listed marker key's `<ingest_hour>` back to its hour bucket, or
+/// `None` if the key (with `prefix` stripped) does not match
+/// `<keyhash32>.<ingest_hour>.idm`: either segment failing its own shape
+/// check is a skip, never a delete. `keyhash32` and the ingest-hour string
+/// both contain no `.`, so splitting on the last `.` before the `.idm` suffix
+/// isolates the hour segment unambiguously.
+fn parse_marker_hour(key: &str, prefix: &str) -> Option<u32> {
+    let basename = key.strip_prefix(prefix)?;
+    let rest = basename.strip_suffix(&format!(".{MARKER_SUFFIX}"))?;
+    let (keyhash, hour_text) = rest.rsplit_once('.')?;
+    if !is_keyhash32(keyhash) {
+        return None;
+    }
+    parse_ingest_hour_string(hour_text).ok()
+}
+
+/// `true` if `s` is exactly 32 lowercase ASCII hex digits: the shape
+/// `ravel_ingest::idempotency::keyhash32` always produces. Rejects anything
+/// else -- wrong length, uppercase, non-hex, or (since `/` is never a hex
+/// digit) a key with an extra path segment before the hour -- so a
+/// non-marker object that merely ends in `.<ingest_hour>.idm` is skipped,
+/// never deleted (docs/catalog-and-mvcc.md, ADR-0051 §5).
+fn is_keyhash32(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 // --- shared helpers --------------------------------------------------------
 
 /// List a shard's commit prefix and classify every key by shape, failing loud
@@ -602,11 +744,13 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use bytes::Bytes;
+    use ravel_ingest::{IdempotencyReceipt, LookupOutcome, marker_key, read_marker, write_marker};
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
     use ravel_object_store::memory::MemoryStore;
+    use ravel_types::TenantId;
 
     use super::*;
     use crate::clock::FixedClock;
@@ -809,5 +953,371 @@ mod tests {
                 "batched: only two commit-prefix LISTs per pass, regardless of candidate count"
             );
         }
+    }
+
+    fn idem_receipt(written_count: u64) -> IdempotencyReceipt {
+        IdempotencyReceipt {
+            written_count,
+            commit_token: "v2:token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_markers_past_window_swept_recent_kept() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant_hash = tenant_id.hash();
+        let signal = Signal::Logs;
+        let now_hour = 10_000u32;
+        let window = 24u32;
+        let config = CompactorConfig {
+            idem_dedup_window_hours: window,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+
+        // The sweep's min_hour also subtracts the shared forward-skew
+        // tolerance (fix for issue #531's adversarial checkpoint): a marker
+        // is only strictly past the window once
+        // now_hour - hour > window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS,
+        // the same margin read_marker grants on its own upper bound, so the
+        // sweep never reaps a marker the read path would still honor.
+        let skew = IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS;
+        let old_hours = [now_hour - window - skew - 1, now_hour - 200];
+        // Within the window (plus skew tolerance), including the exact
+        // boundary: now_hour - hour <= window + skew.
+        let recent_hours = [now_hour - window - skew, now_hour - 1];
+
+        for (i, hour) in old_hours.iter().enumerate() {
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                format!("old-key-{i}").as_bytes(),
+                *hour,
+                &idem_receipt(i as u64),
+            )
+            .await
+            .expect("seed old marker");
+        }
+        for (i, hour) in recent_hours.iter().enumerate() {
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                format!("recent-key-{i}").as_bytes(),
+                *hour,
+                &idem_receipt(100 + i as u64),
+            )
+            .await
+            .expect("seed recent marker");
+        }
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_hash, signal)
+                .await
+                .expect("sweep must succeed");
+        assert_eq!(outcome.deleted, old_hours.len());
+        assert_eq!(outcome.kept, recent_hours.len());
+        assert_eq!(outcome.skipped_malformed, 0);
+
+        for (i, _hour) in old_hours.iter().enumerate() {
+            // A generous window (covering the whole range) turns this lookup into a
+            // pure existence check: a Hit here would mean the sweep failed to
+            // delete the object, regardless of the sweep's own window.
+            let looked_up = read_marker(
+                &store,
+                &tenant_id,
+                signal,
+                format!("old-key-{i}").as_bytes(),
+                now_hour,
+                now_hour,
+            )
+            .await
+            .expect("lookup must succeed");
+            assert_eq!(
+                looked_up,
+                LookupOutcome::Miss,
+                "past-window marker {i} must be gone"
+            );
+        }
+        for (i, hour) in recent_hours.iter().enumerate() {
+            // Checked as a direct store existence check, not via read_marker:
+            // read_marker's own min bound (now_hour - dedup_window) carries no
+            // forward-skew margin -- only its upper bound does -- so the
+            // boundary case (hour == now_hour - window - skew) sits in a gap
+            // the sweep deliberately still protects (for a reader whose clock
+            // lags the sweeper's by up to `skew`) but a same-clock
+            // `read_marker` call would itself already call a Miss. The
+            // sweep's own guarantee is that the object still exists; that is
+            // what this asserts.
+            let key = marker_key(
+                &tenant_id,
+                signal,
+                format!("recent-key-{i}").as_bytes(),
+                *hour,
+            );
+            assert!(
+                store.get(&key, GetRange::Full).await.is_ok(),
+                "recent marker {i} at hour {hour} must remain in the store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_sweep_never_touches_other_prefixes() {
+        let tenant_a = TenantId::new("acme");
+        let tenant_a_hash = tenant_a.hash();
+        let tenant_b = TenantId::new("other-tenant");
+        let tenant_b_hash = tenant_b.hash();
+        let signal = Signal::Logs;
+        let other_signal = Signal::Spans;
+
+        let now_hour = 10_000u32;
+        let window = 24u32;
+        let old_hour = now_hour - 200;
+
+        let mem = MemoryStore::new();
+        // The one marker the sweep is allowed to touch.
+        write_marker(
+            &mem,
+            &tenant_a,
+            signal,
+            b"key-a",
+            old_hour,
+            &idem_receipt(1),
+        )
+        .await
+        .expect("seed tenant_a/logs marker");
+
+        // Decoys seeded directly into the underlying store, bypassing
+        // FaultStore's key-substring rules entirely: these prove isolation
+        // structurally (the decoys are still readable afterward), not just
+        // by asserting no fault fired. An implementation that widened its
+        // LIST prefix or delete loop -- e.g. listing the bare `t/<tenant>/`
+        // prefix instead of the (tenant, signal) idem prefix -- would delete
+        // one of these and this test would catch it even though none of the
+        // FaultPlan rules below would ever trigger.
+        let l0_decoy_key = keys::data_key(
+            &tenant_a_hash,
+            signal,
+            0,
+            Uuid::from_u128(1),
+            0,
+            0,
+            &[0xAB; 32],
+        )
+        .expect("build decoy l0 data key");
+        mem.put(
+            &l0_decoy_key,
+            Bytes::from_static(b"l0-decoy"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed l0 decoy");
+
+        let commit_decoy_key = keys::commit_key(
+            &tenant_a_hash,
+            signal,
+            0,
+            old_hour,
+            Uuid::from_u128(2),
+            0,
+            0,
+        )
+        .expect("build decoy commit key");
+        mem.put(
+            &commit_decoy_key,
+            Bytes::from_static(b"commit-decoy"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed commit decoy");
+
+        write_marker(
+            &mem,
+            &tenant_b,
+            signal,
+            b"key-b",
+            old_hour,
+            &idem_receipt(2),
+        )
+        .await
+        .expect("seed tenant_b/logs decoy marker");
+
+        write_marker(
+            &mem,
+            &tenant_a,
+            other_signal,
+            b"key-a-spans",
+            old_hour,
+            &idem_receipt(3),
+        )
+        .await
+        .expect("seed tenant_a/spans decoy marker");
+
+        let config = CompactorConfig {
+            idem_dedup_window_hours: window,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+
+        let other_tenant_prefix = idem_prefix(&tenant_b_hash, signal);
+        let other_signal_prefix = idem_prefix(&tenant_a_hash, other_signal);
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::List, ScriptedFault::Timeout).with_key_contains("/l0/"))
+            .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains("/l0/"))
+            .with_rule(Rule::new(Op::List, ScriptedFault::Timeout).with_key_contains("/c/"))
+            .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains("/c/"))
+            .with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains(other_tenant_prefix.clone()),
+            )
+            .with_rule(
+                Rule::new(Op::Delete, ScriptedFault::Timeout)
+                    .with_key_contains(other_tenant_prefix),
+            )
+            .with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains(other_signal_prefix.clone()),
+            )
+            .with_rule(
+                Rule::new(Op::Delete, ScriptedFault::Timeout)
+                    .with_key_contains(other_signal_prefix),
+            );
+        let store = FaultStore::new(mem, plan);
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_a_hash, signal)
+                .await
+                .expect("sweep must touch only its own (tenant, signal) idem prefix");
+        assert_eq!(outcome.deleted, 1);
+
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Timeout),
+            0,
+            "no LIST outside the swept (tenant, signal) idem prefix"
+        );
+        assert_eq!(
+            store.fault_count(Op::Delete, FaultKind::Timeout),
+            0,
+            "no DELETE outside the swept (tenant, signal) idem prefix"
+        );
+
+        for decoy_key in [&l0_decoy_key, &commit_decoy_key] {
+            assert!(
+                store.get(decoy_key, GetRange::Full).await.is_ok(),
+                "decoy {decoy_key} must survive the sweep"
+            );
+        }
+        for (decoy_tenant, decoy_signal, key_hint) in [
+            (&tenant_b, signal, b"key-b" as &[u8]),
+            (&tenant_a, other_signal, b"key-a-spans"),
+        ] {
+            let decoy_marker_key = marker_key(decoy_tenant, decoy_signal, key_hint, old_hour);
+            assert!(
+                store.get(&decoy_marker_key, GetRange::Full).await.is_ok(),
+                "decoy marker {decoy_marker_key} must survive the sweep"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_sweep_skips_malformed_marker_key_without_deleting() {
+        let store = MemoryStore::new();
+        let tenant_hash = TenantId::new("acme").hash();
+        let signal = Signal::Logs;
+
+        let prefix = idem_prefix(&tenant_hash, signal);
+        let wrong_suffix_key = format!("{prefix}deadbeefdeadbeefdeadbeefdeadbeef.txt");
+        let bad_hour_key = format!("{prefix}deadbeefdeadbeefdeadbeefdeadbeef.notahexhour.idm");
+        // Real bug this guards against: a key whose pre-hour segment is not a
+        // genuine 32-char lowercase-hex keyhash must be skipped, never
+        // deleted, exactly like a bad hour string already is (fix for issue
+        // #531's adversarial checkpoint).
+        let short_keyhash_key = format!("{prefix}deadbeef.19700101T00.idm");
+        let uppercase_keyhash_key =
+            format!("{prefix}DEADBEEFDEADBEEFDEADBEEFDEADBEEF.19700101T00.idm");
+        let not_hex_keyhash_key = format!("{prefix}not-hex-at-all.19700101T00.idm");
+        let nested_path_key =
+            format!("{prefix}backup/deadbeefdeadbeefdeadbeefdeadbeef.19700101T00.idm");
+        let malformed_keys = [
+            &wrong_suffix_key,
+            &bad_hour_key,
+            &short_keyhash_key,
+            &uppercase_keyhash_key,
+            &not_hex_keyhash_key,
+            &nested_path_key,
+        ];
+        for key in malformed_keys {
+            store
+                .put(key, Bytes::from_static(b"garbage"), PutOptions::default())
+                .await
+                .expect("seed malformed key");
+        }
+
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(0);
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_hash, signal)
+                .await
+                .expect("malformed keys are skipped, never fatal");
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.kept, 0);
+        assert_eq!(outcome.skipped_malformed, malformed_keys.len());
+
+        for key in malformed_keys {
+            let remaining = store.get(key, GetRange::Full).await;
+            assert!(remaining.is_ok(), "malformed key {key} must not be deleted");
+        }
+
+        for key in [&wrong_suffix_key, &bad_hour_key] {
+            let remaining = store.get(key, GetRange::Full).await;
+            assert!(remaining.is_ok(), "malformed key must not be deleted");
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_sweep_dry_run_counts_without_deleting() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant_hash = tenant_id.hash();
+        let signal = Signal::Logs;
+        let now_hour = 10_000u32;
+        let window = 24u32;
+        let old_hour = now_hour - 200;
+
+        write_marker(
+            &store,
+            &tenant_id,
+            signal,
+            b"key",
+            old_hour,
+            &idem_receipt(1),
+        )
+        .await
+        .expect("seed old marker");
+
+        let config = CompactorConfig {
+            idem_dedup_window_hours: window,
+            dry_run: true,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_hash, signal)
+                .await
+                .expect("dry run must not error");
+        assert_eq!(
+            outcome.deleted, 1,
+            "dry run still counts what would be deleted"
+        );
+        assert_eq!(outcome.kept, 0);
+
+        let key = marker_key(&tenant_id, signal, b"key", old_hour);
+        let still_there = store.get(&key, GetRange::Full).await;
+        assert!(still_there.is_ok(), "dry_run must not actually delete");
     }
 }
