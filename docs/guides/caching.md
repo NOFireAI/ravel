@@ -52,7 +52,7 @@ attach a RAM cache. See "Known gaps" below.
 |---|---|---|
 | `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Read once at startup; there is no live resize. |
 | `--cache-dir <path>` | none | Reserved for the disk tier. Setting it fails startup today (see "Known gaps"). |
-| `--disable-cache` | off | Turns the cache off entirely. With this flag, query behavior is byte-for-byte the same as a build with no cache code at all. |
+| `--disable-cache` | off | Turns the fetcher cache off. Query *results* are then byte-for-byte the same as a build with no cache code at all. Memory is not: the catalog keeps a byte cache of its own that this flag does not reach (#553). |
 
 ## Startup warmup
 
@@ -84,7 +84,15 @@ by `mode` (ADR-0044's label allowlist):
   failing the query. Distinct from a normal miss (nothing was there);
   this counter means something was there and could not be trusted.
 
+  This counter is always 0 today. No disk tier is attached, because
+  `--cache-dir` fails startup (see the known gaps below). Do not alert on
+  it until a disk tier exists.
+
 With the cache off, none of these samples appear on `/metrics` at all.
+
+These counters describe the fetcher cache only. The catalog keeps a byte
+cache of its own, which these samples do not cover and `--cache-max-bytes`
+does not bound. Issue #553 tracks that gap.
 
 ## Known gaps
 

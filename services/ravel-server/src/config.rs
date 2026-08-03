@@ -246,7 +246,7 @@ pub struct Cli {
     pub cache_dir: Option<PathBuf>,
 
     /// Disables the ADR-0046 read cache entirely. With this set, no cache is
-    /// constructed and query behavior is byte-for-byte identical to a build
+    /// constructed and query results are byte-for-byte identical to a build
     /// with no read cache wiring at all.
     #[arg(long)]
     pub disable_cache: bool,
