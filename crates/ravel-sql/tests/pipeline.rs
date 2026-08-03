@@ -221,7 +221,8 @@ async fn run_pipeline(
     config: EngineConfig,
 ) -> Reduced {
     let fetcher = SegmentFetcher::new(store);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+    let provider =
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(target_partitions).expect("build plan");
     let batches = collect(plan, Arc::new(TaskContext::default()))
         .await
@@ -534,7 +535,8 @@ async fn max_samples_budget_trips_on_yielded_rows() {
         ..EngineConfig::default()
     };
     let fetcher = SegmentFetcher::new(backend);
-    let provider = RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+    let provider =
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
     let plan = provider.plan(1).expect("plan");
     let err = collect(plan, Arc::new(TaskContext::default()))
         .await

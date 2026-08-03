@@ -171,6 +171,7 @@ impl RsegScanExec {
     /// `min(target_partitions, segments.len())` partitions, with the given
     /// pushdown matchers, optional `series_id` allow-set, and per-partition
     /// `max_series` budget (issue #187).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_hash: TenantHash,
         fetcher: SegmentFetcher,
@@ -323,6 +324,7 @@ struct Prepared {
 /// reservation's byte budget against this segment's decoded size (issue
 /// #188). `reservation` is threaded through and returned so the caller's
 /// batch phase continues growing the same one (see module doc).
+#[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: SegmentFetcher,
     tenant: TenantHash,

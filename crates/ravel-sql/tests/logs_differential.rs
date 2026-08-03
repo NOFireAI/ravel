@@ -910,8 +910,12 @@ async fn scan_rows(
     query: &QuerySpec,
 ) -> Vec<Row> {
     let fetcher = LogSegmentFetcher::new(store);
-    let provider =
-        LogsTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new());
+    let provider = LogsTableProvider::new(
+        snapshot,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
 
     let ctx = SessionContext::new();
     let get_field = ScalarUDF::from(GetField::new());

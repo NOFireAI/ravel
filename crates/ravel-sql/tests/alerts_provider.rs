@@ -219,7 +219,12 @@ fn provider(store: MemoryStore, segments: Vec<SegmentRef>) -> AlertsTableProvide
         segments,
         segments_pruned: 0,
     };
-    AlertsTableProvider::new(snapshot, fetcher, EngineConfig::default(), QueryAccounting::new())
+    AlertsTableProvider::new(
+        snapshot,
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    )
 }
 
 /// A ts range returns exactly the surviving records across several objects, with
