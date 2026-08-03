@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f84606b599c3b59efd3759f0ae1affc7d95f99436f95d081b6cc87cb0451b60f # shrinks to workload = [WorkloadHistogramMetric { name: "aaa", temporality: 2, points: [WorkloadHistogramPoint { ts_offset_ns: 0, count: 0, sum: None, bucket_counts: [0], explicit_bounds: [], flags: 0, min: None, max: None, exemplar_count: 1, attrs: [] }] }]
