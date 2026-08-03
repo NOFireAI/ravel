@@ -871,6 +871,10 @@ mod tests {
     /// agree without touching the real clock (CLAUDE.md: time is injected).
     const NOW: i64 = 1_700_000_000 * NS_PER_SEC;
     const TOKEN: &str = "test-token";
+    /// A second tenant's bearer token, registered on the same router as
+    /// `TOKEN`, so isolation is tested against a resolver that *could* have
+    /// returned the other tenant rather than one that only knows one.
+    const TOKEN_B: &str = "test-token-b";
 
     struct FixedClock(i64);
     impl Clock for FixedClock {
@@ -881,6 +885,10 @@ mod tests {
 
     fn tenant() -> TenantId {
         TenantId::new("tenant-a".to_string())
+    }
+
+    fn tenant_b() -> TenantId {
+        TenantId::new("tenant-b".to_string())
     }
 
     fn labels(metric: &str, extra: &[(&str, &str)]) -> LabelSet {
@@ -954,7 +962,18 @@ mod tests {
         series: Vec<SeriesInputV3>,
         exemplars: Vec<ExemplarInput>,
     ) {
-        let tenant_id = tenant();
+        publish_segment_for(store, &tenant(), writer_seq, series, exemplars).await
+    }
+
+    /// As `publish_segment`, but for an explicit tenant, so a test can put two
+    /// tenants' exemplars into one store.
+    async fn publish_segment_for(
+        store: &MemoryStore,
+        tenant_id: &TenantId,
+        writer_seq: u64,
+        series: Vec<SeriesInputV3>,
+        exemplars: Vec<ExemplarInput>,
+    ) {
         let tenant_hash = tenant_id.hash();
         let shard = 0u32;
         let writer_id = Uuid::new_v4();
@@ -1070,6 +1089,7 @@ mod tests {
             Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
         let mut tokens = HashMap::new();
         tokens.insert(TOKEN.to_string(), tenant());
+        tokens.insert(TOKEN_B.to_string(), tenant_b());
         let state = ExemplarsState {
             catalog,
             store: backend,
@@ -1097,6 +1117,12 @@ mod tests {
     }
 
     async fn query(app: &Router, promql: &str) -> (StatusCode, Value) {
+        query_as(app, promql, Some(TOKEN)).await
+    }
+
+    /// Issues the query as the holder of `token`, or with no `Authorization`
+    /// header at all when `token` is `None`.
+    async fn query_as(app: &Router, promql: &str, token: Option<&str>) -> (StatusCode, Value) {
         let start = NOW - NS_PER_HOUR;
         let uri = format!(
             "/api/v1/query_exemplars?query={}&start={}&end={}",
@@ -1104,12 +1130,11 @@ mod tests {
             start as f64 / NS_PER_SEC as f64,
             NOW as f64 / NS_PER_SEC as f64,
         );
-        let request = Request::builder()
-            .method("GET")
-            .uri(uri)
-            .header("authorization", format!("Bearer {TOKEN}"))
-            .body(Body::empty())
-            .expect("build request");
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let request = builder.body(Body::empty()).expect("build request");
         let response = app.clone().oneshot(request).await.expect("oneshot");
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1431,5 +1456,95 @@ mod tests {
             .collect();
         assert!(traces.contains(&"0a1b2c3d4e5f60718293a4b5c6d7e8f9"));
         assert!(traces.contains(&"77777777777777777777777777777777"));
+    }
+
+    /// Tenant isolation, the endpoint's most important property: two tenants
+    /// publish exemplars under the *same* metric name into the same store,
+    /// both bearer tokens are registered on the same router, and each caller
+    /// sees only its own trace ids. Cross-tenant leakage here would hand one
+    /// customer another customer's trace ids, which are the whole payload of
+    /// this endpoint.
+    #[tokio::test]
+    async fn each_tenant_sees_only_its_own_exemplars() {
+        const TRACE_A: [u8; 16] = [0xaa; 16];
+        const TRACE_B: [u8; 16] = [0xbb; 16];
+        const TRACE_A_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const TRACE_B_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let store = Arc::new(MemoryStore::new());
+
+        // Same metric name, same label set, same timestamp for both tenants:
+        // only the tenant scoping can tell the two apart. (The series ids
+        // differ because `SeriesId::compute` mixes in the tenant, which is
+        // exactly the property under test at the storage layer; the query
+        // layer must not depend on that to keep them apart.)
+        let (sid_a, series_a) = scalar_series(
+            &tenant(),
+            "shared_metric",
+            &[("route", "/x")],
+            &[(NOW - 60 * NS_PER_SEC, 1.0)],
+        );
+        let ex_a = exemplar(sid_a, NOW - 30 * NS_PER_SEC, 1.0, TRACE_A, SPAN_ID, &[]);
+        publish_segment_for(&store, &tenant(), 1, vec![series_a], vec![ex_a]).await;
+
+        let (sid_b, series_b) = scalar_series(
+            &tenant_b(),
+            "shared_metric",
+            &[("route", "/x")],
+            &[(NOW - 60 * NS_PER_SEC, 2.0)],
+        );
+        let ex_b = exemplar(sid_b, NOW - 30 * NS_PER_SEC, 2.0, TRACE_B, SPAN_ID, &[]);
+        publish_segment_for(&store, &tenant_b(), 1, vec![series_b], vec![ex_b]).await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+
+        for (token, own, other) in [
+            (TOKEN, TRACE_A_HEX, TRACE_B_HEX),
+            (TOKEN_B, TRACE_B_HEX, TRACE_A_HEX),
+        ] {
+            let (status, body) = query_as(&app, "shared_metric", Some(token)).await;
+            assert_eq!(status, StatusCode::OK);
+            let data = body["data"].as_array().expect("data array");
+            assert_eq!(
+                data.len(),
+                1,
+                "{token} must see exactly its own one series, got {body}"
+            );
+            let traces: Vec<&str> = data
+                .iter()
+                .flat_map(|s| s["exemplars"].as_array().expect("exemplars array"))
+                .map(|e| e["labels"]["trace_id"].as_str().expect("trace_id"))
+                .collect();
+            assert_eq!(traces, vec![own], "{token} sees only its own trace id");
+            assert!(
+                !traces.contains(&other),
+                "{token} must never see the other tenant's trace id"
+            );
+        }
+    }
+
+    /// An unauthenticated request is a 401, not an empty 200. Without this,
+    /// deleting the `authenticate` call and hardcoding a tenant hash would
+    /// leave every other test green.
+    #[tokio::test]
+    async fn missing_authorization_header_is_unauthorized() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&store, 1, vec![series], vec![ex]).await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query_as(&app, "m", None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "no Authorization header must be 401, not an empty 200"
+        );
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["errorType"], "unauthorized");
+        assert!(
+            body["data"].is_null(),
+            "an unauthorized response carries no data"
+        );
     }
 }
