@@ -12,8 +12,9 @@
 //! resolves stream-identifying attribute equalities against the object's
 //! STREAM_DIR, and combines those with the caller's ts-range and word/phrase
 //! predicates into one [`ravel_logseg::Predicate`] handed to
-//! [`RlogReader::scan`]. Skip-index and bloom pruning stay entirely inside
-//! `scan`; nothing here duplicates format-layer logic.
+//! [`RlogReader::scan_pruned`], alongside the caller's prune-only channel
+//! ([`LogQuery::prune`]). Skip-index, POSTINGS, and bloom pruning stay entirely
+//! inside the reader; nothing here duplicates format-layer logic.
 //!
 //! One part of this is approximate, and callers must know it: the
 //! stream-attribute matching in [`LogSegmentFetcher::matching_streams`] is a
@@ -81,31 +82,54 @@ impl StreamAttrEquals {
 }
 
 /// One log query against a single segment: an inclusive ts range, zero or more
-/// stream-attribute equalities (ANDed, resolved against STREAM_DIR), and zero
-/// or more content predicates (`HasWord`/`Equals`, ANDed, passed straight to
-/// the reader). The ts range is always applied; the other two are optional.
+/// stream-attribute equalities (ANDed, resolved against STREAM_DIR), zero or
+/// more content predicates (`HasWord`/`Equals`, ANDed, passed straight to the
+/// reader as its exact per-row filter), and zero or more prune-only predicates.
+/// The ts range is always applied; everything else is optional.
 ///
 /// The ts range and the content predicates are exact. The `stream_attrs`
 /// filters are not: they over-approximate, and a fetch can return records from
 /// a stream that does not genuinely carry the requested attribute. See
 /// [`LogSegmentFetcher::matching_streams`].
+///
+/// `prune` is not a filter at all: its arms drive POSTINGS block pruning inside
+/// [`RlogReader::scan_pruned`] and are never evaluated per row, so they never
+/// remove a record from the result. A query built without
+/// [`with_prune`](Self::with_prune) reads and returns exactly what it did before
+/// the channel existed: an empty `prune` makes `scan_pruned` equivalent to
+/// `scan`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogQuery {
     pub ts_min_ns: i64,
     pub ts_max_ns: i64,
     pub stream_attrs: Vec<StreamAttrEquals>,
     pub content: Vec<Predicate>,
+    /// Prune-only predicates (today: `Equals` on `FieldSel::Attr`, from
+    /// `ravel_sql::LogsPushdown::prune`). These narrow which blocks the fetch
+    /// decodes and nothing else: the reader never evaluates them per row, so
+    /// adding an arm can only reduce work, never rows. An arm whose field the
+    /// object's POSTINGS index does not cover prunes nothing at all
+    /// (docs/adrs/0049-rlog-postings.md decision 5, ADR-0013's widen-only
+    /// rule).
+    ///
+    /// A caller that needs the predicate to actually filter must evaluate it
+    /// itself (in SQL: DataFusion's `Inexact` residual over the merged `attrs`
+    /// column, which stays the sole exact evaluator). Putting a merged-view
+    /// attribute equality in `content` instead would drop every record whose
+    /// match lives only in its resource or scope attributes.
+    pub prune: Vec<Predicate>,
 }
 
 impl LogQuery {
     /// A query over the inclusive ts range `[ts_min_ns, ts_max_ns]` with no
-    /// stream-attribute or content predicates.
+    /// stream-attribute, content, or prune predicates.
     pub fn new(ts_min_ns: i64, ts_max_ns: i64) -> Self {
         LogQuery {
             ts_min_ns,
             ts_max_ns,
             stream_attrs: Vec::new(),
             content: Vec::new(),
+            prune: Vec::new(),
         }
     }
 
@@ -118,6 +142,14 @@ impl LogQuery {
     #[must_use]
     pub fn with_content(mut self, pred: Predicate) -> Self {
         self.content.push(pred);
+        self
+    }
+
+    /// Adds one prune-only predicate (see [`LogQuery::prune`]). Adding an arm
+    /// changes which blocks the fetch decodes, never which records it returns.
+    #[must_use]
+    pub fn with_prune(mut self, pred: Predicate) -> Self {
+        self.prune.push(pred);
         self
     }
 }
@@ -276,13 +308,16 @@ impl LogSegmentFetcher {
     /// ([`GetRange::Full`]), the STREAM_DIR is consulted to resolve any
     /// stream-attribute equalities into a [`Predicate::StreamIn`], and the
     /// combined predicate (ts range AND resolved streams AND content) is handed
-    /// to [`RlogReader::scan`], whose skip-index and bloom pruning do the
-    /// block-level work.
+    /// to [`RlogReader::scan_pruned`] together with `query.prune`, whose
+    /// skip-index, POSTINGS, and bloom pruning do the block-level work.
     ///
     /// # The returned records are exact except for `stream_attrs`
     ///
     /// The ts range and the content predicates hold exactly on every returned
-    /// record. `query.stream_attrs` does not: it is resolved by
+    /// record. `query.prune` does not hold on every returned record and is not
+    /// meant to: it only drops blocks proven to hold no match, so the record set
+    /// is the same one an empty `prune` would return (see [`LogQuery::prune`]).
+    /// `query.stream_attrs` does not hold either: it is resolved by
     /// [`matching_streams`], which over-approximates, so the returned records
     /// can include records from a stream that does not carry the requested
     /// attribute as a genuine top-level resource or scope attribute (a nested
@@ -429,11 +464,12 @@ impl LogSegmentFetcher {
 
     /// Shared tail of both fetch entry points: resolve stream-attribute
     /// equalities against STREAM_DIR (over-approximating, see
-    /// [`matching_streams`](Self::matching_streams)), build the combined
-    /// predicate, and scan. Identical regardless of whether `bytes` came from
-    /// the store or the cache -- `RlogReader::scan`'s block-level skip-index
-    /// and bloom verification run unconditionally either way, so a corrupt
-    /// cache entry fails exactly like a corrupt store read.
+    /// [`matching_streams`](Self::matching_streams)), build the combined exact
+    /// predicate, and scan it with `query.prune` as the prune-only channel.
+    /// Identical regardless of whether `bytes` came from the store or the cache
+    /// -- `RlogReader::scan_pruned`'s block-level skip-index and bloom
+    /// verification run unconditionally either way, so a corrupt cache entry
+    /// fails exactly like a corrupt store read.
     fn scan_bytes(
         &self,
         key: &str,
@@ -464,7 +500,14 @@ impl LogSegmentFetcher {
         let pred = Predicate::And(arms);
 
         let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
-        let (records, stats) = reader.scan(&pred).map_err(|source| corrupt(key, source))?;
+        // `prune` is passed as the reader's prune-only channel, never folded
+        // into `pred`: an arm there would become an exact per-row filter and
+        // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
+        // amendment 2026-08-03). An empty channel makes this identical to
+        // `scan`.
+        let (records, stats) = reader
+            .scan_pruned(&pred, &query.prune)
+            .map_err(|source| corrupt(key, source))?;
         Ok(Some(LogFetchOutput { records, stats }))
     }
 

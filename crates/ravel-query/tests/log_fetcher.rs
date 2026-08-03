@@ -550,3 +550,219 @@ async fn matching_streams_resolves_ids_from_stream_dir() {
         .expect("resolve");
     assert!(none.is_empty(), "no stream carries service.name=absent");
 }
+
+/// A record on stream `name` carrying per-record dynamic attributes, for the
+/// POSTINGS prune-channel tests below. Keys used here are per-record only: a key
+/// that also lives at resource or scope level is a different case (the reader
+/// declines it on a version 1 object), and a resource-only key has no FIELD_DIR
+/// column to key a posting by at all.
+fn record_with_attrs(name: &str, ts: i64, body: &str, attrs: &[(String, AttrValue)]) -> LogRecord {
+    let (stream_id, stream_attrs) = stream(name);
+    LogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: attrs.to_vec(),
+    }
+}
+
+/// Like [`write_object`], but names `indexed` as the object's POSTINGS indexed
+/// fields (ADR-0049 decision 3: opt-in per field). Without this an object has no
+/// POSTINGS section and the prune channel has nothing to probe.
+async fn write_indexed_object(
+    store: &MemoryStore,
+    key: &str,
+    records: &[LogRecord],
+    indexed: &[&str],
+) -> SegmentRef {
+    let mut w = RlogWriter::new(small_blocks(), identity())
+        .with_indexed_fields(indexed.iter().map(|s| s.to_string()).collect());
+    for r in records {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    store
+        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put object");
+
+    let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+    let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [0u8; 32],
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+    }
+}
+
+/// Twelve records on one stream, ts 100..=111, each carrying a per-record
+/// `request.id = "r<ts>"` (indexed) and a per-record `other.key = "same"` (never
+/// indexed). At three records per block that is four blocks, so block pruning
+/// has something to prove.
+fn prune_records() -> Vec<LogRecord> {
+    (100..=111)
+        .map(|ts| {
+            record_with_attrs(
+                "api",
+                ts,
+                "ok",
+                &[
+                    ("request.id".to_string(), AttrValue::Str(format!("r{ts}"))),
+                    ("other.key".to_string(), AttrValue::Str("same".to_string())),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// Issue #544: the prune channel a `LogQuery` now carries reaches POSTINGS, so a
+/// fetch decodes strictly fewer blocks, and it does that without dropping a
+/// record the equality matches.
+///
+/// The record set a pruned fetch returns is a superset of the true matches, not
+/// the matches themselves: `prune` is never evaluated per row, so every record
+/// in a surviving block comes back and the caller's own exact filter (in SQL,
+/// DataFusion's residual over the merged `attrs` column) does the filtering.
+/// That superset property is what `Inexact` pushdown requires, and it is what is
+/// asserted here.
+#[tokio::test]
+async fn prune_channel_prunes_blocks_and_never_drops_a_match() {
+    let mem = MemoryStore::new();
+    let records = prune_records();
+    let seg_ref = write_indexed_object(&mem, "logs/prune.rlog", &records, &["request.id"]).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+
+    let arm = Predicate::Equals {
+        field: FieldSel::Attr("request.id".into()),
+        value: AttrValue::Str("r105".into()),
+    };
+
+    // Baseline: the identical query with no prune arm. A `LogQuery` built
+    // without `with_prune` must behave exactly as it did before the field
+    // existed, so this reads the whole object.
+    let base = fetcher
+        .fetch(&seg_ref, &LogQuery::new(0, 5000))
+        .await
+        .expect("fetch")
+        .expect("in range");
+    assert_eq!(base.stats.blocks_total, 4, "12 records at 3 per block");
+    assert_eq!(
+        base.stats.blocks_scanned, base.stats.blocks_total,
+        "with no prune arm every block is decoded"
+    );
+    assert_eq!(base.records.len(), 12);
+
+    // The same query with the prune arm: POSTINGS is exact, so only the one
+    // block holding `request.id = r105` survives.
+    let pruned = fetcher
+        .fetch(&seg_ref, &LogQuery::new(0, 5000).with_prune(arm.clone()))
+        .await
+        .expect("fetch")
+        .expect("in range");
+    assert!(!pruned.stats.postings_degraded, "POSTINGS parsed cleanly");
+    assert_eq!(pruned.stats.blocks_total, 4);
+    assert_eq!(
+        pruned.stats.blocks_scanned, 1,
+        "the prune arm left one of four blocks: {:?}",
+        pruned.stats
+    );
+
+    // Soundness: every record the equality truly matches is still returned.
+    let matches = |r: &LogRecord| {
+        r.attrs
+            .iter()
+            .any(|(k, v)| k == "request.id" && *v == AttrValue::Str("r105".into()))
+    };
+    let expected: Vec<i64> = base
+        .records
+        .iter()
+        .filter(|r| matches(r))
+        .map(|r| r.ts_ns)
+        .collect();
+    assert_eq!(expected, vec![105], "the fixture has exactly one r105 record");
+    let kept: Vec<i64> = pruned
+        .records
+        .iter()
+        .filter(|r| matches(r))
+        .map(|r| r.ts_ns)
+        .collect();
+    assert_eq!(kept, expected, "the prune dropped no true match");
+    // And the returned set is a superset of the matches, not equal to it: the
+    // surviving block's other records come back untouched for the caller's
+    // exact filter to reject.
+    assert_eq!(
+        pruned.records.len(),
+        3,
+        "the whole surviving block is returned, unfiltered"
+    );
+}
+
+/// A prune arm on a field the object's POSTINGS index does not cover prunes
+/// nothing: `other.key` is a real per-record attribute (so it has a FIELD_DIR
+/// column) but was never named as an indexed field, so the probe reports "no
+/// information" and every block stays a candidate. Every record still comes
+/// back, byte for byte the same result as no prune arm at all.
+#[tokio::test]
+async fn prune_arm_on_unindexed_field_prunes_nothing() {
+    let mem = MemoryStore::new();
+    let records = prune_records();
+    let seg_ref =
+        write_indexed_object(&mem, "logs/unindexed.rlog", &records, &["request.id"]).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+
+    let base = fetcher
+        .fetch(&seg_ref, &LogQuery::new(0, 5000))
+        .await
+        .expect("fetch")
+        .expect("in range");
+
+    let unindexed = fetcher
+        .fetch(
+            &seg_ref,
+            &LogQuery::new(0, 5000).with_prune(Predicate::Equals {
+                field: FieldSel::Attr("other.key".into()),
+                value: AttrValue::Str("same".into()),
+            }),
+        )
+        .await
+        .expect("fetch")
+        .expect("in range");
+
+    assert!(
+        !unindexed.stats.postings_degraded,
+        "an unindexed field is a clean 'no information', not a degrade"
+    );
+    assert_eq!(
+        unindexed.stats.blocks_scanned, unindexed.stats.blocks_total,
+        "an unindexed prune arm must leave every block a candidate"
+    );
+    assert_eq!(
+        unindexed.stats.blocks_scanned, base.stats.blocks_scanned,
+        "identical to the no-prune fetch"
+    );
+    let got: Vec<i64> = unindexed.records.iter().map(|r| r.ts_ns).collect();
+    let expected: Vec<i64> = base.records.iter().map(|r| r.ts_ns).collect();
+    assert_eq!(got, expected, "every matching record is returned");
+    assert_eq!(got.len(), 12);
+}
