@@ -415,11 +415,16 @@ dropped one exemplar in favour of another would make an L1 object something
 other than the exact multiset of its inputs, which is precisely what
 ADR-0018's overlap harmlessness forbids.
 
-`decode_exemplars_from_decoded` exists to serve that remap, but the
-compactor does not yet call it: L0-to-L1 compaction currently carries no
-exemplars, so an L1 object has none regardless of its inputs. The rule
-above is normative for the change that adds it (issue #474), not a
-description of what compaction does today.
+L0-to-L1 compaction implements that rule (issue #474): it decodes each
+input's section through `decode_exemplars_section` (the public wrapper over
+`decode_exemplars_from_decoded`, which owns the whole-section decode),
+resolves each record's `series_index` to the series id it named, and hands
+the records to the output writer, which resolves the id back into an index
+in the output's own SERIES_IDS. Records of one series keep canonical input
+order, and the writer's stable sort by `(series_index, ts_ns)` leaves the
+section ascending with equal keys intact. Every input exemplar must reach
+exactly one output part, or the run is abandoned before anything is
+published.
 
 ## Page format (TS, VAL, HIST)
 
