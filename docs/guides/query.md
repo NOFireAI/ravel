@@ -263,6 +263,17 @@ reads the objects that the `ts` range selects, then applies the attribute
 filter to the decoded records. A filter on `ts`, or a `has_word` content
 search, does prune the read.
 
+Log rows are at-least-once, and a `SELECT` (or `COUNT(*)`) reflects that. A
+client retry after a lost ack re-ingests the batch, and unlike metrics there
+is no query-time dedup for logs, so the retried rows are returned as extra
+rows. A `COUNT` over logs is therefore a lower-bounded count, not an exact
+one, for any window a retry may have touched. The `x-ravel-idempotency-key`
+suppresses this for keyed sequential retries; unkeyed ingest gets plain
+at-least-once. See
+[consistency-model.md](../consistency-model.md#duplicates-and-idempotency)
+for the full contract. The same applies to spans once a span query surface
+lands.
+
 ## HTTP status codes
 
 | Status | `errorType` | When |

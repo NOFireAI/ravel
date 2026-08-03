@@ -199,7 +199,24 @@ ingestion.
   `event_ts > ingest_ts + max_future_skew` (default 10 m) or
   `event_ts < ingest_ts - max_ingest_lag` (default 2 h) are rejected with a
   partial-success reason. These bounds are what make the catalog listing
-  window sound.
+  window sound. Logs and spans enforce the same bounds at admission
+  (ADR-0051 §4); spans bound `end_ts` by `max_future_skew` and `start_ts` by
+  `max_ingest_lag`.
+- Config discipline: `max_ingest_lag` is one shared bound, not a per-signal
+  one, in the sense that matters operationally, though it is not shared by
+  reference: the admission checks (one `max_ingest_lag_ns` constant per
+  signal crate) and the catalog listing window
+  (crates/ravel-catalog/src/config.rs) each hold their own copy, which must
+  be kept numerically equal by convention (ravel-maintain's own copy
+  documents this with a startup equality assertion). The bound on what is
+  *admitted* and the bound on what is *discoverable* must be the same
+  value. Raising the admission lag for a signal or tenant is
+  legal only together with the catalog-side listing-window config: widen the
+  catalog window first, then the admission bound, the same ordering
+  `max_flush_lifetime` follows between folders and writers
+  (docs/catalog-and-mvcc.md, "Config discipline"). Lowering the admission lag
+  is always safe. Raising the admission lag alone admits records the listing
+  window then fails to discover on any non-token query.
 
 ## Crash matrix (strict mode)
 

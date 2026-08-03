@@ -10,6 +10,11 @@ Start here to run Ravel, ingest into it, or query it.
 - [guides/ingest.md](guides/ingest.md): OTLP ingest endpoints, authentication,
   strict vs. buffered acknowledgement, every rejection reason, admission
   limits, and commit tokens. Read this to write data into Ravel.
+- [guides/admission-limits.md](guides/admission-limits.md): the per-tenant
+  ingest admission limits (body size, byte rate, series/stream caps,
+  series-creation rate, event-time skew), their defaults, what a breach
+  looks like to a client, per-process enforcement, and the coordinated-raise
+  rule for `max_ingest_lag`. Read this to size or debug ingest rejections.
 - [guides/query.md](guides/query.md): the five `/api/v1` endpoints, the
   supported PromQL subset, query budgets, and HTTP status codes. Read this
   to read data back out.
