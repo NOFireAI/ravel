@@ -609,9 +609,16 @@ never drop a true result):
   (bloom-accelerated pruning inside the scan) and needs no residual correction.
   A plain `LIKE '%word%'` pattern's literal is recognized but is **not** pushed
   as a prune, because token matching is not a superset of SQL substring `LIKE`.
+- `attrs['k'] = 'v'` — an attribute equality. `extract_logs` sends it to a
+  prune-only channel that drives POSTINGS block pruning (ADR-0049). The channel
+  never becomes the reader's per-row filter, so it cannot drop a resource-only
+  match. The merged `attrs` residual evaluates the equality exactly.
+  `attrs['k'] IN (...)` stays unextracted, because an `IN` list is a
+  disjunction the intersecting prune channel cannot represent soundly
+  (issue #519).
 
-One known gap remains of the two ADR-0033 recorded. Both were deliberate,
-not oversights.
+Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
+oversights.
 
 1. ~~**`attrs['k']` subscript planning is not wired.**~~ **Closed.** This
    crate's DataFusion is built with `features = ["sql"]` only, so no
@@ -628,39 +635,30 @@ not oversights.
    (`services/ravel-server/tests/sql_endpoint.rs::a_logs_attrs_subscript_query_succeeds_over_http`),
    not only against a session the crate's own tests build. Gap 2 below is
    what remains, and it is about pruning, not planning.
-2. **An attribute equality has no fetch-time prune from SQL yet.** Because
-   `attrs` merges resource, scope, and per-record attributes with record-wins
-   precedence, `attrs['k'] = 'v'` matches a record whose match lives in
-   *either* its per-record attributes *or* its resource/scope stream
-   attributes. Two things follow.
+2. **A stream-attribute equality prunes through a prune-only channel.**
+   `attrs` merges resource, scope, and per-record attributes. On a key
+   collision the record wins. A stream-level (STREAM_DIR) match therefore
+   cannot prune the equality: it would drop a record whose match lives only in
+   its per-record attributes, and no residual restores a dropped record. The
+   reader's per-record `Equals` reads a record's own column and `attrs_raw`
+   overflow only. It never reads the resource or scope blob. So it matches a
+   strict subset of the merged equality. To evaluate it as the reader's exact
+   per-row filter drops every resource-only match.
 
-   First, no stream-level (STREAM_DIR) match can soundly prune it: a
-   stream-level `StreamIn` would drop a record whose match lives only in its
-   per-record attributes. ADR-0049's POSTINGS section is the
-   record-attribute-aware index ADR-0033 named as the fix: it indexes the
-   per-record dynamic columns at block granularity, and `RlogReader::scan`
-   already probes it per `Predicate::Equals` arm (widen-only: an unindexed
-   field keeps its blocks).
+   ADR-0049 closes the gap in two layers. Layer 1 is the index: the POSTINGS
+   section prunes blocks exactly on an indexed per-record attribute value.
+   Layer 2 is a prune-only channel: `extract_logs` sends `attrs['k'] = 'v'` to
+   `LogsPushdown::prune`, and `RlogReader::scan_pruned` applies that channel to
+   POSTINGS block pruning alone. The channel never feeds the per-row filter. If
+   the POSTINGS index does not cover a field, the channel prunes nothing, so it
+   stays widen-only (ADR-0013). DataFusion's `Inexact` residual still evaluates
+   the equality exactly over the merged `attrs` column. The prune changes which
+   blocks the fetch reads. It does not change which rows the query returns.
 
-   Second — and this is why the SQL push is still not wired — the reader's
-   `content` predicate channel is not a prune-only hint. Every pushed
-   `Predicate::Equals` arm is also applied as an **exact per-record row
-   filter**, and that filter checks a record's own dynamic column and
-   `attrs_raw` overflow only, never its resource/scope stream attributes. So a
-   pushed `attrs['k'] = 'v'` would drop a record whose match is resource- or
-   scope-only, making the scan return a *subset* of what the query needs.
-   Pushdown is `Inexact`, which requires a *superset*, so that is a data-loss
-   bug, not a missed optimization — the exact mirror of the stream-level case.
-
-   Therefore `attrs['k'] = 'v'` and `attrs['k'] IN (...)` are still not
-   extracted into a fetch prune; they are evaluated **entirely by DataFusion's
-   residual** over the merged `attrs` column. The fetch still prunes exactly on
-   the `ts` range and on content (`has_word`). Wiring the POSTINGS prune from
-   SQL needs an `ravel-logseg` change: the reader must expose the
-   postings-eligible `Equals` arms as a prune-only channel (block pruning, not
-   row filtering, leaving exactness to the residual), or evaluate `Equals` on
-   an attribute against the merged resource+scope+record view. That is the
-   remaining piece of issue #510.
+   The reader channel and the SQL extractor land in issue #538. The log fetch
+   plumbing that carries `LogsPushdown::prune` to `RlogReader::scan_pruned` (a
+   `prune` field on `ravel_query::LogQuery` and the fetch that applies it) is a
+   follow-up in `ravel-query`.
 
 ## Caching note
 

@@ -32,69 +32,50 @@
 //! pushed predicate today; `has_word`, whose SQL semantics are defined to equal
 //! `HasWord` exactly (crate::logs_udf), is the sound text-pruning path.
 //!
-//! # Why attribute equalities are still not pushed (issue #510)
+//! # How attribute equalities are pushed (prune-only)
 //!
-//! `attrs['k'] = 'v'` (lowered by the map-field planner to
-//! `get_field(attrs, 'k') = 'v'`, issue #507) and `attrs['k'] IN (...)` are
-//! **not** extracted into `content`, and this is a soundness decision, not an
-//! oversight. The reasoning has two layers, and ADR-0049's POSTINGS section
-//! removes only the first.
+//! `attrs['k'] = 'v'` (lowered to `get_field(attrs, 'k') = 'v'`, either operand
+//! order) is extracted into the prune-only [`LogsPushdown::prune`] channel, not
+//! into `content`. `attrs` is the merged view: resource + scope + per-record
+//! attributes, the record winning on a key collision ([`crate::rlog_attrs`]).
+//! Two layers of the old gap are now closed:
 //!
-//! **Layer 1 — no stream-level prune.** It is tempting to resolve the equality
-//! against STREAM_DIR into a `Predicate::StreamIn` prune (ADR-0033 first
-//! described exactly this), but that is unsound under the ADR-0033 amendment's
-//! merged `attrs` column. `attrs` merges resource + scope + record attributes
-//! with the record winning on a key collision, so a record's `attrs['k']` can
-//! differ from its stream-identifying resource/scope attributes. A `StreamIn`
-//! built from stream-level attributes drops a record whose match lives only in
-//! its per-record dynamic attributes (resource `service.name = worker`, record
-//! attribute `service.name = api`, query `= 'api'`) — a narrowing, not a widen.
-//! ADR-0049's POSTINGS section is the "record-attribute-aware index" ADR-0033
-//! named as the fix for this layer: it indexes the per-record dynamic columns at
-//! block granularity, and `RlogReader::scan` already probes it per
-//! `Predicate::Equals` arm (reader.rs), skipping any field it has not indexed
-//! (`Ok(None)`), so the *pruning* it drives is widen-only.
+//! - Layer 1, the index. ADR-0049's POSTINGS section gives exact block-level
+//!   pruning on an indexed per-record attribute value.
+//! - Layer 2, the coupling. The prune channel drives that pruning without
+//!   feeding the reader's exact per-row filter. `RlogReader::scan_pruned` treats
+//!   a prune arm as a block prune only and never evaluates it per row. This
+//!   matters because the reader's per-record `Equals` resolves against a
+//!   record's own dynamic column and `attrs_raw` overflow only, never the
+//!   resource/scope blob, so it is a strict subset of the merged equality.
+//!   Pushing it as an exact filter drops a record whose match lives only in its
+//!   resource/scope attributes (resource `service.name = worker`, record
+//!   attribute `service.name = api`, query `= 'api'`); a prune cannot, because a
+//!   field the POSTINGS index does not cover prunes nothing (widen-only,
+//!   ADR-0013).
 //!
-//! **Layer 2 — the reader's content channel is an exact per-record filter, and
-//! this is the blocker.** The `content: Vec<Predicate>` this extractor feeds is
-//! not a prune-only hint. Every arm is AND-combined into the single predicate
-//! `RlogReader::scan` evaluates *exactly, per row*, and `eval` resolves a
-//! `Predicate::Equals { field: FieldSel::Attr(k), .. }` against the record's
-//! own dynamic column plus `attrs_raw` overflow only — never against its
-//! resource/scope stream attributes (reader.rs `equals`; the write path keeps
-//! resource/scope attrs out of the per-record columns, see
-//! `ravel_otlp::logs_normalize` and `ravel_logseg::writer::resolve_row`). So the
-//! reader's `Equals{Attr}` is the *per-record* predicate, a strict subset of the
-//! merged `attrs['k'] = 'v'`: it matches `per-record k = v`, never
-//! `resource/scope k = v` where the record carries no own `k`.
+//! The equality is therefore pruned but still evaluated exactly by DataFusion's
+//! `Inexact` residual over the merged `attrs` column ([`crate::logs_scan`]),
+//! which stays the sole exact evaluator. Nothing changes about which rows the
+//! query returns; only which blocks the fetch must read.
 //!
-//! Pushing it would therefore make the scan return a **subset** of the rows the
-//! query needs. Pushdown here is always `Inexact`, which requires the scan to
-//! return a *superset* (DataFusion re-applies the original above it to reach
-//! exactness); a subset is a data-loss bug the residual cannot repair, because
-//! the residual only ever removes emitted rows, never adds a dropped one. The
-//! concrete case is the resource-only match
-//! (`crate::logs_provider::tests::attrs_subscript_plans_and_filters_correctly`'s
-//! `ts=4`: resource `service.name = api`, no per-record attribute): the merged
-//! residual keeps it, the reader's per-record `Equals` drops it. This is the
-//! exact mirror of the layer-1 record-only case — the merged predicate is a
-//! *union* over two attribute layers, and neither a stream-level nor a
-//! per-record-level exact filter is a sound over-approximation of it.
+//! `attrs['k'] IN (...)` stays unextracted. An `IN` list is a disjunction, and
+//! the prune channel intersects its arms, so a sound disjunctive prune needs a
+//! different shape (tracked by #519). It contributes nothing to either channel.
 //!
-//! So the equality is evaluated entirely by DataFusion's `Inexact` residual over
-//! the merged `attrs` column ([`crate::logs_scan`]), exactly as before. Wiring
-//! the POSTINGS prune from SQL needs a `ravel-logseg` change this crate cannot
-//! make: the reader must expose the postings-eligible `Equals{Attr}` arms as a
-//! **prune-only** channel (used for block pruning, not row filtering, leaving
-//! exactness to the merged residual), or `eval` must resolve `Equals{Attr}`
-//! against the merged resource+scope+record view. Until one of those lands,
-//! extracting the equality is unsound. See the issue #510 report.
+//! The `attrs['k']` subscript *syntax* plans through the hand-written
+//! `crate::map_field_planner` `ExprPlanner` (issue #507); the older note that it
+//! failed planning under `features = ["sql"]` is closed.
 
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
-use ravel_logseg::{FieldSel, Predicate};
+use ravel_logseg::{AttrValue, FieldSel, Predicate};
 
 use crate::logs_udf::HAS_WORD_UDF;
+
+/// The scalar UDF name an `attrs['k']` subscript lowers to
+/// ([`crate::map_field_planner`]).
+const GET_FIELD_UDF: &str = "get_field";
 
 /// Everything the extractor pulled out of a `logs` filter set, all widen-only.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -103,10 +84,18 @@ pub struct LogsPushdown {
     pub ts_lo: Option<i64>,
     /// Inclusive upper bound on `ts` in nanoseconds, if provably required.
     pub ts_hi: Option<i64>,
-    /// Content predicates handed straight to `RlogReader::scan`. Only shapes
-    /// whose SQL semantics equal the reader's exact filter are pushed (today:
-    /// `has_word`).
+    /// Content predicates handed straight to `RlogReader::scan` as the exact
+    /// per-row filter. Only shapes whose SQL semantics equal the reader's exact
+    /// filter are pushed (today: `has_word`).
     pub content: Vec<Predicate>,
+    /// Prune-only attribute equalities (`attrs['k'] = 'v'`), each a
+    /// `Predicate::Equals` on `FieldSel::Attr`. These drive POSTINGS block
+    /// pruning in `RlogReader::scan_pruned` and nothing else. They are never fed
+    /// to `content`: the reader's per-record `Equals` is a strict subset of the
+    /// merged-view SQL equality, so evaluating one exactly would drop a
+    /// resource/scope-only match. The merged residual stays the sole exact
+    /// evaluator, so pushdown stays `Inexact`. See the module doc.
+    pub prune: Vec<Predicate>,
 }
 
 impl LogsPushdown {
@@ -170,14 +159,57 @@ fn handle_leaf(expr: &Expr, out: &mut LogsPushdown) {
 }
 
 fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown) {
-    // ts vs literal timestamp comparison (either operand order). Attribute
-    // equalities (`get_field(attrs, 'k') = 'v'`) and `attrs['k'] IN (...)` are
-    // deliberately not extracted; see the module doc ("Why attribute equalities
-    // are still not pushed") for why pushing them into the reader's exact
-    // per-record `content` channel would drop resource/scope-only matches.
+    // ts vs literal timestamp comparison (either operand order).
     if let Some((op, ts_ns)) = ts_comparison(be) {
         apply_ts_bound(out, op, ts_ns);
+        return;
     }
+    // A merged-attribute equality `attrs['k'] = 'v'` feeds the prune-only
+    // channel. It never becomes a content predicate: the reader would evaluate
+    // it against per-record attributes only, a strict subset of the merged view,
+    // and drop resource/scope-only matches (see the module doc).
+    if let Some(p) = attr_equality_predicate(be) {
+        out.prune.push(p);
+    }
+}
+
+/// `get_field(attrs, 'k') = 'v'` (either operand order) -> a prune-only
+/// [`Predicate::Equals`] on `FieldSel::Attr("k")` with a string value. Only a
+/// string-literal comparison value is recognized; any other value contributes
+/// nothing. `attrs['k'] IN (...)` is an `Expr::InList`, not a `BinaryExpr`, so
+/// it never reaches here and stays unextracted (a disjunction the intersecting
+/// prune channel cannot soundly represent; tracked by #519).
+fn attr_equality_predicate(be: &BinaryExpr) -> Option<Predicate> {
+    if be.op != Operator::Eq {
+        return None;
+    }
+    let (key, value) = match attr_subscript_key(&be.left) {
+        Some(k) => (k, lit_utf8(&be.right)?),
+        None => {
+            let k = attr_subscript_key(&be.right)?;
+            (k, lit_utf8(&be.left)?)
+        }
+    };
+    Some(Predicate::Equals {
+        field: FieldSel::Attr(key),
+        value: AttrValue::Str(value),
+    })
+}
+
+/// The key literal `k` of an `attrs['k']` subscript, planned as
+/// `get_field(attrs, 'k')`. `None` for any other expression, including
+/// `get_field` over a column other than `attrs` or with a non-literal key.
+fn attr_subscript_key(e: &Expr) -> Option<String> {
+    let Expr::ScalarFunction(sf) = e else {
+        return None;
+    };
+    if sf.func.name() != GET_FIELD_UDF || sf.args.len() != 2 {
+        return None;
+    }
+    if !matches!(&sf.args[0], Expr::Column(c) if c.name == "attrs") {
+        return None;
+    }
+    lit_utf8(&sf.args[1])
 }
 
 // --- ts bound extraction (mirrors crate::pushdown's metrics logic) ---
@@ -383,56 +415,45 @@ mod tests {
         assert_eq!(p, LogsPushdown::default());
     }
 
-    /// `attrs['k'] = 'v'` (planned to `get_field(attrs, 'k') = 'v'`) and
-    /// `attrs['k'] IN (...)` are deliberately NOT extracted into `content`. The
-    /// reader would apply an extracted `Predicate::Equals { field: Attr(..) }`
-    /// as an exact per-record row filter, which under-returns resource/scope-
-    /// only matches the merged `attrs` residual must keep (module doc, "Why
-    /// attribute equalities are still not pushed"). This locks that decision:
-    /// no `Predicate` is emitted for either shape, so the residual stays the
-    /// sole, exact evaluator. Correct end-to-end results for these shapes,
-    /// including the resource-only match a naive push drops, are proven over
-    /// the full SQL path in `crate::logs_provider::tests`.
     #[test]
     fn attribute_equality_and_in_are_not_extracted() {
-        let attr = || get_field(col("attrs"), "service.name");
+        // `attrs['service.name'] = 'api'` (lowered to
+        // `get_field(attrs, 'service.name') = 'api'`) now goes to the prune-only
+        // channel, never to content: the reader would evaluate it against
+        // per-record attributes only and drop resource/scope-only matches.
+        let expected = vec![Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("api".into()),
+        }];
 
-        // Equality, both operand orders.
-        assert!(extract_logs(&[attr().eq(lit("api"))]).content.is_empty());
-        assert!(extract_logs(&[lit("api").eq(attr())]).content.is_empty());
+        let eq = get_field(col("attrs"), "service.name").eq(lit("api"));
+        let p = extract_logs(&[eq]);
+        assert_eq!(p.prune, expected);
+        assert!(p.content.is_empty(), "the equality must not become content");
+        assert_eq!((p.ts_lo, p.ts_hi), (None, None));
 
-        // `IN` list: an OR of equalities; the reader intersects `Equals` arms
-        // (a conjunction), so one arm per element would be doubly unsound.
-        // Extract nothing (issue #519 tracks a sound disjunctive form).
-        let in_list = attr().in_list(vec![lit("api"), lit("worker")], false);
-        assert!(extract_logs(&[in_list]).content.is_empty());
+        // The value on the left extracts the identical predicate.
+        let eq_flipped = lit("api").eq(get_field(col("attrs"), "service.name"));
+        let p = extract_logs(&[eq_flipped]);
+        assert_eq!(p.prune, expected);
+        assert!(p.content.is_empty());
 
-        // The equality does not disturb a ts bound extracted from the same AND.
-        let p = extract_logs(&[col("ts").gt_eq(ts_lit(100)), attr().eq(lit("api"))]);
-        assert_eq!((p.ts_lo, p.content.len()), (Some(100), 0));
+        // `attrs['k'] IN (...)` is a disjunction: it contributes nothing to
+        // either channel. The intersecting prune channel cannot represent it
+        // soundly; #519 tracks a disjunctive form.
+        let in_list = get_field(col("attrs"), "k").in_list(vec![lit("a"), lit("b")], false);
+        let p = extract_logs(&[in_list]);
+        assert!(p.content.is_empty());
+        assert!(p.prune.is_empty(), "IN must not populate the prune channel");
     }
 
-    /// Shapes that must never be extracted even once a sound attribute prune
-    /// exists: an inequality, an `OR` across different keys, a `NOT`, and a
-    /// comparison against a non-literal. None contributes a `content`
-    /// predicate today (nothing does), so this pins the invariant that they
-    /// stay non-extractable and are left to the residual.
     #[test]
-    fn non_extractable_attribute_shapes_contribute_nothing() {
-        let sn = || get_field(col("attrs"), "service.name");
-        let region = || get_field(col("attrs"), "region");
-
-        // Inequality.
-        assert!(extract_logs(&[sn().not_eq(lit("api"))]).content.is_empty());
-        // OR across different keys.
-        assert!(
-            extract_logs(&[or(sn().eq(lit("api")), region().eq(lit("eu")))])
-                .content
-                .is_empty()
-        );
-        // NOT around an equality.
-        assert!(extract_logs(&[!sn().eq(lit("api"))]).content.is_empty());
-        // Comparison against a non-literal (attr vs attr).
-        assert!(extract_logs(&[sn().eq(region())]).content.is_empty());
+    fn get_field_over_non_attrs_column_is_not_pushed() {
+        // Only the `attrs` map is prunable; a subscript on any other column
+        // contributes nothing to either channel.
+        let eq = get_field(col("resource"), "service.name").eq(lit("api"));
+        let p = extract_logs(&[eq]);
+        assert!(p.prune.is_empty());
+        assert!(p.content.is_empty());
     }
 }
