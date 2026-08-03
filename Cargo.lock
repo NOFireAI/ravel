@@ -4318,6 +4318,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "futures",
+ "hex",
  "parking_lot",
  "proptest",
  "prost",

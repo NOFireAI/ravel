@@ -665,13 +665,17 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     }
 }
 
-/// The two catalog anomaly counters (`crates/ravel-catalog/src/catalog.rs`),
-/// decoupled from `Catalog` itself so the renderer is testable with a plain
-/// struct literal.
+/// The catalog anomaly and hard-failure counters
+/// (`crates/ravel-catalog/src/catalog.rs`), decoupled from `Catalog` itself
+/// so the renderer is testable with a plain struct literal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CatalogCountersSnapshot {
     pub interlock_violations: u64,
     pub compaction_input_set_conflicts: u64,
+    /// ADR-0050 §2 hard isolation-breach failures: a HEAD/postings
+    /// tenant_hash mismatch or an out-of-prefix listing result. Unlike the
+    /// two counters above, each of these also failed its query.
+    pub isolation_breaches: u64,
 }
 
 fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCountersSnapshot) {
@@ -699,6 +703,19 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_compaction_input_set_conflicts_total",
         &[Label::Mode(mode)],
         snapshot.compaction_input_set_conflicts,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_isolation_breach_total",
+        "Hard-failed queries from a HEAD/postings tenant_hash mismatch or an out-of-prefix listing result (ADR-0050 section 2).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_isolation_breach_total",
+        &[Label::Mode(mode)],
+        snapshot.isolation_breaches,
     );
 }
 
@@ -963,6 +980,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     let catalog_snapshot = CatalogCountersSnapshot {
         interlock_violations: state.catalog.interlock_violations(),
         compaction_input_set_conflicts: state.catalog.compaction_input_set_conflicts(),
+        isolation_breaches: state.catalog.isolation_breaches(),
     };
 
     let maintain_snapshot =
@@ -1159,6 +1177,7 @@ mod tests {
         let catalog = CatalogCountersSnapshot {
             interlock_violations: 1,
             compaction_input_set_conflicts: 2,
+            isolation_breaches: 3,
         };
         let body = render(Mode::Gateway, &store, &ingest, &catalog, None, None);
 
@@ -1292,6 +1311,28 @@ mod tests {
     }
 
     #[test]
+    fn isolation_breach_counter_renders_at_metrics() {
+        let catalog = CatalogCountersSnapshot {
+            interlock_violations: 0,
+            compaction_input_set_conflicts: 0,
+            isolation_breaches: 5,
+        };
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &catalog,
+            None,
+            None,
+        );
+
+        assert!(
+            body.contains("ravel_catalog_isolation_breach_total{mode=\"gateway\"} 5"),
+            "isolation-breach counter must render its current value:\n{body}"
+        );
+    }
+
+    #[test]
     fn zero_valued_snapshot_renders_valid_output_not_omitted() {
         let body = render(
             Mode::Maintain,
@@ -1310,6 +1351,10 @@ mod tests {
         assert!(
             body.contains("ravel_catalog_interlock_violations_total{mode=\"maintain\"} 0"),
             "zero catalog counters must render, not be omitted:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_catalog_isolation_breach_total{mode=\"maintain\"} 0"),
+            "zero isolation-breach counter must render, not be omitted:\n{body}"
         );
         assert!(
             body.contains(

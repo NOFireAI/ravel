@@ -634,3 +634,143 @@ fn build_segment_ref_from_entry(
 fn hex16(hash: &[u8; 32]) -> String {
     hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use bytes::Bytes;
+    use ravel_object_store::instrument::StoreOp;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, PutOptions};
+    use ravel_proto::catalog::v1::{SnapshotPartRef, SnapshotPostingsRef};
+
+    use super::*;
+    use crate::config::CatalogConfig;
+    use crate::snapshot_format::HEAD_FORMAT_VERSION;
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0xab; 16])
+    }
+
+    fn config(shard_count: u32) -> CatalogConfig {
+        CatalogConfig {
+            shard_count,
+            ..Default::default()
+        }
+    }
+
+    /// A HEAD with one syntactically valid but unfetched part ref: enough to
+    /// pass `validate_head`'s shape checks without needing a real,
+    /// resolvable part object, since the tenant_hash check runs before any
+    /// part is loaded.
+    fn head_with_tenant(tenant_hash: [u8; 16]) -> SnapshotHead {
+        SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION,
+            tenant_hash: tenant_hash.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as u32,
+            shard_count: 1,
+            watermark_hour: 10,
+            parts: vec![SnapshotPartRef {
+                key: "unused-part-key".to_string(),
+                blake3: vec![0u8; 32],
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn head_tenant_hash_mismatch_is_hard_error() {
+        let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let catalog = Catalog::new(instrumented.clone(), config(1)).expect("catalog");
+        let tenant = tenant();
+        let wrong_tenant = TenantHash([0xff; 16]);
+
+        let head = head_with_tenant(wrong_tenant.0);
+        let head_bytes = snapshot_format::encode_head(&head).expect("encode head");
+        let head_key = head_object_key(&tenant, Signal::Metrics);
+        instrumented
+            .put(&head_key, Bytes::from(head_bytes), PutOptions::default())
+            .await
+            .expect("put head");
+
+        let now_ns = 20 * NS_PER_HOUR;
+        let range = TimeRange {
+            start_ns: now_ns - 1_000,
+            end_ns: now_ns,
+        };
+        let err = catalog
+            .resolve(&tenant, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("tenant_hash mismatch must hard-fail, never degrade to listing");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "tenant_hash"),
+            other => panic!("expected FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+        assert_eq!(
+            instrumented.metrics().snapshot().op(StoreOp::List).calls,
+            0,
+            "a tenant_hash-mismatched HEAD must never fall back to listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn postings_tenant_hash_mismatch_is_hard_error() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let tenant = tenant();
+        let wrong_tenant = TenantHash([0xff; 16]);
+
+        let mut head = head_with_tenant(tenant.0);
+        let part_blake3: [u8; 32] = head.parts[0]
+            .blake3
+            .clone()
+            .try_into()
+            .expect("32-byte part blake3");
+
+        let postings_bytes = snapshot_format::encode_postings(
+            wrong_tenant.0,
+            signal::to_proto(Signal::Metrics) as u32,
+            &[part_blake3],
+            0,
+            &[],
+        )
+        .expect("encode postings");
+        let postings_hash = *blake3::hash(&postings_bytes).as_bytes();
+        let postings_key = "postings-key".to_string();
+        catalog
+            .store()
+            .put(
+                &postings_key,
+                Bytes::from(postings_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put postings");
+        head.postings = Some(SnapshotPostingsRef {
+            key: postings_key,
+            blake3: postings_hash.to_vec(),
+            size: postings_bytes.len() as u64,
+            name_count: 0,
+            part_blake3: vec![part_blake3.to_vec()],
+        });
+
+        let accounting = QueryAccounting::new();
+        let err = catalog
+            .load_snapshot_postings(&tenant, &head, &[], &accounting)
+            .await
+            .expect_err("tenant_hash mismatch must hard-fail, never degrade pruning");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "tenant_hash"),
+            other => panic!("expected FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+    }
+}
