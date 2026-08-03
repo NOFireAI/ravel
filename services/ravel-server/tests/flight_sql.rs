@@ -460,6 +460,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
         config,
         store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("starts");

@@ -299,6 +299,7 @@ pub async fn start(
     config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
     store_metrics: Arc<StoreMetrics>,
+    cache: Option<Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>>,
 ) -> anyhow::Result<Running> {
     let ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
         Some(Arc::new(IngestRouter::new(
@@ -454,6 +455,7 @@ pub async fn start(
             catalog.clone(),
             store.clone(),
             config.tenant_resolver.clone(),
+            cache.clone(),
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
@@ -471,6 +473,7 @@ pub async fn start(
                 catalog.clone(),
                 store.clone(),
                 config.tenant_resolver.clone(),
+                cache.clone(),
             )?;
             alert_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));

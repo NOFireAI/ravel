@@ -345,6 +345,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         config,
         store_dyn,
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts");
@@ -460,6 +461,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         config,
         store_dyn,
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts");

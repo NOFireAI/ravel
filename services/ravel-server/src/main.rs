@@ -97,10 +97,10 @@ async fn main() -> anyhow::Result<()> {
     // `build_store` wraps the backend in (issue #272). Held for the whole
     // process lifetime and threaded into `start` below, which serves it at
     // `GET /metrics` (issue #423).
-    // Attached to the query fetchers in the next commit (ADR-0046); built
-    // here so `--cache-max-bytes`/`--disable-cache` are validated at the same
-    // startup point as every other flag.
-    let (store, store_metrics, _cache) =
+    // Attached to the query fetchers via `ravel_server::start` below (ADR-0046);
+    // built here so `--cache-max-bytes`/`--disable-cache` are validated at the
+    // same startup point as every other flag.
+    let (store, store_metrics, cache) =
         ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
     // Retention windows are validated at startup against the ADR-0019 floor,
@@ -214,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
         limits,
     };
 
-    let running = ravel_server::start(config, store, store_metrics).await?;
+    let running = ravel_server::start(config, store, store_metrics, cache).await?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
     if cfg!(feature = "flight-sql") {
         tracing::info!(

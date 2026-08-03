@@ -110,7 +110,7 @@ async fn start_test_server() -> ravel_server::Running {
         otap: true,
         limits: ravel_server::LimitsConfig::default(),
     };
-    ravel_server::start(config, store, Arc::new(StoreMetrics::default()))
+    ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
         .await
         .expect("server starts")
 }

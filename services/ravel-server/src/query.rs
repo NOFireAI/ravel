@@ -3,10 +3,11 @@
 
 use std::sync::Arc;
 
+use ravel_cache::Cache;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::http::{AppState, TenantResolver};
-use ravel_query::{EngineConfig, QueryEngine};
+use ravel_query::{CacheFetchError, EngineConfig, QueryEngine};
 
 /// Builds the shared [`Catalog`] used both for query resolve and for the
 /// background fold task (docs/metric-index-plan.md section 4): one instance
@@ -28,8 +29,12 @@ pub fn build_app_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
+    cache: Option<Arc<Cache<CacheFetchError>>>,
 ) -> AppState {
-    let engine = QueryEngine::new(catalog, store, EngineConfig::default());
+    let mut engine = QueryEngine::new(catalog, store, EngineConfig::default());
+    if let Some(cache) = cache {
+        engine = engine.with_cache(cache);
+    }
     AppState {
         engine: Arc::new(engine),
         tenant_resolver,
@@ -56,19 +61,26 @@ pub fn build_sql_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
+    cache: Option<Arc<Cache<CacheFetchError>>>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SqlConfig, SqlExecutor};
 
     let config = SqlConfig::default();
     let max_deadline = config.engine.deadline;
+    let mut metrics_fetcher = SegmentFetcher::new(store.clone());
+    let mut logs_fetcher = LogSegmentFetcher::new(store.clone());
+    if let Some(cache) = cache {
+        metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
+        logs_fetcher = logs_fetcher.with_cache(cache);
+    }
     // The metrics fetcher (RSEG) and the logs fetcher (RLOG) both read the
     // same object store; the executor uses whichever the query's target table
     // needs (ADR-0033).
     let executor = SqlExecutor::new(
         catalog,
-        SegmentFetcher::new(store.clone()),
-        LogSegmentFetcher::new(store.clone()),
+        metrics_fetcher,
+        logs_fetcher,
         config,
         DEFAULT_MAX_TENANT_BYTES,
     );

@@ -82,6 +82,7 @@ async fn start_with_mtls(
         config,
         store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
     )
     .await
     .expect("server starts")
