@@ -221,7 +221,11 @@ fn encode_marker(receipt: &IdempotencyReceipt) -> Result<Vec<u8>, MarkerError> {
 /// Decode and verify a marker body. Every failure mode (truncation, bad
 /// magic, unsupported version, checksum mismatch, malformed payload) is a
 /// typed [`MarkerError`], never a panic.
-fn decode_marker(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
+///
+/// Public so `ravel-cli`'s `idem inspect` (EB-12) can report the specific
+/// failure reason [`read_marker`]'s [`LookupOutcome::Corrupt`] collapses:
+/// the one and only decoder for this frozen format, not a second copy.
+pub fn decode_marker(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
     if bytes.len() < HEADER_LEN {
         return Err(MarkerError::Truncated(bytes.len()));
     }

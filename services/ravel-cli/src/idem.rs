@@ -2,101 +2,31 @@
 //! and render one idempotency marker object by its exact key
 //! (`t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`).
 //!
-//! The wire layout mirrored here (`RIDM` magic, u16 version, crc32c over
-//! `magic || version || payload`, then `written_count` / commit-token-length
-//! / commit-token payload) is the frozen contract documented in
-//! docs/catalog-and-mvcc.md ("Idempotency marker body layout") and encoded by
-//! `ravel_ingest::idempotency`. That module's own encoder/decoder pair is
-//! private to the crate (only `write_marker`, `read_marker`, `marker_key`,
-//! and the `IdempotencyReceipt` / `MarkerError` / `LookupOutcome` types are
-//! exported), and `read_marker`'s public `LookupOutcome::Corrupt` collapses
-//! every decode failure to one variant with no detail retained. Neither
-//! exposes what this inspector needs: the specific `MarkerError` for a given
-//! marker's bytes. This module therefore re-implements the documented decode
-//! against the normative doc rather than `ravel_ingest`'s own (private)
-//! decoder; see the final task report for the upstream visibility gap this
-//! works around.
+//! Decoding goes through `ravel_ingest::idempotency::decode_marker`, the same
+//! function the ingest path itself uses (via `read_marker`) to interpret a
+//! marker's bytes. There is exactly one decoder for this frozen, checksummed
+//! format; this module must never fork a second copy, or a future version
+//! bump could update one and silently leave the other reporting stale
+//! results (a marker the ingest path treats as corrupt could report `valid`
+//! here, or vice versa).
 use std::sync::Arc;
 
-use ravel_ingest::{IdempotencyReceipt, MarkerError};
+use ravel_ingest::decode_marker;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 
-const MAGIC: [u8; 4] = *b"RIDM";
-const VERSION: u16 = 1;
-const HEADER_LEN: usize = 10;
-/// `written_count` (u64) + commit-token length prefix (u16).
-const RECEIPT_HEADER_LEN: usize = 10;
-
-/// Decode a receipt payload (post-header bytes): `written_count` (u64 LE),
-/// then a u16 LE length prefix, then that many UTF-8 bytes of comma-joined
-/// commit tokens. Mirrors `ravel_ingest::idempotency`'s private
-/// `decode_receipt`.
-fn decode_receipt(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
-    if bytes.len() < RECEIPT_HEADER_LEN {
-        return Err(MarkerError::MalformedReceipt(format!(
-            "receipt payload is {} bytes, need at least {RECEIPT_HEADER_LEN}",
-            bytes.len()
-        )));
-    }
-    let (header, rest) = bytes.split_at(RECEIPT_HEADER_LEN);
-    let written_count = u64::from_le_bytes(header[0..8].try_into().unwrap_or([0; 8]));
-    let token_len = u16::from_le_bytes([header[8], header[9]]) as usize;
-    if rest.len() != token_len {
-        return Err(MarkerError::MalformedReceipt(format!(
-            "commit token length prefix says {token_len} bytes, {} remain",
-            rest.len()
-        )));
-    }
-    let commit_token = String::from_utf8(rest.to_vec()).map_err(|e| {
-        MarkerError::MalformedReceipt(format!("commit token is not valid utf-8: {e}"))
-    })?;
-    Ok(IdempotencyReceipt {
-        written_count,
-        commit_token,
-    })
-}
-
-/// Decode and verify a marker body. Every failure mode (truncation, bad
-/// magic, unsupported version, checksum mismatch, malformed payload) is a
-/// typed `MarkerError`, never a panic. Mirrors `ravel_ingest::idempotency`'s
-/// private `decode_marker`.
-fn decode_marker(bytes: &[u8]) -> Result<IdempotencyReceipt, MarkerError> {
-    if bytes.len() < HEADER_LEN {
-        return Err(MarkerError::Truncated(bytes.len()));
-    }
-    let (header, payload) = bytes.split_at(HEADER_LEN);
-    let magic = &header[0..4];
-    if magic != MAGIC {
-        let mut got = [0u8; 4];
-        got.copy_from_slice(magic);
-        return Err(MarkerError::BadMagic(got));
-    }
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != VERSION {
-        return Err(MarkerError::UnsupportedVersion(version));
-    }
-    let stored_crc = u32::from_le_bytes(header[6..10].try_into().unwrap_or([0; 4]));
-    // Coverage is magic || version || payload: the crc field itself
-    // (header[6..10]) is excluded, matching docs/catalog-and-mvcc.md.
-    let computed_crc = crc32c::crc32c_append(crc32c::crc32c(&header[0..6]), payload);
-    if stored_crc != computed_crc {
-        return Err(MarkerError::ChecksumMismatch {
-            stored: stored_crc,
-            computed: computed_crc,
-        });
-    }
-    decode_receipt(payload)
-}
-
 /// Render a decoded marker's fields for `idem inspect`'s stdout report.
-fn render(receipt: &IdempotencyReceipt) -> String {
-    let tokens: Vec<&str> = receipt
-        .commit_token
-        .split(',')
-        .filter(|t| !t.is_empty())
-        .collect();
+/// `commit_token` is the raw stored comma-joined string: split without
+/// filtering empty fields, so a malformed value like `"a,,b"` is shown
+/// faithfully (three fields, one empty) rather than silently collapsed to
+/// two -- this is a diagnostic tool, and hiding an anomaly defeats it.
+fn render(receipt: &ravel_ingest::IdempotencyReceipt) -> String {
+    let tokens: Vec<&str> = if receipt.commit_token.is_empty() {
+        Vec::new()
+    } else {
+        receipt.commit_token.split(',').collect()
+    };
     format!(
-        "magic: valid (RIDM)\nversion: valid ({VERSION})\ncrc32c: valid\nwritten_count: {}\ncommit_tokens: [{}]",
+        "magic: valid (RIDM)\nversion: valid\ncrc32c: valid\nwritten_count: {}\ncommit_tokens: [{}]",
         receipt.written_count,
         tokens.join(", ")
     )
@@ -249,5 +179,103 @@ mod tests {
         .await
         .expect_err("a missing marker must error, not print a false report");
         assert!(err.to_string().contains("no marker object"), "err: {err}");
+    }
+
+    /// Encodes a raw marker frame matching the frozen wire format
+    /// (docs/catalog-and-mvcc.md "Idempotency marker body layout"), for
+    /// exercising decode failure modes `renders_marker_fields` and the
+    /// existing corrupt/truncated tests don't reach: `decode_marker` is
+    /// reused directly by `inspect` (no second copy in this crate), so this
+    /// only needs to build bytes, not duplicate any decode logic.
+    fn raw_marker(magic: &[u8; 4], version: u16, written_count: u64, token: &str) -> Vec<u8> {
+        let token_bytes = token.as_bytes();
+        let mut payload = Vec::with_capacity(10 + token_bytes.len());
+        payload.extend_from_slice(&written_count.to_le_bytes());
+        payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
+        payload.extend_from_slice(token_bytes);
+
+        let mut header = Vec::with_capacity(10);
+        header.extend_from_slice(magic);
+        header.extend_from_slice(&version.to_le_bytes());
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&header), &payload);
+        header.extend_from_slice(&crc.to_le_bytes());
+
+        let mut out = header;
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    async fn put_raw(store: &dyn ObjectStoreBackend, key: &str, bytes: Vec<u8>) {
+        store
+            .put(
+                key,
+                bytes::Bytes::from(bytes),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("put must succeed");
+    }
+
+    #[tokio::test]
+    async fn bad_magic_reports_specific_reason() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let key = "t/deadbeefdeadbeefdeadbeefdeadbeef/l/idem/abc.0495972.idm";
+        put_raw(store.as_ref(), key, raw_marker(b"XXXX", 1, 1, "v2:token")).await;
+
+        let err = inspect(store, key)
+            .await
+            .expect_err("a bad-magic marker must be a typed, non-zero failure, not a panic");
+        assert!(
+            err.to_string().contains("magic"),
+            "expected the specific BadMagic reason, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_version_reports_specific_reason() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let key = "t/deadbeefdeadbeefdeadbeefdeadbeef/l/idem/abc.0495972.idm";
+        put_raw(store.as_ref(), key, raw_marker(b"RIDM", 2, 1, "v2:token")).await;
+
+        let err = inspect(store, key)
+            .await
+            .expect_err("an unsupported-version marker must be a typed, non-zero failure");
+        assert!(
+            err.to_string().contains("version"),
+            "expected the specific UnsupportedVersion reason, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_receipt_token_length_mismatch_reports_specific_reason() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let key = "t/deadbeefdeadbeefdeadbeefdeadbeef/l/idem/abc.0495972.idm";
+
+        // Build a frame, then lie about the token-length prefix and
+        // recompute the crc over the now-inconsistent payload, so the frame
+        // passes the crc check and reaches decode_receipt's own length
+        // check (`rest.len() != token_len`) instead of failing earlier.
+        let mut bytes = raw_marker(b"RIDM", 1, 1, "v2:token");
+        let token_len_offset = 10 + 8; // header (10) + written_count (8)
+        let real_len = u16::from_le_bytes([bytes[token_len_offset], bytes[token_len_offset + 1]]);
+        let lied_len = real_len + 5;
+        bytes[token_len_offset..token_len_offset + 2].copy_from_slice(&lied_len.to_le_bytes());
+        let header = bytes[..6].to_vec();
+        let payload = bytes[10..].to_vec();
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&header), &payload);
+        bytes[6..10].copy_from_slice(&crc.to_le_bytes());
+
+        put_raw(store.as_ref(), key, bytes).await;
+
+        let err = inspect(store, key)
+            .await
+            .expect_err("a token-length lie must be a typed, non-zero failure, not a panic");
+        assert!(
+            err.to_string().contains("length prefix"),
+            "expected the specific MalformedReceipt reason, got: {err}"
+        );
     }
 }

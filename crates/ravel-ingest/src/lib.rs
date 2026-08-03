@@ -33,8 +33,8 @@ pub use config::{
 };
 pub use error::WriteError;
 pub use idempotency::{
-    IdempotencyReceipt, LookupOutcome, MarkerError, MarkerWriteError, WriteOutcome, keyhash32,
-    marker_key, read_marker, write_marker,
+    IdempotencyReceipt, LookupOutcome, MarkerError, MarkerWriteError, WriteOutcome, decode_marker,
+    keyhash32, marker_key, read_marker, write_marker,
 };
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
