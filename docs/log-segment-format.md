@@ -638,19 +638,29 @@ its access path (ADR-0010 §4):
 | SKIP_IDX stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
 | one BLOCKS block's stored bytes | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block |
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
+| POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
 | one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |
 
-BLOCKS, BLOOM, and POSTINGS have no whole-section crc because they are
-never read whole: a selective scan touches a handful of blocks, blooms,
-or term blocks, and a whole-section crc could not be verified without
-fetching the whole section, defeating the point. Their per-block and
-per-entry crc32c are the access-path-verifiable equivalents. The
-POSTINGS header fields themselves (`column_id`, `capped`, `stride`,
-counts, `first_term`, offsets) carry no separate checksum: they are
-validated structurally at parse time (ascending order, cap checks, exact
-block tiling) rather than by crc, the same way FIELD_DIR's and
-STREAM_DIR's framing is validated structurally under their one
-whole-section crc. The `enc`/`comp` bytes of a page are covered by the
+BLOCKS and BLOOM have no whole-section crc because they are never read
+whole: a selective scan touches a handful of blocks or blooms, and a
+whole-section crc could not be verified without fetching the whole
+section, defeating the point. Their per-block and per-entry crc32c are
+the access-path-verifiable equivalents.
+
+POSTINGS is read differently: `scan` always reads the section's stored
+bytes in full to reach any block within it, so its whole-section
+`Section.crc32c` is verified the same way STREAM_DIR's and FIELD_DIR's
+is, before `PostingsSection::parse` touches the header. This is the only
+protection an out-of-bounds or garbage `first_term`, offset, or count in
+the header gets; earlier revisions of this format checked it only
+structurally (ascending order, cap checks, exact block tiling) and not
+by crc, which let a header byte flip route `probe` to the wrong block
+without detection as long as ordering and per-block checksums still
+passed. `probe` adds a second, independent check for a future reader
+that fetches one block via a range read instead of the whole section: it
+requires the decompressed block's first term to equal the sparse
+entry's `first_term`, and every term in the block to sort below the next
+entry's `first_term`. The `enc`/`comp` bytes of a page are covered by the
 enclosing block's crc, so a flipped tag fails the crc rather than causing
 a silent misdecode. Pad bytes between sections are never interpreted and
 fall under the whole-object BLAKE3 in the commit record.
@@ -704,13 +714,18 @@ All violations are `Corrupted`, never panics:
   consuming exactly its bytes.
 - bloom: `m_bits` not a power of two or below 512; `k = 0`; `bits` length
   wrong; entry crc mismatch; entry index out of range.
-- postings: unknown section grammar version; field count or one field's
-  term/block count over its cap; non-ascending `column_id` across fields
-  or `first_term` within a field; a term block's declared
+- postings: whole-section crc mismatch (checked before the header is
+  parsed at all); unknown section grammar version; field count or one
+  field's term/block count over its cap; non-ascending `column_id`
+  across fields or `first_term` within a field; a term block's declared
   `uncompressed_len` over its cap; a `block_offset` that does not exactly
   continue the running cursor (catches both an offset past the section
   and a gap or overlap between blocks); a term block's crc mismatch or a
-  decompressed length not equal to its declared `uncompressed_len`; terms
-  within a decompressed block not ascending; a declared term or posting
-  count the block's remaining bytes cannot support.
+  decompressed length not equal to its declared `uncompressed_len`; a
+  decompressed block's first term not equal to its sparse-index entry's
+  `first_term`, or any term in it not sorting below the next entry's
+  `first_term`; terms within a decompressed block not ascending, or
+  trailing bytes left over once the declared term count is consumed; a
+  declared term or posting count the block's remaining bytes cannot
+  support.
 - block crc mismatch.
