@@ -241,6 +241,46 @@ pub fn decode_postings(
     Ok(DecodedPostings { header, names })
 }
 
+/// Reads only the declared `tenant_hash` from a postings object's header,
+/// without decoding or validating its body or checking its part binding.
+///
+/// This exists so the ADR-0050 §2 tenant-hash isolation check can run
+/// *before* [`decode_postings`]'s part-binding check: the binding check
+/// degrades to a listing fallback (a postings object bound to a different
+/// part set is stale, not a breach), and if it ran first it would mask a
+/// foreign `tenant_hash` on an object that also happens not to bind, letting
+/// an isolation breach degrade silently instead of hard-failing (#528).
+///
+/// The caller must have already verified `bytes` against the postings ref's
+/// blake3 (postings objects are content-addressed), so the framing is
+/// trusted enough to locate and decode the header; every failure is still a
+/// typed error, never a panic. `decode_postings` re-reads and fully
+/// validates the same header, so this never widens what is accepted.
+pub fn postings_declared_tenant_hash(bytes: &[u8]) -> Result<[u8; 16], SnapshotFormatError> {
+    if bytes.len() < MIN_POSTINGS_ENVELOPE_LEN {
+        return Err(SnapshotFormatError::PostingsTooSmall { size: bytes.len() });
+    }
+    let mut pos = 0usize;
+    let magic = take_array::<4>(bytes, &mut pos)?;
+    if magic != POSTINGS_MAGIC {
+        return Err(SnapshotFormatError::BadMagic);
+    }
+    let version = take_bytes(bytes, &mut pos, 1)?[0];
+    if version != POSTINGS_VERSION {
+        return Err(SnapshotFormatError::PostingsUnsupportedVersion(version));
+    }
+    let reserved = take_array::<3>(bytes, &mut pos)?;
+    if reserved != POSTINGS_RESERVED {
+        return Err(SnapshotFormatError::ReservedNonZero);
+    }
+    let header_len = take_u32_le(bytes, &mut pos)?;
+    let header_bytes = take_bytes(bytes, &mut pos, to_usize(header_len)?)?;
+    let header = SnapshotPostingsHeader::decode(header_bytes)
+        .map_err(|e| SnapshotFormatError::PostingsHeaderDecode(e.to_string()))?;
+    <[u8; 16]>::try_from(header.tenant_hash.as_slice())
+        .map_err(|_| SnapshotFormatError::BadTenantHashLen(header.tenant_hash.len()))
+}
+
 /// Sort/uniqueness/bound validation shared by `encode_postings` (defensive
 /// check of caller input) and `decode_postings` (untrusted-bytes check).
 fn validate_names(names: &[NamePostings], entry_count: u64) -> Result<(), SnapshotFormatError> {

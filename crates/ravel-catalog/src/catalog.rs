@@ -857,7 +857,7 @@ impl Catalog {
         accounting: &QueryAccounting,
     ) -> Result<Arc<CompactionRecord>, CatalogError> {
         if let Some(cached) = self.compaction_cache.get(tenant, key, accounting) {
-            validate_compaction_expected_fields(&cached, tenant, signal, shard, key)?;
+            validate_compaction_expected_fields(self, &cached, tenant, signal, shard, key)?;
             return Ok(cached);
         }
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
@@ -868,7 +868,7 @@ impl Catalog {
                 source: e,
             }
         })?;
-        validate_compaction_expected_fields(&record, tenant, signal, shard, key)?;
+        validate_compaction_expected_fields(self, &record, tenant, signal, shard, key)?;
         let record = Arc::new(record);
         self.compaction_cache.insert(
             *tenant,
@@ -902,7 +902,7 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         let key = keys::commit_key_for_token(tenant, signal, token)?;
         if let Some(cached) = self.cache.get(tenant, &key, accounting)
-            && validate_expected_fields(&cached, tenant, signal, token.shard, &key).is_ok()
+            && validate_expected_fields(self, &cached, tenant, signal, token.shard, &key).is_ok()
         {
             let segment_ref = build_segment_ref(&key, &cached)?;
             out.entry(segment_ref.data_object_key.clone())
@@ -927,7 +927,7 @@ impl Catalog {
                 Ok(got) => {
                     let bytes = got.data.len() as u64;
                     let record = record::decode(&got.data)?;
-                    validate_expected_fields(&record, tenant, signal, token.shard, &key)?;
+                    validate_expected_fields(self, &record, tenant, signal, token.shard, &key)?;
                     let record = Arc::new(record);
                     self.cache.insert(
                         *tenant,
@@ -1041,13 +1041,13 @@ impl Catalog {
         accounting: &QueryAccounting,
     ) -> Result<Arc<CommitRecord>, CatalogError> {
         if let Some(cached) = self.cache.get(tenant, key, accounting) {
-            validate_expected_fields(&cached, tenant, signal, shard, key)?;
+            validate_expected_fields(self, &cached, tenant, signal, shard, key)?;
             return Ok(cached);
         }
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
         let record = record::decode(&got.data)?;
-        validate_expected_fields(&record, tenant, signal, shard, key)?;
+        validate_expected_fields(self, &record, tenant, signal, shard, key)?;
         let record = Arc::new(record);
         self.cache.insert(
             *tenant,
@@ -1101,7 +1101,16 @@ fn unsatisfiable_token(token: &CommitToken) -> CatalogError {
 /// Validate a decoded record's tenant_hash/signal/shard against the
 /// (tenant, signal, shard) it was listed or addressed under (ADR-0010 §10:
 /// checked on every cache hit and every fresh decode).
+///
+/// A `tenant_hash` disagreement is an isolation breach (ADR-0050 §2): a
+/// commit record listed or addressed under one tenant's prefix that declares
+/// another tenant. It is recorded on `ravel_catalog_isolation_breach_total`
+/// before the hard `FieldMismatch` is returned, so an operator sees it on the
+/// same counter the HEAD and postings breaches increment (#529). The
+/// `catalog` handle is threaded in purely to reach that counter; the
+/// rejection itself is unchanged.
 fn validate_expected_fields(
+    catalog: &Catalog,
     record: &CommitRecord,
     tenant: &TenantHash,
     signal: Signal,
@@ -1109,6 +1118,7 @@ fn validate_expected_fields(
     key: &str,
 ) -> Result<(), CatalogError> {
     if record.tenant_hash.as_slice() != tenant.0.as_slice() {
+        catalog.record_isolation_breach();
         return Err(CatalogError::FieldMismatch {
             key: key.to_string(),
             field: "tenant_hash",
@@ -1138,8 +1148,13 @@ fn validate_expected_fields(
 /// Validate a decoded compaction record's tenant_hash/signal/shard against
 /// the (tenant, signal, shard) it was listed or addressed under, and verify
 /// its own key reconstructs to the key it was found at (ADR-0010 §7). The
-/// compaction-record analog of [`validate_expected_fields`].
+/// compaction-record analog of [`validate_expected_fields`], and like it a
+/// `tenant_hash` disagreement is recorded on
+/// `ravel_catalog_isolation_breach_total` before the hard `FieldMismatch`
+/// (ADR-0050 §2, #529). The `catalog` handle is threaded in purely to reach
+/// that counter; the rejection itself is unchanged.
 fn validate_compaction_expected_fields(
+    catalog: &Catalog,
     record: &CompactionRecord,
     tenant: &TenantHash,
     signal: Signal,
@@ -1147,6 +1162,7 @@ fn validate_compaction_expected_fields(
     key: &str,
 ) -> Result<(), CatalogError> {
     if record.tenant_hash.as_slice() != tenant.0.as_slice() {
+        catalog.record_isolation_breach();
         return Err(CatalogError::FieldMismatch {
             key: key.to_string(),
             field: "tenant_hash",
@@ -2429,5 +2445,86 @@ mod tests {
             other => panic!("expected FieldMismatch, got {other:?}"),
         }
         assert_eq!(catalog.isolation_breaches(), 1);
+    }
+
+    /// #529 / ADR-0050 §2: a commit record and a compaction record whose
+    /// tenant_hash disagrees with the prefix they were listed under are the
+    /// highest-signal breach the metric must reflect. Both validators must
+    /// count the breach on `ravel_catalog_isolation_breach_total`, not merely
+    /// reject it. tenant_hash is checked before every other field (and before
+    /// key reconstruction for the compaction record), so a foreign hash
+    /// reaches exactly the breach branch.
+    #[tokio::test]
+    async fn record_tenant_hash_mismatch_records_isolation_breach() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let listed_under = tenant();
+        let foreign = TenantHash([0xff; 16]);
+        let now = 500_000 * NS_PER_HOUR;
+
+        // A self-consistent commit record for the FOREIGN tenant, validated as
+        // if it were listed under this tenant's prefix.
+        let writer_id = Uuid::new_v4();
+        let payload = b"payload".to_vec();
+        let content_hash = content_hash_for(&payload);
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: foreign,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: now - 1_000,
+            max_event_ts_ns: now,
+            min_ingest_ts_ns: now - 1_000,
+            max_ingest_ts_ns: now,
+            segment_format_version: 1,
+            created_unix_ns: now,
+            ingest_hour_bucket: 500_000,
+        })
+        .expect("valid record");
+
+        let err = validate_expected_fields(
+            &catalog,
+            &commit,
+            &listed_under,
+            Signal::Metrics,
+            0,
+            "listed-under-key",
+        )
+        .expect_err("a commit record naming a foreign tenant must be rejected");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "tenant_hash"),
+            other => panic!("expected tenant_hash FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+
+        // A compaction record declaring the foreign tenant. tenant_hash is
+        // checked before key reconstruction, so a default-filled record with a
+        // foreign hash reaches the breach branch without a reconstructable key.
+        let compaction = CompactionRecord {
+            tenant_hash: foreign.0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard: 0,
+            ..Default::default()
+        };
+        let err = validate_compaction_expected_fields(
+            &catalog,
+            &compaction,
+            &listed_under,
+            Signal::Metrics,
+            0,
+            "listed-under-ckey",
+        )
+        .expect_err("a compaction record naming a foreign tenant must be rejected");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "tenant_hash"),
+            other => panic!("expected tenant_hash FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 2);
     }
 }

@@ -12,7 +12,9 @@ mod postings;
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
 pub use part::{DecodedPart, decode_part, encode_part};
-pub use postings::{DecodedPostings, NamePostings, decode_postings, encode_postings};
+pub use postings::{
+    DecodedPostings, NamePostings, decode_postings, encode_postings, postings_declared_tenant_hash,
+};
 
 /// Envelope magic, first 4 bytes of every snapshot part object.
 pub const MAGIC: [u8; 4] = *b"RCS1";
