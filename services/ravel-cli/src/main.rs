@@ -800,6 +800,7 @@ fn rlog_section_kind_name(kind: u32) -> &'static str {
         kind::BLOCKS => "BLOCKS",
         kind::SKIP_IDX => "SKIP_IDX",
         kind::BLOOM => "BLOOM",
+        kind::POSTINGS => "POSTINGS",
         _ => "UNKNOWN",
     }
 }

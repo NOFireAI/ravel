@@ -90,7 +90,7 @@ fn build_object() -> Vec<u8> {
         writer_epoch: 7,
         writer_seq: 42,
     };
-    let mut w = RlogWriter::new(cfg, identity);
+    let mut w = RlogWriter::new(cfg, identity).with_indexed_fields(vec!["svc".to_string()]);
     for r in [
         rec(1, 100, 9, "get /api ok", "api", 200),
         rec(1, 200, 17, "get /api timeout", "api", 504),
