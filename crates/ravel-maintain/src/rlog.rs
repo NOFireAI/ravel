@@ -17,9 +17,31 @@
 //!   [`MaintainError::StreamAttrsConflict`], never a silent pick;
 //! - re-sorts the merged record set by `(stream_ref, ts)` ascending, rebuilds
 //!   `FIELD_DIR` from the merged column set under the same 1000-dynamic-column
-//!   cap with overflow folded into `attrs_raw`, and rebuilds `SKIP_IDX` and the
-//!   per-block `BLOOM`s over the merged, re-blocked contents at the same 8192
-//!   record block target.
+//!   cap with overflow folded into `attrs_raw`, and rebuilds `SKIP_IDX`, the
+//!   per-block `BLOOM`s, and `POSTINGS` over the merged, re-blocked contents at
+//!   the same 8192 record block target.
+//!
+//! # POSTINGS is rebuilt, never merged (ADR-0049 decision 6, issue #509)
+//!
+//! A POSTINGS posting list holds *block indices*, and the merge re-blocks every
+//! record, so an input's block indices describe nothing in the output. Nothing
+//! from an input's POSTINGS section is ever copied, concatenated, or shifted
+//! into the output: the output's postings are built by the writer from the
+//! output's own blocks, exactly like `FIELD_DIR`, `SKIP_IDX`, and `BLOOM`.
+//!
+//! Two consequences follow from rebuilding on the merged object:
+//!
+//! - The per-field distinct-value cap (`RlogConfig::postings_max_distinct`)
+//!   applies to the *merged* object. A merged object can exceed it while no
+//!   single input does, exactly as the 1000-dynamic-column cap already behaves
+//!   on merge. When it fires the field is simply not indexed in the output, and
+//!   results do not change: POSTINGS pruning is widen-only (ADR-0013), so an
+//!   unindexed field prunes nothing and the field stays queryable through
+//!   `BLOOM` plus the exact scan.
+//! - The output's *indexed-field list* is recovered from the inputs
+//!   ([`RlogCodec::load_input_catalog`]), because per-tenant configuration of
+//!   that list is issue #511 and does not exist yet. See
+//!   [`input_indexed_fields`] for what is recovered and how.
 //!
 //! # Reuse, not reimplementation
 //!
@@ -48,10 +70,12 @@
 //! reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue of
 //! `ravel_segment::open_from_suffix` and closes that raw-bytes gap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ravel_commit::keys;
+use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SuffixOutcome, kind};
+use ravel_logseg::postings::PostingsSection;
 use ravel_logseg::{
     AttrValue, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter, decode_section,
     writer::ObjectIdentity,
@@ -71,16 +95,35 @@ use crate::read::InputRecord;
 /// the log analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`].
 pub const OUTPUT_FORMAT_VERSION: u32 = 2;
 
-/// One RLOG input's retained catalog metadata: the data-object key and a
-/// [`RlogRangeReader`] over its directories (STREAM_DIR, FIELD_DIR, SKIP_IDX).
-/// This is all the read side retains; the block/bloom bytes are fetched by
-/// range one stream at a time during the merge (issue #275, docs/log-segment-format.md,
-/// this module's memory note). The untrusted-input caps on the directory
-/// sections live inside the ranged reader.
+/// Untrusted-input cap on an input's FIELD_DIR entry count for the compactor's
+/// own decode of that section (the indexed-field recovery below needs the
+/// `column_id` -> name mapping). Same value as `ravel_logseg`'s internal
+/// `MAX_FIELDS`, which is not exported; a real object holds at most
+/// `RlogConfig::max_dynamic_columns` (1000) entries, so this is a sanity
+/// ceiling, not a policy.
+const MAX_FIELD_DIR_ENTRIES: u64 = 1 << 20;
+
+/// The term a [`PostingsSection::probe`] uses purely to ask "is this column
+/// indexed in this object?". Empty bytes sort at or before every real term, so
+/// the probe is answered from the sparse index without decompressing a term
+/// block (unless the field genuinely holds an empty-string term, in which case
+/// one block decodes). Only the `Option` is read, never the block list.
+const INDEXED_PROBE_TERM: &[u8] = &[];
+
+/// One RLOG input's retained catalog metadata: the data-object key, a
+/// [`RlogRangeReader`] over its directories (STREAM_DIR, FIELD_DIR, SKIP_IDX),
+/// and the input's indexed-field names. This is all the read side retains; the
+/// block/bloom bytes are fetched by range one stream at a time during the merge
+/// (issue #275, docs/log-segment-format.md, this module's memory note). The
+/// untrusted-input caps on the directory sections live inside the ranged reader.
 #[derive(Debug, Clone)]
 pub struct RlogInputCatalog {
     pub object_key: String,
     pub reader: RlogRangeReader,
+    /// The dynamic attribute names this input carries a POSTINGS entry for, as
+    /// recovered by [`input_indexed_fields`]. Only the *names* survive into the
+    /// merge; no posting list from an input is ever read (ADR-0049 decision 6).
+    pub indexed_fields: Vec<String>,
 }
 
 /// The logs codec: implements the [`SegmentCodec`] seam for `.rlog` objects.
@@ -130,9 +173,20 @@ impl SegmentCodec for RlogCodec {
         let field_dir_raw = fetch_section(store, &object_key, &ftr, kind::FIELD_DIR, &cfg).await?;
         let skip_idx_raw = fetch_section(store, &object_key, &ftr, kind::SKIP_IDX, &cfg).await?;
 
+        // Which fields this input had indexed. Recovered here, while the
+        // object's footer and FIELD_DIR bytes are already at hand, and reduced
+        // immediately to a name list: the POSTINGS bytes themselves are dropped
+        // before this function returns and never take part in the merge.
+        let indexed_fields =
+            input_indexed_fields(store, &object_key, &ftr, &field_dir_raw, &cfg).await?;
+
         let reader =
             RlogRangeReader::from_sections(&ftr, &stream_dir_raw, &field_dir_raw, &skip_idx_raw)?;
-        Ok(RlogInputCatalog { object_key, reader })
+        Ok(RlogInputCatalog {
+            object_key,
+            reader,
+            indexed_fields,
+        })
     }
 
     async fn build_parts(
@@ -179,6 +233,10 @@ impl SegmentCodec for RlogCodec {
         // time in gather_stream below, so raw resident bytes stay bounded to one
         // stream, never the whole bucket (issue #275).
         let identity = compactor_identity(bucket, config);
+        // The output's indexed-field list: the union of the inputs' (issue #509,
+        // and see `input_indexed_fields`). Every part of this compaction gets
+        // the same list, so a field is indexed uniformly across the output.
+        let indexed_fields = merged_indexed_fields(catalogs);
         let mut parts = Vec::new();
         let mut part_index: u32 = 0;
         let mut batch: Vec<LogRecord> = Vec::new();
@@ -209,6 +267,7 @@ impl SegmentCodec for RlogCodec {
                     input_set_hash,
                     part_index,
                     std::mem::take(&mut batch),
+                    &indexed_fields,
                     config.dry_run,
                 )
                 .await?;
@@ -225,6 +284,7 @@ impl SegmentCodec for RlogCodec {
                 input_set_hash,
                 part_index,
                 batch,
+                &indexed_fields,
                 config.dry_run,
             )
             .await?;
@@ -264,10 +324,19 @@ async fn gather_stream(
 }
 
 /// Build one L1 part from an accumulated record batch: encode it through the
-/// shared writer pipeline via [`RlogWriter::finish_compacted`] (stamping
-/// `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
+/// shared writer pipeline via [`RlogWriter::finish_compacted_with_stats`]
+/// (stamping `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
 /// `CreateIfAbsent`. The part's summary stats are read back from the produced
 /// object's own footer, so they describe exactly what was written.
+///
+/// `indexed_fields` is handed to the same [`RlogWriter::with_indexed_fields`]
+/// the L0 write path uses, so this part's POSTINGS is built by the one writer
+/// implementation from this part's own blocks (ADR-0049 decision 6, issue #509).
+/// The per-field distinct-value cap therefore applies to the merged part; when
+/// it fires the writer drops that field's postings and reports it in
+/// `WriteStats`, which is logged here because a silently unindexed field is
+/// invisible in the object bytes (they are simply absent, which is always
+/// legal).
 #[allow(clippy::too_many_arguments)]
 async fn flush_part(
     store: &dyn ObjectStoreBackend,
@@ -276,15 +345,25 @@ async fn flush_part(
     input_set_hash: &[u8; 32],
     part_index: u32,
     batch: Vec<LogRecord>,
+    indexed_fields: &[String],
     dry_run: bool,
 ) -> Result<BuiltPart> {
     let (first_stream_id, last_stream_id) = stream_id_bounds(&batch);
 
-    let mut writer = RlogWriter::new(RlogConfig::default(), *identity);
+    let mut writer = RlogWriter::new(RlogConfig::default(), *identity)
+        .with_indexed_fields(indexed_fields.to_vec());
     for r in batch {
         writer.push(r)?;
     }
-    let object = writer.finish_compacted(1, input_set_hash.to_vec(), part_index)?;
+    let (object, stats) =
+        writer.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?;
+    if stats.postings_capped_fields > 0 {
+        tracing::warn!(
+            part_index,
+            capped_fields = stats.postings_capped_fields,
+            "rlog compaction dropped POSTINGS for fields over the distinct-value cap in the merged part"
+        );
+    }
     let object = bytes::Bytes::from(object);
 
     // Authoritative summary from the object we just wrote.
@@ -385,6 +464,96 @@ fn attr_value_estimate(v: &AttrValue) -> u64 {
     }
 }
 
+/// The dynamic attribute names one input object carries POSTINGS for.
+///
+/// # Why the inputs are the source (issue #509 deliverable 3)
+///
+/// ADR-0049 decision 3 makes the indexed-field list explicit per-tenant
+/// configuration, and that configuration is issue #511: it is not on main, so
+/// the compactor has no tenant-scoped list to read and must not invent one.
+/// What it does have is the inputs, each of which already records the decision
+/// its writer was configured with. So the output indexes what its inputs
+/// indexed: the same field list, applied to the merged blocks.
+///
+/// Recovery goes through the public reader surface, never a second parser: the
+/// POSTINGS section is fetched by range, crc-verified and parsed by
+/// [`PostingsSection::parse`], and each of the input's FIELD_DIR columns is
+/// probed with [`INDEXED_PROBE_TERM`]. `Ok(Some(_))` means that column has a
+/// POSTINGS entry, so its name was in the writer's list. Only the name is kept;
+/// the section bytes and every posting list in them are dropped here.
+///
+/// Two known edges, both benign and both widen-only:
+///
+/// - A field the writer indexed but that hit the distinct-value cap in *this*
+///   input reads back as `Ok(None)` ([`PostingsSection::probe`] cannot
+///   distinguish "capped" from "never indexed"), so its name is not recovered.
+///   The merged object holds a superset of that input's values for the field, so
+///   it would exceed the same cap anyway and the field would be dropped from the
+///   output either way; the only difference is a `Capped` marker entry versus no
+///   entry, and both read back as "not indexed".
+/// - A field whose name is in the writer's list but which never appeared in this
+///   input (or overflowed the 1000-dynamic-column budget) has no column and so
+///   no name to recover. Also legal: an unindexed field prunes nothing.
+///
+/// A corrupt POSTINGS section is a loud error, matching how FIELD_DIR is decoded
+/// (and validated) above even though the merge rebuilds it: a query can degrade
+/// past corruption because absence is legal, but a compactor rewriting the
+/// object should not quietly bake a corrupt input's damage into the output.
+///
+/// Issue #511 replaces this whole function with a read of the tenant's
+/// configured list. That changes behaviour in two ways the inputs cannot express:
+/// a newly configured field becomes indexed at the next compaction even though
+/// no input indexed it, and a de-configured field stops being indexed even
+/// though its inputs still carry postings.
+async fn input_indexed_fields(
+    store: &dyn ObjectStoreBackend,
+    object_key: &str,
+    ftr: &footer::LogFooter,
+    field_dir_raw: &[u8],
+    cfg: &RlogConfig,
+) -> Result<Vec<String>> {
+    // POSTINGS is optional (ADR-0049 decision 5): no section means the input
+    // indexed nothing, so there is nothing to carry forward.
+    let Some(desc) = ftr.section(kind::POSTINGS) else {
+        return Ok(Vec::new());
+    };
+    let got = store
+        .get(
+            object_key,
+            GetRange::Range(desc.offset, desc.offset + desc.len),
+        )
+        .await?;
+    let raw = decode_section(got.data.as_ref(), desc, cfg)?;
+    let section = PostingsSection::parse(&raw)?;
+    let field_dir = FieldDir::decode(field_dir_raw, MAX_FIELD_DIR_ENTRIES)?;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for entry in field_dir.entries() {
+        if section
+            .probe(entry.column_id, INDEXED_PROBE_TERM)?
+            .is_some()
+        {
+            names.insert(entry.name.clone());
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// The output's indexed-field list: the union of the inputs' recovered lists,
+/// sorted and deduplicated. Union, not intersection: a field indexed by one
+/// input stays indexed in the output, and indexing a field no other input
+/// indexed is never wrong (its postings are built from the merged blocks like
+/// any other field's). Deterministic ordering keeps identical inputs producing
+/// byte-identical output.
+fn merged_indexed_fields(catalogs: &[RlogInputCatalog]) -> Vec<String> {
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for catalog in catalogs {
+        for name in &catalog.indexed_fields {
+            names.insert(name.as_str());
+        }
+    }
+    names.into_iter().map(str::to_string).collect()
+}
+
 /// Fetch one required whole-read section by range and return its decompressed,
 /// crc-verified bytes. Fetches exactly `[offset, offset + len)` (the section's
 /// stored bytes), never the whole object.
@@ -417,6 +586,8 @@ mod tests {
     use prost::Message;
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_logseg::field_dir::FieldDir;
+    use ravel_logseg::record::FieldType;
+    use ravel_logseg::skip_index::SkipIndex;
     use ravel_logseg::{FieldSel, RlogConfig, RlogReader, RlogWriter, footer, read_section};
     use ravel_logseg::{LogRecord, Predicate, stream_attrs_bytes, writer::ObjectIdentity};
     use ravel_object_store::memory::MemoryStore;
@@ -491,6 +662,21 @@ mod tests {
         seq: u64,
         records: &[LogRecord],
     ) -> Bytes {
+        seed_l0(store, writer_id, seq, records, RlogConfig::default(), &[]).await
+    }
+
+    /// [`seed`] with the L0 writer's config and POSTINGS field list under test
+    /// control: `cfg` so an input can be blocked differently from the 8192-record
+    /// output (the compactor always writes with `RlogConfig::default()`), and
+    /// `indexed` so an input carries POSTINGS at all.
+    async fn seed_l0(
+        store: &dyn ObjectStoreBackend,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+        cfg: RlogConfig,
+        indexed: &[&str],
+    ) -> Bytes {
         let th = tenant_hash();
         let identity = ObjectIdentity {
             tenant_hash: th.0,
@@ -499,7 +685,8 @@ mod tests {
             writer_epoch: EPOCH,
             writer_seq: seq,
         };
-        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        let mut w = RlogWriter::new(cfg, identity)
+            .with_indexed_fields(indexed.iter().map(|s| (*s).to_string()).collect());
         for r in records {
             w.push(r.clone()).expect("push");
         }
@@ -642,6 +829,491 @@ mod tests {
         let raw =
             read_section(bytes, ftr.section(kind::FIELD_DIR).unwrap(), &cfg).expect("section");
         FieldDir::decode(&raw, MAX_FIELDS).expect("decode").len()
+    }
+
+    // --- POSTINGS rebuild helpers (ADR-0049 decision 6, issue #509) ----------
+
+    /// The block index of every record of an RLOG object, in stored order,
+    /// taken from the object's own SKIP_IDX record counts. This is the ground
+    /// truth POSTINGS must agree with, derived without reading POSTINGS.
+    fn row_block_indices(bytes: &[u8]) -> Vec<u32> {
+        let cfg = RlogConfig::default();
+        let ftr = footer::open(bytes).expect("open");
+        let raw =
+            read_section(bytes, ftr.section(kind::SKIP_IDX).unwrap(), &cfg).expect("skip section");
+        let skip = SkipIndex::decode(&raw, 1 << 24).expect("decode skip");
+        let mut out = Vec::new();
+        for (i, entry) in skip.l0.iter().enumerate() {
+            for _ in 0..entry.record_count {
+                out.push(i as u32);
+            }
+        }
+        out
+    }
+
+    /// The blocks of `bytes` that really hold a row with the string attribute
+    /// `name` = `value`, computed from the decoded records plus the object's own
+    /// block framing. Never consults POSTINGS, so it is a valid oracle for it.
+    fn true_blocks_for(bytes: &[u8], name: &str, value: &str) -> BTreeSet<u32> {
+        let rows = decode_all(bytes);
+        let blocks = row_block_indices(bytes);
+        assert_eq!(
+            rows.len(),
+            blocks.len(),
+            "SKIP_IDX record counts must cover exactly the decoded rows"
+        );
+        rows.iter()
+            .zip(blocks)
+            .filter(|(r, _)| {
+                r.attrs
+                    .iter()
+                    .any(|(k, v)| k == name && matches!(v, AttrValue::Str(s) if s == value))
+            })
+            .map(|(_, b)| b)
+            .collect()
+    }
+
+    /// The POSTINGS posting list for a string attribute term of an object:
+    /// `None` when the field carries no postings there (never indexed, or
+    /// dropped for exceeding the distinct-value cap).
+    fn postings_probe(bytes: &[u8], name: &str, value: &str) -> Option<BTreeSet<u32>> {
+        let cfg = RlogConfig::default();
+        let ftr = footer::open(bytes).expect("open");
+        let desc = ftr
+            .section(kind::POSTINGS)
+            .expect("object must carry a POSTINGS section");
+        let raw = read_section(bytes, desc, &cfg).expect("postings section");
+        let section = PostingsSection::parse(&raw).expect("parse postings");
+        let fd_raw =
+            read_section(bytes, ftr.section(kind::FIELD_DIR).unwrap(), &cfg).expect("field_dir");
+        let fd = FieldDir::decode(&fd_raw, MAX_FIELDS).expect("decode field_dir");
+        let cid = fd
+            .column(name, FieldType::Str)
+            .expect("indexed column present in FIELD_DIR")
+            .column_id;
+        section
+            .probe(cid, value.as_bytes())
+            .expect("probe")
+            .map(|blocks| blocks.into_iter().collect())
+    }
+
+    /// A record on stream 0 with one `svc` string attribute.
+    fn svc_record(ts: i64, svc: &str) -> LogRecord {
+        record(
+            0,
+            ts,
+            "log line",
+            vec![("svc".into(), AttrValue::Str(svc.into()))],
+        )
+    }
+
+    /// The two-input corpus behind the postings-rebuild tests. The inputs
+    /// interleave in `ts` (A even, B odd) and are each written with 1000-record
+    /// blocks, while the compactor writes the merged object with the default
+    /// 8192-record blocks. So merged row index equals `ts`, the output has two
+    /// blocks (0: ts 0..8192, 1: ts 8192..8600), and no input's block index for
+    /// any term matches the output's -- a copied, concatenated, or offset-shifted
+    /// posting list cannot accidentally be right.
+    ///
+    /// Terms, and where they land:
+    ///
+    /// | term        | in A            | in B            | in the merged output |
+    /// |-------------|-----------------|-----------------|----------------------|
+    /// | `cross`     | ts 6000, blk 3  | ts 201, blk 0   | rows 6000/201, blk 0 |
+    /// | `tail_only` | ts 8580, blk 4  | absent          | row 8580, blk 1      |
+    /// | `both_tail` | ts 8300, blk 4  | ts 8301, blk 4  | rows 8300/8301, blk 1|
+    fn interleaved_corpus() -> (Vec<LogRecord>, Vec<LogRecord>) {
+        let a: Vec<LogRecord> = (0..4300i64)
+            .map(|i| {
+                let ts = i * 2;
+                let svc = match ts {
+                    6000 => "cross",
+                    8580 => "tail_only",
+                    8300 => "both_tail",
+                    _ => "bulk",
+                };
+                svc_record(ts, svc)
+            })
+            .collect();
+        let b: Vec<LogRecord> = (0..4300i64)
+            .map(|i| {
+                let ts = i * 2 + 1;
+                let svc = match ts {
+                    201 => "cross",
+                    8301 => "both_tail",
+                    _ => "bulk",
+                };
+                svc_record(ts, svc)
+            })
+            .collect();
+        (a, b)
+    }
+
+    /// L0 writer config for the corpus above: 1000-record blocks, so the inputs
+    /// are blocked differently from the output.
+    fn l0_blocked_cfg() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 1000,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Seeds [`interleaved_corpus`] as two L0 inputs indexing `svc`, compacts,
+    /// and returns the input bytes and the single L1 part.
+    async fn compact_interleaved_corpus(store: &MemoryStore) -> (Bytes, Bytes, Bytes) {
+        let (a, b) = interleaved_corpus();
+        let a_bytes = seed_l0(store, Uuid::from_u128(1), 1, &a, l0_blocked_cfg(), &["svc"]).await;
+        let b_bytes = seed_l0(store, Uuid::from_u128(2), 2, &b, l0_blocked_cfg(), &["svc"]).await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, mut parts) = read_output(store).await;
+        assert_eq!(parts.len(), 1, "one stream never straddles parts");
+        (a_bytes, b_bytes, parts.remove(0))
+    }
+
+    /// Every record matching `pred` in `objects`, as a canonical multiset.
+    fn scan_all(objects: &[&Bytes], pred: &Predicate) -> Vec<Canon> {
+        let cfg = RlogConfig::default();
+        let mut rows: Vec<LogRecord> = Vec::new();
+        for obj in objects {
+            let reader = RlogReader::new(obj, &cfg).expect("open");
+            let (got, _) = reader.scan(pred).expect("scan");
+            rows.extend(got);
+        }
+        canon_multiset(&rows)
+    }
+
+    fn svc_equals(value: &str) -> Predicate {
+        Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str(value.into()),
+        }
+    }
+
+    /// The acceptance test for issue #509. POSTINGS in an L1 part is rebuilt
+    /// from the merged, re-blocked records: every term's posting list names the
+    /// output's own block indices (checked against an oracle derived from the
+    /// output's decoded rows and its own SKIP_IDX, never from POSTINGS), and a
+    /// query over the L1 part returns exactly the records the same query returns
+    /// over its inputs.
+    #[tokio::test]
+    async fn compaction_rebuilds_postings_from_merged_blocks() {
+        let store = MemoryStore::new();
+        let (a_bytes, b_bytes, l1) = compact_interleaved_corpus(&store).await;
+
+        // The output is re-blocked: two 8192-record-target blocks, not the
+        // inputs' five 1000-record blocks each.
+        let out_blocks = row_block_indices(&l1);
+        assert_eq!(
+            out_blocks.len(),
+            8600,
+            "every input record is in the output"
+        );
+        let block_count = footer::open(&l1).expect("open l1").block_count;
+        assert_eq!(block_count, 2, "8600 records at 8192 per block");
+
+        // Every term's posting list is exactly the set of output blocks that
+        // really hold it. This is the property that fails for a copied,
+        // concatenated, or offset-shifted list.
+        for term in ["bulk", "cross", "tail_only", "both_tail"] {
+            let want = true_blocks_for(&l1, "svc", term);
+            assert!(
+                !want.is_empty(),
+                "term {term} must be present in the output"
+            );
+            assert_eq!(
+                postings_probe(&l1, "svc", term),
+                Some(want.clone()),
+                "posting list for {term} must name the output's own blocks"
+            );
+            for &b in &want {
+                assert!(
+                    u64::from(b) < block_count,
+                    "block index {b} for {term} is not a block of this object"
+                );
+            }
+        }
+
+        // Concretely: `tail_only` sits in the output's block 1 but in its input's
+        // block 4, so the output's list cannot have come from the input's.
+        assert_eq!(
+            postings_probe(&l1, "svc", "tail_only"),
+            Some(BTreeSet::from([1])),
+            "tail_only is in the output's second block"
+        );
+        assert_eq!(
+            postings_probe(&a_bytes, "svc", "tail_only"),
+            Some(BTreeSet::from([4])),
+            "tail_only was in its input's fifth block"
+        );
+
+        // The query differential: for every term, the L1 part answers exactly
+        // what its inputs answer, and the postings-pruned path is the one
+        // serving it.
+        for term in ["bulk", "cross", "tail_only", "both_tail"] {
+            let pred = svc_equals(term);
+            let from_l1 = scan_all(&[&l1], &pred);
+            let from_inputs = scan_all(&[&a_bytes, &b_bytes], &pred);
+            assert!(!from_l1.is_empty(), "term {term} must match some record");
+            assert_eq!(
+                from_l1, from_inputs,
+                "query on svc = {term} must return the same records over the L1 part as over its inputs"
+            );
+        }
+
+        // Pruning really happens through POSTINGS, and soundly: `tail_only`
+        // lives only in block 1, so the exact posting list prunes block 0 that
+        // the skip index alone keeps.
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&l1, &cfg).expect("open l1");
+        let (rows, stats) = reader.scan(&svc_equals("tail_only")).expect("scan");
+        assert_eq!(rows.len(), 1);
+        assert!(!stats.postings_degraded, "POSTINGS must parse, not degrade");
+        assert_eq!(stats.blocks_total, 2);
+        assert_eq!(stats.blocks_after_skip, 2, "no ts predicate to prune with");
+        assert_eq!(
+            stats.blocks_after_postings, 1,
+            "the rebuilt postings prune the block that cannot hold the term"
+        );
+    }
+
+    /// A term carried by two inputs at *different* block indices resolves to the
+    /// output's own blocks, never to the union or concatenation of the inputs'.
+    /// This is the test that catches a concatenated posting list.
+    #[tokio::test]
+    async fn postings_term_in_two_inputs_at_different_blocks_never_concatenated() {
+        let store = MemoryStore::new();
+        let (a_bytes, b_bytes, l1) = compact_interleaved_corpus(&store).await;
+
+        // `cross` is in input A's block 3 and input B's block 0.
+        let in_a = postings_probe(&a_bytes, "svc", "cross").expect("indexed in A");
+        let in_b = postings_probe(&b_bytes, "svc", "cross").expect("indexed in B");
+        assert_eq!(in_a, BTreeSet::from([3]));
+        assert_eq!(in_b, BTreeSet::from([0]));
+        assert_ne!(in_a, in_b, "the inputs must disagree for this test to bite");
+
+        // In the merged object both occurrences are in block 0.
+        let out = postings_probe(&l1, "svc", "cross").expect("indexed in the output");
+        assert_eq!(out, true_blocks_for(&l1, "svc", "cross"));
+        assert_eq!(out, BTreeSet::from([0]));
+
+        // Not the union (which would carry the phantom block 3), and not a
+        // shift-and-concatenate (which would carry 3 and 5).
+        let union: BTreeSet<u32> = in_a.union(&in_b).copied().collect();
+        assert_ne!(out, union, "a concatenated list would include block 3");
+        assert!(
+            !out.contains(&3),
+            "block 3 does not exist in the output ({} blocks)",
+            footer::open(&l1).expect("open").block_count
+        );
+
+        // Same for a term both inputs hold in their *last* block: the output
+        // holds it in block 1, and every matching record is still returned.
+        let both_tail = postings_probe(&l1, "svc", "both_tail").expect("indexed");
+        assert_eq!(both_tail, BTreeSet::from([1]));
+        assert_eq!(
+            postings_probe(&a_bytes, "svc", "both_tail"),
+            Some(BTreeSet::from([4]))
+        );
+        assert_eq!(
+            postings_probe(&b_bytes, "svc", "both_tail"),
+            Some(BTreeSet::from([4]))
+        );
+        let pred = svc_equals("both_tail");
+        assert_eq!(
+            scan_all(&[&l1], &pred),
+            scan_all(&[&a_bytes, &b_bytes], &pred),
+            "both occurrences must still be found in the output"
+        );
+        assert_eq!(scan_all(&[&l1], &pred).len(), 2);
+    }
+
+    /// The per-field distinct-value cap applies to the MERGED object: a field
+    /// under the cap in every single input can exceed it once merged, exactly as
+    /// the 1000-dynamic-column cap already behaves on merge. The field is then
+    /// not indexed in the output, and the output stays correct because POSTINGS
+    /// pruning is widen-only (ADR-0013): an unindexed field prunes nothing.
+    #[tokio::test]
+    async fn postings_distinct_value_cap_applies_to_merged_object() {
+        let cap = RlogConfig::default().postings_max_distinct; // 10_000
+        let per_input = cap / 2 + 1000; // 6000: under the cap alone, over it merged
+        let store = MemoryStore::new();
+
+        let mk = |prefix: char, odd: i64| -> Vec<LogRecord> {
+            (0..per_input as i64)
+                .map(|i| {
+                    record(
+                        0,
+                        i * 2 + odd,
+                        "log line",
+                        vec![("reqid".into(), AttrValue::Str(format!("{prefix}{i:05}")))],
+                    )
+                })
+                .collect()
+        };
+        let a = mk('r', 0);
+        let b = mk('q', 1);
+        let a_bytes = seed_l0(
+            &store,
+            Uuid::from_u128(1),
+            1,
+            &a,
+            RlogConfig::default(),
+            &["reqid"],
+        )
+        .await;
+        let b_bytes = seed_l0(
+            &store,
+            Uuid::from_u128(2),
+            2,
+            &b,
+            RlogConfig::default(),
+            &["reqid"],
+        )
+        .await;
+
+        // Every single input is under the cap, so each has real postings.
+        assert!(per_input <= cap);
+        assert!(
+            postings_probe(&a_bytes, "reqid", "r00042").is_some(),
+            "input A is under the cap, so reqid is indexed there"
+        );
+        assert!(
+            postings_probe(&b_bytes, "reqid", "q00042").is_some(),
+            "input B is under the cap, so reqid is indexed there"
+        );
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        let l1 = &parts[0];
+
+        // The merged object holds 12000 distinct values, over the cap, so the
+        // field is dropped from the output's POSTINGS: it reads back as "not
+        // indexed", never as a narrowed or empty posting list.
+        assert!(2 * per_input > cap, "the merged object must exceed the cap");
+        assert_eq!(
+            postings_probe(l1, "reqid", "r00042"),
+            None,
+            "a field over the cap in the merged object must not be indexed"
+        );
+        assert_eq!(postings_probe(l1, "reqid", "q00042"), None);
+
+        // And the output is still correct: a query on the unindexed field
+        // returns every matching record, identical to the same query over the
+        // inputs, with no postings pruning applied at all (widen-only).
+        let cfg = RlogConfig::default();
+        for term in ["r00042", "q00777"] {
+            let pred = Predicate::Equals {
+                field: FieldSel::Attr("reqid".into()),
+                value: AttrValue::Str(term.into()),
+            };
+            let reader = RlogReader::new(l1, &cfg).expect("open l1");
+            let (rows, stats) = reader.scan(&pred).expect("scan");
+            assert_eq!(rows.len(), 1, "reqid = {term} must still be found");
+            assert!(!stats.postings_degraded, "capping is not a parse failure");
+            assert_eq!(
+                stats.blocks_after_postings, stats.blocks_after_skip,
+                "an unindexed field prunes nothing"
+            );
+            assert_eq!(
+                scan_all(&[l1], &pred),
+                scan_all(&[&a_bytes, &b_bytes], &pred),
+                "the same query over the inputs returns the same records"
+            );
+        }
+
+        // No record was lost while the index was dropped.
+        assert_eq!(decode_all(l1).len(), 2 * per_input);
+    }
+
+    /// The output's indexed-field list is the union of its inputs' (issue #509
+    /// deliverable 3, until issue #511 makes it per-tenant configuration): a
+    /// field one input indexed is indexed in the output even when another input
+    /// indexed nothing, and an object whose inputs indexed nothing gets no
+    /// POSTINGS section at all.
+    #[tokio::test]
+    async fn output_indexed_field_list_is_the_union_of_its_inputs() {
+        let store = MemoryStore::new();
+        let a: Vec<LogRecord> = (0..4i64).map(|i| svc_record(i * 2, "alpha")).collect();
+        let b: Vec<LogRecord> = (0..4i64).map(|i| svc_record(i * 2 + 1, "beta")).collect();
+        seed_l0(
+            &store,
+            Uuid::from_u128(1),
+            1,
+            &a,
+            RlogConfig::default(),
+            &["svc"],
+        )
+        .await;
+        // Input B indexes nothing at all: no POSTINGS section.
+        let b_bytes = seed_l0(
+            &store,
+            Uuid::from_u128(2),
+            2,
+            &b,
+            RlogConfig::default(),
+            &[],
+        )
+        .await;
+        assert!(
+            footer::open(&b_bytes)
+                .expect("open")
+                .section(kind::POSTINGS)
+                .is_none(),
+            "input B must carry no POSTINGS"
+        );
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+
+        // svc is indexed in the output, and covers B's records too: B's "beta"
+        // is in the output's postings even though B had no postings of its own.
+        assert_eq!(
+            postings_probe(&parts[0], "svc", "alpha"),
+            Some(true_blocks_for(&parts[0], "svc", "alpha"))
+        );
+        assert_eq!(
+            postings_probe(&parts[0], "svc", "beta"),
+            Some(true_blocks_for(&parts[0], "svc", "beta")),
+            "the rebuilt postings cover every merged record, not only the indexed input's"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_input_postings_means_no_output_postings() {
+        // Neither input indexes a field, so the output has no POSTINGS section:
+        // the compactor invents no indexed-field list of its own (absence is
+        // always legal, ADR-0049 decision 5).
+        let store = MemoryStore::new();
+        let a = vec![svc_record(1, "alpha")];
+        let b = vec![svc_record(2, "beta")];
+        seed(&store, Uuid::from_u128(1), 1, &a).await;
+        seed(&store, Uuid::from_u128(2), 2, &b).await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        assert!(
+            footer::open(&parts[0])
+                .expect("open l1")
+                .section(kind::POSTINGS)
+                .is_none(),
+            "no input indexed anything, so the output indexes nothing"
+        );
     }
 
     #[tokio::test]
