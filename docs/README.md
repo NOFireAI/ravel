@@ -53,8 +53,8 @@ code, not only to use it.
   what Ravel actually promises.
 - [catalog-and-mvcc.md](catalog-and-mvcc.md): object key layout, the commit
   protocol, commit tokens, and snapshot resolution.
-- [segment-format.md](segment-format.md): the RSEG v5 on-object-store binary
-  format (the only supported version pre-release, ADR-0027).
+- [segment-format.md](segment-format.md): the RSEG v6 on-object-store binary
+  format (the only supported version pre-release, ADR-0027 and ADR-0047).
 - [log-segment-format.md](log-segment-format.md): the RLOG v1 on-object-store
   binary format for logs (ADR-0029).
 - [object-store-contract.md](object-store-contract.md): the

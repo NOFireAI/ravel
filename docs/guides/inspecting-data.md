@@ -55,7 +55,8 @@ key to feed into `segment inspect` or `commit decode`.
 
 ![RSEG layout](../diagrams/rseg-layout.svg)
 
-Every segment is RSEG v5 (ADR-0027 left it the only version). The command is:
+Every segment is RSEG v6. ADR-0027 leaves one supported version at a time,
+and ADR-0047 moved it from v5 to v6. The command is:
 
 ```sh
 cargo run -p ravel-cli -- segment inspect \
@@ -65,7 +66,7 @@ cargo run -p ravel-cli -- segment inspect \
 ```
 total_size: 949
 trailer_offset: 933
-version: 5
+version: 6
 footer_offset: 699
 tenant_hash: c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5
 shard: 5
@@ -134,6 +135,12 @@ Field by field:
   `SERIES_META`: the sparse catalog. `VAL_PAGES` is absent when no series
   is scalar, and `HIST_PAGES` when none is a histogram. `comp` is the raw wire
   integer (`0` none, `1` lz4, `2` zstd).
+
+  `kind=10` `EXEMPLARS` holds the exemplars that samples in this object
+  carried. The section is present only when at least one sample carried
+  one. The example above shows no `kind=10` line, because its samples
+  carried none. An absent `EXEMPLARS` section is normal and is not an
+  error.
 - `schema_count (derived)` / `schema[N]:`: SERIES_META groups series by
   distinct label-*name* set (a "schema"). Each line lists that schema's
   names, resolved through `LABEL_DICT`. `ravel-cli` derives this from the

@@ -42,8 +42,8 @@ commit crates match this sequence end to end against MinIO/S3).
 
 ## rseg-layout.svg
 
-The byte layout of an RSEG v5 object (the only supported version,
-ADR-0027). The main drawing is the v5 layout: LABEL_DICT and SERIES_IDS,
+The byte layout of an RSEG v6 object (the only supported version,
+ADR-0027 and ADR-0047). The main drawing is the v6 layout: LABEL_DICT and SERIES_IDS,
 the run-major SERIES_META catalog (or, at/above the 4096-series threshold,
 the sparse SERIES_IDX kind 8 + chunked SERIES_META_CHUNKS kind 9 pair),
 the TS_PAGES / VAL_PAGES / HIST_PAGES containers with per-page headers

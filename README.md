@@ -291,10 +291,10 @@ Pull the published image, or build natively on an amd64 host, instead.
 ## Documentation
 
 - [docs/README.md](docs/README.md): index of every guide and spec
-- [docs/segment-format.md](docs/segment-format.md): the RSEG v5
+- [docs/segment-format.md](docs/segment-format.md): the RSEG v6
   specification (columnar catalog, native histograms, multi-run
-  compaction layout, sparse catalog), the only version Ravel reads or
-  writes pre-release (ADR-0027)
+  compaction layout, sparse catalog, exemplars), the only version Ravel
+  reads or writes pre-release (ADR-0027, ADR-0047)
 - [docs/log-segment-format.md](docs/log-segment-format.md): the RLOG v1
   specification (ADR-0029)
 - [docs/span-segment-format.md](docs/span-segment-format.md): the RSPAN
