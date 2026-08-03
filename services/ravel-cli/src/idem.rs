@@ -242,9 +242,12 @@ mod tests {
     #[tokio::test]
     async fn missing_marker_is_a_typed_error() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let err = inspect(store, "t/deadbeefdeadbeefdeadbeefdeadbeef/l/idem/none.0495972.idm")
-            .await
-            .expect_err("a missing marker must error, not print a false report");
+        let err = inspect(
+            store,
+            "t/deadbeefdeadbeefdeadbeefdeadbeef/l/idem/none.0495972.idm",
+        )
+        .await
+        .expect_err("a missing marker must error, not print a false report");
         assert!(err.to_string().contains("no marker object"), "err: {err}");
     }
 }
