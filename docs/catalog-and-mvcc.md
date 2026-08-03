@@ -12,6 +12,7 @@ t/<tenant_hash>/m/l1/<shard>/<ingest_hour>/<input_set_hash16>.<part:04>.<hash16>
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt       compaction record
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/retire.tmb                      retention tombstone
 t/<tenant_hash>/m/maint/<shard>/cursor                                    advisory scan cursor
+t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable, phase 5)
@@ -36,6 +37,16 @@ listing consistency under a fresh `run-id` each run; these objects are
 transient probe fixtures, not durable state, and carry no lifecycle
 guarantee beyond the run that created them.
 
+- `keyhash32` (idempotency marker keys only, ADR-0051 §5): 32 lowercase hex
+  chars, the first 16 bytes of `blake3("ravel-idem-v1" || tenant_id ||
+  client_key)`, where `tenant_id` is the logical tenant identifier (not
+  `tenant_hash`) and `client_key` is the caller's opaque
+  `x-ravel-idempotency-key`. The `idem/` prefix is additive: no existing
+  read, resolve, or sweep path lists it (commit resolution lists `c/…`, the
+  orphan sweep lists `l0/…`; the fail-loud unknown-key rule below applies
+  only to the `c/` prefix), and markers older than the dedup window
+  (default 24h, from the `ingest_hour` in the file name) are deleted by a
+  stateless sweep rule in `ravel-maintain`, not by this crate.
 - `input_set_hash16`: first 16 hex chars of the blake3 digest over the
   compaction record's sorted `inputs` list (canonical encoding, sorted by
   `(writer_id, writer_epoch, writer_seq)`). `hash16` on an L1 part is the
