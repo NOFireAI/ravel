@@ -13,8 +13,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, ListArray, RecordBatch,
-    StringArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
+    RecordBatch, StringArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -558,6 +559,243 @@ fn an_exemplar_with_no_timestamp_column_is_dropped_and_counted() {
 
     assert!(result.exemplars.is_empty());
     assert_eq!(dropped_counts(&result.output.rejected), vec![1]);
+}
+
+/// A field with no `encoding` metadata at all, so the `id`/`parent_id`
+/// encoding falls to its spec default: DELTA on the core id chain (of which
+/// `HISTOGRAM_DP_EXEMPLARS.id` is one).
+fn default_encoding_field(name: &str, data_type: DataType) -> Field {
+    Field::new(name, data_type, true)
+}
+
+/// A `HISTOGRAM_DP_EXEMPLARS` batch of two rows, both `parent_id = 0`, with an
+/// explicit `id` column and per-row timestamps. `id_encoding` names the field
+/// metadata for the `id` column (`None` = no metadata, so the DELTA default).
+fn exemplar_batch_with_ids(
+    ids: Vec<Option<u32>>,
+    times: Vec<i64>,
+    values: Vec<f64>,
+    id_encoding: Option<&str>,
+) -> RecordBatch {
+    let id_field = match id_encoding {
+        // Nullable field (the `id` column is optional), carrying the requested
+        // encoding metadata.
+        Some(enc) => default_encoding_field("id", DataType::UInt32).with_metadata(
+            [("encoding".to_string(), enc.to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        None => default_encoding_field("id", DataType::UInt32),
+    };
+    let schema = Schema::new(vec![
+        plain_field("parent_id", DataType::UInt32),
+        id_field,
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("double_value", DataType::Float64, true),
+    ]);
+    let n = ids.len();
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32; n])),
+            Arc::new(UInt32Array::from(ids)),
+            Arc::new(TimestampNanosecondArray::from(times)),
+            Arc::new(Float64Array::from(
+                values.into_iter().map(Some).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("build exemplar batch with ids")
+}
+
+/// A `HISTOGRAM_DP_EXEMPLAR_ATTRS` batch: one int-valued attribute per row,
+/// joined to the exemplar whose `id` equals the row's `parent_id`. `parent_id`
+/// is `plain`-encoded so the join key is literal.
+fn exemplar_attrs_batch(rows: Vec<(u32, &str, i64)>) -> RecordBatch {
+    let schema = Schema::new(vec![
+        plain_field("parent_id", DataType::UInt32),
+        Field::new("key", DataType::Utf8, false),
+        Field::new("type", DataType::UInt8, true),
+        Field::new("int", DataType::Int64, true),
+    ]);
+    let parents: Vec<u32> = rows.iter().map(|(p, _, _)| *p).collect();
+    let keys: Vec<&str> = rows.iter().map(|(_, k, _)| *k).collect();
+    let types: Vec<u8> = rows.iter().map(|_| 2u8).collect(); // ANY_VALUE_TYPE_INT
+    let ints: Vec<i64> = rows.iter().map(|(_, _, v)| *v).collect();
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(parents)),
+            Arc::new(StringArray::from(keys)),
+            Arc::new(UInt8Array::from(types)),
+            Arc::new(Int64Array::from(ints)),
+        ],
+    )
+    .expect("build exemplar attrs batch")
+}
+
+/// Return the carried exemplar (there must be exactly one) whose value matches
+/// `value`, so a test can name a specific row regardless of admission order.
+fn carried_with_value(result: &MetricsNormalizeResult, value: f64) -> &ravel_types::Exemplar {
+    let matches: Vec<_> = result
+        .exemplars
+        .iter()
+        .filter(|e| e.exemplar.value_bits == value.to_bits())
+        .collect();
+    assert_eq!(matches.len(), 1, "exactly one exemplar with value {value}");
+    &matches[0].exemplar
+}
+
+/// FINDING 1: a null `id` slot must join to no attributes. Under DELTA (the
+/// spec default for the id chain), `decode_delta_u32` carries its accumulator
+/// through a null slot, so without the validity-bit guard the second exemplar
+/// would inherit the first's id 7 and therefore its `http.status=500`. The two
+/// exemplars sit in different cap windows so both are admitted.
+#[test]
+fn a_null_id_slot_joins_to_no_attributes_under_delta_encoding() {
+    let window = ExemplarCap::DEFAULT_WINDOW_NS;
+    let base = INGEST_TS_NS - INGEST_TS_NS.rem_euclid(window);
+    let mut cap = ExemplarCap::default();
+    let result = normalize_custom(
+        vec![
+            (ArrowPayloadType::UnivariateMetrics, histogram_root_batch()),
+            (ArrowPayloadType::HistogramDataPoints, histogram_dp_batch()),
+            (
+                ArrowPayloadType::HistogramDpExemplars,
+                // Row 0: id 7, value 1.0. Row 1: null id (DELTA carries acc=7
+                // forward here), value 2.0.
+                exemplar_batch_with_ids(
+                    vec![Some(7), None],
+                    vec![base, base + window],
+                    vec![1.0, 2.0],
+                    None,
+                ),
+            ),
+            (
+                ArrowPayloadType::HistogramDpExemplarAttrs,
+                exemplar_attrs_batch(vec![(7, "http.status", 500)]),
+            ),
+        ],
+        &mut cap,
+    );
+
+    assert_eq!(result.exemplars.len(), 2);
+    // The id-7 exemplar carries the attribute.
+    assert_eq!(
+        carried_with_value(&result, 1.0).filtered_attributes,
+        vec![Label {
+            name: "http_status".to_string(),
+            value: "500".to_string(),
+        }]
+    );
+    // The null-id exemplar carries none: it declared no join key.
+    assert!(
+        carried_with_value(&result, 2.0)
+            .filtered_attributes
+            .is_empty()
+    );
+    assert!(dropped_counts(&result.output.rejected).is_empty());
+}
+
+/// FINDING 1, Plain arm: a null slot must yield "no id" here too. A Plain
+/// decode reads `values()` straight from the backing buffer and ignores the
+/// validity bitmap; arrow zero-fills a null slot, so the buggy decode reads
+/// id 0 for the null row. Row 0 declares id 0 (which has an attribute), so
+/// without the validity-bit guard the null row would inherit id 0's
+/// `http.status=500`. With the guard it joins to nothing.
+#[test]
+fn a_null_id_slot_joins_to_no_attributes_under_plain_encoding() {
+    let window = ExemplarCap::DEFAULT_WINDOW_NS;
+    let base = INGEST_TS_NS - INGEST_TS_NS.rem_euclid(window);
+    let mut cap = ExemplarCap::default();
+    let result = normalize_custom(
+        vec![
+            (ArrowPayloadType::UnivariateMetrics, histogram_root_batch()),
+            (ArrowPayloadType::HistogramDataPoints, histogram_dp_batch()),
+            (
+                ArrowPayloadType::HistogramDpExemplars,
+                // Row 0: id 0, value 1.0. Row 1: null id (Plain reads the
+                // zero-filled buffer slot as 0), value 2.0.
+                exemplar_batch_with_ids(
+                    vec![Some(0), None],
+                    vec![base, base + window],
+                    vec![1.0, 2.0],
+                    Some("plain"),
+                ),
+            ),
+            (
+                ArrowPayloadType::HistogramDpExemplarAttrs,
+                exemplar_attrs_batch(vec![(0, "http.status", 500)]),
+            ),
+        ],
+        &mut cap,
+    );
+
+    assert_eq!(result.exemplars.len(), 2);
+    // Row 0 declared id 0, so it carries the attribute.
+    assert_eq!(
+        carried_with_value(&result, 1.0).filtered_attributes,
+        vec![Label {
+            name: "http_status".to_string(),
+            value: "500".to_string(),
+        }]
+    );
+    // The null-id row declared no join key, so it carries none, even though the
+    // zero-filled buffer slot would otherwise read as id 0.
+    assert!(
+        carried_with_value(&result, 2.0)
+            .filtered_attributes
+            .is_empty()
+    );
+}
+
+/// FINDING 1, duplicate-id behavior: two rows declaring the SAME id both join
+/// to that id's attribute set. The id is the explicit join key, so a duplicate
+/// is not misattribution: each row independently resolves its own declared id,
+/// which is deterministic. Both carry `http.status=500`.
+#[test]
+fn duplicate_ids_each_join_to_that_ids_attributes() {
+    let window = ExemplarCap::DEFAULT_WINDOW_NS;
+    let base = INGEST_TS_NS - INGEST_TS_NS.rem_euclid(window);
+    let mut cap = ExemplarCap::default();
+    let result = normalize_custom(
+        vec![
+            (ArrowPayloadType::UnivariateMetrics, histogram_root_batch()),
+            (ArrowPayloadType::HistogramDataPoints, histogram_dp_batch()),
+            (
+                ArrowPayloadType::HistogramDpExemplars,
+                exemplar_batch_with_ids(
+                    vec![Some(7), Some(7)],
+                    vec![base, base + window],
+                    vec![1.0, 2.0],
+                    Some("plain"),
+                ),
+            ),
+            (
+                ArrowPayloadType::HistogramDpExemplarAttrs,
+                exemplar_attrs_batch(vec![(7, "http.status", 500)]),
+            ),
+        ],
+        &mut cap,
+    );
+
+    assert_eq!(result.exemplars.len(), 2);
+    let expected = vec![Label {
+        name: "http_status".to_string(),
+        value: "500".to_string(),
+    }];
+    assert_eq!(
+        carried_with_value(&result, 1.0).filtered_attributes,
+        expected
+    );
+    assert_eq!(
+        carried_with_value(&result, 2.0).filtered_attributes,
+        expected
+    );
 }
 
 proptest! {

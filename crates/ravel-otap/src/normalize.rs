@@ -1643,8 +1643,17 @@ fn group_exemplars_by_parent_id(
         // chain, and optional. Without it, this table's rows cannot be joined
         // to `HISTOGRAM_DP_EXEMPLAR_ATTRS`, which references that id; the
         // exemplars themselves still decode, just with no attributes.
-        let ids = column_as::<UInt32Array>(rb, "id")
-            .and_then(|ids| decode_id_column_u32(rb, "id", ids, rejected));
+        //
+        // A NULL slot in the `id` column means "this exemplar declares no id"
+        // and must join to no attributes. Neither raw decode expresses that:
+        // DELTA (`decode_delta_u32`) carries its accumulator through a null
+        // slot, so the row would inherit the previous row's id; Plain reads
+        // the null slot's raw buffer value. Both would misattribute one
+        // exemplar's attributes to another. Keep the source column so the
+        // per-row join below can force a null slot back to `None`, regardless
+        // of encoding.
+        let id_col = column_as::<UInt32Array>(rb, "id");
+        let decoded_ids = id_col.and_then(|ids| decode_id_column_u32(rb, "id", ids, rejected));
         let times = column_as::<TimestampNanosecondArray>(rb, "time_unix_nano");
         let ints = column_as::<Int64Array>(rb, "int_value");
         let doubles = column_as::<Float64Array>(rb, "double_value");
@@ -1653,7 +1662,18 @@ fn group_exemplars_by_parent_id(
 
         for (i, &parent_id) in decoded_parents.iter().enumerate() {
             grouped.entry(parent_id).or_default().push(FlatExemplar {
-                id: ids.as_ref().and_then(|ids| ids.get(i).copied()),
+                // A null `id` slot yields `None` (no join key, no attributes)
+                // under every encoding: check the source column's validity bit
+                // rather than trusting the decoded value, which for a null slot
+                // is either the carried DELTA accumulator or a stale Plain
+                // buffer value. Two exemplars declaring the SAME id both join to
+                // that id's attribute set: the id is the explicit join key, so a
+                // duplicate is not misattribution, and each row independently
+                // resolving its own declared id keeps that deterministic.
+                id: match (id_col, decoded_ids.as_ref()) {
+                    (Some(col), Some(decoded)) if !col.is_null(i) => decoded.get(i).copied(),
+                    _ => None,
+                },
                 ts_ns: times.filter(|c| !c.is_null(i)).map(|c| c.value(i)),
                 // A double wins over an int when a malformed producer sets
                 // both, matching how OTLP's exemplar carries exactly one arm
