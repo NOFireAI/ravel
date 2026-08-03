@@ -271,6 +271,26 @@ Dependent flags fail fast at startup: OIDC needs both its issuer and JWKS URL;
 `--oidc-tenant-claim`/`--oidc-audience` without OIDC, or `--mtls-header`
 without `--mtls-enabled`, refuse to start rather than silently do nothing.
 
+## Legal hold
+
+`ravel-cli hold set --tenant <id> --scope <prefix> [--reason <text>]`,
+`ravel-cli hold clear --tenant <id> --scope <prefix>`, and `ravel-cli hold
+list --tenant <id>` write and read the ADR-0040 audit records that both
+maintenance drivers check before any destructive pass (ADR-0048 decisions
+1-2). A `--signal`/`--shard` form writes all the prefixes one shard needs
+in a single command, so the documented L0-only-hold mistake isn't possible
+from the CLI.
+
+**The hold is not effective the instant the command returns.** Each
+maintenance tick refreshes its hold snapshot once, before its destructive
+pass; a hold set after that tick's refresh is not honored until the next
+one (ADR-0048 decision 1). The exposure window is one
+`--maintain-interval-secs` interval, 5 minutes by default. After placing an
+urgent hold, run `ravel-cli hold list --tenant <id>` and confirm the scope
+is present before assuming the data is protected; the `hold set` command
+returning success only means the record was written, not that a
+maintenance pass has picked it up.
+
 ## Disposability
 
 You can kill every Ravel process (any `--mode`) at any time. Correctness needs
@@ -397,6 +417,8 @@ Default alert rules:
 | Legal hold refresh failing | `increase(ravel_maintain_legal_hold_refresh_failures_total[15m]) > 0` | Every failure already skips that tenant's tick entirely (fail-closed, ADR-0048 decision 1); a sustained failure means a tenant is silently receiving no maintenance at all. |
 | Compaction conservation gate aborting | `increase(ravel_maintain_conservation_aborts_total[15m]) > 0` | Each abort means a compaction publish was refused because input and output record counts disagreed (ADR-0048 decision 6); nothing was written, but a bucket stuck retrying every tick without ever compacting needs an operator, not just a retry. |
 | Mass-orphan circuit breaker trip | `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | Fire on the **first trip**, not on a sustained condition. The trip condition can clear itself (dilution or partial restoration, see below) while the underlying record loss and the pass's withheld deletions persist; a sustained-state alert (`orphan_breaker_tripped_total` treated as a level) can clear before anyone looks. The counter only increments, so any `increase() > 0` is a real trip that happened, whether or not the shard is still tripping now. |
+| Discovered tenants not maintained | `ravel_maintain_tenants_maintained < ravel_maintain_tenants_discovered` for `10m` | A prefix under `t/` holds data with no maintaining owner, the exact `maintained < discovered` condition ADR-0048 decision 3 names, and the same S2-17/S5-09 finding recurring for a different reason (ADR-0048 Context). Ten minutes is two cycles at the default 300s `--maintain-interval-secs`, long enough that a single tick's transient gap (a restart, a tenant mid-onboarding) doesn't page, short enough that a real gap alarms within the hour. |
+| Tenant discovery failing | `increase(ravel_maintain_tenant_discovery_failures_total[5m]) > 0` | A failed `LIST t/` skips the *entire* cycle, every tenant, not just one (ADR-0048 decision 3): the supervisor deliberately never treats a failed enumeration as "no tenants" so it can't be confused with healthy idleness, but that means a sustained failure is a fully silent maintenance outage. Alarm on the first occurrence rather than waiting for a sustained window, faster than the gauge condition above, because a skipped cycle is worse than one tenant falling behind: nothing is being maintained at all. |
 
 `ravel_maintain_orphans_withheld` is a gauge, not an alert target: it
 reflects only the most recent sweep pass and drops to zero on the very
