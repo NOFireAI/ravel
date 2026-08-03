@@ -4646,6 +4646,7 @@ name = "ravel-remote-write"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hex",
  "proptest",
  "prost",
  "prost-build",

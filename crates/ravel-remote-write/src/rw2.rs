@@ -23,7 +23,8 @@ use crate::proto::write_v2::{
     BucketSpan, Histogram as ProtoHistogramV2, Request, TimeSeries as ProtoTimeSeriesV2,
 };
 use crate::resolved::{
-    ResolvedCount, ResolvedHistogram, ResolvedRequest, ResolvedSample, ResolvedSeries, ResolvedSpan,
+    ResolvedCount, ResolvedExemplar, ResolvedHistogram, ResolvedRequest, ResolvedSample,
+    ResolvedSeries, ResolvedSpan,
 };
 use crate::snappy::{self, SnappyError};
 
@@ -174,13 +175,21 @@ fn resolve_series(
         resolved_label_budget,
     )?;
 
+    let mut exemplars = Vec::with_capacity(ts.exemplars.len());
     for (exemplar_index, exemplar) in ts.exemplars.iter().enumerate() {
-        validate_exemplar_label_refs(
+        let labels = resolve_exemplar_label_refs(
             series_index,
             exemplar_index,
             &exemplar.labels_refs,
-            symbols.len(),
+            symbols,
+            resolved_label_bytes,
+            resolved_label_budget,
         )?;
+        exemplars.push(ResolvedExemplar {
+            ts_ms: exemplar.timestamp,
+            value: exemplar.value,
+            labels,
+        });
     }
 
     if let Some(meta) = &ts.metadata {
@@ -211,7 +220,6 @@ fn resolve_series(
             value: s.value,
         });
     }
-    let exemplar_count = ts.exemplars.len();
     let mut histograms = Vec::with_capacity(ts.histograms.len());
     for h in ts.histograms {
         if h.start_timestamp != 0 {
@@ -224,7 +232,7 @@ fn resolve_series(
         labels,
         samples,
         histograms,
-        exemplar_count,
+        exemplars,
     })
 }
 
@@ -326,15 +334,27 @@ fn resolve_label_refs(
     Ok(labels)
 }
 
-/// Validate one exemplar's `labels_refs` without materializing the labels:
-/// exemplars are accepted-and-dropped (ADR-0015), so only the reference
-/// shape needs checking, never the resolved strings.
-fn validate_exemplar_label_refs(
+/// Resolve one exemplar's `labels_refs` into labels, enforcing the same
+/// reference-shape rules as before ADR-0047 gave exemplars storage (even
+/// length, every index in range of `symbols`) and charging the resolved
+/// strings against the same cumulative budget series labels pay
+/// ([`Rw2DecodeError::ResolvedLabelBudgetExceeded`]): now that these strings
+/// are kept rather than discarded, an adversarial exemplar `labels_refs` list
+/// amplifies wire bytes into resident bytes exactly like a series one.
+///
+/// Unlike [`resolve_label_refs`], an empty label *name* is not rejected here.
+/// Exemplar labels are not series identity (ADR-0047 decision 1 carries them
+/// as an exemplar's filtered attributes), so an odd name cannot alias one
+/// series onto another, and rejecting a whole request over an informational
+/// attribute would be stricter than the sender's own model.
+fn resolve_exemplar_label_refs(
     series_index: usize,
     exemplar_index: usize,
     labels_refs: &[u32],
-    symbols_len: usize,
-) -> Result<(), Rw2DecodeError> {
+    symbols: &[String],
+    resolved_label_bytes: &mut usize,
+    resolved_label_budget: usize,
+) -> Result<Vec<Label>, Rw2DecodeError> {
     if !labels_refs.len().is_multiple_of(2) {
         return Err(Rw2DecodeError::OddExemplarLabelRefsLength {
             series_index,
@@ -342,18 +362,35 @@ fn validate_exemplar_label_refs(
             len: labels_refs.len(),
         });
     }
-    for (position, &symbol_ref) in labels_refs.iter().enumerate() {
-        if symbol_ref as usize >= symbols_len {
-            return Err(Rw2DecodeError::ExemplarLabelRefOutOfRange {
-                series_index,
-                exemplar_index,
-                position,
-                symbol_ref,
-                symbols_len,
+    let mut labels = Vec::with_capacity(labels_refs.len() / 2);
+    for (pair_index, pair) in labels_refs.chunks_exact(2).enumerate() {
+        let name_position = pair_index * 2;
+        let resolve = |position: usize, symbol_ref: u32| {
+            symbols
+                .get(symbol_ref as usize)
+                .ok_or(Rw2DecodeError::ExemplarLabelRefOutOfRange {
+                    series_index,
+                    exemplar_index,
+                    position,
+                    symbol_ref,
+                    symbols_len: symbols.len(),
+                })
+        };
+        let name = resolve(name_position, pair[0])?;
+        let value = resolve(name_position + 1, pair[1])?;
+        *resolved_label_bytes += name.len() + value.len();
+        if *resolved_label_bytes > resolved_label_budget {
+            return Err(Rw2DecodeError::ResolvedLabelBudgetExceeded {
+                resolved_bytes: *resolved_label_bytes,
+                budget_bytes: resolved_label_budget,
             });
         }
+        labels.push(Label {
+            name: name.clone(),
+            value: value.clone(),
+        });
     }
-    Ok(())
+    Ok(labels)
 }
 
 #[cfg(test)]
@@ -423,10 +460,11 @@ mod tests {
     }
 
     #[test]
-    /// Native histograms are materialized (durable storage since RSEG v5);
-    /// exemplars stay a tally, since ADR-0017 defers exemplar storage.
-    fn materializes_histograms_and_tallies_exemplars() {
-        let syms = symbols(&["__name__", "latency"]);
+    /// Native histograms are materialized (durable storage since RSEG v5), and
+    /// so are exemplars, whose `labels_refs` now resolve against `symbols`
+    /// into real labels rather than being validated and discarded (ADR-0047).
+    fn materializes_histograms_and_exemplars() {
+        let syms = symbols(&["__name__", "latency", "trace_id", "abcd"]);
         let req = request(
             syms,
             vec![ProtoTimeSeriesV2 {
@@ -434,7 +472,7 @@ mod tests {
                 samples: vec![],
                 histograms: vec![Default::default(), Default::default()],
                 exemplars: vec![ProtoExemplarV2 {
-                    labels_refs: vec![],
+                    labels_refs: vec![3, 4],
                     value: 1.0,
                     timestamp: 1_000,
                 }],
@@ -444,7 +482,17 @@ mod tests {
 
         let resolved = decode(&req).expect("decode");
         assert_eq!(resolved.series[0].histograms.len(), 2);
-        assert_eq!(resolved.series[0].exemplar_count, 1);
+        assert_eq!(
+            resolved.series[0].exemplars,
+            vec![ResolvedExemplar {
+                ts_ms: 1_000,
+                value: 1.0,
+                labels: vec![Label {
+                    name: "trace_id".to_string(),
+                    value: "abcd".to_string(),
+                }],
+            }]
+        );
     }
 
     /// Every histogram field reaches [`ResolvedHistogram`] unreshaped, and

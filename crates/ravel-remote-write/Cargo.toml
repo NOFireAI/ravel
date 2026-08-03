@@ -12,6 +12,7 @@ ravel-otlp = { workspace = true }
 ravel-segment = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
+hex = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
