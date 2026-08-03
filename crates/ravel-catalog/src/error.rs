@@ -35,8 +35,14 @@ pub enum CatalogError {
     },
     /// A decoded record's tenant_hash/signal/shard does not match the
     /// (tenant, signal, shard) it was listed or addressed under (ADR-0010
-    /// §10: validated on every cache hit and every fresh decode).
-    #[error("commit record at {key:?} has unexpected {field}: expected {expected}, got {actual}")]
+    /// §10: validated on every cache hit and every fresh decode). Also used,
+    /// per ADR-0050 §2, for: a catalog HEAD or postings object whose
+    /// tenant_hash does not match the requesting tenant (hard failure, never
+    /// a fallback to listing), and for a listing helper result whose key
+    /// does not begin with the requesting tenant's prefix (`field ==
+    /// "list_prefix"`, a hard isolation-breach error, never a silently
+    /// dropped or served foreign key).
+    #[error("object at {key:?} has unexpected {field}: expected {expected}, got {actual}")]
     FieldMismatch {
         key: String,
         field: &'static str,

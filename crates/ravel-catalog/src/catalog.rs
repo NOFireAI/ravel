@@ -89,6 +89,13 @@ pub struct Catalog {
     /// sets plus all uncovered L0s are still included (harmless overlap);
     /// the counter surfaces the invariant breach for a human to investigate.
     compaction_input_set_conflicts: AtomicU64,
+    /// Count of hard isolation-breach failures observed: a HEAD or postings
+    /// object whose `tenant_hash` does not match the requesting tenant, or a
+    /// listing helper result whose key does not begin with the requesting
+    /// tenant's prefix (ADR-0050 §2). Unlike the two counters above, each of
+    /// these also fails the query: the count is a record of hard failures,
+    /// not a harmless-overlap anomaly tally.
+    isolation_breaches: AtomicU64,
     /// Bounds the object-store requests one resolve keeps in flight (#278
     /// item 2). Ephemeral, process-local, correctness-free: it changes only
     /// how many round trips overlap, never which segments a resolve returns.
@@ -121,6 +128,7 @@ impl Catalog {
             byte_cache: Cache::new(byte_cache_limits),
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
+            isolation_breaches: AtomicU64::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
         })
     }
@@ -208,11 +216,18 @@ impl Catalog {
     /// `accounting` is credited one [`AccountedOp::List`] request per page,
     /// unconditionally, mirroring `InstrumentedStore`'s convention that a
     /// LIST never moves bytes.
+    ///
+    /// Also the sole funnel for the ADR-0050 §2 LIST-prefix assertion: every
+    /// returned key must begin with `tenant`'s prefix, or this is a hard
+    /// isolation-breach `CatalogError::FieldMismatch`, never a silently
+    /// dropped or served foreign key.
     async fn guarded_list_all(
         &self,
+        tenant: &TenantHash,
         prefix: &str,
         accounting: &QueryAccounting,
-    ) -> Result<Vec<ObjectMeta>, StoreError> {
+    ) -> Result<Vec<ObjectMeta>, CatalogError> {
+        let tenant_prefix = format!("t/{}/", tenant.to_hex());
         let mut out: Vec<ObjectMeta> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut page_token = None;
@@ -226,6 +241,15 @@ impl Catalog {
                 page?
             };
             for meta in page.objects {
+                if !meta.key.starts_with(&tenant_prefix) {
+                    self.record_isolation_breach();
+                    return Err(CatalogError::FieldMismatch {
+                        key: prefix.to_string(),
+                        field: "list_prefix",
+                        expected: tenant_prefix,
+                        actual: meta.key,
+                    });
+                }
                 if seen.insert(meta.key.clone()) {
                     out.push(meta);
                 }
@@ -255,6 +279,21 @@ impl Catalog {
     /// row 11).
     pub fn compaction_input_set_conflicts(&self) -> u64 {
         self.compaction_input_set_conflicts.load(Ordering::Relaxed)
+    }
+
+    /// Count of hard isolation-breach failures observed across this
+    /// catalog's lifetime (ADR-0050 §2): a HEAD/postings tenant_hash
+    /// mismatch or an out-of-prefix listing result. See
+    /// docs/catalog-and-mvcc.md.
+    pub fn isolation_breaches(&self) -> u64 {
+        self.isolation_breaches.load(Ordering::Relaxed)
+    }
+
+    /// `pub(crate)`: lets `snapshot_resolve` (ADR-0050 §2) bump the
+    /// isolation-breach counter from its own `impl Catalog` block before
+    /// returning the hard `CatalogError::FieldMismatch`.
+    pub(crate) fn record_isolation_breach(&self) {
+        self.isolation_breaches.fetch_add(1, Ordering::Relaxed);
     }
 
     /// `pub(crate)`: lets `fold` (docs/metric-index-plan.md section 4) issue
@@ -585,7 +624,7 @@ impl Catalog {
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
         let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
-        let objects = self.guarded_list_all(&prefix, accounting).await?;
+        let objects = self.guarded_list_all(tenant, &prefix, accounting).await?;
 
         // Partition the listed keys by shape (docs/catalog-and-mvcc.md step
         // 2). An unrecognized shape is a fail-loud error, never a silent
@@ -949,7 +988,7 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         let prefix =
             keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)?;
-        let objects = self.guarded_list_all(&prefix, accounting).await?;
+        let objects = self.guarded_list_all(tenant, &prefix, accounting).await?;
         let mut compaction_keys: Vec<String> = Vec::new();
         for meta in objects {
             match keys::partition_bucket_entry(&meta.key)? {
