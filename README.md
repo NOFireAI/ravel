@@ -99,6 +99,13 @@ piece, see [docs/adrs/](docs/adrs/).
   functions), over `/api/v1/query` and `/api/v1/query_range`. Native
   (exponential) histograms are ingested, stored, and queryable with the
   full set of native-histogram functions.
+- **Exemplars**: `GET`/`POST /api/v1/query_exemplars`, the Prometheus
+  exemplar surface Grafana calls to link a metric point to a trace. Each
+  exemplar's `trace_id` and `span_id` ride in the returned `labels` under
+  those conventional keys, hex-encoded; an all-zero id is treated as absent
+  and its label is omitted. The endpoint reads exemplars from the same
+  segments a sample query over `[start, end]` matches, and ignores `offset`
+  and `@`, matching Prometheus.
 - **SQL**, through Apache DataFusion (`ravel-sql`): `POST /api/v1/sql`
   against a `samples` table (metrics) or a `logs` table, read-only, with
   the same duplicate-sample resolution as PromQL so the two agree on
@@ -167,7 +174,7 @@ quantiles can differ.
   into `POST /api/v1/sql`) and trace-by-id lookup. Ingest, compaction, and
   retention for spans already run end to end (see What's built); nothing
   reads them back yet.
-- Profiles and exemplars.
+- Profiles.
 - Catalog snapshots: an index object in place of per-query listing, needed
   before listing-based discovery runs out of headroom.
 - OTAP (OpenTelemetry Arrow) ingest: the codec is written but not wired
@@ -194,6 +201,13 @@ curl -G http://127.0.0.1:4318/api/v1/query_range \
   --data-urlencode "end=<unix seconds>" \
   --data-urlencode "step=15s"
 
+# Exemplars: trace/span ids for a metric selector, over [start, end]
+curl -G http://127.0.0.1:4318/api/v1/query_exemplars \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode "query=http_request_duration_seconds{method=\"get\"}" \
+  --data-urlencode "start=<unix seconds>" \
+  --data-urlencode "end=<unix seconds>"
+
 # SQL over metrics (needs ravel-server built/run with --features sql)
 curl -X POST http://127.0.0.1:4318/api/v1/sql \
   -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
@@ -210,6 +224,23 @@ curl -X POST http://127.0.0.1:4318/api/v1/analytics \
   -d '{"query": "http_requests_total", "start": 0, "end": 1893456000, "step": "30s",
        "op": {"type": "change_point", "downsample": false}}'
 ```
+
+`/api/v1/query_exemplars` returns Prometheus' exemplar shape: an array of
+`{seriesLabels, exemplars}`, each exemplar carrying `labels`, `value`, and
+`timestamp`. The exemplar's trace and span ids ride in `labels` under the
+conventional `trace_id` and `span_id` keys, hex-encoded, which is what
+Grafana follows to open a trace; an all-zero id means absent and its label
+is omitted. Two behaviours an operator should know:
+
+- **Fetch window.** Exemplars are read from exactly the `[start, end]`
+  window's segments. `offset` and `@` in the query are ignored, matching
+  Prometheus; a returned exemplar is kept only when its own timestamp falls
+  inside `[start, end]`.
+- **Deduplication.** During compaction the same exemplar can be readable
+  from two segments at once. Results are deduplicated on the exemplar's
+  full stored identity (series, timestamp, trace id, span id, value, and
+  attributes), so an exact duplicate collapses to one dot while two
+  exemplars that differ in any of those fields are both returned.
 
 The SQL endpoint is off by default; build or run `ravel-server` with the
 `sql` cargo feature (`flight-sql` implies `sql`). It accepts only `SELECT`
