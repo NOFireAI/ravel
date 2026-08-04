@@ -81,6 +81,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p <your-crate>        # plus --workspace when your change is cross-crate
 ```
 
+None of those compile `ravel-server`'s SQL or Flight SQL surfaces: both sit
+behind cargo features that are off by default. When your change touches
+`ravel-server`, `ravel-sql`, or `ravel-query`, add:
+
+```sh
+cargo clippy -p ravel-server --features sql --all-targets -- -D warnings
+cargo test   -p ravel-server --features sql
+cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
+cargo test   -p ravel-server -p ravel-sql --features flight-sql
+```
+
+`scripts/gates.sh` runs these when the crates are in scope. Do not skip them:
+a workspace gate has printed "All gates passed" on a tree where
+`--features sql` failed to compile, because the broken call site sat in a
+target the default feature set never builds.
+
 ### Fast local iteration
 
 While iterating, use `cargo check -p <crate>` for fast feedback (or
@@ -101,7 +117,9 @@ connection, a pushed-but-broken main).
 
 - `scripts/gates.sh [-p CRATE ...]` — the Gates list above. No args runs
   the full workspace gate; `-p CRATE` (repeatable) scopes clippy/test/doc
-  to specific crates for fast iteration.
+  to specific crates for fast iteration. It also runs the `sql` and
+  `flight-sql` feature lanes, always in workspace mode and in scoped mode
+  when `ravel-server` or `ravel-sql` is named.
 - `scripts/fleet-watch.sh <watch-url> [poll-interval-seconds]` — waits on
   a `fleet_dispatch`/`fleet_status` task by polling its watch endpoint in
   a loop. The SSE stream it wraps drops the connection almost immediately
