@@ -1655,6 +1655,21 @@ mod tests {
         r
     }
 
+    /// Like [`rec_res`] but with an explicit scope name, so two records can
+    /// share a resource `service.name` yet land in distinct streams (distinct
+    /// `stream_attrs` blobs, hence distinct blocks). Used to place a
+    /// resource-level-only key's matching records in more than one block.
+    fn rec_res_scope(stream: u8, ts: i64, resource_svc: &str, scope: &str) -> LogRecord {
+        let mut r = rec(stream, ts, "msg");
+        r.stream_attrs = crate::record::stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str(resource_svc.into()))],
+            scope,
+            "1",
+            &[],
+        );
+        r
+    }
+
     /// Rewrites a freshly written (version 2) object's POSTINGS section version
     /// byte to 1 and fixes both the section crc and the footer crc, producing a
     /// structurally valid version-1 object for the reader to exercise the
@@ -1944,5 +1959,174 @@ mod tests {
         let pd_bytes = &obj[pd_desc.offset as usize..(pd_desc.offset + pd_desc.len) as usize];
         let section = crate::postings::PostingsSection::parse(pd_bytes).expect("parse");
         assert_eq!(section.probe(cid, b"svc0").expect("probe"), None);
+    }
+
+    /// Issue #552: a key that is resource-level on EVERY record and per-record
+    /// on none. Before this change it had no FIELD_DIR column, so no posting
+    /// list, so a merged-view prune for it skipped nothing -- the ordinary
+    /// single/few-service OTLP deployment the ADR-0049 amendment was written
+    /// for. Now the writer gives it a stream-level-only column, so the prune
+    /// proves non-matching blocks absent AND every matching record survives.
+    ///
+    /// Three streams, one block each: resource `service.name` = svc0 (block 0),
+    /// svc1 (block 1), svc0 again on a different stream (block 2). A prune for
+    /// svc0 must keep blocks 0 and 2 (ten records, in two non-adjacent blocks,
+    /// so completeness is non-trivial) and drop block 1. No record carries
+    /// `service.name` per-record.
+    #[test]
+    fn resource_only_key_prunes_blocks_and_returns_every_match() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..5i64 {
+            recs.push(rec_res_scope(0, i, "svc0", "sa"));
+        }
+        for i in 5..10i64 {
+            recs.push(rec_res_scope(1, i, "svc1", "sb"));
+        }
+        for i in 10..15i64 {
+            recs.push(rec_res_scope(2, i, "svc0", "sc"));
+        }
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        // Pruning: block 1 (svc1) is proven absent through POSTINGS and skipped.
+        assert_eq!(stats.blocks_total, 3);
+        assert_eq!(stats.blocks_after_skip, 3);
+        assert_eq!(stats.blocks_after_postings, 2);
+        assert_eq!(stats.blocks_scanned, 2);
+        // Soundness: every merged-view svc0 match returned, across both blocks.
+        assert_eq!(rows.len(), 10);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// Issue #552 soundness: adding a stream-level-only column must NOT turn
+    /// `equals` (the exact per-record channel) into a merged-view match. A
+    /// record whose `service.name` comes solely from its resource blob must not
+    /// match a `content` equals for it, because the column carries no per-record
+    /// value (it is a POSTINGS key, all-null in every block). This is the exact
+    /// mistake the spec warns against: if the writer materialized the resource
+    /// value into every row, this would match and the prune/exact channels would
+    /// no longer be a sound subset relationship.
+    #[test]
+    fn equals_on_resource_only_key_stays_a_per_record_predicate() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        // Every record: resource service.name = svc0, no per-record attribute.
+        let recs: Vec<LogRecord> = (0..10).map(|i| rec_res_scope(0, i, "svc0", "sa")).collect();
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // The stream-level column now exists, so a prune would match; but
+        // `content` reads the per-record layer only, which is empty here.
+        let (rows, _stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("service.name".into()),
+                value: AttrValue::Str("svc0".into()),
+            })
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            0,
+            "a resource-only value must not match a content equals: equals is per-record"
+        );
+
+        // The rebuilt records must not have gained a phantom per-record
+        // service.name attribute from the all-null column either.
+        let (all, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan all");
+        assert_eq!(all.len(), 10);
+        assert!(
+            all.iter()
+                .all(|r| !r.attrs.iter().any(|(k, _)| k == "service.name")),
+            "the stream-level column must not materialize a per-record attribute"
+        );
+    }
+
+    /// Issue #552 under version 1: a resource-level-only key now has a column
+    /// and a posting list, but a v1 posting list indexes the per-record layer
+    /// only, so the conservative rule must decline to prune it (the key is at
+    /// stream level). Every merged-view match still reads back; no block is
+    /// pruned. Built by pinning the version byte in a fixture.
+    #[test]
+    fn version_1_object_declines_to_prune_resource_only_key() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..5i64 {
+            recs.push(rec_res_scope(0, i, "svc0", "sa"));
+        }
+        for i in 5..10i64 {
+            recs.push(rec_res_scope(1, i, "svc1", "sb"));
+        }
+        for i in 10..15i64 {
+            recs.push(rec_res_scope(2, i, "svc0", "sc"));
+        }
+        let obj = downgrade_postings_to_v1(&build_indexed(cfg, recs, &["service.name"]));
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        // service.name is at stream level, so v1 declines to prune: all blocks
+        // survive and every record reads back.
+        assert_eq!(rows.len(), 15, "v1 conservative rule keeps every record");
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// A truncated POSTINGS section on an object whose only indexed field is
+    /// resource-level (the issue #552 shape) still degrades to a typed error
+    /// path, never a panic: the scan falls back to bloom + exact scan and sets
+    /// `postings_degraded`.
+    #[test]
+    fn corrupt_postings_on_resource_only_key_degrades_not_panics() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..5i64 {
+            recs.push(rec_res_scope(0, i, "svc0", "sa"));
+        }
+        for i in 5..10i64 {
+            recs.push(rec_res_scope(1, i, "svc1", "sb"));
+        }
+        let mut obj = build_indexed(cfg, recs, &["service.name"]);
+        let footer = crate::footer::open(&obj).expect("open footer");
+        let desc = *footer
+            .section(crate::footer::kind::POSTINGS)
+            .expect("postings present");
+        // Flip the version byte: the whole-section crc no longer matches, so the
+        // reader degrades this arm instead of pruning on corrupt bytes.
+        obj[desc.offset as usize] ^= 0xFF;
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan degrades, not errors");
+        assert!(stats.postings_degraded);
+        // No pruning applied, so every record survives.
+        assert_eq!(rows.len(), 10);
     }
 }

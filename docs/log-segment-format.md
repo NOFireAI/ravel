@@ -208,6 +208,19 @@ columnar and never pruned by field predicates. Readers reject a
 non-ascending sequence, an entry count over the cap, an unknown type
 byte, and truncation.
 
+A FIELD_DIR column normally exists because at least one record carries the
+key as a per-record attribute. An **indexed** field (POSTINGS, below) is the
+one exception: if the writer was told to index a name (`with_indexed_fields`)
+that appears only at stream level (a resource or scope attribute) across the
+whole object and per-record on no record, that `(name, type)` still gets a
+column, so its merged-view postings have a `column_id` to key by (ADR-0049,
+issue #552). Such a column is a POSTINGS key, not a materialized value: no
+row writes a per-record value to it, so it is all-null in every block, its
+`present_blocks` is 0, and the reader's exact per-record equality on the key
+still reads only the per-record layer (it never resolves against the resource
+or scope blob). It counts against the same 1000-dynamic-column budget as any
+column; one that cannot fit degrades to bloom plus exact scan, always legal.
+
 ## BLOCKS
 
 Records are sorted `(stream_ref ascending, ts_ns ascending)`. Target 8192
@@ -570,6 +583,19 @@ apart from the bytes, which is why the version byte exists.
   `ravel_sql::rlog_attrs::merged_attrs` computes for the `attrs` column). A
   reader prunes a merged-view query directly. This is the version the writer
   emits (ADR-0049 amendment 2026-08-03, issue #547).
+
+Issue #552 completed the version-2 writer, which until then indexed a
+merged-view key only when it also had a per-record column; a key that was
+resource- or scope-level across the whole object (the ordinary OTLP
+`service.name` shape) got no column and so no posting list, and pruned
+nothing. The writer now gives such a key a stream-level-only FIELD_DIR column
+(above), so its merged-view postings exist. This added no version bump: it
+adds entries under the existing version-2 meaning (a posting list indexes the
+merged view) rather than changing what a posting list means, so the bytes and
+their interpretation are unchanged. An old version-2 object simply carries no
+posting list for a resource-only key, which a reader handles as "no
+information" (probe returns `Ok(None)`, no prune) exactly as for any
+unindexed field.
 
 A reader accepts both versions. Stored version-1 objects are not rewritten,
 so the conservative rule keeps them correct with no migration.
