@@ -219,6 +219,10 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Clippy (sql feature)
         run: cargo clippy --locked -p ravel-server --features sql --all-targets -- -D warnings
+      # `sql` does not imply `flight-sql`, so the step above leaves the Flight
+      # SQL service, its stream, and their tests unlinted (issue #616).
+      - name: Clippy (flight-sql feature)
+        run: cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
 
   check:
     needs: changes
@@ -295,6 +299,44 @@ jobs:
           PROPTEST_CASES: 512
         run: cargo nextest run --locked -p ravel-sql --test differential
 
+  # The Flight SQL surface (issue #616). Until this job existed, every test
+  # behind ravel-server's `flight-sql` feature was compiled and discarded: the
+  # `features` lane below ran `cargo check` on the combination and nothing
+  # else, and no `cargo test` or `cargo nextest run` anywhere in this workflow
+  # passed the feature. `sql` does not imply it. A Flight SQL test could
+  # assert nothing, or panic on every run, and no gate would report it.
+  #
+  # A separate job rather than two more steps in `sql`, which is where these
+  # first went: `flight-sql` pulls arrow-flight, tonic, and the whole
+  # DataFusion tree, and shares no incremental state with the `sql` feature
+  # build, so linking both configurations on one runner died with
+  # `collect2: fatal error: ld terminated with signal 7 [Bus error]`. Same
+  # reason the `features` lane carries its own 30-minute budget.
+  #
+  # Gated on sql_area like `sql`, and required like `sql`. When renaming this
+  # job, update main's required status checks in the same change, or the
+  # tests silently stop blocking again.
+  flight-sql:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Flight SQL tests
+        run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
+
   # Never-compiled feature combinations (ADR-0053 D6, issue #601). Four cargo
   # features are off by default and no other job builds them, so a break in
   # any of them -- an unreachable e2e test path, three bench binaries that
@@ -302,9 +344,13 @@ jobs:
   # still compiles (`cargo check`, not a test run), which is the cheap gap it
   # closes:
   #   - ravel-server --features otap        (links ravel-otap + arrow tree)
-  #   - ravel-server --features flight-sql  (implies its own `sql`; also
-  #     selects ravel-sql so ravel-sql/flight-sql, which flight-sql pulls in,
-  #     is checked as a first-class package here rather than only as a dep)
+  #
+  # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
+  # above (issue #616), which lints and RUNS it: a compile-only probe let
+  # every test behind that feature ship unexecuted, and this lane is not a
+  # required check, so even its type check could fail unnoticed. It did, and
+  # does: `ravel-bench --features parquet-baseline` has not compiled since
+  # 2026-07-28 (issue #621).
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   features:
@@ -328,8 +374,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check ravel-server --features otap
         run: cargo check --locked -p ravel-server --features otap
-      - name: Check ravel-server --features flight-sql
-        run: cargo check --locked -p ravel-server -p ravel-sql --features flight-sql
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress

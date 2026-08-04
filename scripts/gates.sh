@@ -75,4 +75,44 @@ else
   cargo test --locked --doc --profile ci "${crate_args[@]}"
 fi
 
+# Feature-gated surfaces (issues #609, #616). ravel-server's `sql` and
+# `flight-sql` features are off by default, so nothing above compiles the SQL
+# handler, the Flight SQL service, or their tests. Without these lanes a local
+# run prints "All gates passed" on a tree CI rejects. That happened while
+# rebasing #511: the workspace gate was green and `--features sql` failed with
+# E0061 on a call site that had gone stale under a textually clean merge.
+#
+# Mirrors CI's `lint` and `flight-sql` jobs. In scoped mode these run only
+# when the affected crates are named, so `-p ravel-logseg` does not pay for a
+# ravel-server build it did not ask for.
+run_feature_lane() {
+  local feature="$1"
+  shift
+  echo "==> cargo clippy --locked $* --features ${feature} --all-targets -- -D warnings"
+  cargo clippy --locked "$@" --features "${feature}" --all-targets -- -D warnings
+  if [[ ${have_nextest} -eq 1 ]]; then
+    echo "==> cargo nextest run --locked $* --features ${feature}"
+    cargo nextest run --locked "$@" --features "${feature}"
+  else
+    echo "==> cargo test --locked $* --features ${feature}"
+    cargo test --locked "$@" --features "${feature}"
+  fi
+}
+
+want_features=0
+if [[ ${#crate_args[@]} -eq 0 ]]; then
+  want_features=1
+else
+  for arg in "${crate_args[@]}"; do
+    case "${arg}" in
+      ravel-server | ravel-sql) want_features=1 ;;
+    esac
+  done
+fi
+
+if [[ ${want_features} -eq 1 ]]; then
+  run_feature_lane sql -p ravel-server
+  run_feature_lane flight-sql -p ravel-server -p ravel-sql
+fi
+
 echo "All gates passed."
