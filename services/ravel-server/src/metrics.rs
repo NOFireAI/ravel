@@ -882,18 +882,6 @@ fn render_tenancy_family(out: &mut String, mode: Mode, v1_unkeyed_adoptions: u64
     );
 }
 
-/// Dynamic-tenant `shard_count` provisioning failures (ADR-0050 section 5,
-/// EC5): a dynamically-resolved tenant's durable provisioning check failed,
-/// either a real disagreement against this process's configured `--shards`
-/// (failing that single first-touch request), an unreadable record (corrupt
-/// or a future format version, also a hard failure), or the same class of
-/// failure caught on the maintain per-tenant loop instead (which skips that
-/// tenant's tick rather than failing a request). A static tenant's mismatch
-/// refuses startup instead and never reaches this counter. A nonzero value
-/// means at least one dynamic tenant's provisioning record could not be
-/// validated as expected; the operations guide pages on any increase.
-/// Process-global atomic read from [`crate::provisioning`], single source,
-/// no labels.
 /// The logs prune-selectivity family (ADR-0049, issue #511 deliverable 2):
 /// blocks the logs scans saw, survived, and pruned by postings, cumulative
 /// across queries. Reads the `LogsScanExec` DataFusion counters (#544) that
@@ -942,6 +930,18 @@ fn render_query_postings_family(out: &mut String, mode: Mode, blocks: (u64, u64,
     );
 }
 
+/// Dynamic-tenant `shard_count` provisioning failures (ADR-0050 section 5,
+/// EC5): a dynamically-resolved tenant's durable provisioning check failed,
+/// either a real disagreement against this process's configured `--shards`
+/// (failing that single first-touch request), an unreadable record (corrupt
+/// or a future format version, also a hard failure), or the same class of
+/// failure caught on the maintain per-tenant loop instead (which skips that
+/// tenant's tick rather than failing a request). A static tenant's mismatch
+/// refuses startup instead and never reaches this counter. A nonzero value
+/// means at least one dynamic tenant's provisioning record could not be
+/// validated as expected; the operations guide pages on any increase.
+/// Process-global atomic read from [`crate::provisioning`], single source,
+/// no labels.
 fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatches: u64) {
     write_header(
         out,

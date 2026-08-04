@@ -257,6 +257,152 @@ async fn a_logs_query_is_accounted() {
     );
 }
 
+/// Corpus for `a_logs_query_with_an_indexed_predicate_prunes_blocks_by_postings`:
+/// 48 records on one stream, in six groups of eight, each group carrying a
+/// distinct value of the per-record attribute `region` (`region-0` ..
+/// `region-5`). It must be a per-record attribute, not a resource one: a
+/// resource-only key gets no dynamic column and so no postings at all
+/// (ADR-0049, the same gap Fix 1 of this ticket documents).
+const POSTINGS_PRUNE_RECORD_COUNT: usize = 48;
+const POSTINGS_PRUNE_GROUP_SIZE: usize = 8;
+
+/// `block_target_records: 4`, so the object holds exactly
+/// `POSTINGS_PRUNE_RECORD_COUNT / 4 = 12` blocks, and because the group size
+/// (8) is a multiple of the block size (4), each region value's eight
+/// records span exactly two whole blocks with no block straddling a group
+/// boundary: region `k` owns blocks `2k` and `2k+1`, nothing else.
+fn postings_prune_cfg() -> RlogConfig {
+    RlogConfig {
+        block_target_records: 4,
+        ..RlogConfig::default()
+    }
+}
+
+/// Publishes one RLOG object with the per-record attribute `region` indexed
+/// (see [`POSTINGS_PRUNE_RECORD_COUNT`]'s doc comment for the block layout),
+/// plus its `Signal::Logs` commit record.
+async fn publish_logs_with_region_postings(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("query-accounting".to_string()),
+    )];
+    let stream_id = logstream::log_stream_id(&resource, "scope", "1.0", &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+
+    let writer_id = Uuid::from_u128(9_001);
+    let mut writer = RlogWriter::new(
+        postings_prune_cfg(),
+        ObjectIdentity {
+            tenant_hash: tenant.hash().0,
+            shard: 0,
+            writer_id: *writer_id.as_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+    )
+    .with_indexed_fields(vec!["region".to_string()]);
+
+    for i in 0..POSTINGS_PRUNE_RECORD_COUNT {
+        let ts_ns = 1_000 + i as i64;
+        let region = i / POSTINGS_PRUNE_GROUP_SIZE;
+        writer
+            .push(LogRecord {
+                stream_id,
+                stream_attrs: stream_attrs.clone(),
+                ts_ns,
+                observed_ts_ns: ts_ns,
+                severity_num: 9,
+                severity_text: "INFO".to_string(),
+                body: format!("postings prune record {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![(
+                    "region".to_string(),
+                    AttrValue::Str(format!("region-{region}")),
+                )],
+            })
+            .expect("push log record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+
+    let content_hash = [10u8; 32];
+    let new_record = NewCommitRecord {
+        tenant_hash: tenant.hash(),
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: POSTINGS_PRUNE_RECORD_COUNT as u64,
+        series_count: 1,
+        min_event_ts_ns: 1_000,
+        max_event_ts_ns: 1_000 + POSTINGS_PRUNE_RECORD_COUNT as i64 - 1,
+        min_ingest_ts_ns: 1_000,
+        max_ingest_ts_ns: 1_000 + POSTINGS_PRUNE_RECORD_COUNT as i64 - 1,
+        segment_format_version: 1,
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    };
+    let rec = record::build(new_record).expect("valid logs commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("logs data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put rlog object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish logs commit record");
+}
+
+/// The anti-vacuity guard for issue #511 deliverable 2: `a_logs_query_is_accounted`
+/// above proves `blocks_pruned_by_postings` is not spuriously nonzero (no
+/// predicate, so nothing is pruned); it does not prove the counter can ever
+/// be nonzero at all. A metric that is permanently zero passes every test
+/// that only checks it equals zero, so this test writes a query with an
+/// indexed equality predicate and requires the prune to be both real
+/// (greater than zero) and partial (less than the total block count, since
+/// the matching value's own blocks must still be scanned).
+#[tokio::test]
+async fn a_logs_query_with_an_indexed_predicate_prunes_blocks_by_postings() {
+    let tenant = tenant_id("logs-postings-prune");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_logs_with_region_postings(store.as_ref(), &tenant).await;
+    let fixture = Fixture::build(Arc::clone(&store), &[], SqlConfig::default(), 1 << 30).await;
+
+    let outcome = fixture
+        .executor
+        .execute(
+            tenant.hash(),
+            &request("SELECT ts, body FROM logs WHERE attrs['region'] = 'region-0'"),
+        )
+        .await
+        .expect("logs query with an indexed equality predicate");
+
+    assert_eq!(
+        outcome.output.num_rows(),
+        POSTINGS_PRUNE_GROUP_SIZE,
+        "exactly one region's eight records must match"
+    );
+    assert_eq!(
+        outcome.stats.blocks_total, 12,
+        "48 records at 4 per block must land in 12 blocks"
+    );
+    assert!(
+        outcome.stats.blocks_pruned_by_postings > 0,
+        "an indexed equality predicate must prune at least one block: {:?}",
+        outcome.stats
+    );
+    assert!(
+        outcome.stats.blocks_pruned_by_postings < outcome.stats.blocks_total,
+        "the matching region's own blocks must still be scanned, so pruning \
+         cannot be total: {:?}",
+        outcome.stats
+    );
+}
+
 fn reduce_rows(batches: &[RecordBatch]) -> HashMap<[u8; 16], HashMap<i64, u64>> {
     let mut out: HashMap<[u8; 16], HashMap<i64, u64>> = HashMap::new();
     for batch in batches {
