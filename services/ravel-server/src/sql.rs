@@ -98,8 +98,12 @@ pub struct SqlState {
     /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
     /// #425). Each completed statement folds its accounting snapshot and cost
     /// estimate into it, tagged with the tenant hash and workload class, for
-    /// `/metrics`. Shared with the Flight SQL and PromQL paths' `/metrics` view
-    /// through one instance per process.
+    /// `/metrics`. One instance per process, shared with `/api/v1/analytics`.
+    ///
+    /// The Flight SQL and PromQL paths do not record into it yet: both build
+    /// their own `QueryAccounting` per request and report it in the response
+    /// only, so `/metrics` covers SQL and analytics traffic, not all query
+    /// traffic. Wiring them is the rest of #425.
     pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
 }
 
