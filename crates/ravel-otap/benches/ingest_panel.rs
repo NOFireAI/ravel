@@ -157,6 +157,7 @@ fn build_otap_batch(card: Cardinality) -> BatchArrowRecords {
                         .collect();
                     global_idx += 1;
                     DataPointRow {
+                        exemplars: vec![],
                         time_unix_nano: INGEST_TS_NS + p as i64 * 1_000_000,
                         value: p as f64 * 0.5,
                         flags: 0,

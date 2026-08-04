@@ -91,6 +91,7 @@ fn a9_f01_delta_sum_empty_name_rejection_classes_agree() {
             is_monotonic: true,
         },
         data_points: vec![DataPointRow {
+            exemplars: vec![],
             time_unix_nano: TS,
             value: 1.0,
             flags: 0,
@@ -155,6 +156,7 @@ fn a9_f01_attr_order_rejection_classes_agree() {
         name: "m".to_string(),
         kind: MetricKind::Gauge,
         data_points: vec![DataPointRow {
+            exemplars: vec![],
             time_unix_nano: TS,
             value: 1.0,
             flags: 0,

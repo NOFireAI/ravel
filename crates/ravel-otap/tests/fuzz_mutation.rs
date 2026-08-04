@@ -76,6 +76,7 @@ fn representative_metrics() -> Vec<MetricRow> {
             kind: MetricKind::Gauge,
             data_points: vec![
                 DataPointRow {
+                    exemplars: vec![],
                     time_unix_nano: 1_000,
                     value: 0.5,
                     flags: 0,
@@ -85,6 +86,7 @@ fn representative_metrics() -> Vec<MetricRow> {
                     }],
                 },
                 DataPointRow {
+                    exemplars: vec![],
                     time_unix_nano: 2_000,
                     value: f64::NAN,
                     flags: 0,
@@ -99,6 +101,7 @@ fn representative_metrics() -> Vec<MetricRow> {
                 is_monotonic: true,
             },
             data_points: vec![DataPointRow {
+                exemplars: vec![],
                 time_unix_nano: 3_000,
                 value: 128.0,
                 flags: 0,

@@ -72,6 +72,7 @@ fn otap_series_id(attrs: Vec<AttrRow>) -> SeriesId {
         name: METRIC.to_string(),
         kind: MetricKind::Gauge,
         data_points: vec![DataPointRow {
+            exemplars: vec![],
             time_unix_nano: INGEST_TS_NS,
             value: 1.0,
             flags: 0,

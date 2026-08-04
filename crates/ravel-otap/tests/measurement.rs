@@ -199,6 +199,7 @@ fn otap_batch(
             })
             .collect();
         current_dps.push(DataPointRow {
+            exemplars: vec![],
             time_unix_nano: INGEST_TS_NS + point.ts_offset_ns,
             value: point.value,
             flags: 0,

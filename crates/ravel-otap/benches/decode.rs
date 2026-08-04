@@ -48,6 +48,7 @@ fn build_batch() -> BatchArrowRecords {
             kind: MetricKind::Gauge,
             data_points: (0..POINTS_PER_SERIES)
                 .map(|p| DataPointRow {
+                    exemplars: vec![],
                     time_unix_nano: p as i64 * 1_000_000,
                     value: p as f64 * 0.5,
                     flags: 0,
