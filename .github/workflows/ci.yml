@@ -4,9 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
+
+# Cancel a superseded run for the same ref so a force-push to an open PR does
+# not leave the old run burning coverage/k8s minutes to completion (ADR-0053
+# D3). Keyed on the workflow plus the ref. `cancel-in-progress` is disabled on
+# `main` itself: a push to main is history other things build on, so its run
+# must always finish rather than be cancelled by the next push. It stays true
+# for PR and merge-queue refs, where only the latest run matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Lets a docs-only change (README, PROGRESS, ADRs, guides) skip the whole
@@ -17,6 +28,7 @@ jobs:
   # `*.md` flips this back to the normal full run.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       docs_only: ${{ steps.check.outputs.docs_only }}
     steps:
@@ -25,6 +37,17 @@ jobs:
           fetch-depth: 0
       - id: check
         run: |
+          # merge_group events (the GitHub merge queue, ADR-0053 D1) carry no
+          # base SHA to diff against: the payload has merge_group.base_sha but
+          # no github.event.before, and the queued tree must exercise every
+          # lane the way main will. Force the full run rather than fall through
+          # to the empty-base heuristic below, so a queued merge can never
+          # silently skip compiling lanes as if it were docs-only.
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            echo "::notice::merge_group event, running full CI"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
           else
@@ -46,10 +69,35 @@ jobs:
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # Cheap, build-free guards wired in from ADR-0053 D6 / T2 (issue #596):
+  #   - scripts/check-doc-drift.sh recomputes the derived counts in
+  #     docs/query-engine.md's generated conformance block and diffs them, so
+  #     a stale block (the textually-clean-but-wrong parallel-merge case that
+  #     already slipped through once) fails CI instead of merging silently.
+  #   - `make test-python` runs the stdlib unittest suite for
+  #     scripts/process_metrics.py, which previously had no runner at all.
+  # Both exit non-zero on drift/failure, which fails this job.
+  #
+  # Deliberately not gated on docs_only and not `needs: changes`: it uses no
+  # cargo toolchain and no build, so it is seconds either way, and the
+  # doc-drift target it guards lives under docs/ -- a docs-only PR that edits
+  # docs/query-engine.md must still be checked, which a docs_only skip would
+  # miss. It is one lightweight runner, not a workspace compile.
+  doc-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check derived-doc drift (docs/query-engine.md)
+        run: scripts/check-doc-drift.sh
+      - name: Python script unit tests
+        run: make test-python
+
   check:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       # Share compiled objects across the six workspace-compiling jobs via the
       # GitHub Actions cache backend. rust-cache only restores the dependency
@@ -69,12 +117,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo nextest run --workspace --cargo-profile ci
+        run: cargo nextest run --locked --workspace --cargo-profile ci
       # nextest does not run doctests; keep them covered separately.
       - name: Doctests
-        run: cargo test --doc --workspace
+        run: cargo test --locked --doc --workspace
 
   # The SQL surface (ticket B3, issue #22). Two things the `check` job cannot
   # cover:
@@ -98,6 +146,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -112,15 +161,51 @@ jobs:
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (sql feature)
-        run: cargo clippy -p ravel-server --features sql --all-targets -- -D warnings
+        run: cargo clippy --locked -p ravel-server --features sql --all-targets -- -D warnings
       - name: SQL endpoint tests
-        run: cargo nextest run -p ravel-server --features sql
+        run: cargo nextest run --locked -p ravel-server --features sql
       - name: Differential correctness gate
         env:
           # Well above the in-file default so CI explores far more of the
           # float edge-case and multi-segment-overlap space than a local run.
           PROPTEST_CASES: 512
-        run: cargo nextest run -p ravel-sql --test differential
+        run: cargo nextest run --locked -p ravel-sql --test differential
+
+  # Never-compiled feature combinations (ADR-0053 D6, issue #601). Four cargo
+  # features are off by default and no other job builds them, so a break in
+  # any of them -- an unreachable e2e test path, three bench binaries that
+  # never link -- ships undetected. This lane only proves each combination
+  # still compiles (`cargo check`, not a test run), which is the cheap gap it
+  # closes:
+  #   - ravel-server --features otap        (links ravel-otap + arrow tree)
+  #   - ravel-server --features flight-sql  (implies its own `sql`; also
+  #     selects ravel-sql so ravel-sql/flight-sql, which flight-sql pulls in,
+  #     is checked as a first-class package here rather than only as a dep)
+  #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
+  #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
+  features:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+      - name: Check ravel-server --features otap
+        run: cargo check --locked -p ravel-server --features otap
+      - name: Check ravel-server --features flight-sql
+        run: cargo check --locked -p ravel-server -p ravel-sql --features flight-sql
+      - name: Check ravel-bench --features parquet-baseline
+        run: cargo check --locked -p ravel-bench --features parquet-baseline
+      - name: Check ravel-bench --features flight-egress
+        run: cargo check --locked -p ravel-bench --features flight-egress
 
   # Supply-chain gate (finding a11-F01). deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
@@ -137,6 +222,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install cargo-deny
@@ -156,6 +242,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       # Bounded case count keeps wall-clock in check while exploring far more
       # of the corrupt-input space than the 256-case default.
@@ -172,11 +259,11 @@ jobs:
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Fuzz RSEG codecs (varint, gorilla, delta-varint)
-        run: cargo nextest run -p ravel-segment --lib fuzz_mutation
+        run: cargo nextest run --locked -p ravel-segment --lib fuzz_mutation
       - name: Fuzz RSEG footer/section reader
-        run: cargo nextest run -p ravel-segment --test fuzz_mutation
+        run: cargo nextest run --locked -p ravel-segment --test fuzz_mutation
       - name: Fuzz OTAP Arrow IPC decode
-        run: cargo nextest run -p ravel-otap --test fuzz_mutation
+        run: cargo nextest run --locked -p ravel-otap --test fuzz_mutation
 
   # Runs the object-store contract suite (docs/object-store-contract.md)
   # against real S3-compatible endpoints: MinIO, and floci. Without this job
@@ -204,6 +291,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -262,7 +350,7 @@ jobs:
           # for this one command: nextest otherwise wraps the digits and words
           # of its summary line in ANSI escapes even when piped, which breaks
           # the pass-count grep below.
-          cargo nextest run -p ravel-object-store --test contract \
+          cargo nextest run --locked -p ravel-object-store --test contract \
             -E 'test(=minio_contract)' --no-capture --color never 2>&1 \
             | tee contract-output.txt
           # Prove the suite actually ran against MinIO rather than taking the
@@ -332,7 +420,7 @@ jobs:
           set -o pipefail
           # Same invocation shape as the MinIO step above; see its comment for
           # why `--no-capture` and `--color never` are needed for the greps.
-          cargo nextest run -p ravel-object-store --test contract \
+          cargo nextest run --locked -p ravel-object-store --test contract \
             -E 'test(=floci_contract)' --no-capture --color never 2>&1 \
             | tee floci-contract-output.txt
           # Prove the suite ran against floci rather than taking the
@@ -366,6 +454,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -419,7 +508,7 @@ jobs:
           # Same invocation shape as object-store-contract's MinIO step; see
           # its comment for why --no-capture and --color never are needed
           # for the greps below.
-          cargo nextest run -p ravel-bench --test s3_e2e_smoke \
+          cargo nextest run --locked -p ravel-bench --test s3_e2e_smoke \
             -E 'test(=minio_ingest_read_smoke)' --no-capture --color never 2>&1 \
             | tee bench-smoke-output.txt
           # Prove the test actually ran against MinIO rather than taking the
@@ -451,6 +540,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -481,7 +571,7 @@ jobs:
           # nextest otherwise wraps the digits and words of its summary line
           # in ANSI escapes even when piped, which breaks the pass-count grep
           # below.
-          cargo nextest run -p ravel-promql-difftest --test difftest_selectors \
+          cargo nextest run --locked -p ravel-promql-difftest --test difftest_selectors \
             --no-capture --color never 2>&1 | tee difftest-output.txt
           # Prove the gated test actually ran against the pinned binary
           # rather than taking its RAVEL_DIFFTEST-unset early return.
@@ -528,6 +618,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -666,6 +757,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    # 60m, not the ~10m the no-op path suggests: when Dockerfile/.dockerignore
+    # actually change this job runs a full workspace compile inside Docker at
+    # CARGO_BUILD_JOBS=2 with no access to this workflow's sccache (~57m
+    # measured on a constrained host per the notes below). A single timeout
+    # covers the whole job regardless of which path it takes, so it must be
+    # sized to the build path or it would kill every real Dockerfile change;
+    # the far-more-common no-op path exits in seconds well under this ceiling.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -709,10 +808,19 @@ jobs:
         if: steps.dockerfile-changed.outputs.build == 'true'
         run: docker build --target operator .
 
+  # Coverage is visibility, not a gate (ADR-0053 D2): it leaves the required
+  # set and no longer runs on pull_request or in the merge queue. It runs only
+  # on pushes to main, where it updates the badge and the JSON artifact. Gating
+  # the whole job on the event (rather than dropping a trigger) is the clean
+  # option now that `on:` carries push, pull_request, and merge_group: the
+  # job-level `if` names exactly the one context it should run in.
   coverage:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -726,10 +834,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      # Run the workspace suite once and keep the raw coverage data
+      # (`--no-report`), then render it twice from that same data: once as the
+      # text summary for the step summary, once as JSON for the badge/artifact.
+      # This replaces two full `cargo llvm-cov` invocations that each re-ran the
+      # entire test suite (ADR-0053 D2).
       - name: Measure coverage
         run: |
-          cargo llvm-cov --workspace --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov --workspace --summary-only --json --output-path coverage.json
+          cargo llvm-cov --locked --no-report --workspace
+          cargo llvm-cov report --workspace --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --workspace --summary-only --json --output-path coverage.json
       # Updates the badge data gist read by the README's shields.io endpoint
       # badge. Only on pushes to main, since the badge reflects main's state
       # and pull_request runs (including from forks) never see GIST_PAT.
