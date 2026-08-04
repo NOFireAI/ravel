@@ -30,22 +30,46 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      # docs_only skips every compiling job (ADR-0053 pre-D4 behaviour). The
+      # four *_area outputs (ADR-0053 D4) narrow which lanes run within a
+      # non-docs change: a lane runs only when docs_only is false AND its own
+      # area output is true. Mappings are conservative -- when a change cannot
+      # be proven irrelevant to a lane, the area is forced true so the lane
+      # runs (see the workspace-level rule and the merge_group/no-base full-run
+      # branches below).
       docs_only: ${{ steps.check.outputs.docs_only }}
+      server_or_operator: ${{ steps.check.outputs.server_or_operator }}
+      sql_area: ${{ steps.check.outputs.sql_area }}
+      promql_area: ${{ steps.check.outputs.promql_area }}
+      object_store_area: ${{ steps.check.outputs.object_store_area }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: check
         run: |
+          # Emit all five outputs from a single point so no code path forgets
+          # one. $1 is docs_only; $2..$5 are the four area flags in output
+          # order (server_or_operator, sql_area, promql_area, object_store_area).
+          emit() {
+            {
+              echo "docs_only=$1"
+              echo "server_or_operator=$2"
+              echo "sql_area=$3"
+              echo "promql_area=$4"
+              echo "object_store_area=$5"
+            } >> "$GITHUB_OUTPUT"
+          }
           # merge_group events (the GitHub merge queue, ADR-0053 D1) carry no
           # base SHA to diff against: the payload has merge_group.base_sha but
           # no github.event.before, and the queued tree must exercise every
-          # lane the way main will. Force the full run rather than fall through
-          # to the empty-base heuristic below, so a queued merge can never
-          # silently skip compiling lanes as if it were docs-only.
+          # lane the way main will. Force the full run (docs_only false, every
+          # area true) rather than fall through to the empty-base heuristic
+          # below, so a queued merge can never silently skip compiling lanes as
+          # if it were docs-only or a narrow single-area change.
           if [ "${{ github.event_name }}" = "merge_group" ]; then
             echo "::notice::merge_group event, running full CI"
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            emit false true true true true
             exit 0
           fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -55,19 +79,57 @@ jobs:
           fi
           if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
             echo "::notice::no usable base commit, running full CI"
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            emit false true true true true
             exit 0
           fi
           merge_base=$(git merge-base "$base" "${{ github.sha }}")
+          # ONE diff feeds every classification below; no per-area re-diff.
           changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
           if [ -z "$changed" ]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          elif echo "$changed" | grep -qvE '\.md$'; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::docs-only change, skipping compiling jobs"
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            # No changed files (e.g. an empty-range push): nothing to prove
+            # irrelevant, so run everything, matching the pre-D4 docs_only=false
+            # default.
+            echo "::notice::no changed files, running full CI"
+            emit false true true true true
+            exit 0
           fi
+          # docs-only: every changed path ends in .md. Areas are irrelevant
+          # then -- no compiling job runs at all -- so report them false.
+          if ! echo "$changed" | grep -qvE '\.md$'; then
+            echo "::notice::docs-only change, skipping compiling jobs"
+            emit true false false false false
+            exit 0
+          fi
+          # Workspace-level paths change the build for every crate, so they
+          # force every area true: the root manifests, the lockfile, the
+          # toolchain pin, anything under .github/ (CI itself), and anything
+          # under proto/ (regenerates types every crate can depend on).
+          if echo "$changed" | grep -qE '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml)$|^\.github/|^proto/'; then
+            echo "::notice::workspace-level change, running every area"
+            emit false true true true true
+            exit 0
+          fi
+          # Per-area path lists (conservative supersets; ravel-server and
+          # ravel-operator live under services/, not crates/). A path matching
+          # more than one list turns on every area it matches.
+          server_or_operator=false
+          sql_area=false
+          promql_area=false
+          object_store_area=false
+          if echo "$changed" | grep -qE '^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$'; then
+            server_or_operator=true
+          fi
+          if echo "$changed" | grep -qE '^crates/ravel-sql/|^services/ravel-server/|^crates/ravel-query/'; then
+            sql_area=true
+          fi
+          if echo "$changed" | grep -qE '^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-query/'; then
+            promql_area=true
+          fi
+          if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'; then
+            object_store_area=true
+          fi
+          echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area"
+          emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area"
 
   # Cheap, build-free guards wired in from ADR-0053 D6 / T2 (issue #596):
   #   - scripts/check-doc-drift.sh recomputes the derived counts in
@@ -93,6 +155,51 @@ jobs:
       - name: Python script unit tests
         run: make test-python
 
+  # First-stage fail-fast gate (ADR-0053 D3). Runs fmt and the two clippy
+  # configurations the workspace has (default features, plus ravel-server's
+  # `sql` feature) as a metadata-only/lint-only compile with no test run, so a
+  # style or lint failure kills the run in a few minutes instead of after the
+  # expensive lanes have burned their minutes. `check` and `sql` used to carry
+  # these same fmt/clippy steps; they now live here alone (D3: "check and sql
+  # drop their now-duplicate fmt/clippy steps").
+  #
+  # The expensive lanes gate on this job (k8s-integration and the main-push
+  # coverage job carry `needs: lint`). The cheap lanes (`check`, `sql`, the
+  # other test jobs) deliberately do NOT gate on it: they keep fanning out
+  # behind `changes` and run their real nextest suites in parallel with lint,
+  # since that is useful work regardless of lint's outcome and D3's rejected
+  # alternatives ruled out serializing them behind a prior job.
+  #
+  # No free-disk-space: this job builds no images and runs no tests, so it does
+  # not need the headroom the heavier lanes clear. It DOES keep sccache and
+  # rust-cache: `cargo clippy --all-targets` over a 26-member workspace is a
+  # near-full compile of every crate's lib and test targets, so a cold run
+  # without the shared caches would be ~15-20m (far past the ~4-5m warm
+  # estimate ADR-0053 D3 assumes), which would undercut the whole point of a
+  # fast first-stage kill. With the caches warm from sibling jobs it lands in
+  # the ADR's window.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy (sql feature)
+        run: cargo clippy --locked -p ravel-server --features sql --all-targets -- -D warnings
+
   check:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
@@ -114,10 +221,6 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo nextest run --locked --workspace --cargo-profile ci
       # nextest does not run doctests; keep them covered separately.
@@ -144,7 +247,10 @@ jobs:
   # signed-zero semantics, so a bump that changes them fails here.
   sql:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    # docs_only skips it entirely; the sql_area gate (ADR-0053 D4) further
+    # skips it when no ravel-sql / ravel-server / ravel-query path changed.
+    # The now-removed "Clippy (sql feature)" step moved to the `lint` job (D3).
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -160,8 +266,6 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (sql feature)
-        run: cargo clippy --locked -p ravel-server --features sql --all-targets -- -D warnings
       - name: SQL endpoint tests
         run: cargo nextest run --locked -p ravel-server --features sql
       - name: Differential correctness gate
@@ -293,7 +397,9 @@ jobs:
   # discovered in the k8s lane.
   object-store-contract:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    # object_store_area (ADR-0053 D4): only when object-store, bench, commit,
+    # catalog, ingest, or workspace-level paths changed.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -456,7 +562,10 @@ jobs:
   # about the bench harness, not the contract suite).
   bench-smoke:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    # Same object_store_area gate as object-store-contract (ADR-0053 D4): this
+    # bench-harness smoke test lives in ravel-bench and exercises the same
+    # object-store request path.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -542,7 +651,9 @@ jobs:
   # binary and runs the differential comparison rather than skipping.
   promql-difftest:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    # promql_area (ADR-0053 D4): only when ravel-promql, ravel-promql-difftest,
+    # ravel-query, or workspace-level paths changed.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.promql_area == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -599,48 +710,44 @@ jobs:
   # Deployments whose pods actually reach Ready against a real S3-compatible
   # backend, the images actually starting under Kubernetes, and an OTLP export
   # accepted by the gateway Service being read back through the query Service.
-  # `check` compiles and unit-tests the operator; only this job runs it.
+  # `check` compiles and unit-tests the operator; only this lane runs it.
   #
-  # The release binaries are built on the runner and the images are assembled
-  # from them (Dockerfile.prebuilt) instead of letting kind-up.sh run the root
+  # ADR-0053 D5 executes the split ci.yml already named as the remedy for this
+  # lane breaching its 25m warm-cache budget: the release binary build and image
+  # assembly live in `k8s-build`, which uploads the two assembled images as an
+  # artifact; `k8s-integration` downloads and `docker load`s them, then runs
+  # kind. The split moves work between jobs; no individual build/assemble/kind
+  # step's command, env, or order changed.
+  #
+  # The release binaries are built on the runner and the images assembled from
+  # them (Dockerfile.prebuilt) instead of letting kind-up.sh run the root
   # Dockerfile's builder stage: that stage recompiles the whole workspace inside
   # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's caches (57
   # minutes measured on an 8 GiB arm64 host). RAVEL_SKIP_IMAGE_BUILD=1 exists
-  # for exactly this split, and the sccache/rust-cache setup below is the same
-  # one `check` uses, so the release build here starts warm.
-  #
-  # kind-demo.sh asserts the round-trip value and exits nonzero on any failure,
-  # so unlike the object-store-contract and promql-difftest jobs this needs no
-  # grep over the output to prove it really ran: it has no environment-gated
-  # skip path that could be mistaken for a pass.
-  #
-  # Budget expectation (ADR-0034 decision 7): the slowest job in this workflow,
-  # dominated by the release build. If it grows past roughly 25 minutes
-  # warm-cache, the named remedy is to split the binary build into a shared
-  # artifact job rather than to trim what the lane covers.
-  k8s-integration:
+  # for exactly this split, and the sccache/rust-cache setup here is the same one
+  # `check` uses, so the release build starts warm.
+  k8s-build:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    # Same gate k8s-integration carries (docs_only plus server_or_operator,
+    # ADR-0053 D4). k8s-integration additionally needs this job, so when this
+    # one skips, k8s-integration skips with it.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.server_or_operator == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-      # The tags the assembly step writes and kind-up.sh then loads into the
-      # cluster and points the RavelCluster at. Set explicitly rather than
-      # relying on the script's defaults so both halves read one value. Not the
-      # script's `:kind-dev` default on purpose: a developer's local kind-dev
-      # images and a CI-assembled image are built two different ways and should
-      # not share a tag.
+      # The tags the assembly step writes; k8s-integration loads them into the
+      # cluster and points the RavelCluster at them, so both jobs set the same
+      # values. Not the script's `:kind-dev` default on purpose: a developer's
+      # local kind-dev images and a CI-assembled image are built two different
+      # ways and should not share a tag.
       RAVEL_SERVER_IMAGE: ravel-server:kind-ci
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
-      # Must match the cluster_name passed to helm/kind-action below: kind-up.sh
-      # reuses an existing cluster of this name rather than creating its own.
-      RAVEL_KIND_CLUSTER: ravel-ci
     steps:
       - uses: actions/checkout@v4
-      # First, before anything pulls: a kind node image, two Ravel images, floci,
-      # and a release target directory together need real headroom.
+      # First, before anything pulls: two Ravel images and a release target
+      # directory together need real headroom.
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
@@ -672,9 +779,77 @@ jobs:
           # documents, where a runner-built binary needs symbol versions the base
           # image lacks -- fails here with the dynamic linker's own message,
           # instead of as an opaque CrashLoopBackOff inside the cluster several
-          # minutes later.
+          # minutes later. Kept in this job because it needs only the images, not
+          # the cluster.
           docker run --rm "$RAVEL_SERVER_IMAGE" --help >/dev/null
           docker run --rm "$RAVEL_OPERATOR_IMAGE" --help >/dev/null
+      # Hand the two assembled images to k8s-integration. `docker save` both into
+      # one tar so the assemble logic above stays the single source of the images
+      # (k8s-integration only `docker load`s, it never re-assembles).
+      - name: Save the assembled images
+        run: docker save -o k8s-images.tar "$RAVEL_SERVER_IMAGE" "$RAVEL_OPERATOR_IMAGE"
+      - name: Upload the assembled images
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-images
+          path: k8s-images.tar
+          retention-days: 1
+
+  # kind-demo.sh asserts the round-trip value and exits nonzero on any failure,
+  # so unlike the object-store-contract and promql-difftest jobs this needs no
+  # grep over the output to prove it really ran: it has no environment-gated
+  # skip path that could be mistaken for a pass.
+  k8s-integration:
+    # needs lint (ADR-0053 D3: expensive lanes gain needs: lint) and k8s-build
+    # (D5: it consumes the images k8s-build assembled), plus changes for the
+    # gate outputs.
+    needs: [changes, lint, k8s-build]
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.server_or_operator == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same tags k8s-build wrote; used to `docker load` the artifact and, via
+      # kind-up.sh, load them into the cluster and point the RavelCluster at them.
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+      # Must match the cluster_name passed to helm/kind-action below: kind-up.sh
+      # reuses an existing cluster of this name rather than creating its own.
+      RAVEL_KIND_CLUSTER: ravel-ci
+    steps:
+      - uses: actions/checkout@v4
+      # Still disk-hungry: a kind node image, two Ravel images, and floci all
+      # land on this runner even though the release build moved to k8s-build.
+      - uses: ./.github/actions/free-disk-space
+      # This job compiles nothing (kind-up.sh runs with RAVEL_SKIP_IMAGE_BUILD=1
+      # and the node-image resolve step is a sed), so it carries no toolchain,
+      # sccache, or rust-cache setup -- only the images k8s-build produced.
+      - name: Download the assembled images
+        uses: actions/download-artifact@v4
+        with:
+          name: k8s-images
+      - name: Load the assembled images into the docker daemon
+        run: docker load -i k8s-images.tar
+      # kubectl download is a known flake (issue #587). Install it explicitly,
+      # pinned to the cluster's Kubernetes minor (v1.32, matching the pinned
+      # kindest/node:v1.32.2 that kind-up.sh sets) rather than helm/kind-action's
+      # newer default, and wrap the download in a retry loop so a transient
+      # network blip does not fail the whole lane. helm/kind-action's own
+      # kubectl_version is pinned to the same value below for good measure.
+      - name: Install kubectl (pinned, retried)
+        run: |
+          version=v1.32.2
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 -o /tmp/kubectl \
+                "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"; then
+              break
+            fi
+            echo "kubectl download attempt ${attempt} failed; retrying" >&2
+            sleep $((attempt * 5))
+            [ "$attempt" = 5 ] && { echo "::error::kubectl download failed after 5 attempts"; exit 1; }
+          done
+          chmod +x /tmp/kubectl
+          sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          kubectl version --client
       - name: Resolve the pinned kind node image
         id: node-image
         run: |
@@ -701,7 +876,20 @@ jobs:
           version: v0.32.0
           node_image: ${{ steps.node-image.outputs.image }}
           cluster_name: ravel-ci
-          wait: 120s
+          # Pin kubectl to the cluster's own minor rather than the action's
+          # newer default (issue #587: version skew plus a flaky download); the
+          # explicit retried install above already put this exact version on
+          # PATH, so this only keeps the action from re-installing a different
+          # one.
+          kubectl_version: v1.32.2
+          # Raised from 120s to 300s (issue #587: readiness timeout with no
+          # headroom). This is the action's control-plane readiness wait before
+          # kind-up.sh runs; 300s matches the per-condition readiness timeouts
+          # kind-up.sh itself uses so control-plane bring-up on a disk-cleared
+          # runner is not the tighter gate. (kind-up.sh's own 300s pod-readiness
+          # waits are the deeper gate #587 also names, but they live in that
+          # script, out of this file's scope.)
+          wait: 300s
       - name: Bring up the kind environment
         env:
           # The images are already built and in the runner's docker daemon;
@@ -721,11 +909,29 @@ jobs:
           scripts/kind-up.sh
       - name: OTLP round trip through the gateway and query Services
         run: scripts/kind-demo.sh
+      # On any failure above (issue #587's readiness-timeout mode leaves only a
+      # bare `kubectl wait` timeout otherwise), dump what a human would ask for
+      # before the cluster is torn down. Ordered broad-to-specific: every pod's
+      # scheduling/state, then the full describe (restarts, probe failures,
+      # events per pod) narrowed to the operator's namespace kind-up.sh creates,
+      # then the cluster event stream newest-relevant last, then the operator's
+      # own logs by its Deployment label selector. Runs only on failure so a
+      # green run stays quiet; must precede the delete step so there is still a
+      # cluster to query.
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl describe pods -n ravel-system || true
+          kubectl get events -A --sort-by=.lastTimestamp || true
+          kubectl logs -n ravel-system -l app.kubernetes.io/name=ravel-operator \
+            --all-containers --tail=500 || true
       # helm/kind-action also deletes the cluster in its own post step, so this
       # looks redundant and is not: the teardown path a developer uses has to be
       # exercised too, and both are idempotent (`kind delete cluster` on a
       # cluster that is already gone exits 0), so running both is safe in either
-      # order.
+      # order. Stays if: always() so cleanup runs even after the diagnostics
+      # dump above fires.
       - name: Delete the kind cluster
         if: always()
         run: scripts/kind-down.sh
@@ -825,7 +1031,11 @@ jobs:
   # option now that `on:` carries push, pull_request, and merge_group: the
   # job-level `if` names exactly the one context it should run in.
   coverage:
-    needs: changes
+    # needs lint too (ADR-0053 D3: the main-push coverage lane gains needs:
+    # lint so a fmt/clippy failure kills it before it burns ~25m). It already
+    # only runs on pushes to main; lint runs there as well, so this adds one
+    # fail-fast dependency without changing when coverage is eligible.
+    needs: [changes, lint]
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main'
       && needs.changes.outputs.docs_only != 'true'
