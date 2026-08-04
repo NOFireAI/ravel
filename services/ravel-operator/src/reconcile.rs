@@ -175,6 +175,16 @@ fn tenant_token_args(spec: &RavelClusterSpec, ctx: &RenderCtx) -> Vec<String> {
 /// Args shared by every mode: store selection, shard count, and the S3
 /// bucket/region/endpoint flags. Access/secret keys are NOT here (they are env
 /// vars, see [`s3_credential_env`]).
+///
+/// Also carries `--tenant-hash-unkeyed` (ADR-0050 section 3): a fresh bucket
+/// now refuses to start unless it is told a scheme, and the CRD has no field
+/// yet for an operator-managed deployment to opt into the keyed variant (that
+/// needs a `--tenant-hash-key-file` sourced from a Secret, which is a real
+/// design task, not a one-line addition). Passing the unkeyed flag here keeps
+/// every existing and new `RavelCluster` on today's behavior -- the same
+/// v1-unkeyed derivation it has always used -- rather than silently becoming
+/// keyed-by-default and refusing to start. Revisit once the CRD grows a
+/// tenant-hash-key field.
 fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     let mut args = vec![
         "--store".to_string(),
@@ -185,6 +195,7 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
         spec.storage.s3.bucket.clone(),
         "--s3-region".to_string(),
         spec.storage.s3.region.clone(),
+        "--tenant-hash-unkeyed".to_string(),
     ];
     if let Some(endpoint) = &spec.storage.s3.endpoint {
         args.push("--s3-endpoint".to_string());
@@ -627,6 +638,25 @@ mod tests {
         // And also into maintain, which sweeps every shard.
         let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
         assert_eq!(arg_value(&args_of(&m), "--shards").as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn every_deployment_carries_tenant_hash_unkeyed() {
+        // ADR-0050 section 3: a fresh bucket refuses to start unless told a
+        // scheme, and the CRD has no field yet to opt an operator-managed
+        // deployment into the keyed variant. Every deployment must pass
+        // --tenant-hash-unkeyed so a RavelCluster keeps starting on today's
+        // v1-unkeyed behavior instead of refusing on a fresh bucket.
+        let spec = base_spec();
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
+        for args in [args_of(&g), args_of(&q), args_of(&m)] {
+            assert!(
+                args.iter().any(|a| a == "--tenant-hash-unkeyed"),
+                "missing --tenant-hash-unkeyed in {args:?}"
+            );
+        }
     }
 
     #[test]
