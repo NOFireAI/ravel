@@ -290,6 +290,73 @@ async fn collect_exemplars(
 
     let now_ns = state.clock.now_ns();
     let window = TimeRange { start_ns, end_ns };
+
+    // Resolve-and-read is retried once on a store `NotFound`, exactly as the
+    // sample path's `resolve_snapshot_with_retry` (ravel-query engine): a
+    // pinned segment can vanish under a concurrent L0-to-L1 publish and sweep,
+    // which is continuous normal compaction, not a fault. Without the retry a
+    // query issued during that window returns 503 where `/api/v1/query` over
+    // the same window re-resolves and succeeds. A second `NotFound` gives up
+    // with `SnapshotInvalidated`, the same 503 class the engine surfaces.
+    //
+    // Each attempt gets a fresh `QueryAccounting` so the discarded first
+    // attempt's in-flight counts never bleed into the attempt that produced
+    // the result (ADR-0044 decision 1), matching the engine.
+    match collect_once(
+        state,
+        tenant_hash,
+        &matcher_sets,
+        name_filter.as_deref(),
+        window,
+        start_ns,
+        end_ns,
+        min_tokens,
+        now_ns,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(CollectError::Api(e)) => Err(e),
+        Err(CollectError::SnapshotStale) => match collect_once(
+            state,
+            tenant_hash,
+            &matcher_sets,
+            name_filter.as_deref(),
+            window,
+            start_ns,
+            end_ns,
+            min_tokens,
+            now_ns,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(CollectError::Api(e)) => Err(e),
+            Err(CollectError::SnapshotStale) => {
+                Err(ApiError::from_query(QueryError::SnapshotInvalidated))
+            }
+        },
+    }
+}
+
+/// One resolve-and-read attempt: resolve the snapshot, enforce `max_segments`,
+/// read every matched segment's exemplars, and build this attempt's stats.
+/// Returns [`CollectError::SnapshotStale`] when a pinned object GET returns
+/// `NotFound` mid-flight, which [`collect_exemplars`] retries once; every other
+/// failure is a fatal [`CollectError::Api`]. A fresh [`QueryAccounting`] is
+/// created here so a retried attempt starts from zero counters.
+#[allow(clippy::too_many_arguments)]
+async fn collect_once(
+    state: &ExemplarsState,
+    tenant_hash: TenantHash,
+    matcher_sets: &[Vec<LabelMatcher>],
+    name_filter: Option<&str>,
+    window: TimeRange,
+    start_ns: i64,
+    end_ns: i64,
+    min_tokens: &[CommitToken],
+    now_ns: i64,
+) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), CollectError> {
     let accounting = QueryAccounting::new();
     let snapshot = state
         .catalog
@@ -299,18 +366,20 @@ async fn collect_exemplars(
             window,
             min_tokens,
             now_ns,
-            name_filter.as_deref(),
+            name_filter,
             &accounting,
         )
         .await
-        .map_err(|e| ApiError::from_query(QueryError::from(e)))?;
+        .map_err(|e| CollectError::Api(ApiError::from_query(QueryError::from(e))))?;
 
     // The same snapshot-size ceiling `/api/v1/query` enforces after resolve.
     if snapshot.segments.len() > state.max_segments {
-        return Err(ApiError::from_query(QueryError::TooManySegments {
-            count: snapshot.segments.len(),
-            max: state.max_segments,
-        }));
+        return Err(CollectError::Api(ApiError::from_query(
+            QueryError::TooManySegments {
+                count: snapshot.segments.len(),
+                max: state.max_segments,
+            },
+        )));
     }
 
     // Segments are read sequentially. The sample path fans this out under a
@@ -328,7 +397,7 @@ async fn collect_exemplars(
             state,
             tenant_hash,
             seg,
-            &matcher_sets,
+            matcher_sets,
             start_ns,
             end_ns,
             &accounting,
@@ -344,6 +413,21 @@ async fn collect_exemplars(
         accounting: QueryAccountingJson::from_snapshot(&accounting.snapshot()),
     };
     Ok((group_by_series(collected), stats))
+}
+
+/// Outcome of a single [`collect_once`] attempt that is not a success.
+enum CollectError {
+    /// A pinned object GET returned `NotFound`: the snapshot went stale under
+    /// a concurrent publish-and-sweep. The caller re-resolves and retries once.
+    SnapshotStale,
+    /// Any other failure, already mapped to its client-visible form.
+    Api(ApiError),
+}
+
+impl From<ApiError> for CollectError {
+    fn from(e: ApiError) -> Self {
+        CollectError::Api(e)
+    }
 }
 
 /// Reads one segment's exemplars for the matched series, appending the ones
@@ -366,18 +450,23 @@ async fn read_segment_exemplars(
     accounting: &QueryAccounting,
     seen: &mut HashSet<(SeriesId, i64, [u8; 16])>,
     collected: &mut Vec<(SeriesId, LabelSet, ExemplarRecord)>,
-) -> Result<(), ApiError> {
+) -> Result<(), CollectError> {
     let data_object_key = seg.data_object_key.as_str();
     let limits = ReaderLimits::default();
 
     // One whole-object GET per matched segment, recorded at the same funnel
     // the sample fetcher uses (ADR-0044): request count, transferred bytes,
-    // and one opened segment.
-    let got = state
-        .store
-        .get(data_object_key, GetRange::Full)
-        .await
-        .map_err(|source| fetch_store_error(data_object_key, source))?;
+    // and one opened segment. A `NotFound` here means a pinned object vanished
+    // under a concurrent publish-and-sweep: surface it as `SnapshotStale` so
+    // the caller re-resolves once, exactly as the sample path does. Any other
+    // store fault is fatal.
+    let got = match state.store.get(data_object_key, GetRange::Full).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Err(CollectError::SnapshotStale),
+        Err(source) => {
+            return Err(CollectError::Api(fetch_store_error(data_object_key, source)));
+        }
+    };
     accounting.record_s3_request(AccountedOp::Get);
     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
     accounting.add_segments_opened(1);
@@ -453,7 +542,8 @@ async fn read_segment_exemplars(
             return Err(corrupt(
                 data_object_key,
                 ravel_segment::SegmentError::ExemplarSeriesIndexOutOfRange(rec.series_index),
-            ));
+            )
+            .into());
         };
         if !matched[idx] {
             continue;
@@ -475,7 +565,7 @@ async fn read_segment_exemplars(
         // `max_series` does: the accumulation never exceeds the budget it is
         // being checked against.
         if collected.len() >= state.max_exemplars {
-            return Err(too_many_exemplars(state.max_exemplars));
+            return Err(too_many_exemplars(state.max_exemplars).into());
         }
         collected.push((entry.entry.series_id, entry.entry.labels.clone(), rec));
     }
@@ -1112,6 +1202,9 @@ mod tests {
     use ravel_commit::publish::RetryPolicy;
     use ravel_commit::record::NewCommitRecord;
     use ravel_commit::{keys, publish, record};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_query::http::StaticBearerTokenResolver;
     use ravel_segment::{
@@ -1856,6 +1949,54 @@ mod tests {
                 "{token} must never see the other tenant's trace id"
             );
         }
+    }
+
+    /// F7: a store `NotFound` on the first data-object GET is retried once.
+    /// A pinned segment can vanish under a concurrent L0-to-L1 publish and
+    /// sweep (continuous normal compaction); the sample path re-resolves once
+    /// before giving up, and this endpoint must too. Here the first `.rseg`
+    /// GET returns `NotFound` and the re-resolve's GET succeeds, so the request
+    /// is a 200 rather than the 503 a single attempt would return. The fault
+    /// counter proves the injected fault actually fired.
+    #[tokio::test]
+    async fn not_found_on_first_get_re_resolves_and_succeeds() {
+        let mem = MemoryStore::new();
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&mem, 1, vec![series], vec![ex]).await;
+
+        // Fail only the first GET of the `.rseg` data object (commit records
+        // end in `.cmt`, so the resolve's own reads are untouched); the retry's
+        // GET falls through to the real object.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains(".rseg")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let faulted = Arc::new(FaultStore::new(mem, plan));
+        let counter = faulted.clone();
+        let backend: Arc<dyn ObjectStoreBackend> = faulted;
+
+        let app = build_router_with_store(backend, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the re-resolve after NotFound must succeed: {body}"
+        );
+        assert_eq!(
+            body["data"][0]["exemplars"]
+                .as_array()
+                .expect("array")
+                .len(),
+            1,
+            "the exemplar is served on the retried attempt: {body}"
+        );
+        assert_eq!(
+            counter.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the injected NotFound must have fired exactly once"
+        );
     }
 
     /// F5: the ADR-0010 section 7 footer identity check. An object whose
