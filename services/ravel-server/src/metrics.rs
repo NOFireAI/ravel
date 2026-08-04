@@ -1354,7 +1354,9 @@ impl QueryAccountingMetrics {
         let mut rows = self.rows.lock();
         let acc = rows.entry((bucket, workload_class)).or_default();
         acc.queries = acc.queries.saturating_add(1);
-        acc.s3_requests = acc.s3_requests.saturating_add(accounting.total_s3_requests());
+        acc.s3_requests = acc
+            .s3_requests
+            .saturating_add(accounting.total_s3_requests());
         acc.s3_bytes = acc.s3_bytes.saturating_add(accounting.total_s3_bytes());
         acc.cache_hits = acc.cache_hits.saturating_add(accounting.cache_hits);
         acc.cache_misses = acc.cache_misses.saturating_add(accounting.cache_misses);

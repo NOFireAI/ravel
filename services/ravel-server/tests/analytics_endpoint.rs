@@ -140,9 +140,9 @@ fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, Tena
         engine: Arc::new(engine),
         tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
         clock: Arc::new(FixedClock),
-        query_accounting: Arc::new(
-            ravel_server::metrics::QueryAccountingMetrics::new(std::collections::HashSet::new()),
-        ),
+        query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
     })
 }
 

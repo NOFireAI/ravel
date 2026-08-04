@@ -30,7 +30,7 @@ use ravel_query::http::StaticBearerTokenResolver;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{SqlConfig, SqlExecutor, SqlRequest};
-use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId, TenantHash, TimeRange};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -55,7 +55,11 @@ impl Clock for FixedClock {
 /// Publish one real RSEG segment plus its commit record for `tenant`, so a
 /// `SELECT ... FROM samples` resolves and fetches real data and the accounting
 /// counters are non-trivial.
-async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, samples: &[(i64, f64)]) {
+async fn publish_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    samples: &[(i64, f64)],
+) {
     let tenant_hash = tenant.hash();
     let metric = "m";
     let label_set = LabelSet::new(vec![Label {
@@ -289,7 +293,12 @@ async fn query_accounting_reaches_response_stats_and_metrics_endpoint() {
 async fn query_result_is_byte_identical_with_and_without_accounting() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
-    publish_segment(store.as_ref(), &tenant, &[(100, 1.0), (200, 2.5), (300, 4.0)]).await;
+    publish_segment(
+        store.as_ref(),
+        &tenant,
+        &[(100, 1.0), (200, 2.5), (300, 4.0)],
+    )
+    .await;
     let h = harness(Arc::clone(&store), HashSet::new());
 
     let query = "SELECT ts, value FROM samples ORDER BY ts";
