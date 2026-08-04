@@ -59,7 +59,10 @@ use datafusion::arrow::array::RecordBatch;
 use futures::{Stream, StreamExt};
 use ravel_catalog::Snapshot;
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{
+    CostEstimate, QueryAccounting, QueryCostRecorder, QueryWorkloadClass,
+};
+use std::sync::Arc;
 use tonic::Status;
 
 use crate::error::SqlError;
@@ -85,6 +88,7 @@ pub(super) async fn statement_stream(
     tenant: TenantHash,
     ticket: FlightTicket,
     config: &FlightSqlConfig,
+    recorder: Arc<dyn QueryCostRecorder>,
 ) -> Result<DoGetStream, Status> {
     // Re-run the security gate on redemption. The statement is carried in
     // bytes a client holds, and the gate is cheap; running it again means a
@@ -117,8 +121,24 @@ pub(super) async fn statement_stream(
         })
     });
 
-    let (first, stream) = started.map_err(|err| status_from_sql(&err, tenant))?;
+    let (first, stream, accounting) = started.map_err(|err| status_from_sql(&err, tenant))?;
     let schema = stream.schema();
+
+    // Fold this RPC's execution cost into the aggregator when the result stream
+    // ends (ADR-0044 section 4, issue #425). `accounting` is the successful
+    // attempt's handle; the executing stream holds clones of it
+    // (SqlExecutor::plan_pinned), so its counters keep rising as batches are
+    // pulled. The guard snapshots it on drop -- when the client finishes the
+    // stream or drops it -- so the recorded cost covers the whole DoGet, not
+    // just the first batch. The estimate is zero here: the query's whole-query
+    // estimate was recorded at GetFlightInfo (crate::flight::service), so the
+    // two RPCs' folds sum to one estimate beside the summed actual. A DoGet
+    // that failed before this point returned above and records nothing.
+    let record_guard = RecordOnStreamEnd {
+        recorder,
+        accounting,
+        tenant,
+    };
 
     // Post-emission rule: any vanished segment from here on is terminal.
     let tail = stream.map(|item| {
@@ -149,9 +169,39 @@ pub(super) async fn statement_stream(
     let encoded = FlightDataEncoderBuilder::new()
         .with_schema(schema)
         .build(batches)
-        .map(|item| item.map_err(flight_error_to_status));
+        .map(move |item| {
+            // Owning the guard in the encoder's per-item closure ties its
+            // lifetime to the stream: when the stream is exhausted or dropped,
+            // this closure drops and the guard folds the final cost. The
+            // reference keeps the move explicit without touching the value.
+            let _keep = &record_guard;
+            item.map_err(flight_error_to_status)
+        });
 
     Ok(Box::pin(encoded))
+}
+
+/// Records a completed `DoGet`'s execution cost into the aggregator on drop,
+/// i.e. when the result stream ends or the client drops it. Holds a clone of
+/// the query's [`QueryAccounting`] handle, whose counters the executing stream
+/// keeps incrementing, so the snapshot taken here is the whole RPC's cost. The
+/// estimate is zero: the whole-query estimate was recorded once at
+/// `GetFlightInfo`.
+struct RecordOnStreamEnd {
+    recorder: Arc<dyn QueryCostRecorder>,
+    accounting: QueryAccounting,
+    tenant: TenantHash,
+}
+
+impl Drop for RecordOnStreamEnd {
+    fn drop(&mut self) {
+        self.recorder.record(
+            &self.accounting.snapshot(),
+            &CostEstimate::new(0, 0, 0, 0, 0),
+            self.tenant,
+            QueryWorkloadClass::Interactive,
+        );
+    }
 }
 
 /// Nanoseconds left before `deadline_ns`, as a duration. Never negative; the
@@ -174,7 +224,7 @@ async fn start_pinned(
     tenant: TenantHash,
     snapshot: &Snapshot,
     sql: &str,
-) -> Result<(Option<RecordBatch>, PinnedStream), SqlError> {
+) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
     // At most two passes: the original and the one retry the consistency
     // model allows.
     for attempt in 0..2u32 {
@@ -203,18 +253,20 @@ async fn first_batch(
     tenant: TenantHash,
     snapshot: &Snapshot,
     sql: &str,
-) -> Result<(Option<RecordBatch>, PinnedStream), SqlError> {
+) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
     // A fresh handle per attempt, matching `SqlExecutor::run`'s per-attempt
-    // accounting: DoGet's own execution accounting (crate::flight::service
-    // covers only its own RPC, a documented gap, see the comment there).
+    // accounting so a retried attempt's counters never bleed in. Returned to
+    // the caller so the successful attempt's cost is folded into `/metrics`
+    // once the stream ends (issue #425); `plan_pinned` clones it into the
+    // execution stream, so its counters keep rising as batches are pulled.
     let accounting = QueryAccounting::new();
     let planned = executor
         .plan_pinned(tenant, snapshot.clone(), sql, &accounting)
         .await?;
     let mut stream = planned.execute().await?;
     match stream.next().await {
-        None => Ok((None, stream)),
-        Some(Ok(batch)) => Ok((Some(batch), stream)),
+        None => Ok((None, stream, accounting)),
+        Some(Ok(batch)) => Ok((Some(batch), stream, accounting)),
         Some(Err(err)) => Err(err),
     }
 }

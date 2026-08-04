@@ -31,6 +31,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::TenantHash;
+
 /// The store operation kinds a query can be charged for. Distinct from
 /// `ravel_object_store::instrument::StoreOp`: this crate does not depend on
 /// `ravel-object-store`, and a query only ever issues gets, lists, and
@@ -262,6 +264,42 @@ impl QueryAccountingSnapshot {
     pub fn total_s3_bytes(&self) -> u64 {
         self.s3_bytes.iter().sum()
     }
+
+    /// Field-wise saturating sum of two snapshots, for one request that runs
+    /// several independently-accounted sub-queries and must report one
+    /// combined cost. The `/api/v1/series` and `/api/v1/labels` endpoints are
+    /// the case that needs it: each `match[]` selector resolves under its own
+    /// [`QueryAccounting`] handle, so the request's total cost is the sum of
+    /// the per-selector snapshots. Every accumulating counter adds, but
+    /// `peak_intermediate_bytes` takes the maximum, not the sum: it is a
+    /// high-water mark, so the peak across sub-queries is the larger of their
+    /// peaks and never their total (the same rule
+    /// [`QueryAccounting::observe_intermediate_bytes`] keeps within one query).
+    pub fn saturating_add(&self, other: &QueryAccountingSnapshot) -> QueryAccountingSnapshot {
+        let mut s3_requests = [0u64; ACCOUNTED_OP_COUNT];
+        let mut s3_bytes = [0u64; ACCOUNTED_OP_COUNT];
+        for i in 0..ACCOUNTED_OP_COUNT {
+            s3_requests[i] = self.s3_requests[i].saturating_add(other.s3_requests[i]);
+            s3_bytes[i] = self.s3_bytes[i].saturating_add(other.s3_bytes[i]);
+        }
+        QueryAccountingSnapshot {
+            s3_requests,
+            s3_bytes,
+            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
+            cache_misses: self.cache_misses.saturating_add(other.cache_misses),
+            cache_bytes: self.cache_bytes.saturating_add(other.cache_bytes),
+            decompressed_bytes: self
+                .decompressed_bytes
+                .saturating_add(other.decompressed_bytes),
+            segments_opened: self.segments_opened.saturating_add(other.segments_opened),
+            segments_pruned: self.segments_pruned.saturating_add(other.segments_pruned),
+            series_matched: self.series_matched.saturating_add(other.series_matched),
+            bytes_reused: self.bytes_reused.saturating_add(other.bytes_reused),
+            peak_intermediate_bytes: self
+                .peak_intermediate_bytes
+                .max(other.peak_intermediate_bytes),
+        }
+    }
 }
 
 /// Pre-execution cost estimate for a query, computed after `Catalog::resolve`
@@ -305,6 +343,28 @@ impl CostEstimate {
         }
     }
 
+    /// Field-wise saturating sum of two estimates, for one request whose cost
+    /// is the total of several independently-estimated sub-queries (the
+    /// multi-`match[]` metadata endpoints; see
+    /// [`QueryAccountingSnapshot::saturating_add`]). The upper envelope of a
+    /// request that runs N selectors is the sum of the N per-selector
+    /// envelopes, so every field adds.
+    pub fn saturating_add(&self, other: &CostEstimate) -> CostEstimate {
+        CostEstimate {
+            estimated_requests: self
+                .estimated_requests
+                .saturating_add(other.estimated_requests),
+            estimated_store_bytes: self
+                .estimated_store_bytes
+                .saturating_add(other.estimated_store_bytes),
+            estimated_decompressed_bytes: self
+                .estimated_decompressed_bytes
+                .saturating_add(other.estimated_decompressed_bytes),
+            segments: self.segments.saturating_add(other.segments),
+            series: self.series.saturating_add(other.series),
+        }
+    }
+
     /// Ratio of actual to estimated cost, per dimension: `actual /
     /// estimated`. A value above 1.0 means the estimate under-shot, the
     /// failure mode that matters. Dividing by a zero estimate returns
@@ -336,6 +396,78 @@ pub struct CostDivergence {
     pub requests: f64,
     pub store_bytes: f64,
     pub decompressed_bytes: f64,
+}
+
+/// How a completed query reached the engine, carried to a
+/// [`QueryCostRecorder`] so an aggregate can dimension cost by workload
+/// (ADR-0044 section 4, the `workload_class` label). A closed set:
+/// `Interactive` is a client-driven query (an HTTP or Flight SQL request);
+/// `Background` is an internally scheduled one (alert-rule evaluation). It
+/// lives here, not in the service crate that renders the label, for the same
+/// dependency reason the recorder trait does: `ravel-query` and `ravel-sql`
+/// stamp it at the call site and neither can name a `services/ravel-server`
+/// type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryWorkloadClass {
+    Interactive,
+    Background,
+}
+
+/// Sink for one completed query's cost, to be folded into a process-global
+/// aggregate exported at `/metrics` (ADR-0044 section 4). The query path owns
+/// a [`QueryAccounting`] per query and, once the response is built, hands its
+/// finished [`snapshot`](QueryAccounting::snapshot) here, so the same numbers
+/// the response reports also reach the scrape.
+///
+/// The seam lives in `ravel-types` for the same dependency reason
+/// [`QueryAccounting`] itself does: `ravel-query` and `ravel-sql` produce the
+/// accounting but cannot depend on the `services/ravel-server` crate that owns
+/// the aggregator, so the two sides meet at this trait. A caller holds an
+/// `Arc<dyn QueryCostRecorder>`; a deployment sets the real aggregator and a
+/// test or a library-only embedding uses [`NoopQueryCostRecorder`], so no call
+/// site needs an `Option` branch.
+///
+/// # An implementation must be cheap and must not block
+///
+/// [`record`](Self::record) runs on the request path, synchronously, after the
+/// response has been built but before the handler returns it. It is called
+/// once per query, never per store call, so it is off the hot per-request-I/O
+/// path; but it is still on the query's own tail latency. An implementation
+/// must do bounded, non-blocking work only: fold the counters (for example
+/// under a short mutex) and return. It must not perform I/O, `await`, sleep, or
+/// hold a lock across an await, because any stall here stalls the response the
+/// client is waiting on.
+pub trait QueryCostRecorder: Send + Sync {
+    /// Fold one finished query's actual `accounting` and its pre-execution
+    /// `estimate` into the aggregate, attributed to `tenant_hash` and
+    /// `workload_class`. Returns nothing: recording never changes the query's
+    /// result and a caller never inspects an outcome.
+    fn record(
+        &self,
+        accounting: &QueryAccountingSnapshot,
+        estimate: &CostEstimate,
+        tenant_hash: TenantHash,
+        workload_class: QueryWorkloadClass,
+    );
+}
+
+/// A [`QueryCostRecorder`] that discards every recording. It lets a query path
+/// with no aggregator configured (every test, and any library-only embedding
+/// of the routers) hold a recorder unconditionally instead of an `Option`, so
+/// each call site records without a branch. Every method is a no-op the
+/// optimizer can see through.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopQueryCostRecorder;
+
+impl QueryCostRecorder for NoopQueryCostRecorder {
+    fn record(
+        &self,
+        _accounting: &QueryAccountingSnapshot,
+        _estimate: &CostEstimate,
+        _tenant_hash: TenantHash,
+        _workload_class: QueryWorkloadClass,
+    ) {
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +574,60 @@ mod tests {
         assert_eq!(d.requests, 0.5);
         assert_eq!(d.store_bytes, 0.5);
         assert_eq!(d.decompressed_bytes, 0.5);
+    }
+
+    #[test]
+    fn snapshot_saturating_add_sums_counters_but_maxes_the_peak() {
+        let a = QueryAccounting::new();
+        a.record_s3_request(AccountedOp::Get);
+        a.add_s3_bytes(AccountedOp::Get, 100);
+        a.record_cache_hit();
+        a.observe_intermediate_bytes(500);
+        let b = QueryAccounting::new();
+        b.record_s3_request(AccountedOp::Get);
+        b.record_s3_request(AccountedOp::List);
+        b.add_s3_bytes(AccountedOp::Get, 40);
+        b.observe_intermediate_bytes(300);
+
+        let sum = a.snapshot().saturating_add(&b.snapshot());
+        assert_eq!(sum.s3_requests(AccountedOp::Get), 2, "get requests add");
+        assert_eq!(sum.s3_requests(AccountedOp::List), 1, "list requests add");
+        assert_eq!(sum.s3_bytes(AccountedOp::Get), 140, "get bytes add");
+        assert_eq!(sum.cache_hits, 1);
+        assert_eq!(
+            sum.peak_intermediate_bytes, 500,
+            "peak is the max of the two peaks, never their sum"
+        );
+    }
+
+    #[test]
+    fn estimate_saturating_add_sums_every_field() {
+        let a = CostEstimate::new(3, 100, 50, 2, 4);
+        let b = CostEstimate::new(1, 20, 5, 1, 3);
+        let sum = a.saturating_add(&b);
+        assert_eq!(sum.estimated_requests, 4);
+        assert_eq!(sum.estimated_store_bytes, 120);
+        assert_eq!(sum.estimated_decompressed_bytes, 55);
+        assert_eq!(sum.segments, 3);
+        assert_eq!(sum.series, 7);
+    }
+
+    #[test]
+    fn noop_recorder_is_object_safe_and_records_nothing_observable() {
+        // Holding the recorder as a trait object is the object-safety check:
+        // the whole seam exists to be an `Arc<dyn QueryCostRecorder>`.
+        let recorder: Arc<dyn QueryCostRecorder> = Arc::new(NoopQueryCostRecorder);
+        let acc = QueryAccounting::new();
+        acc.record_s3_request(AccountedOp::Get);
+        // The no-op consumes the snapshot and returns; there is nothing to
+        // assert but that this compiles and does not panic. The value is the
+        // object-safe call itself.
+        recorder.record(
+            &acc.snapshot(),
+            &CostEstimate::new(1, 2, 3, 4, 5),
+            TenantHash([7u8; 16]),
+            QueryWorkloadClass::Interactive,
+        );
     }
 
     #[test]

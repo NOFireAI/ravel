@@ -663,12 +663,22 @@ A query reports what it spent on object storage to the client that ran it.
 An operator can then see cost per tenant and per workload, and never reads
 a query's text to do it.
 
-**Coverage is partial in this release.** Only `POST /api/v1/sql` and
-`POST /api/v1/analytics` fold their cost into `GET /metrics`. The
-Prometheus-shaped and the Flight SQL paths report their cost in the
-response only. Their cost is missing from the `ravel_query_*` family
-below. Issue #425 tracks the remaining work. Read every `/metrics` number
-below as SQL and analytics traffic, not as all query traffic.
+**Coverage is complete for read queries.** Every read surface folds its
+cost into `GET /metrics`. This covers `POST /api/v1/sql` and
+`POST /api/v1/analytics`. This covers the Prometheus-shaped
+`GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`, and
+`GET /api/v1/series`. This covers every Flight SQL request. Read each
+`ravel_query_*` number below as all read traffic. A Flight SQL statement
+records two folds. The plan request records the first fold. The fetch
+request records the second fold. The two folds sum to one whole-query
+estimate beside the summed whole-query actual.
+
+A Flight fetch records when its result stream ends. A client that
+disconnects after the first batch still ends the stream, so its partial
+cost is recorded and counts as one query. This is deliberate: the bytes
+were spent, and the alternative is to lose them. An unusually low
+cost-per-query ratio on the Flight path can therefore mean early client
+disconnects rather than cheap queries.
 
 **In the response.** `POST /api/v1/sql` and `POST /api/v1/analytics` add a
 `stats` object beside `data`, carrying this query's `accounting` (the

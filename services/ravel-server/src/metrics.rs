@@ -54,7 +54,9 @@ use ravel_object_store::instrument::{
     LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT, StoreErrorClass, StoreMetricsSnapshot,
     StoreOp,
 };
-use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot};
+use ravel_types::accounting::{
+    CostEstimate, QueryAccountingSnapshot, QueryCostRecorder, QueryWorkloadClass,
+};
 use ravel_types::{Signal, TenantHash};
 
 use crate::config::Mode;
@@ -1432,6 +1434,36 @@ impl QueryAccountingMetrics {
                 .then_with(|| a.workload_class.name().cmp(b.workload_class.name()))
         });
         out
+    }
+}
+
+/// The recorder seam (ADR-0044 section 4, issue #425): this is what lets the
+/// Prometheus-shaped query handlers in `ravel-query` and the Flight SQL path in
+/// `ravel-sql` fold their per-query cost into this process-global aggregator
+/// without depending on `services/ravel-server`. Both hold an
+/// `Arc<dyn QueryCostRecorder>`; a deployment hands them this type, so all four
+/// read surfaces (PromQL instant/range, PromQL labels/series, Flight SQL, and
+/// the HTTP SQL and analytics paths wired in `sql.rs`/`analytics.rs`) sum into
+/// one `ravel_query_*` family.
+///
+/// The fold is bounded and non-blocking, as the trait requires: it maps the
+/// bounded workload class and takes the row mutex briefly in
+/// [`QueryAccountingMetrics::record`].
+impl QueryCostRecorder for QueryAccountingMetrics {
+    fn record(
+        &self,
+        accounting: &QueryAccountingSnapshot,
+        estimate: &CostEstimate,
+        tenant_hash: TenantHash,
+        workload_class: QueryWorkloadClass,
+    ) {
+        let workload = match workload_class {
+            QueryWorkloadClass::Interactive => WorkloadClass::Interactive,
+            QueryWorkloadClass::Background => WorkloadClass::Background,
+        };
+        // Fully qualified so this resolves to the inherent fold method, not this
+        // very trait method, which shares its name.
+        QueryAccountingMetrics::record(self, tenant_hash, workload, accounting, estimate);
     }
 }
 

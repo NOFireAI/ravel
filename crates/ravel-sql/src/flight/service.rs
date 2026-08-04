@@ -40,7 +40,7 @@ use prost::Message;
 use ravel_maintain::{QueryStatus, write_query_audit};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{QueryAccounting, QueryCostRecorder, QueryWorkloadClass};
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
@@ -86,6 +86,14 @@ pub struct RavelFlightSqlService {
     /// Shared with the HTTP endpoint's own store handle in a process that runs
     /// both, exactly as `executor` is.
     store: Arc<dyn ObjectStoreBackend>,
+    /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
+    /// #425). Each Flight statement folds its cost into it: `GetFlightInfo`
+    /// records the resolve-and-plan cost with the query's estimate, and `DoGet`
+    /// records its execution cost when the result stream ends. Shared with the
+    /// PromQL and HTTP SQL paths through one instance per process, so all the
+    /// read surfaces sum into one `ravel_query_*` family. Defaults to the no-op
+    /// so an embedding with no aggregator needs no branch.
+    recorder: Arc<dyn QueryCostRecorder>,
 }
 
 impl RavelFlightSqlService {
@@ -105,6 +113,7 @@ impl RavelFlightSqlService {
         clock: Arc<dyn FlightClock>,
         config: FlightSqlConfig,
         store: Arc<dyn ObjectStoreBackend>,
+        recorder: Arc<dyn QueryCostRecorder>,
     ) -> Self {
         let mut ticket_key = TicketKey::default();
         rand::rng().fill_bytes(&mut ticket_key);
@@ -115,6 +124,7 @@ impl RavelFlightSqlService {
             config,
             ticket_key,
             store,
+            recorder,
         }
     }
 
@@ -253,14 +263,17 @@ impl FlightSqlService for RavelFlightSqlService {
         // Step 2: resolve exactly once. This snapshot, and only this
         // snapshot, is what DoGet will execute against (review F18).
         //
-        // This accounting handle covers only this RPC's resolve and logical
-        // plan; DoGet (crate::flight::stream) builds its own for the
-        // execution it runs, so a Flight SQL statement's accounting is split
-        // across two handles rather than unified across the two RPCs like
-        // the HTTP path's single `SqlExecutor::execute` call. Known,
-        // documented gap (ADR-0044); not fixed by this ticket.
+        // This accounting handle covers this RPC's resolve and logical plan.
+        // DoGet (crate::flight::stream) builds its own handle for the execution
+        // it runs, so a Flight SQL statement's cost is recorded as two folds,
+        // one per RPC (ADR-0044's documented two-handle split): the resolve and
+        // plan cost here, the execution cost there. Both now reach `/metrics`
+        // (issue #425). The `estimate` is this query's whole-query upper
+        // envelope, so it is recorded once, here, against this RPC's actual;
+        // DoGet records its actual with a zero estimate so the two folds sum to
+        // one whole-query estimate beside the summed whole-query actual.
         let accounting = QueryAccounting::new();
-        let (snapshot, _estimate) = self
+        let (snapshot, estimate) = self
             .executor
             .resolve_snapshot(tenant, &req, &accounting)
             .await
@@ -283,6 +296,18 @@ impl FlightSqlService for RavelFlightSqlService {
             .map_err(|err| status_from_sql(&err, tenant))?;
         let schema = planned.schema();
         drop(planned);
+
+        // Fold this RPC's resolve-and-plan cost, with the query's estimate, into
+        // the process aggregator (ADR-0044 section 4, issue #425). Recorded here,
+        // after planning succeeds, so a statement rejected at resolve or plan
+        // records nothing, the same rule the HTTP paths follow. DoGet folds the
+        // execution cost separately.
+        self.recorder.record(
+            &accounting.snapshot(),
+            &estimate,
+            tenant,
+            QueryWorkloadClass::Interactive,
+        );
 
         let ticket = FlightTicket {
             tenant,
@@ -372,6 +397,7 @@ impl FlightSqlService for RavelFlightSqlService {
             tenant,
             decoded,
             &self.config,
+            Arc::clone(&self.recorder),
         )
         .await;
         let status = match &result {

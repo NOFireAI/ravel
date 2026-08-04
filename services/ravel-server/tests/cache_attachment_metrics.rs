@@ -22,7 +22,7 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::http::{AppState, StaticBearerTokenResolver, router};
+use ravel_query::http::{StaticBearerTokenResolver, router};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::Cli;
 use ravel_server::query::{build_app_state, build_catalog};
@@ -172,11 +172,11 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache.clone()),
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
     );
-    let app: Router = router(AppState {
-        engine: state.engine,
-        tenant_resolver: state.tenant_resolver,
-    });
+    let app: Router = router(state);
 
     let query = encode_query_param("http_requests_total");
     let uri = format!(

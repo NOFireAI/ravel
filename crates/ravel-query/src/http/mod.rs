@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::get;
+use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
 
 pub use error::{MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, QueryErrorResponse};
 pub use tenant::{
@@ -24,13 +25,43 @@ use crate::QueryEngine;
 
 const ONE_HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
 
-/// Shared state for every route: the query engine and the tenant
-/// resolution strategy. There is no `Default`: callers must pick a
-/// `TenantResolver` explicitly (default-deny, docs/query-engine.md).
+/// Shared state for every route: the query engine, the tenant resolution
+/// strategy, and the per-query cost recorder. There is no `Default`: callers
+/// must pick a `TenantResolver` explicitly (default-deny, docs/query-engine.md).
+///
+/// Construct with [`AppState::new`], which defaults the cost recorder to the
+/// no-op, so a caller that mounts the router without a `/metrics` aggregator,
+/// and every test, needs no recorder of its own. A deployment attaches a real
+/// one with [`AppState::with_cost_recorder`].
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<QueryEngine>,
     pub tenant_resolver: Arc<dyn TenantResolver>,
+    /// Records each completed query's cost (its accounting snapshot and its
+    /// pre-execution estimate) into a process aggregate exported at `/metrics`
+    /// (ADR-0044 section 4, issue #425). Defaults to
+    /// [`NoopQueryCostRecorder`]; a deployment sets the real aggregator so the
+    /// Prometheus-shaped read paths fold into `/metrics` like the SQL path
+    /// does.
+    pub cost_recorder: Arc<dyn QueryCostRecorder>,
+}
+
+impl AppState {
+    /// State with the given engine and resolver and a no-op cost recorder.
+    pub fn new(engine: Arc<QueryEngine>, tenant_resolver: Arc<dyn TenantResolver>) -> Self {
+        AppState {
+            engine,
+            tenant_resolver,
+            cost_recorder: Arc::new(NoopQueryCostRecorder),
+        }
+    }
+
+    /// Set the recorder every completed query folds its cost into. Returns
+    /// `self` so it chains off [`AppState::new`].
+    pub fn with_cost_recorder(mut self, cost_recorder: Arc<dyn QueryCostRecorder>) -> Self {
+        self.cost_recorder = cost_recorder;
+        self
+    }
 }
 
 /// Builds the Prometheus-compatible query API router. The caller is
