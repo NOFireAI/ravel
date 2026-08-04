@@ -92,6 +92,9 @@ use ravel_query::{QueryEngine, QueryError};
 use ravel_types::{CommitToken, LabelSet, Sample, TenantHash};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::Instrument;
+
+use crate::metrics::WorkloadClass;
 
 /// Cap on the request body. The analytics request is a query plus a few scalar
 /// parameters, never large in legitimate use; this mirrors the defensive bound
@@ -113,6 +116,11 @@ pub struct AnalyticsState {
     pub engine: Arc<QueryEngine>,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     pub clock: Arc<dyn Clock>,
+    /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
+    /// #425). The analytics endpoint runs the same range evaluation
+    /// `/api/v1/query_range` does, so its accounting folds into `/metrics`
+    /// exactly like a range query's would.
+    pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
 }
 
 /// The `/api/v1/analytics` router.
@@ -216,7 +224,20 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
     }
 
     let now_ns = state.clock.now_ns();
-    let (value, _stats) = state
+
+    // A request-level span carrying only bounded values (ADR-0044 section 5):
+    // the tenant hash, the workload class, and -- once the range evaluation
+    // finishes -- the final store request and byte counts. No query text, label
+    // values, or object keys ever become span fields. An analytics call is an
+    // interactive, client-driven query.
+    let span = tracing::info_span!(
+        "analytics_query",
+        tenant_hash = %tenant_hash.to_hex(),
+        workload_class = WorkloadClass::Interactive.name(),
+        s3_requests = tracing::field::Empty,
+        s3_bytes = tracing::field::Empty,
+    );
+    let (value, stats) = state
         .engine
         .range_with_stats(
             tenant_hash,
@@ -228,8 +249,22 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
             now_ns,
             deadline,
         )
+        .instrument(span.clone())
         .await
         .map_err(ApiError::from_query)?;
+
+    // Fold this query's actual cost and its pre-execution estimate into the
+    // process-global aggregator for `/metrics` (ADR-0044 section 4) and record
+    // the final counts on the span.
+    span.record("s3_requests", stats.accounting.total_s3_requests());
+    span.record("s3_bytes", stats.accounting.total_s3_bytes());
+    state.query_accounting.record(
+        tenant_hash,
+        WorkloadClass::Interactive,
+        &stats.accounting,
+        &stats.estimate,
+    );
+    let stats_json = crate::query::accounting_stats_json(&stats.accounting, &stats.estimate);
 
     let matrix = match value {
         Value::Matrix(matrix) => matrix,
@@ -260,6 +295,9 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
                 "resultType": "analytics",
                 "result": result,
             },
+            // Beside `data`, the "stats object beside data" shape
+            // `/api/v1/query_exemplars` uses (ADR-0044, issue #425).
+            "stats": stats_json,
         })),
     )
         .into_response())

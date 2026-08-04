@@ -183,6 +183,9 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         store,
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache.clone()),
+        Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
     )
     .expect("sql state");
     let app = ravel_server::sql::router(sql_state);

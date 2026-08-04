@@ -8,6 +8,52 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::http::{AppState, TenantResolver};
 use ravel_query::{CacheFetchError, EngineConfig, QueryEngine};
+use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
+
+/// The per-query `stats` object attached beside a query response's data
+/// (issue #425, ADR-0044 sections 1 and 3): this query's actual accounting
+/// counters and its pre-execution cost estimate, rendered as camelCase JSON to
+/// match the field names `ravel-query`'s PromQL `stats.accounting`/`stats.estimate`
+/// already use (crates/ravel-query/src/http/json.rs).
+///
+/// It deliberately omits the `rawF64Pages`/`rawF64Bytes` and
+/// `segmentsFetched`/`segmentsPruned` fields the PromQL shape carries: those
+/// come from `ravel-query`'s internal per-segment `FetchStats`/`QueryStats`,
+/// which the SQL executor's `SqlOutcome` and the analytics range call do not
+/// surface. The accounting snapshot and the cost estimate are the shape every
+/// query path can supply, so both server-owned handlers report exactly that,
+/// and the divergence between the estimate and the actual stays computable from
+/// the response as well as from `/metrics`.
+pub fn accounting_stats_json(
+    accounting: &QueryAccountingSnapshot,
+    estimate: &CostEstimate,
+) -> serde_json::Value {
+    serde_json::json!({
+        "accounting": {
+            "s3GetRequests": accounting.s3_requests(AccountedOp::Get),
+            "s3GetBytes": accounting.s3_bytes(AccountedOp::Get),
+            "s3ListRequests": accounting.s3_requests(AccountedOp::List),
+            "s3ListBytes": accounting.s3_bytes(AccountedOp::List),
+            "s3HeadRequests": accounting.s3_requests(AccountedOp::Head),
+            "s3HeadBytes": accounting.s3_bytes(AccountedOp::Head),
+            "cacheHits": accounting.cache_hits,
+            "cacheMisses": accounting.cache_misses,
+            "cacheBytes": accounting.cache_bytes,
+            "decompressedBytes": accounting.decompressed_bytes,
+            "segmentsOpened": accounting.segments_opened,
+            "seriesMatched": accounting.series_matched,
+            "bytesReused": accounting.bytes_reused,
+            "peakIntermediateBytes": accounting.peak_intermediate_bytes,
+        },
+        "estimate": {
+            "estimatedRequests": estimate.estimated_requests,
+            "estimatedStoreBytes": estimate.estimated_store_bytes,
+            "estimatedDecompressedBytes": estimate.estimated_decompressed_bytes,
+            "segments": estimate.segments,
+            "series": estimate.series,
+        },
+    })
+}
 
 /// Builds the shared [`Catalog`] used both for query resolve and for the
 /// background fold task (docs/metric-index-plan.md section 4): one instance
@@ -69,6 +115,7 @@ pub fn build_sql_state(
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<Arc<Cache<CacheFetchError>>>,
+    query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SqlConfig, SqlExecutor};
@@ -99,5 +146,6 @@ pub fn build_sql_state(
         store,
         clock: Arc::new(ravel_ingest::SystemClock),
         max_deadline,
+        query_accounting,
     })
 }

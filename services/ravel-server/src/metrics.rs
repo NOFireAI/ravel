@@ -34,6 +34,7 @@
 //! from [`render`]; it does not mean reshaping [`Label`] or the escaping and
 //! line-writing helpers below.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::Router;
@@ -53,20 +54,28 @@ use ravel_object_store::instrument::{
     LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT, StoreErrorClass, StoreMetricsSnapshot,
     StoreOp,
 };
+use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot};
 use ravel_types::{Signal, TenantHash};
 
 use crate::config::Mode;
 
-/// Reserved for future query-classification series (issue #425); no sample
-/// this module renders uses it yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a query reached the engine, the `workload_class` label on the
+/// per-query cost family (issue #425, ADR-0044 section 4). A closed set:
+/// `interactive` is a client-driven HTTP or Flight query, `background` is an
+/// internally scheduled query (alert-rule evaluation). Bounded like every
+/// other label here, so it can dimension the query-cost series without
+/// unbounding cardinality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkloadClass {
     Interactive,
     Background,
 }
 
 impl WorkloadClass {
-    fn name(self) -> &'static str {
+    /// The `workload_class` label value and the span-field spelling; public so
+    /// query handlers can stamp the same bounded string on their request span
+    /// (ADR-0044 section 5) that this module renders on `/metrics`.
+    pub fn name(self) -> &'static str {
         match self {
             WorkloadClass::Interactive => "interactive",
             WorkloadClass::Background => "background",
@@ -1254,6 +1263,300 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
     }
 }
 
+/// One (tenant bucket, workload class) row's accumulated per-query cost
+/// counters (issue #425, ADR-0044 section 1 and 3). Both the actuals summed
+/// from each query's [`QueryAccountingSnapshot`] and the estimates summed from
+/// each query's [`CostEstimate`] live here side by side, but they render as
+/// separate metric families ([`render_query_family`]): the estimate never
+/// replaces the actual, so their divergence stays directly measurable (ADR-0044
+/// section 3, "the estimate's accuracy is itself a measurable quantity").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryCostCounters {
+    /// Queries that recorded accounting into this row (the denominator an
+    /// operator divides the sums by for a per-query average).
+    pub queries: u64,
+    pub s3_requests: u64,
+    pub s3_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub decompressed_bytes: u64,
+    pub estimated_requests: u64,
+    pub estimated_store_bytes: u64,
+    pub estimated_decompressed_bytes: u64,
+}
+
+/// One rendered row of the per-query cost family: the (tenant bucket, workload
+/// class) key plus its accumulated [`QueryCostCounters`]. `tenant` is `None`
+/// for the folded `other` bucket and `Some(hash)` for a configured tenant, the
+/// same convention [`tenant_label`] renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryAccountingRow {
+    pub tenant: Option<TenantHash>,
+    pub workload_class: WorkloadClass,
+    pub counters: QueryCostCounters,
+}
+
+/// Process-global aggregator for per-query cost accounting (ADR-0044 section
+/// 4), written once per completed query by every query handler and read at
+/// scrape time by [`metrics_handler`]. One instance per process, shared with
+/// each query path's handler state, so it is the query analogue of the
+/// process-global `StoreMetrics`.
+///
+/// # Bounded cardinality by a record-time fold
+///
+/// The `configured` set is the per-tenant allowlist ADR-0044 section 4 names:
+/// a query for a tenant in it records under that tenant's real `tenant_hash`;
+/// every other tenant folds into the shared `other` bucket *at record time*,
+/// so an unconfigured tenant can never allocate a new row no matter how much
+/// traffic it drives. Cardinality is therefore bounded by
+/// `(configured.len() + 1) * WorkloadClass` regardless of how many distinct
+/// tenants query, which is the whole point of the allowlist. The set is empty
+/// unless `--metrics-tenant-labels` is set (ADR-0051 section 6): on this
+/// unauthenticated route a real `tenant_hash` discloses one tenant's query
+/// volumes, so per-tenant query series are gated on the same operator opt-in
+/// the admission family's are (ADR-0044 consequences, "blocked on an
+/// authentication decision").
+#[derive(Debug)]
+pub struct QueryAccountingMetrics {
+    configured: HashSet<TenantHash>,
+    rows: parking_lot::Mutex<HashMap<(Option<TenantHash>, WorkloadClass), QueryCostCounters>>,
+}
+
+impl QueryAccountingMetrics {
+    /// A new aggregator whose per-tenant allowlist is `configured`; every
+    /// tenant outside it folds into `other`. Pass an empty set for the
+    /// cardinality-safe default (every tenant folds).
+    pub fn new(configured: HashSet<TenantHash>) -> Self {
+        QueryAccountingMetrics {
+            configured,
+            rows: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Fold one completed query's actual counters and its pre-execution
+    /// estimate into the (tenant bucket, workload class) row. Called once per
+    /// query, off the hot per-store-call path, so a plain mutex is cheaper
+    /// than a fixed atomic block that could not key on an open tenant set.
+    pub fn record(
+        &self,
+        tenant_hash: TenantHash,
+        workload_class: WorkloadClass,
+        accounting: &QueryAccountingSnapshot,
+        estimate: &CostEstimate,
+    ) {
+        // The fold that bounds cardinality: a non-configured tenant keys to
+        // `None` (the `other` bucket) here, at record time, so it never
+        // allocates a row of its own.
+        let bucket = self
+            .configured
+            .contains(&tenant_hash)
+            .then_some(tenant_hash);
+        let mut rows = self.rows.lock();
+        let acc = rows.entry((bucket, workload_class)).or_default();
+        acc.queries = acc.queries.saturating_add(1);
+        acc.s3_requests = acc.s3_requests.saturating_add(accounting.total_s3_requests());
+        acc.s3_bytes = acc.s3_bytes.saturating_add(accounting.total_s3_bytes());
+        acc.cache_hits = acc.cache_hits.saturating_add(accounting.cache_hits);
+        acc.cache_misses = acc.cache_misses.saturating_add(accounting.cache_misses);
+        acc.decompressed_bytes = acc
+            .decompressed_bytes
+            .saturating_add(accounting.decompressed_bytes);
+        acc.estimated_requests = acc
+            .estimated_requests
+            .saturating_add(estimate.estimated_requests);
+        acc.estimated_store_bytes = acc
+            .estimated_store_bytes
+            .saturating_add(estimate.estimated_store_bytes);
+        acc.estimated_decompressed_bytes = acc
+            .estimated_decompressed_bytes
+            .saturating_add(estimate.estimated_decompressed_bytes);
+    }
+
+    /// A stable-ordered copy of every observed row, for rendering. Order by
+    /// tenant label then workload class name so scrapes and test assertions
+    /// stay diffable (a `HashMap` iterates in an unspecified order), matching
+    /// [`render_admission_family`]'s discipline.
+    pub fn snapshot(&self) -> Vec<QueryAccountingRow> {
+        let rows = self.rows.lock();
+        let mut out: Vec<QueryAccountingRow> = rows
+            .iter()
+            .map(|((tenant, workload_class), counters)| QueryAccountingRow {
+                tenant: *tenant,
+                workload_class: *workload_class,
+                counters: *counters,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            tenant_label(a.tenant)
+                .value()
+                .cmp(&tenant_label(b.tenant).value())
+                .then_with(|| a.workload_class.name().cmp(b.workload_class.name()))
+        });
+        out
+    }
+}
+
+/// The per-query cost family (issue #425, ADR-0044 section 4). Every sample
+/// carries `mode`, `tenant_hash`, and `workload_class`, all closed or
+/// allowlist-bounded (see [`QueryAccountingMetrics`] for the tenant fold). The
+/// estimate series (`*_estimated_*`) render beside the actuals under distinct
+/// names, never in place of them, so `estimated_requests / s3_requests` and the
+/// like are computable in PromQL: ADR-0044 section 3 asks for both precisely so
+/// the estimate's divergence from the actual is measurable before a later ADR
+/// enforces on it.
+fn render_query_family(out: &mut String, mode: Mode, rows: &[QueryAccountingRow]) {
+    fn labels(mode: Mode, row: &QueryAccountingRow) -> [Label; 3] {
+        [
+            Label::Mode(mode),
+            Label::TenantHash(tenant_label(row.tenant)),
+            Label::WorkloadClass(row.workload_class),
+        ]
+    }
+
+    write_header(
+        out,
+        "ravel_query_queries_total",
+        "Completed queries that reported cost accounting, by tenant and workload class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_queries_total",
+            &labels(mode, row),
+            row.counters.queries,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_s3_requests_total",
+        "Actual object-store requests issued by accounted queries, by tenant and workload class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_s3_requests_total",
+            &labels(mode, row),
+            row.counters.s3_requests,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_s3_bytes_total",
+        "Actual object-store bytes transferred by accounted queries, by tenant and workload class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_s3_bytes_total",
+            &labels(mode, row),
+            row.counters.s3_bytes,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_cache_hits_total",
+        "In-process read-cache hits attributed to accounted queries, by tenant and workload class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_cache_hits_total",
+            &labels(mode, row),
+            row.counters.cache_hits,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_cache_misses_total",
+        "In-process read-cache misses attributed to accounted queries, by tenant and workload \
+         class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_cache_misses_total",
+            &labels(mode, row),
+            row.counters.cache_misses,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_decompressed_bytes_total",
+        "Actual decompressed sample bytes decoded by accounted queries, by tenant and workload \
+         class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_decompressed_bytes_total",
+            &labels(mode, row),
+            row.counters.decompressed_bytes,
+        );
+    }
+
+    // The estimate families: separate names from the actuals above, per
+    // ADR-0044 section 3. An estimate that silently replaced the actual would
+    // defeat the reason the ADR records both.
+    write_header(
+        out,
+        "ravel_query_estimated_requests_total",
+        "Pre-execution upper-envelope estimate of object-store requests, summed over accounted \
+         queries, by tenant and workload class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_estimated_requests_total",
+            &labels(mode, row),
+            row.counters.estimated_requests,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_estimated_store_bytes_total",
+        "Pre-execution upper-envelope estimate of object-store bytes, summed over accounted \
+         queries, by tenant and workload class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_estimated_store_bytes_total",
+            &labels(mode, row),
+            row.counters.estimated_store_bytes,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_estimated_decompressed_bytes_total",
+        "Pre-execution upper-envelope estimate of decompressed sample bytes, summed over accounted \
+         queries, by tenant and workload class.",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_query_estimated_decompressed_bytes_total",
+            &labels(mode, row),
+            row.counters.estimated_decompressed_bytes,
+        );
+    }
+}
+
 /// Render every source this module knows about into one Prometheus text
 /// exposition document. `ingest` is empty in a mode that builds no ingest
 /// router (`Mode::Query`, `Mode::Maintain`): those families are omitted
@@ -1278,6 +1581,7 @@ pub fn render(
     maintain_safety: Option<&MaintenanceSafetySnapshot>,
     cache: Option<&CacheMetricsSnapshot>,
     admission: &AdmissionCountersSnapshot,
+    query_accounting: &[QueryAccountingRow],
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -1301,6 +1605,7 @@ pub fn render(
         render_cache_family(&mut out, mode, snapshot);
     }
     render_admission_family(&mut out, mode, admission);
+    render_query_family(&mut out, mode, query_accounting);
     out
 }
 
@@ -1335,6 +1640,10 @@ pub struct MetricsState {
     /// each observed tenant's real hash. Off keeps the exposition's cardinality
     /// bounded regardless of tenant count, which is why it is opt-in.
     pub metrics_tenant_labels: bool,
+    /// The process-global per-query cost aggregator (issue #425, ADR-0044
+    /// section 4), written by every query handler and read here at scrape time.
+    /// Always present; renders no samples until a query records into it.
+    pub query_accounting: Arc<QueryAccountingMetrics>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -1407,6 +1716,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         tenant_labels: state.metrics_tenant_labels,
     };
 
+    // Per-query cost rows, read at scrape time like every other family (a
+    // lock-and-copy, no `.await`).
+    let query_rows = state.query_accounting.snapshot();
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -1416,6 +1729,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         maintain_safety_snapshot.as_ref(),
         cache_snapshot.as_ref(),
         &admission_snapshot,
+        &query_rows,
     );
     (
         StatusCode::OK,
@@ -1478,6 +1792,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(
@@ -1594,6 +1909,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -1741,6 +2057,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(
@@ -1760,6 +2077,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -1811,6 +2129,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(
@@ -1848,6 +2167,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(
@@ -1893,6 +2213,7 @@ mod tests {
             Some(&snapshot),
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(
@@ -1957,6 +2278,7 @@ mod tests {
             Some(&snapshot),
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         for line in body.lines() {
@@ -2005,6 +2327,7 @@ mod tests {
             None,
             Some(&snapshot),
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(
@@ -2049,6 +2372,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         assert!(
@@ -2122,6 +2446,7 @@ mod tests {
             None,
             None,
             &snapshot,
+            &[],
         );
 
         assert_eq!(
@@ -2185,6 +2510,7 @@ mod tests {
             None,
             None,
             &snapshot,
+            &[],
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -2223,6 +2549,221 @@ mod tests {
                 hashes[2]
             )),
             "series_cap rejection must render distinctly:\n{body}"
+        );
+    }
+
+    // --- Issue #425: the per-query cost family ---
+
+    use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot};
+
+    fn tenant_hash(name: &str) -> TenantHash {
+        ravel_types::TenantId::new(name).hash()
+    }
+
+    /// An accounting snapshot with distinct, non-zero, easily-recognized
+    /// counter values so a summed render can be checked against them.
+    fn accounting(get_requests: u64, get_bytes: u64, decompressed: u64) -> QueryAccountingSnapshot {
+        QueryAccountingSnapshot {
+            s3_requests: [get_requests, 0, 0],
+            s3_bytes: [get_bytes, 0, 0],
+            decompressed_bytes: decompressed,
+            ..QueryAccountingSnapshot::default()
+        }
+    }
+
+    fn render_query_only(metrics: &QueryAccountingMetrics) -> String {
+        render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &metrics.snapshot(),
+        )
+    }
+
+    /// Every distinct `tenant_hash` value across the `ravel_query_*` lines.
+    fn query_tenant_hashes(body: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for line in body.lines() {
+            if !line.starts_with("ravel_query_") {
+                continue;
+            }
+            let brace = line.find('{').expect("query sample carries labels");
+            let labels = &line[brace + 1..line.find('}').expect("closed label block")];
+            for pair in labels.split(',') {
+                if let Some(value) = pair.strip_prefix("tenant_hash=\"") {
+                    out.insert(value.trim_end_matches('"').to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// THE FOLD TEST (issue #425 deliverable 2). With no tenant configured
+    /// (the safe default), every tenant's per-query cost folds into
+    /// `tenant_hash="other"` *at record time*, so an unconfigured tenant can
+    /// never allocate a new series no matter how many distinct tenants query.
+    /// Asserts the label *set*, not only the values, so a later change that
+    /// leaked a raw hash onto this route would fail here.
+    #[test]
+    fn query_family_folds_every_unconfigured_tenant_to_other() {
+        let metrics = QueryAccountingMetrics::new(HashSet::new());
+        // 50 distinct tenants, all unconfigured.
+        for i in 0..50 {
+            metrics.record(
+                tenant_hash(&format!("tenant-{i}")),
+                WorkloadClass::Interactive,
+                &accounting(2, 100, 10),
+                &CostEstimate::new(3, 200, 20, 1, 1),
+            );
+        }
+        let body = render_query_only(&metrics);
+
+        assert_eq!(
+            query_tenant_hashes(&body),
+            HashSet::from(["other".to_string()]),
+            "50 unconfigured tenants must collapse to exactly tenant_hash=\"other\":\n{body}"
+        );
+
+        // The label set on every query sample is exactly {mode, tenant_hash,
+        // workload_class} -- never a raw per-tenant dimension beyond the fold.
+        for line in body.lines() {
+            if !line.starts_with("ravel_query_") {
+                continue;
+            }
+            let brace = line.find('{').expect("query sample carries labels");
+            let labels = &line[brace + 1..line.find('}').expect("closed label block")];
+            let keys: Vec<&str> = labels
+                .split(',')
+                .map(|pair| pair.split_once('=').expect("label is key=value").0)
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["mode", "tenant_hash", "workload_class"],
+                "query cost sample carries an unexpected label set: {line}"
+            );
+        }
+
+        // The fold sums: one `other` series carries every query's contribution
+        // (50 queries, 50*2 requests, 50*100 bytes).
+        assert!(
+            body.contains(
+                "ravel_query_queries_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 workload_class=\"interactive\"} 50"
+            ),
+            "folded query count must sum across tenants:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_query_s3_requests_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 workload_class=\"interactive\"} 100"
+            ),
+            "folded request counter must sum across tenants:\n{body}"
+        );
+    }
+
+    /// A configured tenant keeps its own `tenant_hash`; an unconfigured one
+    /// beside it still folds into `other`. Proves the allowlist is per-tenant,
+    /// not all-or-nothing.
+    #[test]
+    fn query_family_renders_configured_tenant_and_folds_the_rest() {
+        let configured = tenant_hash("configured");
+        let metrics = QueryAccountingMetrics::new(HashSet::from([configured]));
+        metrics.record(
+            configured,
+            WorkloadClass::Interactive,
+            &accounting(1, 10, 5),
+            &CostEstimate::new(2, 20, 10, 1, 1),
+        );
+        metrics.record(
+            tenant_hash("unconfigured"),
+            WorkloadClass::Interactive,
+            &accounting(4, 40, 20),
+            &CostEstimate::new(8, 80, 40, 1, 1),
+        );
+        let body = render_query_only(&metrics);
+
+        assert_eq!(
+            query_tenant_hashes(&body),
+            HashSet::from([configured.to_hex(), "other".to_string()]),
+            "the configured tenant keeps its hash; the other folds to \"other\":\n{body}"
+        );
+    }
+
+    /// The estimate and the actual render as SEPARATE, differently-named
+    /// series (issue #425 deliverable 3, ADR-0044 section 3), so their
+    /// divergence is directly measurable. A single query with a deliberately
+    /// higher estimate than actual proves neither replaced the other.
+    #[test]
+    fn query_family_estimate_and_actual_are_separate_series() {
+        let metrics = QueryAccountingMetrics::new(HashSet::new());
+        metrics.record(
+            tenant_hash("t"),
+            WorkloadClass::Interactive,
+            &accounting(7, 700, 70),
+            &CostEstimate::new(9, 900, 90, 1, 1),
+        );
+        let body = render_query_only(&metrics);
+
+        // Actual: 7 requests.
+        assert!(
+            body.contains(
+                "ravel_query_s3_requests_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 workload_class=\"interactive\"} 7"
+            ),
+            "actual request series missing or wrong:\n{body}"
+        );
+        // Estimate: 9 requests, under a distinct metric name.
+        assert!(
+            body.contains(
+                "ravel_query_estimated_requests_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 workload_class=\"interactive\"} 9"
+            ),
+            "estimate request series missing, wrong, or collapsed onto the actual:\n{body}"
+        );
+        // The two names are genuinely distinct families in the output.
+        assert!(
+            body.contains("# TYPE ravel_query_s3_requests_total counter")
+                && body.contains("# TYPE ravel_query_estimated_requests_total counter"),
+            "estimate and actual must each declare their own TYPE line:\n{body}"
+        );
+    }
+
+    /// A `background` (alert-evaluation) query and an `interactive` one for the
+    /// same tenant bucket stay distinct rows, so the workload split is real.
+    #[test]
+    fn query_family_splits_interactive_from_background() {
+        let metrics = QueryAccountingMetrics::new(HashSet::new());
+        metrics.record(
+            tenant_hash("t"),
+            WorkloadClass::Interactive,
+            &accounting(1, 0, 0),
+            &CostEstimate::new(0, 0, 0, 0, 0),
+        );
+        metrics.record(
+            tenant_hash("t"),
+            WorkloadClass::Background,
+            &accounting(1, 0, 0),
+            &CostEstimate::new(0, 0, 0, 0, 0),
+        );
+        let body = render_query_only(&metrics);
+        assert!(
+            body.contains(
+                "ravel_query_queries_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 workload_class=\"interactive\"} 1"
+            ),
+            "interactive row missing:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_query_queries_total{mode=\"gateway\",tenant_hash=\"other\",\
+                 workload_class=\"background\"} 1"
+            ),
+            "background row missing:\n{body}"
         );
     }
 }

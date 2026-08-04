@@ -66,6 +66,9 @@ use ravel_sql::{ErrorClass, SqlError, SqlExecutor, SqlRequest};
 use ravel_types::{CommitToken, TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
+use tracing::Instrument;
+
+use crate::metrics::WorkloadClass;
 
 /// The Arrow IPC stream media type, as registered by the Arrow project.
 pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
@@ -92,6 +95,12 @@ pub struct SqlState {
     pub clock: Arc<dyn Clock>,
     /// Server wall-deadline ceiling. A request `timeout` is clamped to it.
     pub max_deadline: Duration,
+    /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
+    /// #425). Each completed statement folds its accounting snapshot and cost
+    /// estimate into it, tagged with the tenant hash and workload class, for
+    /// `/metrics`. Shared with the Flight SQL and PromQL paths' `/metrics` view
+    /// through one instance per process.
+    pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
 }
 
 /// The `/api/v1/sql` router.
@@ -138,13 +147,30 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
 
+    // A request-level span carrying only bounded values (ADR-0044 section 5):
+    // the tenant hash, the workload class, and -- recorded once the query
+    // finishes -- the final store request and byte counts. No query text, label
+    // values, or object keys ever become span fields. Every SQL statement over
+    // this transport is an interactive, client-driven query.
+    let span = tracing::info_span!(
+        "sql_query",
+        tenant_hash = %tenant_hash.to_hex(),
+        workload_class = WorkloadClass::Interactive.name(),
+        s3_requests = tracing::field::Empty,
+        s3_bytes = tracing::field::Empty,
+    );
+
     // The query has now reached execution for a resolved tenant, so it is
     // auditable (ADR-0042 decision 4). Run it, then write exactly one
     // query-audit record for the outcome - success or the specific SqlError -
     // before mapping the result to a response. Requests rejected earlier (no
     // tenant, an unreadable body, or invalid request parameters) never reach
     // here and are not audited: there is no executed query to attribute.
-    let result = state.executor.execute(tenant_hash, &request).await;
+    let result = state
+        .executor
+        .execute(tenant_hash, &request)
+        .instrument(span.clone())
+        .await;
     let status = match &result {
         Ok(_) => QueryStatus::Ok,
         Err(_) => QueryStatus::Error,
@@ -161,7 +187,24 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     .await;
 
     let outcome = result.map_err(|err| ApiError::from_sql(err, tenant_hash))?;
-    encode(&headers, &outcome, tenant_hash)
+
+    // Fold this query's actual cost and its pre-execution estimate into the
+    // process-global aggregator for `/metrics` (ADR-0044 section 4), and record
+    // the final counts on the span. The executor already built and dropped a
+    // fresh `QueryAccounting` per attempt; `outcome.accounting` is the
+    // successful attempt's snapshot, so a retried attempt's counters never
+    // bleed in.
+    span.record("s3_requests", outcome.accounting.total_s3_requests());
+    span.record("s3_bytes", outcome.accounting.total_s3_bytes());
+    state.query_accounting.record(
+        tenant_hash,
+        WorkloadClass::Interactive,
+        &outcome.accounting,
+        &outcome.estimate,
+    );
+
+    let stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    encode(&headers, &outcome, tenant_hash, stats)
 }
 
 /// Write the query-audit record for one request. The audit trail is a
@@ -284,10 +327,19 @@ fn seconds_to_ns(name: &str, secs: f64) -> Result<i64, ApiError> {
 }
 
 /// Encode the result per the `Accept` header.
+///
+/// `stats` is this query's cost accounting and estimate (ADR-0044, issue
+/// #425). It attaches only to the JSON encoding, as a sibling of `data`
+/// mirroring `/api/v1/query_exemplars`' "stats beside data" shape: an Arrow IPC
+/// stream is a bare columnar payload with no envelope to carry a JSON object,
+/// so an arrow-negotiated response reports no in-body stats. The `/metrics`
+/// aggregation still captures every query regardless of encoding, since the
+/// fold happens before this function runs.
 fn encode(
     headers: &HeaderMap,
     outcome: &ravel_sql::SqlOutcome,
     tenant_hash: TenantHash,
+    stats: serde_json::Value,
 ) -> Result<Response, ApiError> {
     if wants_arrow(headers) {
         let bytes = outcome
@@ -308,7 +360,7 @@ fn encode(
         .map_err(|err| ApiError::from_sql(err, tenant_hash))?;
     Ok((
         StatusCode::OK,
-        axum::Json(json!({ "status": "success", "data": data })),
+        axum::Json(json!({ "status": "success", "data": data, "stats": stats })),
     )
         .into_response())
 }
