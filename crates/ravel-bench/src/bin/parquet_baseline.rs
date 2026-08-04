@@ -1,14 +1,15 @@
 //! Write-side Parquet baseline harness (GitHub issue #97 phase a).
 //!
 //! From the identical generated workloads the RSEG benches use, this bin
-//! encodes the same logical content four ways and reports encode wall
+//! encodes the same logical content three ways and reports encode wall
 //! (median of >=5 in-memory writes) and stored object bytes, same run and
 //! same host:
 //!
 //!   1. Parquet, rows sorted by (series_id bytes, ts).
 //!   2. Parquet, rows in generator input order (unsorted).
-//!   3. RSEG v1 (`SegmentWriter::write`).
-//!   4. RSEG v2 (`SegmentWriter::write_v2`).
+//!   3. RSEG (v5, via `build_segment` -> `SegmentWriter::write_v5`). ADR-0027
+//!      collapsed RSEG to a single writable version, so there is one RSEG
+//!      encoder to measure, not the retired v1/v2 pair.
 //!
 //! Parquet schema: series_id FixedSizeBinary(16), ts Int64, value Float64,
 //! and one Dictionary(Int32, Utf8) column per label. Writer properties:
@@ -40,7 +41,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
 use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};
-use ravel_bench::segment_support::{build_segment, build_segment_v2};
+use ravel_bench::segment_support::build_segment;
 use ravel_types::{LabelSet, Sample, SeriesId};
 
 /// Median-of-N runs, plus enough runs to be defensible. The task asks for
@@ -152,17 +153,15 @@ fn run_shape(label: &str, config: &WorkloadConfig) {
     let (pq_unsorted_ms, pq_unsorted_bytes) =
         median_write(|| write_parquet(Arc::clone(&schema), &unsorted_batch));
 
-    // RSEG v1/v2 from the same logical content. build_segment consumes its
+    // RSEG (v5) from the same logical content. build_segment consumes its
     // input, so pre-clone RUNS copies outside the timed region (the
     // in-timed-region clone bias fixed by commit d605400, BENCHMARKS.md).
-    let (rseg_v1_ms, rseg_v1_bytes) = median_rseg(&raw, build_segment);
-    let (rseg_v2_ms, rseg_v2_bytes) = median_rseg(&raw, build_segment_v2);
+    let (rseg_ms, rseg_bytes) = median_rseg(&raw, build_segment);
 
     println!("  encoder            median ms     object bytes");
     print_row("parquet sorted", pq_sorted_ms, pq_sorted_bytes);
     print_row("parquet unsorted", pq_unsorted_ms, pq_unsorted_bytes);
-    print_row("rseg v1", rseg_v1_ms, rseg_v1_bytes);
-    print_row("rseg v2", rseg_v2_ms, rseg_v2_bytes);
+    print_row("rseg", rseg_ms, rseg_bytes);
     println!();
 }
 
