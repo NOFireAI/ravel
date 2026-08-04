@@ -104,6 +104,8 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
     };
     let running = ravel_server::start(
         config,

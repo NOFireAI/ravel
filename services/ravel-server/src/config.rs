@@ -279,6 +279,51 @@ pub struct Cli {
     /// refuses to start. Mutually exclusive with `--tenant-hash-key-file`.
     #[arg(long)]
     pub tenant_hash_unkeyed: bool,
+
+    /// This process's GC protection horizon, as a humantime duration (e.g.
+    /// `25h`). Maintain-mode startup requires it to EQUAL the durable
+    /// `sys/gc` `protection_horizon` (must-match, ADR-0050 section 4); this
+    /// is the flag that lets an operator bring maintain into line after a
+    /// `ravel-cli gc-config set`. Feeds the real compactor
+    /// (`CompactorConfig::protection_horizon_ns`) as well as the validation,
+    /// so it is enforced, not merely checked. Omitted defaults to
+    /// `ravel_maintain::config::DEFAULT_PROTECTION_HORIZON_NS` (25h), the
+    /// compiled-in compactor default, so an operator who sets none of the
+    /// `--gc-*` flags gets byte-identical behavior to before they existed.
+    #[arg(long, value_name = "DURATION")]
+    pub gc_protection_horizon: Option<String>,
+
+    /// This process's GC grace period, as a humantime duration (e.g. `24h`).
+    /// Maintain-mode startup requires it to EQUAL the durable `sys/gc`
+    /// `grace` (must-match, ADR-0050 section 4). Feeds the real compactor
+    /// (`CompactorConfig::grace_ns`) as well as the validation. Omitted
+    /// defaults to `ravel_maintain::config::DEFAULT_GRACE_NS` (24h).
+    #[arg(long, value_name = "DURATION")]
+    pub gc_grace: Option<String>,
+
+    /// This process's query-engine deadline, as a humantime duration (e.g.
+    /// `30s`). Query-mode startup requires it to be `<=` the durable `sys/gc`
+    /// `max_query_duration` (ADR-0050 section 4). Feeds the real
+    /// `QueryEngine` (`EngineConfig::deadline`) as well as the validation, so
+    /// the value validated is the value enforced. Omitted defaults to
+    /// `ravel_query::EngineConfig::default().deadline` (30s), the compiled-in
+    /// engine deadline, so behavior is byte-identical when unset. Note this
+    /// is the *engine's* enforced query timeout, a distinct quantity from
+    /// `sys/gc`'s `max_query_duration` (the GC protection budget the timeout
+    /// must fit under); the flag governs the former.
+    #[arg(long, value_name = "DURATION")]
+    pub gc_max_query_duration: Option<String>,
+
+    /// This process's maximum flush lifetime, as a humantime duration (e.g.
+    /// `1h`). Feeds the real compactor
+    /// (`CompactorConfig::max_flush_lifetime_ns`), which governs the seal
+    /// margin and the orphan age gate. Omitted defaults to
+    /// `ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS` (1h). Not part
+    /// of the `sys/gc` must-match set (maintain validates only horizon and
+    /// grace), but kept alongside them so the compactor's GC-relevant knobs
+    /// are configured from one coherent group of flags.
+    #[arg(long, value_name = "DURATION")]
+    pub gc_max_flush_lifetime: Option<String>,
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
@@ -588,6 +633,56 @@ impl Cli {
         Ok(ConfiguredScheme::Unspecified)
     }
 
+    /// Resolve the four `--gc-*` duration flags into the concrete values the
+    /// GC-config startup path needs (ADR-0050 section 4). Each flag is
+    /// optional; an omitted flag falls back to its compiled-in default, so a
+    /// process that sets none of them is byte-identical to before the flags
+    /// existed.
+    ///
+    /// This is the single resolution point: `main` feeds the returned values
+    /// into BOTH the `sys/gc` validation (`validate_maintain` /
+    /// `validate_query`) AND the real compactor and query engine, so a flag
+    /// that satisfies validation is the same flag that is actually enforced.
+    /// A flag that only satisfied validation while a `::default()` was enforced
+    /// elsewhere would be the exact "looks configured, is actually inert" bug
+    /// this wiring exists to prevent.
+    pub fn resolve_gc_runtime(&self) -> anyhow::Result<GcRuntimeConfig> {
+        use ravel_maintain::config::{
+            DEFAULT_GRACE_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_PROTECTION_HORIZON_NS,
+        };
+
+        let protection_horizon_ns = match self.gc_protection_horizon.as_deref() {
+            Some(s) => parse_gc_duration_ns("--gc-protection-horizon", s)?,
+            None => DEFAULT_PROTECTION_HORIZON_NS,
+        };
+        let grace_ns = match self.gc_grace.as_deref() {
+            Some(s) => parse_gc_duration_ns("--gc-grace", s)?,
+            None => DEFAULT_GRACE_NS,
+        };
+        let max_flush_lifetime_ns = match self.gc_max_flush_lifetime.as_deref() {
+            Some(s) => parse_gc_duration_ns("--gc-max-flush-lifetime", s)?,
+            None => DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        };
+        let query_deadline = match self.gc_max_query_duration.as_deref() {
+            Some(s) => {
+                let ns = parse_gc_duration_ns("--gc-max-query-duration", s)?;
+                Duration::from_nanos(u64::try_from(ns).unwrap_or(0))
+            }
+            // The engine deadline's established default lives in ravel-query,
+            // and the real query engine uses it today; defaulting here to the
+            // same constant keeps a single source of truth and preserves the
+            // 30s enforced deadline exactly when the flag is unset.
+            None => ravel_query::EngineConfig::default().deadline,
+        };
+
+        Ok(GcRuntimeConfig {
+            protection_horizon_ns,
+            grace_ns,
+            max_flush_lifetime_ns,
+            query_deadline,
+        })
+    }
+
     /// Load and validate `--limits-file` (ADR-0051 section 3). Absent flag
     /// means the shipped defaults apply to every tenant with no override at
     /// all. See [`limits::parse_limits_file`] for the format and validation
@@ -627,6 +722,42 @@ pub fn merge_fold_tenants<'a>(
         }
     }
     out
+}
+
+/// The GC knobs resolved from the `--gc-*` flags (ADR-0050 section 4). `main`
+/// builds the real [`ravel_maintain::CompactorConfig`] and query-engine
+/// deadline from these, and validates `sys/gc` against these same values, so
+/// the configured GC values and the enforced GC values are one and the same.
+#[derive(Debug, Clone, Copy)]
+pub struct GcRuntimeConfig {
+    /// Compactor protection horizon, and the value maintain must match against
+    /// stored `sys/gc`.
+    pub protection_horizon_ns: i64,
+    /// Compactor grace, and the value maintain must match against stored
+    /// `sys/gc`.
+    pub grace_ns: i64,
+    /// Compactor max flush lifetime.
+    pub max_flush_lifetime_ns: i64,
+    /// The query engine's enforced deadline, validated `<=` stored
+    /// `sys/gc.max_query_duration`.
+    pub query_deadline: Duration,
+}
+
+/// Parse a `--gc-*` humantime duration into saturating `i64` nanoseconds,
+/// mirroring the `--retention-*` duration convention (`parse_window_ns`).
+/// Rejects zero and negative durations: a zero `sys/gc` value is exactly the
+/// all-zero bricking scenario `GcConfigValues::validate` refuses on the
+/// durable-object write path, and this is the same value on the flag path
+/// feeding the process's own configured side of the must-match check.
+fn parse_gc_duration_ns(flag: &str, s: &str) -> anyhow::Result<i64> {
+    let dur =
+        humantime::parse_duration(s).map_err(|e| anyhow::anyhow!("invalid {flag} '{s}': {e}"))?;
+    let ns =
+        i64::try_from(dur.as_nanos()).map_err(|_| anyhow::anyhow!("{flag} '{s}' is too large"))?;
+    if ns <= 0 {
+        anyhow::bail!("{flag} '{s}' must be a positive duration, got {ns} ns");
+    }
+    Ok(ns)
 }
 
 /// Reject a sink URL that is empty or not HTTP(S) at startup rather than
@@ -1099,6 +1230,31 @@ pub mod limits {
 mod tests {
     use super::*;
     use ravel_ingest::{CountLimit, RateLimit};
+
+    /// A zero (or negative) `--gc-*` duration must be rejected at parse time,
+    /// not resolved to a 0 ns value: the same all-zero bricking scenario
+    /// `GcConfigValues::validate` refuses on the durable `sys/gc` write path
+    /// applies equally to the process's own configured side of the
+    /// must-match check.
+    #[test]
+    fn zero_gc_duration_flag_is_rejected() {
+        for flag in [
+            "--gc-protection-horizon",
+            "--gc-grace",
+            "--gc-max-query-duration",
+            "--gc-max-flush-lifetime",
+        ] {
+            let cli = Cli::try_parse_from(["ravel-server", "--mode", "query", flag, "0s"])
+                .expect("flag parses at the CLI layer");
+            let err = cli
+                .resolve_gc_runtime()
+                .expect_err(&format!("{flag} 0s must be rejected as non-positive"));
+            assert!(
+                err.to_string().contains("positive"),
+                "expected a positive-duration error for {flag}, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn limits_file_tenant_override_parses() {

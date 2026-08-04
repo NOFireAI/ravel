@@ -92,7 +92,10 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Commit { .. }
         | Command::Store { .. }
         | Command::Idem { .. }
-        | Command::Tenancy { .. } => false,
+        | Command::Tenancy { .. }
+        // sys/gc is a bucket-root object, not under any tenant prefix, so
+        // gc-config never hashes a tenant.
+        | Command::GcConfig { .. } => false,
     }
 }
 
@@ -154,6 +157,37 @@ enum Command {
     Provision {
         #[command(subcommand)]
         command: ProvisionCommand,
+    },
+    /// Show or set the durable deployment-wide GC configuration `sys/gc`
+    /// (ADR-0050 section 4).
+    GcConfig {
+        #[command(subcommand)]
+        command: GcConfigCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GcConfigCommand {
+    /// Print the durable `sys/gc` values (protection horizon, grace, max query
+    /// duration, max flush lifetime), or report that the bucket is not yet
+    /// bootstrapped.
+    Show {},
+    /// Write a full new `sys/gc`, enforcing `protection_horizon >=
+    /// max_query_duration + grace` at write time and swapping the durable object
+    /// with `CasVersion`. All four durations are humantime strings (e.g. `25h`).
+    Set {
+        /// Horizon between a deletion anchor and physical deletion (e.g. `25h`).
+        #[arg(long, value_name = "DURATION")]
+        protection_horizon: String,
+        /// Shared grace period for the GC age gates (e.g. `24h`).
+        #[arg(long, value_name = "DURATION")]
+        grace: String,
+        /// Longest a single query may run (e.g. `1h`).
+        #[arg(long, value_name = "DURATION")]
+        max_query_duration: String,
+        /// Longest a flush may stay open (e.g. `1h`).
+        #[arg(long, value_name = "DURATION")]
+        max_flush_lifetime: String,
     },
 }
 
@@ -606,6 +640,28 @@ async fn main() -> anyhow::Result<()> {
                 &tenant,
                 shards,
                 signal,
+                now_ns()?,
+            )
+            .await
+        }
+        Command::GcConfig {
+            command: GcConfigCommand::Show {},
+        } => ravel_cli::gc_config::show(store::build_store(&cli.store)?).await,
+        Command::GcConfig {
+            command:
+                GcConfigCommand::Set {
+                    protection_horizon,
+                    grace,
+                    max_query_duration,
+                    max_flush_lifetime,
+                },
+        } => {
+            ravel_cli::gc_config::set(
+                store::build_store(&cli.store)?,
+                &protection_horizon,
+                &grace,
+                &max_query_duration,
+                &max_flush_lifetime,
                 now_ns()?,
             )
             .await

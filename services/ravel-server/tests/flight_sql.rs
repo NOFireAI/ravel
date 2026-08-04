@@ -185,7 +185,14 @@ impl FlightServer {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (tx, rx) = oneshot::channel::<()>();
-        let service = ravel_server::flight::service(state);
+        // The Flight ticket-TTL ceiling is sourced from the durable sys/gc
+        // (ADR-0050 section 4, EC4); this test uses the maintain-default ceiling
+        // (protection_horizon - grace) the server would source on a fresh
+        // bucket.
+        let ceiling = ravel_server::gc_config::flight_ceiling(
+            &ravel_maintain::GcConfigValues::maintain_defaults(),
+        );
+        let service = ravel_server::flight::service(state, ceiling);
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
@@ -460,6 +467,8 @@ async fn the_server_registers_the_real_flight_sql_service() {
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
     };
     let running = ravel_server::start(
         config,

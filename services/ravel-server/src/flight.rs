@@ -72,9 +72,16 @@ impl FlightClock for IngestClock {
 /// Builds the Flight SQL service to register on the gRPC server.
 ///
 /// `max_deadline` comes from `SqlState`, so a Flight query and an HTTP query
-/// are bounded by the same server ceiling; the GC protection horizon and the
-/// default event-time window take ravel-sql's documented defaults.
-pub fn service(state: &SqlState) -> FlightServiceServer<RavelFlightSqlService> {
+/// are bounded by the same server ceiling. `gc_protection_horizon` is
+/// `gc_ticket_ceiling`, sourced by the caller from the durable `sys/gc` object
+/// (`protection_horizon - grace`, ADR-0050 section 4, EC4) rather than
+/// ravel-sql's conservative hardcoded default: this is where the ticket's GC
+/// ceiling becomes the single durable authority the flight_ticket.rs docs
+/// anticipate. The default event-time window still takes ravel-sql's default.
+pub fn service(
+    state: &SqlState,
+    gc_ticket_ceiling: std::time::Duration,
+) -> FlightServiceServer<RavelFlightSqlService> {
     let auth = Arc::new(ResolverFlightAuth {
         tenant_resolver: Arc::clone(&state.tenant_resolver),
     });
@@ -83,6 +90,7 @@ pub fn service(state: &SqlState) -> FlightServiceServer<RavelFlightSqlService> {
     });
     let config = FlightSqlConfig {
         max_deadline: state.max_deadline,
+        gc_protection_horizon: gc_ticket_ceiling,
         ..FlightSqlConfig::default()
     };
     FlightServiceServer::new(RavelFlightSqlService::new(

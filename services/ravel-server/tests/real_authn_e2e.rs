@@ -79,6 +79,8 @@ async fn start_with_mtls(
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
     };
     ravel_server::start(
         config,

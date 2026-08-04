@@ -171,6 +171,7 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         backend,
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache.clone()),
+        ravel_query::EngineConfig::default(),
     );
     let app: Router = router(AppState {
         engine: state.engine,

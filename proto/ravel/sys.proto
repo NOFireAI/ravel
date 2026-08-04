@@ -2,14 +2,14 @@
 // per-(tenant, signal) provisioning record (ADR-0050). Persistent contract:
 // field numbers are frozen once shipped; only additive changes are allowed.
 // This file holds the tenancy marker and its per-tenant recovery manifest
-// (ADR-0050 section 3) and the durable shard_count provisioning record
-// (`t/<tenant_hash>/<sig>/prov`, ADR-0050 section 5, EC5). The GC-config
-// object (`sys/gc`, EC4) lands as its own message in a later change. Each
-// object is its own top-level message and never shares an envelope with the
-// others. Protobuf numbers fields per message, so a new message begins its
-// own field-number space at 1; ProvisioningRecord below reuses no field of
-// TenancyMarker or TenantRecoveryManifest because those are separate
-// messages, not because their low numbers are avoided.
+// (ADR-0050 section 3), the durable shard_count provisioning record
+// (`t/<tenant_hash>/<sig>/prov`, ADR-0050 section 5, EC5), and the durable
+// GC-config object (`sys/gc`, ADR-0050 section 4, EC4). Each object is its own
+// top-level message and never shares an envelope with the others. Protobuf
+// numbers fields per message, so a new message begins its own field-number
+// space at 1; ProvisioningRecord and GcConfig below reuse no field of
+// TenancyMarker or TenantRecoveryManifest because those are separate messages,
+// not because their low numbers are avoided.
 syntax = "proto3";
 
 package ravel.sys.v1;
@@ -94,4 +94,46 @@ message ProvisioningRecord {
   Signal signal = 3;
   uint32 shard_count = 4;      // the pinned shard count for this (tenant, signal)
   sfixed64 created_unix_ns = 5;  // informational; when the record was first written
+}
+
+// The durable, deployment-wide GC configuration at the bucket root `sys/gc`
+// (ADR-0050 section 4, EC4). It is deployment-wide, not per-tenant, so it lives
+// at the bucket root beside `sys/tenancy`, never under a tenant prefix.
+//
+// Written once at bucket bootstrap via CreateIfAbsent (from the maintain
+// defaults, which already satisfy the constraint below) by whichever process
+// first touches a fresh bucket; a racing loser re-reads and validates against
+// the winner's object. It is mutated only by `ravel-cli gc-config set`, which
+// enforces the constraint at write time and swaps the object with CasVersion so
+// a concurrent mutation is caught, never silently overwritten.
+//
+// Every mode validates itself against this object at startup and refuses to
+// start on a real violation (ADR-0050 section 4): maintain's configured horizon
+// and grace must equal the stored values; a query engine's deadline must be
+// <= max_query_duration_ns; a Flight SQL ticket-TTL ceiling must be
+// <= protection_horizon_ns - grace_ns. A process that can read a bootstrapped
+// `sys/gc` and finds a real violation does not start; there is no
+// "assume defaults" path.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message GcConfig {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout as v1 (matching TenancyMarker/ProvisioningRecord). = 1.
+  uint32 format_version = 1;
+  // The horizon between a deletion anchor and physical deletion. The invariant
+  // this whole object exists to make durable and single-sourced:
+  // protection_horizon_ns >= max_query_duration_ns + grace_ns.
+  sfixed64 protection_horizon_ns = 2;
+  // The shared grace period for the orphan and unreferenced-part age gates.
+  sfixed64 grace_ns = 3;
+  // The longest a single query may run; the query-duration term of the
+  // protection-horizon constraint.
+  sfixed64 max_query_duration_ns = 4;
+  // The longest a flush may stay open; recorded so the value is single-sourced
+  // for the deployment rather than recomputed per process.
+  sfixed64 max_flush_lifetime_ns = 5;
+  // Informational; when this record was last written (bootstrap or a
+  // `gc-config set`).
+  sfixed64 created_unix_ns = 6;
 }
