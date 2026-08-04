@@ -127,6 +127,7 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
         // Long enough never to tick during the test: the cycles are driven
         // explicitly via `run_probe_cycle` for determinism.
         store_probe_interval: Duration::from_secs(3600),
+        indexed_fields: Default::default(),
     };
     ravel_server::start(
         config,
