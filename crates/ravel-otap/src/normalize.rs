@@ -46,17 +46,22 @@
 //! per-metric last-seen [`SeriesIdMemo`] -- the same memoization
 //! granularity `ravel_otlp` itself uses -- since one input point yields
 //! several series with different synthesized names/labels rather than one
-//! series per distinct attribute set. OTAP carries histogram exemplars in
-//! a separate `HISTOGRAM_DP_EXEMPLARS` table (OTLP embeds them inline on
-//! the data point), with their attributes in `HISTOGRAM_DP_EXEMPLAR_ATTRS`
-//! below that, so both are joined by id here rather than read from a field.
+//! series per distinct attribute set. OTAP carries exemplars in separate
+//! `NUMBER_DP_EXEMPLARS` and `HISTOGRAM_DP_EXEMPLARS` tables (OTLP embeds
+//! them inline on the data point), with their attributes in the matching
+//! `*_DP_EXEMPLAR_ATTRS` table below each, so both are joined by id here
+//! rather than read from a field. The two tables have identical columns, so
+//! one decoder and one admission path serve both (issue #539).
 //! Since ADR-0047 they are carried, not just counted: each is offered to the
 //! caller's [`ravel_types::ExemplarCap`] and attaches to the bucket series
-//! whose `le` bound is the smallest at or above its value, the same rule the
-//! OTLP path applies, and the `HistogramExemplarsDropped` counter now reports
-//! what the cap turned away. OTAP-carried exponential histograms keep rejecting typed via
-//! [`push_unsupported_type_rejections`] (ADR-0017 is a separate, later
-//! ticket).
+//! whose `le` bound is the smallest at or above its value for a histogram, or
+//! to the data point's own series for a gauge or sum, which is the same rule
+//! the OTLP path applies in each case, and the `HistogramExemplarsDropped`
+//! counter now reports what the cap turned away. OTAP-carried exponential
+//! histograms keep rejecting typed via [`push_unsupported_type_rejections`]
+//! (ADR-0017 is a separate, later ticket), and the exemplars they carry are
+//! counted as dropped by [`push_exp_histogram_exemplar_drops`], which also
+//! records the attachment rule waiting for them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -469,7 +474,8 @@ pub fn normalize_decoded_with_exemplars(
 ) -> MetricsNormalizeResult {
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
-        // No payload past the count is decoded, so no exemplar is even read,
+        // No payload past the count is decoded, so no exemplar is even read
+        // (this is as true of `NUMBER_DP_EXEMPLARS` as of the histogram table),
         // let alone offered to the cap. This is where OTAP differs from the
         // other two surfaces: OTLP and Remote Write both hold their exemplars
         // in memory at the count check, so both count the request's exemplars
@@ -497,6 +503,7 @@ pub fn normalize_decoded_with_exemplars(
 
     let mut rejected = Vec::new();
     push_unsupported_type_rejections(batch, &mut rejected);
+    push_exp_histogram_exemplar_drops(batch, &mut rejected);
 
     let root_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::UnivariateMetrics);
     let dp_batches: Vec<&RecordBatch> = payloads_of(batch, ArrowPayloadType::NumberDataPoints);
@@ -509,6 +516,10 @@ pub fn normalize_decoded_with_exemplars(
         payloads_of(batch, ArrowPayloadType::HistogramDpExemplars);
     let hist_exemplar_attr_batches: Vec<&RecordBatch> =
         payloads_of(batch, ArrowPayloadType::HistogramDpExemplarAttrs);
+    let number_exemplar_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::NumberDpExemplars);
+    let number_exemplar_attr_batches: Vec<&RecordBatch> =
+        payloads_of(batch, ArrowPayloadType::NumberDpExemplarAttrs);
     let summary_dp_batches: Vec<&RecordBatch> =
         payloads_of(batch, ArrowPayloadType::SummaryDataPoints);
     let summary_attr_batches: Vec<&RecordBatch> =
@@ -520,6 +531,9 @@ pub fn normalize_decoded_with_exemplars(
     let flat_hist_attrs = flatten_attrs(&hist_attr_batches, &mut rejected);
     let hist_exemplar_rows = group_exemplars_by_parent_id(&hist_exemplar_batches, &mut rejected);
     let flat_hist_exemplar_attrs = flatten_attrs(&hist_exemplar_attr_batches, &mut rejected);
+    let number_exemplar_rows =
+        group_exemplars_by_parent_id(&number_exemplar_batches, &mut rejected);
+    let flat_number_exemplar_attrs = flatten_attrs(&number_exemplar_attr_batches, &mut rejected);
     let flat_summary_dp = flatten_summary_dp(&summary_dp_batches, &mut rejected);
     let flat_summary_attrs = flatten_attrs(&summary_attr_batches, &mut rejected);
 
@@ -550,6 +564,15 @@ pub fn normalize_decoded_with_exemplars(
     let attr_order = sort_attrs_by_parent(&flat_attrs);
     let mut points = Vec::with_capacity(flat_dp.len());
     let mut group_cache: GroupCache = HashMap::new();
+    let mut exemplars = Vec::new();
+    let number_exemplar_attr_order = sort_attrs_by_parent(&flat_number_exemplar_attrs);
+    let mut number_exemplar_admission = ExemplarAdmission {
+        rows: &number_exemplar_rows,
+        attrs: &flat_number_exemplar_attrs,
+        attr_order: &number_exemplar_attr_order,
+        cap: exemplar_cap,
+        out: &mut exemplars,
+    };
 
     for dp in &flat_dp {
         let Some(decision) = metric_decision
@@ -636,8 +659,9 @@ pub fn normalize_decoded_with_exemplars(
 
         match outcome {
             Ok((label_set, series_id)) => {
+                let series_id = *series_id;
                 points.push(NormalizedPoint {
-                    series_id: *series_id,
+                    series_id,
                     labels: label_set.clone(),
                     sample: Sample {
                         ts_ns: dp.ts_ns,
@@ -645,14 +669,23 @@ pub fn normalize_decoded_with_exemplars(
                     },
                     is_monotonic_sum: decision.is_sum && decision.is_monotonic,
                 });
+                // A number data point has no buckets, so its exemplars attach
+                // to the point's own series: there is no `le` bound to resolve
+                // (issue #539). This is the same rule `ravel_otlp::build_point`
+                // applies to a gauge or sum exemplar, which is what keeps the
+                // two paths' exemplar decisions identical (ADR-0011).
+                number_exemplar_admission.admit(dp.id, limits, |_| series_id, &mut rejected);
             }
             Err(rejection) => rejected.push(rejection.clone()),
         }
     }
+    // Rows whose `parent_id` matches no NUMBER_DATA_POINTS row at all: no
+    // series to attach to and no point rejection accounting for them, so
+    // without this they would vanish uncounted.
+    number_exemplar_admission.count_orphans(flat_dp.iter().map(|dp| dp.id), &mut rejected);
 
     let hist_attr_order = sort_attrs_by_parent(&flat_hist_attrs);
     let hist_exemplar_attr_order = sort_attrs_by_parent(&flat_hist_exemplar_attrs);
-    let mut exemplars = Vec::new();
     let mut exemplar_admission = ExemplarAdmission {
         rows: &hist_exemplar_rows,
         attrs: &flat_hist_exemplar_attrs,
@@ -690,6 +723,7 @@ pub fn normalize_decoded_with_exemplars(
             Err(rejection) => rejected.push(rejection),
         }
     }
+    exemplar_admission.count_orphans(flat_hist_dp.iter().map(|dp| dp.id), &mut rejected);
 
     let summary_attr_order = sort_attrs_by_parent(&flat_summary_attrs);
     let mut summary_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
@@ -776,6 +810,42 @@ fn push_unsupported_type_rejections(batch: &DecodedBatch, rejected: &mut Vec<Rej
             metric_type: "exponential_histogram",
             count,
         });
+    }
+}
+
+/// Count every `EXP_HISTOGRAM_DP_EXEMPLARS` row as dropped (issue #539).
+///
+/// None of these can be carried today, and the reason is structural rather
+/// than a missing decode: `EXP_HISTOGRAM_DATA_POINTS` is rejected outright by
+/// [`push_unsupported_type_rejections`] (ADR-0017 is a separate ticket on this
+/// path), so the data point an exemplar would attach to is never normalized
+/// and no series exists to attach it to. Reading the exemplar's own columns
+/// would produce a value with nowhere to go.
+///
+/// The attachment rule this path will use once exp histograms are supported is
+/// already decided, and it is the same one the number path above uses: the
+/// exemplar attaches to the data point's OWN series. A native histogram is one
+/// Ravel series carrying one native-histogram sample per timestamp; unlike a
+/// classic histogram it does not explode into per-bucket `le` series, so
+/// resolving the exemplar's value to a bucket index through the exponential
+/// schema's scale would name a series that does not exist. That is why
+/// ADR-0047 needs no amendment here: its decision 1 attaches an exemplar to a
+/// `(series, ts_ns)`, and the explicit-bucket rule is a consequence of the
+/// classic histogram exploding, not a separate rule. `ravel_otlp`'s
+/// `build_native_histogram_point`, which does carry these exemplars, already
+/// resolves them with `|_| series_id` for exactly this reason.
+///
+/// Counting rows, rather than decoding and then discarding them, is what keeps
+/// this exact: one row on the wire is one exemplar, whatever its columns hold.
+fn push_exp_histogram_exemplar_drops(batch: &DecodedBatch, rejected: &mut Vec<Rejection>) {
+    let count: usize = batch
+        .payloads
+        .iter()
+        .filter(|(t, _)| *t == ArrowPayloadType::ExpHistogramDpExemplars)
+        .map(|(_, rb)| rb.num_rows())
+        .sum();
+    if count > 0 {
+        rejected.push(Rejection::HistogramExemplarsDropped { count });
     }
 }
 
@@ -878,9 +948,11 @@ struct FlatAttr<'b> {
     double_val: Option<f64>,
 }
 
-/// One decoded `HISTOGRAM_DP_EXEMPLARS` row, with its `parent_id` already
-/// resolved by [`group_exemplars_by_parent_id`] and its attributes still to be
-/// joined from `HISTOGRAM_DP_EXEMPLAR_ATTRS` by `id`.
+/// One decoded `NUMBER_DP_EXEMPLARS` or `HISTOGRAM_DP_EXEMPLARS` row, with its
+/// `parent_id` already resolved by [`group_exemplars_by_parent_id`] and its
+/// attributes still to be joined from the matching `*_DP_EXEMPLAR_ATTRS` table
+/// by `id`. The two tables have identical columns in the data model, so one
+/// decoder serves both.
 ///
 /// `ts_ns` and `value` are `Option` because both columns are optional in the
 /// table (otap-spec.md section 5.3.6). A row with no value is what OTLP itself
@@ -1633,11 +1705,14 @@ fn flatten_summary_dp(
     out
 }
 
-/// Group `HISTOGRAM_DP_EXEMPLARS` rows by the histogram data-point id they
-/// belong to (OTAP carries exemplars in their own table joined by `parent_id`;
-/// OTLP embeds them inline on the data point as `dp.exemplars`). Rows keep
-/// their table order within a parent, which is what lets the admission pass
-/// mirror OTLP's per-data-point ordering.
+/// Group `NUMBER_DP_EXEMPLARS` or `HISTOGRAM_DP_EXEMPLARS` rows by the
+/// data-point id they belong to (OTAP carries exemplars in their own table
+/// joined by `parent_id`; OTLP embeds them inline on the data point as
+/// `dp.exemplars`). Rows keep their table order within a parent, which is what
+/// lets the admission pass mirror OTLP's per-data-point ordering.
+///
+/// Called once per exemplar table; both tables have the same columns and the
+/// same encoding rules, so this is one decoder rather than two (issue #539).
 ///
 /// This used to count rows and discard them, back when the exemplar's own
 /// columns had nowhere to go (ADR-0047 gave them an RSEG section). The
@@ -2067,6 +2142,11 @@ fn exemplar_bucket_index(explicit_bounds: &[f64], value: f64) -> usize {
 /// output vector must be threaded by `&mut` through every data point in the
 /// batch: the cap's whole purpose is state that outlives one point (ADR-0047
 /// decision 2).
+///
+/// One of these is built per exemplar source (`NUMBER_DP_EXEMPLARS` and
+/// `HISTOGRAM_DP_EXEMPLARS`), each borrowing the same caller-owned cap in turn
+/// and appending to the same output vector, so a gauge point and a histogram
+/// bucket in one batch compete for the same per-series window.
 struct ExemplarAdmission<'a, 'b> {
     rows: &'a HashMap<u32, Vec<FlatExemplar>>,
     attrs: &'a [FlatAttr<'b>],
@@ -2078,12 +2158,14 @@ struct ExemplarAdmission<'a, 'b> {
 impl ExemplarAdmission<'_, '_> {
     /// Offer data point `dp_id`'s exemplars to the cap, pushing the admitted
     /// ones onto `out` tagged with the series `series_id_for` resolves each
-    /// value to (for a classic histogram, the bucket series whose `le` bound is
+    /// value to: for a classic histogram, the bucket series whose `le` bound is
     /// the smallest at or above the exemplar's value, matching Prometheus's own
-    /// convention and the OTLP path). Rows too malformed to carry (no value, no
-    /// timestamp) and rows the cap turns away are counted into `informational`
-    /// through the existing drop counter, so the count stays visible now that
-    /// some exemplars are kept.
+    /// convention and the OTLP path; for a gauge or sum, the data point's own
+    /// series, since a number point has no buckets and so no `le` bound to
+    /// resolve. Rows too malformed to carry (no value, no timestamp) and rows
+    /// the cap turns away are counted into `informational` through the existing
+    /// drop counter, so the count stays visible now that some exemplars are
+    /// kept.
     ///
     /// Candidates are offered newest-first, since [`ExemplarCap::admit`] never
     /// retracts an admission it already handed back: that ordering is what
@@ -2137,8 +2219,44 @@ impl ExemplarAdmission<'_, '_> {
         }
     }
 
+    /// Count exemplar rows whose `parent_id` matches no data-point row in the
+    /// table they belong to. Such a row has no series to attach to and no data
+    /// point whose own rejection accounts for it, so without this it would be
+    /// the one shape of exemplar that still vanishes silently.
+    ///
+    /// Rows whose parent data point exists but was rejected are deliberately
+    /// NOT counted here: they are dropped along with their point, exactly as
+    /// `ravel_otlp` drops the exemplars of a point it rejects (its
+    /// `build_point` returns before reaching admission). Counting them would
+    /// give the same logical input a rejection class OTLP does not produce,
+    /// which ADR-0011 forbids. An orphan has no OTLP equivalent at all -- OTLP
+    /// exemplars ride inline on their data point and cannot be orphaned -- so
+    /// counting it cannot diverge the two paths on any input both can express.
+    ///
+    /// `dp_ids` is walked only when there are exemplar rows to account for, so
+    /// a batch with no exemplars pays nothing for this.
+    fn count_orphans(
+        &mut self,
+        dp_ids: impl Iterator<Item = u32>,
+        informational: &mut Vec<Rejection>,
+    ) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let known: std::collections::HashSet<u32> = dp_ids.collect();
+        let orphans: usize = self
+            .rows
+            .iter()
+            .filter(|(parent_id, _)| !known.contains(parent_id))
+            .map(|(_, rows)| rows.len())
+            .sum();
+        if orphans > 0 {
+            informational.push(Rejection::HistogramExemplarsDropped { count: orphans });
+        }
+    }
+
     /// Turn one decoded row into the shared canonical shape (ADR-0047 decision
-    /// 1), joining its attributes from `HISTOGRAM_DP_EXEMPLAR_ATTRS` by the
+    /// 1), joining its attributes from the matching `*_DP_EXEMPLAR_ATTRS` by the
     /// row's own `id`, or `None` if the row carries no value or no timestamp.
     ///
     /// An attribute whose value is complex (map/slice/bytes) becomes an
