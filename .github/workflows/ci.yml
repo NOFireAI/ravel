@@ -128,6 +128,26 @@ jobs:
           if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'; then
             object_store_area=true
           fi
+          # Catch-all: the four lists above are conservative allowlists, not a
+          # conservative superset of every workspace member -- a crate that
+          # matches none of them (ravel-types, ravel-segment, ravel-logseg,
+          # ravel-otlp, ravel-otap, and others not yet named above) would
+          # otherwise leave every area false, silently skipping required
+          # checks (sql, promql-difftest, object-store-contract) that ADR-0053
+          # D4 says must run whenever a lane "cannot be proven irrelevant".
+          # Checked per changed path, not by whether any area flag ended up
+          # true: a push that touches both a listed crate (e.g. ravel-sql,
+          # which sets sql_area true) and an unlisted one (e.g. ravel-types)
+          # in the same diff must still force every area true for the
+          # unlisted crate's sake, even though sql_area is already true.
+          area_paths='^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$|^crates/ravel-sql/|^crates/ravel-query/|^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'
+          if echo "$changed" | grep -E '^crates/|^services/' | grep -qvE "$area_paths"; then
+            echo "::notice::changed crate/service not in any named area list, running every area"
+            server_or_operator=true
+            sql_area=true
+            promql_area=true
+            object_store_area=true
+          fi
           echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area"
           emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area"
 
@@ -733,7 +753,11 @@ jobs:
     # one skips, k8s-integration skips with it.
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.server_or_operator == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 55m: the original single job's 60m covered the release build plus the
+    # kind half; this half is build + docker save + artifact upload only, but
+    # a cold-sccache release build alone has been observed near 45m, and the
+    # save/upload adds real minutes on top of that, not headroom to spend.
+    timeout-minutes: 55
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -833,11 +857,24 @@ jobs:
       # pinned to the cluster's Kubernetes minor (v1.32, matching the pinned
       # kindest/node:v1.32.2 that kind-up.sh sets) rather than helm/kind-action's
       # newer default, and wrap the download in a retry loop so a transient
-      # network blip does not fail the whole lane. helm/kind-action's own
-      # kubectl_version is pinned to the same value below for good measure.
+      # network blip does not fail the whole lane. helm/kind-action installs
+      # its own kubectl too (pinned to the same version below) and prepends it
+      # to PATH, which would otherwise shadow this retried one for every step
+      # after cluster creation -- the "Prefer the retried kubectl" step below
+      # re-asserts this binary's directory at the front of PATH so the
+      # actually-used kubectl is the one that survived the retry loop, not the
+      # action's unretried download.
       - name: Install kubectl (pinned, retried)
         run: |
           version=v1.32.2
+          # A dedicated directory, not /usr/local/bin: the runner image also
+          # ships its own kind binary there, and prepending /usr/local/bin
+          # wholesale (see the "Prefer the retried kubectl" step) would
+          # un-pin that kind install too, shadowing the action's own pinned
+          # v0.32.0 tool-cache copy with whatever the image happens to ship.
+          # A directory holding only this kubectl shadows only kubectl.
+          bin_dir="${RUNNER_TEMP}/kubectl-bin"
+          mkdir -p "$bin_dir"
           for attempt in 1 2 3 4 5; do
             if curl -fsSL --retry 3 -o /tmp/kubectl \
                 "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"; then
@@ -848,8 +885,8 @@ jobs:
             [ "$attempt" = 5 ] && { echo "::error::kubectl download failed after 5 attempts"; exit 1; }
           done
           chmod +x /tmp/kubectl
-          sudo mv /tmp/kubectl /usr/local/bin/kubectl
-          kubectl version --client
+          mv /tmp/kubectl "$bin_dir/kubectl"
+          "$bin_dir/kubectl" version --client
       - name: Resolve the pinned kind node image
         id: node-image
         run: |
@@ -877,10 +914,12 @@ jobs:
           node_image: ${{ steps.node-image.outputs.image }}
           cluster_name: ravel-ci
           # Pin kubectl to the cluster's own minor rather than the action's
-          # newer default (issue #587: version skew plus a flaky download); the
-          # explicit retried install above already put this exact version on
-          # PATH, so this only keeps the action from re-installing a different
-          # one.
+          # newer default (issue #587: version skew plus a flaky download).
+          # The action installs its own copy of this same version regardless
+          # (its own download has no retry); the step right after this one
+          # re-asserts the explicit retried install's directory at the front
+          # of PATH so that copy, not the action's, is what every later step
+          # actually runs.
           kubectl_version: v1.32.2
           # Raised from 120s to 300s (issue #587: readiness timeout with no
           # headroom). This is the action's control-plane readiness wait before
@@ -890,6 +929,17 @@ jobs:
           # waits are the deeper gate #587 also names, but they live in that
           # script, out of this file's scope.)
           wait: 300s
+      # helm/kind-action's own kubectl install prepends its directory to
+      # GITHUB_PATH, which would otherwise shadow the retried install above
+      # for every step from here on. Re-prepend the dedicated kubectl-only
+      # directory (not /usr/local/bin, which also holds the runner image's
+      # own kind binary -- prepending that wholesale would un-pin kind
+      # against the action's pinned v0.32.0 tool-cache copy too) so the
+      # binary that survived the retry loop -- not the action's unretried
+      # download -- is the one kind-up.sh, kind-demo.sh, and the diagnostics
+      # step below actually invoke, while kind stays exactly as pinned.
+      - name: Prefer the retried kubectl over the action's own install
+        run: echo "${RUNNER_TEMP}/kubectl-bin" >> "$GITHUB_PATH"
       - name: Bring up the kind environment
         env:
           # The images are already built and in the runner's docker daemon;
