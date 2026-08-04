@@ -95,6 +95,7 @@ fn log_state(
         admission,
         store,
         recovery: None,
+        provisioning: None,
     }
 }
 

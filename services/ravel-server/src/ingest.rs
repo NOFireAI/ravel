@@ -27,6 +27,11 @@ pub struct IngestState {
     /// bucket. `handle_export` ensures the tenant's manifest before its first
     /// write; `None` (an unkeyed bucket) is a no-op.
     pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
+    /// Durable shard_count provisioning-record writer (ADR-0050 section 5).
+    /// `handle_export` pins the (tenant, Metrics) record on the tenant's first
+    /// write and fails the request on a `shard_count` mismatch. `Some` in the
+    /// ingest modes; `None` (e.g. a unit test) is a no-op.
+    pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
 }
 
 pub struct IngestOutcome {
@@ -41,6 +46,11 @@ pub enum IngestRequestError {
     /// A whole-request, retryable-later rejection: series-creation-rate
     /// exceeded. No tokens are consumed on rejection.
     Admission(RequestRejection),
+    /// The configured `shard_count` disagrees with this (tenant, signal)'s
+    /// durable provisioning record (ADR-0050 section 5). The request fails
+    /// rather than writing into a shard topology that hides the tenant's
+    /// existing data; an operator must reconcile config with the record.
+    Provisioning(String),
     Write(WriteError),
 }
 
@@ -48,6 +58,7 @@ impl std::fmt::Display for IngestRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IngestRequestError::Admission(rejection) => write!(f, "{}", rejection.reason),
+            IngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
             IngestRequestError::Write(err) => write!(f, "{err}"),
         }
     }
@@ -58,10 +69,13 @@ impl std::error::Error for IngestRequestError {}
 impl IngestRequestError {
     /// Whether a client may reasonably retry the whole request. An
     /// admission rejection is always retryable later, once the tenant's
-    /// bucket refills; delegates to [`WriteError::is_retryable`] otherwise.
+    /// bucket refills; delegates to [`WriteError::is_retryable`] otherwise. A
+    /// provisioning mismatch is an operator misconfiguration, not a transient
+    /// condition, so a naive client retry cannot succeed.
     pub fn is_retryable(&self) -> bool {
         match self {
             IngestRequestError::Admission(_) => true,
+            IngestRequestError::Provisioning(_) => false,
             IngestRequestError::Write(err) => err.is_retryable(),
         }
     }
@@ -87,6 +101,19 @@ pub async fn handle_export(
     // (ADR-0050 section 3). Best-effort and off the durability path: see
     // `crate::tenancy::ensure_recovery_manifest`.
     crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, ingest_ts_ns).await;
+
+    // Pin (and validate) the (tenant, Metrics) shard_count provisioning record
+    // on the tenant's first write (ADR-0050 section 5). A hard mismatch fails
+    // this one request with a typed error; a store blip or corrupt record is
+    // logged inside `ensure_provisioning_record` and ingest proceeds.
+    crate::provisioning::ensure_provisioning_record(
+        &state.provisioning,
+        &tenant,
+        ravel_types::Signal::Metrics,
+        ingest_ts_ns,
+    )
+    .await
+    .map_err(|e| IngestRequestError::Provisioning(e.to_string()))?;
 
     let normalized = normalize_metrics(&tenant, request, &state.limits, ingest_ts_ns);
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
@@ -239,6 +266,7 @@ mod tests {
                 AdmissionLimits::default(),
             )),
             recovery: None,
+            provisioning: None,
         }
     }
 
@@ -398,6 +426,7 @@ mod tests {
                 AdmissionLimits::default(),
             )),
             recovery: Some(writer),
+            provisioning: None,
         };
 
         let tenant = TenantId::new("acme");

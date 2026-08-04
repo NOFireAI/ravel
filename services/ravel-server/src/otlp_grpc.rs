@@ -90,6 +90,7 @@ impl MetricsService for GrpcMetricsService {
         .await
         .map_err(|err| match err {
             IngestRequestError::Admission(rejection) => admission_rejection_status(rejection),
+            IngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),
             IngestRequestError::Write(write_err) if write_err.is_retryable() => {
                 Status::unavailable(write_err.to_string())
             }

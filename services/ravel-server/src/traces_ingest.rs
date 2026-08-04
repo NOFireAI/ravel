@@ -31,6 +31,9 @@ pub struct SpanIngestState {
     /// Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
     /// bucket. Ensured before the first write; `None` (unkeyed) is a no-op.
     pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
+    /// Durable shard_count provisioning-record writer (ADR-0050 section 5),
+    /// pins the (tenant, Spans) record on the tenant's first span write.
+    pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
 }
 
 pub struct SpanIngestOutcome {
@@ -63,6 +66,10 @@ pub enum SpanIngestRequestError {
     InvalidIdempotencyKey {
         len: usize,
     },
+    /// The configured `shard_count` disagrees with this (tenant, Spans)'s
+    /// durable provisioning record (ADR-0050 section 5). Operator
+    /// misconfiguration, not client fault; the request fails.
+    Provisioning(String),
     Write(SpanWriteError),
 }
 
@@ -73,6 +80,7 @@ impl std::fmt::Display for SpanIngestRequestError {
                 f,
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
             ),
+            SpanIngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
             SpanIngestRequestError::Write(err) => write!(f, "{err}"),
         }
     }
@@ -83,10 +91,12 @@ impl std::error::Error for SpanIngestRequestError {}
 impl SpanIngestRequestError {
     /// Whether a client may reasonably retry the whole request. An over-long
     /// key cannot succeed on retry unchanged; a write error defers to
-    /// [`SpanWriteError::is_retryable`].
+    /// [`SpanWriteError::is_retryable`]; a provisioning mismatch is an operator
+    /// misconfiguration and cannot succeed on a naive retry.
     pub fn is_retryable(&self) -> bool {
         match self {
             SpanIngestRequestError::InvalidIdempotencyKey { .. } => false,
+            SpanIngestRequestError::Provisioning(_) => false,
             SpanIngestRequestError::Write(err) => err.is_retryable(),
         }
     }
@@ -117,6 +127,17 @@ pub async fn handle_export_traces(
     // Record the tenant's recovery manifest on its first write (ADR-0050
     // section 3), best-effort and off the durability path.
     crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, ingest_ts_ns).await;
+
+    // Pin/validate the (tenant, Spans) shard_count provisioning record on first
+    // write (ADR-0050 section 5); a hard mismatch fails this request.
+    crate::provisioning::ensure_provisioning_record(
+        &state.provisioning,
+        &tenant,
+        ravel_types::Signal::Spans,
+        ingest_ts_ns,
+    )
+    .await
+    .map_err(|e| SpanIngestRequestError::Provisioning(e.to_string()))?;
     // One hour-bucket computation shared by the lookup and the marker write.
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
 
@@ -314,6 +335,7 @@ mod tests {
             ack_deadline: Duration::from_secs(5),
             store,
             recovery: None,
+            provisioning: None,
         }
     }
 

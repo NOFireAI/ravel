@@ -782,6 +782,33 @@ fn render_tenancy_family(out: &mut String, mode: Mode, v1_unkeyed_adoptions: u64
     );
 }
 
+/// Dynamic-tenant `shard_count` provisioning failures (ADR-0050 section 5,
+/// EC5): a dynamically-resolved tenant's durable provisioning check failed,
+/// either a real disagreement against this process's configured `--shards`
+/// (failing that single first-touch request), an unreadable record (corrupt
+/// or a future format version, also a hard failure), or the same class of
+/// failure caught on the maintain per-tenant loop instead (which skips that
+/// tenant's tick rather than failing a request). A static tenant's mismatch
+/// refuses startup instead and never reaches this counter. A nonzero value
+/// means at least one dynamic tenant's provisioning record could not be
+/// validated as expected; the operations guide pages on any increase.
+/// Process-global atomic read from [`crate::provisioning`], single source,
+/// no labels.
+fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatches: u64) {
+    write_header(
+        out,
+        "ravel_provisioning_shard_count_mismatch_total",
+        "Dynamic-tenant provisioning checks that failed: a shard_count disagreement, an unreadable record, or a maintain-loop check catching either (ADR-0050 section 5).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_provisioning_shard_count_mismatch_total",
+        &[Label::Mode(mode)],
+        shard_count_mismatches,
+    );
+}
+
 /// Storage-derived tenant discovery counters for the maintenance driver
 /// (ADR-0048 decision 3, issue #504), decoupled from
 /// [`crate::tenant_discovery::TenantDiscoveryMetrics`] so the renderer is
@@ -1259,6 +1286,11 @@ pub fn render(
     }
     render_catalog_family(&mut out, mode, catalog);
     render_tenancy_family(&mut out, mode, crate::tenancy::v1_unkeyed_adoption_count());
+    render_provisioning_family(
+        &mut out,
+        mode,
+        crate::provisioning::shard_count_mismatch_count(),
+    );
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
     }

@@ -56,17 +56,25 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
 
 /// Catalog configuration.
 ///
-/// `shard_count` is immutable per (tenant, signal) in v1 (ADR-0010 §9):
-/// once segments for a (tenant, signal) exist, changing this value is a
-/// data-loss operation (segments already routed to a shard index become
-/// unreachable if the shard count changes) and is forbidden. Phase 1 reads
-/// it from static config; resolvers will read it from a per-tenant manifest
-/// object once that lands (ADR-0010 §9), at which point this field becomes
-/// a cache of that manifest rather than the source of truth.
+/// `shard_count` is immutable per (tenant, signal) (ADR-0010 §9): once
+/// segments for a (tenant, signal) exist, changing this value is a data-loss
+/// operation (segments already routed to a shard index become unreachable if
+/// the shard count changes) and is forbidden. It is no longer merely a static
+/// process config that resolvers trust blindly: ADR-0050 section 5 makes it a
+/// durable, startup-checked property. A (tenant, signal)'s first write pins the
+/// configured value in an immutable provisioning record at
+/// `t/<tenant_hash>/<sig>/prov` ([`crate::validate_or_adopt`]); every later
+/// ingest, catalog, and maintain touch validates this configured value against
+/// that record and refuses (static tenant) or fails the request (dynamic
+/// tenant) on disagreement, rather than silently resolving over a subset of
+/// shards. This field is therefore the configured value validated against the
+/// durable record, not an unchecked source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogConfig {
     /// Number of shards for the (tenant, signal) this catalog serves. See
-    /// the struct docs: immutable per (tenant, signal), never hot-reloaded.
+    /// the struct docs: immutable per (tenant, signal), never hot-reloaded,
+    /// and validated at startup/first-touch against the durable provisioning
+    /// record (ADR-0050 section 5).
     pub shard_count: u32,
     /// How far behind `range.start_ns` the commit listing window extends,
     /// in nanoseconds. Default 2h ([`DEFAULT_MAX_INGEST_LAG_NS`]).

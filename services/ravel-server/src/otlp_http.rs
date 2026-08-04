@@ -224,6 +224,9 @@ async fn export_metrics(
             encode_commit_tokens(&outcome.tokens).as_deref(),
         ),
         Err(IngestRequestError::Admission(rejection)) => admission_rejection_response(rejection),
+        Err(err @ IngestRequestError::Provisioning(_)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
         Err(err @ IngestRequestError::Write(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
@@ -286,6 +289,9 @@ async fn export_logs(
         Err(err @ LogIngestRequestError::InvalidIdempotencyKey { .. }) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }
+        Err(err @ LogIngestRequestError::Provisioning(_)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
         Err(err @ LogIngestRequestError::Write(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
@@ -347,6 +353,9 @@ async fn export_traces(
         ),
         Err(err @ SpanIngestRequestError::InvalidIdempotencyKey { .. }) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+        }
+        Err(err @ SpanIngestRequestError::Provisioning(_)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
         Err(err @ SpanIngestRequestError::Write(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()

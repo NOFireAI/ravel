@@ -9,6 +9,7 @@ mod catalog;
 mod config;
 mod error;
 mod fold;
+mod provisioning;
 mod snapshot;
 mod snapshot_format;
 mod snapshot_resolve;
@@ -23,6 +24,10 @@ pub use config::{
 };
 pub use error::CatalogError;
 pub use fold::{FoldReport, Transaction};
+pub use provisioning::{
+    AbsentPolicy, PROVISIONING_FORMAT_VERSION, ProvisioningCheck, ProvisioningError,
+    provisioning_key, validate_or_adopt,
+};
 pub use snapshot::{SegmentLevel, SegmentRef, Snapshot};
 pub use snapshot_format::{
     DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, DecodedPostings,

@@ -37,6 +37,9 @@ pub struct LogIngestState {
     /// Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
     /// bucket. Ensured before the first write; `None` (unkeyed) is a no-op.
     pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
+    /// Durable shard_count provisioning-record writer (ADR-0050 section 5),
+    /// pins the (tenant, Logs) record on the tenant's first log write.
+    pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
 }
 
 #[derive(Debug)]
@@ -76,6 +79,10 @@ pub enum LogIngestRequestError {
     InvalidIdempotencyKey {
         len: usize,
     },
+    /// The configured `shard_count` disagrees with this (tenant, Logs)'s
+    /// durable provisioning record (ADR-0050 section 5). Operator
+    /// misconfiguration, not client fault; the request fails.
+    Provisioning(String),
     Write(LogWriteError),
 }
 
@@ -87,6 +94,7 @@ impl std::fmt::Display for LogIngestRequestError {
                 f,
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
             ),
+            LogIngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
             LogIngestRequestError::Write(err) => write!(f, "{err}"),
         }
     }
@@ -103,6 +111,8 @@ impl LogIngestRequestError {
             // Retrying the identical over-long key cannot succeed; the client
             // must change it.
             LogIngestRequestError::InvalidIdempotencyKey { .. } => false,
+            // An operator misconfiguration, not transient.
+            LogIngestRequestError::Provisioning(_) => false,
             LogIngestRequestError::Write(err) => err.is_retryable(),
         }
     }
@@ -134,6 +144,17 @@ pub async fn handle_export_logs(
     // Record the tenant's recovery manifest on its first write (ADR-0050
     // section 3), best-effort and off the durability path.
     crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, ingest_ts_ns).await;
+
+    // Pin/validate the (tenant, Logs) shard_count provisioning record on first
+    // write (ADR-0050 section 5); a hard mismatch fails this request.
+    crate::provisioning::ensure_provisioning_record(
+        &state.provisioning,
+        &tenant,
+        ravel_types::Signal::Logs,
+        ingest_ts_ns,
+    )
+    .await
+    .map_err(|e| LogIngestRequestError::Provisioning(e.to_string()))?;
     // One hour-bucket computation, shared by the lookup and the marker write
     // so they cannot drift within a request (see `request_ingest_hour_bucket`).
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
@@ -371,6 +392,7 @@ mod tests {
             )),
             store,
             recovery: None,
+            provisioning: None,
         }
     }
 
