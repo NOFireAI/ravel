@@ -146,6 +146,27 @@ tenants; anything else folds into `tenant_hash="other"`. `shard` is not a
 label. Query text, metric names, label values, stream ids, trace ids, and
 object keys are never labels.
 
+**Amendment, 2026-08-04 (issue #603).** ADR-0051 section 6 added an
+eighth permitted label, `reason`, for the admission family's
+`ravel_admission_rejected_total`. That decision belongs to ADR-0051; this
+paragraph records it so that the list above stays exhaustive rather than
+becoming the stale half of a contradiction. A reader who treated this
+section as normative and the code as wrong, or the reverse, would have
+been correct either way, which is why the list is amended in place
+instead of being left to the later ADR alone.
+
+`reason` meets the same two tests every other key meets. Its values are a
+closed enum, so cardinality is bounded by construction, and none of them
+carries tenant identity. Extending the list is therefore a widening of
+the allowlist, not an exception to it.
+
+The `reason` value set is smaller in code than in ADR-0051 section 6.
+That section names six values; `RejectReason` in
+`services/ravel-server/src/metrics.rs` has three (`byte_rate`,
+`series_rate`, `series_cap`). The other three have no counter to render,
+and a rendered series that no data source can fill is worse than an
+absent one. They join the enum when their counters do.
+
 ### 5. Tracing spans on the query path
 
 Each crate instruments its own phases with `tracing` spans: catalog
