@@ -2117,6 +2117,7 @@ mod tests {
             None,
             None,
             &AdmissionCountersSnapshot::default(),
+            &[],
         );
 
         let postings_lines: Vec<&str> = body
