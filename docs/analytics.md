@@ -256,13 +256,19 @@ the evaluated matrix:
       {"metric": {"__name__": "http_requests_total", "job": "api"},
        "result": { ... op result ... }}
     ]
-  }
+  },
+  "stats": { "accounting": { ... }, "estimate": { ... } }
 }
 ```
 
 Each entry's `metric` is the series' label set; its `result` is the op's
 result object, serialized by server-local serde structs (the crate carries no
 serde). Fields are snake_case.
+
+`stats` sits beside `data`, not inside it. It carries what this query spent
+on object storage, and the pre-execution upper envelope of that spend
+(ADR-0044). docs/guides/operations.md, section "Per-query cost accounting",
+gives the field list.
 
 `change_point` result:
 

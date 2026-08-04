@@ -504,9 +504,16 @@ cardinality trade an operator opts into deliberately, not a default.
 
 ### Per-query cost accounting (ADR-0044, issue #425)
 
-Every query the server executes reports what it spent on object storage
-both to the client that ran it and to `GET /metrics`, so an operator can
-see cost per tenant and per workload without reading a query's text.
+A query reports what it spent on object storage to the client that ran it.
+An operator can then see cost per tenant and per workload, and never reads
+a query's text to do it.
+
+**Coverage is partial in this release.** Only `POST /api/v1/sql` and
+`POST /api/v1/analytics` fold their cost into `GET /metrics`. The
+Prometheus-shaped and the Flight SQL paths report their cost in the
+response only. Their cost is missing from the `ravel_query_*` family
+below. Issue #425 tracks the remaining work. Read every `/metrics` number
+below as SQL and analytics traffic, not as all query traffic.
 
 **In the response.** `POST /api/v1/sql` and `POST /api/v1/analytics` add a
 `stats` object beside `data`, carrying this query's `accounting` (the
@@ -521,15 +528,16 @@ response is a bare columnar payload with no envelope for a JSON object, so it
 reports no in-body stats; the `/metrics` aggregation below still captures the
 query regardless of its encoding.
 
-**At `/metrics`.** The `ravel_query_*` family aggregates every accounted
-query, labeled by `mode`, `tenant_hash`, and `workload_class`
-(`interactive` for a client-driven HTTP or Flight query, `background` for an
-internally scheduled one). The actual and the estimate render as separate,
-distinctly-named series so their divergence is directly measurable in PromQL:
+**At `/metrics`.** The `ravel_query_*` family aggregates each accounted
+query. Its labels are `mode`, `tenant_hash`, and `workload_class`. Only
+`workload_class="interactive"` occurs in this release. No production caller
+runs a query as `background` yet. The actual and the estimate render as
+separate series with different names. An operator can then measure their
+divergence directly in PromQL:
 
 | Metric | What |
 |---|---|
-| `ravel_query_queries_total` | Accounted queries; the denominator for per-query averages. |
+| `ravel_query_queries_total` | Accounted queries. This is the denominator for per-query averages. |
 | `ravel_query_s3_requests_total` / `ravel_query_s3_bytes_total` | Actual object-store requests and bytes. |
 | `ravel_query_cache_hits_total` / `ravel_query_cache_misses_total` | In-process read-cache outcomes attributed to queries. |
 | `ravel_query_decompressed_bytes_total` | Actual decompressed sample bytes decoded. |
@@ -550,6 +558,13 @@ record time, so `/metrics` cardinality is bounded by the configured tenant
 count regardless of how many distinct tenants query -- the same
 disclosure-and-cardinality trade the admission family makes on this
 unauthenticated route. Off (the default), every tenant folds into `other`.
+
+A query that fails records nothing. A deadline breach, an admission
+rejection, and an execution error all return before the fold, and the error
+type carries no accounting snapshot. The runaway query that the ratio below
+exists to show is therefore the one query the ratio can miss. Read a sudden
+drop in `ravel_query_queries_total`, against steady request logs, as
+failures rather than as idle capacity.
 
 Suggested operator uses: alert on
 `increase(ravel_query_s3_requests_total[5m]) / increase(ravel_query_estimated_requests_total[5m]) > 1`
