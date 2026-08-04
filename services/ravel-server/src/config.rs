@@ -10,6 +10,7 @@ use ravel_maintain::RetentionPolicy;
 use ravel_types::{TenantHash, TenantId};
 
 use crate::alert_sink::AlertSink;
+use crate::postings_config::IndexedFieldPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
@@ -118,6 +119,26 @@ pub struct Cli {
     /// existing duration-string convention in this crate.
     #[arg(long = "retention-tenant", value_name = "TENANT=DURATION")]
     pub retention_tenants: Vec<String>,
+
+    /// Default POSTINGS indexed-field list (ADR-0049 decision 3, issue #511),
+    /// as a repeatable `--indexed-field FIELD`. These are the attribute names
+    /// the log writer builds an exact block-level index over, so an equality or
+    /// `IN` query on one prunes to the blocks that hold it. Unset falls back to
+    /// the shipped default set (`service.name`, `k8s.namespace.name`,
+    /// `http.status_code`); pass one or more to replace it. Opt-in per field,
+    /// never automatic: indexing every attribute is how a log store acquires
+    /// unbounded per-object cost.
+    #[arg(long = "indexed-field", value_name = "FIELD")]
+    pub indexed_field_defaults: Vec<String>,
+
+    /// Repeatable per-tenant indexed-field override,
+    /// `TENANT=field1,field2` (e.g. `acme=service.name,http.route`), replacing
+    /// the default list for that tenant. An empty right-hand side
+    /// (`--indexed-field-tenant acme=`) opts the tenant out of POSTINGS
+    /// indexing entirely. Overrides are total, not additive, matching how
+    /// `--retention-tenant` overrides `--retention-default`.
+    #[arg(long = "indexed-field-tenant", value_name = "TENANT=FIELDS")]
+    pub indexed_field_tenants: Vec<String>,
 
     /// Path to the JSON alert-rules file (ADR-0043 decision 2). Alert
     /// evaluation is off unless this names a file with at least one rule. A
@@ -417,6 +438,43 @@ impl Cli {
             tenants.push((tenant.to_string(), parse_window_ns(dur)?));
         }
         Ok(RetentionPolicy { default, tenants })
+    }
+
+    /// Build the raw [`IndexedFieldPolicy`] from `--indexed-field` and the
+    /// repeatable `--indexed-field-tenant TENANT=FIELDS` (issue #511). An unset
+    /// default (`--indexed-field` never passed) is `None`, so
+    /// [`IndexedFieldConfig::from_policy`](crate::postings_config::IndexedFieldConfig::from_policy)
+    /// falls back to the shipped list; a
+    /// per-tenant override with an empty field set is a deliberate opt-out. This
+    /// only splits the strings; the empty/duplicate-name validation happens in
+    /// `from_policy`, alongside tenant-id hashing, mirroring how
+    /// `parse_retention_policy` defers floor validation to
+    /// `RetentionConfig::from_policy`.
+    pub fn parse_indexed_field_policy(&self) -> anyhow::Result<IndexedFieldPolicy> {
+        let default = if self.indexed_field_defaults.is_empty() {
+            None
+        } else {
+            Some(self.indexed_field_defaults.clone())
+        };
+        let mut tenants = Vec::with_capacity(self.indexed_field_tenants.len());
+        for pair in &self.indexed_field_tenants {
+            let (tenant, fields) = pair.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("invalid --indexed-field-tenant '{pair}', expected TENANT=FIELDS")
+            })?;
+            if tenant.is_empty() {
+                anyhow::bail!("invalid --indexed-field-tenant '{pair}', expected TENANT=FIELDS");
+            }
+            // An empty right-hand side is a valid explicit opt-out (index
+            // nothing for this tenant); a non-empty one splits on commas and
+            // trims each name.
+            let list: Vec<String> = if fields.is_empty() {
+                Vec::new()
+            } else {
+                fields.split(',').map(|f| f.trim().to_string()).collect()
+            };
+            tenants.push((tenant.to_string(), list));
+        }
+        Ok(IndexedFieldPolicy { default, tenants })
     }
 
     /// Build the alert sink list from `--alert-webhook-url` and
@@ -1359,6 +1417,63 @@ mod tests {
             .expect_err("an empty tenant name fails startup");
         assert!(
             err.to_string().contains("--maintain-tenant"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn absent_indexed_field_flags_yield_an_unset_default_and_no_overrides() {
+        let policy = cli(&[])
+            .parse_indexed_field_policy()
+            .expect("absent flags are not an error");
+        assert!(
+            policy.default.is_none(),
+            "unset default falls back to the shipped list in from_policy"
+        );
+        assert!(policy.tenants.is_empty());
+    }
+
+    #[test]
+    fn indexed_field_flags_parse_default_and_per_tenant_overrides() {
+        let policy = cli(&[
+            "--indexed-field",
+            "service.name",
+            "--indexed-field",
+            "http.route",
+            "--indexed-field-tenant",
+            "acme=service.name, http.status_code",
+            "--indexed-field-tenant",
+            "globex=",
+        ])
+        .parse_indexed_field_policy()
+        .expect("valid flags parse");
+        assert_eq!(
+            policy.default,
+            Some(vec!["service.name".to_string(), "http.route".to_string()])
+        );
+        assert_eq!(policy.tenants.len(), 2);
+        assert_eq!(
+            policy.tenants[0],
+            (
+                "acme".to_string(),
+                vec!["service.name".to_string(), "http.status_code".to_string()]
+            ),
+            "commas split and whitespace is trimmed"
+        );
+        assert_eq!(
+            policy.tenants[1],
+            ("globex".to_string(), Vec::<String>::new()),
+            "an empty right-hand side is an explicit opt-out"
+        );
+    }
+
+    #[test]
+    fn indexed_field_tenant_without_equals_is_rejected() {
+        let err = cli(&["--indexed-field-tenant", "acme"])
+            .parse_indexed_field_policy()
+            .expect_err("a missing '=' fails startup");
+        assert!(
+            err.to_string().contains("--indexed-field-tenant"),
             "error names the flag: {err}"
         );
     }
