@@ -72,8 +72,13 @@ cap matches the shape of the cardinality limiter.
 Ravel counts every exemplar that it stores and every exemplar that it drops.
 The ingest metrics hold two counters. The `exemplars_written_total` counter
 counts stored exemplars. The `exemplars_dropped_total` counter counts dropped
-exemplars. If the cap engages, the `exemplars_dropped_total` counter rises. To
-confirm that the cap engaged, read the `exemplars_dropped_total` counter.
+exemplars. If the cap engages, the `exemplars_dropped_total` counter rises.
+
+`GET /metrics` does not expose these two counters yet. The server renders
+the ingest family from `IngestPipelineSnapshot`, and that structure carries
+no exemplar field. An operator therefore cannot see the cap engage from
+outside the process. Issue #606 tracks the work. Until it lands, read the
+drop count from the flush logs.
 
 ## How to query exemplars
 
