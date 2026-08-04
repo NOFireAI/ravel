@@ -89,14 +89,31 @@ data, the same config-asserts-reality bug class this derivation removes.
 
 Every mode, maintain included, serves two health routes on `--listen-http`
 (ADR-0034 decision 4). `/healthz` (liveness) returns 200 whenever the HTTP
-listener is serving, so a routed 200 proves the axum event loop is alive.
-`/readyz` (readiness) returns 503 until startup has fully completed (config
-parsed, the object-store capability gate passed, both listeners bound) and
-200 thereafter; it performs no object-store call per probe, deliberately, to
-avoid adding S3 cost on every kubelet probe and to avoid a transient S3 blip
-ejecting every pod from its Service at once. In maintain mode these three
-routes are the entire HTTP surface: liveness there means the routes answer,
-not merely that a TCP connection is accepted.
+listener is serving, so a routed 200 proves the axum event loop is alive; it is
+deliberately independent of store reachability, so a store outage never makes
+liveness fail and get healthy processes killed and restarted. `/readyz`
+(readiness) returns 503 until startup has fully completed (config parsed, the
+object-store capability gate passed, both listeners bound), and thereafter is
+the AND of that startup latch and a background store-reachability probe
+(ADR-0050 section 7): one probe per process GETs the fixed `sys/tenancy` object
+every `--store-probe-interval` (default 30s, jittered), and after four
+consecutive failures readiness flips to 503, recovering on the first success
+(asymmetric hysteresis). `/readyz` still performs no object-store call on the
+probe path itself -- the kubelet reads an in-memory atomic the probe maintains
+-- which keeps the two objections the original design documented (kubelet-
+frequency S3 cost, single-blip mass ejection) answered rather than overridden.
+The probe also exports `ravel_store_reachable` (gauge) and
+`ravel_store_probe_failures_total` (counter) at `/metrics`, with a default
+alert rule (docs/guides/operations.md). In maintain mode these three routes are
+the entire HTTP surface: liveness there means the routes answer, not merely that
+a TCP connection is accepted.
+
+Startup is also gated on the store backend being qualified (ADR-0050 section 6):
+on any non-`memory` store, every mode reads the durable `sys/qualification`
+record before binding a listener and refuses to start if it is absent or its
+suite version is below the binary's floor. A fresh production deployment must run
+`ravel-cli store qualify` first; this is deliberate, not a bootstrap-and-continue
+path (docs/guides/operations.md).
 
 Every mode also serves `GET /metrics` on `--listen-http` (ADR-0044 section 4,
 issue #423): a hand-written Prometheus text exposition of counters Ravel

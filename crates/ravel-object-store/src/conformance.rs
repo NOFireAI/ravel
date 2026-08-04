@@ -22,6 +22,7 @@
 //! opaque failure.
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
 
@@ -30,6 +31,34 @@ use crate::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_
 /// added, tightened, or its pass criteria changes, so an old qualification
 /// record can be told apart from one taken under the current suite.
 pub const CONFORMANCE_SUITE_VERSION: u32 = 1;
+
+/// Root-prefix key for the durable qualification record (ADR-0050 section 6,
+/// "New durable objects and key-layout entries": root prefix `sys/`).
+///
+/// Relocated here from `ravel-cli`'s `qualify` module so the two crates that
+/// need it -- `ravel-cli store qualify` (the writer) and `ravel-server` startup
+/// (the reader, ADR-0050 section 6 enforcement, EC7) -- share one definition
+/// rather than each declaring their own. Neither depends on the other, and
+/// this module already owns [`CONFORMANCE_SUITE_VERSION`], the record's most
+/// load-bearing field, so it is the natural shared home.
+pub const QUALIFICATION_KEY: &str = "sys/qualification";
+
+/// Durable record written to [`QUALIFICATION_KEY`] on a passing qualification
+/// run. JSON, not protobuf: `proto/ravel/sys.proto` (which ADR-0050 section 6
+/// names for the eventual durable `sys/*` messages) is out of scope; the field
+/// names and JSON shape here are a frozen contract so an already-written
+/// `sys/qualification` object from before this relocation still decodes
+/// byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualificationRecord {
+    /// The [`CONFORMANCE_SUITE_VERSION`] the passing run was recorded under.
+    /// Server startup refuses when this is below the running binary's required
+    /// floor (ADR-0050 section 6).
+    pub suite_version: u32,
+    pub backend_identity: String,
+    pub qualified_unix_ns: i64,
+    pub passed_properties: Vec<String>,
+}
 
 /// One property the object store contract requires, named so a failure
 /// report can point at exactly what a backend cannot do.
@@ -366,6 +395,59 @@ mod tests {
     use crate::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use crate::memory::MemoryStore;
     use crate::{Capabilities, DelimitedList, GetOutcome, ListPage, ObjectMeta, PageToken};
+
+    /// The `sys/qualification` JSON shape is a frozen contract (ADR-0050
+    /// section 6): a record written before this struct was relocated out of
+    /// `ravel-cli` must still decode, so the field names and encoding must not
+    /// drift. Pins the exact serialized keys and a round-trip, so a rename or a
+    /// serde-attribute change that would silently break an existing object
+    /// fails this test instead.
+    #[test]
+    fn qualification_record_json_shape_is_stable() {
+        let record = QualificationRecord {
+            suite_version: 1,
+            backend_identity: "s3://ravel-test @ minio:9000".to_string(),
+            qualified_unix_ns: 1_700_000_000_000_000_000,
+            passed_properties: vec![
+                "conditional_write_create_if_absent".to_string(),
+                "consistent_read_after_write".to_string(),
+            ],
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&record).expect("encode"))
+                .expect("decode to a generic JSON value");
+        let obj = value.as_object().expect("record encodes as a JSON object");
+        // Exactly these four keys, no more, no fewer.
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                &"backend_identity".to_string(),
+                &"passed_properties".to_string(),
+                &"qualified_unix_ns".to_string(),
+                &"suite_version".to_string(),
+            ],
+            "the sys/qualification field set is a frozen contract"
+        );
+        assert_eq!(obj["suite_version"], serde_json::json!(1));
+        assert_eq!(
+            obj["backend_identity"],
+            serde_json::json!("s3://ravel-test @ minio:9000")
+        );
+        assert_eq!(
+            obj["qualified_unix_ns"],
+            serde_json::json!(1_700_000_000_000_000_000i64)
+        );
+
+        // Round-trip: an encoded record decodes back to the same fields.
+        let decoded: QualificationRecord =
+            serde_json::from_value(value).expect("round-trips back to the record type");
+        assert_eq!(decoded.suite_version, record.suite_version);
+        assert_eq!(decoded.backend_identity, record.backend_identity);
+        assert_eq!(decoded.qualified_unix_ns, record.qualified_unix_ns);
+        assert_eq!(decoded.passed_properties, record.passed_properties);
+    }
 
     #[tokio::test]
     async fn conforming_backend_qualifies() {

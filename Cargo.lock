@@ -4495,6 +4495,8 @@ dependencies = [
  "object_store 0.14.1",
  "parking_lot",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

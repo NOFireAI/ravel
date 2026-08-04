@@ -8,24 +8,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ravel_object_store::conformance::{CONFORMANCE_SUITE_VERSION, run_conformance_suite};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
-use serde::{Deserialize, Serialize};
 
-/// Root-prefix key for the durable qualification record (ADR-0050 section 6,
-/// "New durable objects and key-layout entries": root prefix `sys/`).
-pub const QUALIFICATION_KEY: &str = "sys/qualification";
-
-/// Durable record written to [`QUALIFICATION_KEY`] on a passing run. JSON, not
-/// protobuf: `proto/ravel/sys.proto` (which ADR-0050 section 6 names for the
-/// eventual durable `sys/*` messages) is out of scope for this change --
-/// see the final report for why this is a deliberate, flagged gap rather
-/// than a silent one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QualificationRecord {
-    pub suite_version: u32,
-    pub backend_identity: String,
-    pub qualified_unix_ns: i64,
-    pub passed_properties: Vec<String>,
-}
+// The record and its key now live in `ravel-object-store` so `ravel-server`
+// startup (ADR-0050 section 6, EC7) and this writer share one definition.
+// Re-exported here so existing `ravel_cli::qualify::{QUALIFICATION_KEY,
+// QualificationRecord}` call sites (and the in-process CLI test) keep resolving
+// against the CLI's own module path.
+pub use ravel_object_store::conformance::{QUALIFICATION_KEY, QualificationRecord};
 
 /// Run the conformance suite against `store` under a fresh scratch prefix and
 /// print each property's outcome. On a pass, writes [`QualificationRecord`]

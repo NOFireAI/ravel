@@ -118,6 +118,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
     };
     let running = ravel_server::start(
         config,
@@ -300,6 +301,7 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
     };
     let running = ravel_server::start(
         config,

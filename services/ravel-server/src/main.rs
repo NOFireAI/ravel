@@ -63,6 +63,18 @@ async fn main() -> anyhow::Result<()> {
     let (store, store_metrics, cache) =
         ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
+    // Store-backend qualification gate (ADR-0050 section 6, EC7). On any
+    // production store kind, refuse to start unless a `sys/qualification` record
+    // written by `ravel-cli store qualify` is present and at least this binary's
+    // suite-version floor. Read-only, runs once before any listener binds, in
+    // every mode; `StoreKind::Memory` (the semantics oracle) is exempt. Unlike
+    // the tenancy marker and GC config, an absent record is NOT a
+    // bootstrap-and-continue case: a fresh production deployment must run `store
+    // qualify` first, by design (see `qualification` and the operations guide).
+    ravel_server::qualification::enforce(store.as_ref(), cli.store)
+        .await
+        .context("store backend is not qualified (sys/qualification); refusing to start")?;
+
     // Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the bucket's
     // scheme from `sys/tenancy` (writing the marker for a fresh or pre-ADR
     // bucket) and install it process-wide. A configured scheme or key that
@@ -307,6 +319,9 @@ async fn main() -> anyhow::Result<()> {
         deployment_key,
         gc,
         query_deadline: gc_runtime.query_deadline,
+        store_probe_interval: cli
+            .parse_store_probe_interval()
+            .context("failed to parse --store-probe-interval")?,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;
