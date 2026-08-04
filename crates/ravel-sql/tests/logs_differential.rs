@@ -357,7 +357,10 @@ async fn write_object(
     seq: u64,
 ) -> SegmentRef {
     let identity = ObjectIdentity {
-        tenant_hash: [1u8; 16],
+        // Matches the TenantHash([7u8; 16]) this test fetches as; issue #612
+        // added a footer tenant_hash check on the RLOG read path, so a footer
+        // naming a different tenant than the fetch now fails closed.
+        tenant_hash: [7u8; 16],
         shard: 0,
         writer_id: [2u8; 16],
         writer_epoch: 1,
