@@ -1887,6 +1887,98 @@ mod tests {
         assert_eq!(exemplars[0]["value"], "1");
     }
 
+    /// F10: the query-time `[start, end]` clamp is inclusive at both ends. An
+    /// exemplar at exactly `start_ns` and one at exactly `end_ns` are present;
+    /// one at `start_ns - 1` and one at `end_ns + 1` are absent. Pins the
+    /// boundary so flipping the clamp's `<`/`>` to `<=`/`>=` (or the reverse)
+    /// fails a test rather than passing silently.
+    #[tokio::test]
+    async fn time_range_clamp_is_inclusive_at_both_boundaries() {
+        let store = Arc::new(MemoryStore::new());
+        // The `query` helper resolves exactly this window.
+        let start_ns = NOW - NS_PER_HOUR;
+        let end_ns = NOW;
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let at_start = exemplar(sid, start_ns, 1.0, [0x01; 16], SPAN_ID, &[]);
+        let at_end = exemplar(sid, end_ns, 1.0, [0x02; 16], SPAN_ID, &[]);
+        let before_start = exemplar(sid, start_ns - 1, 1.0, [0x03; 16], SPAN_ID, &[]);
+        let after_end = exemplar(sid, end_ns + 1, 1.0, [0x04; 16], SPAN_ID, &[]);
+        publish_segment(
+            &store,
+            1,
+            vec![series],
+            vec![at_start, at_end, before_start, after_end],
+        )
+        .await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+        let traces: Vec<&str> = body["data"][0]["exemplars"]
+            .as_array()
+            .expect("exemplars array")
+            .iter()
+            .map(|e| e["labels"]["trace_id"].as_str().expect("trace_id"))
+            .collect();
+        assert!(
+            traces.contains(&"01010101010101010101010101010101"),
+            "an exemplar at exactly start_ns is present: {body}"
+        );
+        assert!(
+            traces.contains(&"02020202020202020202020202020202"),
+            "an exemplar at exactly end_ns is present: {body}"
+        );
+        assert!(
+            !traces.contains(&"03030303030303030303030303030303"),
+            "an exemplar at start_ns - 1 is absent: {body}"
+        );
+        assert!(
+            !traces.contains(&"04040404040404040404040404040404"),
+            "an exemplar at end_ns + 1 is absent: {body}"
+        );
+        assert_eq!(
+            traces.len(),
+            2,
+            "exactly the two boundary exemplars, no more: {body}"
+        );
+    }
+
+    /// F10, the positive half of data fact 1: an exemplar whose `ts_ns` falls
+    /// outside its object's `min_event_ts_ns`/`max_event_ts_ns` (set by the
+    /// object's samples) but inside the query `[start, end]` is returned,
+    /// because the object was fetched for its samples and every in-window
+    /// exemplar in it is considered. This is the counterpart to
+    /// `exemplar_outside_time_range_is_excluded`: object event bounds neither
+    /// widen nor narrow the returned set; only the exemplar's own `ts_ns`
+    /// against `[start, end]` does.
+    #[tokio::test]
+    async fn exemplar_outside_object_event_bounds_but_in_window_is_returned() {
+        let store = Arc::new(MemoryStore::new());
+        // A single sample pins the object's event bounds to [NOW-10s, NOW-10s].
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 10 * NS_PER_SEC, 1.0)]);
+        // The exemplar is 30s ago: earlier than the object's min_event_ts, so
+        // outside its event bounds, yet well inside the query window [NOW-1h,
+        // NOW].
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&store, 1, vec![series], vec![ex]).await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+        let exemplars = body["data"][0]["exemplars"]
+            .as_array()
+            .expect("exemplars array");
+        assert_eq!(
+            exemplars.len(),
+            1,
+            "an in-window exemplar outside the object's event bounds is returned: {body}"
+        );
+        assert_eq!(
+            exemplars[0]["labels"]["trace_id"],
+            "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+        );
+    }
+
     /// Decision, data fact 2: the same exemplar readable twice during
     /// ADR-0018's overlap window (an L1 part and its input both in the
     /// snapshot) is deduplicated on `(series, ts, trace_id)` and returned
