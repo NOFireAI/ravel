@@ -422,6 +422,28 @@ pub async fn start(
         admission.set_tenant_limits(tenant.clone(), *limits);
     }
 
+    // Per-query cost aggregator (ADR-0044 section 4, issue #425): one per
+    // process, shared with every query handler below and read at scrape time by
+    // the `/metrics` route. Its per-tenant allowlist is the tenants an operator
+    // explicitly configured limits for, but only when `--metrics-tenant-labels`
+    // is set: on this unauthenticated route a real `tenant_hash` discloses a
+    // tenant's query volumes, so per-tenant query series are gated on the same
+    // opt-in the admission family's per-tenant series are (ADR-0044
+    // consequences; ADR-0051 section 6). Off (the default), the allowlist is
+    // empty and every tenant folds into `tenant_hash="other"`.
+    let query_accounting = Arc::new(metrics::QueryAccountingMetrics::new(
+        if config.metrics_tenant_labels {
+            config
+                .limits
+                .tenants
+                .keys()
+                .map(|tenant| tenant.hash())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        },
+    ));
+
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
     // and is latched to true below, once both listeners are bound and the
@@ -514,6 +536,7 @@ pub async fn start(
         cache_metrics: cache.as_ref().map(|c| c.metrics()),
         admission: admission.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
+        query_accounting: query_accounting.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 
@@ -557,6 +580,7 @@ pub async fn start(
                 store.clone(),
                 config.tenant_resolver.clone(),
                 cache.clone(),
+                query_accounting.clone(),
             )?;
             alert_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));
@@ -584,6 +608,7 @@ pub async fn start(
             engine: app_state.engine.clone(),
             tenant_resolver: config.tenant_resolver.clone(),
             clock: Arc::new(SystemClock),
+            query_accounting: query_accounting.clone(),
         };
         http_router = http_router.merge(analytics::router(analytics_state));
         if let Some(mtls) = &config.mtls_listener {
@@ -591,6 +616,7 @@ pub async fn start(
                 engine: app_state.engine.clone(),
                 tenant_resolver: mtls.resolver.clone(),
                 clock: Arc::new(SystemClock),
+                query_accounting: query_accounting.clone(),
             };
             mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
         }
