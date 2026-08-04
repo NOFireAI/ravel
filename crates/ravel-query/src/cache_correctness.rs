@@ -30,6 +30,7 @@ use ravel_cache::{Cache, CacheKey, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_segment::{
@@ -50,6 +51,20 @@ use crate::{
 
 const RSEG_TENANT: TenantHash = TenantHash([13u8; 16]);
 const RLOG_TENANT: TenantHash = TenantHash([21u8; 16]);
+
+/// Two tenants for the cross-tenant isolation tests below. Chosen to differ
+/// in every byte, with no all-zero/all-ones byte and no single-byte-apart or
+/// byte-swapped relationship, so a plausible truncation, zero-extension, or
+/// byte-order bug in key construction could not make one alias the other.
+/// Neither is `TenantHash([7u8; 16])`, the literal every existing `ravel-sql`
+/// call site passes, precisely so a hardcoded-tenant provider bug would be
+/// caught here rather than pass silently.
+const TENANT_A: TenantHash = TenantHash([
+    0x5A, 0x3C, 0x91, 0xE7, 0x02, 0xBD, 0x44, 0x68, 0xF1, 0x09, 0xAC, 0x37, 0xD0, 0x6B, 0x8E, 0x25,
+]);
+const TENANT_B: TenantHash = TenantHash([
+    0xC4, 0x71, 0x2F, 0x9A, 0xEB, 0x50, 0x86, 0x1D, 0x3B, 0xF6, 0x0C, 0xA9, 0x47, 0xD2, 0x68, 0xBE,
+]);
 
 /// Mirrors `fetcher::coalesce_ranges` (module-private there): merges ranges
 /// whose gap is at most `max_gap`, so a test can predict exactly which
@@ -139,9 +154,18 @@ fn scalar_series_v3(metric: &str, samples: &[(i64, f64)]) -> SeriesInputV3 {
 /// puts it on a fresh `MemoryStore`, and returns a matching L0 `SegmentRef`
 /// under `RSEG_TENANT`.
 async fn write_rseg_segment() -> (Arc<MemoryStore>, SegmentRef) {
+    write_rseg_segment_under(RSEG_TENANT).await
+}
+
+/// Like [`write_rseg_segment`] but writes the segment identity (and therefore
+/// the footer's `tenant_hash`) under `tenant`, so a fetch as any other tenant
+/// fails `check_identity`. The cross-tenant tests write under `TENANT_A` and
+/// fetch first as `TENANT_A` (which populates the cache and passes identity)
+/// and then as `TENANT_B`.
+async fn write_rseg_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, SegmentRef) {
     let writer_id = Uuid::from_u128(5);
     let identity = SegmentIdentity {
-        tenant_hash: RSEG_TENANT.0,
+        tenant_hash: tenant.0,
         shard: 0,
         writer_id: writer_id.to_string(),
         writer_epoch: 1,
@@ -200,9 +224,9 @@ async fn write_rseg_segment() -> (Arc<MemoryStore>, SegmentRef) {
 
 // ---- RLOG test segment -------------------------------------------------
 
-fn rlog_identity() -> ObjectIdentity {
+fn rlog_identity_under(tenant: TenantHash) -> ObjectIdentity {
     ObjectIdentity {
-        tenant_hash: RLOG_TENANT.0,
+        tenant_hash: tenant.0,
         shard: 0,
         writer_id: [22u8; 16],
         writer_epoch: 1,
@@ -213,6 +237,15 @@ fn rlog_identity() -> ObjectIdentity {
 /// Writes a small RLOG object (20 records, one stream), puts it on a fresh
 /// `MemoryStore`, and returns a matching L0 `SegmentRef` under `RLOG_TENANT`.
 async fn write_rlog_segment() -> (Arc<MemoryStore>, SegmentRef) {
+    write_rlog_segment_under(RLOG_TENANT).await
+}
+
+/// Like [`write_rlog_segment`] but writes the object identity under `tenant`.
+/// Unlike RSEG, the RLOG fetch/scan path carries no tenant identity check, so
+/// a cross-tenant cache hit here would silently return the first tenant's
+/// records; the isolation these tests prove therefore rests entirely on the
+/// cache key including `tenant_hash`.
+async fn write_rlog_segment_under(tenant: TenantHash) -> (Arc<MemoryStore>, SegmentRef) {
     let resource = vec![(
         "service.name".to_string(),
         AttrValue::Str("cache-test".to_string()),
@@ -235,7 +268,7 @@ async fn write_rlog_segment() -> (Arc<MemoryStore>, SegmentRef) {
         })
         .collect();
 
-    let mut writer = RlogWriter::new(RlogConfig::default(), rlog_identity());
+    let mut writer = RlogWriter::new(RlogConfig::default(), rlog_identity_under(tenant));
     for record in &records {
         writer.push(record.clone()).expect("push record");
     }
@@ -802,4 +835,205 @@ async fn corrupted_page_hit_behind_clean_footer_fails_closed() {
             );
         }
     }
+}
+
+// ---- Cross-tenant cache isolation (issue #554) --------------------------
+//
+// ADR-0046 decision 2: `tenant_hash` is in the `CacheKey` as a
+// defence-in-depth boundary so "a hash collision or a programming error
+// cannot serve one tenant's bytes to another". Cache-key construction was
+// sound by inspection but untested. These four tests pin it from both
+// sides -- a different tenant misses, the same tenant hits -- for each of
+// the two funnels this crate owns (RSEG `SegmentFetcher::guarded_get` and
+// RLOG `LogSegmentFetcher::fetch_accounted_with_tenant`).
+//
+// The shape common to all four: tenant A fetches once against a real
+// `MemoryStore`, warming a shared cache. A second fetcher over the same
+// cache is given a `FaultStore` whose every GET fails permanently. Whether
+// the second fetch reaches that store is the whole signal: a cache hit
+// never touches it (fault counter stays 0), a cache miss does (counter
+// rises). The fault counter, not merely the presence of an error, is the
+// discriminator -- an RSEG cross-tenant hit still errors, on the footer
+// identity check, so "is_err()" alone would pass even with a broken key.
+
+/// A store whose every GET fails with a permanent error. The wrapped
+/// `MemoryStore` is empty and never reached: the `Permanent` fault returns
+/// before delegating, so a fetch that reaches this store fails, and one that
+/// does not never moves the counter. `fault_count(Op::Get,
+/// FaultKind::Permanent)` is therefore an exact "was the store consulted?"
+/// probe.
+fn get_failing_store() -> Arc<FaultStore<MemoryStore>> {
+    Arc::new(FaultStore::new(
+        MemoryStore::new(),
+        FaultPlan::empty().with_rule(Rule::new(
+            Op::Get,
+            ScriptedFault::Permanent("cross-tenant isolation test: every GET must fail".into()),
+        )),
+    ))
+}
+
+/// RSEG: a second tenant must not read the first tenant's cached bytes.
+///
+/// Tenant A fetches the segment (written under `TENANT_A`, so identity
+/// passes) and warms the cache. Tenant B then fetches the SAME `SegmentRef`
+/// -- same `content_hash`, same whole-object range -- through a GET-failing
+/// store sharing that cache. A correct key includes `tenant_hash`, so B's
+/// key differs from A's, B misses, and B must consult the store, which
+/// fails. Dropping `tenant_hash` from the key would let B hit A's entry and
+/// never touch the store: it would still error (on `check_identity`, since
+/// the footer carries `TENANT_A`), so the fault counter is the assertion
+/// that actually distinguishes the two.
+#[tokio::test]
+async fn rseg_a_second_tenant_does_not_read_the_first_tenants_cached_bytes() {
+    let (store, seg_ref) = write_rseg_segment_under(TENANT_A).await;
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache = Arc::new(Cache::new(limits));
+
+    let backend_a: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher_a = SegmentFetcher::new(backend_a).with_cache(cache.clone());
+    fetcher_a
+        .fetch_soa(TENANT_A, &seg_ref, &[])
+        .await
+        .expect("tenant A's own fetch populates the cache");
+
+    let fault_store = get_failing_store();
+    let backend_b: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let fetcher_b = SegmentFetcher::new(backend_b).with_cache(cache);
+    let result = fetcher_b.fetch_soa(TENANT_B, &seg_ref, &[]).await;
+
+    assert!(
+        result.is_err(),
+        "tenant B must not receive a result for tenant A's object; got {result:?}"
+    );
+    assert!(
+        fault_store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+        "tenant B's fetch must consult the store (proving a cache miss keyed on tenant_hash), \
+         but no GET fault fired -- the cache served one tenant's bytes to another"
+    );
+}
+
+/// RLOG: a second tenant must not read the first tenant's cached bytes.
+///
+/// Same shape as the RSEG test, on the log funnel. RLOG has no tenant
+/// identity check on its scan path, so a cross-tenant cache hit here would
+/// return tenant A's records to tenant B as `Ok(Some(..))` -- the isolation
+/// rests entirely on the cache key. Both `is_err()` and the fault counter
+/// therefore fail under a key that drops `tenant_hash`.
+#[tokio::test]
+async fn rlog_a_second_tenant_does_not_read_the_first_tenants_cached_bytes() {
+    let (store, seg_ref) = write_rlog_segment_under(TENANT_A).await;
+    let query = LogQuery::new(0, 19);
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(limits));
+
+    let backend_a: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher_a = LogSegmentFetcher::new(backend_a).with_cache(cache.clone());
+    fetcher_a
+        .fetch_accounted_with_tenant(&seg_ref, TENANT_A, &query, &QueryAccounting::new())
+        .await
+        .expect("tenant A's own fetch must succeed")
+        .expect("segment overlaps the query range");
+
+    let fault_store = get_failing_store();
+    let backend_b: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let fetcher_b = LogSegmentFetcher::new(backend_b).with_cache(cache);
+    let result = fetcher_b
+        .fetch_accounted_with_tenant(&seg_ref, TENANT_B, &query, &QueryAccounting::new())
+        .await;
+
+    assert!(
+        result.is_err(),
+        "tenant B must not receive tenant A's log records from the cache; got {result:?}"
+    );
+    assert!(
+        fault_store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+        "tenant B's log fetch must consult the store (proving a cache miss keyed on tenant_hash), \
+         but no GET fault fired -- the cache served one tenant's bytes to another"
+    );
+}
+
+/// RSEG: the same tenant reads its own cached bytes without consulting the
+/// store. The complement to the cross-tenant test: without it, a cache that
+/// never hits (so every tenant always misses to the store) would also pass
+/// the cross-tenant test. Here tenant A fetches twice; the second fetcher's
+/// every GET fails, so the second fetch can only succeed from the cache, and
+/// the fault counter must stay 0 to prove the store was never consulted.
+#[tokio::test]
+async fn rseg_the_same_tenant_reads_its_own_cached_bytes_without_consulting_the_store() {
+    let (store, seg_ref) = write_rseg_segment_under(TENANT_A).await;
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache = Arc::new(Cache::new(limits));
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = SegmentFetcher::new(backend).with_cache(cache.clone());
+    let (mut truth, _stats) = fetcher
+        .fetch_soa(TENANT_A, &seg_ref, &[])
+        .await
+        .expect("first fetch populates the cache");
+    truth.sort_by_key(|s| s.series_id.0);
+
+    let fault_store = get_failing_store();
+    let backend_b: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let fetcher_b = SegmentFetcher::new(backend_b).with_cache(cache);
+    let (mut hit, _stats) = fetcher_b
+        .fetch_soa(TENANT_A, &seg_ref, &[])
+        .await
+        .expect("the same tenant must be served from cache without touching the failing store");
+    hit.sort_by_key(|s| s.series_id.0);
+
+    assert_eq!(hit.len(), truth.len());
+    for (a, b) in hit.iter().zip(truth.iter()) {
+        assert!(
+            soa_bits_eq(a, b),
+            "the same-tenant cache hit must be bit-identical to tenant A's first fetch"
+        );
+    }
+    assert_eq!(
+        fault_store.fault_count(Op::Get, FaultKind::Permanent),
+        0,
+        "a same-tenant cache hit must not consult the store at all"
+    );
+}
+
+/// RLOG: the same tenant reads its own cached bytes without consulting the
+/// store. Log-funnel complement to the RSEG same-tenant test, for the same
+/// reason: it stops the cross-tenant test from being satisfiable by a cache
+/// that simply never hits.
+#[tokio::test]
+async fn rlog_the_same_tenant_reads_its_own_cached_bytes_without_consulting_the_store() {
+    let (store, seg_ref) = write_rlog_segment_under(TENANT_A).await;
+    let query = LogQuery::new(0, 19);
+
+    let limits = CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024);
+    let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(limits));
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let fetcher = LogSegmentFetcher::new(backend).with_cache(cache.clone());
+    let truth = fetcher
+        .fetch_accounted_with_tenant(&seg_ref, TENANT_A, &query, &QueryAccounting::new())
+        .await
+        .expect("first fetch must succeed")
+        .expect("segment overlaps the query range");
+
+    let fault_store = get_failing_store();
+    let backend_b: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let fetcher_b = LogSegmentFetcher::new(backend_b).with_cache(cache);
+    let hit = fetcher_b
+        .fetch_accounted_with_tenant(&seg_ref, TENANT_A, &query, &QueryAccounting::new())
+        .await
+        .expect("the same tenant must be served from cache without touching the failing store")
+        .expect("segment overlaps the query range");
+
+    assert_eq!(
+        hit.records, truth.records,
+        "the same-tenant cache hit must return the same records as tenant A's first fetch"
+    );
+    assert_eq!(
+        fault_store.fault_count(Op::Get, FaultKind::Permanent),
+        0,
+        "a same-tenant cache hit must not consult the store at all"
+    );
 }
