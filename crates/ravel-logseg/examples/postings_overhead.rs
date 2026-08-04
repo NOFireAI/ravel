@@ -10,12 +10,11 @@
 //! Run: `cargo run -p ravel-logseg --release --example postings_overhead`
 //!
 //! The four-field list is three per-record attributes plus one resource-level
-//! attribute (`service.name`), the same shape issue #552 measured. In the
-//! current tree the writer builds a dynamic column only from per-record
-//! attributes, so a key that is only ever a resource attribute
-//! (`service.name` here) has no column and contributes no postings: the
-//! measurement therefore reports the overhead of the three indexable fields,
-//! and names the resource-only one as contributing nothing.
+//! attribute (`service.name`), the ordinary OTLP shape. All four emit
+//! postings: issue #552 gave every indexed stream-level key its own FIELD_DIR
+//! column, so a key that is only ever a resource attribute is indexed like any
+//! other. Before #552 this measurement covered three fields, not four, and
+//! reported 0.10% rather than 0.13%.
 
 // A throwaway measurement binary, not a production path: `expect` on the
 // in-memory writer (which cannot fail for this fixed corpus) keeps it short.
@@ -114,7 +113,7 @@ fn write(indexed: &[&str]) -> (usize, WriteStats) {
 
 fn main() {
     // The four-field list: three per-record HTTP attributes plus the
-    // resource-level service.name (the shape issue #552 measured).
+    // resource-level service.name. All four are indexed since issue #552.
     let four_fields = [
         "service.name",
         "http.status_code",
@@ -131,7 +130,7 @@ fn main() {
 
     println!("corpus: {RECORD_COUNT} records over {SERVICE_COUNT} services");
     println!("indexed-field list: {four_fields:?}");
-    println!("  (service.name is resource-only, so it has no column and no postings here)");
+    println!("  (service.name is resource-only; issue #552 indexes it anyway)");
     println!("baseline object (no indexed fields): {baseline} bytes");
     println!("object with POSTINGS:                {with_postings} bytes");
     println!(

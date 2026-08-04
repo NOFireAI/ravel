@@ -179,11 +179,12 @@ from SQL, and it is named here rather than assumed.
 - Object size grows only for tenants that configure indexed fields.
   Indicative at the time of writing: 5 to 15% of object size for a four-field
   list, to be measured before the default list is set. **Measured (issue #511,
-  see BENCHMARKS.md "RLOG POSTINGS storage overhead"): 0.10% for a
-  four-field list over a 64k-record object, of which three fields actually
-  emitted postings** (the fourth, `service.name`, is a resource-only
-  attribute in that corpus, so it has no dynamic column and contributes no
-  postings). The 5-to-15% estimate did not hold; it was a guess made before
+  see BENCHMARKS.md "RLOG POSTINGS storage overhead"): 0.13% for a
+  four-field list over a 64k-record object, all four fields emitting
+  postings** (three per-record HTTP attributes plus the resource-level
+  `service.name`, which issue #552 made indexable by giving every indexed
+  stream-level key its own FIELD_DIR column). The 5-to-15% estimate did not
+  hold; it was a guess made before
   the block-granularity design existed and is roughly two orders of
   magnitude too high. POSTINGS scales with distinct values times blocks, both
   small for the low-cardinality default fields, and a high-cardinality field
