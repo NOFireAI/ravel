@@ -78,13 +78,19 @@ pub fn build_catalog(
     Ok(Arc::new(catalog))
 }
 
+/// Build the query `AppState`. `engine_config` carries the resolved query
+/// deadline (ADR-0050 section 4, EC4): the caller passes the SAME
+/// `EngineConfig` whose `deadline` was validated against `sys/gc` in `main`, so
+/// the engine that actually enforces the deadline uses the validated value
+/// rather than an independent `EngineConfig::default()`.
 pub fn build_app_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<Arc<Cache<CacheFetchError>>>,
+    engine_config: EngineConfig,
 ) -> AppState {
-    let mut engine = QueryEngine::new(catalog, store, EngineConfig::default());
+    let mut engine = QueryEngine::new(catalog, store, engine_config);
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
     }
@@ -109,18 +115,28 @@ pub const DEFAULT_MAX_TENANT_BYTES: usize = 1024 * 1024 * 1024;
 /// its own `isolation_breaches` counter, so a tenant_hash or LIST-prefix
 /// breach hit only through the SQL path would never reach
 /// `ravel_catalog_isolation_breach_total` and the alert rule built on it.
+///
+/// `engine_config` carries the resolved query deadline (ADR-0050 section 4,
+/// EC4), the SAME value passed to [`build_app_state`]: SQL and Flight SQL
+/// must enforce the deadline `main` validated against `sys/gc`, not an
+/// independent `EngineConfig::default()` (the bug the fix-continuation for
+/// issue #588 found: PromQL was wired, SQL/Flight SQL were not).
 #[cfg(feature = "sql")]
 pub fn build_sql_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<Arc<Cache<CacheFetchError>>>,
+    engine_config: EngineConfig,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SqlConfig, SqlExecutor};
 
-    let config = SqlConfig::default();
+    let config = SqlConfig {
+        engine: engine_config,
+        ..SqlConfig::default()
+    };
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());
     let mut logs_fetcher = LogSegmentFetcher::new(store.clone());
@@ -148,4 +164,53 @@ pub fn build_sql_state(
         max_deadline,
         query_accounting,
     })
+}
+
+#[cfg(all(test, feature = "sql"))]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_query::http::StaticBearerTokenResolver;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    /// `build_sql_state` must enforce the `EngineConfig` it was given, not an
+    /// independent `SqlConfig::default()` -- the gap the ADR-0050 section 4 /
+    /// EC4 fix-continuation found: the PromQL path (`build_app_state`) took a
+    /// resolved deadline, but SQL/Flight SQL silently kept a hardcoded 30s.
+    #[test]
+    fn build_sql_state_honors_the_passed_engine_config_deadline() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(store.clone(), 1).expect("catalog");
+        let tenant_resolver: Arc<dyn TenantResolver> =
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new()));
+        let non_default = EngineConfig {
+            deadline: Duration::from_secs(10),
+            ..EngineConfig::default()
+        };
+        assert_ne!(
+            non_default.deadline,
+            EngineConfig::default().deadline,
+            "sanity: the test deadline must actually differ from the default"
+        );
+
+        let state = build_sql_state(
+            catalog,
+            store,
+            tenant_resolver,
+            None,
+            non_default,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+        )
+        .expect("sql state builds");
+
+        assert_eq!(
+            state.max_deadline, non_default.deadline,
+            "build_sql_state's max_deadline must be the resolved value passed in, \
+             not an independent EngineConfig::default()"
+        );
+    }
 }

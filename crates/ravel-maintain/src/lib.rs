@@ -44,6 +44,7 @@ pub mod compact;
 pub mod config;
 pub mod discover;
 pub mod error;
+pub mod gc_config;
 pub mod legal_hold;
 pub mod publish;
 pub mod query_audit;
@@ -61,6 +62,10 @@ pub use compact::{CompactionOutcome, compact_bucket};
 pub use config::{CompactorConfig, RetentionConfig, RetentionConfigError, RetentionPolicy};
 pub use discover::discover_tenants;
 pub use error::{MaintainError, Result};
+pub use gc_config::{
+    GC_CONFIG_KEY, GcConfigError, GcConfigValues, SetOutcome, bootstrap_gc_config, read_gc_config,
+    set_gc_config, validate_flight_ceiling, validate_maintain, validate_query_deadline,
+};
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };

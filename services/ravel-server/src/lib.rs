@@ -11,6 +11,7 @@ pub mod exemplars;
 pub mod flight;
 pub mod flight_auth;
 pub mod fold;
+pub mod gc_config;
 pub mod health;
 pub mod ingest;
 pub mod logs_ingest;
@@ -176,6 +177,21 @@ pub struct ServerConfig {
     /// `sys/t/<tenant_hash>` recovery manifest. `None` on an unkeyed bucket,
     /// which needs no manifest.
     pub deployment_key: Option<Box<[u8; 32]>>,
+    /// The durable, deployment-wide GC configuration read from (or bootstrapped
+    /// into) `sys/gc` at startup (ADR-0050 section 4, EC4). `main` bootstraps or
+    /// reads it and validates the maintain and query modes against it before
+    /// building this config; [`start`] uses it to source the Flight SQL ticket
+    /// ceiling (`protection_horizon - grace`) from this single durable authority
+    /// rather than a hardcoded default, and validates the sourced ceiling.
+    pub gc: ravel_maintain::GcConfigValues,
+    /// The query engine's enforced deadline (`EngineConfig::deadline`),
+    /// resolved from `--gc-max-query-duration` (default 30s), ADR-0050 section
+    /// 4, EC4. `main` validates this exact value `<=` stored
+    /// `sys/gc.max_query_duration` before building this config; [`start`] then
+    /// builds the real `QueryEngine` with it, so the deadline validated is the
+    /// deadline enforced. Distinct from `sys/gc.max_query_duration` (the GC
+    /// protection budget); this is the timeout the engine actually applies.
+    pub query_deadline: Duration,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -559,11 +575,20 @@ pub async fn start(
     let mut alert_tasks = alerting::AlertEvalTasks::none();
 
     if matches!(config.mode, Mode::All | Mode::Query) {
+        // The real query engine's deadline is the value `main` validated
+        // against `sys/gc` (ADR-0050 section 4, EC4), not an independent
+        // `EngineConfig::default()`: the deadline validated is the deadline
+        // enforced. Every other engine limit stays at its default.
+        let engine_config = ravel_query::EngineConfig {
+            deadline: config.query_deadline,
+            ..ravel_query::EngineConfig::default()
+        };
         let app_state = query::build_app_state(
             catalog.clone(),
             store.clone(),
             config.tenant_resolver.clone(),
             cache.clone(),
+            engine_config,
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
@@ -582,6 +607,7 @@ pub async fn start(
                 store.clone(),
                 config.tenant_resolver.clone(),
                 cache.clone(),
+                engine_config,
                 query_accounting.clone(),
             )?;
             alert_sql_executor = Some(state.executor.clone());
@@ -786,8 +812,21 @@ pub async fn start(
     // The gRPC listener carries OTLP ingest, so gateway modes always bind it.
     // With `flight-sql` on it also carries Flight SQL, which is a query
     // surface, so a query-only process binds it too.
+    // Source the Flight SQL ticket-TTL ceiling from the durable `sys/gc`
+    // (ADR-0050 section 4, EC4): `protection_horizon - grace`, not the
+    // conservative hardcoded default that predates this object. Validate the
+    // sourced ceiling against `sys/gc` (it passes by construction, and stands as
+    // the fail-closed guard against a hand-set ceiling), refusing to start on a
+    // real violation.
     #[cfg(feature = "flight-sql")]
-    let flight_service = sql_state.as_ref().map(flight::service);
+    let flight_service = {
+        let ceiling = gc_config::flight_ceiling(&config.gc);
+        gc_config::validate_flight(&config.gc, ceiling)
+            .map_err(|e| anyhow::anyhow!("Flight SQL ticket-TTL ceiling violates sys/gc: {e}"))?;
+        sql_state
+            .as_ref()
+            .map(|state| flight::service(state, ceiling))
+    };
     #[cfg(feature = "flight-sql")]
     let serve_grpc = metrics_service.is_some() || flight_service.is_some();
     #[cfg(not(feature = "flight-sql"))]

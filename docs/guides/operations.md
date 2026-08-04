@@ -272,6 +272,83 @@ provably hiding data). Run `provision adopt` before rolling out a version
 that will enforce the record, so an adoption refusal surfaces as a CLI error
 you can act on rather than a server that refuses to start mid-rollout.
 
+## Durable GC config (ADR-0050 section 4)
+
+`protection_horizon >= max_query_duration + grace` is what keeps the GC sweeper
+from deleting a segment a pinned in-flight reader still needs. Before ADR-0050
+these four values lived in three unlinked per-process configs (the maintain
+sweep config, the query engine deadline, the Flight SQL ticket ceiling) that
+could be deployed independently, with nothing validating the constraint. They
+are now recorded once, deployment-wide, in a durable object `sys/gc` at the
+bucket root, and every mode validates itself against it at startup.
+
+**Bootstrap is automatic and never blocks a fresh deployment.** The first
+process to touch a fresh bucket writes `sys/gc` from the maintain defaults
+(which satisfy the constraint by construction), then validates against the
+object it just wrote. If several processes start together against one empty
+bucket (a fresh operator-managed cluster's gateway, query, and maintain pods),
+one wins the `CreateIfAbsent` and the others re-read and validate against the
+winner's object. A fresh, never-bootstrapped bucket does not fail startup for
+any process; only a *present* object a mode really violates refuses.
+
+**What each mode validates:**
+
+- **maintain**: its configured `protection_horizon` and `grace` must EQUAL the
+  stored values (they are must-match, not independent knobs). A process flag
+  that merely satisfies the inequality but differs from the durable value still
+  refuses.
+- **query modes** (`--mode query`, `--mode all`): the engine deadline must be
+  `<= max_query_duration`.
+- **Flight SQL** (only when built with the `flight-sql` feature): the ticket-TTL
+  ceiling must be `<= protection_horizon - grace`. The server sources this
+  ceiling from `sys/gc` rather than a hardcoded default, so it tracks the
+  durable authority automatically.
+
+**A startup refusal from a GC-config mismatch** names the configured and stored
+values and the exact rule violated. It is not transient and does not clear on
+restart: `sys/gc` records the deployment's true GC configuration. The fix is to
+align the process's configuration with the durable object, or to change the
+durable object deliberately (below) if the new values are intended.
+
+**Inspecting and changing `sys/gc`.** `ravel-cli gc-config show` prints the
+stored values (and whether the bucket is bootstrapped yet). `ravel-cli
+gc-config set --protection-horizon 25h --grace 24h --max-query-duration 1h
+--max-flush-lifetime 1h` is the single mutation path: it enforces
+`protection_horizon >= max_query_duration + grace` at write time (refusing a
+violating proposal without writing anything) and swaps the durable object with
+`CasVersion`, so a concurrent `gc-config set` is caught as a conflict rather
+than silently overwritten. Every `sys/gc` value must be strictly positive; a
+set with a zero or negative duration is refused at write time (an all-zero
+config would trivially satisfy the horizon constraint yet be impossible for any
+mode to match, so it is rejected rather than written).
+
+After changing `sys/gc`, every mode's process configuration must be brought
+into line with it, or those processes will refuse to start against the new
+object. The `ravel-server` binary exposes one `--gc-*` flag per knob for
+exactly this, each a humantime duration defaulting to its shipped value (so a
+process that sets none of them is unchanged):
+
+- `--gc-protection-horizon` and `--gc-grace` feed the maintain compactor and
+  must be set to EQUAL the durable `protection_horizon` and `grace`
+  (must-match); set them to whatever the last `gc-config set` wrote.
+- `--gc-max-query-duration` sets the enforced deadline for every query engine
+  this process builds -- PromQL, SQL, and Flight SQL alike, all from the same
+  resolved value -- and must be kept `<=` the durable `max_query_duration`;
+  lower it if a `gc-config set` tightened `max_query_duration` below the
+  current deadline.
+- `--gc-max-flush-lifetime` sets the compactor's flush lifetime (seal margin
+  and orphan age gate); not part of the must-match set, but kept in the same
+  group.
+
+Each flag feeds both the startup validation and the real compactor/query
+engine, so a value that passes validation is the value actually enforced.
+
+The Kubernetes operator does not expose GC-horizon flags in its CRD, and does
+not need to: it deploys every pod with the same shipped defaults, so the first
+pod bootstraps `sys/gc` from those defaults and every pod validates trivially.
+`spec.retention.default` is age-based retention (ADR-0019), a separate concept
+from these GC-safety horizons and unrelated to `sys/gc`.
+
 ## Storage backend configuration
 
 **MinIO (local development):** see

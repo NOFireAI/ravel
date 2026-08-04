@@ -243,6 +243,23 @@ across those four. The fifth rule (idempotency marker) anchors on the
 marker's own `<ingest_hour>` instead, and its own age gate carries a
 forward-skew tolerance the other four don't need (see below the table).
 
+`protection_horizon`, `grace`, `max_query_duration`, and `max_flush_lifetime`
+are not per-process knobs each component sets independently. They are recorded
+once, deployment-wide, in the durable object `sys/gc` at the bucket root
+(ADR-0050 section 4, EC4). The first process to touch a fresh bucket bootstraps
+`sys/gc` from the maintain defaults via `CreateIfAbsent` (the defaults satisfy
+`protection_horizon >= max_query_duration + grace` by construction; a racing
+loser re-reads the winner's object, so a fresh bucket never fails startup), and
+only `ravel-cli gc-config set` mutates it, enforcing the constraint at write
+time and swapping with `CasVersion`. Every mode then validates itself against
+`sys/gc` at startup and refuses to start on a real violation: maintain's
+configured horizon and grace must equal the stored values; a query engine's
+deadline must be `<= max_query_duration`; a Flight SQL ticket-TTL ceiling must
+be `<= protection_horizon - grace`. A process that can read a bootstrapped
+`sys/gc` and finds a real violation does not start; there is no "assume
+defaults" path, because assumed defaults are precisely the cross-process drift
+this object exists to prevent.
+
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
 | orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden) | object last_modified |

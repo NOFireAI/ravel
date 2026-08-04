@@ -160,7 +160,24 @@ async fn main() -> anyhow::Result<()> {
     // mismatch would validate the retention floor against a different lag
     // assumption than the catalog actually resolves with. A window below the
     // floor fails startup here rather than being silently clamped.
-    let compactor = CompactorConfig::default();
+    // The GC knobs (ADR-0050 section 4, EC4) resolved from the `--gc-*` flags,
+    // each defaulting to its compiled-in value when unset (byte-identical to a
+    // process that predates the flags). This is the single resolution point:
+    // the SAME values feed the `sys/gc` validation below AND the real compactor
+    // and query engine `start` builds, so a flag that satisfies validation is
+    // the flag that is actually enforced. Without these flags there was no way
+    // to bring maintain/query into line after a `ravel-cli gc-config set`, so
+    // any set to non-default values permanently bricked those modes; these are
+    // the documented remediation (docs/guides/operations.md).
+    let gc_runtime = cli
+        .resolve_gc_runtime()
+        .context("failed to parse the --gc-* GC-config flags")?;
+    let compactor = CompactorConfig {
+        protection_horizon_ns: gc_runtime.protection_horizon_ns,
+        grace_ns: gc_runtime.grace_ns,
+        max_flush_lifetime_ns: gc_runtime.max_flush_lifetime_ns,
+        ..CompactorConfig::default()
+    };
     let catalog_max_ingest_lag_ns = ravel_catalog::CatalogConfig::default().max_ingest_lag_ns;
     let retention_policy = cli
         .parse_retention_policy()
@@ -168,6 +185,30 @@ async fn main() -> anyhow::Result<()> {
     let retention =
         RetentionConfig::from_policy(retention_policy, &compactor, catalog_max_ingest_lag_ns)
             .map_err(|e| anyhow::anyhow!("invalid retention configuration: {e}"))?;
+
+    // Durable GC configuration (ADR-0050 section 4, EC4). Bootstrap `sys/gc`
+    // from this process's maintain defaults on a fresh bucket, or read the
+    // durable object on a bootstrapped one, then validate this mode against it,
+    // before any listener binds. A fresh, never-bootstrapped bucket never fails
+    // startup here: the object is written from the maintain defaults (which
+    // satisfy the constraint) and validated against what was just written, and a
+    // concurrent bootstrap loser re-reads the winner's object rather than
+    // refusing. Only a *present* object this mode really violates refuses to
+    // start. The Flight SQL ceiling is sourced and validated in
+    // `ravel_server::start` (it is `flight-sql`-feature-gated).
+    let gc = ravel_server::gc_config::bootstrap(store.as_ref(), now_unix_ns())
+        .await
+        .context("failed to bootstrap or read the durable GC config (sys/gc)")?;
+    if matches!(cli.mode, Mode::Maintain) {
+        ravel_server::gc_config::validate_maintain(&gc, &compactor).map_err(|e| {
+            anyhow::anyhow!("maintain GC-config validation failed against sys/gc: {e}")
+        })?;
+    }
+    if matches!(cli.mode, Mode::All | Mode::Query) {
+        ravel_server::gc_config::validate_query(&gc, gc_runtime.query_deadline).map_err(|e| {
+            anyhow::anyhow!("query GC-config validation failed against sys/gc: {e}")
+        })?;
+    }
 
     // Alert rules are static per-tenant config loaded once at startup
     // (ADR-0043 decision 2), and every validation the rules can fail happens
@@ -264,6 +305,8 @@ async fn main() -> anyhow::Result<()> {
         limits,
         metrics_tenant_labels: cli.metrics_tenant_labels,
         deployment_key,
+        gc,
+        query_deadline: gc_runtime.query_deadline,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;

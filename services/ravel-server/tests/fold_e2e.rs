@@ -342,6 +342,8 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
     };
     let running = ravel_server::start(
         config,
@@ -460,6 +462,8 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
     };
     let running = ravel_server::start(
         config,
