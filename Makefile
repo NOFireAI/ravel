@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test build minio minio-down demo kind-up kind-demo kind-down bench audit difftest
+.PHONY: check fmt clippy test test-python doc-drift build minio minio-down demo kind-up kind-demo kind-down bench audit difftest
 
 check: fmt clippy test
 
@@ -10,6 +10,21 @@ clippy:
 
 test:
 	cargo test --workspace
+
+# Unit tests for scripts/process_metrics.py (SP0), which had no runner at all
+# (ADR-0053 decision 6). stdlib unittest rather than pytest: the script and its
+# tests deliberately take no third-party dependency, and CI has no Python
+# environment beyond the interpreter. Run from scripts/ so the tests'
+# `from process_metrics import ...` resolves without a package layout.
+test-python:
+	cd scripts && python3 -m unittest test_process_metrics -v
+
+# Derived counts in docs/query-engine.md's generated conformance block
+# (ADR-0053 decision 6). No build, so it is cheap enough to run before a
+# commit; the full regeneration lives in ravel-promql-difftest's
+# conformance_table test.
+doc-drift:
+	./scripts/check-doc-drift.sh
 
 build:
 	cargo build --workspace --release
