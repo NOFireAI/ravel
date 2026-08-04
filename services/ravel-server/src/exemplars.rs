@@ -57,14 +57,17 @@
 //! 2. **An exemplar carries no dedup priority.** During ADR-0018's overlap
 //!    window a snapshot can hold both an L1 part and its inputs, so the same
 //!    exemplar is readable twice; samples resolve this by dedup priority, but
-//!    exemplars have none. This endpoint deduplicates at query time on
-//!    `(series_id, ts_ns, trace_id)`, keeping the first occurrence. That
-//!    collapses the compaction-overlap double (identical `(series, ts,
-//!    trace)`) that would otherwise render two identical dots in Grafana,
-//!    while preserving genuinely distinct exemplars: a retried write can leave
-//!    two exemplars at the same `(series, ts)`, but ADR-0047's 2026-08-03
-//!    amendment records that they "differ only in trace id", so a different
-//!    `trace_id` keeps both.
+//!    exemplars have none. This endpoint deduplicates at query time on the
+//!    exemplar's full stored identity (series id, `ts_ns`, trace id, span id,
+//!    value bit pattern, and attributes verbatim), keeping the first
+//!    occurrence (see [`ExemplarDedupKey`]). That collapses the
+//!    compaction-overlap double, which is byte-identical by construction and
+//!    would otherwise render two identical dots in Grafana, while preserving
+//!    genuinely distinct exemplars: two records that share `(series, ts,
+//!    trace)` can still differ in span id, value, or attributes, and the
+//!    writer preserves both verbatim and checks nothing else, so both must
+//!    survive. Keying only on `(series, ts, trace)` would silently collapse
+//!    them.
 //!
 //! # Cost
 //!
@@ -391,7 +394,7 @@ async fn collect_once(
     // distinct exemplars (an overlap-window duplicate must not consume budget)
     // and so neither `collected` nor `seen` can grow past the cap.
     let mut collected: Vec<(SeriesId, LabelSet, ExemplarRecord)> = Vec::new();
-    let mut seen: HashSet<(SeriesId, i64, [u8; 16])> = HashSet::new();
+    let mut seen: HashSet<ExemplarDedupKey> = HashSet::new();
     for seg in &snapshot.segments {
         read_segment_exemplars(
             state,
@@ -414,6 +417,18 @@ async fn collect_once(
     };
     Ok((group_by_series(collected), stats))
 }
+
+/// The cross-segment exemplar dedup key. Two records collapse only when they
+/// are byte-identical in every field the writer preserves: series id,
+/// timestamp, trace id, span id, the value (by bit pattern, never `==`, per
+/// the storage float rules), and the attributes verbatim (order and any
+/// duplicate names included). The ADR-0018 overlap double is byte-identical by
+/// construction, so it still collapses to one; two records that share
+/// `(series, ts, trace)` but differ in span id, value, or attributes are
+/// genuinely distinct (a retried write preserves both verbatim and checks
+/// nothing else) and both survive. Widening this key can only ever increase
+/// the kept count, so the `max_exemplars` cap still counts distinct exemplars.
+type ExemplarDedupKey = (SeriesId, i64, [u8; 16], [u8; 8], u64, Vec<(String, String)>);
 
 /// Outcome of a single [`collect_once`] attempt that is not a success.
 enum CollectError {
@@ -448,7 +463,7 @@ async fn read_segment_exemplars(
     start_ns: i64,
     end_ns: i64,
     accounting: &QueryAccounting,
-    seen: &mut HashSet<(SeriesId, i64, [u8; 16])>,
+    seen: &mut HashSet<ExemplarDedupKey>,
     collected: &mut Vec<(SeriesId, LabelSet, ExemplarRecord)>,
 ) -> Result<(), CollectError> {
     let data_object_key = seg.data_object_key.as_str();
@@ -555,10 +570,20 @@ async fn read_segment_exemplars(
         if rec.ts_ns < start_ns || rec.ts_ns > end_ns {
             continue;
         }
-        // Dedup on (series_id, ts_ns, trace_id), keeping the first occurrence
-        // (module doc, data fact 2). A duplicate costs no budget and no
+        // Dedup on the full record identity (see [`ExemplarDedupKey`]), keeping
+        // the first occurrence (module doc, data fact 2). Only a byte-identical
+        // record collapses; a record differing in span id, value, or attributes
+        // is genuinely distinct and kept. A duplicate costs no budget and no
         // `LabelSet` clone.
-        if !seen.insert((entry.entry.series_id, rec.ts_ns, rec.trace_id)) {
+        let dedup_key: ExemplarDedupKey = (
+            entry.entry.series_id,
+            rec.ts_ns,
+            rec.trace_id,
+            rec.span_id,
+            rec.value.to_bits(),
+            rec.attrs.clone(),
+        );
+        if !seen.insert(dedup_key) {
             continue;
         }
         // Reject before growing past the cap, the way the engine's
@@ -572,11 +597,11 @@ async fn read_segment_exemplars(
     Ok(())
 }
 
-/// Groups collected exemplars by series. Deduplication on `(series_id, ts_ns,
-/// trace_id)` already happened during accumulation (see the module doc, data
-/// fact 2), where it also keeps the result cap counting distinct exemplars.
-/// Output is deterministic: series ordered by id, exemplars within a series
-/// ordered by `(ts_ns, trace_id)`.
+/// Groups collected exemplars by series. Deduplication on the exemplar's full
+/// identity ([`ExemplarDedupKey`]) already happened during accumulation (see
+/// the module doc, data fact 2), where it also keeps the result cap counting
+/// distinct exemplars. Output is deterministic: series ordered by id,
+/// exemplars within a series ordered by `(ts_ns, trace_id)`.
 fn group_by_series(
     collected: Vec<(SeriesId, LabelSet, ExemplarRecord)>,
 ) -> Vec<ExemplarSeriesJson> {
@@ -616,7 +641,26 @@ fn group_by_series(
 /// own attributes become `labels`, plus `trace_id`/`span_id` under the
 /// conventional keys when present (hex-encoded, all-zero omitted).
 fn exemplar_to_json(rec: ExemplarRecord) -> ExemplarEntryJson {
+    // The exemplar's own attributes become `labels`. A Prometheus exemplar
+    // `labels` object is a unique-name label set (Prometheus models it as
+    // `labels.Labels`) and a JSON object cannot carry a repeated key, so
+    // collecting the writer's verbatim attribute list into a `BTreeMap`
+    // resolves any duplicate name last-wins, deterministically in the writer's
+    // stored order. Duplicate attribute names are discouraged by OTLP and
+    // unrepresentable in this response shape either way; the query-time dedup
+    // key keeps records with differing duplicates distinct even though they
+    // render identically here.
     let mut labels: BTreeMap<String, String> = rec.attrs.into_iter().collect();
+    // `trace_id`/`span_id` are reserved for the real ids. Strip any
+    // tenant-supplied attribute of those names first, so a fake one can never
+    // survive into the response: Grafana follows the `trace_id` label to a
+    // trace, and an all-zero (absent) real id would otherwise leave the
+    // tenant's value in place, sending the operator to a trace that is not the
+    // exemplar's. The real id is then inserted only when present; an all-zero
+    // id is absent (W3C Trace Context reserves it), so its label is simply
+    // omitted.
+    labels.remove("trace_id");
+    labels.remove("span_id");
     if !rec.trace_id.iter().all(|&b| b == 0) {
         labels.insert("trace_id".to_string(), hex_encode(&rec.trace_id));
     }
@@ -1884,6 +1928,82 @@ mod tests {
             .collect();
         assert!(traces.contains(&"0a1b2c3d4e5f60718293a4b5c6d7e8f9"));
         assert!(traces.contains(&"77777777777777777777777777777777"));
+    }
+
+    /// F9: two exemplars sharing `(series, ts, trace_id)` but differing in
+    /// span id, value, or attributes are genuinely distinct records the writer
+    /// preserved verbatim. The widened dedup key keeps all of them, where the
+    /// old `(series, ts, trace)` key would have collapsed them to one; a
+    /// byte-identical copy still collapses.
+    #[tokio::test]
+    async fn distinct_exemplars_sharing_series_ts_trace_all_survive() {
+        let store = Arc::new(MemoryStore::new());
+        let ts = NOW - 30 * NS_PER_SEC;
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        // All four share (series, ts, TRACE_ID) and differ in exactly one of
+        // span id, value, or attributes.
+        let base = exemplar(sid, ts, 1.0, TRACE_ID, SPAN_ID, &[]);
+        let diff_span = exemplar(sid, ts, 1.0, TRACE_ID, [0x99; 8], &[]);
+        let diff_value = exemplar(sid, ts, 2.0, TRACE_ID, SPAN_ID, &[]);
+        let diff_attrs = exemplar(sid, ts, 1.0, TRACE_ID, SPAN_ID, &[("k", "v")]);
+        // A byte-identical copy of `base`, which MUST still collapse.
+        let dup_base = exemplar(sid, ts, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(
+            &store,
+            1,
+            vec![series],
+            vec![base, diff_span, diff_value, diff_attrs, dup_base],
+        )
+        .await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+        let exemplars = body["data"][0]["exemplars"]
+            .as_array()
+            .expect("exemplars array");
+        assert_eq!(
+            exemplars.len(),
+            4,
+            "four distinct records survive; the byte-identical duplicate collapses: {body}"
+        );
+    }
+
+    /// A tenant-supplied attribute literally named `trace_id` must never reach
+    /// the response in place of the real trace id: Grafana follows the
+    /// `trace_id` label to a trace, and an all-zero (absent) real id must not
+    /// leave the tenant's fake value behind. The `trace_id`/`span_id` label
+    /// keys are reserved for the real ids.
+    #[tokio::test]
+    async fn tenant_supplied_trace_id_attribute_never_masquerades() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        // Real trace id is all-zero (absent); the tenant tries to inject a
+        // fake one, plus a fake span id, through the attribute list.
+        let ex = exemplar(
+            sid,
+            NOW - 30 * NS_PER_SEC,
+            1.0,
+            [0u8; 16],
+            [0u8; 8],
+            &[("trace_id", "deadbeef"), ("span_id", "cafe"), ("region", "eu")],
+        );
+        publish_segment(&store, 1, vec![series], vec![ex]).await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+        let labels = &body["data"][0]["exemplars"][0]["labels"];
+        assert!(
+            labels.get("trace_id").is_none(),
+            "a tenant trace_id attribute must not survive when the real id is absent: {body}"
+        );
+        assert!(
+            labels.get("span_id").is_none(),
+            "a tenant span_id attribute must not survive when the real id is absent: {body}"
+        );
+        // A genuine, non-reserved attribute is untouched.
+        assert_eq!(labels["region"], "eu");
     }
 
     /// Tenant isolation, the endpoint's most important property: two tenants
