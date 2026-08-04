@@ -113,11 +113,14 @@ connection, a pushed-but-broken main).
   for review before merging. Never trust an executor's own "gates green"
   claim; look at what actually landed.
 - `scripts/fleet-result-merge.sh <task-id> <message-file> [-p CRATE ...]`
-  — merges the reviewed result branch (`--no-ff`), runs `gates.sh`, and
-  only pushes `main` and deletes the task's remote refs if gates pass.
-  Write the merge commit message to `<message-file>` first (trailers
-  included); this script does not construct one for you. Run
-  `fleet-result-inspect.sh` first — this script does not pause for
+  — cleans `wip:`/fixup commits out of the reviewed result branch, runs
+  `gates.sh`, and opens a PR against `main` with auto-merge enabled
+  (`main` is protected; the script never pushes or merges it directly).
+  Task refs are left on origin until the PR is confirmed merged; see the
+  merge-fleet-result skill for that step. Write the PR message to
+  `<message-file>` first (trailers included; line 1 is the title, the
+  body starts at line 3); this script does not construct one for you.
+  Run `fleet-result-inspect.sh` first — this script does not pause for
   review, it assumes you already decided the scope is correct.
 - `scripts/verify-dispatch-gates.sh <ref> <scratchpad-dir>` — the tier-1
   gate check behind the `verify-dispatch` skill: an isolated worktree
