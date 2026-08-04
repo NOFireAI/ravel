@@ -26,6 +26,7 @@ fn metric(name: &str, points: Vec<DataPointRow>) -> MetricRow {
 
 fn point(time_unix_nano: i64, value: f64, attrs: Vec<(&str, &str)>) -> DataPointRow {
     DataPointRow {
+        exemplars: vec![],
         time_unix_nano,
         value,
         flags: 0,

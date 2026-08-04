@@ -286,6 +286,7 @@ fn build_otap_batch(
                 .points
                 .iter()
                 .map(|p| DataPointRow {
+                    exemplars: vec![],
                     time_unix_nano: INGEST_TS_NS + p.ts_offset_ns,
                     value: p.value,
                     flags: p.flags,
@@ -495,6 +496,7 @@ fn complex_attribute_value_rejected_on_both_paths() {
         name: "widgets".to_string(),
         kind: MetricKind::Gauge,
         data_points: vec![DataPointRow {
+            exemplars: vec![],
             time_unix_nano: INGEST_TS_NS,
             value: 1.0,
             flags: 0,
@@ -539,6 +541,7 @@ fn complex_attribute_type_slots_round_trip_rejected() {
         name: name.to_string(),
         kind: MetricKind::Gauge,
         data_points: vec![DataPointRow {
+            exemplars: vec![],
             time_unix_nano: INGEST_TS_NS,
             value: 1.0,
             flags: 0,
@@ -608,6 +611,7 @@ fn delta_sum_rejected_on_both_paths() {
             is_monotonic: true,
         },
         data_points: vec![DataPointRow {
+            exemplars: vec![],
             time_unix_nano: INGEST_TS_NS,
             value: 1.0,
             flags: 0,

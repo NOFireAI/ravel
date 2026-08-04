@@ -38,12 +38,15 @@
 //!   stream. The normalizer must not infer a value's shape from column
 //!   presence alone -- only `type` is authoritative.
 //!
-//! - `HISTOGRAM_DP_EXEMPLARS` and `HISTOGRAM_DP_EXEMPLAR_ATTRS`: the exemplar
-//!   table's own columns (otap-spec.md section 5.3.6: `id`, `parent_id`,
-//!   `time_unix_nano`, `int_value`, `double_value`, `span_id`, `trace_id`) and
-//!   the U32-attrs shape below it, joined to an exemplar's `id`. Exemplars
-//!   used to be emitted as bare `parent_id` rows, since the normalizer only
-//!   counted them; ADR-0047 carries them, so they need real columns to carry.
+//! - `NUMBER_DP_EXEMPLARS`, `HISTOGRAM_DP_EXEMPLARS`, and their
+//!   `*_EXEMPLAR_ATTRS` tables: the exemplar table's own columns
+//!   (otap-spec.md section 5.3.6: `id`, `parent_id`, `time_unix_nano`,
+//!   `int_value`, `double_value`, `span_id`, `trace_id`) and the U32-attrs
+//!   shape below it, joined to an exemplar's `id`. Exemplars used to be
+//!   emitted as bare `parent_id` rows, since the normalizer only counted them;
+//!   ADR-0047 carries them, so they need real columns to carry. The number and
+//!   histogram exemplar tables share one schema and one builder, since the
+//!   data model gives them identical columns.
 //!
 //! All `id`/`parent_id` columns are emitted as plain absolute values (no
 //! delta or quasi-delta transport encoding, see otap-spec.md section 6.4):
@@ -107,11 +110,15 @@ pub struct AttrRow {
     pub value: AttrValue,
 }
 
-/// One data point on a metric.
+/// One data point on a metric. Each entry in `exemplars` becomes one
+/// `NUMBER_DP_EXEMPLARS` row joined to this point by `parent_id`, and its
+/// `attrs` become `NUMBER_DP_EXEMPLAR_ATTRS` rows joined to that exemplar's
+/// own `id`, the same two-table shape the histogram side uses (issue #539).
 pub struct DataPointRow {
     pub time_unix_nano: i64,
     pub value: f64,
     pub flags: u32,
+    pub exemplars: Vec<ExemplarRow>,
     pub attrs: Vec<AttrRow>,
 }
 
@@ -134,9 +141,9 @@ pub struct MetricRow {
     pub data_points: Vec<DataPointRow>,
 }
 
-/// One exemplar's value, which the `HISTOGRAM_DP_EXEMPLARS` table carries in
-/// either of two columns (`int_value` or `double_value`, otap-spec.md section
-/// 5.3.6). `Absent` populates neither, the shape OTLP itself calls an invalid
+/// One exemplar's value, which the `*_DP_EXEMPLARS` tables carry in either of
+/// two columns (`int_value` or `double_value`, otap-spec.md section 5.3.6).
+/// `Absent` populates neither, the shape OTLP itself calls an invalid
 /// exemplar, so the normalizer's drop-and-count path stays reachable.
 pub enum ExemplarValue {
     Double(f64),
@@ -144,7 +151,8 @@ pub enum ExemplarValue {
     Absent,
 }
 
-/// One `HISTOGRAM_DP_EXEMPLARS` row, joined to its data point by `parent_id`.
+/// One `NUMBER_DP_EXEMPLARS` or `HISTOGRAM_DP_EXEMPLARS` row, joined to its
+/// data point by `parent_id`.
 /// A `None` id is emitted as a null in that fixed-size-binary column, which is
 /// how the table says "no trace/span id" (ADR-0047 decision 1 reads that back
 /// as the all-zero sentinel).
@@ -336,12 +344,14 @@ fn summary_data_points_schema() -> Schema {
     ])
 }
 
-/// The `HISTOGRAM_DP_EXEMPLARS` columns of otap-spec.md section 5.3.6. `id`
-/// is here so `HISTOGRAM_DP_EXEMPLAR_ATTRS` rows have something to reference,
-/// and both value columns are always present because one Arrow IPC schema is
-/// fixed for a stream's life while individual rows populate one column or
-/// neither (same reason `attrs_schema` carries all four value columns).
-fn histogram_exemplars_schema() -> Schema {
+/// The `*_DP_EXEMPLARS` columns of otap-spec.md section 5.3.6, shared by the
+/// `NUMBER_DP_EXEMPLARS` and `HISTOGRAM_DP_EXEMPLARS` tables (the data model
+/// gives them identical columns). `id` is here so the matching
+/// `*_DP_EXEMPLAR_ATTRS` rows have something to reference, and both value
+/// columns are always present because one Arrow IPC schema is fixed for a
+/// stream's life while individual rows populate one column or neither (same
+/// reason `attrs_schema` carries all four value columns).
+fn exemplars_schema() -> Schema {
     Schema::new(vec![
         plain_encoding_field("id", DataType::UInt32, false),
         plain_encoding_field("parent_id", DataType::UInt32, false),
@@ -467,6 +477,64 @@ impl AttrColumnBuilder {
     }
 }
 
+/// Accumulates `NUMBER_DP_EXEMPLARS`/`HISTOGRAM_DP_EXEMPLARS` rows
+/// column-by-column, and the `*_EXEMPLAR_ATTRS` rows that hang off them.
+/// Factored out for the same reason as [`AttrColumnBuilder`]: both exemplar
+/// tables share one schema ([`exemplars_schema`]) and one per-row encoding
+/// rule, so a second copy of this would be a place for the two to drift.
+#[derive(Default)]
+struct ExemplarColumnBuilder {
+    ids: Vec<u32>,
+    parent_ids: Vec<u32>,
+    times: Vec<i64>,
+    ints: Vec<Option<i64>>,
+    doubles: Vec<Option<f64>>,
+    span_ids: Vec<Option<[u8; 8]>>,
+    trace_ids: Vec<Option<[u8; 16]>>,
+    attrs: AttrColumnBuilder,
+}
+
+impl ExemplarColumnBuilder {
+    /// Push one exemplar row under data point `parent_id`, taking its own id
+    /// from `next_id` (which is advanced) so its attributes can reference it.
+    fn push(&mut self, next_id: &mut u32, parent_id: u32, exemplar: &ExemplarRow) {
+        let id = *next_id;
+        *next_id = next_id.wrapping_add(1);
+        self.ids.push(id);
+        self.parent_ids.push(parent_id);
+        self.times.push(exemplar.time_unix_nano);
+        let (int_value, double_value) = match exemplar.value {
+            ExemplarValue::Int(v) => (Some(v), None),
+            ExemplarValue::Double(v) => (None, Some(v)),
+            ExemplarValue::Absent => (None, None),
+        };
+        self.ints.push(int_value);
+        self.doubles.push(double_value);
+        self.span_ids.push(exemplar.span_id);
+        self.trace_ids.push(exemplar.trace_id);
+        for attr in &exemplar.attrs {
+            self.attrs.push(id, attr);
+        }
+    }
+
+    /// The exemplar batch and its attributes batch, in that order.
+    fn into_batches(self) -> Result<(RecordBatch, RecordBatch), EncodeError> {
+        let exemplars = RecordBatch::try_new(
+            Arc::new(exemplars_schema()),
+            vec![
+                Arc::new(UInt32Array::from(self.ids)),
+                Arc::new(UInt32Array::from(self.parent_ids)),
+                Arc::new(TimestampNanosecondArray::from(self.times)),
+                Arc::new(Int64Array::from(self.ints)),
+                Arc::new(Float64Array::from(self.doubles)),
+                Arc::new(build_fixed_size_binary_array(&self.span_ids, 8)?),
+                Arc::new(build_fixed_size_binary_array(&self.trace_ids, 16)?),
+            ],
+        )?;
+        Ok((exemplars, self.attrs.into_batch()?))
+    }
+}
+
 /// A persistent per-payload-type Arrow IPC stream writer: one Arrow schema
 /// (and its dictionaries), written once, followed by any number of record
 /// batches.
@@ -529,6 +597,8 @@ pub struct MetricsStreamEncoder {
     root: PayloadStream,
     data_points: PayloadStream,
     attrs: PayloadStream,
+    number_exemplars: PayloadStream,
+    number_exemplar_attrs: PayloadStream,
     hist_data_points: PayloadStream,
     hist_attrs: PayloadStream,
     hist_exemplars: PayloadStream,
@@ -537,6 +607,7 @@ pub struct MetricsStreamEncoder {
     summary_attrs: PayloadStream,
     next_metric_id: u16,
     next_dp_id: u32,
+    next_number_exemplar_id: u32,
     next_hist_dp_id: u32,
     next_hist_exemplar_id: u32,
     next_summary_dp_id: u32,
@@ -563,6 +634,16 @@ impl MetricsStreamEncoder {
                 format!("ravel-otap-number-dp-attrs-{stream_version}"),
                 &attrs_schema(),
             )?,
+            number_exemplars: PayloadStream::try_new(
+                ArrowPayloadType::NumberDpExemplars,
+                format!("ravel-otap-number-dp-exemplars-{stream_version}"),
+                &exemplars_schema(),
+            )?,
+            number_exemplar_attrs: PayloadStream::try_new(
+                ArrowPayloadType::NumberDpExemplarAttrs,
+                format!("ravel-otap-number-dp-exemplar-attrs-{stream_version}"),
+                &attrs_schema(),
+            )?,
             hist_data_points: PayloadStream::try_new(
                 ArrowPayloadType::HistogramDataPoints,
                 format!("ravel-otap-histogram-dp-{stream_version}"),
@@ -576,7 +657,7 @@ impl MetricsStreamEncoder {
             hist_exemplars: PayloadStream::try_new(
                 ArrowPayloadType::HistogramDpExemplars,
                 format!("ravel-otap-histogram-dp-exemplars-{stream_version}"),
-                &histogram_exemplars_schema(),
+                &exemplars_schema(),
             )?,
             hist_exemplar_attrs: PayloadStream::try_new(
                 ArrowPayloadType::HistogramDpExemplarAttrs,
@@ -595,6 +676,7 @@ impl MetricsStreamEncoder {
             )?,
             next_metric_id: 0,
             next_dp_id: 0,
+            next_number_exemplar_id: 0,
             next_hist_dp_id: 0,
             next_hist_exemplar_id: 0,
             next_summary_dp_id: 0,
@@ -640,6 +722,7 @@ impl MetricsStreamEncoder {
         let mut dp_values = Vec::new();
         let mut dp_flags = Vec::new();
         let mut attr_builder = AttrColumnBuilder::default();
+        let mut number_exemplar_builder = ExemplarColumnBuilder::default();
 
         for metric in metrics {
             let metric_id = self.next_metric_id;
@@ -674,6 +757,13 @@ impl MetricsStreamEncoder {
                 for attr in &dp.attrs {
                     attr_builder.push(dp_id, attr);
                 }
+                for exemplar in &dp.exemplars {
+                    number_exemplar_builder.push(
+                        &mut self.next_number_exemplar_id,
+                        dp_id,
+                        exemplar,
+                    );
+                }
             }
         }
 
@@ -690,14 +780,7 @@ impl MetricsStreamEncoder {
         let mut hist_dp_mins: Vec<Option<f64>> = Vec::new();
         let mut hist_dp_maxs: Vec<Option<f64>> = Vec::new();
         let mut hist_attr_builder = AttrColumnBuilder::default();
-        let mut hist_exemplar_ids: Vec<u32> = Vec::new();
-        let mut hist_exemplar_parent_ids: Vec<u32> = Vec::new();
-        let mut hist_exemplar_times: Vec<i64> = Vec::new();
-        let mut hist_exemplar_ints: Vec<Option<i64>> = Vec::new();
-        let mut hist_exemplar_doubles: Vec<Option<f64>> = Vec::new();
-        let mut hist_exemplar_span_ids: Vec<Option<[u8; 8]>> = Vec::new();
-        let mut hist_exemplar_trace_ids: Vec<Option<[u8; 16]>> = Vec::new();
-        let mut hist_exemplar_attr_builder = AttrColumnBuilder::default();
+        let mut hist_exemplar_builder = ExemplarColumnBuilder::default();
 
         for metric in histograms {
             let metric_id = self.next_metric_id;
@@ -728,23 +811,7 @@ impl MetricsStreamEncoder {
                     hist_attr_builder.push(dp_id, attr);
                 }
                 for exemplar in &dp.exemplars {
-                    let exemplar_id = self.next_hist_exemplar_id;
-                    self.next_hist_exemplar_id = self.next_hist_exemplar_id.wrapping_add(1);
-                    hist_exemplar_ids.push(exemplar_id);
-                    hist_exemplar_parent_ids.push(dp_id);
-                    hist_exemplar_times.push(exemplar.time_unix_nano);
-                    let (int_value, double_value) = match exemplar.value {
-                        ExemplarValue::Int(v) => (Some(v), None),
-                        ExemplarValue::Double(v) => (None, Some(v)),
-                        ExemplarValue::Absent => (None, None),
-                    };
-                    hist_exemplar_ints.push(int_value);
-                    hist_exemplar_doubles.push(double_value);
-                    hist_exemplar_span_ids.push(exemplar.span_id);
-                    hist_exemplar_trace_ids.push(exemplar.trace_id);
-                    for attr in &exemplar.attrs {
-                        hist_exemplar_attr_builder.push(exemplar_id, attr);
-                    }
+                    hist_exemplar_builder.push(&mut self.next_hist_exemplar_id, dp_id, exemplar);
                 }
             }
         }
@@ -816,6 +883,8 @@ impl MetricsStreamEncoder {
             ],
         )?;
         let attrs_batch = attr_builder.into_batch()?;
+        let (number_exemplars_batch, number_exemplar_attrs_batch) =
+            number_exemplar_builder.into_batches()?;
 
         let hist_dp_batch = RecordBatch::try_new(
             Arc::new(histogram_data_points_schema()),
@@ -839,19 +908,8 @@ impl MetricsStreamEncoder {
             ],
         )?;
         let hist_attrs_batch = hist_attr_builder.into_batch()?;
-        let hist_exemplars_batch = RecordBatch::try_new(
-            Arc::new(histogram_exemplars_schema()),
-            vec![
-                Arc::new(UInt32Array::from(hist_exemplar_ids)),
-                Arc::new(UInt32Array::from(hist_exemplar_parent_ids)),
-                Arc::new(TimestampNanosecondArray::from(hist_exemplar_times)),
-                Arc::new(Int64Array::from(hist_exemplar_ints)),
-                Arc::new(Float64Array::from(hist_exemplar_doubles)),
-                Arc::new(build_fixed_size_binary_array(&hist_exemplar_span_ids, 8)?),
-                Arc::new(build_fixed_size_binary_array(&hist_exemplar_trace_ids, 16)?),
-            ],
-        )?;
-        let hist_exemplar_attrs_batch = hist_exemplar_attr_builder.into_batch()?;
+        let (hist_exemplars_batch, hist_exemplar_attrs_batch) =
+            hist_exemplar_builder.into_batches()?;
 
         let summary_dp_batch = RecordBatch::try_new(
             Arc::new(summary_data_points_schema()),
@@ -879,6 +937,15 @@ impl MetricsStreamEncoder {
             arrow_payloads.push(p);
         }
         if let Some(p) = self.attrs.write_batch(&attrs_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self.number_exemplars.write_batch(&number_exemplars_batch)? {
+            arrow_payloads.push(p);
+        }
+        if let Some(p) = self
+            .number_exemplar_attrs
+            .write_batch(&number_exemplar_attrs_batch)?
+        {
             arrow_payloads.push(p);
         }
         if let Some(p) = self.hist_data_points.write_batch(&hist_dp_batch)? {
