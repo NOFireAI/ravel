@@ -822,19 +822,22 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
-      # Exactly what the root Dockerfile's builder stage compiles for these two
-      # images, minus ravel-cli (see Dockerfile.prebuilt for why it is omitted).
+      # Exactly what the root Dockerfile's builder stage compiles for these
+      # images, including ravel-cli: scripts/kind-up.sh's store-qualification
+      # Job (ADR-0050 section 6, EC7/#623) runs it from inside the assembled
+      # server image, so it can no longer be left out (see Dockerfile.prebuilt).
       - name: Build the release binaries on the host
         run: |
           cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-cli
           cargo build --release --locked -p ravel-operator
       - name: Assemble both images from the prebuilt binaries
         run: |
           # A staging directory as the build context: the repo root cannot be
           # used because .dockerignore excludes target/ from it, and the context
-          # needs nothing but the two binaries anyway.
+          # needs nothing but the three binaries anyway.
           ctx=$(mktemp -d)
-          cp target/release/ravel-server target/release/ravel-operator "$ctx/"
+          cp target/release/ravel-server target/release/ravel-cli target/release/ravel-operator "$ctx/"
           docker build --file Dockerfile.prebuilt --target server \
             --tag "$RAVEL_SERVER_IMAGE" "$ctx"
           docker build --file Dockerfile.prebuilt --target operator \
