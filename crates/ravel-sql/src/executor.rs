@@ -79,6 +79,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
@@ -149,6 +150,40 @@ pub struct SqlStats {
     pub batches_emitted: usize,
     /// Segments in the snapshot the successful attempt used.
     pub segments: usize,
+    /// Blocks the successful attempt's `LogsScanExec` saw, read straight off
+    /// its DataFusion counters after the stream drained (#544, reused rather
+    /// than recounted). Zero for a metrics query, and for a logs query whose
+    /// plan carries no scan node. `blocks_scanned` over `blocks_total` is the
+    /// prune selectivity ADR-0049 measures (issue #511).
+    pub blocks_total: u64,
+    pub blocks_scanned: u64,
+    pub blocks_pruned_by_postings: u64,
+}
+
+/// The `LogsScanExec` block counters, summed over a plan tree (issue #511).
+#[derive(Clone, Copy, Default)]
+struct BlockCounts {
+    total: u64,
+    scanned: u64,
+    pruned_by_postings: u64,
+}
+
+/// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings`
+/// DataFusion counters over `plan` and its descendants. Only `LogsScanExec`
+/// publishes these names (crate::logs_scan), so the sum is that scan's totals
+/// however the optimizer nested it, and a plan with no logs scan contributes
+/// nothing. Reads the counters the scan already maintains rather than counting
+/// blocks a second time.
+fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
+    if let Some(metrics) = plan.metrics() {
+        let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
+        counts.total += sum("blocks_total");
+        counts.scanned += sum("blocks_scanned");
+        counts.pruned_by_postings += sum("blocks_pruned_by_postings");
+    }
+    for child in plan.children() {
+        accumulate_block_counts(child, counts);
+    }
 }
 
 /// A completed query.
@@ -263,11 +298,15 @@ impl SqlExecutor {
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
 
-            let (result, emitted) = self.attempt(tenant_hash, req, snapshot, &accounting).await;
+            let (result, emitted, blocks) =
+                self.attempt(tenant_hash, req, snapshot, &accounting).await;
             stats.batches_emitted += emitted;
 
             match result {
                 Ok(output) => {
+                    stats.blocks_total = blocks.total;
+                    stats.blocks_scanned = blocks.scanned;
+                    stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
                     return Ok(SqlOutcome {
                         output,
                         stats,
@@ -513,19 +552,19 @@ impl SqlExecutor {
         req: &SqlRequest,
         snapshot: Snapshot,
         accounting: &QueryAccounting,
-    ) -> (Result<QueryOutput, SqlError>, usize) {
+    ) -> (Result<QueryOutput, SqlError>, usize, BlockCounts) {
         let planned = match self
             .plan_pinned(tenant_hash, snapshot, &req.sql, accounting)
             .await
         {
             Ok(planned) => planned,
-            Err(e) => return (Err(e), 0),
+            Err(e) => return (Err(e), 0, BlockCounts::default()),
         };
         let schema = planned.schema();
 
         let mut stream = match planned.execute().await {
             Ok(stream) => stream,
-            Err(e) => return (Err(e), 0),
+            Err(e) => return (Err(e), 0, BlockCounts::default()),
         };
 
         let mut batches = Vec::new();
@@ -536,11 +575,17 @@ impl SqlExecutor {
                     emitted += 1;
                     batches.push(batch);
                 }
-                Err(e) => return (Err(e), emitted),
+                // The scan's block counters are final only after a clean drain,
+                // so a mid-stream error reports none: a partial prune ratio
+                // would misattribute.
+                Err(e) => return (Err(e), emitted, BlockCounts::default()),
             }
         }
 
-        (Ok(QueryOutput::new(schema, batches)), emitted)
+        // The stream drained cleanly: the plan's LogsScanExec counters are now
+        // final, so read them off the plan we kept (issue #511).
+        let blocks = stream.block_counts();
+        (Ok(QueryOutput::new(schema, batches)), emitted, blocks)
     }
 }
 
@@ -575,12 +620,20 @@ impl PinnedQuery {
             schema,
             breach,
         } = self;
-        let inner = frame.execute_stream().await.map_err(plan_error)?;
+        // Build the physical plan explicitly rather than through
+        // `frame.execute_stream()` (which does the same two steps internally)
+        // so the plan handle survives the stream and its `LogsScanExec`
+        // DataFusion counters can be read after the drain (issue #511). The two
+        // are equivalent: `execute_stream` is `create_physical_plan` then
+        // `execute_stream(plan, task_ctx)`.
+        let plan = frame.create_physical_plan().await.map_err(plan_error)?;
+        let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
             inner,
             schema,
             breach,
+            plan,
         })
     }
 }
@@ -601,12 +654,27 @@ pub struct PinnedStream {
     /// the stream fails with [`SqlError::ResourcesExhausted`] instead of
     /// running the over-budget plan to completion.
     breach: Arc<CeilingBreach>,
+    /// The physical plan behind `inner`, kept so its `LogsScanExec` block
+    /// counters can be read once the stream has drained (issue #511). Holding
+    /// it changes nothing about execution: the operators live in `inner`, and
+    /// this is the same `Arc` handle.
+    plan: Arc<dyn ExecutionPlan>,
 }
 
 impl PinnedStream {
     /// The stream's schema, identical to the planned schema.
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+
+    /// The `(blocks_total, blocks_scanned, blocks_pruned_by_postings)` the
+    /// plan's logs scan recorded. Meaningful only once the stream has drained;
+    /// zero on a plan with no logs scan. Reads the existing DataFusion counters
+    /// (issue #511).
+    fn block_counts(&self) -> BlockCounts {
+        let mut counts = BlockCounts::default();
+        accumulate_block_counts(&self.plan, &mut counts);
+        counts
     }
 }
 

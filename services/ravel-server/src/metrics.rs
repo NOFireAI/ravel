@@ -894,6 +894,54 @@ fn render_tenancy_family(out: &mut String, mode: Mode, v1_unkeyed_adoptions: u64
 /// validated as expected; the operations guide pages on any increase.
 /// Process-global atomic read from [`crate::provisioning`], single source,
 /// no labels.
+/// The logs prune-selectivity family (ADR-0049, issue #511 deliverable 2):
+/// blocks the logs scans saw, survived, and pruned by postings, cumulative
+/// across queries. Reads the `LogsScanExec` DataFusion counters (#544) that
+/// `ravel-sql` surfaces on `SqlOutcome::stats`, folded into a process-global by
+/// the SQL endpoint. Selectivity is `blocks_survived / blocks_total` (blocks
+/// surviving over blocks total); the raw counters are exposed so a scraper
+/// derives the ratio over any window. Every sample carries only `{mode,
+/// signal}` (the ADR-0044 allowlist), and `signal` is always `logs`: only the
+/// logs scan publishes these counters.
+fn render_query_postings_family(out: &mut String, mode: Mode, blocks: (u64, u64, u64)) {
+    let (total, survived, pruned_by_postings) = blocks;
+    let labels = [Label::Mode(mode), Label::Signal(Signal::Logs)];
+
+    write_header(
+        out,
+        "ravel_logs_prune_blocks_total",
+        "Blocks the logs scans considered before postings pruning, cumulative (the denominator of prune selectivity).",
+        "counter",
+    );
+    write_sample(out, "ravel_logs_prune_blocks_total", &labels, total);
+
+    write_header(
+        out,
+        "ravel_logs_prune_blocks_survived_total",
+        "Blocks that survived postings pruning and were scanned, cumulative (the numerator of prune selectivity: survived over total).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_logs_prune_blocks_survived_total",
+        &labels,
+        survived,
+    );
+
+    write_header(
+        out,
+        "ravel_logs_prune_blocks_pruned_by_postings_total",
+        "Blocks dropped by the POSTINGS index before scanning, cumulative (ADR-0049).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_logs_prune_blocks_pruned_by_postings_total",
+        &labels,
+        pruned_by_postings,
+    );
+}
+
 fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatches: u64) {
     write_header(
         out,
@@ -1762,6 +1810,7 @@ pub fn render(
         crate::store_probe::store_reachable(),
         crate::store_probe::probe_failures_total(),
     );
+    render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
     }
@@ -2102,6 +2151,53 @@ mod tests {
                 "postings is a log-only family: {line}"
             );
         }
+    }
+
+    /// The prune-selectivity family (issue #511) renders its three counters,
+    /// each labelled with exactly `{mode, signal="logs"}` and nothing more.
+    /// Rendered directly rather than through the process-global so the values
+    /// are deterministic and do not race another test's queries.
+    #[test]
+    fn prune_selectivity_family_carries_only_allowlisted_labels() {
+        let mut out = String::new();
+        // total=100, survived=12, pruned=88.
+        render_query_postings_family(&mut out, Mode::Query, (100, 12, 88));
+
+        let sample_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("ravel_logs_prune_"))
+            .collect();
+        assert_eq!(
+            sample_lines.len(),
+            3,
+            "three counters, one sample each:\n{out}"
+        );
+
+        for line in &sample_lines {
+            let labels = line
+                .split_once('{')
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(inner, _)| inner)
+                .expect("sample carries a label block");
+            let keys: HashSet<&str> = labels
+                .split(',')
+                .map(|kv| kv.split_once('=').expect("label is key=value").0)
+                .collect();
+            assert_eq!(
+                keys,
+                HashSet::from(["mode", "signal"]),
+                "prune sample must carry only {{mode, signal}}: {line}"
+            );
+            assert!(line.contains("signal=\"logs\""), "logs-only family: {line}");
+        }
+        // The survived (numerator) and total (denominator) both render, so a
+        // scraper can form the ratio.
+        assert!(out.contains("ravel_logs_prune_blocks_total{mode=\"query\",signal=\"logs\"} 100"));
+        assert!(
+            out.contains(
+                "ravel_logs_prune_blocks_survived_total{mode=\"query\",signal=\"logs\"} 12"
+            )
+        );
     }
 
     /// Every non-comment line is `name{labels} value`, every `# TYPE`
