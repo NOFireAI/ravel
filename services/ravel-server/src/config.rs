@@ -324,6 +324,16 @@ pub struct Cli {
     /// are configured from one coherent group of flags.
     #[arg(long, value_name = "DURATION")]
     pub gc_max_flush_lifetime: Option<String>,
+
+    /// How often the background store-reachability probe GETs the fixed
+    /// `sys/tenancy` object, as a humantime duration (e.g. `30s`), ADR-0050
+    /// section 7 (EC7). Jittered, so replicas do not probe in lockstep. After
+    /// `store_probe::K` consecutive failed probes `/readyz` flips to 503; a
+    /// single success recovers it. Matches the `--gc-*`/`--retention-*`
+    /// humantime-duration flag convention. Omitted defaults to
+    /// `store_probe::DEFAULT_STORE_PROBE_INTERVAL` (30s).
+    #[arg(long, value_name = "DURATION")]
+    pub store_probe_interval: Option<String>,
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
@@ -516,6 +526,27 @@ impl Cli {
         };
 
         Ok(AuthResolverSettings { oidc, mtls_header })
+    }
+
+    /// Parse `--store-probe-interval` into a duration (ADR-0050 section 7,
+    /// EC7), defaulting to [`crate::store_probe::DEFAULT_STORE_PROBE_INTERVAL`]
+    /// when unset. Rejects a zero or unparseable duration rather than probing
+    /// in a tight loop or silently doing nothing.
+    pub fn parse_store_probe_interval(&self) -> anyhow::Result<Duration> {
+        match self.store_probe_interval.as_deref() {
+            None => Ok(crate::store_probe::DEFAULT_STORE_PROBE_INTERVAL),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --store-probe-interval '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--store-probe-interval '{s}' must be a positive duration: a zero \
+                         interval would probe the store in a tight loop"
+                    );
+                }
+                Ok(dur)
+            }
+        }
     }
 
     /// Parse `--alert-sql-lookback` into a duration.

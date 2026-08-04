@@ -17,6 +17,14 @@ futures = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 crc32c = { workspace = true }
+# Serde derive for the durable `sys/qualification` record (ADR-0050 section 6),
+# relocated here from ravel-cli so ravel-server and ravel-cli share one
+# definition. JSON-encoded; serde_json stays a dev-dependency (the JSON-shape
+# regression test) since the encode/decode itself lives in the two consumers.
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

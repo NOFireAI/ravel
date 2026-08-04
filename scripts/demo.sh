@@ -81,6 +81,14 @@ docker run --rm --network host \
 log "building ravel-server and ravel-cli"
 cargo build --quiet -p ravel-server -p ravel-cli
 
+# ADR-0050 section 6 (EC7, issue #623): server startup on a non-Memory store
+# refuses unless `sys/qualification` is already present, and there is
+# deliberately no bootstrap-and-continue path for it (unlike the tenancy
+# marker and gc-config objects). A bucket `mc mb`'d fresh above has no such
+# record yet, so qualify it before starting the server or it refuses to start.
+log "qualifying store backend (ravel-cli store qualify)"
+cargo run --quiet -p ravel-cli -- --store s3 store qualify
+
 log "generating fresh OTLP fixture at ${FIXTURE_PATH}"
 mkdir -p examples
 cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"

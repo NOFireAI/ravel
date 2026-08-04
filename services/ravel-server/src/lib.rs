@@ -24,11 +24,13 @@ pub mod otlp_grpc_logs;
 pub mod otlp_grpc_traces;
 pub mod otlp_http;
 pub mod provisioning;
+pub mod qualification;
 pub mod query;
 pub mod remote_write;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod store;
+pub mod store_probe;
 pub mod tenancy;
 pub mod tenant;
 pub mod tenant_discovery;
@@ -192,6 +194,13 @@ pub struct ServerConfig {
     /// deadline enforced. Distinct from `sys/gc.max_query_duration` (the GC
     /// protection budget); this is the timeout the engine actually applies.
     pub query_deadline: Duration,
+    /// How often the background store-reachability probe runs (ADR-0050 section
+    /// 7, EC7), from `--store-probe-interval` (default 30s). [`start`] spawns one
+    /// probe task per process at this cadence; it GETs the fixed `sys/tenancy`
+    /// object, and after `store_probe::K` consecutive failures flips the
+    /// reachability flag `/readyz` reads. Not mode-scoped: every mode builds a
+    /// store handle and runs the probe.
+    pub store_probe_interval: Duration,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -215,6 +224,7 @@ pub struct Running {
     maintenance_tasks: maintain::MaintenanceTasks,
     alert_tasks: alerting::AlertEvalTasks,
     jwks_refresh_task: tenant::JwksRefreshTask,
+    store_probe_task: store_probe::StoreProbeTask,
 }
 
 impl Running {
@@ -278,6 +288,7 @@ impl Running {
         self.maintenance_tasks.shutdown().await;
         self.alert_tasks.shutdown().await;
         self.jwks_refresh_task.shutdown().await;
+        self.store_probe_task.shutdown().await;
 
         Ok(())
     }
@@ -914,6 +925,16 @@ pub async fn start(
     // or on first request (which would never flip under low traffic).
     readiness.mark_ready();
 
+    // Background store-reachability probe (ADR-0050 section 7, EC7). Spawned in
+    // every mode (each builds a store handle), and only now, after the startup
+    // latch has fired: readiness is the AND of that latch and this probe's
+    // reachability flag, so starting the probe before `mark_ready` could never
+    // advertise readiness early, but starting it here keeps the ordering
+    // obvious. Its first cycle sleeps a full (jittered) interval before the
+    // first GET, so `/readyz` is 200 immediately on startup and only reflects a
+    // real outage once the probe has observed one.
+    let store_probe_task = store_probe::spawn(store.clone(), config.store_probe_interval);
+
     Ok(Running {
         http_addr,
         grpc_addr,
@@ -931,5 +952,6 @@ pub async fn start(
         maintenance_tasks,
         alert_tasks,
         jwks_refresh_task,
+        store_probe_task,
     })
 }

@@ -35,6 +35,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--cache-dir <path>` | | none | Directory for the read cache's local-disk tier. Not wired to anything yet: the query fetchers only accept a RAM cache. Setting this flag fails startup rather than silently running with no disk tier. See [guides/caching.md](caching.md#known-gaps). |
 | `--disable-cache` | | off | Disables the ADR-0046 read cache entirely. Query behavior becomes byte-for-byte identical to a build with no read cache wiring at all. |
 | `--metrics-tenant-labels` | | off | Emits real per-tenant `tenant_hash` labels on the `ravel_admission_*` family at `/metrics` (ADR-0051 section 6) instead of folding every tenant into `tenant_hash="other"`. A deliberate cardinality trade; off by default so `/metrics` cardinality never scales with tenant count unless an operator opts in. See "Admission usage" above. |
+| `--store-probe-interval <duration>` | | `30s` | How often the background store-reachability probe GETs `sys/tenancy` (ADR-0050 section 7), as a humantime duration, jittered. After four consecutive failures `/readyz` returns 503; one success recovers it. See "Store reachability probe and `/readyz`" below. |
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (through
 flag or env) fails at startup with an explicit error that names the missing
@@ -371,6 +372,83 @@ a real bucket, region, and credentials:
 
 Ravel does not use the AWS credential chain (profiles, instance roles,
 `AWS_ACCESS_KEY_ID`). It reads only the `RAVEL_S3_*` flags/env above.
+
+## Store qualification (ADR-0050 section 6)
+
+Ravel's commit protocol and catalog assume the backing store honors conditional
+writes (`CreateIfAbsent`/`CasVersion` reject a losing writer) and strong
+read/list-after-write consistency. A backend that advertises these but does not
+deliver them silently violates durability. Before a production store is trusted,
+it is qualified empirically, once per bucket:
+
+```sh
+ravel-cli store qualify --store s3 --s3-endpoint ... --s3-bucket ...
+```
+
+On a pass, this records a durable `sys/qualification` object (backend identity,
+suite version, timestamp) via `CreateIfAbsent`. It is once per bucket, never
+per boot, and never overwritten: a second run leaves the existing record alone.
+
+**A fresh production deployment must run `store qualify` before the server can
+start at all.** On any non-`memory` store, `ravel-server` reads
+`sys/qualification` at startup, in every mode, before any listener binds, and
+refuses to start when the record is:
+
+- **absent** -- the backend has never been qualified; run `ravel-cli store
+  qualify`, then start the server; or
+- **stale** -- recorded under a suite version below this binary's required
+  floor; re-run `ravel-cli store qualify` with a current build, then restart.
+
+The two conditions are reported as distinct, named errors. This is intentional,
+not a bug to route around: unlike the tenancy marker (below) and the durable GC
+config, an absent qualification record is **not** a fresh-bucket
+bootstrap-and-continue case. There is no "assume qualified" path, because a
+never-qualified backend has never been shown to honor the guarantees Ravel's
+durability depends on. `--store memory` (the semantics oracle used in
+development and tests) is exempt and never needs qualification.
+
+## Store reachability probe and `/readyz` (ADR-0050 section 7)
+
+`/readyz` (readiness) now reflects store reachability, not just startup
+completion. Each process runs one background probe that GETs the fixed
+`sys/tenancy` object every `--store-probe-interval` (default `30s`, jittered so
+replicas do not probe in lockstep). Readiness is the AND of the startup latch
+and this probe's health:
+
+- After **4 consecutive** failed probes, readiness flips and `/readyz` (and its
+  Prometheus spelling `/-/ready`) returns 503.
+- The **first successful** probe flips it back to 200 immediately (asymmetric:
+  four failures down, one success up).
+
+At the default interval this is roughly two minutes of hysteresis before a
+fleet is marked unready -- a store outage that long means every data path is
+failing, and marking the fleet unready is the truthful signal (traffic fails
+fast at the load balancer instead of timing out per request). The threshold is
+a fixed constant, not a flag, so it cannot be lowered to 1 and reintroduce the
+single-blip mass-ejection failure mode this design exists to prevent.
+
+`/readyz` still does **no** object-store call on the probe path itself: the
+kubelet reads only an in-memory atomic the background probe maintains. And
+`/healthz` (liveness) is deliberately unaffected by the probe -- it still means
+only "the process is alive." A store outage must never make liveness fail and
+get healthy processes killed and restarted; that is exactly the failure mode
+the two objections documented in `health.rs` are about.
+
+`/readyz` flipping on store outages changes rollout semantics: a deployment
+gated on readiness will (correctly) halt while the store is unreachable.
+
+The probe exports two samples at `GET /metrics`, so an operator sees the outage
+even on a metrics-only monitoring setup where nothing consumes `/readyz`:
+
+- `ravel_store_reachable` (gauge, labeled by `mode`): 1 = healthy, 0 = unhealthy.
+- `ravel_store_probe_failures_total` (counter, labeled by `mode`): every failed
+  probe cycle, monotonic, incremented even below the readiness threshold.
+
+Default alert rule:
+
+| Condition | Query | Why |
+|---|---|---|
+| Store unreachable | `ravel_store_reachable == 0` | The background probe has failed four consecutive GETs of `sys/tenancy`; every data path through this process is almost certainly failing and it has already stopped advertising readiness. Alert on the sustained gauge state, not an `increase()`: this is a live "store is down right now" condition, and it clears itself the moment a single probe succeeds. |
 
 ## Tenancy setup
 

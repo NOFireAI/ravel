@@ -12,10 +12,15 @@
 //!   definition, so this handler carries no state.
 //! - `/readyz` (readiness): 503 until startup has fully completed (config
 //!   parsed, the object-store capability gate passed, listeners bound), then
-//!   200. It performs no object-store I/O per probe: a store call on every
-//!   kubelet probe of every pod would add real S3 cost, and a transient S3
-//!   blip would eject every pod from its Service at once. Continuous store
-//!   health probing is a deliberate follow-up, not an omission here.
+//!   200 for as long as the store also stays reachable. It performs no
+//!   object-store I/O per probe: a store call on every kubelet probe of every
+//!   pod would add real S3 cost, and a transient S3 blip would eject every pod
+//!   from its Service at once. Since ADR-0050 section 7 (EC7) readiness is the
+//!   AND of the startup latch and a background store-reachability flag
+//!   ([`crate::store_probe`]): the continuous store probing that the original
+//!   comment deferred now runs on its own jittered cadence, with hysteresis, so
+//!   `/readyz` reflects a real store outage while still reading only an atomic
+//!   per probe.
 //!
 //! `/-/healthy` and `/-/ready` are Prometheus' own spellings of the same two
 //! probes, routed to the same handler functions (issue #336) so a
@@ -29,13 +34,22 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 
-/// Shared readiness flag for the `/readyz` handler.
+/// Readiness for the `/readyz` handler: the AND of a one-way startup-completion
+/// latch and the background store-reachability flag (ADR-0050 section 7, EC7).
 ///
-/// Starts `false` and is flipped to `true` exactly once, at the point in the
-/// startup sequence where config is parsed, the capability gate has passed,
-/// and both listeners are bound. It never flips back: readiness is a
-/// startup-completion latch, not a live health signal (see the module docs on
-/// why `/readyz` does no per-probe store call).
+/// The startup latch starts `false` and is flipped to `true` exactly once, at
+/// the point in the startup sequence where config is parsed, the capability gate
+/// has passed, and both listeners are bound. It never flips back. On its own it
+/// is a startup-completion latch, not a live health signal; readiness combines
+/// it with [`crate::store_probe::store_reachable`], which the background probe
+/// task flips as the store becomes unreachable or recovers. `/readyz` is 200
+/// only when startup has completed AND the store is currently reachable, so a
+/// store outage correctly halts readiness-gated rollouts without any per-probe
+/// store call on this path.
+///
+/// `/healthz` (liveness) is deliberately independent of the probe: a store
+/// outage must never make liveness fail and get healthy processes killed and
+/// restarted (see the module docs).
 #[derive(Clone, Default)]
 pub struct Readiness(Arc<AtomicBool>);
 
@@ -45,15 +59,27 @@ impl Readiness {
         Self(Arc::new(AtomicBool::new(false)))
     }
 
-    /// Latch the flag to ready. Idempotent; calling it more than once is
-    /// harmless and it can never move back to not-ready.
+    /// Latch the startup flag to ready. Idempotent; calling it more than once is
+    /// harmless and the startup latch can never move back to not-ready. Store
+    /// reachability is tracked separately by [`crate::store_probe`] and can flip
+    /// both ways after this latches.
     pub fn mark_ready(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
 
-    /// Whether startup has completed.
-    pub fn is_ready(&self) -> bool {
+    /// Whether the startup latch alone has fired, ignoring store reachability.
+    /// Retained for tests and callers that need the latch state specifically;
+    /// `/readyz` uses [`Readiness::is_ready`], which also requires the store to
+    /// be reachable.
+    pub fn startup_complete(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// Whether the process is ready to serve: startup has completed AND the
+    /// background store probe currently reports the store reachable (ADR-0050
+    /// section 7). Either condition false yields 503 at `/readyz`.
+    pub fn is_ready(&self) -> bool {
+        self.startup_complete() && crate::store_probe::store_reachable()
     }
 }
 

@@ -818,6 +818,43 @@ fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatch
     );
 }
 
+/// Store-reachability probe family (ADR-0050 section 7, EC7): the
+/// `ravel_store_reachable` gauge (1 = the background probe currently reports the
+/// store reachable, 0 = unhealthy after `store_probe::K` consecutive failures)
+/// and the `ravel_store_probe_failures_total` counter (every failed probe
+/// cycle, monotonic). Both are process-global atomic reads from
+/// [`crate::store_probe`], single source and no labels, the same shape as the
+/// tenancy and provisioning families above. Exported unconditionally so an
+/// operator sees a store outage on a metrics-only monitoring setup, even where
+/// nothing consumes `/readyz`.
+fn render_store_probe_family(out: &mut String, mode: Mode, reachable: bool, failures_total: u64) {
+    write_header(
+        out,
+        "ravel_store_reachable",
+        "Whether the background store probe currently reports the object store reachable (1) or unhealthy after K consecutive failed probes (0), with hysteresis (ADR-0050 section 7).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_store_reachable",
+        &[Label::Mode(mode)],
+        u64::from(reachable),
+    );
+
+    write_header(
+        out,
+        "ravel_store_probe_failures_total",
+        "Store-reachability probe cycles that failed to GET sys/tenancy, monotonic (ADR-0050 section 7). Increments on every failed probe, whether or not it crossed the readiness threshold.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_store_probe_failures_total",
+        &[Label::Mode(mode)],
+        failures_total,
+    );
+}
+
 /// Storage-derived tenant discovery counters for the maintenance driver
 /// (ADR-0048 decision 3, issue #504), decoupled from
 /// [`crate::tenant_discovery::TenantDiscoveryMetrics`] so the renderer is
@@ -1597,6 +1634,12 @@ pub fn render(
         mode,
         crate::provisioning::shard_count_mismatch_count(),
     );
+    render_store_probe_family(
+        &mut out,
+        mode,
+        crate::store_probe::store_reachable(),
+        crate::store_probe::probe_failures_total(),
+    );
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
     }
@@ -2182,6 +2225,37 @@ mod tests {
         // present in `ingest` still yields no `signal="spans"` collisions
         // sample; not exercised further here since no span pipeline was
         // constructed in this test.
+    }
+
+    /// EC7 (ADR-0050 section 7): the store-reachability family renders on this
+    /// same closed-label endpoint, in every mode, so a metrics-only monitoring
+    /// setup sees an outage even where nothing consumes `/readyz`. No probe runs
+    /// in this unit test, so the reachability flag reads its default (healthy).
+    #[test]
+    fn render_includes_store_probe_family() {
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+        );
+        // Default reachability is healthy (1); the process runs no probe here.
+        assert!(
+            body.contains("ravel_store_reachable{mode=\"all\"} 1"),
+            "missing store-reachable gauge:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_store_probe_failures_total{mode=\"all\"} 0"),
+            "missing store-probe failure counter:\n{body}"
+        );
+        // Both carry the standard TYPE headers.
+        assert!(body.contains("# TYPE ravel_store_reachable gauge"));
+        assert!(body.contains("# TYPE ravel_store_probe_failures_total counter"));
     }
 
     /// Issue #517: the three maintenance safety controls (ADR-0048 decisions

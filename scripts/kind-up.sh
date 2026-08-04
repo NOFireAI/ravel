@@ -194,6 +194,63 @@ if ! kubectl wait --namespace "$NAMESPACE" --for=condition=Complete --timeout=30
 fi
 log "bucket ${BUCKET} ready on ${S3_ENDPOINT}"
 
+# ---- 4b. store qualification --------------------------------------------
+# ADR-0050 section 6 (EC7, issue #623): server startup on a non-Memory store
+# refuses unless `sys/qualification` is already present. Unlike the tenancy
+# marker and gc-config objects, there is deliberately no bootstrap-and-continue
+# path for this one -- it is only ever written by an explicit `ravel-cli store
+# qualify` run, so this script has to be that run, or every gateway/query/
+# maintain pod the RavelCluster below creates crash-loops on a fresh bucket
+# (the exact EC3/#566 startup-refusal shape, this time for qualification).
+# Runs as a one-shot Job using the server image already loaded into the
+# cluster (it ships ravel-cli alongside ravel-server, see the Dockerfile),
+# against the same bucket/credentials the RavelCluster will use.
+log "running store qualification (ravel-cli store qualify) against ${S3_ENDPOINT}"
+kubectl delete job ravel-store-qualify --namespace "$NAMESPACE" \
+  --ignore-not-found --wait=true >/dev/null
+kubectl apply -f - <<YAML
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ravel-store-qualify
+  namespace: ${NAMESPACE}
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: qualify
+          image: ${SERVER_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/ravel-cli"]
+          args: ["--store", "s3", "store", "qualify"]
+          env:
+            - name: RAVEL_S3_ENDPOINT
+              value: "${S3_ENDPOINT}"
+            - name: RAVEL_S3_BUCKET
+              value: "${BUCKET}"
+            - name: RAVEL_S3_REGION
+              value: "us-east-1"
+            - name: RAVEL_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ${S3_CREDENTIALS_SECRET}
+                  key: accessKeyId
+            - name: RAVEL_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ${S3_CREDENTIALS_SECRET}
+                  key: secretAccessKey
+YAML
+if ! kubectl wait --namespace "$NAMESPACE" --for=condition=Complete --timeout=120s \
+  job/ravel-store-qualify; then
+  kubectl logs --namespace "$NAMESPACE" job/ravel-store-qualify 2>&1 |
+    sed 's/^/[qualify-job] /' >&2 || true
+  die "store qualification job did not complete"
+fi
+log "store qualified"
+
 # ---- 5. operator -------------------------------------------------------------
 # CRD before the operator Deployment: the operator's watch fails until the
 # RavelCluster kind is served. RBAC before it too, or its API calls 403.

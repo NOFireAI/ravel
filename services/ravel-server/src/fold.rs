@@ -251,8 +251,10 @@ async fn run_tenant_tick(
 }
 
 /// Adds up to 10% jitter on top of `base`, so multiple replicas' fold tasks
-/// (started at roughly the same time) don't tick in lockstep forever.
-fn jittered(base: Duration) -> Duration {
+/// (started at roughly the same time) don't tick in lockstep forever. Shared
+/// with the store-reachability probe ([`crate::store_probe`]), which reuses this
+/// single helper rather than growing a second copy of the same jitter rule.
+pub(crate) fn jittered(base: Duration) -> Duration {
     let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
     if jitter_bound_ms == 0 {
         return base;
