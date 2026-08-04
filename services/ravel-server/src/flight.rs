@@ -102,5 +102,10 @@ pub fn service(
         // query-audit record to, so Flight statements are audited through the
         // same store (issue #395).
         Arc::clone(&state.store),
+        // The same per-query cost aggregator every other read surface folds
+        // into, cloned out of `SqlState` the way `store` is, so Flight SQL cost
+        // reaches the one process `ravel_query_*` family (ADR-0044 section 4,
+        // issue #425).
+        Arc::clone(&state.query_accounting) as Arc<dyn ravel_types::accounting::QueryCostRecorder>,
     ))
 }

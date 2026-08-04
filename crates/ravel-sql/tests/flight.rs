@@ -41,6 +41,11 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{FlightClock, FlightSqlConfig, FlightTicket, RavelFlightSqlService};
+use ravel_types::TenantHash;
+use ravel_types::accounting::{
+    CostEstimate, NoopQueryCostRecorder, QueryAccountingSnapshot, QueryCostRecorder,
+    QueryWorkloadClass,
+};
 use tonic::Request;
 use tonic::metadata::MetadataMap;
 use util::flight_harness::{
@@ -207,6 +212,7 @@ async fn the_ticket_deadline_is_bounded_by_the_gc_protection_horizon() {
             ..FlightSqlConfig::default()
         },
         Arc::clone(&harness.store),
+        Arc::new(NoopQueryCostRecorder),
     );
 
     let ticket = harness
@@ -301,6 +307,7 @@ async fn do_get_bounds_a_stalled_read_to_the_gc_horizon_not_the_tickets_own_dead
             ..FlightSqlConfig::default()
         },
         Arc::clone(&harness.store),
+        Arc::new(NoopQueryCostRecorder),
     );
 
     let ticket = harness
@@ -800,5 +807,91 @@ async fn an_audit_write_failure_does_not_fail_the_flight_response() {
     assert!(
         audit.is_empty(),
         "the faulted audit write leaves no record behind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-query cost recording (ADR-0044 section 4, issue #425)
+// ---------------------------------------------------------------------------
+
+/// A recorder that keeps every fold, so a test can prove the Flight path folded
+/// its cost and that the numbers are real.
+#[derive(Default)]
+struct CapturingRecorder {
+    calls: std::sync::Mutex<
+        Vec<(
+            QueryAccountingSnapshot,
+            CostEstimate,
+            TenantHash,
+            QueryWorkloadClass,
+        )>,
+    >,
+}
+
+impl QueryCostRecorder for CapturingRecorder {
+    fn record(
+        &self,
+        accounting: &QueryAccountingSnapshot,
+        estimate: &CostEstimate,
+        tenant_hash: TenantHash,
+        workload_class: QueryWorkloadClass,
+    ) {
+        self.calls.lock().expect("recorder mutex").push((
+            *accounting,
+            *estimate,
+            tenant_hash,
+            workload_class,
+        ));
+    }
+}
+
+/// A full `GetFlightInfo` then `DoGet` folds its cost into the aggregator: one
+/// fold per RPC, and the combined cost observed a real object-store request.
+/// Before this wiring both RPCs built a `QueryAccounting`, used it, and dropped
+/// it, so nothing reached `/metrics`.
+#[tokio::test]
+async fn a_flight_statement_folds_its_cost_into_the_recorder() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let recorder = Arc::new(CapturingRecorder::default());
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let harness = Harness::build_with_recorder(
+        store,
+        &[(&tenant, &seg_specs)],
+        Arc::clone(&recorder) as Arc<dyn QueryCostRecorder>,
+    )
+    .await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    // Draining the DoGet stream to completion drops it, which fires the
+    // execution fold: the recorded DoGet cost is the whole RPC, not just its
+    // first batch.
+    let _batches = harness.do_get("acme", &ticket).await.expect("do get");
+
+    let calls = recorder.calls.lock().expect("recorder mutex");
+    assert_eq!(
+        calls.len(),
+        2,
+        "GetFlightInfo folds resolve+plan, DoGet folds execution: two folds"
+    );
+    for (_, _, tenant_hash, workload) in calls.iter() {
+        assert_eq!(
+            *tenant_hash,
+            tenant.hash(),
+            "folded under the query's tenant"
+        );
+        assert_eq!(
+            *workload,
+            QueryWorkloadClass::Interactive,
+            "a Flight query is interactive"
+        );
+    }
+    let total_requests: u64 = calls.iter().map(|(a, ..)| a.total_s3_requests()).sum();
+    assert!(
+        total_requests > 0,
+        "the flight query read the catalog and a segment, so the summed folds must record > 0 s3 requests"
     );
 }

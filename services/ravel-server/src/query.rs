@@ -89,15 +89,16 @@ pub fn build_app_state(
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<Arc<Cache<CacheFetchError>>>,
     engine_config: EngineConfig,
+    query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
 ) -> AppState {
     let mut engine = QueryEngine::new(catalog, store, engine_config);
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
     }
-    AppState {
-        engine: Arc::new(engine),
-        tenant_resolver,
-    }
+    // Fold every completed Prometheus-shaped query into the same process
+    // aggregator the SQL and analytics paths use (ADR-0044 section 4, issue
+    // #425), so `/metrics` covers PromQL read traffic too.
+    AppState::new(Arc::new(engine), tenant_resolver).with_cost_recorder(query_accounting)
 }
 
 /// Default per-tenant SQL memory ceiling: 1 GiB across a tenant's concurrent

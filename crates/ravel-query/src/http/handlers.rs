@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Body};
 
 use ravel_promql::LabelMatcher;
+use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot, QueryWorkloadClass};
 use ravel_types::{LabelSet, SeriesId, TimeRange};
 
 use crate::engine::parse_match_selector;
@@ -105,11 +106,21 @@ async fn handle_query(
         .instant_with_stats_annotated(tenant_hash, query, time_ms, &min_tokens, now, deadline)
         .await?;
     let (warnings, infos) = annotations.into_parts();
-    Ok((
-        with_stats(instant_value_to_json(value, time_ms)?, stats),
-        warnings,
-        infos,
-    ))
+    // Copy the counters out before `stats` is moved into the response body, so
+    // the numbers folded into /metrics are exactly the numbers the response
+    // reports; recording after the JSON render succeeds means a completed,
+    // fully-rendered query is what gets counted (ADR-0044 section 4, issue
+    // #425). Both are `Copy`.
+    let accounting = stats.accounting;
+    let estimate = stats.estimate;
+    let data = with_stats(instant_value_to_json(value, time_ms)?, stats);
+    state.cost_recorder.record(
+        &accounting,
+        &estimate,
+        tenant_hash,
+        QueryWorkloadClass::Interactive,
+    );
+    Ok((data, warnings, infos))
 }
 
 pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -149,14 +160,21 @@ async fn handle_query_range(
         )
         .await?;
     let (warnings, infos) = annotations.into_parts();
-    Ok((
-        with_stats(
-            range_value_to_json(value, start_ms, end_ms, step_ms)?,
-            stats,
-        ),
-        warnings,
-        infos,
-    ))
+    // See handle_query: record the same counters the response reports, once
+    // the range payload has rendered.
+    let accounting = stats.accounting;
+    let estimate = stats.estimate;
+    let data = with_stats(
+        range_value_to_json(value, start_ms, end_ms, step_ms)?,
+        stats,
+    );
+    state.cost_recorder.record(
+        &accounting,
+        &estimate,
+        tenant_hash,
+        QueryWorkloadClass::Interactive,
+    );
+    Ok((data, warnings, infos))
 }
 
 fn parse_duration_ms_field(params: &Params) -> Result<i64, ApiError> {
@@ -277,12 +295,22 @@ async fn resolve_matched_series(
     // bound.
     let request_deadline = tokio::time::Instant::now() + deadline;
 
+    // Accumulates every sub-query's cost so the whole metadata request folds
+    // once into the /metrics aggregator (ADR-0044 section 4, issue #425). Each
+    // match[] selector resolves under its own accounting handle, so the
+    // request total is the field-wise sum of the per-selector snapshots.
+    // Recording once per request, not once per selector, keeps
+    // ravel_query_queries_total counting requests.
+    let mut combined: Option<(QueryAccountingSnapshot, CostEstimate)> = None;
+
     if selectors.is_empty() {
         let remaining = remaining_budget(request_deadline, deadline)?;
-        let series = state
+        let (series, stats) = state
             .engine
-            .resolve_series(tenant_hash, &[], window, &min_tokens, now, remaining)
+            .resolve_series_with_stats(tenant_hash, &[], window, &min_tokens, now, remaining)
             .await?;
+        accumulate_cost(&mut combined, &stats);
+        record_combined(state, tenant_hash, combined);
         return Ok(series);
     }
 
@@ -302,15 +330,55 @@ async fn resolve_matched_series(
     for selector in selectors {
         let matchers: Vec<LabelMatcher> = parse_match_selector(selector)?;
         let remaining = remaining_budget(request_deadline, deadline)?;
-        let series = state
+        let (series, stats) = state
             .engine
-            .resolve_series(tenant_hash, &matchers, window, &min_tokens, now, remaining)
+            .resolve_series_with_stats(tenant_hash, &matchers, window, &min_tokens, now, remaining)
             .await?;
+        accumulate_cost(&mut combined, &stats);
         for (id, labels) in series {
             by_id.entry(id).or_insert(labels);
         }
     }
+    record_combined(state, tenant_hash, combined);
     Ok(by_id.into_iter().collect())
+}
+
+/// Fold one sub-query's [`QueryStats`](crate::QueryStats) into the request's
+/// running cost total. The counters sum and the estimate sums
+/// ([`QueryAccountingSnapshot::saturating_add`]); the first call seeds the
+/// total because [`CostEstimate`] has no zero value (an estimate is only ever
+/// a real resolved snapshot's, ADR-0044).
+fn accumulate_cost(
+    combined: &mut Option<(QueryAccountingSnapshot, CostEstimate)>,
+    stats: &crate::QueryStats,
+) {
+    *combined = Some(match combined.take() {
+        None => (stats.accounting, stats.estimate),
+        Some((accounting, estimate)) => (
+            accounting.saturating_add(&stats.accounting),
+            estimate.saturating_add(&stats.estimate),
+        ),
+    });
+}
+
+/// Record the whole metadata request's summed cost into the aggregator, once.
+/// `combined` is `Some` whenever any resolve ran (every path above runs at
+/// least one), so a request that reached here without an error records exactly
+/// one query; a request that failed a resolve returned earlier through `?` and
+/// records nothing, the same rule the value-bearing handlers follow.
+fn record_combined(
+    state: &AppState,
+    tenant_hash: ravel_types::TenantHash,
+    combined: Option<(QueryAccountingSnapshot, CostEstimate)>,
+) {
+    if let Some((accounting, estimate)) = combined {
+        state.cost_recorder.record(
+            &accounting,
+            &estimate,
+            tenant_hash,
+            QueryWorkloadClass::Interactive,
+        );
+    }
 }
 
 /// Time left in the shared request wall budget, or a `DeadlineExceeded`

@@ -104,10 +104,7 @@ impl RavelStack {
 
         let mut tokens = std::collections::HashMap::new();
         tokens.insert(TOKEN.to_string(), tenant.clone());
-        let state = AppState {
-            engine,
-            tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
-        };
+        let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)));
 
         Ok(RavelStack {
             app: router(state),

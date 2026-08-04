@@ -165,10 +165,7 @@ fn build_app(
     let backend: Arc<dyn ObjectStoreBackend> = store;
     let catalog = Arc::new(Catalog::new(backend.clone(), catalog_config).expect("catalog"));
     let engine = Arc::new(QueryEngine::new(catalog, backend, engine_config));
-    let state = AppState {
-        engine,
-        tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
-    };
+    let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)));
     router(state)
 }
 
@@ -748,4 +745,220 @@ async fn series_endpoint_requires_match_param() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["errorType"], "bad_data");
+}
+
+// ---------------------------------------------------------------------------
+// Per-query cost recording (ADR-0044 section 4, issue #425)
+//
+// These prove the Prometheus-shaped handlers fold each completed query's cost
+// into the `QueryCostRecorder` seam, and that the numbers recorded are exactly
+// the numbers the response body reports. A capturing recorder stands in for the
+// process-global aggregator: what it captures is what `/metrics` would sum.
+// ---------------------------------------------------------------------------
+
+/// A [`QueryCostRecorder`] that keeps every recording for inspection.
+#[derive(Default)]
+struct CapturingRecorder {
+    calls: std::sync::Mutex<
+        Vec<(
+            ravel_types::accounting::QueryAccountingSnapshot,
+            ravel_types::accounting::CostEstimate,
+            TenantHash,
+            ravel_types::accounting::QueryWorkloadClass,
+        )>,
+    >,
+}
+
+impl ravel_types::accounting::QueryCostRecorder for CapturingRecorder {
+    fn record(
+        &self,
+        accounting: &ravel_types::accounting::QueryAccountingSnapshot,
+        estimate: &ravel_types::accounting::CostEstimate,
+        tenant_hash: TenantHash,
+        workload_class: ravel_types::accounting::QueryWorkloadClass,
+    ) {
+        self.calls.lock().expect("recorder mutex").push((
+            *accounting,
+            *estimate,
+            tenant_hash,
+            workload_class,
+        ));
+    }
+}
+
+/// One tenant, plus a capturing cost recorder wired into the router the same
+/// way a deployment wires the real aggregator.
+fn one_tenant_app_with_recorder(
+    store: Arc<MemoryStore>,
+    engine_config: EngineConfig,
+    tenant_id: &TenantId,
+    token: &str,
+    recorder: Arc<CapturingRecorder>,
+) -> Router {
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let catalog =
+        Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+    let engine = Arc::new(QueryEngine::new(catalog, backend, engine_config));
+    let mut tokens = HashMap::new();
+    tokens.insert(token.to_string(), tenant_id.clone());
+    let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)))
+        .with_cost_recorder(recorder);
+    router(state)
+}
+
+#[tokio::test]
+async fn instant_query_folds_cost_into_recorder_matching_the_response_stats() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    let now = now_ns();
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+    let series = vec![series_input(
+        &tid,
+        "http_requests_total",
+        &[("method", "get")],
+        &[(now - NS_PER_MIN, 42.0)],
+    )];
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
+
+    let recorder = Arc::new(CapturingRecorder::default());
+    let app = one_tenant_app_with_recorder(
+        store,
+        EngineConfig::default(),
+        &tid,
+        "secret-a",
+        Arc::clone(&recorder),
+    );
+    let query = encode_query_param("http_requests_total{method=\"get\"}");
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK, "query failed: {body}");
+
+    let calls = recorder.calls.lock().expect("recorder mutex");
+    assert_eq!(
+        calls.len(),
+        1,
+        "exactly one query is recorded per completed request"
+    );
+    let (snapshot, _estimate, tenant_hash, workload) = &calls[0];
+    assert_eq!(*tenant_hash, th, "recorded under the query's tenant");
+    assert_eq!(
+        *workload,
+        ravel_types::accounting::QueryWorkloadClass::Interactive,
+        "an HTTP query is interactive"
+    );
+    // A genuine segment GET happened, so the recorded actual is non-zero: this
+    // is not a zero placeholder folded in regardless of work done.
+    assert!(
+        snapshot.total_s3_requests() > 0,
+        "the query fetched a segment, so recorded s3 requests must be > 0"
+    );
+
+    // The recorded snapshot equals, field for field, the accounting the
+    // response body reported. This is the assertion a future refactor that
+    // re-introduces a second, separately-counted handle would break: the
+    // metric and the response body can never disagree.
+    let reported = &body["data"]["stats"]["accounting"];
+    use ravel_types::accounting::AccountedOp;
+    assert_eq!(
+        reported["s3GetRequests"].as_u64().expect("s3GetRequests"),
+        snapshot.s3_requests(AccountedOp::Get),
+        "recorded get requests must equal the response's"
+    );
+    assert_eq!(
+        reported["s3ListRequests"].as_u64().expect("s3ListRequests"),
+        snapshot.s3_requests(AccountedOp::List),
+    );
+    assert_eq!(
+        reported["s3GetBytes"].as_u64().expect("s3GetBytes"),
+        snapshot.s3_bytes(AccountedOp::Get),
+    );
+    assert_eq!(
+        reported["decompressedBytes"]
+            .as_u64()
+            .expect("decompressedBytes"),
+        snapshot.decompressed_bytes,
+    );
+    assert_eq!(
+        reported["segmentsOpened"].as_u64().expect("segmentsOpened"),
+        snapshot.segments_opened,
+    );
+}
+
+#[tokio::test]
+async fn series_endpoint_folds_cost_into_recorder() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    let now = now_ns();
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+    let series = vec![series_input(
+        &tid,
+        "http_requests_total",
+        &[("method", "get")],
+        &[(now - NS_PER_MIN, 1.0)],
+    )];
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
+
+    let recorder = Arc::new(CapturingRecorder::default());
+    let app = one_tenant_app_with_recorder(
+        store,
+        EngineConfig::default(),
+        &tid,
+        "secret-a",
+        Arc::clone(&recorder),
+    );
+    let matcher = encode_query_param("http_requests_total");
+    let uri = format!("/api/v1/series?match%5B%5D={matcher}");
+    let (status, _body) = call(&app, &uri, Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let calls = recorder.calls.lock().expect("recorder mutex");
+    assert_eq!(
+        calls.len(),
+        1,
+        "one /series request folds its cost exactly once, not once per selector"
+    );
+    let (snapshot, _estimate, tenant_hash, workload) = &calls[0];
+    assert_eq!(*tenant_hash, th);
+    assert_eq!(
+        *workload,
+        ravel_types::accounting::QueryWorkloadClass::Interactive
+    );
+    // The metadata resolve listed and read the catalog and opened the matching
+    // segment, so its cost is real and non-zero. Before this wiring the
+    // handler dropped its accounting and this stayed zero.
+    assert!(
+        snapshot.total_s3_requests() > 0,
+        "the /series resolve fetched from the store, so recorded s3 requests must be > 0"
+    );
 }

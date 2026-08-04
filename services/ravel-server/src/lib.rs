@@ -600,6 +600,7 @@ pub async fn start(
             config.tenant_resolver.clone(),
             cache.clone(),
             engine_config,
+            query_accounting.clone(),
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
@@ -699,10 +700,9 @@ pub async fn start(
         )?;
 
         if let Some(mtls) = &config.mtls_listener {
-            let mtls_app_state = ravel_query::http::AppState {
-                engine: app_state.engine.clone(),
-                tenant_resolver: mtls.resolver.clone(),
-            };
+            let mtls_app_state =
+                ravel_query::http::AppState::new(app_state.engine.clone(), mtls.resolver.clone())
+                    .with_cost_recorder(query_accounting.clone());
             mtls_router = mtls_router.merge(ravel_query::http::router(mtls_app_state));
         }
         http_router = http_router.merge(ravel_query::http::router(app_state));

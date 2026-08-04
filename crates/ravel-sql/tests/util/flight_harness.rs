@@ -32,6 +32,7 @@ use ravel_query::LogSegmentFetcher;
 use ravel_sql::{
     FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SqlConfig, SqlExecutor,
 };
+use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
 use ravel_types::{CommitToken, TenantHash, TenantId};
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Status};
@@ -130,6 +131,17 @@ impl Harness {
         store: Arc<dyn ObjectStoreBackend>,
         tenants: &[(&TenantId, &[SegSpec])],
     ) -> Self {
+        Harness::build_with_recorder(store, tenants, Arc::new(NoopQueryCostRecorder)).await
+    }
+
+    /// Like [`Harness::build`], but with an explicit cost recorder so a test
+    /// can inspect what each Flight RPC folded into the aggregator (issue
+    /// #425).
+    pub async fn build_with_recorder(
+        store: Arc<dyn ObjectStoreBackend>,
+        tenants: &[(&TenantId, &[SegSpec])],
+        recorder: Arc<dyn QueryCostRecorder>,
+    ) -> Self {
         let fixture =
             Fixture::build(Arc::clone(&store), tenants, SqlConfig::default(), 1 << 30).await;
         let executor = Arc::new(SqlExecutor::new(
@@ -158,6 +170,7 @@ impl Harness {
                 ..FlightSqlConfig::default()
             },
             Arc::clone(&store),
+            recorder,
         );
         Harness {
             service,
