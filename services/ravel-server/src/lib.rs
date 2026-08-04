@@ -23,6 +23,7 @@ pub mod otlp_grpc;
 pub mod otlp_grpc_logs;
 pub mod otlp_grpc_traces;
 pub mod otlp_http;
+pub mod postings_config;
 pub mod provisioning;
 pub mod qualification;
 pub mod query;
