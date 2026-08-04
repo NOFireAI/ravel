@@ -21,6 +21,7 @@ pub mod otlp_grpc;
 pub mod otlp_grpc_logs;
 pub mod otlp_grpc_traces;
 pub mod otlp_http;
+pub mod provisioning;
 pub mod query;
 pub mod remote_write;
 #[cfg(feature = "sql")]
@@ -272,6 +273,7 @@ fn gateway_state(
     admission: &Arc<AdmissionController>,
     store: &Arc<dyn ObjectStoreBackend>,
     recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
+    provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -281,6 +283,7 @@ fn gateway_state(
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             recovery: recovery.clone(),
+            provisioning: provisioning.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
@@ -289,6 +292,7 @@ fn gateway_state(
             admission: admission.clone(),
             store: store.clone(),
             recovery: recovery.clone(),
+            provisioning: provisioning.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
@@ -296,6 +300,7 @@ fn gateway_state(
             ack_deadline: DEFAULT_ACK_DEADLINE,
             store: store.clone(),
             recovery: recovery.clone(),
+            provisioning: provisioning.clone(),
         },
         admission: admission.clone(),
     })
@@ -306,6 +311,7 @@ fn remote_write_state(
     tenant_resolver: Arc<dyn TenantResolver>,
     admission: &Arc<AdmissionController>,
     recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
+    provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -315,6 +321,7 @@ fn remote_write_state(
         metrics: remote_write::RemoteWriteMetrics::default(),
         admission: admission.clone(),
         recovery: recovery.clone(),
+        provisioning: provisioning.clone(),
     })
 }
 
@@ -387,6 +394,22 @@ pub async fn start(
         ))
     });
 
+    // Durable shard_count provisioning-record writer (ADR-0050 section 5, EC5).
+    // Present in exactly the ingest modes, so a tenant's first write for a
+    // signal pins the configured shard_count in `t/<tenant_hash>/<sig>/prov`.
+    // Built once and shared across every ingest path, so the per-process "seen
+    // (tenant, signal)" set is shared and one first write provisions the record
+    // once regardless of transport. Its shard_count is `config.shard_count`, the
+    // same value the ingest routers and catalog above are built with.
+    let provisioning_writer = if matches!(config.mode, Mode::All | Mode::Gateway) {
+        Some(Arc::new(provisioning::ProvisioningRecordWriter::new(
+            store.clone(),
+            config.shard_count,
+        )))
+    } else {
+        None
+    };
+
     // Tenant admission (ADR-0051): one controller per process, shared by
     // every ingest path below. `defaults` seeds the baseline and each
     // `--limits-file` tenant override replaces it via `set_tenant_limits`.
@@ -424,6 +447,7 @@ pub async fn start(
             &admission,
             &store,
             &recovery,
+            &provisioning_writer,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -431,6 +455,7 @@ pub async fn start(
             config.tenant_resolver.clone(),
             &admission,
             &recovery,
+            &provisioning_writer,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -443,15 +468,22 @@ pub async fn start(
                 &admission,
                 &store,
                 &recovery,
+                &provisioning_writer,
             );
-            let mtls_rw_state =
-                remote_write_state(router, mtls.resolver.clone(), &admission, &recovery);
+            let mtls_rw_state = remote_write_state(
+                router,
+                mtls.resolver.clone(),
+                &admission,
+                &recovery,
+                &provisioning_writer,
+            );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
                 .merge(remote_write::router(mtls_rw_state));
         }
     }
     let catalog = query::build_catalog(store.clone(), config.shard_count)?;
+    // Durable shard_count enforcement on the read path (ADR-0050 section 5).
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
     // spawns `maintain::spawn` below and therefore has discovery counters to
@@ -652,6 +684,7 @@ pub async fn start(
             &admission,
             &store,
             &recovery,
+            &provisioning_writer,
         )),
         _ => None,
     };

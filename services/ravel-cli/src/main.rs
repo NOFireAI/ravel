@@ -82,7 +82,10 @@ struct TenancyArgs {
 /// `tenancy show` (which reads the marker directly), do not.
 fn command_hashes_tenant(command: &Command) -> bool {
     match command {
-        Command::Catalog { .. } | Command::Maintain { .. } | Command::Hold { .. } => true,
+        Command::Catalog { .. }
+        | Command::Maintain { .. }
+        | Command::Hold { .. }
+        | Command::Provision { .. } => true,
         Command::Segment { .. }
         | Command::Rlog { .. }
         | Command::Rspan { .. }
@@ -146,6 +149,31 @@ enum Command {
     Tenancy {
         #[command(subcommand)]
         command: TenancyCommand,
+    },
+    /// Manage the durable shard_count provisioning record (ADR-0050 section 5).
+    Provision {
+        #[command(subcommand)]
+        command: ProvisionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProvisionCommand {
+    /// Adopt pre-ADR data into a `shard_count` provisioning record, ahead of a
+    /// server touching the tenant (ADR-0050 section 5). Runs the same adoption
+    /// path the server runs at ingest/maintenance: writes the record only when
+    /// every observed shard index is below `--shards`, and refuses (writing
+    /// nothing) when a higher shard index proves the value would hide data.
+    Adopt {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        /// The configured shard_count to adopt at (the server's `--shards`).
+        #[arg(long)]
+        shards: u32,
+        /// Restrict to one signal; omit to adopt metrics, logs, and spans.
+        #[arg(long, value_enum)]
+        signal: Option<SignalArg>,
     },
 }
 
@@ -564,6 +592,23 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             print!("{report}");
             Ok(())
+        }
+        Command::Provision {
+            command:
+                ProvisionCommand::Adopt {
+                    tenant,
+                    shards,
+                    signal,
+                },
+        } => {
+            ravel_cli::provision::adopt(
+                store::build_store(&cli.store)?,
+                &tenant,
+                shards,
+                signal,
+                now_ns()?,
+            )
+            .await
         }
     }
 }

@@ -12,6 +12,7 @@ t/<tenant_hash>/m/l1/<shard>/<ingest_hour>/<input_set_hash16>.<part:04>.<hash16>
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt       compaction record
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/retire.tmb                      retention tombstone
 t/<tenant_hash>/m/maint/<shard>/cursor                                    advisory scan cursor
+t/<tenant_hash>/<signal>/prov                                           shard_count provisioning record (write-once, additive; ADR-0050 §5)
 t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
@@ -38,6 +39,25 @@ conformance.rs) writes and reads while probing conditional-write and
 listing consistency under a fresh `run-id` each run; these objects are
 transient probe fixtures, not durable state, and carry no lifecycle
 guarantee beyond the run that created them.
+
+`t/<tenant_hash>/<signal>/prov` (ADR-0050 §5, EC5) is the durable
+`shard_count` provisioning record: an immutable per-(tenant, signal) object
+holding `tenant_hash`, `signal`, `shard_count`, a `format_version` floor,
+and `created_unix_ns` (proto/ravel/sys.proto `ProvisioningRecord`). It is
+written with `CreateIfAbsent` at the tenant's first write for that signal
+(`ravel_catalog::validate_or_adopt`), so a racing loser re-reads and
+validates against the winner rather than erroring. It lives under the
+tenant's own prefix, alongside that signal's `l0/` and `c/` shard data, not
+in the bucket-root `sys/` space, because it is per-tenant state. Every
+ingest, catalog-resolve, and maintenance touch validates the configured
+`shard_count` against it: a statically-known tenant's disagreement refuses
+startup, a dynamic tenant's disagreement fails that one request, and a query
+never resolves over a subset of shards. A (tenant, signal) with pre-ADR data
+but no record is adopted once (the record is written from config) only when
+every observed shard index is below the configured `shard_count`; a higher
+observed index proves the value would hide data and refuses without writing.
+`shard_count` is immutable per (tenant, signal); resharding is deferred to
+its own ADR (epic EK) and would add a field here, never mutate `shard_count`.
 
 - `keyhash32` (idempotency marker keys only, ADR-0051 §5): 32 lowercase hex
   chars, the first 16 bytes of `blake3("ravel-idem-v1" || tenant_id ||

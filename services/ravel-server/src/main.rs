@@ -93,6 +93,27 @@ async fn main() -> anyhow::Result<()> {
     let maintain_tenants = cli.parse_maintain_tenants()?;
     let fold_tenants =
         ravel_server::config::merge_fold_tenants(tenant_tokens.values(), &maintain_tenants);
+
+    // Durable shard_count validation for statically-known tenants (ADR-0050
+    // section 5, EC5). The static set is exactly `fold_tenants`, the union of
+    // `--tenant-token` and `--maintain-tenant` (already hashed under the pinned
+    // scheme). Each (tenant, signal) whose durable provisioning record
+    // disagrees with `--shards` refuses startup here, before any listener
+    // binds, so a lower shard_count on restart is a failed deploy rather than a
+    // silent resolve over a subset of shards. A brand-new tenant with no prior
+    // writes and no record passes through cleanly (nothing to validate yet), so
+    // a fresh, operator-managed cluster with configured tenants and zero data
+    // starts normally; only a present, disagreeing record, or pre-ADR data a
+    // lower value would hide, refuses. An OIDC/mTLS deployment with no static
+    // tenants validates nothing here and checks each tenant at first touch.
+    ravel_server::provisioning::validate_static_provisioning(
+        store.as_ref(),
+        &fold_tenants,
+        cli.shards,
+        now_unix_ns(),
+    )
+    .await
+    .context("shard_count provisioning validation failed for a statically-known tenant")?;
     // Real authn (ADR-0042 decision 6): the OIDC and mTLS resolvers join the
     // FallbackResolver chain alongside the static bearer resolver when their
     // flags are set. Validation of dependent-flag misuse happens in

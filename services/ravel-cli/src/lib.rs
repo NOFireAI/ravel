@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod hold;
 pub mod idem;
 pub mod maintain;
+pub mod provision;
 pub mod qualify;
 pub mod store;
 pub mod tenancy;

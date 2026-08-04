@@ -170,6 +170,15 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
                     ),
                     false,
                 ),
+                // A hard shard_count provisioning failure (ADR-0050 section 5):
+                // the configured value would resolve over a subset of shards, or
+                // the record is unreadable so the true shard_count is unknown.
+                // Not retryable and not the client's fault; nack this batch as an
+                // internal fault, matching the OTLP gRPC path (otlp_grpc.rs), and
+                // keep the stream open so unrelated batches still flow.
+                Err(IngestRequestError::Provisioning(msg)) => {
+                    (nack(batch_id, StatusCode::Internal, msg), false)
+                }
                 Err(IngestRequestError::Write(err)) => {
                     // Same retry classification the OTLP gRPC path applies: a
                     // retryable write is RESOURCE_EXHAUSTED/UNAVAILABLE-shaped
@@ -234,6 +243,17 @@ async fn write_batch(
     // so it needs its own call, matching ingest.rs/logs_ingest.rs/
     // traces_ingest.rs/remote_write.rs.
     crate::tenancy::ensure_recovery_manifest(&ingest.recovery, tenant, ingest_ts_ns).await;
+
+    // Pin/validate the (tenant, Metrics) shard_count provisioning record on
+    // first write (ADR-0050 section 5); a hard mismatch fails this request.
+    crate::provisioning::ensure_provisioning_record(
+        &ingest.provisioning,
+        tenant,
+        ravel_types::Signal::Metrics,
+        ingest_ts_ns,
+    )
+    .await
+    .map_err(|e| IngestRequestError::Provisioning(e.to_string()))?;
 
     let normalized = normalize_decoded(tenant, decoded, &ingest.limits, ingest_ts_ns);
     let mut points: Vec<IngestPoint> =

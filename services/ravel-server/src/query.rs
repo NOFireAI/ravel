@@ -20,8 +20,15 @@ pub fn build_catalog(
         shard_count,
         ..CatalogConfig::default()
     };
+    // Durable shard_count enforcement on the read path (ADR-0050 section 5,
+    // EC5): the first resolve for each (tenant, signal) validates this
+    // catalog's configured shard_count against the tenant's provisioning
+    // record, so a query never silently resolves over a subset of shards. The
+    // check is read-only (it never writes a record), so a query-only node with
+    // write-restricted credentials is unaffected.
     let catalog = Catalog::new(store, catalog_config)
-        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
+        .with_provisioning_enforcement();
     Ok(Arc::new(catalog))
 }
 

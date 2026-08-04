@@ -136,6 +136,7 @@ above).
 | `ravel-cli catalog fold --tenant <name> [--shards <n>]` | `--shards` default `4` | One-shot catalog fold: seals every eligible hour into a new snapshot part and CAS-advances HEAD. Prints the fold report (watermark before/after, buckets folded, entry count, request counts). This is the same operation that the background fold task runs on a timer. |
 | `ravel-cli catalog inspect --tenant <name>` | | Decodes and prints HEAD and every referenced snapshot part: watermark, part keys, hashes, entry counts. It reports rather than errors when no HEAD exists yet. |
 | `ravel-cli catalog verify --tenant <name>` | | Re-lists every sealed commit record and diffs it against the current snapshot. Prints counts of entries missing from or mismatched against the snapshot; exits nonzero on any divergence. It reports rather than errors when no HEAD exists yet. |
+| `ravel-cli provision adopt --tenant <name> --shards <n> [--signal <metrics\|logs\|spans>]` | | Writes the durable `shard_count` provisioning record for a tenant with pre-ADR data, ahead of any server touching it (ADR-0050 section 5). Runs the same adoption path the server runs: writes the record only when every observed shard index is below `--shards`, and refuses (writing nothing, exiting nonzero) when a higher index proves `--shards` would hide data. Prints one line per signal. A signal with no data and no record is left untouched (its record is written on first ingest). |
 
 `segment inspect` and `commit decode` accept a local file path or an
 object-store key. A path that exists on disk is read directly; otherwise it is
@@ -225,6 +226,51 @@ Default alert rule:
 | Condition | Query | Why |
 |---|---|---|
 | Isolation breach | `increase(ravel_catalog_isolation_breach_total[5m]) > 0` | Every increment already failed a query with a hard error; there is no sustained-condition or dilution case to wait out, unlike the mass-orphan breaker below. Any nonzero increase is a cross-tenant key-layout or hashing bug an operator needs to see immediately, not a rate to threshold. |
+
+## Durable shard count (ADR-0050 section 5)
+
+`--shards` is immutable per (tenant, signal): once a tenant's data for a
+signal is written across N shards, resolution iterates `0..N`, so serving
+that tenant with a lower `--shards` would silently omit every series in the
+missing shards. To make that a loud failure instead of silent data loss, the
+first write for a (tenant, signal) records `--shards` in a durable
+provisioning record at `t/<tenant_hash>/<signal>/prov`, and every later
+ingest, query, and maintenance touch validates the configured value against
+it.
+
+**A startup refusal from a shard_count mismatch** means this process was
+configured with a different `--shards` than a statically-known tenant's data
+was written under. The error names the tenant, signal, expected (recorded),
+and actual (configured) values. It is not transient and does not clear on
+restart: the object storage records the true shard count, and the fix is to
+set `--shards` back to the recorded value (never lower it below what a tenant
+already used). Lowering `--shards` for a tenant that has data in higher
+shards is a data-hiding operation and is refused by construction.
+
+A brand-new tenant with no prior writes has no record yet, so a fresh
+deployment (including an operator-managed cluster that starts with zero data
+and configured tenant tokens) starts normally; the record is created on the
+tenant's first write. Only a tenant whose record already disagrees, or whose
+pre-ADR data a lower value would hide, refuses.
+
+For a **dynamically-resolved tenant** (OIDC/mTLS), a mismatch is not known
+until a request arrives: that one request fails with a typed error and
+`ravel_provisioning_shard_count_mismatch_total` increments; the process is
+never taken down for a single tenant's mismatch. Alert on any increase:
+
+| Condition | Query | Why |
+|---|---|---|
+| shard_count mismatch | `increase(ravel_provisioning_shard_count_mismatch_total[5m]) > 0` | A dynamic tenant's provisioning check failed: either a real shard_count disagreement against the durable record (that one request fails, per above), or an unreadable record (corrupt or a future format version) caught on the maintain per-tenant loop, which skips that tenant's tick rather than failing a request. Either way, a nonzero increase means a config-vs-data problem an operator must reconcile, not a rate to threshold. |
+
+**Adopting pre-ADR data.** A (tenant, signal) that already had data before
+this record existed is adopted the first time a server ingests or maintains
+it, or deliberately ahead of a rollout with `ravel-cli provision adopt
+--tenant <name> --shards <n>`. Adoption writes the record from `--shards`
+only when every observed shard index is below it; if any observed index is at
+or above `--shards`, adoption refuses and writes nothing (the value is
+provably hiding data). Run `provision adopt` before rolling out a version
+that will enforce the record, so an adoption refusal surfaces as a CLI error
+you can act on rather than a server that refuses to start mid-rollout.
 
 ## Storage backend configuration
 

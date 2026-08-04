@@ -1,11 +1,15 @@
-// Bucket-root system objects under the reserved `sys/` prefix (ADR-0050).
-// Persistent contract: field numbers are frozen once shipped; only additive
-// changes are allowed. This file is scoped to the tenancy marker and its
-// per-tenant recovery manifest (ADR-0050 section 3). The GC-config object
-// (`sys/gc`, EC4) and the durable shard_count / provisioning record (EC5)
-// land as their own messages in later changes; they must not reuse field
-// numbers reserved here, and each carries its own top-level message rather
-// than sharing an envelope with these.
+// Bucket-root system objects under the reserved `sys/` prefix, plus the
+// per-(tenant, signal) provisioning record (ADR-0050). Persistent contract:
+// field numbers are frozen once shipped; only additive changes are allowed.
+// This file holds the tenancy marker and its per-tenant recovery manifest
+// (ADR-0050 section 3) and the durable shard_count provisioning record
+// (`t/<tenant_hash>/<sig>/prov`, ADR-0050 section 5, EC5). The GC-config
+// object (`sys/gc`, EC4) lands as its own message in a later change. Each
+// object is its own top-level message and never shares an envelope with the
+// others. Protobuf numbers fields per message, so a new message begins its
+// own field-number space at 1; ProvisioningRecord below reuses no field of
+// TenancyMarker or TenantRecoveryManifest because those are separate
+// messages, not because their low numbers are avoided.
 syntax = "proto3";
 
 package ravel.sys.v1;
@@ -52,4 +56,42 @@ message TenantRecoveryManifest {
   bytes nonce = 2;             // 12 bytes (AES-256-GCM nonce)
   bytes ciphertext = 3;        // sealed tenant-id UTF-8 bytes, incl. 16-byte tag
   sfixed64 created_unix_ns = 4;
+}
+
+// Telemetry signal kind (ADR-0050 section 5). Mirrors ravel.commit.v1.Signal
+// value-for-value so a provisioning record's signal decodes to the same
+// ravel_types::Signal a commit record under the same prefix does. Defined
+// here rather than imported so this file stays self-contained; the mapping is
+// pinned by a test in ravel-catalog.
+enum Signal {
+  SIGNAL_UNSPECIFIED = 0;
+  SIGNAL_METRICS = 1;
+  SIGNAL_LOGS = 2;
+  SIGNAL_SPANS = 3;
+  SIGNAL_PROFILES = 4;
+  SIGNAL_ALERTS = 5;
+  SIGNAL_AUDIT = 6;
+}
+
+// The immutable per-(tenant, signal) provisioning record at
+// `t/<tenant_hash>/<sig>/prov` (ADR-0050 section 5, EC5). Written with
+// CreateIfAbsent at a tenant's first write for that signal, and validated on
+// every ingest/catalog/maintain touch: a process whose configured shard_count
+// disagrees with the recorded one refuses to start (static tenant) or fails
+// the request (dynamic tenant) rather than silently resolving over a subset
+// of shards.
+//
+// This is its own top-level message, keyed under the tenant's own prefix (not
+// a bucket-root `sys/` object). shard_count is immutable per (tenant, signal)
+// in this decision; resharding is deferred to its own ADR (ADR-0050 section 5,
+// epic EK) and would add a field here, never mutate this one.
+message ProvisioningRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout as v1 (matching TenancyMarker's format_version guard). = 1.
+  uint32 format_version = 1;
+  bytes tenant_hash = 2;       // 16 bytes; the `t/<tenant_hash>/` prefix owner
+  Signal signal = 3;
+  uint32 shard_count = 4;      // the pinned shard count for this (tenant, signal)
+  sfixed64 created_unix_ns = 5;  // informational; when the record was first written
 }

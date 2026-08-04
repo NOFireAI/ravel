@@ -73,6 +73,7 @@ impl LogsService for GrpcLogsService {
             err @ LogIngestRequestError::InvalidIdempotencyKey { .. } => {
                 Status::invalid_argument(err.to_string())
             }
+            LogIngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),
             LogIngestRequestError::Write(write_err) if write_err.is_retryable() => {
                 Status::unavailable(write_err.to_string())
             }

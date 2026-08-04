@@ -132,6 +132,9 @@ pub struct RemoteWriteState {
     /// Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
     /// bucket. Ensured before the write; `None` (unkeyed) is a no-op.
     pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
+    /// Durable shard_count provisioning-record writer (ADR-0050 section 5),
+    /// pins the (tenant, Metrics) record on the tenant's first write.
+    pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
 }
 
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
@@ -237,6 +240,21 @@ async fn remote_write(
     // Record the tenant's recovery manifest on its first write (ADR-0050
     // section 3), best-effort and off the durability path.
     crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, now_ns()).await;
+
+    // Pin/validate the (tenant, Metrics) shard_count provisioning record on
+    // first write (ADR-0050 section 5). A hard mismatch fails this request with
+    // a 500; a store blip or corrupt record is logged and ingest proceeds.
+    if let Err(err) = crate::provisioning::ensure_provisioning_record(
+        &state.provisioning,
+        &tenant,
+        Signal::Metrics,
+        now_ns(),
+    )
+    .await
+    {
+        state.metrics.record_request_rejected();
+        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    }
 
     // Layer 2 (ADR-0051 section 2): byte rate on the compressed wire body,
     // before decode, whole-request rejection with no tokens consumed.

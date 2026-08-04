@@ -4,6 +4,7 @@ use ravel_commit::keys::{KeyError, ReconstructionError};
 use ravel_commit::record::RecordError;
 use ravel_object_store::StoreError;
 
+use crate::provisioning::ProvisioningError;
 use crate::snapshot_format::SnapshotFormatError;
 
 #[derive(Debug, thiserror::Error)]
@@ -73,4 +74,13 @@ pub enum CatalogError {
         "fold gave up after {attempts} HEAD CAS attempts at watermark_hour={watermark_hour}: a concurrent folder keeps winning"
     )]
     FoldCasRetriesExhausted { attempts: u32, watermark_hour: u32 },
+    /// The configured `shard_count` disagrees with the (tenant, signal)'s
+    /// durable provisioning record, or the record could not be read/decoded
+    /// (ADR-0050 section 5, EC5). Fails the resolve rather than iterating
+    /// `0..shard_count` and silently dropping the shards a lower value omits.
+    /// A `shard_count` disagreement carries the same loud, named semantics as
+    /// the fold-HEAD [`CatalogError::FieldMismatch`] this extends to Phase 1
+    /// listing and fresh tenants.
+    #[error("provisioning check failed: {0}")]
+    Provisioning(#[from] ProvisioningError),
 }
