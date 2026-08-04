@@ -83,6 +83,68 @@ fn v6_inspect_output_matches_golden_fixture() {
     );
 }
 
+/// A v6 object with no exemplars at all must inspect cleanly and print
+/// `exemplar_count: 0`, never listing an `EXEMPLARS` section and never
+/// erroring. The golden fixture always carries an exemplar, so it cannot
+/// exercise the absent-section path (ADR-0047: absence, not a zero-count
+/// section, is the only legal representation of "no exemplars"). This builds a
+/// scalar-only object through the writer, whose empty exemplar list emits no
+/// `EXEMPLARS` section, and inspects it.
+#[test]
+fn absent_exemplars_section_prints_cleanly() {
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
+
+    let labels = LabelSet::new(vec![Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: "no_exemplars_metric".to_string(),
+    }])
+    .expect("valid labels");
+    let series = vec![SeriesInput {
+        series_id: SeriesId([0x11; 16]),
+        labels,
+        samples: vec![Sample {
+            ts_ns: 100,
+            value: 1.5,
+        }],
+    }];
+    let written = SegmentWriter::write(
+        series,
+        SegmentIdentity {
+            tenant_hash: [0x22; 16],
+            shard: 0,
+            writer_id: "no-exemplars".to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 1000,
+        },
+    )
+    .expect("writes a v6 object with no exemplars");
+
+    let path = temp_path("no-exemplars");
+    std::fs::write(&path, written.bytes.as_ref()).expect("writes object");
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        output.status.success(),
+        "inspecting a v6 object with no EXEMPLARS section must succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert!(
+        stdout.contains("exemplar_count: 0"),
+        "an object with no exemplars must print `exemplar_count: 0`, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("name=EXEMPLARS"),
+        "an object with no exemplars must not list an EXEMPLARS section, got:\n{stdout}"
+    );
+}
+
 /// A corrupt object must fail with the typed `SegmentError` text on stderr and
 /// a non-zero exit status, never a panic. Flips a byte inside the SERIES_META
 /// section's stored bytes (located via the footer), which corrupts that
