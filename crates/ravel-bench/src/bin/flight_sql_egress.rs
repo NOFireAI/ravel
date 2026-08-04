@@ -57,6 +57,7 @@ use ravel_sql::{
     FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SqlConfig, SqlExecutor,
     SqlRequest,
 };
+use ravel_types::accounting::NoopQueryCostRecorder;
 use ravel_types::{CommitToken, Signal, TenantHash, TenantId, TimeRange};
 use tonic::Request;
 use tonic::metadata::{MetadataMap, MetadataValue};
@@ -193,6 +194,11 @@ async fn run(args: &Args) -> Report {
         Arc::new(BenchClock),
         FlightSqlConfig::default(),
         Arc::clone(&store),
+        // This binary measures egress bytes, not process metrics. There is no
+        // `/metrics` route here to fold a cost into, and folding one would put
+        // the benchmark's own synthetic queries into the same counters a real
+        // deployment reports.
+        Arc::new(NoopQueryCostRecorder),
     );
 
     // One warm run per path establishes the deterministic byte counts and
