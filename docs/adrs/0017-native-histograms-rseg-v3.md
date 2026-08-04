@@ -150,6 +150,12 @@ economics (ADR-0014 section 4) are weighed exactly when the version is
 being paid, with a consumer spec in hand instead of speculative format
 surface (the rseg-v2-plan section 3.8 rule).
 
+> **Update (2026-08-04, #475):** both prerequisites have since been met.
+> ADR-0047 added exemplar storage, and the read surface
+> `/api/v1/query_exemplars` shipped in `services/ravel-server`. The
+> "there is none today -- no /api/v1/query_exemplars" note above records
+> the state when this ADR was written, not the state today.
+
 ## Consequences
 
 - Until v3 lands: RW and OTLP native histogram points are rejected at
