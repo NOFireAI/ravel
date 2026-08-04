@@ -84,6 +84,24 @@ pub struct LogIngestMetrics {
     /// Counted once per shard on the first observation, so it never exceeds
     /// `shard_count` and makes a permanently degraded process observable.
     shard_deaths: AtomicU64,
+    /// Objects flushed carrying a non-empty POSTINGS section (ADR-0049, issue
+    /// #511). The denominator for average section bytes per indexed object; an
+    /// object whose resolved indexed-field list produced no section is not
+    /// counted here.
+    postings_objects: AtomicU64,
+    /// Cumulative encoded POSTINGS section bytes across every flushed object.
+    postings_bytes_total: AtomicU64,
+    /// Cumulative count of indexed fields that emitted a posting list, summed
+    /// over objects. The denominator for a mean distinct-per-field
+    /// (`postings_distinct_values_total / postings_indexed_fields_total`); no
+    /// per-field label is kept, which the ADR-0044 allowlist forbids.
+    postings_indexed_fields_total: AtomicU64,
+    /// Cumulative distinct-value count across every non-capped indexed field,
+    /// summed over objects.
+    postings_distinct_values_total: AtomicU64,
+    /// Indexed fields dropped from POSTINGS for exceeding the per-field
+    /// distinct-value cap (ADR-0049 decision 4), summed over objects.
+    postings_capped_fields_total: AtomicU64,
 }
 
 /// Point-in-time copy of [`LogIngestMetrics`] for scraping. See the
@@ -102,6 +120,11 @@ pub struct LogIngestMetricsSnapshot {
     pub acks_err: u64,
     pub stream_id_collisions: u64,
     pub shard_deaths: u64,
+    pub postings_objects: u64,
+    pub postings_bytes_total: u64,
+    pub postings_indexed_fields_total: u64,
+    pub postings_distinct_values_total: u64,
+    pub postings_capped_fields_total: u64,
 }
 
 impl LogIngestMetrics {
@@ -153,6 +176,27 @@ impl LogIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Fold one flushed object's write-side POSTINGS counters
+    /// ([`ravel_logseg::writer::WriteStats`]) into the cumulative totals
+    /// (ADR-0049, issue #511). An object with no POSTINGS section
+    /// (`postings_bytes == 0`) still records here: it moves no counter, so an
+    /// unindexed tenant leaves every total untouched. Unlike the single-counter
+    /// `record_*` methods this moves several counters at once, one per field of
+    /// the stats.
+    pub(crate) fn record_postings(&self, stats: ravel_logseg::writer::WriteStats) {
+        if stats.postings_bytes > 0 {
+            self.postings_objects.fetch_add(1, Ordering::Relaxed);
+        }
+        self.postings_bytes_total
+            .fetch_add(stats.postings_bytes, Ordering::Relaxed);
+        self.postings_indexed_fields_total
+            .fetch_add(u64::from(stats.postings_indexed_fields), Ordering::Relaxed);
+        self.postings_distinct_values_total
+            .fetch_add(stats.postings_distinct_total, Ordering::Relaxed);
+        self.postings_capped_fields_total
+            .fetch_add(u64::from(stats.postings_capped_fields), Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> LogIngestMetricsSnapshot {
         LogIngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -167,6 +211,15 @@ impl LogIngestMetrics {
             acks_err: self.acks_err.load(Ordering::Relaxed),
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            postings_objects: self.postings_objects.load(Ordering::Relaxed),
+            postings_bytes_total: self.postings_bytes_total.load(Ordering::Relaxed),
+            postings_indexed_fields_total: self
+                .postings_indexed_fields_total
+                .load(Ordering::Relaxed),
+            postings_distinct_values_total: self
+                .postings_distinct_values_total
+                .load(Ordering::Relaxed),
+            postings_capped_fields_total: self.postings_capped_fields_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -278,6 +331,34 @@ mod tests {
                 acks_err: 1,
                 ..Default::default()
             },
+        );
+        // record_postings folds a whole WriteStats into the postings totals and
+        // touches nothing else. An object carrying a section increments the
+        // object count; its distinct counts and capped-field count add through.
+        assert_only(
+            |m| {
+                m.record_postings(ravel_logseg::writer::WriteStats {
+                    postings_capped_fields: 1,
+                    postings_bytes: 512,
+                    postings_indexed_fields: 3,
+                    postings_distinct_total: 40,
+                    postings_distinct_max: 25,
+                })
+            },
+            LogIngestMetricsSnapshot {
+                postings_objects: 1,
+                postings_bytes_total: 512,
+                postings_indexed_fields_total: 3,
+                postings_distinct_values_total: 40,
+                postings_capped_fields_total: 1,
+                ..Default::default()
+            },
+        );
+        // An object with no section (bytes 0) moves no counter, not even the
+        // object count.
+        assert_only(
+            |m| m.record_postings(ravel_logseg::writer::WriteStats::default()),
+            LogIngestMetricsSnapshot::default(),
         );
     }
 

@@ -82,6 +82,7 @@ async fn start_with_mtls(
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        indexed_fields: Default::default(),
     };
     ravel_server::start(
         config,

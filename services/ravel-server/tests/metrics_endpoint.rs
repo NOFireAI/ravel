@@ -43,6 +43,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        indexed_fields: Default::default(),
     };
     ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
         .await
@@ -287,6 +288,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        indexed_fields: Default::default(),
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,

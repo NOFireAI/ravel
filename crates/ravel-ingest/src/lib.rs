@@ -39,7 +39,7 @@ pub use idempotency::{
 };
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
-pub use log_router::{LogIngestRouter, LogWriteReceipt};
+pub use log_router::{LogIndexedFields, LogIngestRouter, LogWriteReceipt, NoIndexedFields};
 pub use metrics::{FlushTrigger, IngestMetrics, IngestMetricsSnapshot};
 pub use router::{IngestRouter, WriteMode, WriteReceipt};
 pub use span_error::SpanWriteError;
