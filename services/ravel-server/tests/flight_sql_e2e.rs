@@ -338,6 +338,7 @@ async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     let running = ravel_server::start(
         config,

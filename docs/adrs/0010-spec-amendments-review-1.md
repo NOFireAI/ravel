@@ -95,6 +95,16 @@ findings live in the review record; this ADR fixes the decisions.
     anyone with list access. A deployment-keyed hash is available via
     config for deployments that need enumeration resistance.
 
+    Correction (ADR-0050 §3, EC3): the last sentence was never true when
+    written. No keyed derivation or key-loading config existed in the
+    workspace; the claim was aspirational. ADR-0050 §3 makes the keyed
+    variant real, default (for buckets created after it), and durable: the
+    scheme is pinned per bucket by the `sys/tenancy` marker, keyed via
+    `blake3::derive_key("ravel-tenant-v2", deployment_key)` with the key
+    loaded from `--tenant-hash-key-file`, and a wrong key is a startup
+    refusal rather than a silent parallel namespace. Existing unkeyed
+    buckets stay unkeyed permanently; there is no re-key migration.
+
 ## Consequences
 
 - proto/ravel/commit.proto gains field 19 (ingest_hour_bucket) before any

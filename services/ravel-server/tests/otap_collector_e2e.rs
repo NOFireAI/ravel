@@ -110,6 +110,7 @@ async fn start_test_server() -> ravel_server::Running {
         otap: true,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
         .await

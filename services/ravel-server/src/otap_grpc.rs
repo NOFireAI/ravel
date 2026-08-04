@@ -227,6 +227,14 @@ async fn write_batch(
     decoded: &DecodedBatch,
     ingest_ts_ns: i64,
 ) -> Result<WriteOutcome, IngestRequestError> {
+    // Record the tenant's recovery manifest on its first write in this process
+    // (ADR-0050 section 3). Best-effort and off the durability path: see
+    // `crate::tenancy::ensure_recovery_manifest`. OTAP is a genuinely separate
+    // code path from `handle_export` (see this function's own doc comment),
+    // so it needs its own call, matching ingest.rs/logs_ingest.rs/
+    // traces_ingest.rs/remote_write.rs.
+    crate::tenancy::ensure_recovery_manifest(&ingest.recovery, tenant, ingest_ts_ns).await;
+
     let normalized = normalize_decoded(tenant, decoded, &ingest.limits, ingest_ts_ns);
     let mut points: Vec<IngestPoint> =
         Vec::with_capacity(normalized.points.len() + normalized.histogram_points.len());

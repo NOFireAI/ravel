@@ -104,6 +104,7 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     ravel_server::start(
         config,

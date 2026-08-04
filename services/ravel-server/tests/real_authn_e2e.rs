@@ -78,6 +78,7 @@ async fn start_with_mtls(
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     ravel_server::start(
         config,

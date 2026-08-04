@@ -26,6 +26,7 @@ pub mod remote_write;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod store;
+pub mod tenancy;
 pub mod tenant;
 pub mod tenant_discovery;
 pub mod traces_ingest;
@@ -164,6 +165,13 @@ pub struct ServerConfig {
     /// because it unbounds `/metrics` cardinality by tenant count on an
     /// unauthenticated route; on only where the scrape network is trusted.
     pub metrics_tenant_labels: bool,
+    /// The bucket's 32-byte deployment key, `Some` only on a keyed bucket
+    /// (ADR-0050 section 3). `main` fills it from the resolved tenancy; [`start`]
+    /// builds one [`tenancy::RecoveryManifestWriter`] from it and threads it into
+    /// every ingest path, so a keyed tenant's first write records its
+    /// `sys/t/<tenant_hash>` recovery manifest. `None` on an unkeyed bucket,
+    /// which needs no manifest.
+    pub deployment_key: Option<Box<[u8; 32]>>,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -255,6 +263,7 @@ impl Running {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gateway_state(
     ingest_router: &Arc<IngestRouter>,
     log_ingest_router: &Arc<LogIngestRouter>,
@@ -262,6 +271,7 @@ fn gateway_state(
     tenant_resolver: Arc<dyn TenantResolver>,
     admission: &Arc<AdmissionController>,
     store: &Arc<dyn ObjectStoreBackend>,
+    recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -270,6 +280,7 @@ fn gateway_state(
             limits: IngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
+            recovery: recovery.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
@@ -277,12 +288,14 @@ fn gateway_state(
             ack_deadline: DEFAULT_ACK_DEADLINE,
             admission: admission.clone(),
             store: store.clone(),
+            recovery: recovery.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
             limits: SpanIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
             store: store.clone(),
+            recovery: recovery.clone(),
         },
         admission: admission.clone(),
     })
@@ -292,6 +305,7 @@ fn remote_write_state(
     ingest_router: &Arc<IngestRouter>,
     tenant_resolver: Arc<dyn TenantResolver>,
     admission: &Arc<AdmissionController>,
+    recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -300,6 +314,7 @@ fn remote_write_state(
         ack_deadline: DEFAULT_ACK_DEADLINE,
         metrics: remote_write::RemoteWriteMetrics::default(),
         admission: admission.clone(),
+        recovery: recovery.clone(),
     })
 }
 
@@ -360,6 +375,18 @@ pub async fn start(
         None
     };
 
+    // Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
+    // bucket. Threaded into every ingest path below so a keyed tenant's first
+    // write records its `sys/t/<tenant_hash>` manifest; an unkeyed bucket needs
+    // none. Built once here and shared, so its per-process "seen tenant" set is
+    // shared across metrics, logs, spans, and remote-write alike.
+    let recovery = config.deployment_key.as_ref().map(|key| {
+        Arc::new(tenancy::RecoveryManifestWriter::new(
+            store.clone(),
+            key.clone(),
+        ))
+    });
+
     // Tenant admission (ADR-0051): one controller per process, shared by
     // every ingest path below. `defaults` seeds the baseline and each
     // `--limits-file` tenant override replaces it via `set_tenant_limits`.
@@ -396,9 +423,15 @@ pub async fn start(
             config.tenant_resolver.clone(),
             &admission,
             &store,
+            &recovery,
         );
         http_router = http_router.merge(otlp_http::router(state));
-        let rw_state = remote_write_state(router, config.tenant_resolver.clone(), &admission);
+        let rw_state = remote_write_state(
+            router,
+            config.tenant_resolver.clone(),
+            &admission,
+            &recovery,
+        );
         http_router = http_router.merge(remote_write::router(rw_state));
 
         if let Some(mtls) = &config.mtls_listener {
@@ -409,8 +442,10 @@ pub async fn start(
                 mtls.resolver.clone(),
                 &admission,
                 &store,
+                &recovery,
             );
-            let mtls_rw_state = remote_write_state(router, mtls.resolver.clone(), &admission);
+            let mtls_rw_state =
+                remote_write_state(router, mtls.resolver.clone(), &admission, &recovery);
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
                 .merge(remote_write::router(mtls_rw_state));
@@ -616,6 +651,7 @@ pub async fn start(
             config.tenant_resolver.clone(),
             &admission,
             &store,
+            &recovery,
         )),
         _ => None,
     };

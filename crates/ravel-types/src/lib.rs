@@ -55,14 +55,261 @@ impl TenantId {
         &self.0
     }
 
+    /// Derive this tenant's object-key prefix hash under the process-wide
+    /// scheme installed by [`install_tenant_hash_scheme`]. Absent an install,
+    /// the scheme is [`TenantHashScheme::V1Unkeyed`], byte-for-byte identical
+    /// to the pre-ADR-0050 derivation, so every existing bucket and every
+    /// caller that never opts into keying is unaffected.
+    ///
+    /// The scheme is consulted here rather than threaded through every call
+    /// site (ADR-0050 section 3): the bucket pins one derivation at birth, so
+    /// a process-global resolved once at startup covers ingest, query,
+    /// maintenance, and the CLI without a scheme parameter on each `.hash()`.
     pub fn hash(&self) -> TenantHash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ravel-tenant-v1");
-        hasher.update(self.0.as_bytes());
-        let digest = hasher.finalize();
+        active_tenant_hash_scheme().hash(self)
+    }
+}
+
+/// The tenant-hash derivation scheme (ADR-0050 section 3). A bucket pins one
+/// scheme at birth via its `sys/tenancy` marker; a process resolves that
+/// marker once at startup and installs the matching scheme with
+/// [`install_tenant_hash_scheme`]. One binary carries both derivations
+/// forever; no object is ever rewritten.
+///
+/// [`Debug`] is hand-written to redact the keyed variant's `hash_key`: the
+/// derived hashing key is secret material, and a `#[derive(Debug)]` would leak
+/// its 32 raw bytes into any log line, panic message, or debug print that
+/// touches this type. Only the variant name is shown.
+#[derive(Clone)]
+pub enum TenantHashScheme {
+    /// Unkeyed BLAKE3 over `"ravel-tenant-v1" || tenant_id`, truncated to 16
+    /// bytes. The original derivation and the default for any process with no
+    /// scheme installed. Every pre-ADR-0050 bucket is pinned to this
+    /// permanently; the derivation is a frozen contract and never changes.
+    V1Unkeyed,
+    /// Keyed BLAKE3: `keyed_hash(hash_key, tenant_id)[0..16]`. `hash_key` is
+    /// `blake3::derive_key("ravel-tenant-v2", deployment_key)`; the raw 32-byte
+    /// deployment key is never stored here. Enumeration-resistant: without the
+    /// key, a bucket's prefixes reveal nothing about which tenants exist.
+    V2Keyed { hash_key: [u8; 32] },
+}
+
+impl std::fmt::Debug for TenantHashScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TenantHashScheme::V1Unkeyed => f.write_str("V1Unkeyed"),
+            // Never print `hash_key`: it is derived secret material.
+            TenantHashScheme::V2Keyed { .. } => f
+                .debug_struct("V2Keyed")
+                .field("hash_key", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+/// Key-derivation context for the v2 keyed tenant hash (ADR-0050 section 3).
+/// Part of the persistent contract: changing it silently relocates every
+/// keyed prefix.
+const TENANT_V2_HASH_CONTEXT: &str = "ravel-tenant-v2";
+
+/// Key-derivation context for the v2 key fingerprint recorded in
+/// `sys/tenancy` (ADR-0050 section 3).
+const TENANT_V2_FINGERPRINT_CONTEXT: &str = "ravel-tenant-v2-fingerprint";
+
+/// Width of the deployment-key fingerprint stored in `sys/tenancy`, in bytes.
+/// 16 matches [`TenantHash`]'s own width and gives 128 bits of collision
+/// resistance for the wrong-key startup check (ADR-0050 section 3).
+pub const TENANT_KEY_FINGERPRINT_LEN: usize = 16;
+
+/// The fingerprint of a 32-byte deployment key recorded in `sys/tenancy`
+/// (ADR-0050 section 3): `blake3::derive_key("ravel-tenant-v2-fingerprint",
+/// deployment_key)` truncated to [`TENANT_KEY_FINGERPRINT_LEN`] bytes. A
+/// fingerprint of the key for detecting a wrong key before it does damage,
+/// never the key itself. Shared here so the server (which writes and checks
+/// it) and the CLI (`tenancy show`) derive it identically.
+pub fn tenant_key_fingerprint(deployment_key: &[u8; 32]) -> [u8; TENANT_KEY_FINGERPRINT_LEN] {
+    let derived = blake3::derive_key(TENANT_V2_FINGERPRINT_CONTEXT, deployment_key);
+    let mut fp = [0u8; TENANT_KEY_FINGERPRINT_LEN];
+    fp.copy_from_slice(&derived[..TENANT_KEY_FINGERPRINT_LEN]);
+    fp
+}
+
+impl TenantHashScheme {
+    /// Build the keyed scheme from a 32-byte deployment key, deriving the
+    /// domain-separated hashing key so the deployment key itself is not held
+    /// in the scheme.
+    pub fn v2_from_deployment_key(deployment_key: &[u8; 32]) -> Self {
+        TenantHashScheme::V2Keyed {
+            hash_key: blake3::derive_key(TENANT_V2_HASH_CONTEXT, deployment_key),
+        }
+    }
+
+    /// Derive a tenant's 128-bit prefix hash under this scheme.
+    pub fn hash(&self, tenant: &TenantId) -> TenantHash {
+        let digest = match self {
+            TenantHashScheme::V1Unkeyed => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"ravel-tenant-v1");
+                hasher.update(tenant.0.as_bytes());
+                hasher.finalize()
+            }
+            TenantHashScheme::V2Keyed { hash_key } => {
+                blake3::keyed_hash(hash_key, tenant.0.as_bytes())
+            }
+        };
         let mut out = [0u8; 16];
         out.copy_from_slice(&digest.as_bytes()[..16]);
         TenantHash(out)
+    }
+}
+
+static ACTIVE_TENANT_HASH_SCHEME: std::sync::OnceLock<TenantHashScheme> =
+    std::sync::OnceLock::new();
+
+/// Install the process-wide tenant-hash scheme resolved from `sys/tenancy`
+/// (ADR-0050 section 3). Callable once per process; a second call returns the
+/// rejected scheme as `Err` and leaves the first install in force. Real
+/// binaries call this exactly once at startup, before the first `.hash()`.
+/// Tests that need to exercise a specific derivation call
+/// [`TenantHashScheme::hash`] directly rather than mutating this global.
+pub fn install_tenant_hash_scheme(scheme: TenantHashScheme) -> Result<(), TenantHashScheme> {
+    ACTIVE_TENANT_HASH_SCHEME.set(scheme)
+}
+
+/// The installed scheme, or [`TenantHashScheme::V1Unkeyed`] when none was
+/// installed. The default is what makes an un-pinned process byte-for-byte
+/// compatible with pre-ADR-0050 behavior.
+fn active_tenant_hash_scheme() -> &'static TenantHashScheme {
+    static DEFAULT_SCHEME: TenantHashScheme = TenantHashScheme::V1Unkeyed;
+    ACTIVE_TENANT_HASH_SCHEME.get().unwrap_or(&DEFAULT_SCHEME)
+}
+
+/// The tenant-hash derivation a bucket's `sys/tenancy` marker records
+/// (ADR-0050 section 3), decoded from the persisted protobuf enum by the
+/// caller so this crate stays free of a protobuf dependency. Only the two real
+/// derivations appear here; an unspecified or unknown marker value is the
+/// caller's own "corrupt marker" refusal and never reaches this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerScheme {
+    V1Unkeyed,
+    V2Keyed,
+}
+
+/// The tenant-hash scheme a process was configured for from its startup or CLI
+/// flags, before the bucket's `sys/tenancy` marker is read (ADR-0050 section
+/// 3). Held here, next to the derivation it selects, so the server startup
+/// path and the CLI resolve a configured scheme against a marker through one
+/// shared, fail-closed decision ([`resolve_scheme_against_marker`]) rather than
+/// two copies that could drift on the most safety-critical rule in the design.
+///
+/// The raw deployment key is carried only long enough to derive the hashing
+/// scheme (and, server-side, the recovery-manifest AEAD key). [`Debug`] is
+/// hand-written to keep those bytes out of any log line.
+#[derive(Clone)]
+pub enum ConfiguredScheme {
+    /// A 32-byte deployment key was supplied (`--tenant-hash-key-file`).
+    Keyed(Box<[u8; 32]>),
+    /// The operator opted out of keying (`--tenant-hash-unkeyed`).
+    Unkeyed,
+    /// Neither flag was supplied. A fresh bucket refuses (keyed is the
+    /// default and needs a key); an existing bucket takes its marker's scheme.
+    Unspecified,
+}
+
+impl ConfiguredScheme {
+    /// A short human label for startup and refusal messages. Prints only the
+    /// choice, never the key bytes.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ConfiguredScheme::Keyed(_) => "v2-keyed",
+            ConfiguredScheme::Unkeyed => "v1-unkeyed",
+            ConfiguredScheme::Unspecified => "unspecified (keyed-by-default)",
+        }
+    }
+}
+
+impl std::fmt::Debug for ConfiguredScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the deployment key; only which variant is configured.
+        f.write_str(match self {
+            ConfiguredScheme::Keyed(_) => "Keyed(<redacted>)",
+            ConfiguredScheme::Unkeyed => "Unkeyed",
+            ConfiguredScheme::Unspecified => "Unspecified",
+        })
+    }
+}
+
+/// A configured scheme is incompatible with what a bucket's marker already
+/// pins (ADR-0050 section 3). Every variant is a fail-closed refusal: the
+/// marker is authoritative, and a process that disagrees must stop rather than
+/// open a silent parallel namespace under the wrong derivation. This is the
+/// single most correctness-critical decision in the tenancy design, shared so
+/// the server and the CLI cannot drift on it.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum SchemeResolutionError {
+    #[error(
+        "sys/tenancy pins this bucket to {marker_scheme}, but this process is configured for \
+         {configured_scheme}: refusing to open a parallel namespace"
+    )]
+    SchemeMismatch {
+        marker_scheme: &'static str,
+        configured_scheme: &'static str,
+    },
+    #[error(
+        "sys/tenancy pins this bucket to v2-keyed, but no deployment key was configured: the \
+         bucket's prefixes are unreadable without it"
+    )]
+    KeyRequired,
+    #[error(
+        "sys/tenancy pins this bucket to v2-keyed with key fingerprint {expected}, but the \
+         configured key has fingerprint {got}: refusing to open a parallel namespace under the \
+         wrong key"
+    )]
+    KeyFingerprintMismatch { expected: String, got: String },
+}
+
+/// Resolve a configured scheme against a bucket's *present* `sys/tenancy`
+/// marker: the shared fail-closed decision from ADR-0050 section 3. Returns the
+/// [`TenantHashScheme`] to install, or a typed refusal. The marker is
+/// authoritative; a configured scheme that disagrees is never silently
+/// downgraded to another derivation.
+///
+/// This decides only the marker-present case. What to do when no marker exists
+/// (bootstrap a fresh bucket, or adopt a pre-ADR one as unkeyed) is a
+/// deployment-specific policy the caller owns: the server writes a marker; the
+/// read-only CLI treats an absent marker as unkeyed.
+pub fn resolve_scheme_against_marker(
+    marker_scheme: MarkerScheme,
+    marker_fingerprint: &[u8],
+    configured: &ConfiguredScheme,
+) -> Result<TenantHashScheme, SchemeResolutionError> {
+    match marker_scheme {
+        MarkerScheme::V1Unkeyed => match configured {
+            ConfiguredScheme::Keyed(_) => Err(SchemeResolutionError::SchemeMismatch {
+                marker_scheme: "v1-unkeyed",
+                configured_scheme: configured.label(),
+            }),
+            ConfiguredScheme::Unkeyed | ConfiguredScheme::Unspecified => {
+                Ok(TenantHashScheme::V1Unkeyed)
+            }
+        },
+        MarkerScheme::V2Keyed => match configured {
+            ConfiguredScheme::Unkeyed => Err(SchemeResolutionError::SchemeMismatch {
+                marker_scheme: "v2-keyed",
+                configured_scheme: configured.label(),
+            }),
+            ConfiguredScheme::Unspecified => Err(SchemeResolutionError::KeyRequired),
+            ConfiguredScheme::Keyed(key) => {
+                let fp = tenant_key_fingerprint(key);
+                if marker_fingerprint != fp.as_slice() {
+                    return Err(SchemeResolutionError::KeyFingerprintMismatch {
+                        expected: hex::encode(marker_fingerprint),
+                        got: hex::encode(fp),
+                    });
+                }
+                Ok(TenantHashScheme::v2_from_deployment_key(key))
+            }
+        },
     }
 }
 
@@ -453,5 +700,126 @@ mod tests {
     fn tenant_hash_hex_roundtrip() {
         let h = TenantId::new("acme").hash();
         assert_eq!(TenantHash::from_hex(&h.to_hex()).expect("decodes"), h);
+    }
+
+    #[test]
+    fn keyed_hash_v2_differs_from_v1_and_roundtrips() {
+        let tenant = TenantId::new("acme");
+        let key = [7u8; 32];
+        let v1 = TenantHashScheme::V1Unkeyed.hash(&tenant);
+        let v2 = TenantHashScheme::v2_from_deployment_key(&key).hash(&tenant);
+        // The keyed derivation must move the prefix off the unkeyed one; a
+        // bucket switching schemes must not land tenants on their old prefixes.
+        assert_ne!(v1, v2, "v2 keyed hash must differ from v1 unkeyed");
+        // Deterministic given the same key and id: the scheme is rebuilt from
+        // the same deployment key and produces the same prefix.
+        let v2_again = TenantHashScheme::v2_from_deployment_key(&key).hash(&tenant);
+        assert_eq!(v2, v2_again, "v2 hash is deterministic given key + id");
+        // A different key yields a different prefix (enumeration resistance):
+        // the same tenant id under a different deployment key is unlinkable.
+        let v2_other = TenantHashScheme::v2_from_deployment_key(&[9u8; 32]).hash(&tenant);
+        assert_ne!(
+            v2, v2_other,
+            "different deployment key must move the prefix"
+        );
+    }
+
+    #[test]
+    fn v1_unkeyed_scheme_matches_frozen_derivation() {
+        // Pin the v1 derivation independently of `hash()`'s implementation:
+        // blake3("ravel-tenant-v1" || id)[0..16]. If this ever changes, every
+        // existing bucket's prefixes move and this test fails loudly.
+        let tenant = TenantId::new("acme");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ravel-tenant-v1");
+        hasher.update(b"acme");
+        let digest = hasher.finalize();
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&digest.as_bytes()[..16]);
+        assert_eq!(TenantHashScheme::V1Unkeyed.hash(&tenant).0, expected);
+        // The uninstalled default `.hash()` must equal the explicit v1 scheme.
+        assert_eq!(tenant.hash(), TenantHashScheme::V1Unkeyed.hash(&tenant));
+    }
+
+    #[test]
+    fn debug_redacts_keyed_scheme_key() {
+        let scheme = TenantHashScheme::v2_from_deployment_key(&[0x11; 32]);
+        let rendered = format!("{scheme:?}");
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        // The raw derived key must not appear in any form.
+        assert!(!rendered.contains("11, 11"), "leaked key bytes: {rendered}");
+        assert!(!rendered.contains("17"), "leaked key bytes: {rendered}");
+        assert_eq!(format!("{:?}", TenantHashScheme::V1Unkeyed), "V1Unkeyed");
+    }
+
+    #[test]
+    fn debug_redacts_configured_key() {
+        let configured = ConfiguredScheme::Keyed(Box::new([0x22; 32]));
+        let rendered = format!("{configured:?}");
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        assert!(!rendered.contains("34"), "leaked key bytes: {rendered}");
+        assert_eq!(format!("{:?}", ConfiguredScheme::Unkeyed), "Unkeyed");
+    }
+
+    #[test]
+    fn resolve_keyed_marker_without_key_is_fail_closed() {
+        // A v2-keyed marker with no key configured must refuse, never fall back
+        // to the v1 default (the EC3/#566 data-safety bug this guards).
+        let err = resolve_scheme_against_marker(
+            MarkerScheme::V2Keyed,
+            &[0u8; TENANT_KEY_FINGERPRINT_LEN],
+            &ConfiguredScheme::Unspecified,
+        )
+        .expect_err("keyed marker, no key, must refuse");
+        assert_eq!(err, SchemeResolutionError::KeyRequired);
+    }
+
+    #[test]
+    fn resolve_keyed_marker_with_correct_key_yields_v2() {
+        let key = [7u8; 32];
+        let fp = tenant_key_fingerprint(&key);
+        let scheme = resolve_scheme_against_marker(
+            MarkerScheme::V2Keyed,
+            &fp,
+            &ConfiguredScheme::Keyed(Box::new(key)),
+        )
+        .expect("correct key resolves");
+        // The resolved scheme reproduces exactly the keyed prefix.
+        let tenant = TenantId::new("acme");
+        assert_eq!(
+            scheme.hash(&tenant),
+            TenantHashScheme::v2_from_deployment_key(&key).hash(&tenant)
+        );
+    }
+
+    #[test]
+    fn resolve_keyed_marker_with_wrong_key_is_fingerprint_mismatch() {
+        let fp = tenant_key_fingerprint(&[1u8; 32]);
+        let err = resolve_scheme_against_marker(
+            MarkerScheme::V2Keyed,
+            &fp,
+            &ConfiguredScheme::Keyed(Box::new([2u8; 32])),
+        )
+        .expect_err("a wrong key must refuse");
+        assert!(matches!(
+            err,
+            SchemeResolutionError::KeyFingerprintMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_unkeyed_marker_rejects_a_key_and_accepts_unkeyed() {
+        let err = resolve_scheme_against_marker(
+            MarkerScheme::V1Unkeyed,
+            &[],
+            &ConfiguredScheme::Keyed(Box::new([3u8; 32])),
+        )
+        .expect_err("keying an unkeyed bucket must refuse");
+        assert!(matches!(err, SchemeResolutionError::SchemeMismatch { .. }));
+
+        let scheme =
+            resolve_scheme_against_marker(MarkerScheme::V1Unkeyed, &[], &ConfiguredScheme::Unkeyed)
+                .expect("unkeyed marker, unkeyed config resolves");
+        assert!(matches!(scheme, TenantHashScheme::V1Unkeyed));
     }
 }

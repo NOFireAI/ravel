@@ -574,3 +574,40 @@ From [PROGRESS.md](../../PROGRESS.md), as of the Phase 1 vertical slice:
   as a duplicate (both copies are stored; a query takes the last value at
   a given timestamp). An idempotency-key window to collapse these is
   planned, not built.
+
+### Tenant hash scheme
+
+The object-key prefix for a tenant is a hash of the tenant id, pinned per
+bucket at the bucket's birth by a `sys/tenancy` marker (ADR-0050 section 3).
+Two schemes exist and one binary carries both, selected once at startup:
+
+- v1-unkeyed: the original derivation. Every bucket created before ADR-0050
+  is pinned to it permanently. Tenant names are not in keys, but anyone with
+  list access can confirm a guessed tenant id offline.
+- v2-keyed (the default for new buckets): the prefix is keyed by a 32-byte
+  deployment key loaded from `--tenant-hash-key-file` (a file, so the secret
+  never appears in a process listing). Without the key, prefixes reveal
+  nothing about which tenants exist.
+
+Startup pinning:
+
+- A fresh bucket refuses to start with no key unless `--tenant-hash-unkeyed`
+  is passed explicitly (keyed is the default; the choice is permanent).
+- An existing keyed bucket refuses to start if the configured key's
+  fingerprint disagrees with the marker: a wrong key is a failed deploy, not
+  a silent parallel namespace. `ravel-cli tenancy show
+  --tenant-hash-key-file <path>` verifies a key against a bucket offline.
+- A pre-ADR bucket (data present, no marker) is adopted as v1-unkeyed once,
+  logged and counted at `/metrics`
+  (`ravel_tenancy_v1_unkeyed_adoptions_total`). Its existing prefixes are
+  unchanged.
+
+Key custody: for a keyed bucket the deployment key is tier-0 durable state
+outside the object store. Losing it makes every `t/<hash>/` prefix
+unattributable. Bucket-plus-key is always sufficient to recover the full
+tenant-id-to-prefix mapping, via the per-tenant `sys/t/<tenant_hash>`
+recovery manifests; the bucket alone reveals nothing.
+
+There is no re-key migration between schemes. Moving a bucket between schemes
+would relocate every object and is not built: a deployment that needs to
+change schemes starts a new bucket and drains into it operationally.

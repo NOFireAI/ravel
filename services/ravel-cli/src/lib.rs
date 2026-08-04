@@ -11,6 +11,7 @@ pub mod idem;
 pub mod maintain;
 pub mod qualify;
 pub mod store;
+pub mod tenancy;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

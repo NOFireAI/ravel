@@ -1,0 +1,55 @@
+// Bucket-root system objects under the reserved `sys/` prefix (ADR-0050).
+// Persistent contract: field numbers are frozen once shipped; only additive
+// changes are allowed. This file is scoped to the tenancy marker and its
+// per-tenant recovery manifest (ADR-0050 section 3). The GC-config object
+// (`sys/gc`, EC4) and the durable shard_count / provisioning record (EC5)
+// land as their own messages in later changes; they must not reuse field
+// numbers reserved here, and each carries its own top-level message rather
+// than sharing an envelope with these.
+syntax = "proto3";
+
+package ravel.sys.v1;
+
+// Tenant-hash derivation scheme pinned for a bucket at its birth
+// (ADR-0050 section 3). Selected once and recorded in `sys/tenancy`; a
+// process whose configured scheme disagrees with the recorded one refuses to
+// start rather than opening a silent parallel namespace.
+enum TenantHashScheme {
+  SCHEME_UNSPECIFIED = 0;  // never written; an all-zero/absent marker is invalid
+  V1_UNKEYED = 1;          // unkeyed blake3("ravel-tenant-v1" || tenant_id)
+  V2_KEYED = 2;            // keyed blake3, key derived from the deployment key
+}
+
+// The immutable `sys/tenancy` marker written once (CreateIfAbsent) at the
+// bucket root, never under a tenant prefix, since its whole purpose is to
+// establish the tenant prefixes.
+message TenancyMarker {
+  uint32 format_version = 1;         // = 1
+  TenantHashScheme scheme = 2;
+  // Present only when scheme == V2_KEYED; empty for V1_UNKEYED. 16 bytes:
+  // blake3::derive_key("ravel-tenant-v2-fingerprint", deployment_key)
+  // truncated to 16 bytes. 16 was chosen to match TenantHash's own width
+  // (a familiar length in this layout) and gives 128 bits of collision
+  // resistance for the "wrong key deployed" check, which is far more than a
+  // startup accident needs. This is a fingerprint of the key for detecting a
+  // wrong key before it does damage, never the key itself.
+  bytes key_fingerprint = 3;
+  sfixed64 created_unix_ns = 4;      // informational; when the bucket was pinned
+}
+
+// Per-tenant recovery manifest at `sys/t/<tenant_hash>` (ADR-0050 section 3),
+// written once (CreateIfAbsent, immutable) at a tenant's first write in a
+// keyed bucket. Holds the tenant id encrypted under an AEAD key derived from
+// the deployment key, so bucket-plus-key always suffices to reconstruct the
+// full tenant-id-to-prefix mapping while the bucket alone reveals nothing.
+// Unkeyed buckets never write this object: an unkeyed prefix is trivially
+// reversible given the (small, known) tenant-id space, so there is nothing to
+// recover. Cipher: AES-256-GCM with a 96-bit nonce; the tenant_hash the
+// manifest is keyed under is bound as AEAD associated data, so a manifest
+// cannot be relocated to another tenant's key and still open.
+message TenantRecoveryManifest {
+  uint32 format_version = 1;   // = 1
+  bytes nonce = 2;             // 12 bytes (AES-256-GCM nonce)
+  bytes ciphertext = 3;        // sealed tenant-id UTF-8 bytes, incl. 16-byte tag
+  sfixed64 created_unix_ns = 4;
+}

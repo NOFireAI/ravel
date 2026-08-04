@@ -18,6 +18,8 @@ t/<tenant_hash>/catalog/<signal>/HEAD                                    head po
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable, phase 5)
 sys/qualification                                                       store qualification record (write-once, additive)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
+sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
+sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 ```
 
 The four compaction/retention key shapes (ADR-0018, ADR-0019;
@@ -76,8 +78,29 @@ guarantee beyond the run that created them.
   ADR-0003 HEAD pointer has. Losing or corrupting it costs a rescan, never
   correctness; it carries no durability role and is not a manifest.
 
-- `tenant_hash`: hex, 32 chars (ADR-0009). Unkeyed BLAKE3 by default; a
-  deployment-keyed variant is available via config (ADR-0010 §13).
+- `tenant_hash`: hex, 32 chars (ADR-0009). The derivation is pinned per
+  bucket at bucket birth by the `sys/tenancy` marker (ADR-0050 §3), and one
+  binary carries both derivations, selected once at startup:
+  - v1-unkeyed: `blake3("ravel-tenant-v1" || tenant_id)[0..16]`. The
+    original derivation and the permanent scheme for every pre-ADR-0050
+    bucket. Unkeyed BLAKE3 hides tenant names from keys but lets anyone with
+    list access confirm a guessed id offline.
+  - v2-keyed (the default for buckets created after ADR-0050):
+    `blake3::keyed_hash(k, tenant_id)[0..16]` where `k =
+    blake3::derive_key("ravel-tenant-v2", deployment_key)` and the 32-byte
+    deployment key is loaded from `--tenant-hash-key-file`. Enumeration
+    resistant: without the key, prefixes reveal nothing about which tenants
+    exist. `sys/tenancy` records a 16-byte fingerprint of the key (never the
+    key), so a wrong key is a startup refusal, not a silent parallel
+    namespace, and keyed buckets write a `sys/t/<tenant_hash>` recovery
+    manifest (the tenant id encrypted under an AES-256-GCM key derived from
+    the deployment key) at each tenant's first write.
+
+  Correction: this table and ADR-0010 §13 previously stated a
+  deployment-keyed variant was "available via config". It was never
+  implemented until ADR-0050 §3 (EC3); the keyed variant described above is
+  the real, default, durable design. There is no re-key migration between
+  schemes (ADR-0050 §3; docs/guides/operations.md).
 - `m` = metrics signal. Logs `l`, spans `s`, profiles `p` reserved.
   Alerts `a` and audit `u` (ADR-0040) share `l`'s RLOG segment format
   verbatim - no new byte layout, only two new signal-keyspace prefixes.

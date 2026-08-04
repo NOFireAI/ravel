@@ -129,6 +129,9 @@ pub struct RemoteWriteState {
     /// cap breach, which instead reduces the written count in a 2xx (no
     /// partial-success message on this surface).
     pub admission: Arc<AdmissionController>,
+    /// Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
+    /// bucket. Ensured before the write; `None` (unkeyed) is a no-op.
+    pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
 }
 
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
@@ -230,6 +233,10 @@ async fn remote_write(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Record the tenant's recovery manifest on its first write (ADR-0050
+    // section 3), best-effort and off the durability path.
+    crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, now_ns()).await;
 
     // Layer 2 (ADR-0051 section 2): byte rate on the compressed wire body,
     // before decode, whole-request rejection with no tokens consumed.

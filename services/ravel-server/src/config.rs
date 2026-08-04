@@ -261,6 +261,24 @@ pub struct Cli {
     /// with no read cache wiring at all.
     #[arg(long)]
     pub disable_cache: bool,
+
+    /// Path to the 32-byte deployment key that keys the tenant hash
+    /// (ADR-0050 section 3). A file, never an env var or inline value, so the
+    /// secret never appears in a process listing. Contents are either 64 hex
+    /// characters or exactly 32 raw bytes. Presence selects the keyed (v2)
+    /// derivation; the bucket's `sys/tenancy` marker pins the choice
+    /// permanently and a key whose fingerprint disagrees with the marker fails
+    /// startup. Mutually exclusive with `--tenant-hash-unkeyed`.
+    #[arg(long, value_name = "PATH")]
+    pub tenant_hash_key_file: Option<PathBuf>,
+
+    /// Opt a fresh bucket out of the keyed tenant hash, pinning it to the
+    /// unkeyed (v1) derivation permanently (ADR-0050 section 3). Required to
+    /// bootstrap a fresh bucket without a key, since keyed is the default; a
+    /// fresh bucket with neither this flag nor `--tenant-hash-key-file`
+    /// refuses to start. Mutually exclusive with `--tenant-hash-key-file`.
+    #[arg(long)]
+    pub tenant_hash_unkeyed: bool,
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
@@ -513,6 +531,16 @@ impl Cli {
             );
         }
 
+        // A key file and the unkeyed opt-out are contradictory: one selects
+        // the keyed derivation, the other refuses it. There is no meaningful
+        // resolution, so refuse rather than pick one (ADR-0050 section 3).
+        if self.tenant_hash_key_file.is_some() && self.tenant_hash_unkeyed {
+            anyhow::bail!(
+                "--tenant-hash-key-file and --tenant-hash-unkeyed are mutually exclusive: the \
+                 first keys the tenant hash, the second opts out of keying. Pass exactly one."
+            );
+        }
+
         if let Some(mtls_listener) = self.mtls_listener {
             // More specific than the general aliasing check below: names the
             // exact combination (dev header plus mTLS listener on the public
@@ -535,6 +563,29 @@ impl Cli {
         }
 
         Ok(())
+    }
+
+    /// Resolve the configured tenant-hash scheme from the startup flags
+    /// (ADR-0050 section 3), loading and validating the deployment key from
+    /// `--tenant-hash-key-file` when present. The mutual-exclusion check lives
+    /// in [`Cli::validate`]; this reads the key file. A file that is neither
+    /// 64 hex characters nor exactly 32 raw bytes fails startup rather than
+    /// truncating or padding a wrong-length key into place.
+    pub fn resolve_tenancy_config(&self) -> anyhow::Result<crate::tenancy::ConfiguredScheme> {
+        use crate::tenancy::ConfiguredScheme;
+        if let Some(path) = self.tenant_hash_key_file.as_deref() {
+            let raw = std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("could not read --tenant-hash-key-file {path:?}: {e}")
+            })?;
+            let key = parse_deployment_key(&raw).map_err(|e| {
+                anyhow::anyhow!("invalid --tenant-hash-key-file {}: {e}", path.display())
+            })?;
+            return Ok(ConfiguredScheme::Keyed(Box::new(key)));
+        }
+        if self.tenant_hash_unkeyed {
+            return Ok(ConfiguredScheme::Unkeyed);
+        }
+        Ok(ConfiguredScheme::Unspecified)
     }
 
     /// Load and validate `--limits-file` (ADR-0051 section 3). Absent flag
@@ -585,6 +636,36 @@ fn validated_sink_url<'a>(flag: &str, url: &'a str) -> anyhow::Result<&'a str> {
         anyhow::bail!("invalid {flag} '{url}', expected an http:// or https:// URL");
     }
     Ok(url)
+}
+
+/// Parse a 32-byte deployment key from a `--tenant-hash-key-file`'s raw
+/// bytes. Accepts 64 hex characters (whitespace-trimmed, the operator-friendly
+/// form that tolerates a trailing newline) or exactly 32 raw bytes. Any other
+/// length is an error: silently truncating or zero-padding a wrong-length key
+/// would derive a different tenant hash than intended, which the whole pinning
+/// design exists to make impossible.
+fn parse_deployment_key(raw: &[u8]) -> anyhow::Result<[u8; 32]> {
+    if let Ok(text) = std::str::from_utf8(raw) {
+        let trimmed = text.trim();
+        if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let bytes =
+                hex::decode(trimmed).map_err(|e| anyhow::anyhow!("key is not valid hex: {e}"))?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("hex key did not decode to 32 bytes"))?;
+            return Ok(arr);
+        }
+    }
+    if raw.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(raw);
+        return Ok(key);
+    }
+    anyhow::bail!(
+        "must contain a 32-byte deployment key: either 64 hex characters or exactly 32 raw \
+         bytes (got {} bytes)",
+        raw.len()
+    );
 }
 
 /// Parse a humantime duration string into a nanosecond window, rejecting

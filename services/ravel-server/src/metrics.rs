@@ -761,6 +761,27 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     );
 }
 
+/// Tenancy adoption counter (ADR-0050 section 3). Counts buckets this process
+/// pinned to `V1_UNKEYED` because they held `t/` data but no `sys/tenancy`
+/// marker (a pre-ADR-0050 bucket adopted once, permanently). A nonzero value
+/// is the visible signal that the one-time migration happened; it is a
+/// process-global atomic read directly from [`crate::tenancy`], not a
+/// snapshot struct, since it has a single source and no labels.
+fn render_tenancy_family(out: &mut String, mode: Mode, v1_unkeyed_adoptions: u64) {
+    write_header(
+        out,
+        "ravel_tenancy_v1_unkeyed_adoptions_total",
+        "Buckets pinned to the unkeyed tenant hash on adoption of a pre-ADR-0050 bucket (t/ data present, sys/tenancy absent).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_tenancy_v1_unkeyed_adoptions_total",
+        &[Label::Mode(mode)],
+        v1_unkeyed_adoptions,
+    );
+}
+
 /// Storage-derived tenant discovery counters for the maintenance driver
 /// (ADR-0048 decision 3, issue #504), decoupled from
 /// [`crate::tenant_discovery::TenantDiscoveryMetrics`] so the renderer is
@@ -1237,6 +1258,7 @@ pub fn render(
         render_ingest_family(&mut out, mode, ingest);
     }
     render_catalog_family(&mut out, mode, catalog);
+    render_tenancy_family(&mut out, mode, crate::tenancy::v1_unkeyed_adoption_count());
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
     }
