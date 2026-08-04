@@ -374,17 +374,28 @@ mod tests {
         let fields = config.fields_for(&TenantId::new("acme").hash());
         assert_eq!(fields, ["http.status_code"]);
 
-        // Twelve records over six blocks. `http.status_code` cycles three
-        // values (one third of blocks match one value); `http.method` cycles
-        // two values but is NOT in the configured list.
+        // Twelve records over six two-record blocks (block target 2, so block
+        // j holds records 2j and 2j+1). `http.status_code` cycles three
+        // values every record (s{i%3}); block j therefore holds
+        // s{(2j)%3} and s{(2j+1)%3}, so "s0" lands in blocks 0, 1, 3, 4 (a
+        // proper subset of the six) and is absent from blocks 2 and 5.
+        // `http.method` is NOT in the configured list, and it is deliberately
+        // NOT alternated per record (m{i%2} would put both values in every
+        // block, since each block holds one even and one odd `i` -- that
+        // shape cannot discriminate "not pruned" from "pruned but every block
+        // matched anyway"). Instead it takes "m0" for i in 0..6 and "m1" for
+        // i in 6..12, a change that lands exactly on a block boundary, so
+        // "m0" occupies blocks 0, 1, 2 only -- also a proper subset, not
+        // every block.
         let mut writer = RlogWriter::new(cfg(), identity()).with_indexed_fields(fields.to_vec());
         for i in 0..12i64 {
+            let method = if i < 6 { "m0" } else { "m1" };
             writer
                 .push(record(
                     i,
                     &[
                         ("http.status_code", AttrValue::Str(format!("s{}", i % 3))),
-                        ("http.method", AttrValue::Str(format!("m{}", i % 2))),
+                        ("http.method", AttrValue::Str(method.to_string())),
                     ],
                 ))
                 .expect("push");
@@ -396,8 +407,15 @@ mod tests {
         );
 
         // The configured field prunes: probing one of its three values drops
-        // the blocks that hold only the other two.
+        // the blocks that hold only the other two. Pin down the exact block
+        // layout above so a future change to the fixture cannot silently
+        // regress this test back to vacuity.
         let indexed = scan_for(&obj, "http.status_code", "s0");
+        assert_eq!(indexed.blocks_total, 6, "twelve records at two per block");
+        assert_eq!(
+            indexed.blocks_after_postings, 4,
+            "\"s0\" occupies exactly blocks 0, 1, 3, 4"
+        );
         assert!(
             indexed.blocks_after_postings < indexed.blocks_after_skip,
             "the configured field must prune: {} !< {}",
@@ -407,7 +425,12 @@ mod tests {
 
         // The unconfigured field does not prune: it has no posting list, so its
         // prune arm resolves to nothing and every candidate block survives.
+        // "m0" occupies only blocks 0, 1, 2 of 6 (see the layout comment
+        // above), so this equality is not trivially true: it would fail if a
+        // regression started pruning on an unconfigured field, since that
+        // would drop the equality to 3 blocks instead of 6.
         let unindexed = scan_for(&obj, "http.method", "m0");
+        assert_eq!(unindexed.blocks_total, 6);
         assert_eq!(
             unindexed.blocks_after_postings, unindexed.blocks_after_skip,
             "an unconfigured field must not prune"

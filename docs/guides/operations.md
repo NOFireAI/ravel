@@ -30,6 +30,8 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--maintain-interval-secs <n>` | | `300` | Used only in `--mode maintain`. How often each tenant's maintenance task wakes to run retention, compaction, and the sweeper over every shard of both signals. |
 | `--retention-default <duration>` | | none | Used only in `--mode maintain`. The default age-based retention window applied to every tenant with no explicit override, as a humantime duration (`30d`, `720h`). Omitted means no default retention: nothing is age-deleted unless a per-tenant window is set. It is validated at startup against the ADR-0019 floor; a window below the floor fails startup rather than being clamped. |
 | `--retention-tenant TENANT=DURATION` | | none, repeatable | Used only in `--mode maintain`. The per-tenant retention window; it overrides `--retention-default` for that tenant. Parsed with `humantime::parse_duration`. Same below-floor validation. |
+| `--indexed-field FIELD` | | shipped default list, repeatable | POSTINGS indexed field for a tenant with no `--indexed-field-tenant` override (ADR-0049 decision 3). Pass the flag once per field. The shipped default is `service.name`, `k8s.namespace.name`, and `http.status_code`. Any value you pass replaces the shipped default list, not adds to it. |
+| `--indexed-field-tenant TENANT=FIELDS` | | none, repeatable | Per-tenant POSTINGS indexed-field override, as `TENANT=field1,field2`. It replaces the default list for that tenant only. An empty field list (`--indexed-field-tenant acme=`) turns off POSTINGS indexing for that tenant. |
 | `--limits-file <path>` | | none (shipped defaults) | TOML admission-limits file (ADR-0051 section 3): `[defaults]` plus per-tenant `[tenants.<id>]` overrides. Parsed and validated at startup; an unparseable file, an unknown key, or a nonsensical limit (zero, or a burst set with no rate to pair it with) fails startup rather than falling back to defaults. See "Admission limits file" below. |
 | `--cache-max-bytes <n>` | | `268435456` (256 MiB) | Maximum resident bytes for the ADR-0046 read cache's RAM tier. Read once at startup; there is no live resize. Ignored when `--disable-cache` is set. See [guides/caching.md](caching.md). |
 | `--cache-dir <path>` | | none | Directory for the read cache's local-disk tier. Not wired to anything yet: the query fetchers only accept a RAM cache. Setting this flag fails startup rather than silently running with no disk tier. See [guides/caching.md](caching.md#known-gaps). |
@@ -349,6 +351,51 @@ not need to: it deploys every pod with the same shipped defaults, so the first
 pod bootstraps `sys/gc` from those defaults and every pod validates trivially.
 `spec.retention.default` is age-based retention (ADR-0019), a separate concept
 from these GC-safety horizons and unrelated to `sys/gc`.
+## POSTINGS indexed-field metrics (ADR-0049)
+
+POSTINGS gives the log store exact block-level pruning for an attribute
+equality predicate. An operator names the indexed fields with
+`--indexed-field` and `--indexed-field-tenant` (see the flag table above).
+Indexing is opt-in per field. An unindexed field still works through the
+bloom and the exact scan. A missing index changes query cost, not query
+correctness (ADR-0049 decision 5).
+
+### Write-side POSTINGS metrics
+
+`ravel_logs_postings_*` renders at `GET /metrics` for the log ingest
+pipeline. Every sample carries `mode` and `signal` labels. Each name is a
+counter, cumulative over flushed log objects that carried a POSTINGS
+section:
+
+- `ravel_logs_postings_objects_total`: flushed log objects that carried a
+  POSTINGS section.
+- `ravel_logs_postings_bytes_total`: encoded POSTINGS section bytes, summed
+  across flushed objects.
+- `ravel_logs_postings_indexed_fields_total`: indexed fields that emitted a
+  posting list, summed across flushed objects.
+- `ravel_logs_postings_distinct_values_total`: distinct values across
+  non-capped indexed fields, summed across flushed objects.
+- `ravel_logs_postings_capped_fields_total`: indexed fields dropped from a
+  flushed object for exceeding the per-field distinct-value cap (ADR-0049
+  decision 4).
+
+### Query-side prune-selectivity metrics
+
+`ravel_logs_prune_*` renders at `GET /metrics` for the logs query path.
+Every sample carries a `mode` label and a constant `signal="logs"` label.
+Each name is a counter, cumulative across queries:
+
+- `ravel_logs_prune_blocks_total`: blocks a logs scan considered before
+  postings pruning. It is the denominator of prune selectivity.
+- `ravel_logs_prune_blocks_survived_total`: blocks that survived postings
+  pruning. The scan then read these blocks. It is the numerator of prune
+  selectivity.
+- `ravel_logs_prune_blocks_pruned_by_postings_total`: blocks the POSTINGS
+  index dropped before the scan read them.
+
+Prune selectivity is `blocks_survived` divided by `blocks_total`. A ratio of
+1.0 means the query pruned no blocks. A lower ratio means POSTINGS did more
+work.
 
 ## Storage backend configuration
 

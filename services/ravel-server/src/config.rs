@@ -454,7 +454,16 @@ impl Cli {
         let default = if self.indexed_field_defaults.is_empty() {
             None
         } else {
-            Some(self.indexed_field_defaults.clone())
+            // Trim each value the same way the per-tenant list below does, so
+            // `--indexed-field " service.name"` indexes `service.name`
+            // instead of a field named " service.name" (which matches
+            // nothing, so it silently indexes nothing).
+            Some(
+                self.indexed_field_defaults
+                    .iter()
+                    .map(|f| f.trim().to_string())
+                    .collect(),
+            )
         };
         let mut tenants = Vec::with_capacity(self.indexed_field_tenants.len());
         for pair in &self.indexed_field_tenants {
@@ -1464,6 +1473,20 @@ mod tests {
             policy.tenants[1],
             ("globex".to_string(), Vec::<String>::new()),
             "an empty right-hand side is an explicit opt-out"
+        );
+    }
+
+    #[test]
+    fn a_leading_space_in_an_indexed_field_default_is_trimmed() {
+        let policy = cli(&["--indexed-field", " service.name"])
+            .parse_indexed_field_policy()
+            .expect("valid flags parse");
+        assert_eq!(
+            policy.default,
+            Some(vec!["service.name".to_string()]),
+            "the default list must trim whitespace the same way \
+             --indexed-field-tenant does, or a leading space silently \
+             indexes nothing"
         );
     }
 
