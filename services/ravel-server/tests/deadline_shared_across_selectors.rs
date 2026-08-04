@@ -108,6 +108,7 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        indexed_fields: Default::default(),
     };
     ravel_server::start(
         config,

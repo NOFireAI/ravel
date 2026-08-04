@@ -31,6 +31,8 @@ use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_types::logstream::{AttrValue, LogStreamId};
 use ravel_types::{CommitToken, Signal, TenantId};
+
+use crate::log_router::LogIndexedFields;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -158,6 +160,9 @@ pub(crate) struct LogShardActor {
     metrics: Arc<LogIngestMetrics>,
     rx: mpsc::Receiver<LogShardMsg>,
     tenants: HashMap<TenantId, LogTenantBuf>,
+    /// Resolves each tenant's POSTINGS indexed-field list at flush time
+    /// (ADR-0049 decision 3, issue #511). Shared across shards.
+    indexed_fields: Arc<dyn LogIndexedFields>,
 }
 
 impl LogShardActor {
@@ -171,6 +176,7 @@ impl LogShardActor {
         config: IngestConfig,
         metrics: Arc<LogIngestMetrics>,
         rx: mpsc::Receiver<LogShardMsg>,
+        indexed_fields: Arc<dyn LogIndexedFields>,
     ) -> Self {
         LogShardActor {
             shard,
@@ -183,6 +189,7 @@ impl LogShardActor {
             metrics,
             rx,
             tenants: HashMap::new(),
+            indexed_fields,
         }
     }
 
@@ -392,7 +399,13 @@ impl LogShardActor {
             writer_epoch: self.epoch,
             writer_seq: seq,
         };
-        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        // Resolve this tenant's POSTINGS indexed-field list (ADR-0049 decision
+        // 3, issue #511) once per object and hand it to the writer. An empty
+        // list leaves the object without a POSTINGS section, which is always
+        // legal (decision 5).
+        let indexed_fields = self.indexed_fields.fields_for(&tenant_hash);
+        let mut writer =
+            RlogWriter::new(RlogConfig::default(), identity).with_indexed_fields(indexed_fields);
         for rec in records {
             if let Err(e) = writer.push(to_logseg_record(rec)) {
                 self.metrics.record_abandoned_input_rejected();
@@ -400,8 +413,14 @@ impl LogShardActor {
                 return;
             }
         }
-        let bytes = match writer.finish() {
-            Ok(bytes) => bytes,
+        let bytes = match writer.finish_with_stats() {
+            Ok((bytes, stats)) => {
+                // Write-side POSTINGS metrics (issue #511): section bytes,
+                // per-field distinct counts, and the cap-exceeded counter, all
+                // aggregated label-free by the /metrics renderer.
+                self.metrics.record_postings(stats);
+                bytes
+            }
             Err(LogSegError::InconsistentStreamAttrs(msg)) => {
                 self.metrics.record_stream_id_collision();
                 self.ack_waiters(waiters, Err(LogWriteError::StreamIdCollision(msg)));
@@ -737,6 +756,7 @@ mod tests {
                 config,
                 Arc::clone(&metrics),
                 rx,
+                Arc::new(crate::log_router::NoIndexedFields),
             );
             let task = tokio::spawn(actor.run());
             Harness {

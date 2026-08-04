@@ -468,6 +468,24 @@ pub struct IngestPipelineSnapshot {
     pub acks_err: u64,
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
+    /// Write-side POSTINGS counters (ADR-0049, issue #511). `Some` only for the
+    /// log pipeline; `None` for metrics and spans, which build no POSTINGS
+    /// section, so the postings family renders no sample for them.
+    pub postings: Option<PostingsCounters>,
+}
+
+/// The log pipeline's write-side POSTINGS counters, cumulative over flushed
+/// objects (ADR-0049 decision 4, issue #511). Rendered without any per-field
+/// label, which the ADR-0044 allowlist forbids: `distinct_values_total` over
+/// `indexed_fields_total` is the mean distinct-per-field, and `bytes_total`
+/// over `objects` the mean section bytes per indexed object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PostingsCounters {
+    pub objects: u64,
+    pub bytes_total: u64,
+    pub indexed_fields_total: u64,
+    pub distinct_values_total: u64,
+    pub capped_fields_total: u64,
 }
 
 impl IngestPipelineSnapshot {
@@ -486,6 +504,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.series_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            postings: None,
         }
     }
 
@@ -504,6 +523,13 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            postings: Some(PostingsCounters {
+                objects: snapshot.postings_objects,
+                bytes_total: snapshot.postings_bytes_total,
+                indexed_fields_total: snapshot.postings_indexed_fields_total,
+                distinct_values_total: snapshot.postings_distinct_values_total,
+                capped_fields_total: snapshot.postings_capped_fields_total,
+            }),
         }
     }
 
@@ -522,6 +548,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
+            postings: None,
         }
     }
 }
@@ -715,6 +742,68 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             &labels(mode, pipeline.signal),
             pipeline.shard_deaths,
         );
+    }
+}
+
+/// The write-side POSTINGS counters (ADR-0049 decision 4, issue #511): section
+/// bytes and per-field distinct-value counts per indexed object, and the
+/// cap-exceeded counter.
+///
+/// Only the pipelines that build POSTINGS (the log pipeline;
+/// `IngestPipelineSnapshot::postings` is `Some`) render a sample, so the family
+/// is empty in a metrics- or spans-only process. Every sample carries exactly
+/// `{mode, signal}` and no more: the per-field distinct counts are summed into
+/// `ravel_logs_postings_distinct_values_total` with the field count in
+/// `ravel_logs_postings_indexed_fields_total`, so a scraper derives the mean
+/// distinct-per-field without any field-name label, which the ADR-0044 label
+/// allowlist forbids. The prune-selectivity metric is rendered separately, off
+/// the query path's DataFusion counters (issue #511 deliverable 2).
+fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelineSnapshot]) {
+    fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
+        [Label::Mode(mode), Label::Signal(signal)]
+    }
+
+    // (metric name, HELP text, counter selector).
+    type PostingsMetric = (&'static str, &'static str, fn(&PostingsCounters) -> u64);
+
+    // Each metric is one header then one sample per pipeline that builds
+    // postings, keeping the zero-is-not-absence discipline the other families
+    // keep for a configured-but-idle pipeline.
+    let metrics: [PostingsMetric; 5] = [
+        (
+            "ravel_logs_postings_objects_total",
+            "Flushed log objects that carried a POSTINGS section, by signal (the denominator for average section bytes per indexed object).",
+            |p| p.objects,
+        ),
+        (
+            "ravel_logs_postings_bytes_total",
+            "Cumulative encoded POSTINGS section bytes across flushed log objects, by signal.",
+            |p| p.bytes_total,
+        ),
+        (
+            "ravel_logs_postings_indexed_fields_total",
+            "Cumulative count of indexed fields that emitted a posting list, summed over objects, by signal (the denominator for mean distinct-per-field).",
+            |p| p.indexed_fields_total,
+        ),
+        (
+            "ravel_logs_postings_distinct_values_total",
+            "Cumulative distinct-value count across non-capped indexed fields, summed over objects, by signal.",
+            |p| p.distinct_values_total,
+        ),
+        (
+            "ravel_logs_postings_capped_fields_total",
+            "Indexed fields dropped from POSTINGS for exceeding the per-field distinct-value cap (ADR-0049 decision 4), summed over objects, by signal.",
+            |p| p.capped_fields_total,
+        ),
+    ];
+
+    for (name, help, get) in metrics {
+        write_header(out, name, help, "counter");
+        for pipeline in pipelines {
+            if let Some(postings) = &pipeline.postings {
+                write_sample(out, name, &labels(mode, pipeline.signal), get(postings));
+            }
+        }
     }
 }
 
@@ -1658,6 +1747,7 @@ pub fn render(
     render_store_family(&mut out, mode, store);
     if !ingest.is_empty() {
         render_ingest_family(&mut out, mode, ingest);
+        render_logs_postings_family(&mut out, mode, ingest);
     }
     render_catalog_family(&mut out, mode, catalog);
     render_tenancy_family(&mut out, mode, crate::tenancy::v1_unkeyed_adoption_count());
@@ -1946,6 +2036,72 @@ mod tests {
              never appear here"
         );
         assert_eq!(one_of_each.len(), 8, "exactly 8 permitted label keys");
+    }
+
+    /// The POSTINGS family (issue #511) renders one sample per metric for the
+    /// log pipeline, each carrying exactly the labels the ADR-0044 allowlist
+    /// permits for it: `{mode, signal}` and nothing else. The label *set* is
+    /// asserted, not just the values, so a future stray label (a field name,
+    /// say) fails here loudly rather than silently unbounding `/metrics`
+    /// cardinality. Metrics and spans build no POSTINGS, so they render no
+    /// sample in this family.
+    #[test]
+    fn postings_family_carries_only_allowlisted_labels() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                postings_objects: 3,
+                postings_bytes_total: 900,
+                postings_indexed_fields_total: 6,
+                postings_distinct_values_total: 42,
+                postings_capped_fields_total: 1,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &populated_store_snapshot(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+        );
+
+        let postings_lines: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("ravel_logs_postings_"))
+            .collect();
+        // Five metrics, one sample each (only the log pipeline has postings).
+        assert_eq!(
+            postings_lines.len(),
+            5,
+            "one sample per postings metric, log pipeline only:\n{body}"
+        );
+
+        for line in &postings_lines {
+            let labels = line
+                .split_once('{')
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(inner, _)| inner)
+                .expect("sample carries a label block");
+            let keys: HashSet<&str> = labels
+                .split(',')
+                .map(|kv| kv.split_once('=').expect("label is key=value").0)
+                .collect();
+            assert_eq!(
+                keys,
+                HashSet::from(["mode", "signal"]),
+                "postings sample must carry only {{mode, signal}}: {line}"
+            );
+            // And the sample is the logs signal, not metrics or spans.
+            assert!(
+                line.contains("signal=\"logs\""),
+                "postings is a log-only family: {line}"
+            );
+        }
     }
 
     /// Every non-comment line is `name{labels} value`, every `# TYPE`

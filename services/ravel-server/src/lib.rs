@@ -202,6 +202,13 @@ pub struct ServerConfig {
     /// reachability flag `/readyz` reads. Not mode-scoped: every mode builds a
     /// store handle and runs the probe.
     pub store_probe_interval: Duration,
+    /// Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
+    /// issue #511), resolved from `--indexed-field` / `--indexed-field-tenant`.
+    /// [`start`] wraps it in an `Arc` and hands it to the log ingest router,
+    /// which resolves `fields_for(tenant_hash)` at flush time and feeds the
+    /// result to `RlogWriter::with_indexed_fields`. This is the one production
+    /// call site that reads the configuration.
+    pub indexed_fields: crate::postings_config::IndexedFieldConfig,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -383,13 +390,19 @@ pub async fn start(
     // `l` keyspace (docs/ingest.md "Log pipeline"). It exists in exactly the
     // modes that serve ingest, so the two options are always Some together.
     let log_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
-        Some(Arc::new(LogIngestRouter::new(
+        // The per-tenant POSTINGS indexed-field resolver (issue #511) reaches
+        // the writer here: the router hands it to every shard, which resolves
+        // `fields_for(tenant_hash)` at flush time.
+        let indexed_fields: Arc<dyn ravel_ingest::LogIndexedFields> =
+            Arc::new(config.indexed_fields.clone());
+        Some(Arc::new(LogIngestRouter::new_with_indexed_fields(
             IngestConfig {
                 shard_count: config.shard_count,
                 ..IngestConfig::default()
             },
             store.clone(),
             Arc::new(SystemClock),
+            indexed_fields,
         )))
     } else {
         None

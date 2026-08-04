@@ -250,6 +250,18 @@ async fn main() -> anyhow::Result<()> {
             .as_deref()
             .map_or_else(|| "shipped defaults".to_string(), |p| p.display().to_string())
     );
+    // Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
+    // issue #511). An empty or duplicate field name fails startup here rather
+    // than silently indexing the wrong set. `ravel_server::start` hands this to
+    // the log ingest router, the one production call site that reads it.
+    let indexed_fields = ravel_server::postings_config::IndexedFieldConfig::from_policy(
+        cli.parse_indexed_field_policy()?,
+    )
+    .context("failed to parse --indexed-field / --indexed-field-tenant")?;
+    tracing::info!(
+        default_fields = ?indexed_fields.default_fields(),
+        "POSTINGS indexed-field defaults resolved"
+    );
     if !alert_rules.is_empty() && alert_sinks.is_empty() {
         tracing::info!(
             "alert rules are configured but no sink is: transitions will be written as durable \
@@ -322,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
         store_probe_interval: cli
             .parse_store_probe_interval()
             .context("failed to parse --store-probe-interval")?,
+        indexed_fields,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;

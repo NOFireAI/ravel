@@ -345,6 +345,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        indexed_fields: Default::default(),
     };
     let running = ravel_server::start(
         config,
@@ -466,6 +467,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        indexed_fields: Default::default(),
     };
     let running = ravel_server::start(
         config,

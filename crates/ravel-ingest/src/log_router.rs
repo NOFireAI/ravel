@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
-use ravel_types::{CommitToken, shard_for_log};
+use ravel_types::{CommitToken, TenantHash, shard_for_log};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -24,6 +24,33 @@ use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
 use crate::log_shard::{LogShardActor, LogShardMsg};
 use crate::router::WriteMode;
+
+/// Resolves the POSTINGS indexed-field list for a tenant at flush time
+/// (ADR-0049 decision 3, issue #511). The shard actor calls this once per
+/// object, just before building the writer, and hands the result to
+/// `RlogWriter::with_indexed_fields`.
+///
+/// It is a trait here so `ravel-ingest` does not depend on the server's
+/// per-tenant configuration types: the server implements it for its
+/// `IndexedFieldConfig`, and a deployment that wires no configuration gets
+/// [`NoIndexedFields`], for which every object is unindexed (absence of a
+/// POSTINGS section is always legal, ADR-0049 decision 5).
+pub trait LogIndexedFields: Send + Sync {
+    /// The indexed-field names for `tenant`, or an empty list to index nothing.
+    fn fields_for(&self, tenant: &TenantHash) -> Vec<String>;
+}
+
+/// The default resolver: no tenant indexes any field, so the writer emits no
+/// POSTINGS section. This is the behaviour of every call site that has not
+/// wired per-tenant configuration, which is exactly what the writer did before
+/// issue #511.
+pub struct NoIndexedFields;
+
+impl LogIndexedFields for NoIndexedFields {
+    fn fields_for(&self, _tenant: &TenantHash) -> Vec<String> {
+        Vec::new()
+    }
+}
 
 /// One token per shard the request's records flushed through. Empty in
 /// buffered mode, or if the request carried no records.
@@ -57,10 +84,26 @@ pub struct LogIngestRouter {
 }
 
 impl LogIngestRouter {
+    /// Builds a router whose shards index no POSTINGS field
+    /// ([`NoIndexedFields`]). Use [`Self::new_with_indexed_fields`] to wire
+    /// per-tenant configuration (issue #511).
     pub fn new(
         config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::new_with_indexed_fields(config, store, clock, Arc::new(NoIndexedFields))
+    }
+
+    /// Like [`Self::new`], but every shard resolves each tenant's POSTINGS
+    /// indexed-field list through `indexed_fields` at flush time (ADR-0049
+    /// decision 3, issue #511). This is the production constructor; the server
+    /// passes its per-tenant `IndexedFieldConfig` here.
+    pub fn new_with_indexed_fields(
+        config: IngestConfig,
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<dyn Clock>,
+        indexed_fields: Arc<dyn LogIndexedFields>,
     ) -> Self {
         let metrics = Arc::new(LogIngestMetrics::default());
         let writer_id = Uuid::new_v4();
@@ -78,6 +121,7 @@ impl LogIngestRouter {
                     config,
                     Arc::clone(&metrics),
                     rx,
+                    Arc::clone(&indexed_fields),
                 );
                 let task = tokio::spawn(actor.run());
                 LogShardHandle {

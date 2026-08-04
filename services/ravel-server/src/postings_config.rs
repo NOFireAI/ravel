@@ -134,6 +134,17 @@ impl IndexedFieldConfig {
     }
 }
 
+/// Bridge to the ingest layer's resolver trait (issue #511). `ravel-ingest`
+/// owns the trait so it need not depend on this crate's config types; the log
+/// ingest router calls `fields_for` per flush. The inherent `fields_for` above
+/// wins method resolution here, so this is not a self-recursive call; it only
+/// copies the resolved slice into the owned `Vec` the trait returns.
+impl ravel_ingest::LogIndexedFields for IndexedFieldConfig {
+    fn fields_for(&self, tenant: &TenantHash) -> Vec<String> {
+        IndexedFieldConfig::fields_for(self, tenant).to_vec()
+    }
+}
+
 /// Reject an empty or duplicate field name in one list. Order is preserved: the
 /// writer treats the list as a set, but keeping insertion order makes the
 /// startup log line read back the way the operator wrote it.
