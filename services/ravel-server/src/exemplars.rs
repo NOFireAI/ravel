@@ -42,17 +42,26 @@
 //!    The exemplar timestamp does not go through the sample path's
 //!    event-time clamp, so a stored exemplar can sit outside the object's
 //!    `min_event_ts_ns`/`max_event_ts_ns` and outside the commit record's
-//!    bounds. This endpoint resolves *the same snapshot the equivalent sample
-//!    query resolves* (`Catalog::resolve_pruned_with_accounting` over exactly
-//!    `[start, end]`, with the same equality-`__name__` pruning), and never
-//!    widens the window to chase a stray exemplar into an object the sample
-//!    query would not have fetched. That is the deliberate choice: deliverable
-//!    3 ("never fetch a segment the equivalent sample query would not") is an
-//!    invariant, exemplars are an illustrative/sampled signal by construction
-//!    (ADR-0047 decision 2), and widening would trade that invariant for a
-//!    rare edge case. Within a fetched object every exemplar is considered;
-//!    the returned set is then clamped to `[start, end]` by the exemplar's own
+//!    bounds. This endpoint resolves the snapshot over exactly `[start, end]`
+//!    (`Catalog::resolve_pruned_with_accounting`, with the same
+//!    equality-`__name__` pruning a sample query uses) and never widens the
+//!    window to chase a stray exemplar into an object it would not otherwise
+//!    fetch: exemplars are an illustrative/sampled signal by construction
+//!    (ADR-0047 decision 2), and widening would fetch more objects for a rare
+//!    edge case. Within a fetched object every exemplar is considered; the
+//!    returned set is then clamped to `[start, end]` by the exemplar's own
 //!    `ts_ns`, matching Prometheus' time-range contract.
+//!
+//!    The fetch set is the fixed `[start, end]` window. It is *not* the sample
+//!    path's `selector_fetch_window`: the `offset` and `@` modifiers do not
+//!    move it. This matches Prometheus, which ignores `offset` and `@` on
+//!    `/api/v1/query_exemplars` and reads the raw `start`/`end` window. So an
+//!    earlier statement that this endpoint "never fetches a segment the
+//!    equivalent sample query would not" holds only for a query with no
+//!    `offset`/`@`: `query=foo offset 1h` gives the sample path a window
+//!    shifted back one hour and this endpoint the raw `[start, end]`, two
+//!    disjoint windows. The behaviour is deliberate and Prometheus-compatible;
+//!    only that fetch-parity claim is narrowed.
 //!
 //! 2. **An exemplar carries no dedup priority.** During ADR-0018's overlap
 //!    window a snapshot can hold both an L1 part and its inputs, so the same
@@ -155,7 +164,9 @@ const DEFAULT_MAX_EXEMPLARS: usize = 100_000;
 
 /// Shared state for the exemplars route. Holds its own `Catalog` and object
 /// store handles (the same instances the PromQL engine uses, so an exemplar
-/// query resolves byte-for-byte the snapshot a sample query would), plus the
+/// query resolves byte-for-byte the snapshot a sample query would over the
+/// same `[start, end]` window; `offset`/`@` do not apply here, see the module
+/// doc data fact 1), plus the
 /// query engine's own budget knobs read from its [`EngineConfig`] so this
 /// endpoint honors the identical deadline and `max_segments` ceiling.
 #[derive(Clone)]
@@ -261,10 +272,12 @@ async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, ApiE
     Ok((StatusCode::OK, axum::Json(Envelope::success(series, stats))).into_response())
 }
 
-/// Resolves the snapshot the equivalent sample query would, reads exemplars
-/// from each matched segment, filters and deduplicates them, and groups them
-/// by series into the Prometheus response shape, alongside this request's
-/// cost counters (ADR-0044).
+/// Resolves the snapshot over the query's `[start, end]` window (the fixed
+/// exemplar fetch set; `offset`/`@` do not move it, matching Prometheus, see
+/// the module doc data fact 1), reads exemplars from each matched segment,
+/// filters and deduplicates them, and groups them by series into the
+/// Prometheus response shape, alongside this request's cost counters
+/// (ADR-0044).
 async fn collect_exemplars(
     state: &ExemplarsState,
     tenant_hash: TenantHash,
