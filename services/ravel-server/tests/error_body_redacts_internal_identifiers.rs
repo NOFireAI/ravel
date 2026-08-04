@@ -135,6 +135,7 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     let running = ravel_server::start(
         config,

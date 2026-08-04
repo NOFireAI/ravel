@@ -60,6 +60,7 @@ async fn start_test_server() -> ravel_server::Running {
         otap: true,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     ravel_server::start(
         config,
@@ -101,6 +102,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,
         },
+        deployment_key: None,
     };
     ravel_server::start(
         config,

@@ -94,6 +94,7 @@ fn log_state(
         ack_deadline: Duration::from_secs(5),
         admission,
         store,
+        recovery: None,
     }
 }
 

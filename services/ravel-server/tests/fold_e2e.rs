@@ -341,6 +341,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     let running = ravel_server::start(
         config,
@@ -458,6 +459,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     let running = ravel_server::start(
         config,

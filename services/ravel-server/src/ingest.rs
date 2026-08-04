@@ -23,6 +23,10 @@ pub struct IngestState {
     /// upstream of `handle_export`, at the transport handler, on undecoded
     /// wire bytes.
     pub admission: Arc<AdmissionController>,
+    /// Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
+    /// bucket. `handle_export` ensures the tenant's manifest before its first
+    /// write; `None` (an unkeyed bucket) is a no-op.
+    pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
 }
 
 pub struct IngestOutcome {
@@ -79,6 +83,11 @@ pub async fn handle_export(
     request: ExportMetricsServiceRequest,
     ingest_ts_ns: i64,
 ) -> Result<IngestOutcome, IngestRequestError> {
+    // Record the tenant's recovery manifest on its first write in this process
+    // (ADR-0050 section 3). Best-effort and off the durability path: see
+    // `crate::tenancy::ensure_recovery_manifest`.
+    crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, ingest_ts_ns).await;
+
     let normalized = normalize_metrics(&tenant, request, &state.limits, ingest_ts_ns);
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
@@ -229,6 +238,7 @@ mod tests {
                 Arc::new(SystemClock),
                 AdmissionLimits::default(),
             )),
+            recovery: None,
         }
     }
 
@@ -354,5 +364,63 @@ mod tests {
         .await
         .expect("empty request never fails");
         assert!(outcome.response.partial_success.is_none());
+    }
+
+    /// EC3/#566 finding 2: on a keyed bucket, a tenant's first ingest write must
+    /// record its recovery manifest. This drives the real `handle_export`
+    /// through an `IngestState` carrying a `RecoveryManifestWriter`, then
+    /// asserts `sys/t/<tenant_hash>` exists and decrypts to the tenant id. It is
+    /// the wiring, not the writer's own round-trip (unit-tested in `tenancy`),
+    /// that this proves.
+    #[tokio::test]
+    async fn first_ingest_write_records_recovery_manifest_on_keyed_bucket() {
+        use ravel_object_store::GetRange;
+        use ravel_types::TenantHashScheme;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let key = Box::new([0x5Au8; 32]);
+        let writer = Arc::new(crate::tenancy::RecoveryManifestWriter::new(
+            store.clone(),
+            key.clone(),
+        ));
+        let router = Arc::new(IngestRouter::new(
+            IngestConfig::default(),
+            store.clone(),
+            Signal::Metrics,
+            Arc::new(SystemClock),
+        ));
+        let state = IngestState {
+            router,
+            limits: IngestLimits::default(),
+            ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            recovery: Some(writer),
+        };
+
+        let tenant = TenantId::new("acme");
+        handle_export(
+            &state,
+            tenant.clone(),
+            WriteMode::Buffered,
+            empty_request(),
+            1_000,
+        )
+        .await
+        .expect("ingest succeeds");
+
+        let hash = TenantHashScheme::v2_from_deployment_key(&key).hash(&tenant);
+        let obj = store
+            .get(
+                &crate::tenancy::recovery_manifest_key(&hash),
+                GetRange::Full,
+            )
+            .await
+            .expect("recovery manifest must exist after the first write");
+        let recovered = crate::tenancy::open_recovery_manifest(&key, &hash, &obj.data)
+            .expect("manifest decrypts under the deployment key");
+        assert_eq!(recovered, tenant, "manifest recovers the tenant id");
     }
 }

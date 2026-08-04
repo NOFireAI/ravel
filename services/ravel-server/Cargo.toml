@@ -19,6 +19,21 @@ ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-analytics = { workspace = true }
+# Prost types for the sys/tenancy marker and the recovery manifest
+# (ADR-0050 section 3, proto/ravel/sys.proto).
+ravel-proto = { workspace = true }
+# The sys/tenancy fingerprint hex in startup-refusal errors, and the tenant
+# hash hex in recovery-manifest keys.
+hex = { workspace = true }
+# The recovery-manifest writer's per-process "seen tenant" set.
+parking_lot = { workspace = true }
+# AES-256-GCM for the per-tenant recovery manifest (ADR-0050 section 3). ring
+# is already in this workspace's dependency graph (kube's TLS backend, rustls);
+# pinned directly here rather than through `[workspace.dependencies]` for the
+# same reason `toml` and `reqwest` above are (the workspace root Cargo.toml is
+# outside this task's scope). No new crate enters Cargo.lock: 0.17.x is already
+# resolved.
+ring = "0.17"
 # OTAP (OpenTelemetry Arrow) ingest, linked only by the `otap` feature. It
 # pulls the arrow / arrow-ipc dependency tree, so it stays out of the default
 # build (docs/otap-ingest.md risk mitigation).
@@ -44,6 +59,9 @@ toml = "1"
 humantime = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
+# Typed startup-pinning and recovery-manifest errors (ADR-0050 section 3,
+# tenancy.rs); every variant is a specific, named startup refusal.
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }

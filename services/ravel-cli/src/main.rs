@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
-use ravel_cli::{catalog, hold, idem, maintain, now_ns, store};
+use ravel_cli::{catalog, hold, idem, maintain, now_ns, store, tenancy};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, kind};
@@ -43,8 +43,54 @@ struct Cli {
     #[command(flatten)]
     store: store::StoreArgs,
 
+    #[command(flatten)]
+    tenancy: TenancyArgs,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Global tenant-hash scheme selection (ADR-0050 section 3, EC3/#566). Every
+/// subcommand that computes a `t/<tenant_hash>/` prefix resolves the bucket's
+/// scheme from `sys/tenancy` before running (see `resolve_and_install_scheme`);
+/// these flags supply the deployment key, or the unkeyed opt-out, that
+/// resolution needs, mirroring the server's own startup flags. A keyed bucket
+/// run with neither flag refuses rather than hashing under the wrong (v1)
+/// derivation. `tenancy show` needs neither and takes its own key flag: it
+/// reads the marker directly to discover the scheme in the first place.
+///
+/// These are top-level flags, given before the subcommand
+/// (`ravel-cli --tenant-hash-key-file k hold set ...`); they are intentionally
+/// not `global` so they cannot collide with `tenancy show`'s own key flag.
+#[derive(Debug, Parser)]
+struct TenancyArgs {
+    /// Path to the bucket's 32-byte deployment key (64 hex characters or 32 raw
+    /// bytes), needed to address a v2-keyed bucket's tenant prefixes.
+    #[arg(long, value_name = "PATH")]
+    tenant_hash_key_file: Option<std::path::PathBuf>,
+
+    /// Assert the bucket is v1-unkeyed. An unkeyed or absent marker resolves to
+    /// v1 without this, but it makes the expectation explicit; mutually
+    /// exclusive with --tenant-hash-key-file.
+    #[arg(long)]
+    tenant_hash_unkeyed: bool,
+}
+
+/// Whether a subcommand computes a `t/<tenant_hash>/` prefix and therefore
+/// needs the bucket's scheme resolved and installed first (EC3/#566). The
+/// inspection commands that take an explicit object key or a local file, and
+/// `tenancy show` (which reads the marker directly), do not.
+fn command_hashes_tenant(command: &Command) -> bool {
+    match command {
+        Command::Catalog { .. } | Command::Maintain { .. } | Command::Hold { .. } => true,
+        Command::Segment { .. }
+        | Command::Rlog { .. }
+        | Command::Rspan { .. }
+        | Command::Commit { .. }
+        | Command::Store { .. }
+        | Command::Idem { .. }
+        | Command::Tenancy { .. } => false,
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -96,6 +142,11 @@ enum Command {
         #[command(subcommand)]
         command: IdemCommand,
     },
+    /// Inspect the bucket's tenant-hash scheme marker (ADR-0050 section 3).
+    Tenancy {
+        #[command(subcommand)]
+        command: TenancyCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -141,6 +192,20 @@ enum IdemCommand {
     Inspect {
         /// Object store key of the marker.
         key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TenancyCommand {
+    /// Print the bucket's `sys/tenancy` marker: its scheme and, for a keyed
+    /// bucket, the key fingerprint. With `--tenant-hash-key-file`, also
+    /// derives that key's fingerprint and reports whether it matches the
+    /// marker (the same wrong-key check the server makes at startup, offline).
+    Show {
+        /// Optional 32-byte deployment key file (64 hex chars or 32 raw
+        /// bytes) to verify against the marker's fingerprint.
+        #[arg(long, value_name = "PATH")]
+        tenant_hash_key_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -291,6 +356,25 @@ enum CatalogCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // EC3/#566: before running any subcommand that computes a tenant hash,
+    // resolve the bucket's real tenant-hash scheme from `sys/tenancy` and
+    // install it process-wide. Without this every hashing command silently
+    // used the v1-unkeyed default, so on a v2-keyed bucket it addressed the
+    // wrong `t/` prefix (a legal hold written where the server's sweeper never
+    // looks, for example). A keyed bucket with no key configured refuses here
+    // rather than proceeding under the wrong derivation.
+    if command_hashes_tenant(&cli.command) {
+        let store = store::build_store(&cli.store)?;
+        let configured = tenancy::configured_scheme_from_flags(
+            cli.tenancy.tenant_hash_key_file.as_deref(),
+            cli.tenancy.tenant_hash_unkeyed,
+        )?;
+        let scheme = tenancy::resolve_scheme(store.as_ref(), configured).await?;
+        ravel_types::install_tenant_hash_scheme(scheme)
+            .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
+    }
+
     match cli.command {
         Command::Segment {
             command: SegmentCommand::Inspect { path },
@@ -466,6 +550,19 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let report = idem::inspect(store::build_store(&cli.store)?, &key).await?;
             println!("{report}");
+            Ok(())
+        }
+        Command::Tenancy {
+            command: TenancyCommand::Show {
+                tenant_hash_key_file,
+            },
+        } => {
+            let report = tenancy::show(
+                store::build_store(&cli.store)?,
+                tenant_hash_key_file.as_deref(),
+            )
+            .await?;
+            print!("{report}");
             Ok(())
         }
     }

@@ -39,6 +39,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
         .await
@@ -279,6 +280,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         oidc_refresh: None,
         otap: false,
         metrics_tenant_labels: tenant_labels,
+        deployment_key: None,
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,

@@ -28,6 +28,9 @@ pub struct SpanIngestState {
     /// 5), the span-pipeline counterpart of
     /// [`crate::logs_ingest::LogIngestState::store`].
     pub store: Arc<dyn ObjectStoreBackend>,
+    /// Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
+    /// bucket. Ensured before the first write; `None` (unkeyed) is a no-op.
+    pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
 }
 
 pub struct SpanIngestOutcome {
@@ -111,6 +114,9 @@ pub async fn handle_export_traces(
     {
         return Err(SpanIngestRequestError::InvalidIdempotencyKey { len: key.len() });
     }
+    // Record the tenant's recovery manifest on its first write (ADR-0050
+    // section 3), best-effort and off the durability path.
+    crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, ingest_ts_ns).await;
     // One hour-bucket computation shared by the lookup and the marker write.
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
 
@@ -307,6 +313,7 @@ mod tests {
             limits: SpanIngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
             store,
+            recovery: None,
         }
     }
 

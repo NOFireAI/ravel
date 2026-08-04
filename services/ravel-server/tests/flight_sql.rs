@@ -456,6 +456,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
         otap: false,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
+        deployment_key: None,
     };
     let running = ravel_server::start(
         config,

@@ -34,6 +34,9 @@ pub struct LogIngestState {
     /// 5). The router owns its own handle for flushes; the marker path needs
     /// one at the gateway, outside any shard actor.
     pub store: Arc<dyn ObjectStoreBackend>,
+    /// Recovery-manifest writer (ADR-0050 section 3), `Some` only on a keyed
+    /// bucket. Ensured before the first write; `None` (unkeyed) is a no-op.
+    pub recovery: Option<Arc<crate::tenancy::RecoveryManifestWriter>>,
 }
 
 #[derive(Debug)]
@@ -128,6 +131,9 @@ pub async fn handle_export_logs(
     {
         return Err(LogIngestRequestError::InvalidIdempotencyKey { len: key.len() });
     }
+    // Record the tenant's recovery manifest on its first write (ADR-0050
+    // section 3), best-effort and off the durability path.
+    crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, ingest_ts_ns).await;
     // One hour-bucket computation, shared by the lookup and the marker write
     // so they cannot drift within a request (see `request_ingest_hour_bucket`).
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
@@ -364,6 +370,7 @@ mod tests {
                 AdmissionLimits::default(),
             )),
             store,
+            recovery: None,
         }
     }
 

@@ -32,3 +32,9 @@ pub mod logseg {
         include!(concat!(env!("OUT_DIR"), "/ravel.logseg.v1.rs"));
     }
 }
+
+pub mod sys {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/ravel.sys.v1.rs"));
+    }
+}

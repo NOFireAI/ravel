@@ -15,6 +15,18 @@ use ravel_server::{
 };
 use tracing_subscriber::EnvFilter;
 
+/// Wall-clock unix nanoseconds for stamping the `sys/tenancy` marker's
+/// informational `created_unix_ns` at bootstrap. This is the binary entry
+/// point, not library logic, so a direct clock read here does not violate the
+/// injected-time rule the library crates follow.
+fn now_unix_ns() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -41,6 +53,33 @@ async fn main() -> anyhow::Result<()> {
     let otap = cli.otap;
     #[cfg(not(feature = "otap"))]
     let otap = false;
+
+    // Every object-store call this process makes is counted by the decorator
+    // `build_store` wraps the backend in (issue #272), and the same handle is
+    // served at `GET /metrics` and attached to the query fetchers below. Built
+    // here, before any tenant is hashed, because the tenancy scheme is resolved
+    // from `sys/tenancy` on this store and must be installed before the first
+    // `TenantId::hash()` (which `merge_fold_tenants` below performs).
+    let (store, store_metrics, cache) =
+        ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
+
+    // Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the bucket's
+    // scheme from `sys/tenancy` (writing the marker for a fresh or pre-ADR
+    // bucket) and install it process-wide. A configured scheme or key that
+    // disagrees with an existing marker is a startup refusal here, before any
+    // listener binds, so a wrong key is a failed deploy rather than a silent
+    // parallel namespace.
+    let tenancy_config = cli.resolve_tenancy_config()?;
+    let resolved_tenancy =
+        ravel_server::tenancy::resolve_and_pin(store.as_ref(), tenancy_config, now_unix_ns())
+            .await
+            .context("failed to resolve the bucket's tenant-hash scheme (sys/tenancy)")?;
+    ravel_types::install_tenant_hash_scheme(resolved_tenancy.scheme.clone())
+        .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
+    // Retained for the recovery-manifest writer (ADR-0050 section 3): `Some`
+    // only on a keyed bucket. `start` builds the writer from it and wires it
+    // into every ingest path.
+    let deployment_key = resolved_tenancy.deployment_key;
 
     let tenant_tokens = cli.parse_tenant_tokens()?;
     // Fold and maintenance derive their tenant set from storage each cycle
@@ -93,16 +132,6 @@ async fn main() -> anyhow::Result<()> {
         cli.dev_insecure_tenant_header,
         auth,
     )?;
-    // Every object-store call this process makes is counted by the decorator
-    // `build_store` wraps the backend in (issue #272). Held for the whole
-    // process lifetime and threaded into `start` below, which serves it at
-    // `GET /metrics` (issue #423).
-    // Attached to the query fetchers via `ravel_server::start` below (ADR-0046);
-    // built here so `--cache-max-bytes`/`--disable-cache` are validated at the
-    // same startup point as every other flag.
-    let (store, store_metrics, cache) =
-        ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
-
     // Retention windows are validated at startup against the ADR-0019 floor,
     // using the SAME max_ingest_lag this process's catalog resolve window uses
     // (ravel_catalog::CatalogConfig, the value query::build_catalog builds the
@@ -213,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         otap,
         limits,
         metrics_tenant_labels: cli.metrics_tenant_labels,
+        deployment_key,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;
