@@ -187,12 +187,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30m, not 20m: four separate, mutually non-sharing compile
+    # configurations (arrow, parquet, object_store, datafusion, arrow-flight
+    # all appear across the four probes) with no shared incremental state.
+    timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
@@ -771,7 +775,13 @@ jobs:
           fetch-depth: 0
       - id: dockerfile-changed
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # merge_group events carry merge_group.base_sha, not event.before;
+          # diff against that instead of falling into the empty-base branch
+          # below, which would force this ~57m image build on every single
+          # queued merge regardless of whether Dockerfile actually changed.
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            base="${{ github.event.merge_group.base_sha }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
           else
             base="${{ github.event.before }}"
@@ -842,8 +852,8 @@ jobs:
       - name: Measure coverage
         run: |
           cargo llvm-cov --locked --no-report --workspace
-          cargo llvm-cov report --workspace --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --workspace --summary-only --json --output-path coverage.json
+          cargo llvm-cov report --locked | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --locked --summary-only --json --output-path coverage.json
       # Updates the badge data gist read by the README's shields.io endpoint
       # badge. Only on pushes to main, since the badge reflects main's state
       # and pull_request runs (including from forks) never see GIST_PAT.
