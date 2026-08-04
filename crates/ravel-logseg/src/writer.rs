@@ -85,12 +85,32 @@ pub struct RlogWriter {
 
 /// Counters describing one write beyond what the object bytes themselves
 /// already record.
+///
+/// The POSTINGS counters here are the write-side half of the ADR-0049 metrics
+/// (issue #511). They are deliberately shaped so a `/metrics` renderer can
+/// aggregate them without a per-field label, which the ADR-0044 label
+/// allowlist forbids: `postings_distinct_total` over `postings_indexed_fields`
+/// yields a mean distinct-per-field, and `postings_distinct_max` the tail,
+/// with no field name ever leaving this struct.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriteStats {
     /// Indexed fields dropped from POSTINGS in this object for exceeding
     /// `RlogConfig::postings_max_distinct`
     /// (docs/adrs/0049-rlog-postings.md decision 4).
     pub postings_capped_fields: u32,
+    /// Encoded byte length of this object's POSTINGS section, or 0 when the
+    /// object carries none (no indexed field resolved to a dynamic column).
+    pub postings_bytes: u64,
+    /// Number of indexed fields that emitted a (non-capped) posting list in
+    /// this object. The denominator for a per-field distinct-value average; a
+    /// capped field is excluded (its term dictionary was dropped).
+    pub postings_indexed_fields: u32,
+    /// Sum of distinct values across every non-capped indexed field's term
+    /// dictionary in this object.
+    pub postings_distinct_total: u64,
+    /// Largest distinct-value count of any single non-capped indexed field in
+    /// this object, or 0 when no field emitted a posting list.
+    pub postings_distinct_max: u32,
 }
 
 /// The maximum byte length of a string value inserted into the bloom by exact
@@ -473,14 +493,25 @@ impl RlogWriter {
         // never appeared in this object -- also always-legal).
         let postings_capped_fields = postings_capped.len() as u32;
         let mut postings_fields: BTreeMap<u32, FieldTerms> = BTreeMap::new();
+        // Per-field distinct-value accounting for WriteStats (issue #511): a
+        // non-capped field's distinct count is the size of its term
+        // dictionary. Summed and maxed here, never labelled by field name (the
+        // ADR-0044 allowlist forbids a `field` label), so the `/metrics`
+        // renderer can only ever expose a mean and a tail, not a per-field
+        // series.
+        let mut postings_indexed_fields: u32 = 0;
+        let mut postings_distinct_total: u64 = 0;
+        let mut postings_distinct_max: u32 = 0;
         for &cid in &indexed_column_ids {
             if postings_capped.contains(&cid) {
                 postings_fields.insert(cid, FieldTerms::Capped);
             } else {
-                postings_fields.insert(
-                    cid,
-                    FieldTerms::Terms(postings_terms.remove(&cid).unwrap_or_default()),
-                );
+                let map = postings_terms.remove(&cid).unwrap_or_default();
+                let distinct = map.len() as u32;
+                postings_indexed_fields += 1;
+                postings_distinct_total += u64::from(distinct);
+                postings_distinct_max = postings_distinct_max.max(distinct);
+                postings_fields.insert(cid, FieldTerms::Terms(map));
             }
         }
 
@@ -518,12 +549,14 @@ impl RlogWriter {
             kind::BLOOM,
             &Stored::raw(encode_bloom_section(&bloom_entries)),
         );
+        let mut postings_bytes_len: u64 = 0;
         if !indexed_column_ids.is_empty() {
             let postings_bytes = encode_postings_section(
                 &postings_fields,
                 self.cfg.postings_stride,
                 self.cfg.zstd_level,
             )?;
+            postings_bytes_len = postings_bytes.len() as u64;
             push_section(
                 &mut object,
                 &mut sections,
@@ -559,6 +592,10 @@ impl RlogWriter {
             object,
             WriteStats {
                 postings_capped_fields,
+                postings_bytes: postings_bytes_len,
+                postings_indexed_fields,
+                postings_distinct_total,
+                postings_distinct_max,
             },
         ))
     }
@@ -1139,6 +1176,47 @@ mod tests {
     }
 
     #[test]
+    fn write_stats_report_postings_bytes_and_distinct_counts() {
+        // Two indexed fields, "svc" with 5 distinct values and "env" with 2.
+        // The write-side POSTINGS metrics (issue #511) must report both fields,
+        // the summed distinct count (7), the per-field maximum (5), and a
+        // non-zero section byte length.
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity())
+            .with_indexed_fields(vec!["svc".to_string(), "env".to_string()]);
+        for i in 0..20i64 {
+            let mut r = base_record(0, i);
+            r.attrs
+                .push(("svc".into(), AttrValue::Str(format!("s{}", i % 5))));
+            r.attrs
+                .push(("env".into(), AttrValue::Str(format!("e{}", i % 2))));
+            w.push(r).expect("push");
+        }
+        let (_obj, stats) = w.finish_with_stats().expect("finish");
+        assert_eq!(stats.postings_capped_fields, 0);
+        assert_eq!(stats.postings_indexed_fields, 2, "svc and env both indexed");
+        assert_eq!(stats.postings_distinct_total, 7, "5 (svc) + 2 (env)");
+        assert_eq!(stats.postings_distinct_max, 5, "svc is the wider field");
+        assert!(
+            stats.postings_bytes > 0,
+            "an object carrying postings reports a non-zero section length"
+        );
+    }
+
+    #[test]
+    fn write_stats_report_no_postings_when_no_field_configured() {
+        // No indexed fields: no POSTINGS section, so every write-side POSTINGS
+        // counter reports zero (absence is always legal, decision 5).
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.push(base_record(0, 0)).expect("push");
+        let (_obj, stats) = w.finish_with_stats().expect("finish");
+        assert_eq!(stats, WriteStats::default());
+    }
+
+    #[test]
     fn postings_cap_drops_field_and_raises_counter() {
         // 50 distinct values, cap of 2: the field must be dropped, the
         // counter must fire, and the field must read back as "not indexed"
@@ -1158,6 +1236,11 @@ mod tests {
         }
         let (obj, stats) = w.finish_with_stats().expect("finish");
         assert_eq!(stats.postings_capped_fields, 1);
+        // A capped field contributes no term dictionary, so it is excluded from
+        // the distinct-value accounting entirely (issue #511).
+        assert_eq!(stats.postings_indexed_fields, 0);
+        assert_eq!(stats.postings_distinct_total, 0);
+        assert_eq!(stats.postings_distinct_max, 0);
 
         let footer = open(&obj).expect("open");
         let fd = read_field_dir(&obj, &footer);
