@@ -92,15 +92,15 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use ravel_catalog::Catalog;
+use ravel_catalog::{Catalog, SegmentLevel, SegmentRef};
 use ravel_ingest::Clock;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series, plan_selectors};
 use ravel_query::http::{QueryErrorResponse, TenantResolver};
 use ravel_query::{QueryEngine, QueryError};
 use ravel_segment::{
-    ExemplarRecord, ReaderLimits, SeriesEntryV4, decode_catalog_v5, decode_exemplars_section,
-    open_from_full,
+    ExemplarRecord, ExpectedIdentity, Footer, ReaderLimits, SeriesEntryV4, check_identity,
+    decode_catalog_v5, decode_exemplars_section, open_from_full,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{
@@ -327,7 +327,7 @@ async fn collect_exemplars(
         read_segment_exemplars(
             state,
             tenant_hash,
-            &seg.data_object_key,
+            seg,
             &matcher_sets,
             start_ns,
             end_ns,
@@ -359,7 +359,7 @@ async fn collect_exemplars(
 async fn read_segment_exemplars(
     state: &ExemplarsState,
     tenant_hash: TenantHash,
-    data_object_key: &str,
+    seg: &SegmentRef,
     matcher_sets: &[Vec<LabelMatcher>],
     start_ns: i64,
     end_ns: i64,
@@ -367,7 +367,7 @@ async fn read_segment_exemplars(
     seen: &mut HashSet<(SeriesId, i64, [u8; 16])>,
     collected: &mut Vec<(SeriesId, LabelSet, ExemplarRecord)>,
 ) -> Result<(), ApiError> {
-    let _ = tenant_hash; // resolution already scoped the snapshot to the tenant.
+    let data_object_key = seg.data_object_key.as_str();
     let limits = ReaderLimits::default();
 
     // One whole-object GET per matched segment, recorded at the same funnel
@@ -385,6 +385,16 @@ async fn read_segment_exemplars(
 
     let loc = open_from_full(&object, limits).map_err(|source| corrupt(data_object_key, source))?;
     let footer = &loc.footer;
+
+    // ADR-0010 section 7 footer identity check, the same one the sample path
+    // performs in `SegmentFetcher::open_segment`. Key-prefix reconstruction
+    // above catches a wrong-prefix object; this catches an object whose
+    // *content* belongs to another tenant sitting under this tenant's key (a
+    // writer or key-reconstruction fault). Without it `/api/v1/query` returns
+    // `Corrupt` on the same input while this endpoint would serve the foreign
+    // exemplars, trace ids included. Level-aware, matching the fetcher.
+    verify_segment_identity(footer, tenant_hash, seg)
+        .map_err(|source| corrupt(data_object_key, source))?;
 
     // No EXEMPLARS section means the object has no exemplars (ADR-0047
     // decision 1); skip the catalog decode entirely.
@@ -579,6 +589,78 @@ fn shared_equality_name_filter(matcher_sets: &[Vec<LabelMatcher>]) -> Option<Str
         }
     }
     shared.map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Segment identity verification (ADR-0010 section 7)
+// ---------------------------------------------------------------------------
+
+/// Verifies the opened footer's identity against the commit/compaction record
+/// the [`SegmentRef`] was reconstructed from, the same level-aware check the
+/// sample path runs in `SegmentFetcher::open_segment`
+/// (docs/compaction-retention-plan.md section 3.5). An L0 ref checks the
+/// footer's writer identity via [`check_identity`]; an L1 part has no writer
+/// identity of its own, so tenant/shard/ingest_hour/input_set_hash/part_index
+/// and `level == 1` are checked instead. Returns
+/// [`SegmentError::IdentityMismatch`](ravel_segment::SegmentError) naming the
+/// first mismatching field, which the caller maps to a `Corrupt` fetch error.
+fn verify_segment_identity(
+    footer: &Footer,
+    tenant_hash: TenantHash,
+    seg: &SegmentRef,
+) -> Result<(), ravel_segment::SegmentError> {
+    match &seg.level {
+        SegmentLevel::L0 => {
+            let expected = ExpectedIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: seg.shard,
+                writer_id: seg.writer_id.to_string(),
+                writer_epoch: seg.writer_epoch,
+                writer_seq: seg.writer_seq,
+            };
+            check_identity(footer, &expected)
+        }
+        SegmentLevel::L1 {
+            input_set_hash,
+            part_index,
+        } => verify_l1_identity(footer, tenant_hash, seg, input_set_hash, *part_index),
+    }
+}
+
+/// L1-part footer identity check, mirroring `ravel_query`'s crate-private
+/// `verify_l1_identity` (which this endpoint cannot import). A part carries no
+/// writer identity, so these five fields plus `level == 1` are its identity
+/// (docs/compaction-retention-plan.md section 3.5).
+fn verify_l1_identity(
+    footer: &Footer,
+    tenant_hash: TenantHash,
+    seg: &SegmentRef,
+    input_set_hash: &[u8; 32],
+    part_index: u32,
+) -> Result<(), ravel_segment::SegmentError> {
+    if footer.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("tenant_hash"));
+    }
+    if footer.shard != seg.shard {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("shard"));
+    }
+    if footer.ingest_hour_bucket != seg.ingest_hour_bucket {
+        return Err(ravel_segment::SegmentError::IdentityMismatch(
+            "ingest_hour_bucket",
+        ));
+    }
+    if footer.input_set_hash.as_slice() != input_set_hash.as_slice() {
+        return Err(ravel_segment::SegmentError::IdentityMismatch(
+            "input_set_hash",
+        ));
+    }
+    if footer.part_index != part_index {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("part_index"));
+    }
+    if footer.level != 1 {
+        return Err(ravel_segment::SegmentError::IdentityMismatch("level"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1283,71 @@ mod tests {
             .expect("publish");
     }
 
+    /// Writes a segment whose footer `SegmentIdentity` carries `footer_tenant`'s
+    /// hash, but publishes it under `record_tenant`'s commit record and
+    /// reconstructed data key. This is the shape of a writer or
+    /// key-reconstruction fault: one tenant's content sitting under another
+    /// tenant's key prefix. Every field except the footer tenant hash agrees
+    /// with the record, so the ADR-0010 section 7 check fails on exactly that
+    /// field (F5).
+    async fn publish_segment_footer_mismatch(
+        store: &MemoryStore,
+        record_tenant: &TenantId,
+        footer_tenant: &TenantId,
+        writer_seq: u64,
+        series: Vec<SeriesInputV3>,
+        exemplars: Vec<ExemplarInput>,
+    ) {
+        let record_hash = record_tenant.hash();
+        let shard = 0u32;
+        let writer_id = Uuid::new_v4();
+        let hour_bucket = u32::try_from(NOW / NS_PER_HOUR).expect("hour bucket");
+
+        let identity = SegmentIdentity {
+            // The foreign tenant hash: the whole point of the test.
+            tenant_hash: footer_tenant.hash().0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: NOW,
+            max_ingest_ts_ns: NOW,
+        };
+        let written: WrittenSegment =
+            SegmentWriter::write_histograms_with_exemplars(series, identity, bounds, exemplars)
+                .expect("write segment");
+
+        let new_record = NewCommitRecord {
+            tenant_hash: record_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: NOW,
+            max_ingest_ts_ns: NOW,
+            segment_format_version: 6,
+            created_unix_ns: NOW,
+            ingest_hour_bucket: hour_bucket,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
     /// Wraps a store and sleeps before every `get`/`list`, so a query issued
     /// under a tiny wall deadline actually yields past it. Lets the deadline
     /// test force a real elapsed timeout deterministically rather than racing
@@ -1709,6 +1856,39 @@ mod tests {
                 "{token} must never see the other tenant's trace id"
             );
         }
+    }
+
+    /// F5: the ADR-0010 section 7 footer identity check. An object whose
+    /// footer `SegmentIdentity` carries a foreign tenant hash, published under
+    /// this tenant's key, must error rather than serve its exemplars.
+    /// Key-prefix reconstruction alone would hand the foreign trace ids to this
+    /// caller; the content-level identity check stops it, exactly as
+    /// `/api/v1/query` returns `Corrupt` on the same input.
+    #[tokio::test]
+    async fn foreign_tenant_footer_is_rejected_not_served() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        // Footer says tenant-b; commit record and data key say tenant-a.
+        publish_segment_footer_mismatch(&store, &tenant(), &tenant_b(), 1, vec![series], vec![ex])
+            .await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        // A corrupt/identity fault maps to 500 internal, the same class
+        // `/api/v1/query` surfaces; never a 200 serving the foreign data.
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a foreign-tenant footer must be a corruption error, not served: {body}"
+        );
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["errorType"], "internal");
+        // The foreign exemplar's trace id must never reach the response body.
+        assert!(
+            !body.to_string().contains("0a1b2c3d4e5f60718293a4b5c6d7e8f9"),
+            "the foreign trace id must not leak: {body}"
+        );
     }
 
     /// The accounting filled during the request reaches the client: `stats`
