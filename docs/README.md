@@ -18,6 +18,10 @@ Start here to run Ravel, ingest into it, or query it.
 - [guides/query.md](guides/query.md): the five `/api/v1` endpoints, the
   supported PromQL subset, query budgets, and HTTP status codes. Read this
   to read data back out.
+- [guides/correlation.md](guides/correlation.md): how an exemplar links a
+  metric sample to a trace. It covers the storage, the admission cap, the query
+  over `/api/v1/query_exemplars`, and the Grafana metric-to-trace link. Read
+  this to go from a metric point to its trace.
 - [guides/operations.md](guides/operations.md): full `ravel-server`/`ravel-cli`
   flag and env reference, storage backend setup, tenancy, the disposability
   model, and what garbage collection does and does not do today. Read this to
