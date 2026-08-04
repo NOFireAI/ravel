@@ -218,7 +218,15 @@ mod tests {
 
     fn identity() -> ObjectIdentity {
         ObjectIdentity {
-            tenant_hash: [1u8; 16],
+            // Must match the `TenantHash([7u8; 16])` every provider in these
+            // tests is constructed with: issue #612 added a footer tenant_hash
+            // check on the RLOG read path (`fetch_accounted_with_tenant`, which
+            // `LogsScanExec` calls), so an object whose footer names a different
+            // tenant than the fetch now fails closed with
+            // `LogFetchError::Corrupt(IdentityMismatch("tenant_hash"))`. These
+            // fixtures previously wrote `[1u8; 16]` and only passed because the
+            // check did not exist.
+            tenant_hash: [7u8; 16],
             shard: 0,
             writer_id: [2u8; 16],
             writer_epoch: 1,
