@@ -26,6 +26,11 @@ Start here to run Ravel, ingest into it, or query it.
   flag and env reference, storage backend setup, tenancy, the disposability
   model, and what garbage collection does and does not do today. Read this to
   deploy or operate Ravel.
+- [guides/observability.md](guides/observability.md): the `GET /metrics`
+  Prometheus endpoint -- every metric family it renders, the closed label
+  allowlist and the `tenant_hash="other"` fold, how to read the per-query
+  cost estimate against the actual, and three worked diagnosis procedures.
+  Read this to understand a sample on `/metrics`.
 - [guides/caching.md](guides/caching.md): the ADR-0046 read cache -- what it
   stores, its CLI flags, startup warmup, its `/metrics` counters, and its
   known gaps (the disk tier, spans, `alerts`/`audit`). Read this to size or
