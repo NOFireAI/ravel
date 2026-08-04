@@ -177,8 +177,15 @@ from SQL, and it is named here rather than assumed.
   section kind is additive and needs no bump; a change to an existing
   section's grammar, or to the trailer, does.
 - Object size grows only for tenants that configure indexed fields.
-  Indicative: 5 to 15% of object size for a four-field list, to be
-  measured before the default list is set.
+  Indicative at the time of writing: 5 to 15% of object size for a four-field
+  list, to be measured before the default list is set. **Measured (issue #511,
+  see BENCHMARKS.md "RLOG POSTINGS storage overhead"): 0.10% for a realistic
+  four-field list over a 64k-record object.** The 5-to-15% estimate did not
+  hold; it was a guess made before the block-granularity design existed and is
+  roughly two orders of magnitude too high. POSTINGS scales with distinct
+  values times blocks, both small for the low-cardinality default fields, and a
+  high-cardinality field is bounded by the per-field distinct-value cap
+  (decision 4) rather than by any percentage budget.
 - Compaction gains work: postings are rebuilt, not merged.
 - Query planning gains an index-selection step: with several indexed
   predicates, intersect the smallest posting lists first.
