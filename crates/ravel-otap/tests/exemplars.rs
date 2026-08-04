@@ -1,8 +1,10 @@
-//! Exemplar admission on the OTAP path (ADR-0047 decisions 1 and 2, issue
-//! #473): the `HISTOGRAM_DP_EXEMPLARS` table's own columns are carried into
-//! `ravel_types::Exemplar` values, capped at one per series per window by the
-//! caller's `ExemplarCap`, and whatever the cap turns away keeps incrementing
-//! the pre-existing `HistogramExemplarsDropped` counter.
+//! Exemplar admission on the OTAP path (ADR-0047 decisions 1 and 2, issues
+//! #473 and #539): the `HISTOGRAM_DP_EXEMPLARS` and `NUMBER_DP_EXEMPLARS`
+//! tables' own columns are carried into `ravel_types::Exemplar` values, capped
+//! at one per series per window by the caller's `ExemplarCap`, and whatever the
+//! cap turns away keeps incrementing the pre-existing
+//! `HistogramExemplarsDropped` counter (which, despite the name, has always
+//! covered every metric type; see its doc comment in `ravel_otlp`).
 //!
 //! Most cases go through the test encoder, so they exercise the real Arrow IPC
 //! round trip. The ones a fixed encoder schema cannot express (a wrong-width
@@ -22,12 +24,12 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use proptest::prelude::*;
 
 use ravel_otap::encode::{
-    AttrRow, AttrValue, ExemplarRow, ExemplarValue, HistogramMetricRow, HistogramPointRow,
-    MetricsStreamEncoder,
+    AttrRow, AttrValue, DataPointRow, ExemplarRow, ExemplarValue, HistogramMetricRow,
+    HistogramPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
 };
 use ravel_otap::normalize::{
-    AGGREGATION_TEMPORALITY_CUMULATIVE, METRIC_TYPE_HISTOGRAM, normalize_decoded,
-    normalize_decoded_with_exemplars,
+    AGGREGATION_TEMPORALITY_CUMULATIVE, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM,
+    normalize_decoded, normalize_decoded_with_exemplars,
 };
 use ravel_otap::proto::experimental::arrow::v1::ArrowPayloadType;
 use ravel_otap::stream::{DecodedBatch, StreamConfig, StreamState};
@@ -83,9 +85,19 @@ fn exemplar_row(ts_ns: i64, value: f64, trace_id: Option<[u8; 16]>) -> ExemplarR
 /// with the caller's cap. A fresh encoder per call keeps each test's schema
 /// generation independent, exactly as `differential.rs` does.
 fn normalize(histograms: &[HistogramMetricRow], cap: &mut ExemplarCap) -> MetricsNormalizeResult {
+    normalize_ext(&[], histograms, cap)
+}
+
+/// [`normalize`] with gauge/sum metrics too, for the `NUMBER_DP_EXEMPLARS`
+/// cases (issue #539). Same real IPC round trip, same fresh encoder per call.
+fn normalize_ext(
+    metrics: &[MetricRow],
+    histograms: &[HistogramMetricRow],
+    cap: &mut ExemplarCap,
+) -> MetricsNormalizeResult {
     let mut encoder = MetricsStreamEncoder::new("exemplars").expect("new encoder");
     let raw = encoder
-        .encode_batch_ext(0, &[], histograms, &[])
+        .encode_batch_ext(0, metrics, histograms, &[])
         .expect("encode batch");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw).expect("decode batch");
@@ -96,6 +108,33 @@ fn normalize(histograms: &[HistogramMetricRow], cap: &mut ExemplarCap) -> Metric
         INGEST_TS_NS,
         cap,
     )
+}
+
+/// One gauge or sum metric with a single data point carrying `exemplars`.
+/// A number data point has no buckets, so every exemplar on it attaches to
+/// that point's own series and the per-series cap is what decides admission.
+fn number_metric(kind: MetricKind, exemplars: Vec<ExemplarRow>) -> Vec<MetricRow> {
+    vec![MetricRow {
+        name: "requests".to_string(),
+        kind,
+        data_points: vec![DataPointRow {
+            time_unix_nano: INGEST_TS_NS,
+            value: 1.0,
+            flags: 0,
+            exemplars,
+            attrs: vec![AttrRow {
+                key: "host".to_string(),
+                value: AttrValue::Str("a".to_string()),
+            }],
+        }],
+    }]
+}
+
+fn cumulative_monotonic_sum() -> MetricKind {
+    MetricKind::Sum {
+        temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+        is_monotonic: true,
+    }
 }
 
 fn dropped_counts(rejected: &[Rejection]) -> Vec<usize> {
@@ -864,6 +903,417 @@ fn duplicate_ids_each_join_to_that_ids_attributes() {
         carried_with_value(&result, 2.0).filtered_attributes,
         expected
     );
+}
+
+// --- NUMBER_DP_EXEMPLARS: exemplars on gauge and sum points (issue #539) ---
+
+/// A gauge exemplar carried end to end through the real Arrow IPC round trip,
+/// attributes and ids included. It attaches to the data point's own series:
+/// a number point has no buckets, so there is no `le` bound to resolve.
+#[test]
+fn a_gauge_exemplar_is_carried_and_attaches_to_the_points_own_series() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize_ext(
+        &number_metric(
+            MetricKind::Gauge,
+            vec![ExemplarRow {
+                time_unix_nano: INGEST_TS_NS,
+                value: ExemplarValue::Double(2.5),
+                trace_id: Some(TRACE_ID),
+                span_id: Some(SPAN_ID),
+                attrs: vec![AttrRow {
+                    key: "http.status".to_string(),
+                    value: AttrValue::Int(500),
+                }],
+            }],
+        ),
+        &[],
+        &mut cap,
+    );
+
+    assert_eq!(result.output.points.len(), 1);
+    assert_eq!(result.exemplars.len(), 1);
+    let carried = &result.exemplars[0];
+    assert_eq!(carried.exemplar.trace_id, TRACE_ID);
+    assert_eq!(carried.exemplar.span_id, SPAN_ID);
+    assert_eq!(carried.exemplar.ts_ns, INGEST_TS_NS);
+    assert_eq!(carried.exemplar.value_bits, 2.5f64.to_bits());
+    // Attributes come from NUMBER_DP_EXEMPLAR_ATTRS, joined by the exemplar's
+    // own id, and are sanitized like any other attribute name.
+    assert_eq!(
+        carried.exemplar.filtered_attributes,
+        vec![Label {
+            name: "http_status".to_string(),
+            value: "500".to_string(),
+        }]
+    );
+    assert_eq!(carried.series_id, result.output.points[0].series_id);
+    assert!(dropped_counts(&result.output.rejected).is_empty());
+}
+
+/// The sum half of the same contract. ADR-0047's rejected alternative 2 turns
+/// on counters carrying exemplars, so a monotonic cumulative sum is the case
+/// that alternative was rejected to keep working.
+#[test]
+fn a_sum_exemplar_is_carried_and_attaches_to_the_points_own_series() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize_ext(
+        &number_metric(
+            cumulative_monotonic_sum(),
+            vec![ExemplarRow {
+                time_unix_nano: INGEST_TS_NS,
+                value: ExemplarValue::Int(7),
+                trace_id: Some(TRACE_ID),
+                span_id: None,
+                attrs: vec![],
+            }],
+        ),
+        &[],
+        &mut cap,
+    );
+
+    assert_eq!(result.output.points.len(), 1);
+    assert!(
+        result.output.points[0].is_monotonic_sum,
+        "sanity: the point under test really is a monotonic sum"
+    );
+    assert_eq!(result.exemplars.len(), 1);
+    let carried = &result.exemplars[0];
+    assert_eq!(carried.exemplar.trace_id, TRACE_ID);
+    assert_eq!(carried.exemplar.span_id, [0u8; 8]);
+    // An int-valued exemplar is carried as the equivalent f64, same as on the
+    // histogram path.
+    assert_eq!(carried.exemplar.value_bits, 7.0f64.to_bits());
+    assert_eq!(carried.series_id, result.output.points[0].series_id);
+    assert!(dropped_counts(&result.output.rejected).is_empty());
+}
+
+#[test]
+fn a_number_exemplar_with_no_value_column_set_is_dropped_and_counted() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize_ext(
+        &number_metric(
+            MetricKind::Gauge,
+            vec![
+                ExemplarRow {
+                    time_unix_nano: INGEST_TS_NS,
+                    value: ExemplarValue::Absent,
+                    trace_id: Some(TRACE_ID),
+                    span_id: None,
+                    attrs: vec![],
+                },
+                exemplar_row(INGEST_TS_NS, 1.0, None),
+            ],
+        ),
+        &[],
+        &mut cap,
+    );
+
+    // The malformed row is dropped and counted; the well-formed one beside it
+    // is still carried, so a bad row never takes its neighbours with it.
+    assert_eq!(result.exemplars.len(), 1);
+    assert_eq!(result.exemplars[0].exemplar.value_bits, 1.0f64.to_bits());
+    assert_eq!(dropped_counts(&result.output.rejected), vec![1]);
+}
+
+#[test]
+fn two_number_exemplars_in_one_window_admit_the_newest_and_count_one_dropped() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize_ext(
+        &number_metric(
+            MetricKind::Gauge,
+            vec![
+                exemplar_row(INGEST_TS_NS, 1.0, Some(TRACE_ID)),
+                exemplar_row(INGEST_TS_NS + 1_000_000_000, 2.0, None),
+            ],
+        ),
+        &[],
+        &mut cap,
+    );
+
+    assert_eq!(result.exemplars.len(), 1);
+    assert_eq!(
+        result.exemplars[0].exemplar.ts_ns,
+        INGEST_TS_NS + 1_000_000_000
+    );
+    assert_eq!(dropped_counts(&result.output.rejected), vec![1]);
+}
+
+/// The tie-break rule on the number path. `ExemplarCap::admit` is first-wins,
+/// so candidates are sorted newest-first with a STABLE sort and the first in
+/// wire order wins a timestamp tie.
+///
+/// 300 rows over 5 timestamps, all on one series in one window. The size and
+/// the duplicate timestamps are the point: `sort_unstable` insertion-sorts a
+/// short slice and preserves input order, so a two-row input cannot tell a
+/// stable sort from an unstable one. At this length, swapping `sort_by_key` for
+/// `sort_unstable_by_key` in `ExemplarAdmission::admit` does fail this.
+#[test]
+fn identical_timestamp_number_exemplars_keep_the_first_in_wire_order() {
+    let offsets_ns = [3i64, 9, 1, 9, 5];
+    let mut rows = Vec::with_capacity(300);
+    for round in 0..60i64 {
+        for (slot, offset) in offsets_ns.iter().enumerate() {
+            // Value encodes wire position, so the assertion names one row.
+            let position = round * 5 + slot as i64;
+            rows.push(exemplar_row(INGEST_TS_NS + offset, position as f64, None));
+        }
+    }
+    // The newest timestamp is `INGEST_TS_NS + 9`, first seen at position 1.
+    let expected_position = 1.0f64;
+
+    let mut cap = ExemplarCap::default();
+    let result = normalize_ext(&number_metric(MetricKind::Gauge, rows), &[], &mut cap);
+
+    assert_eq!(result.exemplars.len(), 1);
+    assert_eq!(
+        result.exemplars[0].exemplar.ts_ns,
+        INGEST_TS_NS + 9,
+        "the newest timestamp in the window must win"
+    );
+    assert_eq!(
+        result.exemplars[0].exemplar.value_bits,
+        expected_position.to_bits(),
+        "among equal timestamps the first in wire order must win"
+    );
+    assert_eq!(dropped_counts(&result.output.rejected), vec![299]);
+}
+
+/// A gauge and a histogram in one batch draw on the same caller-owned cap and
+/// land in the same output vector, each attaching to its own series.
+#[test]
+fn number_and_histogram_exemplars_share_one_cap_and_one_output() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize_ext(
+        &number_metric(
+            MetricKind::Gauge,
+            vec![exemplar_row(INGEST_TS_NS, 1.0, Some(TRACE_ID))],
+        ),
+        &histogram_with(vec![], vec![exemplar_row(INGEST_TS_NS, 2.0, None)]),
+        &mut cap,
+    );
+
+    // Different series, so both are admitted rather than one capping out the
+    // other.
+    assert_eq!(result.exemplars.len(), 2);
+    let series: Vec<SeriesId> = result.exemplars.iter().map(|e| e.series_id).collect();
+    assert_ne!(series[0], series[1]);
+    for exemplar in &result.exemplars {
+        assert!(
+            result
+                .output
+                .points
+                .iter()
+                .any(|p| p.series_id == exemplar.series_id),
+            "every carried exemplar attaches to a series this batch admitted"
+        );
+    }
+    assert!(dropped_counts(&result.output.rejected).is_empty());
+}
+
+/// The legacy entry point counts what it discards on this path too: nothing
+/// stores exemplars on the OTAP path yet, so a cap-admitted gauge exemplar is
+/// still a dropped one.
+#[test]
+fn the_legacy_entry_point_counts_discarded_number_exemplars() {
+    let metrics = number_metric(
+        MetricKind::Gauge,
+        vec![
+            exemplar_row(INGEST_TS_NS, 1.0, Some(TRACE_ID)),
+            exemplar_row(INGEST_TS_NS + 1, 2.0, None),
+        ],
+    );
+    let mut encoder = MetricsStreamEncoder::new("number-exemplars-legacy").expect("new encoder");
+    let raw = encoder
+        .encode_batch_ext(0, &metrics, &[], &[])
+        .expect("encode batch");
+    let mut state = StreamState::new(StreamConfig::default());
+    let decoded = state.decode(raw).expect("decode batch");
+    let out = normalize_decoded(&tenant(), &decoded, &IngestLimits::default(), INGEST_TS_NS);
+
+    // One turned away by the cap, one admitted then discarded. Both dropped,
+    // both counted.
+    let total: usize = dropped_counts(&out.rejected).iter().sum();
+    assert_eq!(total, 2);
+}
+
+/// One gauge root metric, id 0.
+fn number_root_batch() -> RecordBatch {
+    let schema = Schema::new(vec![
+        plain_field("id", DataType::UInt16),
+        Field::new("metric_type", DataType::UInt8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("aggregation_temporality", DataType::Int32, true),
+        Field::new("is_monotonic", DataType::Boolean, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt16Array::from(vec![0u16])),
+            Arc::new(UInt8Array::from(vec![METRIC_TYPE_GAUGE])),
+            Arc::new(StringArray::from(vec!["requests"])),
+            Arc::new(Int32Array::from(vec![None::<i32>])),
+            Arc::new(BooleanArray::from(vec![None::<bool>])),
+        ],
+    )
+    .expect("build number root batch")
+}
+
+/// One `NUMBER_DATA_POINTS` row, id 0, under metric 0.
+fn number_dp_batch() -> RecordBatch {
+    let schema = Schema::new(vec![
+        plain_field("id", DataType::UInt32),
+        plain_field("parent_id", DataType::UInt16),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("double_value", DataType::Float64, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32])),
+            Arc::new(UInt16Array::from(vec![0u16])),
+            Arc::new(TimestampNanosecondArray::from(vec![INGEST_TS_NS])),
+            Arc::new(Float64Array::from(vec![Some(1.0)])),
+        ],
+    )
+    .expect("build number dp batch")
+}
+
+/// An exemplar batch with explicit per-row `parent_id`s, for the orphan case
+/// the encoder cannot express (it always joins an exemplar to a real point).
+fn exemplar_batch_with_parents(parent_ids: Vec<u32>) -> RecordBatch {
+    let schema = Schema::new(vec![
+        plain_field("parent_id", DataType::UInt32),
+        Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("double_value", DataType::Float64, true),
+    ]);
+    let n = parent_ids.len();
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(parent_ids)),
+            Arc::new(TimestampNanosecondArray::from(vec![INGEST_TS_NS; n])),
+            Arc::new(Float64Array::from(vec![Some(1.5); n])),
+        ],
+    )
+    .expect("build exemplar batch with parents")
+}
+
+/// An exemplar row pointing at a data point that is not in the batch has no
+/// series to attach to and no point rejection accounting for it. Counted, not
+/// silently discarded.
+#[test]
+fn an_orphan_number_exemplar_row_is_counted_as_dropped() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize_custom(
+        vec![
+            (ArrowPayloadType::UnivariateMetrics, number_root_batch()),
+            (ArrowPayloadType::NumberDataPoints, number_dp_batch()),
+            (
+                ArrowPayloadType::NumberDpExemplars,
+                // Point 0 exists; points 4 and 9 do not.
+                exemplar_batch_with_parents(vec![0, 4, 9]),
+            ),
+        ],
+        &mut cap,
+    );
+
+    assert_eq!(result.exemplars.len(), 1);
+    assert_eq!(
+        result.exemplars[0].series_id,
+        result.output.points[0].series_id
+    );
+    let total: usize = dropped_counts(&result.output.rejected).iter().sum();
+    assert_eq!(total, 2);
+}
+
+/// Every `EXP_HISTOGRAM_DP_EXEMPLARS` row is counted as dropped.
+///
+/// This pins the point-3 decision of issue #539. Nothing can carry these yet:
+/// `EXP_HISTOGRAM_DATA_POINTS` is rejected as an unsupported metric type on
+/// this path (ADR-0017 is a separate ticket), so the series an exemplar would
+/// attach to is never built. The attachment rule for when that lands is the
+/// data point's own series, matching `ravel_otlp::build_native_histogram_point`
+/// -- a native histogram is one series with one sample per timestamp, not a set
+/// of exploded `le`-bucket series, so a scale-resolved bucket index would name
+/// a series that does not exist. What an operator sees today is the count.
+#[test]
+fn exp_histogram_exemplars_are_counted_as_dropped() {
+    let mut cap = ExemplarCap::default();
+    let result = normalize_custom(
+        vec![
+            (ArrowPayloadType::UnivariateMetrics, number_root_batch()),
+            (ArrowPayloadType::NumberDataPoints, number_dp_batch()),
+            (
+                ArrowPayloadType::ExpHistogramDpExemplars,
+                exemplar_batch_with_parents(vec![0, 1]),
+            ),
+        ],
+        &mut cap,
+    );
+
+    // Nothing carried, both counted. The number point beside them is
+    // unaffected: an unsupported exemplar source never rejects a good point.
+    assert!(
+        result
+            .exemplars
+            .iter()
+            .all(|e| e.series_id == result.output.points[0].series_id)
+    );
+    assert_eq!(result.exemplars.len(), 0);
+    assert_eq!(result.output.points.len(), 1);
+    assert_eq!(dropped_counts(&result.output.rejected), vec![2]);
+}
+
+proptest! {
+    /// Arbitrary gauge exemplar input never panics, and every exemplar row is
+    /// accounted for exactly once: carried, or counted by the drop counter.
+    #[test]
+    fn arbitrary_number_exemplars_never_panic_and_are_always_accounted(
+        rows in prop::collection::vec(
+            (
+                any::<i64>(),
+                any::<f64>(),
+                proptest::option::of(any::<[u8; 16]>()),
+                proptest::option::of(any::<[u8; 8]>()),
+                any::<bool>(),
+            ),
+            0..6,
+        ),
+    ) {
+        let total = rows.len();
+        let exemplars: Vec<ExemplarRow> = rows
+            .into_iter()
+            .map(|(ts_ns, value, trace_id, span_id, int_valued)| ExemplarRow {
+                time_unix_nano: ts_ns,
+                value: if int_valued {
+                    ExemplarValue::Int(value as i64)
+                } else {
+                    ExemplarValue::Double(value)
+                },
+                trace_id,
+                span_id,
+                attrs: vec![],
+            })
+            .collect();
+
+        let mut cap = ExemplarCap::default();
+        let result = normalize_ext(
+            &number_metric(MetricKind::Gauge, exemplars),
+            &[],
+            &mut cap,
+        );
+        let dropped: usize = dropped_counts(&result.output.rejected).iter().sum();
+        prop_assert_eq!(result.exemplars.len() + dropped, total);
+    }
 }
 
 proptest! {
