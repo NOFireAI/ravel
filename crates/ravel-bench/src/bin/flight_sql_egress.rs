@@ -192,6 +192,7 @@ async fn run(args: &Args) -> Report {
         }),
         Arc::new(BenchClock),
         FlightSqlConfig::default(),
+        Arc::clone(&store),
     );
 
     // One warm run per path establishes the deterministic byte counts and
