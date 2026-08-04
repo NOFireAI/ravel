@@ -492,7 +492,10 @@ async fn read_segment_exemplars(
         Ok(got) => got,
         Err(StoreError::NotFound) => return Err(CollectError::SnapshotStale),
         Err(source) => {
-            return Err(CollectError::Api(fetch_store_error(data_object_key, source)));
+            return Err(CollectError::Api(fetch_store_error(
+                data_object_key,
+                source,
+            )));
         }
     };
     accounting.record_s3_request(AccountedOp::Get);
@@ -2091,7 +2094,11 @@ mod tests {
             1.0,
             [0u8; 16],
             [0u8; 8],
-            &[("trace_id", "deadbeef"), ("span_id", "cafe"), ("region", "eu")],
+            &[
+                ("trace_id", "deadbeef"),
+                ("span_id", "cafe"),
+                ("region", "eu"),
+            ],
         );
         publish_segment(&store, 1, vec![series], vec![ex]).await;
 
@@ -2252,7 +2259,9 @@ mod tests {
         assert_eq!(body["errorType"], "internal");
         // The foreign exemplar's trace id must never reach the response body.
         assert!(
-            !body.to_string().contains("0a1b2c3d4e5f60718293a4b5c6d7e8f9"),
+            !body
+                .to_string()
+                .contains("0a1b2c3d4e5f60718293a4b5c6d7e8f9"),
             "the foreign trace id must not leak: {body}"
         );
     }
