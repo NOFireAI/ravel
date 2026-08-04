@@ -133,6 +133,10 @@ piece, see [docs/adrs/](docs/adrs/).
 - **Grafana and Prometheus compatibility routes**: `/api/v1/labels`,
   `/api/v1/label/{name}/values`, `/api/v1/series`,
   `/api/v1/status/buildinfo`, `/api/v1/metadata`, `/-/healthy`, `/-/ready`.
+- **A Prometheus scrape endpoint**, `GET /metrics`, unauthenticated like the
+  health routes, in every mode. It exports Ravel's own object-store, ingest,
+  catalog, cache, admission, and per-query cost counters under a closed label
+  allowlist. See [docs/guides/observability.md](docs/guides/observability.md).
 - **A Kubernetes operator** (`ravel-operator`): a `RavelCluster` CRD that
   reconciles the gateway, ingest, query, and maintain roles as separate
   deployments. See [docs/guides/kubernetes.md](docs/guides/kubernetes.md).
@@ -343,7 +347,7 @@ Pull the published image, or build natively on an amd64 host, instead.
 - [docs/span-segment-format.md](docs/span-segment-format.md): the RSPAN
   v1 specification (ADR-0041)
 - [docs/guides/](docs/guides/): getting started, ingest, admission limits,
-  query, operations, inspecting data, Kubernetes
+  query, operations, observability, inspecting data, Kubernetes
 - [docs/adrs/](docs/adrs/): one decision record per architectural choice
 - [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
   conformance table, classifying every construct as supported,
