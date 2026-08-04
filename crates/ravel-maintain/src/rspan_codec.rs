@@ -557,7 +557,14 @@ mod tests {
         let ftr = footer::open(&parts[0]).expect("open l1");
         assert_eq!(ftr.level, 1);
         assert!(!ftr.input_set_hash.is_empty());
-        assert_eq!(rec.parts[0].segment_format_version, OUTPUT_FORMAT_VERSION);
+        // Against the format's constant, not the compactor's: see the same
+        // assertion in `rlog.rs` and issue #482. `open` above rejects any
+        // other trailer version, so this pins the recorded number to the
+        // bytes rather than to a second constant in this crate.
+        assert_eq!(
+            rec.parts[0].segment_format_version,
+            u32::from(ravel_rspan::footer::VERSION)
+        );
         assert_eq!(rec.parts[0].sample_count, 4);
         assert_eq!(rec.parts[0].series_count, 3, "three distinct traces");
 

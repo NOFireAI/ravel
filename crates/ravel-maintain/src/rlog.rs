@@ -93,7 +93,14 @@ use crate::read::InputRecord;
 /// The RLOG output trailer version every L1 part carries (ADR-0032, trailer
 /// version 2). Recorded in each part's `CompactionPart.segment_format_version`,
 /// the log analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`].
-pub const OUTPUT_FORMAT_VERSION: u32 = 2;
+///
+/// Tied to `ravel_logseg`'s own trailer version at compile time, for the reason
+/// [`crate::rspan_codec::OUTPUT_FORMAT_VERSION`] records: as a mirrored literal
+/// this goes stale on the next bump, and it goes stale silently, because the
+/// writer stamps `footer::VERSION` into the trailer while this constant keeps
+/// reporting the old number. The compactor would then write parts that claim a
+/// version they are not.
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_logseg::footer::VERSION as u32;
 
 /// Untrusted-input cap on an input's FIELD_DIR entry count for the compactor's
 /// own decode of that section (the indexed-field recovery below needs the
@@ -1434,7 +1441,16 @@ mod tests {
         let ftr = footer::open(&parts[0]).expect("open l1");
         assert_eq!(ftr.level, 1);
         assert!(!ftr.input_set_hash.is_empty());
-        assert_eq!(rec.parts[0].segment_format_version, OUTPUT_FORMAT_VERSION);
+        // Assert the recorded version against the format's own constant, not
+        // against the compactor's `OUTPUT_FORMAT_VERSION`, which would only
+        // assert that constant against itself (issue #482). The `open` above
+        // rejects any trailer whose version is not `footer::VERSION`, so the
+        // part having opened at all is what ties this number to the bytes on
+        // the object rather than to another constant in this crate.
+        assert_eq!(
+            rec.parts[0].segment_format_version,
+            u32::from(ravel_logseg::footer::VERSION)
+        );
 
         // The L1 records are the union of both inputs, decoded in (stream_ref,
         // ts) order. The part's own STREAM_DIR resolves stream identity.
