@@ -29,6 +29,8 @@ pub mod remote_write;
 pub mod sql;
 pub mod store;
 pub mod tenancy;
+#[cfg(all(test, feature = "sql"))]
+mod tests;
 pub mod tenant;
 pub mod tenant_discovery;
 pub mod traces_ingest;
