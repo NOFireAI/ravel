@@ -27,6 +27,7 @@ pub mod postings_config;
 pub mod provisioning;
 pub mod qualification;
 pub mod query;
+pub mod query_postings_metrics;
 pub mod remote_write;
 #[cfg(feature = "sql")]
 pub mod sql;

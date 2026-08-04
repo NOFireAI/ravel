@@ -240,6 +240,21 @@ async fn a_logs_query_is_accounted() {
         outcome.accounting.s3_bytes(AccountedOp::Get) > 0,
         "the accounted logs GET must record bytes transferred"
     );
+    // The LogsScanExec block counters (#544) flow through to the outcome so the
+    // /metrics prune-selectivity family can reuse them (issue #511). This query
+    // has no pruning predicate, so every block the scan considered was scanned.
+    assert!(
+        outcome.stats.blocks_total > 0,
+        "the logs scan's block counters must reach SqlStats"
+    );
+    assert_eq!(
+        outcome.stats.blocks_scanned, outcome.stats.blocks_total,
+        "with no prune predicate every block survives"
+    );
+    assert_eq!(
+        outcome.stats.blocks_pruned_by_postings, 0,
+        "nothing is pruned by postings without an indexed equality predicate"
+    );
 }
 
 fn reduce_rows(batches: &[RecordBatch]) -> HashMap<[u8; 16], HashMap<i64, u64>> {

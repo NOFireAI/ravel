@@ -207,6 +207,18 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         &outcome.estimate,
     );
 
+    // Fold this query's LogsScanExec block counters into the process-global
+    // prune-selectivity totals (issue #511). These are the scan's own
+    // DataFusion counters, read off the plan in ravel-sql and surfaced on
+    // `stats`; a metrics query passes zeros and moves nothing. Separate from
+    // the cost aggregator above: that one answers "what did this query
+    // spend", this one answers "how much did POSTINGS let it skip".
+    crate::query_postings_metrics::record(
+        outcome.stats.blocks_total,
+        outcome.stats.blocks_scanned,
+        outcome.stats.blocks_pruned_by_postings,
+    );
+
     let stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
     encode(&headers, &outcome, tenant_hash, stats)
 }
