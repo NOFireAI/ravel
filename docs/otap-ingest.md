@@ -94,8 +94,9 @@ spec's default). The normalizer (`ravel-otap::normalize`) decodes:
   below, never here.
 - `parent_id` on the `*Attrs` tables (`RESOURCE_ATTRS`, `SCOPE_ATTRS`,
   `NUMBER_DP_ATTRS`, `HISTOGRAM_DP_ATTRS`, `SUMMARY_DP_ATTRS`,
-  `HISTOGRAM_DP_EXEMPLAR_ATTRS`) and on
-  `HISTOGRAM_DP_EXEMPLARS`: QUASI-DELTA (section 6.4.3), applied whenever
+  `NUMBER_DP_EXEMPLAR_ATTRS`, `HISTOGRAM_DP_EXEMPLAR_ATTRS`) and on
+  `NUMBER_DP_EXEMPLARS`/`HISTOGRAM_DP_EXEMPLARS`: QUASI-DELTA (section
+  6.4.3), applied whenever
   declared or when the `encoding` metadata is absent, since QUASI-DELTA is
   the spec default for these columns; PLAIN or DELTA only when explicitly
   declared. The equality columns that gate each run's delta-vs-absolute
@@ -112,29 +113,59 @@ Not decoded:
 
 ## Exemplars
 
-`HISTOGRAM_DP_EXEMPLARS` rows are carried, not just counted (ADR-0047).
-Each row's own columns (`time_unix_nano`, `int_value`/`double_value`,
-`span_id`, `trace_id`) become a `ravel_types::Exemplar`, its attributes are
-joined from `HISTOGRAM_DP_EXEMPLAR_ATTRS` by the exemplar's `id`, and it
-attaches to the bucket series whose `le` bound is the smallest at or above
-its value, the same rule the OTLP path applies. Admission goes through the
-caller's `ravel_types::ExemplarCap` (one exemplar per series per window, a
-security control per ADR-0047 decision 2), so
+`NUMBER_DP_EXEMPLARS` and `HISTOGRAM_DP_EXEMPLARS` rows are carried, not
+just counted (ADR-0047). The two tables have identical columns, so one
+decoder and one admission path serve both. Each row's own columns
+(`time_unix_nano`, `int_value`/`double_value`, `span_id`, `trace_id`) become
+a `ravel_types::Exemplar`, its attributes are joined from the matching
+`*_DP_EXEMPLAR_ATTRS` table by the exemplar's `id`, and it attaches to:
+
+- for a histogram, the bucket series whose `le` bound is the smallest at or
+  above its value;
+- for a gauge or sum, the data point's own series. A number point has no
+  buckets, so there is no `le` bound to resolve.
+
+Both are the rule the OTLP path applies to the same input. Admission goes
+through the caller's `ravel_types::ExemplarCap` (one exemplar per series per
+window, a security control per ADR-0047 decision 2), so
 `normalize_decoded_with_exemplars` takes that cap by `&mut` from whoever
 owns the long-lived per-shard state; `normalize_decoded` keeps its old
-signature and wraps it with a batch-scoped cap.
+signature and wraps it with a batch-scoped cap. One cap and one output
+vector serve every exemplar source in a batch, so a gauge point and a
+histogram bucket compete for the same per-series window.
 
 A row too malformed to carry (no value column set, which OTLP itself calls
 an invalid exemplar; or no timestamp, which leaves nothing to place it in a
-window) and a row the cap turns away both increment the pre-existing
+window), a row the cap turns away, and a row whose `parent_id` matches no
+data point in its table all increment the pre-existing
 `HistogramExemplarsDropped` counter, so that counter now means "dropped by
-the cap or malformed" rather than "every exemplar, always". A `trace_id` or
-`span_id` cell that is null, absent, or in a column of the wrong fixed width
-reads back all-zero, the layout's convention for "absent"; it never rejects
-the exemplar carrying it.
+the cap, malformed, or orphaned" rather than "every exemplar, always".
+Despite its name it has always covered every metric type, not only
+histograms; it is not renamed, because the name reaches no operator-facing
+surface (rejections surface through `Display` and `rejected_count()`, and
+its `Display` string names no metric type) while a rename would break every
+crate that matches on the variant. A `trace_id` or `span_id` cell that is
+null, absent, or in a column of the wrong fixed width reads back all-zero,
+the layout's convention for "absent"; it never rejects the exemplar
+carrying it.
 
-`NUMBER_DP_EXEMPLARS` (exemplars on gauge and sum points) is still not
-decoded at all, the same as before this change.
+Exemplars attached to a data point that was itself rejected are dropped
+with that point and are not counted separately, which is what `ravel-otlp`
+does: counting them would give the same logical input a rejection class the
+OTLP path does not produce, and ADR-0011 requires the two to agree.
+
+`EXP_HISTOGRAM_DP_EXEMPLARS` rows are counted as dropped, never carried.
+The reason is structural, not a missing decode: `EXP_HISTOGRAM_DATA_POINTS`
+is rejected as an unsupported metric type on this path (ADR-0017 is a
+separate ticket), so the series an exemplar would attach to is never built.
+When that changes, the attachment rule is the data point's own series, the
+same as a gauge or sum: Ravel stores a native histogram as one series with
+one native-histogram sample per timestamp rather than a set of exploded
+`le`-bucket series, so resolving the exemplar's value to a bucket index
+through the exponential schema's scale would name a series that does not
+exist. This needs no ADR amendment: ADR-0047 decision 1 attaches an exemplar
+to a `(series, ts_ns)`, and the explicit-bucket rule is a consequence of the
+classic histogram exploding into several series, not a separate rule.
 
 ## Phasing
 
