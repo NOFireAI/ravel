@@ -219,6 +219,14 @@ impl RlogWriter {
             ref_of.insert(*id, i as u32);
         }
 
+        // The caller's indexed-field list (docs/adrs/0049-rlog-postings.md
+        // decision 3: opt-in per field). Resolved before column assignment
+        // because an indexed field that appears only at stream (resource/scope)
+        // level still gets a dynamic column below (issue #552), so its
+        // merged-view postings have a column_id to key by.
+        let indexed_names: std::collections::HashSet<&str> =
+            self.indexed_fields.iter().map(String::as_str).collect();
+
         // Dynamic column assignment: distinct (name, type) sorted by
         // (name bytes, type), the first `max_dynamic_columns` get columns.
         let mut distinct: BTreeSet<(String, u8)> = BTreeSet::new();
@@ -226,6 +234,38 @@ impl RlogWriter {
             for (k, v) in &r.attrs {
                 let (ty, _) = resolve_value(v);
                 distinct.insert((k.clone(), ty.to_u8()));
+            }
+        }
+        // Stream-level-only indexed columns (issue #552, completing the
+        // ADR-0049 2026-08-03 amendment). A key that is resource- or scope-level
+        // across the whole object and per-record on no record gets no column
+        // from the per-record loop above. Before this, such a key had no
+        // POSTINGS column and pruned nothing -- yet `service.name` on the
+        // resource is the ordinary OTLP shape the amendment exists for. Give
+        // each indexed stream-level (name, type) a column so
+        // `merged_indexed_terms` can key its merged-view postings by it.
+        //
+        // The column is a POSTINGS KEY, not a materialized per-record value: no
+        // row writes a value to it (`resolve_row` populates `columns` from
+        // `r.attrs` only), so it stays all-null in every block. The reader's
+        // `equals` on a `FieldSel::Attr` therefore still reads only the
+        // per-record layer and returns false for a value that lives solely in
+        // the resource blob -- the exact channel stays a strict per-record
+        // predicate, distinct from the prune channel that probes these postings
+        // (docs/log-segment-format.md "FIELD_DIR"). These count against the same
+        // `max_dynamic_columns` budget as any dynamic column: they occupy a real
+        // FIELD_DIR entry, and the indexed list is small and opt-in, so the cost
+        // is a handful of columns; one that cannot fit degrades to bloom + exact
+        // scan, always legal (decision 5). Decoding `stream_attrs` can fail on a
+        // corrupt blob; that is propagated rather than silently under-indexing.
+        if !indexed_names.is_empty() {
+            for blob in streams.values() {
+                for (k, v) in stream_attr_pairs(blob)? {
+                    if indexed_names.contains(k.as_str()) {
+                        let (ty, _) = resolve_value(&v);
+                        distinct.insert((k, ty.to_u8()));
+                    }
+                }
             }
         }
         let mut column_of: HashMap<(String, u8), u32> = HashMap::new();
@@ -242,12 +282,9 @@ impl RlogWriter {
         let ty_of_column: HashMap<u32, FieldType> =
             columns.iter().map(|(_, ty, id)| (*id, *ty)).collect();
 
-        // Columns whose name is in the caller's indexed-field list
-        // (docs/adrs/0049-rlog-postings.md decision 3): a name past the
-        // dynamic-column budget above simply has no matching column_id here,
-        // so it has no postings -- legal degradation, not an error.
-        let indexed_names: std::collections::HashSet<&str> =
-            self.indexed_fields.iter().map(String::as_str).collect();
+        // Columns whose name is in the caller's indexed-field list get postings.
+        // A name past the dynamic-column budget above has no matching column_id
+        // here, so it has no postings -- legal degradation, not an error.
         let indexed_column_ids: BTreeSet<u32> = columns
             .iter()
             .filter(|(name, _, _)| indexed_names.contains(name.as_str()))
@@ -582,9 +619,11 @@ fn resolve_row(
 /// reproduced here so the writer does not depend on ravel-sql
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
 ///
-/// A field with no matching dynamic column contributes nothing: a key that is
-/// resource-only across the whole object has no column to key a posting by, and
-/// a key that overflowed the dynamic-column budget likewise. Absence is legal;
+/// A field with no matching dynamic column contributes nothing. Since issue
+/// #552 the writer gives an indexed field a column even when it appears only at
+/// stream level, so a resource-only indexed key normally does have a column to
+/// key a posting by; a key stays column-less only when it overflowed the
+/// dynamic-column budget or is not in the indexed-field list. Absence is legal;
 /// no posting for a field means no pruning on it, never a wrong prune. The
 /// decode of `stream_attrs` can fail on a corrupt blob, which is propagated
 /// (the caller fails the write) rather than silently dropping stream-level
