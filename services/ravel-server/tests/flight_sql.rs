@@ -165,9 +165,9 @@ fn sql_state(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantI
         store,
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
-        query_accounting: Arc::new(
-            ravel_server::metrics::QueryAccountingMetrics::new(std::collections::HashSet::new()),
-        ),
+        query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
     }
 }
 

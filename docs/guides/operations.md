@@ -502,6 +502,62 @@ cardinality stays bounded regardless of tenant count. Pass
 instead -- one series per (tenant, signal, reason) -- which is a
 cardinality trade an operator opts into deliberately, not a default.
 
+### Per-query cost accounting (ADR-0044, issue #425)
+
+Every query the server executes reports what it spent on object storage
+both to the client that ran it and to `GET /metrics`, so an operator can
+see cost per tenant and per workload without reading a query's text.
+
+**In the response.** `POST /api/v1/sql` and `POST /api/v1/analytics` add a
+`stats` object beside `data`, carrying this query's `accounting` (the
+actual counters: object-store requests and bytes split by `get`/`list`/`head`,
+cache hits and misses, decompressed bytes, segments opened, series matched,
+bytes reused, and the peak intermediate footprint) and its `estimate` (the
+pre-execution upper-envelope of requests, store bytes, and decompressed
+bytes). The Prometheus-shaped `GET /api/v1/query` and `/api/v1/query_range`
+already carry the same `stats.accounting`/`stats.estimate` under their `data`
+object. An Arrow IPC (`Accept: application/vnd.apache.arrow.stream`) SQL
+response is a bare columnar payload with no envelope for a JSON object, so it
+reports no in-body stats; the `/metrics` aggregation below still captures the
+query regardless of its encoding.
+
+**At `/metrics`.** The `ravel_query_*` family aggregates every accounted
+query, labeled by `mode`, `tenant_hash`, and `workload_class`
+(`interactive` for a client-driven HTTP or Flight query, `background` for an
+internally scheduled one). The actual and the estimate render as separate,
+distinctly-named series so their divergence is directly measurable in PromQL:
+
+| Metric | What |
+|---|---|
+| `ravel_query_queries_total` | Accounted queries; the denominator for per-query averages. |
+| `ravel_query_s3_requests_total` / `ravel_query_s3_bytes_total` | Actual object-store requests and bytes. |
+| `ravel_query_cache_hits_total` / `ravel_query_cache_misses_total` | In-process read-cache outcomes attributed to queries. |
+| `ravel_query_decompressed_bytes_total` | Actual decompressed sample bytes decoded. |
+| `ravel_query_estimated_requests_total` | Pre-execution estimate of object-store requests. |
+| `ravel_query_estimated_store_bytes_total` | Pre-execution estimate of object-store bytes. |
+| `ravel_query_estimated_decompressed_bytes_total` | Pre-execution estimate of decompressed bytes. |
+
+The estimate is an upper envelope, never a prediction (ADR-0044 section 3):
+the ratio `ravel_query_s3_requests_total / ravel_query_estimated_requests_total`
+staying at or below 1 is the health signal that a later admission ADR could
+enforce on. Nothing in this release rejects a query on it; this is
+measurement only.
+
+Like the admission family, per-tenant `tenant_hash` values render only under
+`--metrics-tenant-labels`, and only for tenants that have explicit admission
+limits configured. Every other tenant folds into `tenant_hash="other"` at
+record time, so `/metrics` cardinality is bounded by the configured tenant
+count regardless of how many distinct tenants query -- the same
+disclosure-and-cardinality trade the admission family makes on this
+unauthenticated route. Off (the default), every tenant folds into `other`.
+
+Suggested operator uses: alert on
+`increase(ravel_query_s3_requests_total[5m]) / increase(ravel_query_estimated_requests_total[5m]) > 1`
+for a sustained window (an actual exceeding its own upper-envelope estimate is
+either a cost-model gap or a runaway to investigate); rank tenants by
+`sum by (tenant_hash) (rate(ravel_query_s3_bytes_total[1h]))` to find the
+tenant whose queries cost the most object-store traffic.
+
 Default alert rules:
 
 | Condition | Query | Why |
