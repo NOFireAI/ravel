@@ -50,9 +50,9 @@ attach a RAM cache. See "Known gaps" below.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Read once at startup; there is no live resize. |
+| `--cache-max-bytes <n>` | `268435456` (256 MiB) | Maximum bytes the RAM tier holds. Bounds **every** ADR-0046 cache in the process from one number: the fetcher cache and the catalog's byte cache both. Read once at startup; there is no live resize. |
 | `--cache-dir <path>` | none | Reserved for the disk tier. Setting it fails startup today (see "Known gaps"). |
-| `--disable-cache` | off | Turns the fetcher cache off. Query *results* are then byte-for-byte the same as a build with no cache code at all. Memory is not: the catalog keeps a byte cache of its own that this flag does not reach (#553). |
+| `--disable-cache` | off | Turns **every** ADR-0046 cache off: the fetcher cache and the catalog's byte cache both. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
 
 ## Startup warmup
 
@@ -71,8 +71,12 @@ Warmup is best-effort:
 
 ## Metrics
 
-When the cache is on, `GET /metrics` reports these counters, labeled only
-by `mode` (ADR-0044's label allowlist):
+When a cache is on, `GET /metrics` reports these counters, labeled by
+`mode` and by `cache` (ADR-0044's label allowlist). The `cache` label names
+which ADR-0046 cache the sample belongs to: `cache="fetch"` for the fetcher
+cache, `cache="catalog"` for the catalog's byte cache. Each cache renders its
+own series, so the hit-rate formulas below can be computed per cache or summed
+across both:
 
 - `ravel_cache_hits_total` / `ravel_cache_misses_total`: read outcomes.
 - `ravel_cache_bytes_served_total`: bytes returned from the cache on a
@@ -88,11 +92,13 @@ by `mode` (ADR-0044's label allowlist):
   `--cache-dir` fails startup (see the known gaps below). Do not alert on
   it until a disk tier exists.
 
-With the cache off, none of these samples appear on `/metrics` at all.
+With every cache off (`--disable-cache`), none of these samples appear on
+`/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`.
 
-These counters describe the fetcher cache only. The catalog keeps a byte
-cache of its own, which these samples do not cover and `--cache-max-bytes`
-does not bound. Issue #553 tracks that gap.
+These counters cover every ADR-0046 cache in the process. Request hit rate is
+`hits / (hits + misses)`; byte hit rate is `bytes_served / (bytes_served +
+bytes_admitted)`. Filter by the `cache` label for one cache's rate, or omit it
+(let PromQL sum the series) for the whole process.
 
 ## Known gaps
 

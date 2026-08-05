@@ -58,12 +58,29 @@ pub fn accounting_stats_json(
 /// Builds the shared [`Catalog`] used both for query resolve and for the
 /// background fold task (docs/metric-index-plan.md section 4): one instance
 /// per process so its decoded HEAD/part caches serve both paths.
+///
+/// `disable_cache` and `cache_max_bytes` are the CLI's `--disable-cache` and
+/// `--cache-max-bytes`, the same flags that govern the fetcher cache in
+/// [`crate::store::build_cache`]. They reach the catalog's ADR-0046 byte cache
+/// too (issue #553): `--disable-cache` builds a catalog with no byte cache at
+/// all (the `byte_cache_max_bytes: 0` sentinel), so a memory-constrained
+/// `--disable-cache` deployment no longer silently keeps a 512 MiB catalog
+/// byte cache; otherwise `cache_max_bytes` is the catalog byte cache's total
+/// budget, sharing one number with the fetcher cache. The other two byte-cache
+/// bounds keep their catalog defaults (the CLI has no flag for them).
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
+    disable_cache: bool,
+    cache_max_bytes: u64,
 ) -> anyhow::Result<Arc<Catalog>> {
+    // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
+    // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
+    // --disable-cache into a `None` fetcher cache.
+    let byte_cache_max_bytes = if disable_cache { 0 } else { cache_max_bytes };
     let catalog_config = CatalogConfig {
         shard_count,
+        byte_cache_max_bytes,
         ..CatalogConfig::default()
     };
     // Durable shard_count enforcement on the read path (ADR-0050 section 5,
@@ -167,6 +184,53 @@ pub fn build_sql_state(
     })
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod catalog_cache_tests {
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+
+    /// Issue #553: `--disable-cache` (passed as `disable_cache: true`) must
+    /// build a catalog with no byte cache constructed, the byte-cache analogue
+    /// of the `None` fetcher cache `build_cache` returns. Asserts on the
+    /// absence of the counters handle, not a zero hit count.
+    #[test]
+    fn build_catalog_disable_cache_constructs_no_byte_cache() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(store, 1, true, ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES)
+            .expect("catalog builds");
+        assert!(
+            catalog.byte_cache_metrics().is_none(),
+            "--disable-cache must leave the catalog with no byte cache constructed"
+        );
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            0,
+            "the disabled catalog config carries the byte-cache disable sentinel"
+        );
+    }
+
+    /// Issue #553: with caching on, `--cache-max-bytes` must bound the catalog
+    /// byte cache, not just the fetcher cache. The value reaches
+    /// `CatalogConfig::byte_cache_max_bytes`, and the byte cache (with its
+    /// counters handle) is constructed.
+    #[test]
+    fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let budget = 7 * 1024 * 1024;
+        let catalog = build_catalog(store, 1, false, budget).expect("catalog builds");
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            budget,
+            "--cache-max-bytes must bound the catalog byte cache, not only the fetcher cache"
+        );
+        assert!(
+            catalog.byte_cache_metrics().is_some(),
+            "an enabled catalog byte cache must expose its counters handle for /metrics"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "sql"))]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -183,7 +247,13 @@ mod tests {
     #[test]
     fn build_sql_state_honors_the_passed_engine_config_deadline() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let catalog = build_catalog(store.clone(), 1).expect("catalog");
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+        )
+        .expect("catalog");
         let tenant_resolver: Arc<dyn TenantResolver> =
             Arc::new(StaticBearerTokenResolver::new(HashMap::new()));
         let non_default = EngineConfig {

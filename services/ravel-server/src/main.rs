@@ -335,6 +335,8 @@ async fn main() -> anyhow::Result<()> {
             .parse_store_probe_interval()
             .context("failed to parse --store-probe-interval")?,
         indexed_fields,
+        disable_cache: cli.disable_cache,
+        cache_max_bytes: cli.cache_max_bytes,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;

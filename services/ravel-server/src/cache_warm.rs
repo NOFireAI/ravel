@@ -292,7 +292,8 @@ mod tests {
     }
 
     fn catalog_for(store: Arc<dyn ObjectStoreBackend>) -> Arc<Catalog> {
-        crate::query::build_catalog(store, 1).expect("catalog")
+        crate::query::build_catalog(store, 1, false, ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES)
+            .expect("catalog")
     }
 
     #[tokio::test]

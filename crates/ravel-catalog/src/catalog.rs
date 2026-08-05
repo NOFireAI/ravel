@@ -78,7 +78,15 @@ pub struct Catalog {
     /// `get_or_fetch`: every call site here does its own plain
     /// get-then-insert, mirroring the five decoded caches' idiom, so no
     /// upstream fetch-closure error type is ever constructed.
-    byte_cache: Cache<std::convert::Infallible>,
+    ///
+    /// `None` when [`CatalogConfig::byte_cache_max_bytes`] is `0`: the byte
+    /// cache is then absent entirely (not a zero-capacity cache), so
+    /// `fetch_content_addressed` reads every object straight through
+    /// [`Catalog::guarded_get`] with no cache hit/miss accounting, exactly as
+    /// a build with no byte-cache wiring would. This is how the server's
+    /// `--disable-cache` disables the catalog byte cache alongside the fetcher
+    /// cache (issue #553).
+    byte_cache: Option<Cache<std::convert::Infallible>>,
     /// Count of unlisted L0 records observed postdating a compaction record
     /// in their bucket (docs/catalog-and-mvcc.md step 3: an interlock
     /// breach, since a flush should have sealed before compaction ran). The
@@ -128,11 +136,18 @@ impl Catalog {
         if config.shard_count == 0 {
             return Err(CatalogError::InvalidConfig);
         }
-        let byte_cache_limits = CacheLimits::new(
-            config.byte_cache_max_bytes,
-            config.byte_cache_max_entries,
-            config.byte_cache_max_entry_bytes,
-        );
+        // `byte_cache_max_bytes == 0` is the disabled sentinel (issue #553):
+        // build no byte cache at all rather than a zero-capacity one, so the
+        // resolve path reads straight through the store with no RAM tier and no
+        // byte-cache accounting, byte-for-byte a build with no byte-cache
+        // wiring. Any other value builds the cache at the configured limits.
+        let byte_cache = (config.byte_cache_max_bytes != 0).then(|| {
+            Cache::new(CacheLimits::new(
+                config.byte_cache_max_bytes,
+                config.byte_cache_max_entries,
+                config.byte_cache_max_entry_bytes,
+            ))
+        });
         Ok(Catalog {
             store,
             config,
@@ -141,7 +156,7 @@ impl Catalog {
             head_cache: HeadCache::default(),
             part_cache: PartCache::default(),
             postings_cache: PostingsCache::default(),
-            byte_cache: Cache::new(byte_cache_limits),
+            byte_cache,
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
@@ -303,15 +318,24 @@ impl Catalog {
                 .await?
                 .data);
         };
+        // No byte cache (disabled via `byte_cache_max_bytes == 0`, issue #553):
+        // read straight through with no cache hit/miss accounting, exactly as
+        // an uncached GET would.
+        let Some(byte_cache) = &self.byte_cache else {
+            return Ok(self
+                .guarded_get(key, GetRange::Full, accounting)
+                .await?
+                .data);
+        };
         let cache_key = CacheKey::new(tenant.0, content_hash, 0, size);
-        if let Some(bytes) = self.byte_cache.get(&cache_key) {
+        if let Some(bytes) = byte_cache.get(&cache_key) {
             accounting.record_cache_hit();
             accounting.add_cache_bytes(bytes.len() as u64);
             return Ok(bytes);
         }
         accounting.record_cache_miss();
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
-        self.byte_cache.insert(cache_key, got.data.clone());
+        byte_cache.insert(cache_key, got.data.clone());
         Ok(got.data)
     }
 
@@ -428,14 +452,29 @@ impl Catalog {
         &self.postings_cache
     }
 
+    /// The byte cache's counters handle (ADR-0046), or `None` when the byte
+    /// cache is disabled ([`CatalogConfig::byte_cache_max_bytes`] `== 0`, issue
+    /// #553). The server threads this to `/metrics` so the catalog byte cache's
+    /// hits/misses/bytes render alongside the fetcher cache's, and a
+    /// `--disable-cache` process renders no catalog cache family at all, the
+    /// same absence a disabled fetcher cache produces.
+    pub fn byte_cache_metrics(&self) -> Option<Arc<ravel_cache::CacheMetrics>> {
+        self.byte_cache.as_ref().map(|cache| cache.metrics())
+    }
+
     /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the
     /// byte cache directly (ADR-0046). Not used by `snapshot_resolve`, which
     /// only ever reaches the byte cache through
     /// [`Catalog::fetch_content_addressed`] -- hence `cfg(test)`, since no
-    /// production code path needs this accessor.
+    /// production code path needs this accessor. Panics if the byte cache is
+    /// disabled; every caller builds a config with a non-zero byte-cache
+    /// budget, so a `None` here is a test-setup bug, not a runtime state.
     #[cfg(test)]
+    #[allow(clippy::expect_used)]
     pub(crate) fn byte_cache(&self) -> &Cache<std::convert::Infallible> {
-        &self.byte_cache
+        self.byte_cache
+            .as_ref()
+            .expect("byte_cache() called on a catalog built with the byte cache disabled")
     }
 
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot

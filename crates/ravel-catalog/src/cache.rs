@@ -1104,4 +1104,67 @@ mod tests {
             "a byte cache hit must skip the store GET the cold path made for the part"
         );
     }
+
+    /// Issue #553: `byte_cache_max_bytes == 0` (the config `--disable-cache`
+    /// resolves to) builds a catalog with no byte cache constructed at all,
+    /// not a zero-capacity one. Asserts on the absence of the cache handle,
+    /// the same style as the fetcher cache's "--disable-cache leaves no cache
+    /// constructed" invariant, rather than on a zero hit count. A resolve over
+    /// such a catalog still returns the published segment: the byte cache is
+    /// an optimization only, so its absence never changes a result.
+    #[tokio::test]
+    async fn disabled_byte_cache_config_constructs_no_byte_cache() {
+        let store = Arc::new(MemoryStore::new());
+        let hour = 900_004u32;
+        let now_ns = now_at_seal(hour);
+        publish_one_segment(&store, hour, now_ns - NS_PER_HOUR).await;
+
+        let disabled_config = CatalogConfig {
+            byte_cache_max_bytes: 0,
+            ..byte_cache_catalog_config(1)
+        };
+
+        let fold_catalog = Catalog::new(store.clone(), disabled_config).expect("catalog");
+        fold_catalog
+            .fold(
+                &byte_cache_tenant(),
+                Signal::Metrics,
+                uuid::Uuid::new_v4(),
+                now_ns,
+                &[],
+            )
+            .await
+            .expect("fold produces a snapshot part");
+
+        let catalog = Catalog::new(store.clone(), disabled_config).expect("catalog");
+        assert!(
+            catalog.byte_cache_metrics().is_none(),
+            "byte_cache_max_bytes == 0 must construct no byte cache, so there is no \
+             counters handle to expose (issue #553)"
+        );
+
+        // An enabled catalog over the same store must, by contrast, expose the
+        // handle: the assertion above is proving a disable, not a permanently
+        // absent feature.
+        let enabled = Catalog::new(store.clone(), byte_cache_catalog_config(1)).expect("catalog");
+        assert!(
+            enabled.byte_cache_metrics().is_some(),
+            "a non-zero byte_cache_max_bytes must construct the byte cache and expose \
+             its counters handle"
+        );
+
+        let range = TimeRange {
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let snapshot = catalog
+            .resolve(&byte_cache_tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("resolve succeeds with the byte cache disabled");
+        assert_eq!(
+            snapshot.segments.len(),
+            1,
+            "the resolve must still find the one published segment with no byte cache"
+        );
+    }
 }

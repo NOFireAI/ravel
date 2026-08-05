@@ -160,6 +160,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         query_accounting: Arc::clone(&query_accounting),
     });
 
+    let catalog_cache_metrics = catalog.byte_cache_metrics();
     let metrics = crate::metrics::router(MetricsState {
         mode: Mode::All,
         store_metrics: Arc::new(StoreMetrics::default()),
@@ -170,6 +171,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         tenant_discovery: None,
         maintenance_safety: None,
         cache_metrics: None,
+        catalog_cache_metrics,
         admission: Arc::new(AdmissionController::new(
             Arc::new(SystemClock),
             AdmissionLimits::default(),

@@ -259,9 +259,12 @@ pub struct Cli {
     #[arg(long)]
     pub otap: bool,
 
-    /// Maximum resident bytes for the ADR-0046 read cache's RAM tier. Read at
-    /// startup only; there is no live resize. Ignored when `--disable-cache`
-    /// is set.
+    /// Maximum resident bytes for the ADR-0046 read caches' RAM tier. Bounds
+    /// every ADR-0046 cache in the process from this one number: the query
+    /// fetcher cache (`store::build_cache`) and the catalog's byte cache
+    /// (`query::build_catalog`) both, not just the fetcher cache (issue #553).
+    /// Read at startup only; there is no live resize. Ignored when
+    /// `--disable-cache` is set.
     #[arg(long, default_value_t = DEFAULT_CACHE_MAX_BYTES)]
     pub cache_max_bytes: u64,
 
@@ -277,9 +280,13 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Disables the ADR-0046 read cache entirely. With this set, no cache is
-    /// constructed and query results are byte-for-byte identical to a build
-    /// with no read cache wiring at all.
+    /// Disables every ADR-0046 read cache in the process entirely: the query
+    /// fetcher cache (`store::build_cache`) and the catalog's byte cache
+    /// (`query::build_catalog`) both, not just the fetcher cache (issue #553).
+    /// With this set, no cache of either kind is constructed, so query results
+    /// are byte-for-byte identical to a build with no read-cache wiring at all
+    /// and the process holds no read-cache memory. This is the flag for a
+    /// memory-constrained container.
     #[arg(long)]
     pub disable_cache: bool,
 

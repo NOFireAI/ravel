@@ -192,7 +192,13 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
 
     let mut tokens = HashMap::new();
     tokens.insert("acme-token".to_string(), tenant.clone());
-    let catalog = build_catalog(Arc::clone(&store), 1).expect("catalog");
+    let catalog = build_catalog(
+        Arc::clone(&store),
+        1,
+        cli.disable_cache,
+        cli.cache_max_bytes,
+    )
+    .expect("catalog");
     let mut sql_state = build_sql_state(
         catalog,
         store,

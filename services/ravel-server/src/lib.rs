@@ -210,6 +210,20 @@ pub struct ServerConfig {
     /// result to `RlogWriter::with_indexed_fields`. This is the one production
     /// call site that reads the configuration.
     pub indexed_fields: crate::postings_config::IndexedFieldConfig,
+    /// `--disable-cache`: turn off every ADR-0046 read cache in the process,
+    /// not just the fetcher cache (issue #553). `main` sets it from
+    /// `Cli::disable_cache`, the same flag `store::build_cache` reads to return
+    /// a `None` fetcher cache; [`start`] additionally passes it to
+    /// [`query::build_catalog`] so the catalog builds no byte cache either, so
+    /// a memory-constrained `--disable-cache` deployment does not silently keep
+    /// a 512 MiB catalog byte cache.
+    pub disable_cache: bool,
+    /// `--cache-max-bytes`: the shared RAM budget for the ADR-0046 read caches.
+    /// `main` sets it from `Cli::cache_max_bytes`; it bounds the fetcher cache
+    /// (via `store::build_cache`) and the catalog byte cache (via
+    /// [`query::build_catalog`]) from one number (issue #553). Ignored when
+    /// `disable_cache` is set.
+    pub cache_max_bytes: u64,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -549,8 +563,15 @@ pub async fn start(
                 .merge(remote_write::router(mtls_rw_state));
         }
     }
-    let catalog = query::build_catalog(store.clone(), config.shard_count)?;
+    let catalog = query::build_catalog(
+        store.clone(),
+        config.shard_count,
+        config.disable_cache,
+        config.cache_max_bytes,
+    )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
+    // The two cache flags reach the catalog byte cache here, not only the
+    // fetcher cache (issue #553).
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
     // spawns `maintain::spawn` below and therefore has discovery counters to
@@ -578,6 +599,7 @@ pub async fn start(
         tenant_discovery: tenant_discovery_metrics.clone(),
         maintenance_safety: maintenance_safety_metrics.clone(),
         cache_metrics: cache.as_ref().map(|c| c.metrics()),
+        catalog_cache_metrics: catalog.byte_cache_metrics(),
         admission: admission.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),

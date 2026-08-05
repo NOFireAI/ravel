@@ -12,12 +12,14 @@
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and its
 //! variants are exhaustively `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, and `reason` (ADR-0044 section 4,
-//! `reason` added by ADR-0051 section 6 for the admission-rejection family).
-//! Every variant's payload is a closed enum or [`TenantHash`]'s fixed-width
-//! hash, so there is no `String` or `&str` anywhere on this path an unlisted
-//! label could travel through, and adding a ninth variant is a compile error
-//! everywhere this module matches on `Label` exhaustively. `shard` is
+//! `error_kind`, `workload_class`, `level`, `reason`, and `cache` (ADR-0044
+//! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
+//! family, `cache` by issue #553 to split the read-cache family into the
+//! fetcher and catalog byte caches). Every variant's payload is a closed enum
+//! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
+//! anywhere on this path an unlisted label could travel through, and adding a
+//! tenth variant is a compile error everywhere this module matches on `Label`
+//! exhaustively. `shard` is
 //! deliberately absent: shard count times tenant count times operation count
 //! is unbounded in the dimension Ravel controls least (ADR-0044, rejected
 //! alternative 6). Query text, metric names, label values beyond the closed
@@ -180,6 +182,28 @@ pub enum Label {
     WorkloadClass(WorkloadClass),
     Level(Level),
     RejectReason(RejectReason),
+    Cache(CacheFamily),
+}
+
+/// Which ADR-0046 read cache a `ravel_cache_*` sample belongs to (issue #553).
+/// Both caches share one metric family and are told apart only by this
+/// `cache=` label, the same discipline every other family here uses to split
+/// one metric name across a closed dimension. `fetch` is the query fetchers'
+/// RAM cache (`ravel_server::store::build_cache`); `catalog` is the catalog's
+/// content-addressed byte cache (`ravel_catalog::Catalog`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheFamily {
+    Fetch,
+    Catalog,
+}
+
+impl CacheFamily {
+    fn name(self) -> &'static str {
+        match self {
+            CacheFamily::Fetch => "fetch",
+            CacheFamily::Catalog => "catalog",
+        }
+    }
 }
 
 impl Label {
@@ -193,6 +217,7 @@ impl Label {
             Label::WorkloadClass(_) => "workload_class",
             Label::Level(_) => "level",
             Label::RejectReason(_) => "reason",
+            Label::Cache(_) => "cache",
         }
     }
 
@@ -206,6 +231,7 @@ impl Label {
             Label::WorkloadClass(class) => class.name().to_string(),
             Label::Level(level) => level.name().to_string(),
             Label::RejectReason(reason) => reason.name().to_string(),
+            Label::Cache(family) => family.name().to_string(),
         }
     }
 }
@@ -1200,96 +1226,79 @@ fn render_maintain_safety_family(
     }
 }
 
-/// The ADR-0046 read cache's counters (issues #445, #502), one process-wide
-/// `Cache` shared by the PromQL and SQL fetchers (`ravel_server::query`), so
-/// this family carries only `mode`, no `signal` split -- the same discipline
-/// `render_store_family` uses (separate metric names per outcome, e.g.
-/// `calls_total`/`ok_total`/`errors_total`, rather than an unlisted "result"
-/// label). Request hit rate is `hits / (hits + misses)`; byte hit rate is
-/// `bytes_served / (bytes_served + bytes_admitted)`; both are left for
-/// PromQL to compute from the raw counters, not baked in here. Deliberately
-/// omits `single_flight_collapses`: issue #503 is its own fleet-wide
+/// The ADR-0046 read caches' counters (issues #445, #502, #553). Two caches
+/// share this one family: the query fetchers' RAM cache (`fetch`) and the
+/// catalog's content-addressed byte cache (`catalog`), told apart by the
+/// `cache=` label, the same one-name-split-by-a-closed-dimension discipline
+/// every other family here uses. There is no `signal` split. Request hit rate
+/// is `hits / (hits + misses)` and byte hit rate is `bytes_served /
+/// (bytes_served plus bytes_admitted)`; both are left for PromQL to compute per
+/// `cache` from the raw counters, not baked in here. The family deliberately
+/// omits `single_flight_collapses` because issue #503 is its own fleet-wide
 /// collapse-rate metric, not this one, and this family must not preempt that
 /// decision by shipping a shape it did not choose.
-fn render_cache_family(out: &mut String, mode: Mode, snapshot: &CacheMetricsSnapshot) {
-    write_header(
-        out,
+///
+/// Each cache is rendered only when it is attached (`Some`): a `--disable-cache`
+/// process passes `None` for both and this family is skipped entirely (see
+/// [`render`]); a process with the fetcher cache off but the catalog byte cache
+/// on, or vice versa, renders only the family that exists. Every metric name's
+/// header is written once even when both caches are present, so the exposition
+/// stays well-formed (one HELP/TYPE line per name, then its samples).
+fn render_cache_family(
+    out: &mut String,
+    mode: Mode,
+    fetch: Option<&CacheMetricsSnapshot>,
+    catalog: Option<&CacheMetricsSnapshot>,
+) {
+    let families = [(CacheFamily::Fetch, fetch), (CacheFamily::Catalog, catalog)];
+
+    // One metric name at a time: header once, then a sample per attached cache
+    // under its `cache=` label. `field` picks the counter this metric renders.
+    let mut emit = |name: &str, help: &str, field: fn(&CacheMetricsSnapshot) -> u64| {
+        write_header(out, name, help, "counter");
+        for (family, snapshot) in families {
+            if let Some(snapshot) = snapshot {
+                write_sample(
+                    out,
+                    name,
+                    &[Label::Mode(mode), Label::Cache(family)],
+                    field(snapshot),
+                );
+            }
+        }
+    };
+
+    emit(
         "ravel_cache_hits_total",
         "Read-cache lookups served from the cache.",
-        "counter",
+        |s| s.hits,
     );
-    write_sample(
-        out,
-        "ravel_cache_hits_total",
-        &[Label::Mode(mode)],
-        snapshot.hits,
-    );
-
-    write_header(
-        out,
+    emit(
         "ravel_cache_misses_total",
         "Read-cache lookups not found in the cache.",
-        "counter",
+        |s| s.misses,
     );
-    write_sample(
-        out,
-        "ravel_cache_misses_total",
-        &[Label::Mode(mode)],
-        snapshot.misses,
-    );
-
-    write_header(
-        out,
+    emit(
         "ravel_cache_bytes_served_total",
         "Bytes served from the cache on a hit.",
-        "counter",
+        |s| s.bytes_served,
     );
-    write_sample(
-        out,
-        "ravel_cache_bytes_served_total",
-        &[Label::Mode(mode)],
-        snapshot.bytes_served,
-    );
-
-    write_header(
-        out,
+    emit(
         "ravel_cache_bytes_admitted_total",
         "Bytes admitted into the cache after a miss.",
-        "counter",
+        |s| s.bytes_admitted,
     );
-    write_sample(
-        out,
-        "ravel_cache_bytes_admitted_total",
-        &[Label::Mode(mode)],
-        snapshot.bytes_admitted,
-    );
-
-    write_header(
-        out,
+    emit(
         "ravel_cache_evictions_total",
         "Entries evicted from the read cache by its S3-FIFO policy.",
-        "counter",
+        |s| s.evictions,
     );
-    write_sample(
-        out,
-        "ravel_cache_evictions_total",
-        &[Label::Mode(mode)],
-        snapshot.evictions,
-    );
-
-    write_header(
-        out,
+    emit(
         "ravel_cache_disk_errors_degraded_to_misses_total",
         "Disk-tier reads that found an entry at its canonical path but discarded it (short \
          read, bad header, key mismatch, or a failed crc32c check) rather than a clean miss. \
          Nonzero here means the disk tier is unhealthy, not merely cold.",
-        "counter",
-    );
-    write_sample(
-        out,
-        "ravel_cache_disk_errors_degraded_to_misses_total",
-        &[Label::Mode(mode)],
-        snapshot.disk_errors_degraded_to_misses,
+        |s| s.disk_errors_degraded_to_misses,
     );
 }
 
@@ -1810,6 +1819,7 @@ pub fn render(
     maintain: Option<&MaintenanceDiscoverySnapshot>,
     maintain_safety: Option<&MaintenanceSafetySnapshot>,
     cache: Option<&CacheMetricsSnapshot>,
+    catalog_cache: Option<&CacheMetricsSnapshot>,
     admission: &AdmissionCountersSnapshot,
     query_accounting: &[QueryAccountingRow],
 ) -> String {
@@ -1839,8 +1849,8 @@ pub fn render(
     if let Some(snapshot) = maintain_safety {
         render_maintain_safety_family(&mut out, mode, snapshot);
     }
-    if let Some(snapshot) = cache {
-        render_cache_family(&mut out, mode, snapshot);
+    if cache.is_some() || catalog_cache.is_some() {
+        render_cache_family(&mut out, mode, cache, catalog_cache);
     }
     render_admission_family(&mut out, mode, admission);
     render_query_family(&mut out, mode, query_accounting);
@@ -1865,9 +1875,17 @@ pub struct MetricsState {
     /// `Some` only in [`Mode::Maintain`], alongside `tenant_discovery` above
     /// (ADR-0048 decisions 1, 4, 6; issue #517).
     pub maintenance_safety: Option<Arc<crate::maintain::MaintenanceSafetyMetrics>>,
-    /// The ADR-0046 read cache's counters handle (issues #445, #502), or
-    /// `None` when `--disable-cache` leaves no cache constructed at all.
+    /// The ADR-0046 fetcher cache's counters handle (issues #445, #502), or
+    /// `None` when `--disable-cache` leaves no fetcher cache constructed at all.
+    /// Rendered under `cache="fetch"`.
     pub cache_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
+    /// The ADR-0046 catalog byte cache's counters handle (issue #553), or
+    /// `None` when `--disable-cache` leaves no catalog byte cache constructed
+    /// at all. Rendered under `cache="catalog"`, the same family as the fetcher
+    /// cache above, so the documented hit-rate formula covers every ADR-0046
+    /// cache in the process, not just the fetcher one. Sourced from
+    /// [`ravel_catalog::Catalog::byte_cache_metrics`].
+    pub catalog_cache_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
     /// The one process-wide admission controller (ADR-0051), shared with every
     /// ingest path. Always present (built in every mode); in a mode that
     /// serves no ingest its `usage_snapshot` is simply empty, so the admission
@@ -1945,6 +1963,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         .cache_metrics
         .as_ref()
         .map(|metrics| metrics.snapshot());
+    let catalog_cache_snapshot = state
+        .catalog_cache_metrics
+        .as_ref()
+        .map(|metrics| metrics.snapshot());
 
     // Read the admission counters at scrape time (a lock-and-copy, no
     // `.await`), like every other family, rather than baking a snapshot in at
@@ -1966,6 +1988,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         maintain_snapshot.as_ref(),
         maintain_safety_snapshot.as_ref(),
         cache_snapshot.as_ref(),
+        catalog_cache_snapshot.as_ref(),
         &admission_snapshot,
         &query_rows,
     );
@@ -2029,6 +2052,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2063,11 +2087,13 @@ mod tests {
         );
 
         // Half two: the label API makes an unlisted label unrepresentable.
-        // This match has no wildcard arm, so a ninth `Label` variant fails
+        // This match has no wildcard arm, so a tenth `Label` variant fails
         // this compile until a case is added here, and the fixed array below
         // then fails the length assertion until it is extended too -- two
         // independent breaks for one added variant, by design. `reason` is the
-        // eighth, added by ADR-0051 section 6 for the admission family.
+        // eighth, added by ADR-0051 section 6 for the admission family; `cache`
+        // is the ninth, added by issue #553 to split the read-cache family into
+        // the fetcher and catalog byte caches.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -2077,6 +2103,7 @@ mod tests {
             Label::WorkloadClass(WorkloadClass::Interactive),
             Label::Level(Level::Info),
             Label::RejectReason(RejectReason::ByteRate),
+            Label::Cache(CacheFamily::Fetch),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -2089,6 +2116,7 @@ mod tests {
                 Label::WorkloadClass(_) => "workload_class",
                 Label::Level(_) => "level",
                 Label::RejectReason(_) => "reason",
+                Label::Cache(_) => "cache",
             })
             .collect();
         assert_eq!(
@@ -2102,11 +2130,12 @@ mod tests {
                 "workload_class",
                 "level",
                 "reason",
+                "cache",
             ],
-            "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason`; `shard` must \
-             never appear here"
+            "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` and issue #553's \
+             `cache`; `shard` must never appear here"
         );
-        assert_eq!(one_of_each.len(), 8, "exactly 8 permitted label keys");
+        assert_eq!(one_of_each.len(), 9, "exactly 9 permitted label keys");
     }
 
     /// The POSTINGS family (issue #511) renders one sample per metric for the
@@ -2135,6 +2164,7 @@ mod tests {
             &populated_store_snapshot(),
             &ingest,
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2257,6 +2287,7 @@ mod tests {
             &store,
             &ingest,
             &catalog,
+            None,
             None,
             None,
             None,
@@ -2408,6 +2439,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2425,6 +2457,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2480,6 +2513,7 @@ mod tests {
             Some(&snapshot),
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2518,6 +2552,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2545,6 +2580,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2594,6 +2630,7 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
@@ -2660,6 +2697,7 @@ mod tests {
             None,
             Some(&snapshot),
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2690,8 +2728,12 @@ mod tests {
     }
 
     #[test]
-    fn cache_family_renders_when_present_and_omits_single_flight_collapses() {
-        let snapshot = CacheMetricsSnapshot {
+    fn cache_family_renders_both_caches_labeled_distinctly_and_omits_single_flight_collapses() {
+        // Issue #553: the fetcher cache (cache="fetch") and the catalog byte
+        // cache (cache="catalog") share this family, told apart by the `cache`
+        // label, so the documented hit-rate formula covers every ADR-0046
+        // cache. Distinct values per cache so a mislabeled sample is caught.
+        let fetch = CacheMetricsSnapshot {
             hits: 10,
             misses: 4,
             bytes_served: 2048,
@@ -2701,6 +2743,16 @@ mod tests {
             single_flight_collapses: 99,
             disk_errors_degraded_to_misses: 3,
         };
+        let catalog = CacheMetricsSnapshot {
+            hits: 70,
+            misses: 5,
+            bytes_served: 4096,
+            bytes_admitted: 8192,
+            admissions_rejected_size: 0,
+            evictions: 6,
+            single_flight_collapses: 11,
+            disk_errors_degraded_to_misses: 0,
+        };
         let body = render(
             Mode::Gateway,
             &StoreMetricsSnapshot::default(),
@@ -2708,35 +2760,77 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             None,
-            Some(&snapshot),
+            Some(&fetch),
+            Some(&catalog),
             &AdmissionCountersSnapshot::default(),
             &[],
         );
 
+        // Fetcher cache, labeled cache="fetch".
         assert!(
-            body.contains("ravel_cache_hits_total{mode=\"gateway\"} 10"),
-            "missing cache hits sample:\n{body}"
+            body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"fetch\"} 10"),
+            "missing fetch cache hits sample:\n{body}"
         );
         assert!(
-            body.contains("ravel_cache_misses_total{mode=\"gateway\"} 4"),
-            "missing cache misses sample:\n{body}"
+            body.contains("ravel_cache_misses_total{mode=\"gateway\",cache=\"fetch\"} 4"),
+            "missing fetch cache misses sample:\n{body}"
         );
         assert!(
-            body.contains("ravel_cache_bytes_served_total{mode=\"gateway\"} 2048"),
-            "missing cache bytes_served sample:\n{body}"
+            body.contains("ravel_cache_bytes_served_total{mode=\"gateway\",cache=\"fetch\"} 2048"),
+            "missing fetch cache bytes_served sample:\n{body}"
         );
         assert!(
-            body.contains("ravel_cache_bytes_admitted_total{mode=\"gateway\"} 1024"),
-            "missing cache bytes_admitted sample:\n{body}"
+            body.contains(
+                "ravel_cache_bytes_admitted_total{mode=\"gateway\",cache=\"fetch\"} 1024"
+            ),
+            "missing fetch cache bytes_admitted sample:\n{body}"
         );
         assert!(
-            body.contains("ravel_cache_evictions_total{mode=\"gateway\"} 2"),
-            "missing cache evictions sample:\n{body}"
+            body.contains("ravel_cache_evictions_total{mode=\"gateway\",cache=\"fetch\"} 2"),
+            "missing fetch cache evictions sample:\n{body}"
         );
         assert!(
-            body.contains("ravel_cache_disk_errors_degraded_to_misses_total{mode=\"gateway\"} 3"),
-            "missing cache disk_errors_degraded_to_misses sample:\n{body}"
+            body.contains(
+                "ravel_cache_disk_errors_degraded_to_misses_total{mode=\"gateway\",cache=\"fetch\"} 3"
+            ),
+            "missing fetch cache disk_errors_degraded_to_misses sample:\n{body}"
         );
+
+        // Catalog byte cache, labeled cache="catalog", same metric names.
+        assert!(
+            body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 70"),
+            "missing catalog cache hits sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_misses_total{mode=\"gateway\",cache=\"catalog\"} 5"),
+            "missing catalog cache misses sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_cache_bytes_served_total{mode=\"gateway\",cache=\"catalog\"} 4096"
+            ),
+            "missing catalog cache bytes_served sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_cache_bytes_admitted_total{mode=\"gateway\",cache=\"catalog\"} 8192"
+            ),
+            "missing catalog cache bytes_admitted sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_evictions_total{mode=\"gateway\",cache=\"catalog\"} 6"),
+            "missing catalog cache evictions sample:\n{body}"
+        );
+
+        // Each metric name still carries exactly one HELP/TYPE header even with
+        // both caches present (Prometheus requires one per name).
+        assert_eq!(
+            body.matches("# TYPE ravel_cache_hits_total counter")
+                .count(),
+            1,
+            "each cache metric name must declare its TYPE exactly once:\n{body}"
+        );
+
         assert!(
             !body.contains("single_flight_collapse"),
             "issue #503: fleet-wide single-flight collapse rate must never be \
@@ -2745,12 +2839,45 @@ mod tests {
     }
 
     #[test]
-    fn cache_family_omitted_entirely_when_no_cache_is_attached() {
+    fn only_the_attached_cache_family_renders() {
+        // The fetcher cache is off (None) but the catalog byte cache is on:
+        // only cache="catalog" renders, no cache="fetch" phantom sample.
+        let catalog = CacheMetricsSnapshot {
+            hits: 7,
+            ..Default::default()
+        };
         let body = render(
             Mode::Gateway,
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            Some(&catalog),
+            &AdmissionCountersSnapshot::default(),
+            &[],
+        );
+        assert!(
+            body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
+            "catalog cache must render when it is the only cache attached:\n{body}"
+        );
+        assert!(
+            !body.contains("cache=\"fetch\""),
+            "no fetch cache sample when the fetcher cache is off:\n{body}"
+        );
+    }
+
+    #[test]
+    fn cache_family_omitted_entirely_when_no_cache_is_attached() {
+        // A `--disable-cache` process attaches neither the fetcher cache nor
+        // the catalog byte cache (issue #553), so the whole family is absent.
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2761,7 +2888,7 @@ mod tests {
         assert!(
             !body.contains("ravel_cache_"),
             "a server run with --disable-cache must not render any cache \
-             family at all:\n{body}"
+             family at all, neither fetch nor catalog:\n{body}"
         );
     }
 
@@ -2828,6 +2955,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &snapshot,
             &[],
         );
@@ -2889,6 +3017,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2960,6 +3089,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
