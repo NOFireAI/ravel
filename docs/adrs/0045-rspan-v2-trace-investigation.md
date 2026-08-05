@@ -1,4 +1,4 @@
-# ADR-0045: RSPAN v2 and v3: pruning columns, a shared codec crate, and a reachable spans table
+# ADR-0045: RSPAN v2 and v4: pruning columns, a shared codec crate, and a reachable spans table
 
 Status: Accepted (2026-08-02)
 
@@ -90,9 +90,15 @@ service dependency workflow. `merge_attrs`
 writer lifts `service.name` out of it into the column and does not
 duplicate it in the blob.
 
-### 3. RSPAN v3: attribute columns and span events
+### 3. RSPAN v4: attribute columns and span events
 
-Trailer version 3, landing after v2 is green. Ports RLOG's proven
+Amended, 2026-08-05 (ADR-0054): this decision was originally numbered
+trailer version 3. ADR-0054 claims v3 for a bloom filter and a
+service_name column instead, since that work is ready to ship and this
+one has no code yet. Renumbered to v4 here; issue #434 carries the same
+renumbering.
+
+Trailer version 4, landing after v3 (ADR-0054) is green. Ports RLOG's proven
 design rather than inventing a span-specific one: per-key typed columns
 with per-type splitting, a 1000-dynamic-column cap, and overflow keys
 folded into an `attrs_raw` column that stays scan-queryable but is never
@@ -114,7 +120,7 @@ retires v2, each in the change that introduces it.
 
 This is the format-change skill's dual-reader question answered
 explicitly: no deployed data exists in RSPAN v1 outside development
-buckets, so no reader keeps two paths. If that stops being true before v3
+buckets, so no reader keeps two paths. If that stops being true before v4
 lands, this decision must be revisited in its own ADR rather than
 assumed.
 
