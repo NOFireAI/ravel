@@ -128,6 +128,8 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
         // explicitly via `run_probe_cycle` for determinism.
         store_probe_interval: Duration::from_secs(3600),
         indexed_fields: Default::default(),
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
     };
     ravel_server::start(
         config,

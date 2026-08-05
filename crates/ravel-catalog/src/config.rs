@@ -151,6 +151,14 @@ pub struct CatalogConfig {
     /// Total byte budget for the byte cache (ADR-0046), the RAM tier of raw
     /// content-addressed bytes consulted ahead of a store GET for snapshot
     /// parts and postings objects. Default [`DEFAULT_BYTE_CACHE_MAX_BYTES`].
+    ///
+    /// `0` is the disabled sentinel: [`crate::Catalog::new`] then builds no
+    /// byte cache at all, so a resolve reads every content-addressed object
+    /// straight through [`crate::Catalog`]'s store funnel with no RAM tier in
+    /// front of it and no cache hit/miss accounting for it. This is how the
+    /// server's `--disable-cache` reaches the catalog byte cache, not just the
+    /// fetcher cache (issue #553); it is the byte-cache analogue of building
+    /// the query fetchers with no `Cache` attached.
     pub byte_cache_max_bytes: u64,
     /// Entry-count bound for the byte cache. Default
     /// [`DEFAULT_BYTE_CACHE_MAX_ENTRIES`].

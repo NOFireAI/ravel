@@ -343,6 +343,8 @@ async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
         indexed_fields: Default::default(),
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
     };
     let running = ravel_server::start(
         config,
