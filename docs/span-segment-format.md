@@ -14,9 +14,11 @@ dictionary-encoded `service_name` column, id 9). Trailer version history:
 Ravel is pre-release: one supported version at a time, earlier versions
 rejected with the same typed `Corrupted` error as an unknown future version,
 never carried by a dual reader (ADR-0045 decision 4, ADR-0054 decision 1,
-ADR-0027 precedent). A v1 or v2 object outside development buckets must be
-compacted (which rewrites to the current version) before v3 ships if it is
-meant to remain queryable.
+ADR-0027 precedent). There is no in-place migration path across a version
+bump: since no dual reader exists, code built against v3 cannot open a v1 or
+v2 object to compact it forward. A v1 or v2 object outside development
+buckets that must remain queryable has to be re-ingested from source under
+v3; this is Ravel's accepted pre-release posture, not a gap to close later.
 Parsers treat every offset, length, count, and tag read from stored bytes as
 untrusted input: bounds-check everything, overflow-check every accumulation,
 fuzz all decoders. No `unsafe`. Every violation is a typed `Corrupted` error,
