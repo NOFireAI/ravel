@@ -137,6 +137,16 @@ pub struct GatewaySpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirementsSpec>,
 
+    /// Per-role S3 credential override for the gateway tier (ADR-0055 section 5).
+    /// When set, the gateway Deployment sources `RAVEL_S3_ACCESS_KEY` /
+    /// `RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /
+    /// `secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,
+    /// so an operator can scope the gateway to a narrower IAM credential. Falls
+    /// back to the shared credential when unset, so existing single-credential
+    /// clusters are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
+
     /// Catalog fold tuning. Fold is a pure query-cost optimization and only
     /// runs in the gateway tier, so it is a gateway-only field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +158,7 @@ impl Default for GatewaySpec {
         Self {
             replicas: default_replicas(),
             resources: None,
+            credentials_secret_ref: None,
             fold: None,
         }
     }
@@ -179,6 +190,16 @@ pub struct QuerySpec {
     /// Container resource requests/limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirementsSpec>,
+
+    /// Per-role S3 credential override for the query tier (ADR-0055 section 5).
+    /// When set, the query Deployment sources `RAVEL_S3_ACCESS_KEY` /
+    /// `RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /
+    /// `secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,
+    /// so an operator can scope the query tier to a narrower IAM credential. Falls
+    /// back to the shared credential when unset, so existing single-credential
+    /// clusters are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
 }
 
 impl Default for QuerySpec {
@@ -186,6 +207,7 @@ impl Default for QuerySpec {
         Self {
             replicas: default_replicas(),
             resources: None,
+            credentials_secret_ref: None,
         }
     }
 }
@@ -208,6 +230,17 @@ pub struct MaintainSpec {
     /// Container resource requests/limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirementsSpec>,
+
+    /// Per-role S3 credential override for the maintain tier (ADR-0055 section 5).
+    /// When set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /
+    /// `RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /
+    /// `secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.
+    /// Maintain is the only role ADR-0055 grants delete, so this is where an
+    /// operator points the delete-capable credential. Falls back to the shared
+    /// credential when unset, so existing single-credential clusters are
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
 }
 
 impl Default for MaintainSpec {
@@ -216,6 +249,7 @@ impl Default for MaintainSpec {
             enabled: default_true(),
             interval_secs: None,
             resources: None,
+            credentials_secret_ref: None,
         }
     }
 }
@@ -508,6 +542,54 @@ mod tests {
                 "{tier}.replicas must reject negative/zero"
             );
         }
+    }
+
+    #[test]
+    fn per_tier_credential_overrides_are_in_the_schema_and_optional() {
+        // ADR-0055 section 5: each tier gains an optional credentialsSecretRef.
+        // The JsonSchema derive must surface them under each tier's properties,
+        // and they must be absent by default (Option::is_none skip) so an
+        // existing spec that omits them still deserializes.
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let spec_props = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        for tier in ["gateway", "query", "maintain"] {
+            let tier_props = spec_props
+                .get(tier)
+                .expect("tier prop")
+                .properties
+                .as_ref()
+                .expect("tier props");
+            assert!(
+                tier_props.contains_key("credentialsSecretRef"),
+                "{tier} must expose credentialsSecretRef in its schema"
+            );
+        }
+
+        // A spec omitting every override still deserializes, with all None.
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(spec.gateway.credentials_secret_ref, None);
+        assert_eq!(spec.query.credentials_secret_ref, None);
+        assert_eq!(spec.maintain.credentials_secret_ref, None);
     }
 
     #[test]

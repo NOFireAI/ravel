@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ravel_object_store::conformance::{CONFORMANCE_SUITE_VERSION, run_conformance_suite};
+use ravel_object_store::conformance::{
+    CONFORMANCE_SUITE_VERSION, probe_object_lock, run_conformance_suite,
+};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
 
 // The record and its key now live in `ravel-object-store` so `ravel-server`
@@ -37,6 +39,21 @@ pub async fn qualify(
             result.detail
         );
     }
+
+    // Informational Object Lock / versioning probe (ADR-0055 section 3, citing
+    // ADR-0042 decision 3). Printed unconditionally, before the pass/fail
+    // decision, and clearly labeled informational and non-blocking: it never
+    // affects whether qualification passes, what is recorded in
+    // `sys/qualification`, or whether the server starts (ADR-0050 section 6 is
+    // unaffected). Today it always reports "unknown" through the
+    // `ObjectStoreBackend` contract, which exposes no such query.
+    let object_lock = probe_object_lock(store.as_ref()).await;
+    println!(
+        "{:<40} {} (informational, non-blocking) {}",
+        "object_lock/versioning",
+        object_lock.status.name(),
+        object_lock.detail
+    );
 
     if !report.passed() {
         let failed_names: Vec<&str> = report.failures().map(|r| r.property.name()).collect();

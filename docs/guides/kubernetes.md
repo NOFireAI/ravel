@@ -267,3 +267,96 @@ cluster.
 - The operator does not expose the gateway Service or the query Service outside
   the cluster. Add an Ingress or a `LoadBalancer` Service yourself, and put
   TLS in front of it: tenant tokens are bearer tokens.
+
+## Storage credential roles (ADR-0055)
+
+By default a `RavelCluster` points every tier at one Secret
+(`spec.storage.s3.credentialsSecretRef`), so the gateway, query, and maintain
+pods all use one bucket-wide S3 credential. ADR-0055 lets you hand each tier a
+distinct, narrower credential instead, so a leak from one tier can only do what
+that tier legitimately does — and only the maintain tier can delete anything at
+all.
+
+Each of the operator's three Deployments maps to one role:
+
+| Tier / Deployment | `--mode` | Role | Scope in one line |
+|---|---|---|---|
+| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes. No delete. |
+| `<name>-query` | `query` | Query | Reads commit and catalog objects, runs fold, appends query audit. No delete. |
+| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only tier granted any delete, and only over `l0/`, `l1/`, `c/`, `idem/`. |
+
+A fourth role, **Admin**, backs `ravel-cli` and is deliberately not managed by
+the operator: there is no CRD field for it and no pod runs it. It is used only
+by out-of-band operator/CI invocations. See
+[operations.md](operations.md#the-admin-credential).
+
+The exact per-role AWS IAM policy JSON, the MinIO equivalent for dev/CI, and
+the first-deployment bootstrap notes all live in one place:
+[operations.md, "Storage credential roles"](operations.md#storage-credential-roles-adr-0055).
+This section covers only the Kubernetes wiring.
+
+### Per-tier credential Secrets
+
+Create one Secret per role you want to scope, each with the same two keys as
+the shared Secret (`accessKeyId`, `secretAccessKey`), holding that role's
+narrower access key:
+
+```sh
+kubectl create secret generic ravel-s3-gateway \
+  --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
+kubectl create secret generic ravel-s3-query \
+  --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
+kubectl create secret generic ravel-s3-maintain \
+  --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
+```
+
+Then reference each from its tier with an additive `credentialsSecretRef`
+field, alongside the existing shared one under `spec.storage.s3`:
+
+```yaml
+apiVersion: ravel.nofire.ai/v1alpha1
+kind: RavelCluster
+metadata:
+  name: prod
+  namespace: ravel-system
+spec:
+  image: ravel-server:1.0.0
+  shards: 8
+  storage:
+    s3:
+      bucket: my-ravel-bucket
+      region: us-west-2
+      # Shared fallback. Any tier that omits its own credentialsSecretRef
+      # below uses this one, exactly as in the single-credential model.
+      credentialsSecretRef:
+        name: ravel-s3-shared
+  gateway:
+    replicas: 3
+    credentialsSecretRef:
+      name: ravel-s3-gateway
+  query:
+    replicas: 3
+    credentialsSecretRef:
+      name: ravel-s3-query
+  maintain:
+    enabled: true
+    credentialsSecretRef:
+      name: ravel-s3-maintain
+  tenantTokensSecretRef:
+    name: ravel-tenant-tokens
+```
+
+The per-tier `spec.<tier>.credentialsSecretRef` fields are additive and
+optional (ADR-0055 section 5): omit a tier's override and that tier falls back
+to the shared `spec.storage.s3.credentialsSecretRef`, unchanged. A
+`RavelCluster` that sets no per-tier override at all behaves exactly as it does
+today — one shared credential across all three Deployments — so adopting the
+split is zero-migration and can be rolled out one tier at a time. Unlike the
+shared Secret, `kind-up.sh` does **not** create these per-tier Secrets: the
+local kind environment deliberately keeps using the single shared credential
+for development convenience (see "Storage credential roles" in
+docs/guides/operations.md — the per-role split is a production hardening,
+and `kind-up.sh` is not meant to be modified to adopt it). To exercise the
+split in a kind cluster anyway, create the per-tier Secrets yourself the same
+way as above (`kubectl create secret generic ...`) before applying a
+`RavelCluster` that references them.

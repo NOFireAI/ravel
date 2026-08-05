@@ -139,6 +139,130 @@ impl ConformanceReport {
     }
 }
 
+/// Informational bucket-protection signal (ADR-0055 section 3, citing ADR-0042
+/// decision 3). Reports whether the target bucket *appears* to have S3 Object
+/// Lock or bucket versioning enabled, so an operator gets a startup-adjacent
+/// signal about the WORM/deny-delete gap instead of discovering it during an
+/// incident.
+///
+/// This is **informational only**. It never contributes to
+/// [`ConformanceReport::passed`], never changes what `ravel-cli store qualify`
+/// records in `sys/qualification`, and never gates server startup: the
+/// mandatory ADR-0050 section 6 checks (record present, `suite_version` at or
+/// above the binary floor) are completely independent of it, in every state.
+/// `object_store` 0.14 exposes no per-PUT Object Lock / versioning API, and
+/// ADR-0042 decision 3 reserved a real Object Lock capability for its own
+/// trait-extending ADR, so this probe cannot become an enforcement point
+/// without contradicting an already-accepted decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLockStatus {
+    /// The backend affirmatively reports Object Lock and/or versioning enabled.
+    Enabled,
+    /// The backend affirmatively reports neither Object Lock nor versioning.
+    Disabled,
+    /// The backend cannot answer: no API exists for it (the S3 adapter and
+    /// [`crate::memory::MemoryStore`] today), the credential is denied the
+    /// configuration read, or the backend kind does not model it at all. This
+    /// is not an error and not a qualification failure -- it is the honest
+    /// default per ADR-0055 section 3.
+    Unknown,
+}
+
+impl ObjectLockStatus {
+    /// Stable, greppable identifier -- this is what lands in `ravel-cli store
+    /// qualify`'s output, so an operator can search for it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ObjectLockStatus::Enabled => "enabled",
+            ObjectLockStatus::Disabled => "disabled",
+            ObjectLockStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// Outcome of the informational Object Lock / versioning probe: an
+/// [`ObjectLockStatus`] plus a human-readable explanation of how it was
+/// determined (or why it is unknown).
+#[derive(Debug, Clone)]
+pub struct ObjectLockProbe {
+    pub status: ObjectLockStatus,
+    pub detail: String,
+}
+
+impl ObjectLockProbe {
+    /// The honest default: the backend could not answer. Not an error.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        ObjectLockProbe {
+            status: ObjectLockStatus::Unknown,
+            detail: detail.into(),
+        }
+    }
+
+    /// The backend affirmatively reported Object Lock / versioning enabled.
+    pub fn enabled(detail: impl Into<String>) -> Self {
+        ObjectLockProbe {
+            status: ObjectLockStatus::Enabled,
+            detail: detail.into(),
+        }
+    }
+
+    /// The backend affirmatively reported no Object Lock / versioning.
+    pub fn disabled(detail: impl Into<String>) -> Self {
+        ObjectLockProbe {
+            status: ObjectLockStatus::Disabled,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Source of the informational Object Lock / versioning signal, kept
+/// deliberately **separate from [`ObjectStoreBackend`]**.
+///
+/// ADR-0042 decision 3 (reaffirmed by ADR-0055 section 3) reserves any real
+/// Object Lock capability on the backend trait for its own capability-gated,
+/// trait-extending ADR, following the existing `Capabilities` pattern. Adding a
+/// method to [`ObjectStoreBackend`] for this informational task would pre-empt
+/// that decision, so this trait is a separate seam instead. Every production
+/// backend reports [`ObjectLockStatus::Unknown`] through it today, because
+/// `object_store` 0.14 has no Object Lock / versioning query and this crate
+/// never opens a second, direct-SDK side channel (an ADR-0042 rejected
+/// alternative). Test fixtures implement it to represent enabled/disabled
+/// buckets so the reporting path is exercised for every state.
+#[async_trait::async_trait]
+pub trait ObjectLockProbeSource {
+    async fn object_lock_status(&self) -> ObjectLockProbe;
+}
+
+/// The production path: a store reached only through the [`ObjectStoreBackend`]
+/// contract cannot answer, so the probe is always [`ObjectLockStatus::Unknown`]
+/// here. Implemented on the trait object itself (not via a blanket `impl`) so
+/// `ravel-cli store qualify`, which holds an `Arc<dyn ObjectStoreBackend>`, can
+/// probe without threading a concrete type, while test fixtures remain free to
+/// implement the trait for their own concrete types to report other states.
+#[async_trait::async_trait]
+impl ObjectLockProbeSource for dyn ObjectStoreBackend {
+    async fn object_lock_status(&self) -> ObjectLockProbe {
+        ObjectLockProbe::unknown(
+            "the ObjectStoreBackend contract exposes no Object Lock / versioning query, and \
+             object_store 0.14 has no API for one; a real probe needs its own trait-extending \
+             ADR (ADR-0042 decision 3). Reporting unknown is the honest, non-blocking default \
+             (ADR-0055 section 3): Object Lock / versioning may or may not be enabled at the \
+             bucket level out of band",
+        )
+    }
+}
+
+/// Run the informational Object Lock / versioning probe against `source`.
+///
+/// Never fails, never panics, and never affects qualification: it returns an
+/// [`ObjectLockProbe`] whose status the caller prints for the operator and
+/// otherwise ignores when deciding pass/fail (ADR-0055 section 3). Kept
+/// separate from [`run_conformance_suite`] precisely so a reader can see it is
+/// not one of the gating properties.
+pub async fn probe_object_lock<S: ObjectLockProbeSource + ?Sized>(source: &S) -> ObjectLockProbe {
+    source.object_lock_status().await
+}
+
 /// Run every conformance probe against `store`, scoping all writes under
 /// `scratch_prefix` (ADR-0050 section 6: `sys/qualify/<run-id>/`). Never
 /// panics on a misbehaving backend: every probe treats an unexpected
@@ -447,6 +571,77 @@ mod tests {
         assert_eq!(decoded.backend_identity, record.backend_identity);
         assert_eq!(decoded.qualified_unix_ns, record.qualified_unix_ns);
         assert_eq!(decoded.passed_properties, record.passed_properties);
+    }
+
+    /// A fixture that reports a fixed [`ObjectLockStatus`], standing in for a
+    /// bucket whose Object Lock / versioning state a real backend could observe
+    /// but the `ObjectStoreBackend` contract cannot. Lets the probe be
+    /// exercised for enabled/disabled/unknown without a live S3 bucket.
+    struct FixedLockSource(ObjectLockStatus);
+
+    #[async_trait::async_trait]
+    impl ObjectLockProbeSource for FixedLockSource {
+        async fn object_lock_status(&self) -> ObjectLockProbe {
+            match self.0 {
+                ObjectLockStatus::Enabled => {
+                    ObjectLockProbe::enabled("fixture: bucket reports Object Lock enabled")
+                }
+                ObjectLockStatus::Disabled => {
+                    ObjectLockProbe::disabled("fixture: bucket reports no Object Lock/versioning")
+                }
+                ObjectLockStatus::Unknown => {
+                    ObjectLockProbe::unknown("fixture: backend cannot answer")
+                }
+            }
+        }
+    }
+
+    /// The informational probe reports "enabled", "disabled", and "unknown" as
+    /// distinct outcomes, a real backend reached only through
+    /// [`ObjectStoreBackend`] reports "unknown", and none of the three affects
+    /// the qualification pass/fail result -- the suite adds no gating property
+    /// for it and [`ConformanceReport::passed`] never consults it (ADR-0055
+    /// section 3, ADR-0042 decision 3).
+    #[tokio::test]
+    async fn object_lock_probe_reports_each_state_and_never_gates_qualification() {
+        // (a) The three states are produced distinctly from fixtures.
+        let enabled = probe_object_lock(&FixedLockSource(ObjectLockStatus::Enabled)).await;
+        let disabled = probe_object_lock(&FixedLockSource(ObjectLockStatus::Disabled)).await;
+        let unknown = probe_object_lock(&FixedLockSource(ObjectLockStatus::Unknown)).await;
+        assert_eq!(enabled.status, ObjectLockStatus::Enabled);
+        assert_eq!(disabled.status, ObjectLockStatus::Disabled);
+        assert_eq!(unknown.status, ObjectLockStatus::Unknown);
+        // Distinct as values and as greppable names.
+        assert_ne!(enabled.status, disabled.status);
+        assert_ne!(disabled.status, unknown.status);
+        assert_eq!(
+            [
+                enabled.status.name(),
+                disabled.status.name(),
+                unknown.status.name()
+            ],
+            ["enabled", "disabled", "unknown"],
+        );
+
+        // (b) A real backend reached only through the trait contract cannot
+        // answer, so the production path is "unknown" -- not an error.
+        let store = MemoryStore::new();
+        let via_backend = probe_object_lock(&store as &dyn ObjectStoreBackend).await;
+        assert_eq!(via_backend.status, ObjectLockStatus::Unknown);
+
+        // (c) Whatever the probe reports, qualification pass/fail is unchanged:
+        // the conforming oracle passes, and the suite carries exactly the four
+        // gating properties -- the probe is none of them.
+        let report = run_conformance_suite(&store, "sys/qualify/object-lock/").await;
+        assert!(
+            report.passed(),
+            "the informational probe must not change the qualification result"
+        );
+        assert_eq!(
+            report.results.len(),
+            4,
+            "the Object Lock probe adds no gating property to the conformance suite"
+        );
     }
 
     #[tokio::test]

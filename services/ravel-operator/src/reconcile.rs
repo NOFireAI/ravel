@@ -21,7 +21,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
-use crate::crd::{RavelClusterSpec, ResourceRequirementsSpec};
+use crate::crd::{LocalSecretRef, RavelClusterSpec, ResourceRequirementsSpec};
 
 /// HTTP listener port (OTLP/HTTP, query API, and the `/healthz` `/readyz`
 /// probes). Fixed to match the Dockerfile's `EXPOSE` and the server's default.
@@ -51,18 +51,83 @@ pub const SECRETS_CHECKSUM_ANNOTATION: &str = "ravel.nofire.ai/secrets-checksum"
 /// so the controller reads them (RBAC grants `get` on Secrets) and passes them
 /// here. Keeping them a plain input rather than an I/O call inside the render
 /// keeps these functions pure and testable.
+///
+/// The credential/token `resourceVersion`s feed the per-Deployment
+/// [`SECRETS_CHECKSUM_ANNOTATION`]. Each Deployment's checksum is computed from
+/// the Secrets that Deployment actually consumes: the shared token Secret plus
+/// the one credential Secret its tier resolves to (its own
+/// `credentialsSecretRef` override, or the shared `storage.s3.credentialsSecretRef`
+/// when unset). A `resourceVersion` changes exactly when a Secret's content
+/// changes, so a per-role credential rotation rolls only the Deployment(s) that
+/// consume that Secret (ADR-0055 section 5). The controller reads these
+/// (it holds the API client); a pure render function must never do I/O.
 #[derive(Debug, Clone, Default)]
 pub struct RenderCtx {
     /// Tenant names (the token Secret's keys), rendered in the given order.
     pub tenant_names: Vec<String>,
 
-    /// Change-detection checksum over the Secrets the pods depend on
-    /// (credentials and, when configured, tenant tokens). Stamped onto every
-    /// Deployment's pod template as [`SECRETS_CHECKSUM_ANNOTATION`] so a Secret
-    /// value change rolls the pods. Computed by the controller (which reads the
-    /// Secrets); a pure render function must never compute it itself, since
-    /// that would require I/O.
-    pub secrets_checksum: String,
+    /// `resourceVersion` of the tenant-token Secret, shared by every tier, or
+    /// `None` when no token Secret is configured.
+    pub token_resource_version: Option<String>,
+
+    /// `resourceVersion` of each credential Secret the spec references, keyed by
+    /// Secret name: the shared `storage.s3.credentialsSecretRef` plus any
+    /// per-tier `credentialsSecretRef` override. A Secret whose `resourceVersion`
+    /// could not be read is simply absent from the map (its checksum component
+    /// is then the empty string, matching the pre-existing "no version" case).
+    pub credential_resource_versions: BTreeMap<String, String>,
+}
+
+/// Resolve the credential Secret name a tier consumes: its own
+/// `credentialsSecretRef` override when present, otherwise the shared
+/// `storage.s3.credentialsSecretRef` (ADR-0055 section 5). This is the single
+/// place the override-else-shared fallback lives, so the credential env
+/// ([`s3_credential_env`]) and the change-detection checksum
+/// ([`tier_secrets_checksum`]) can never disagree about which Secret a tier
+/// actually uses.
+fn tier_credentials_secret_name<'a>(
+    spec: &'a RavelClusterSpec,
+    tier_override: Option<&'a LocalSecretRef>,
+) -> &'a str {
+    tier_override
+        .map(|r| r.name.as_str())
+        .unwrap_or(&spec.storage.s3.credentials_secret_ref.name)
+}
+
+/// A deterministic change-detection checksum over the two Secrets a tier
+/// consumes: the shared token Secret and the tier's resolved credential Secret.
+///
+/// Built from their `resourceVersion`s, which change exactly when a Secret's
+/// content changes and are stable otherwise, so this value is stable across
+/// reconciles that see the same Secrets (no pod churn) and changes the moment a
+/// token is rotated or the tier's credential is rewritten. The hash is
+/// `DefaultHasher` (SipHash with fixed keys), deterministic across processes, so
+/// an operator restart does not roll pods. It is not a security boundary, only a
+/// signal. Stamped onto the tier's pod template as
+/// [`SECRETS_CHECKSUM_ANNOTATION`]; when tiers resolve to different credential
+/// Secrets, a change to one rolls only the tier(s) that consume it.
+pub fn secrets_checksum(token_rv: Option<&str>, credentials_rv: Option<&str>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token_rv.unwrap_or("").hash(&mut hasher);
+    credentials_rv.unwrap_or("").hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The [`SECRETS_CHECKSUM_ANNOTATION`] value for a tier, resolving which
+/// credential Secret the tier consumes and hashing its `resourceVersion`
+/// together with the token Secret's.
+fn tier_secrets_checksum(
+    spec: &RavelClusterSpec,
+    ctx: &RenderCtx,
+    tier_override: Option<&LocalSecretRef>,
+) -> String {
+    let secret_name = tier_credentials_secret_name(spec, tier_override);
+    let credentials_rv = ctx
+        .credential_resource_versions
+        .get(secret_name)
+        .map(String::as_str);
+    secrets_checksum(ctx.token_resource_version.as_deref(), credentials_rv)
 }
 
 /// Standard object labels for a component of a named `RavelCluster`.
@@ -95,8 +160,16 @@ fn child_name(instance: &str, component: &str) -> String {
 /// `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` are read directly from the
 /// environment by `ravel-server` (clap `env`), so no `$(VAR)` argument trick is
 /// needed for these two: the env vars alone configure the store.
-fn s3_credential_env(spec: &RavelClusterSpec) -> Vec<EnvVar> {
-    let secret = &spec.storage.s3.credentials_secret_ref.name;
+///
+/// `tier_override` is the calling tier's own `credentialsSecretRef` (ADR-0055
+/// section 5): when `Some`, the tier sources its credentials from that Secret;
+/// when `None`, it falls back to the shared `storage.s3.credentialsSecretRef`,
+/// so a spec with no overrides renders exactly as before.
+fn s3_credential_env(
+    spec: &RavelClusterSpec,
+    tier_override: Option<&LocalSecretRef>,
+) -> Vec<EnvVar> {
+    let secret = tier_credentials_secret_name(spec, tier_override);
     vec![
         EnvVar {
             name: "RAVEL_S3_ACCESS_KEY".to_string(),
@@ -345,7 +418,8 @@ pub fn desired_gateway_deployment(
         }
     }
 
-    let mut env = s3_credential_env(spec);
+    let tier_override = spec.gateway.credentials_secret_ref.as_ref();
+    let mut env = s3_credential_env(spec, tier_override);
     env.extend(tenant_token_env(spec, ctx));
 
     let ports = vec![
@@ -371,7 +445,7 @@ pub fn desired_gateway_deployment(
         spec.gateway.replicas,
         spec.gateway.resources.as_ref(),
         "RollingUpdate",
-        &ctx.secrets_checksum,
+        &tier_secrets_checksum(spec, ctx, tier_override),
     )
 }
 
@@ -391,7 +465,8 @@ pub fn desired_query_deployment(
     args.extend(common_store_args(spec));
     args.extend(tenant_token_args(spec, ctx));
 
-    let mut env = s3_credential_env(spec);
+    let tier_override = spec.query.credentials_secret_ref.as_ref();
+    let mut env = s3_credential_env(spec, tier_override);
     env.extend(tenant_token_env(spec, ctx));
 
     let ports = vec![ContainerPort {
@@ -410,7 +485,7 @@ pub fn desired_query_deployment(
         spec.query.replicas,
         spec.query.resources.as_ref(),
         "RollingUpdate",
-        &ctx.secrets_checksum,
+        &tier_secrets_checksum(spec, ctx, tier_override),
     )
 }
 
@@ -464,7 +539,8 @@ pub fn desired_maintain_deployment(
         }
     }
 
-    let mut env = s3_credential_env(spec);
+    let tier_override = spec.maintain.credentials_secret_ref.as_ref();
+    let mut env = s3_credential_env(spec, tier_override);
     env.extend(tenant_token_env(spec, ctx));
 
     let ports = vec![ContainerPort {
@@ -483,7 +559,7 @@ pub fn desired_maintain_deployment(
         1,
         spec.maintain.resources.as_ref(),
         "Recreate",
-        &ctx.secrets_checksum,
+        &tier_secrets_checksum(spec, ctx, tier_override),
     ))
 }
 
@@ -574,6 +650,7 @@ mod tests {
             gateway: GatewaySpec {
                 replicas: 3,
                 resources: None,
+                credentials_secret_ref: None,
                 fold: Some(FoldSpec {
                     disabled: false,
                     interval_secs: Some(120),
@@ -582,11 +659,13 @@ mod tests {
             query: QuerySpec {
                 replicas: 2,
                 resources: None,
+                credentials_secret_ref: None,
             },
             maintain: MaintainSpec {
                 enabled: true,
                 interval_secs: Some(600),
                 resources: None,
+                credentials_secret_ref: None,
             },
             retention: Some(RetentionSpec {
                 default: Some("30d".to_string()),
@@ -596,10 +675,44 @@ mod tests {
     }
 
     fn ctx() -> RenderCtx {
+        // Baseline ctx: the shared credential Secret ("ravel-s3", from
+        // `base_spec`) has a resourceVersion, as does the token Secret. Tests
+        // exercising per-tier overrides add the override Secrets' versions.
         RenderCtx {
             tenant_names: vec!["acme".to_string(), "globex".to_string()],
-            secrets_checksum: "deadbeef".to_string(),
+            token_resource_version: Some("tok-1".to_string()),
+            credential_resource_versions: BTreeMap::from([(
+                "ravel-s3".to_string(),
+                "cred-1".to_string(),
+            )]),
         }
+    }
+
+    /// The pod-template [`SECRETS_CHECKSUM_ANNOTATION`] value on a Deployment.
+    fn checksum_of(dep: &Deployment) -> Option<String> {
+        dep.spec
+            .as_ref()?
+            .template
+            .metadata
+            .as_ref()?
+            .annotations
+            .as_ref()?
+            .get(SECRETS_CHECKSUM_ANNOTATION)
+            .cloned()
+    }
+
+    /// The `secretKeyRef` Secret name backing an env var on a Deployment.
+    fn env_secret_name(dep: &Deployment, var: &str) -> Option<String> {
+        container_of(dep)
+            .env
+            .as_ref()?
+            .iter()
+            .find(|e| e.name == var)?
+            .value_from
+            .as_ref()?
+            .secret_key_ref
+            .as_ref()
+            .map(|s| s.name.clone())
     }
 
     /// Read a container's args as a single joined string for substring checks.
@@ -897,28 +1010,20 @@ mod tests {
     fn secrets_checksum_is_stamped_on_every_pod_template() {
         // The checksum annotation on the pod template is what makes the
         // Deployment controller roll pods when a Secret value changes
-        // (ADR-0034 decision 2). It must appear on all three tiers.
+        // (ADR-0034 decision 2). It must appear on all three tiers. With no
+        // per-tier overrides, all three resolve to the shared credential Secret,
+        // so all three carry the same checksum (they roll together).
         let spec = base_spec();
         let ctx = ctx();
-        let template_annotation = |dep: &Deployment| -> Option<String> {
-            dep.spec
-                .as_ref()?
-                .template
-                .metadata
-                .as_ref()?
-                .annotations
-                .as_ref()?
-                .get(SECRETS_CHECKSUM_ANNOTATION)
-                .cloned()
-        };
+        let expected = secrets_checksum(Some("tok-1"), Some("cred-1"));
         for dep in [
             desired_gateway_deployment(&spec, "prod", &ctx),
             desired_query_deployment(&spec, "prod", &ctx),
             desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled"),
         ] {
             assert_eq!(
-                template_annotation(&dep).as_deref(),
-                Some("deadbeef"),
+                checksum_of(&dep).as_deref(),
+                Some(expected.as_str()),
                 "every tier's pod template must carry the secrets checksum"
             );
         }
@@ -1005,5 +1110,221 @@ mod tests {
         let g = desired_gateway_deployment(&spec, "prod", &ctx());
         let args = args_of(&g);
         assert!(!args.iter().any(|a| a == "--disable-fold"));
+    }
+
+    #[test]
+    fn secrets_checksum_is_deterministic_and_changes_with_content() {
+        // The pure hash behind every tier's pod-template annotation (ADR-0055
+        // section 5): stable for the same inputs (no pod churn), and changing
+        // when either the token or the credential resourceVersion moves.
+        let a = secrets_checksum(Some("100"), Some("200"));
+        assert_eq!(a, secrets_checksum(Some("100"), Some("200")));
+        assert_ne!(a, secrets_checksum(Some("101"), Some("200")));
+        assert_ne!(a, secrets_checksum(Some("100"), Some("201")));
+        // Absent versions collapse to a distinct, stable value.
+        let none = secrets_checksum(None, Some("200"));
+        assert_eq!(none, secrets_checksum(None, Some("200")));
+        assert_ne!(none, a);
+    }
+
+    #[test]
+    fn per_tier_credential_overrides_render_three_distinct_secret_sources() {
+        // ADR-0055 section 5: each tier can carry its own credentialsSecretRef.
+        // With all three set to different Secrets, the three Deployments source
+        // RAVEL_S3_ACCESS_KEY / RAVEL_S3_SECRET_KEY from three different Secret
+        // names -- proven through the real desired_* render path, not a helper.
+        let mut spec = base_spec();
+        spec.gateway.credentials_secret_ref = Some(LocalSecretRef {
+            name: "gw-creds".to_string(),
+        });
+        spec.query.credentials_secret_ref = Some(LocalSecretRef {
+            name: "qy-creds".to_string(),
+        });
+        spec.maintain.credentials_secret_ref = Some(LocalSecretRef {
+            name: "mt-creds".to_string(),
+        });
+        // Every referenced credential Secret has a resourceVersion, as the
+        // controller would have read.
+        let ctx = RenderCtx {
+            tenant_names: vec!["acme".to_string(), "globex".to_string()],
+            token_resource_version: Some("tok-1".to_string()),
+            credential_resource_versions: BTreeMap::from([
+                ("ravel-s3".to_string(), "cred-shared".to_string()),
+                ("gw-creds".to_string(), "cred-gw".to_string()),
+                ("qy-creds".to_string(), "cred-qy".to_string()),
+                ("mt-creds".to_string(), "cred-mt".to_string()),
+            ]),
+        };
+
+        let g = desired_gateway_deployment(&spec, "prod", &ctx);
+        let q = desired_query_deployment(&spec, "prod", &ctx);
+        let m = desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled");
+
+        for (dep, expect) in [(&g, "gw-creds"), (&q, "qy-creds"), (&m, "mt-creds")] {
+            assert_eq!(
+                env_secret_name(dep, "RAVEL_S3_ACCESS_KEY").as_deref(),
+                Some(expect),
+                "access key must source from the tier's own Secret"
+            );
+            assert_eq!(
+                env_secret_name(dep, "RAVEL_S3_SECRET_KEY").as_deref(),
+                Some(expect),
+                "secret key must source from the tier's own Secret"
+            );
+        }
+        // The shared credential is used by none of them here.
+        for dep in [&g, &q, &m] {
+            assert_ne!(
+                env_secret_name(dep, "RAVEL_S3_ACCESS_KEY").as_deref(),
+                Some("ravel-s3")
+            );
+        }
+    }
+
+    #[test]
+    fn overrides_unset_render_is_backward_compatible_with_shared_credential() {
+        // True backward compatibility: a spec with all three tier overrides
+        // unset must render byte-identically to the same spec whose overrides
+        // are set explicitly to the shared credential Secret -- i.e. the None
+        // path is a pure passthrough to storage.s3.credentialsSecretRef, so an
+        // existing cluster that never sets an override is unaffected. Field
+        // identity is asserted over the whole serialized Deployment (args, env,
+        // and the checksum annotation), for all three tiers.
+        let none_spec = base_spec(); // all tier overrides are None
+        let shared = LocalSecretRef {
+            name: "ravel-s3".to_string(), // == storage.s3.credentialsSecretRef
+        };
+        let mut explicit_spec = base_spec();
+        explicit_spec.gateway.credentials_secret_ref = Some(shared.clone());
+        explicit_spec.query.credentials_secret_ref = Some(shared.clone());
+        explicit_spec.maintain.credentials_secret_ref = Some(shared.clone());
+
+        let ctx = ctx();
+        let pairs = [
+            (
+                desired_gateway_deployment(&none_spec, "prod", &ctx),
+                desired_gateway_deployment(&explicit_spec, "prod", &ctx),
+            ),
+            (
+                desired_query_deployment(&none_spec, "prod", &ctx),
+                desired_query_deployment(&explicit_spec, "prod", &ctx),
+            ),
+            (
+                desired_maintain_deployment(&none_spec, "prod", &ctx).expect("enabled"),
+                desired_maintain_deployment(&explicit_spec, "prod", &ctx).expect("enabled"),
+            ),
+        ];
+        for (unset, explicit) in pairs {
+            assert_eq!(
+                serde_json::to_value(&unset).expect("serialize unset"),
+                serde_json::to_value(&explicit).expect("serialize explicit"),
+                "override-unset render must equal the shared-credential render"
+            );
+            // And every tier sources from the shared Secret, as it always has.
+            assert_eq!(
+                env_secret_name(&unset, "RAVEL_S3_ACCESS_KEY").as_deref(),
+                Some("ravel-s3")
+            );
+        }
+
+        // All three carry the SAME checksum: with no overrides they consume one
+        // shared Secret, so they roll together exactly as before this change.
+        let g = desired_gateway_deployment(&none_spec, "prod", &ctx);
+        let q = desired_query_deployment(&none_spec, "prod", &ctx);
+        let m = desired_maintain_deployment(&none_spec, "prod", &ctx).expect("enabled");
+        let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"));
+        assert_eq!(checksum_of(&g).as_deref(), Some(shared_checksum.as_str()));
+        assert_eq!(checksum_of(&q).as_deref(), Some(shared_checksum.as_str()));
+        assert_eq!(checksum_of(&m).as_deref(), Some(shared_checksum.as_str()));
+    }
+
+    #[test]
+    fn tier_secret_change_rolls_only_that_tier_but_shared_change_rolls_all() {
+        // ADR-0055 section 5: with per-role overrides set, a change to one
+        // tier's credential Secret (its resourceVersion bumps) must change only
+        // that tier's pod-template checksum -- rolling only its Deployment --
+        // and leave the other two untouched. With no overrides, a change to the
+        // one shared credential must roll all three, matching today's behavior.
+        let mut over_spec = base_spec();
+        over_spec.gateway.credentials_secret_ref = Some(LocalSecretRef {
+            name: "gw-creds".to_string(),
+        });
+        over_spec.query.credentials_secret_ref = Some(LocalSecretRef {
+            name: "qy-creds".to_string(),
+        });
+        over_spec.maintain.credentials_secret_ref = Some(LocalSecretRef {
+            name: "mt-creds".to_string(),
+        });
+        let base_versions = BTreeMap::from([
+            ("ravel-s3".to_string(), "shared-1".to_string()),
+            ("gw-creds".to_string(), "gw-1".to_string()),
+            ("qy-creds".to_string(), "qy-1".to_string()),
+            ("mt-creds".to_string(), "mt-1".to_string()),
+        ]);
+        let before = RenderCtx {
+            tenant_names: vec!["acme".to_string()],
+            token_resource_version: Some("tok-1".to_string()),
+            credential_resource_versions: base_versions.clone(),
+        };
+        // Rotate ONLY the gateway credential Secret.
+        let mut after_versions = base_versions.clone();
+        after_versions.insert("gw-creds".to_string(), "gw-2".to_string());
+        let after = RenderCtx {
+            tenant_names: vec!["acme".to_string()],
+            token_resource_version: Some("tok-1".to_string()),
+            credential_resource_versions: after_versions,
+        };
+
+        let g_before = desired_gateway_deployment(&over_spec, "prod", &before);
+        let g_after = desired_gateway_deployment(&over_spec, "prod", &after);
+        let q_before = desired_query_deployment(&over_spec, "prod", &before);
+        let q_after = desired_query_deployment(&over_spec, "prod", &after);
+        let m_before = desired_maintain_deployment(&over_spec, "prod", &before).expect("enabled");
+        let m_after = desired_maintain_deployment(&over_spec, "prod", &after).expect("enabled");
+
+        assert_ne!(
+            checksum_of(&g_before),
+            checksum_of(&g_after),
+            "gateway secret rotated: its Deployment must roll"
+        );
+        assert_eq!(
+            checksum_of(&q_before),
+            checksum_of(&q_after),
+            "query secret unchanged: its Deployment must NOT roll"
+        );
+        assert_eq!(
+            checksum_of(&m_before),
+            checksum_of(&m_after),
+            "maintain secret unchanged: its Deployment must NOT roll"
+        );
+
+        // No overrides: a shared-credential change rolls all three.
+        let shared_spec = base_spec();
+        let shared_before = RenderCtx {
+            tenant_names: vec!["acme".to_string()],
+            token_resource_version: Some("tok-1".to_string()),
+            credential_resource_versions: BTreeMap::from([(
+                "ravel-s3".to_string(),
+                "shared-1".to_string(),
+            )]),
+        };
+        let shared_after = RenderCtx {
+            tenant_names: vec!["acme".to_string()],
+            token_resource_version: Some("tok-1".to_string()),
+            credential_resource_versions: BTreeMap::from([(
+                "ravel-s3".to_string(),
+                "shared-2".to_string(),
+            )]),
+        };
+        let gb = desired_gateway_deployment(&shared_spec, "prod", &shared_before);
+        let ga = desired_gateway_deployment(&shared_spec, "prod", &shared_after);
+        let qb = desired_query_deployment(&shared_spec, "prod", &shared_before);
+        let qa = desired_query_deployment(&shared_spec, "prod", &shared_after);
+        let mb =
+            desired_maintain_deployment(&shared_spec, "prod", &shared_before).expect("enabled");
+        let ma = desired_maintain_deployment(&shared_spec, "prod", &shared_after).expect("enabled");
+        assert_ne!(checksum_of(&gb), checksum_of(&ga), "gateway must roll");
+        assert_ne!(checksum_of(&qb), checksum_of(&qa), "query must roll");
+        assert_ne!(checksum_of(&mb), checksum_of(&ma), "maintain must roll");
     }
 }
