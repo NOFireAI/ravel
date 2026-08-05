@@ -255,7 +255,13 @@ async fn reshard(
 /// A real `Catalog` (provisioning enforcement on) + `QueryEngine` over `store`,
 /// built exactly as `ravel_server::query::build_catalog` builds the catalog.
 fn engine(store: Arc<dyn ObjectStoreBackend>, catalog_count: u32) -> (Arc<Catalog>, QueryEngine) {
-    let catalog = build_catalog(store.clone(), catalog_count).expect("catalog builds");
+    let catalog = build_catalog(
+        store.clone(),
+        catalog_count,
+        false,
+        ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+    )
+    .expect("catalog builds");
     let engine = QueryEngine::new(catalog.clone(), store, EngineConfig::default());
     (catalog, engine)
 }
