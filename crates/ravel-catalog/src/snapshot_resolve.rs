@@ -180,7 +180,7 @@ impl Catalog {
     /// the generation history the head was ultimately validated against when a
     /// one-shot record re-read was performed (`Some(fresh)`), or `None` when
     /// the head validated under the caller's passed-in `generations`. The
-    /// caller (`resolve_impl`) must build its Phase 1 scan set from `fresh`
+    /// caller (`resolve_fanout`) must build its Phase 1 scan set from `fresh`
     /// whenever it is present, so the listing suffix is never scanned over a
     /// staler generation view than the one that validated the head (Finding 4).
     /// The re-read's fresher view is propagated even when the window itself
