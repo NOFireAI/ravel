@@ -19,17 +19,18 @@ pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
     DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES, DEFAULT_CACHE_CAPACITY_PER_TENANT,
     DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_HEAD_CACHE_CAPACITY,
-    DEFAULT_HEAD_CACHE_TTL_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_INGEST_LAG_NS,
-    DEFAULT_POSTINGS_CACHE_ENTRIES, DEFAULT_SNAPSHOT_CACHE_PARTS,
+    DEFAULT_HEAD_CACHE_TTL_NS, DEFAULT_MAX_CATALOG_LIST_REQUESTS, DEFAULT_MAX_FLUSH_LIFETIME_NS,
+    DEFAULT_MAX_INGEST_LAG_NS, DEFAULT_POSTINGS_CACHE_ENTRIES,
+    DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS, DEFAULT_SNAPSHOT_CACHE_PARTS,
 };
 pub use error::CatalogError;
 pub use fold::{FoldReport, Transaction};
 pub use provisioning::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, GenerationDefect, MAX_SHARD_COUNT,
     PROVISIONING_FORMAT_VERSION, ProvisioningCheck, ProvisioningError, ReshardOutcome,
-    ShardGeneration, active_shard_count, append_generation, provisioning_key, read_generations,
-    read_generations_checked, read_generations_from_store, scan_count, shard_ceiling,
-    validate_or_adopt,
+    ShardGeneration, active_shard_count, append_generation, max_scan_count_over_range,
+    provisioning_key, read_generations, read_generations_checked, read_generations_from_store,
+    scan_count, shard_ceiling, validate_or_adopt,
 };
 pub use snapshot::{SegmentLevel, SegmentRef, Snapshot};
 pub use snapshot_format::{

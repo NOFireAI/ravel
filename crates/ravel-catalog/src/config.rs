@@ -53,6 +53,29 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRIES: usize = 512;
 /// ([`DEFAULT_MAX_SNAPSHOT_PART_BYTES`](snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES) ==
 /// [`DEFAULT_MAX_POSTINGS_BYTES`](snapshot_format::DEFAULT_MAX_POSTINGS_BYTES), both 256 MiB).
 pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
+/// Default ceiling on the pre-execution catalog-request estimate
+/// (`Catalog::estimated_catalog_requests`, ADR-0044 decision 3 as amended
+/// 2026-08-05 for issue #635): a resolve whose `shard_count * hour_buckets +
+/// SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` exceeds this is refused before any
+/// LIST is issued. 100,000 catalog requests permits roughly an 11-year window
+/// at `shard_count = 1` and roughly 8.5 months at `shard_count = 16`, while
+/// refusing the epoch-width `start: 0.0` query (about 496,089 LISTs at a
+/// single shard) that motivated the guard. Sized to catch runaways, not to
+/// cap a tuned deployment; a wider worst case raises the field.
+pub const DEFAULT_MAX_CATALOG_LIST_REQUESTS: u64 = 100_000;
+/// Default crossover at which `Catalog::resolve` switches from the
+/// per-(shard, ingest-hour) LIST loop to a single per-shard recursive prefix
+/// LIST (ADR-0056). Expressed in per-bucket request units, i.e. the number of
+/// `(shard, hour)` buckets the listing suffix spans: at or above this, the
+/// prefix scan (cost `O(objects / page_size)`, independent of window width)
+/// wins over the per-bucket loop (one LIST per bucket, empty buckets
+/// included). 720 is thirty days of hourly buckets at `shard_count = 1`: warm
+/// operational windows stay on the watermark-pruning per-bucket path, and the
+/// per-bucket path's request amplification is capped at 720 LISTs before the
+/// handoff. Purely a performance heuristic -- both paths return identical
+/// snapshots and both respect [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`], so any
+/// value is correct.
+pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
 
 /// Catalog configuration.
 ///
@@ -135,6 +158,25 @@ pub struct CatalogConfig {
     /// Per-entry byte cap for the byte cache; an object larger than this is
     /// never admitted. Default [`DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES`].
     pub byte_cache_max_entry_bytes: u64,
+    /// Ceiling on the pre-execution catalog-request estimate (ADR-0044
+    /// decision 3, amended 2026-08-05 for issue #635). A resolve whose
+    /// estimate ([`Catalog::estimated_catalog_requests`](crate::Catalog::estimated_catalog_requests))
+    /// exceeds this is refused with [`CatalogError::WindowTooWide`](crate::CatalogError::WindowTooWide)
+    /// before any LIST is issued, so an unbounded client window cannot make a
+    /// single request fan out to hundreds of thousands of LISTs. Fail-closed:
+    /// over the ceiling the query is refused, never silently narrowed. Default
+    /// [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`].
+    pub max_catalog_list_requests: u64,
+    /// Crossover, in `(shard, hour)` bucket units, at which `Catalog::resolve`
+    /// switches from the per-bucket LIST loop to a single per-shard recursive
+    /// prefix LIST (ADR-0056). When the listing suffix spans at least this many
+    /// buckets (`shard_count * listing_hours`), the prefix scan is used;
+    /// narrower windows keep the per-bucket loop, which prunes better behind a
+    /// folded snapshot watermark. A performance heuristic only: both paths
+    /// return identical snapshots and both respect
+    /// [`max_catalog_list_requests`](Self::max_catalog_list_requests). Default
+    /// [`DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS`].
+    pub prefix_list_crossover_requests: u64,
 }
 
 impl Default for CatalogConfig {
@@ -155,6 +197,8 @@ impl Default for CatalogConfig {
             byte_cache_max_bytes: DEFAULT_BYTE_CACHE_MAX_BYTES,
             byte_cache_max_entries: DEFAULT_BYTE_CACHE_MAX_ENTRIES,
             byte_cache_max_entry_bytes: DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES,
+            max_catalog_list_requests: DEFAULT_MAX_CATALOG_LIST_REQUESTS,
+            prefix_list_crossover_requests: DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
         }
     }
 }

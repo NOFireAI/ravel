@@ -197,10 +197,25 @@ truncation ([crates/ravel-query/src/config.rs](../../crates/ravel-query/src/conf
 | Samples materialized | 10,000,000 | `query matched {count} samples, exceeding the limit of {max}` |
 | Concurrent segment fetches | 8 | (not user-visible; throughput knob only) |
 | Wall-clock deadline | 30s | `query exceeded its deadline of {deadline}` |
+| Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
 
 `timeout` (Prometheus duration syntax like `30s`/`5m`, or bare float
 seconds) lowers the deadline per request. It cannot raise it above the
 server's configured default.
+
+The catalog-list budget is checked before any object-store request is made,
+not after. The catalog lists one prefix per (shard, ingest hour) from the
+window's start to the current hour, so a query whose `start` reaches far back
+(a `start` of `0`, epoch, is the usual cause) can ask for hundreds of
+thousands of LIST requests against object storage in a single call. Such a
+query is refused up front, before it can run up an object-store bill or
+saturate the listing path; the error reports both the estimate and the limit,
+so narrow the time range by the reported factor and retry. The ceiling
+permits roughly an 11-year window at one shard and about 8.5 months at
+sixteen; it scales down as shard count rises (issue #635, ADR-0044). Note the
+limit is on the query's *start*: a narrow `start`/`end` pair costs little
+however recent it is, so the fix is always to move `start` forward, never to
+change `end`.
 
 ## SQL over the `logs` table
 
@@ -281,6 +296,6 @@ lands.
 | 200 | n/a | Success. |
 | 400 | `bad_data` | Bad or missing parameter, PromQL parse error, invalid time range, step <= 0. |
 | 401 | `unauthorized` | Tenant authentication failed or was not provided. |
-| 422 | `execution` | PromQL construct outside the Phase 1 subset, or a query budget (segments/series/samples) exceeded. |
+| 422 | `execution` | PromQL construct outside the Phase 1 subset, or a query budget (segments/series/samples, or the catalog-list window ceiling) exceeded. |
 | 503 | `unavailable` | Catalog or segment fetch failed, an unresolvable `min_commit_token`, or a snapshot invalidated by concurrent GC/compaction. |
 | 504 | `timeout` | Query exceeded its deadline. |

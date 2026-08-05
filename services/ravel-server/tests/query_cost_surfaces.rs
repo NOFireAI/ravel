@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
@@ -35,10 +36,34 @@ use uuid::Uuid;
 
 const METRIC: &str = "m";
 
+const NS_PER_SEC: i64 = 1_000_000_000;
+const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
+const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
+
+fn now_ns() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos(),
+    )
+    .expect("now fits i64")
+}
+
 /// Publish one real RSEG segment plus its commit record for `tenant`, with two
-/// samples early in ingest-hour bucket 0, so a query over `[0, 1s]` resolves,
-/// opens the segment, and fetches real data.
-async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+/// samples just after `base_ns`, in the ingest-hour bucket `base_ns` falls in,
+/// so a query over a window covering `base_ns` resolves, opens the segment, and
+/// fetches real data.
+///
+/// `base_ns` is a parameter, not a fixed epoch offset, because the PromQL
+/// router reads wall-clock `now` (crates/ravel-query/src/http/handlers.rs) and
+/// `Catalog::resolve` lists one prefix per (shard, ingest-hour) from the window
+/// start up to `now`. Data anchored at the epoch with a `start=0` query would
+/// list every hour bucket since 1970 (about half a million) and now trip the
+/// issue #635 window-cost ceiling; the PromQL tests place data a few minutes in
+/// the past and query a recent window instead, exactly as tests/e2e.rs does.
+/// The Flight SQL path injects a fixed clock, so it keeps `base_ns = 0`.
+async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -50,11 +75,11 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
         labels: label_set,
         samples: vec![
             Sample {
-                ts_ns: 100_000_000,
+                ts_ns: base_ns + 100_000_000,
                 value: 1.0,
             },
             Sample {
-                ts_ns: 200_000_000,
+                ts_ns: base_ns + 200_000_000,
                 value: 2.5,
             },
         ],
@@ -94,8 +119,8 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
         segment_format_version: 1,
-        created_unix_ns: 10,
-        ingest_hour_bucket: 0,
+        created_unix_ns: base_ns + 300_000_000,
+        ingest_hour_bucket: u32::try_from(base_ns / NS_PER_HOUR).expect("hour bucket fits u32"),
     })
     .expect("valid commit record");
 
@@ -107,6 +132,17 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish");
+}
+
+/// Publish a segment a few minutes in the past and return the `(start, end)`
+/// seconds of a recent PromQL query window that covers it. The PromQL router
+/// reads wall-clock `now`, so the window must be anchored on it; a bounded,
+/// recent window keeps the resolve's listing to a handful of hour buckets
+/// (issue #635), the same shape tests/e2e.rs uses.
+async fn publish_recent(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> (i64, i64) {
+    let now = now_ns();
+    publish_segment(store, tenant, now - 10 * NS_PER_MIN).await;
+    ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC)
 }
 
 /// A PromQL router and a `/metrics` router that share one aggregator and one
@@ -229,12 +265,12 @@ fn only_row(
 async fn a_promql_range_query_folds_nonzero_cost_into_the_aggregator() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
-    publish_segment(store.as_ref(), &tenant).await;
+    let (start, end) = publish_recent(store.as_ref(), &tenant).await;
     let s = surfaces(Arc::clone(&store), &tenant);
 
     let (status, body) = get(
         &s.promql,
-        &format!("/api/v1/query_range?query={METRIC}&start=0&end=1&step=1"),
+        &format!("/api/v1/query_range?query={METRIC}&start={start}&end={end}&step=60s"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "query failed: {body}");
@@ -251,12 +287,12 @@ async fn a_promql_range_query_folds_nonzero_cost_into_the_aggregator() {
 async fn a_promql_series_request_folds_nonzero_cost_into_the_aggregator() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
-    publish_segment(store.as_ref(), &tenant).await;
+    let (start, end) = publish_recent(store.as_ref(), &tenant).await;
     let s = surfaces(Arc::clone(&store), &tenant);
 
     let (status, _body) = get(
         &s.promql,
-        &format!("/api/v1/series?match%5B%5D={METRIC}&start=0&end=1"),
+        &format!("/api/v1/series?match%5B%5D={METRIC}&start={start}&end={end}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -273,12 +309,12 @@ async fn a_promql_series_request_folds_nonzero_cost_into_the_aggregator() {
 async fn the_aggregator_total_equals_the_response_stats_total() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
-    publish_segment(store.as_ref(), &tenant).await;
+    let (start, end) = publish_recent(store.as_ref(), &tenant).await;
     let s = surfaces(Arc::clone(&store), &tenant);
 
     let (status, body) = get(
         &s.promql,
-        &format!("/api/v1/query_range?query={METRIC}&start=0&end=1&step=1"),
+        &format!("/api/v1/query_range?query={METRIC}&start={start}&end={end}&step=60s"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "query failed: {body}");
@@ -304,12 +340,12 @@ async fn the_aggregator_total_equals_the_response_stats_total() {
 async fn the_rendered_query_family_uses_only_the_allowlisted_label_keys_after_a_promql_query() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
-    publish_segment(store.as_ref(), &tenant).await;
+    let (start, end) = publish_recent(store.as_ref(), &tenant).await;
     let s = surfaces(Arc::clone(&store), &tenant);
 
     let (status, _body) = get(
         &s.promql,
-        &format!("/api/v1/query_range?query={METRIC}&start=0&end=1&step=1"),
+        &format!("/api/v1/query_range?query={METRIC}&start={start}&end={end}&step=60s"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -485,7 +521,10 @@ mod flight {
     async fn flight_sql_folds_nonzero_cost_and_renders_only_allowlisted_keys() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = TenantId::new("acme".to_string());
-        publish_segment(store.as_ref(), &tenant).await;
+        // The Flight SQL path injects a fixed clock at 4h (see `FixedClock`),
+        // so its listing window is bounded regardless; keep the data at the
+        // epoch hour the fixed-clock window `[0, 4h]` covers.
+        publish_segment(store.as_ref(), &tenant, 0).await;
         let query_accounting = Arc::new(QueryAccountingMetrics::new(HashSet::new()));
         let state = sql_state(Arc::clone(&store), &tenant, Arc::clone(&query_accounting));
 

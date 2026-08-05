@@ -56,3 +56,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0051](0051-tenant-admission-control.md) | Tenant admission control and ingest-time correctness | Accepted |
 | [0050](0050-fail-closed-isolation-and-startup-invariants.md) | Fail-closed isolation and startup invariants: dedicated mTLS listener, hard tenant_hash mismatch errors, keyed tenant hash default, durable GC config and shard_count, store qualification, readiness store probe | Proposed |
 | [0052](0052-online-resharding.md) | Online resharding: generation-versioned shard_count appended to the EC5 provisioning record; no data movement, per-hour scan sets, commit tokens unchanged | Accepted |
+| [0056](0056-catalog-resolve-prefix-list-traversal.md) | Prefix-list traversal for catalog snapshot resolution: a per-shard recursive LIST replacing the per-(shard, hour) loop for wide windows, with a runtime request cap | Accepted |

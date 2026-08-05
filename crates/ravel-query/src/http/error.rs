@@ -100,6 +100,16 @@ impl From<QueryError> for ApiError {
             QueryError::TooManySegments { .. }
             | QueryError::TooManySeries { .. }
             | QueryError::TooManySamples { .. } => ApiError::Unsupported(e.to_string()),
+            // An over-wide window refused before any LIST (issue #635) is a
+            // resource-budget rejection, grouped with the budget classes above
+            // under the same 422 "execution" mapping. Its text carries only the
+            // estimate and the limit (counts, no object key or tenant
+            // identity), so it is echoed rather than redacted, exactly as the
+            // budget errors are. `redacted_storage_message` returns `None` for
+            // it, so it reaches this arm rather than the storage-fault path.
+            QueryError::Catalog(CatalogError::WindowTooWide { .. }) => {
+                ApiError::Unsupported(e.to_string())
+            }
             QueryError::DeadlineExceeded { .. } => ApiError::Timeout(e.to_string()),
             QueryError::Eval(inner) => from_eval_error(inner, &e),
             // Handled above by `redacted_storage_message`.
@@ -130,6 +140,10 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
             FetchError::Corrupt { .. } => MSG_CORRUPT,
             FetchError::Store { .. } | FetchError::EtagChanged { .. } => MSG_UNAVAILABLE,
         }),
+        // An over-wide-window refusal (issue #635) carries only counts and is
+        // safe to show; like the budget errors it is not a storage fault, so
+        // it is not redacted (the `From` impl maps it to a 422).
+        QueryError::Catalog(CatalogError::WindowTooWide { .. }) => None,
         QueryError::Catalog(catalog) => Some(match catalog {
             CatalogError::UnsatisfiableToken { .. } => MSG_UNSATISFIABLE,
             CatalogError::Reconstruction { .. }
@@ -497,6 +511,46 @@ mod tests {
     }
 
     #[test]
+    fn window_too_wide_is_a_422_that_keeps_its_counts() {
+        // Issue #635: an over-wide window refused before any LIST is a
+        // resource-budget rejection grouped with the budget classes at 422
+        // "execution", not a storage fault at 503. It is not redacted (counts
+        // only), and its text reaches the client verbatim.
+        let err = QueryError::Catalog(CatalogError::WindowTooWide {
+            estimate: 496_089,
+            limit: 100_000,
+        });
+        assert!(
+            redacted_storage_message(&err).is_none(),
+            "a counts-only refusal must not be redacted"
+        );
+        assert_eq!(status_code(err), 422);
+
+        let msg = client_message(QueryError::Catalog(CatalogError::WindowTooWide {
+            estimate: 496_089,
+            limit: 100_000,
+        }));
+        assert!(
+            msg.contains("496089"),
+            "estimate must survive to the client"
+        );
+        assert!(msg.contains("100000"), "limit must survive to the client");
+        assert!(
+            msg.contains("narrow"),
+            "message must tell the caller what to do"
+        );
+        assert_redacted(&msg);
+
+        match ApiError::from(QueryError::Catalog(CatalogError::WindowTooWide {
+            estimate: 1,
+            limit: 0,
+        })) {
+            ApiError::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got a different ApiError variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn safe_errors_are_not_redacted() {
         // Budget errors carry only counts and limits: passed through so an
         // operator keeps the useful numbers.
@@ -578,6 +632,12 @@ mod tests {
                 QueryError::Catalog(CatalogError::Store(StoreError::Permanent(
                     RAW_STORE_TEXT.to_string(),
                 )))
+            },
+            || {
+                QueryError::Catalog(CatalogError::WindowTooWide {
+                    estimate: 496_089,
+                    limit: 100_000,
+                })
             },
             // Eval sub-variants: bad_data vs execution vs redacted source.
             || {

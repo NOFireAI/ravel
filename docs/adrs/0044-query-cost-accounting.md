@@ -124,6 +124,100 @@ Each query records the estimate and the actual side by side, so the
 estimate's accuracy is itself a measurable quantity before anything
 depends on it.
 
+**Amendment, 2026-08-05 (issue #635).** Decision 3's catalog term becomes
+load-bearing: it now gates admission. Rejected alternative 4 ("no query is
+rejected on a cost ceiling") is narrowed, not reversed wholesale. The
+*segment* term and every byte- and sample-per-value weight remain
+measurement-only, exactly as this ADR shipped them. Only the *catalog* term
+acquires an enforced ceiling, and only because it is the one part of the
+estimate that is both computed before any work is done and, left unchecked,
+an availability incident on its own: a client-supplied `start` of `0.0` makes
+`Catalog::resolve` issue one LIST per (shard, ingest-hour) from the epoch to
+now -- 496,089 LISTs for a single shard as of this writing (issue #634's
+measurement), a count that grows by one every wall-clock hour, forever, and
+multiplies by `shard_count`.
+
+The catalog term stays an upper envelope and never a prediction. The ceiling
+gates the *worst case* resolve would face with no snapshot watermark to
+shorten the listed suffix; a folded tenant's real LIST count is far lower. The
+ceiling therefore refuses only windows whose worst case is itself
+unsustainable, and never narrows a window that folding would have made cheap.
+
+*Fail-closed, refuse rather than clamp.* A window whose estimate exceeds the
+ceiling is refused with a typed error carrying the estimate and the limit; it
+is never silently narrowed to fit. A clamped window would return a partial
+result that looks complete, which contradicts this system's posture of exact
+semantics by default and approximation only when it is opt-in and visible. The
+caller learns by how much it was over and can narrow its own window and retry.
+
+*Default ceiling.* `CatalogConfig::max_catalog_list_requests` defaults to
+100,000 catalog requests (LISTs plus the `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`
+constant). The estimate is
+`shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`, so the
+permitted window width falls as `shard_count` rises:
+
+- at `shard_count = 1`: about 100,000 hour-buckets, roughly an 11-year window;
+- at `shard_count = 16`, a realistic mid-size tenant: about 6,250
+  hour-buckets, roughly 8.5 months;
+- at `shard_count = 64`: about 1,560 hour-buckets, roughly 65 days.
+
+The epoch-width query that motivated this (about 496,089 LISTs at
+`shard_count = 1`, and about 7.9 million at `shard_count = 16`) is refused
+with several times the ceiling to spare, while every ordinary query passes
+with room left over: the one-hour default window of the SQL and PromQL
+endpoints costs on the order of ten catalog requests. A deployment whose
+shard count and retention make a wider worst case routine raises the field;
+the default is sized to catch runaways, not to cap a tuned deployment.
+
+*Configurability.* The ceiling is a field on `CatalogConfig`
+(`max_catalog_list_requests`), so any `Catalog` constructor can set it and
+`services/ravel-server` inherits the default through
+`CatalogConfig::default()`. It is not yet a server CLI flag; wiring one is a
+mechanical follow-up if an operator needs to tune it without a rebuild.
+
+*One choke point.* The guard is enforced inside `Catalog::resolve` (the single
+funnel all four public resolve entry points delegate to), before any LIST is
+issued, so it covers every caller -- SQL, PromQL, exemplars, analytics -- by
+construction rather than one endpoint at a time. The estimate and the limit
+ride on the typed error only; per section 4's closed label allowlist they are
+never emitted as a metrics label.
+
+**Amendment, 2026-08-05 (issue #636, ADR-0056).** ADR-0056 replaced the
+per-`(shard, ingest-hour)` LIST loop with a single per-shard recursive prefix
+LIST for wide windows. This changes what the catalog term above must mean, in
+two coordinated ways, and the amended contract is:
+
+- The formula is unchanged: `estimated_catalog_requests` still returns
+  `shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`, the
+  per-bucket worst case. It remains a **true upper envelope** of whatever
+  traversal runs -- the prefix scan issues `O(objects / page_size)` LISTs,
+  strictly fewer than the per-bucket loop's `shard_count * hours` base for any
+  window the prefix scan is chosen for, so the bound holds over both paths
+  under the same sparse-bucket assumption this decision already rested on (at
+  most `page_size` objects per bucket; the formula already counts one LIST per
+  bucket and ignores intra-bucket pagination). It stays the number threaded
+  into cost accounting.
+- It is **no longer the admission gate** for wide windows. The pre-execution
+  refusal of `estimate > max_catalog_list_requests` counted hours, and after
+  ADR-0056 a wide window's real cost is object-bounded, not hour-bounded, so
+  refusing on the hour count would reject a prefix scan issuing three orders
+  of magnitude fewer requests -- a cheap query wrongly refused. Instead, a
+  window whose per-bucket cost would exceed the ceiling is **routed to the
+  prefix scan** (which does not amplify), and that scan carries a **runtime
+  LIST cap** at the same `max_catalog_list_requests`: it aborts with
+  `WindowTooWide` before issuing a page that would exceed the ceiling. The
+  hard guarantee "a single resolve never issues more than
+  `max_catalog_list_requests` catalog LISTs" is preserved -- now enforced at
+  runtime on the one path whose cost is not knowable before listing. A
+  wide-but-sparse window that this decision (as amended for #635) would have
+  refused is now served; only a scan whose actual object volume is
+  unsustainable is refused. The typed error, its fields, and its HTTP-422
+  mapping are unchanged.
+
+The envelope property `estimated_catalog_requests >= actual requests issued`,
+the property this ceiling rests on, is verified for both paths and several
+window shapes in `crates/ravel-catalog/tests/resolve_prefix_traversal.rs`.
+
 ### 4. A `/metrics` endpoint with hand-written Prometheus exposition
 
 `ravel-server` serves `GET /metrics` in every mode, including maintain,
