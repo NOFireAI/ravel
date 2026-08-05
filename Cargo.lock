@@ -4674,6 +4674,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+ "ravel-codec",
  "thiserror",
  "zstd",
 ]

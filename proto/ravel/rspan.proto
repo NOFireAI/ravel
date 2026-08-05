@@ -27,6 +27,7 @@ enum SectionKind {
   SECTION_KIND_UNSPECIFIED = 0;
   SECTION_KIND_BLOCKS = 1;
   SECTION_KIND_SKIP_IDX = 2;
+  SECTION_KIND_BLOOM = 3;  // v3 (ADR-0054): per-block token bloom
 }
 
 message Section {

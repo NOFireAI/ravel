@@ -6,13 +6,23 @@
 //! interval-aware SKIP_IDX entry, then emit the BLOCKS and SKIP_IDX sections,
 //! the footer, and the trailer. Identical input yields byte-identical output.
 
+use ravel_codec::bloom::BloomBuilder;
+use ravel_codec::bloom_section::encode_bloom_section;
+use ravel_codec::tokenizer::tokens;
+
 use crate::block::{BlockWriteOut, write_block};
 use crate::error::SpanSegError;
 use crate::footer::{
     COMP_NONE, COMP_ZSTD, SectionDesc, SpanFooter, kind, write_footer_and_trailer,
 };
-use crate::record::SpanRecord;
+use crate::record::{COL_NAME, COL_SERVICE_NAME, SpanRecord, service_name_of};
 use crate::skip_index::{BlockEntry, SkipIndex};
+
+/// Seed for every RSPAN block bloom (ADR-0054). Fixed, not configurable: the
+/// seed is stored inside each serialized bloom entry, so the reader recovers it
+/// from the bytes and a query never needs to know it. A constant keeps writer
+/// output byte-deterministic for identical input.
+const BLOOM_SEED: u64 = 0;
 
 /// Writer configuration and format constants (docs/span-segment-format.md).
 #[derive(Clone, Copy, Debug)]
@@ -109,12 +119,17 @@ impl RspanWriter {
 
         let mut blocks_bytes: Vec<u8> = Vec::new();
         let mut entries: Vec<BlockEntry> = Vec::with_capacity(spans.len());
+        // One serialized bloom per block, positionally addressed: entry i covers
+        // block i (ADR-0054). Over span-name tokens (field COL_NAME) and
+        // service.name tokens (field COL_SERVICE_NAME).
+        let mut bloom_entries: Vec<Vec<u8>> = Vec::with_capacity(spans.len());
         let mut min_start = i64::MAX;
         let mut max_end = i64::MIN;
 
         for span in &spans {
             let rows = &self.records[span.clone()];
             let out: BlockWriteOut = write_block(rows, self.cfg.zstd_level)?;
+            bloom_entries.push(build_block_bloom(rows));
             min_start = min_start.min(out.min_start_ts);
             max_end = max_end.max(out.max_end_ts);
             let block_offset = blocks_bytes.len() as u64;
@@ -136,7 +151,10 @@ impl RspanWriter {
 
         let skip = SkipIndex::new(entries);
 
-        // Assemble sections in kind order: BLOCKS (raw), SKIP_IDX (zstd).
+        // Assemble sections in kind order: BLOCKS (raw), SKIP_IDX (zstd),
+        // BLOOM (raw). The bloom bit arrays are near-incompressible, so the
+        // section is stored raw; its per-entry crc32c framing (ravel-codec)
+        // plus the section's own Section.crc32c cover it (ADR-0054).
         let mut object = Vec::new();
         let mut sections: Vec<SectionDesc> = Vec::new();
         push_section(
@@ -147,6 +165,12 @@ impl RspanWriter {
         );
         let skip_stored = compress(&skip.encode(), self.cfg.zstd_level)?;
         push_section(&mut object, &mut sections, kind::SKIP_IDX, skip_stored);
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::BLOOM,
+            Stored::raw(encode_bloom_section(&bloom_entries)),
+        );
 
         let record_count = self.records.len() as u64;
         let min_trace_id = self.records[0].trace_id;
@@ -172,6 +196,26 @@ impl RspanWriter {
         write_footer_and_trailer(&mut object, &footer);
         Ok(object)
     }
+}
+
+/// Builds one block's serialized bloom entry (ADR-0054): span-name tokens
+/// scoped to field [`COL_NAME`], and `service.name` tokens scoped to field
+/// [`COL_SERVICE_NAME`], so a `name = <lit>` probe and a `service_name = <lit>`
+/// probe read the same bloom through disjoint field ids. Token rule is
+/// `ravel-codec`'s normative tokenizer, shared with RLOG.
+fn build_block_bloom(rows: &[SpanRecord]) -> Vec<u8> {
+    let mut builder = BloomBuilder::new(BLOOM_SEED);
+    for r in rows {
+        for tok in tokens(&r.name) {
+            builder.insert(COL_NAME, &tok);
+        }
+        if let Some(service) = service_name_of(&r.attrs) {
+            for tok in tokens(service) {
+                builder.insert(COL_SERVICE_NAME, &tok);
+            }
+        }
+    }
+    builder.finish()
 }
 
 /// Splits row indices into block spans by record target and an estimated

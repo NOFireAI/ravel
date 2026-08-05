@@ -8,6 +8,8 @@
 //! the block framing and per-block checksums: without it no block can be
 //! located or verified.
 
+use ravel_codec::bloom_section::BloomSection;
+
 use crate::block::{DEFAULT_MAX_UNCOMP, read_block};
 use crate::error::SpanSegError;
 use crate::footer::{SpanFooter, kind, open, read_section};
@@ -62,24 +64,46 @@ pub struct RspanReader<'a> {
     skip: SkipIndex,
     blocks_offset: u64,
     blocks_len: u64,
+    /// Decompressed BLOOM section bytes (v3, ADR-0054). Held so callers can
+    /// parse a [`BloomSection`] for bloom-backed block pruning without
+    /// re-reading the object. The whole-section crc is verified at open time
+    /// by `read_section`; per-entry crcs are verified on probe.
+    bloom_raw: Vec<u8>,
     max_uncomp: u64,
 }
 
 impl<'a> RspanReader<'a> {
-    /// Opens and validates the object, decoding the skip index.
+    /// Opens and validates the object, decoding the skip index and reading the
+    /// mandatory BLOOM section.
     pub fn new(bytes: &'a [u8], cfg: &RspanConfig) -> Result<Self, SpanSegError> {
         let footer = open(bytes)?;
         let skip_desc = section(&footer, kind::SKIP_IDX)?;
         let skip_raw = read_section(bytes, skip_desc, cfg.max_uncomp_section)?;
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
+        let bloom_desc = section(&footer, kind::BLOOM)?;
+        let bloom_raw = read_section(bytes, bloom_desc, cfg.max_uncomp_section)?;
         let blocks = *section(&footer, kind::BLOCKS)?;
         Ok(RspanReader {
             bytes,
             skip,
             blocks_offset: blocks.offset,
             blocks_len: blocks.len,
+            bloom_raw,
             max_uncomp: DEFAULT_MAX_UNCOMP,
         })
+    }
+
+    /// The decoded skip index.
+    pub fn skip_index(&self) -> &SkipIndex {
+        &self.skip
+    }
+
+    /// Parses the object's BLOOM section (v3, ADR-0054). Entry `i` covers block
+    /// `i`. Pass the returned view, with `service_name`/`name` predicates, to
+    /// [`SkipIndex::candidate_blocks_with_bloom`]. A malformed container is a
+    /// typed `Corrupted` error.
+    pub fn bloom(&self) -> Result<BloomSection<'_>, SpanSegError> {
+        Ok(BloomSection::parse(&self.bloom_raw)?)
     }
 
     /// Scans the object for spans matching `query`.
@@ -321,10 +345,17 @@ mod tests {
         };
         let skip_raw = SkipIndex::new(vec![entry]).encode();
 
+        // A minimal valid (empty, zero-entry) BLOOM section: scan never parses
+        // it, but it must be present and pass read_section for open to succeed
+        // (BLOOM is mandatory as of v3, ADR-0054).
+        let bloom_raw: Vec<u8> = 0u32.to_le_bytes().to_vec();
+
         let mut obj = Vec::new();
         obj.extend_from_slice(&blocks_bytes);
         let skip_off = obj.len() as u64;
         obj.extend_from_slice(&skip_raw);
+        let bloom_off = obj.len() as u64;
+        obj.extend_from_slice(&bloom_raw);
 
         let sections = vec![
             SectionDesc {
@@ -342,6 +373,14 @@ mod tests {
                 crc32c: crc32c::crc32c(&skip_raw),
                 comp: COMP_NONE,
                 uncomp_len: skip_raw.len() as u64,
+            },
+            SectionDesc {
+                kind: kind::BLOOM,
+                offset: bloom_off,
+                len: bloom_raw.len() as u64,
+                crc32c: crc32c::crc32c(&bloom_raw),
+                comp: COMP_NONE,
+                uncomp_len: bloom_raw.len() as u64,
             },
         ];
         let footer = SpanFooter {
@@ -436,7 +475,18 @@ mod proptests {
             has_msg in any::<bool>(),
             msg in "[a-z ]{0,20}",
             attrs in proptest::collection::vec(("[a-z.]{1,8}", "[a-zA-Z0-9]{0,12}"), 0..8),
+            // service.name is lifted into its own dictionary column (v3,
+            // ADR-0054); generate it independently and sometimes present so the
+            // round trip exercises the column's extract/re-insert and the block
+            // bloom over its tokens. The key is out of the generated-attrs key
+            // space ("[a-z.]{1,8}" caps at 8 chars, "service.name" is 12), so it
+            // never collides with a random attr.
+            service in proptest::option::of("[a-z][a-z0-9 ./_-]{0,20}"),
         ) -> SpanRecord {
+            let mut attrs: Vec<(String, String)> = attrs.into_iter().collect();
+            if let Some(s) = service {
+                attrs.push(("service.name".to_string(), s));
+            }
             SpanRecord {
                 trace_id: [trace; 16],
                 span_id: [span; 8],
@@ -446,7 +496,7 @@ mod proptests {
                 end_ts_ns: start.saturating_add(dur),
                 status_code: code,
                 status_message: if has_msg { Some(msg) } else { None },
-                attrs: attrs.into_iter().collect(),
+                attrs,
             }
         }
     }

@@ -14,18 +14,23 @@ use std::collections::HashMap;
 
 use crate::error::SpanSegError;
 use crate::record::{
-    COL_ATTRS, COL_END_TS, COL_NAME, COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_START_TS,
-    COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID, SPAN_ID_WIDTH, SpanRecord, StatusCode,
-    TRACE_ID_WIDTH, encode_attrs,
+    COL_ATTRS, COL_END_TS, COL_NAME, COL_PARENT_SPAN_ID, COL_SERVICE_NAME, COL_SPAN_ID,
+    COL_START_TS, COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID, SERVICE_NAME_KEY,
+    SPAN_ID_WIDTH, SpanRecord, StatusCode, TRACE_ID_WIDTH, encode_attrs_without_service_name,
+    service_name_of,
 };
 use crate::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
 use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
 
 /// Upper bound on a block's decoded record count (untrusted-input guard).
 const MAX_RECORDS: u64 = 1 << 24;
-/// Upper bound on a block's page count. The fixed nine columns, each up to two
+/// Upper bound on a block's page count. The fixed ten columns, each up to two
 /// pages, stays far under this.
 const MAX_PAGES: u64 = 4096;
+/// Upper bound on a dictionary column's distinct-value count (untrusted-input
+/// guard). Distinct values never exceed a block's record count, itself capped
+/// at [`MAX_RECORDS`]; this bounds the decode allocation independently.
+const MAX_DICT_VALUES: u64 = MAX_RECORDS;
 /// Page compression floor: pages under this many encoded bytes stay raw.
 const COMPRESSION_FLOOR: usize = 512;
 /// Default per-page decompressed-size cap (zstd bomb guard).
@@ -46,6 +51,11 @@ pub enum Enc {
     Bitmap = 2,
     /// Fixed-width values concatenated with no framing.
     FixedWidth = 3,
+    /// Block-local dictionary (v3, ADR-0054): a header of `uvarint(count)`
+    /// then `count` distinct `uvarint(len)`-prefixed values in ascending
+    /// order, followed by one `uvarint` index per present row into that
+    /// dictionary. Used by the `service_name` column.
+    Dict = 4,
 }
 
 impl Enc {
@@ -54,6 +64,7 @@ impl Enc {
             1 => Enc::Plain,
             2 => Enc::Bitmap,
             3 => Enc::FixedWidth,
+            4 => Enc::Dict,
             other => return Err(SpanSegError::Corrupted(format!("unknown enc tag {other}"))),
         })
     }
@@ -192,7 +203,13 @@ pub fn write_block(rows: &[SpanRecord], zstd_level: i32) -> Result<BlockWriteOut
         encode_strings(&msg_vals),
     );
     // COL_ATTRS: canonical merged-map blob per row, str column, always present.
-    let attr_blobs: Vec<Vec<u8>> = rows.iter().map(|r| encode_attrs(&r.attrs)).collect();
+    // `service.name` is removed here: it lives in COL_SERVICE_NAME and is not
+    // duplicated in the blob (ADR-0054). The reader re-inserts it on decode.
+    // Emitted before COL_SERVICE_NAME to keep column ids ascending.
+    let attr_blobs: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|r| encode_attrs_without_service_name(&r.attrs))
+        .collect();
     let attr_vals: Vec<&[u8]> = attr_blobs.iter().map(Vec::as_slice).collect();
     stage_column(
         &mut pages,
@@ -200,6 +217,24 @@ pub fn write_block(rows: &[SpanRecord], zstd_level: i32) -> Result<BlockWriteOut
         &all_present,
         Enc::Plain,
         encode_strings(&attr_vals),
+    );
+    // COL_SERVICE_NAME: the `service.name` value lifted out of attrs (v3,
+    // ADR-0054), dictionary-encoded, block-local, nullable. A span whose merged
+    // attrs carry no `service.name` has no value here.
+    let service_present: Vec<bool> = rows
+        .iter()
+        .map(|r| service_name_of(&r.attrs).is_some())
+        .collect();
+    let service_vals: Vec<&[u8]> = rows
+        .iter()
+        .filter_map(|r| service_name_of(&r.attrs).map(str::as_bytes))
+        .collect();
+    stage_column(
+        &mut pages,
+        COL_SERVICE_NAME,
+        &service_present,
+        Enc::Dict,
+        encode_dict(&service_vals),
     );
 
     // Compress pages into a payload buffer, collecting descriptors.
@@ -341,6 +376,14 @@ impl DecodedBlock {
             .flatten()
     }
 
+    /// The decoded `service_name` value for `row` (v3, ADR-0054), or `None`
+    /// when the row's merged attrs carried no `service.name`. This reads the
+    /// dictionary-encoded [`COL_SERVICE_NAME`] column directly, without going
+    /// through the attrs blob (the value is not stored there).
+    pub fn service_name(&self, row: usize) -> Option<Vec<u8>> {
+        self.str_at(COL_SERVICE_NAME, row)
+    }
+
     /// Rebuilds the [`SpanRecord`] at `row`, a faithful round-trip of the record
     /// the writer was handed.
     pub fn record(&self, row: usize) -> Result<SpanRecord, SpanSegError> {
@@ -375,11 +418,23 @@ impl DecodedBlock {
             Some(bytes) => Some(string_from(bytes)?),
             None => None,
         };
-        let attrs = crate::record::decode_attrs(
+        let mut attrs = crate::record::decode_attrs(
             &self
                 .str_at(COL_ATTRS, row)
                 .ok_or_else(|| SpanSegError::Corrupted("missing attrs".into()))?,
         )?;
+        // Re-insert the `service.name` value lifted into COL_SERVICE_NAME at
+        // write time (ADR-0054), so the rebuilt record is the one the writer was
+        // handed. The stored attrs blob never carries this key, so this is the
+        // inverse of the writer's extraction, not a duplicate. Keeping attrs
+        // sorted with unique keys preserves the map's canonical contract.
+        if let Some(bytes) = self.service_name(row) {
+            let value = string_from(bytes)?;
+            match attrs.binary_search_by(|(k, _)| k.as_str().cmp(SERVICE_NAME_KEY)) {
+                Ok(i) => attrs[i].1 = value,
+                Err(i) => attrs.insert(i, (SERVICE_NAME_KEY.to_string(), value)),
+            }
+        }
         Ok(SpanRecord {
             trace_id,
             span_id,
@@ -403,6 +458,8 @@ enum ColKind {
     I64,
     Str,
     Fixed(usize),
+    /// A dictionary-encoded string column (v3, ADR-0054): `service_name`.
+    Dict,
 }
 
 fn column_kind(column_id: u32) -> Result<ColKind, SpanSegError> {
@@ -411,6 +468,7 @@ fn column_kind(column_id: u32) -> Result<ColKind, SpanSegError> {
         COL_SPAN_ID | COL_PARENT_SPAN_ID => ColKind::Fixed(SPAN_ID_WIDTH),
         COL_NAME | COL_STATUS_MESSAGE | COL_ATTRS => ColKind::Str,
         COL_START_TS | COL_END_TS | COL_STATUS_CODE => ColKind::I64,
+        COL_SERVICE_NAME => ColKind::Dict,
         other => {
             return Err(SpanSegError::Corrupted(format!(
                 "unknown column id {other}"
@@ -541,6 +599,10 @@ pub fn read_block(
             ColKind::Fixed(width) => {
                 let vals = decode_fixed(enc, encoded, present_count, width)?;
                 out.fixed_cols.insert(column_id, scatter(&present, vals)?);
+            }
+            ColKind::Dict => {
+                let vals = decode_dict(enc, encoded, present_count)?;
+                out.str_cols.insert(column_id, scatter(&present, vals)?);
             }
         }
     }
@@ -708,6 +770,83 @@ fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, 
         out.push(blob[off..off + len].to_vec());
         off += len;
     }
+    Ok(out)
+}
+
+/// Encodes a block-local dictionary column (v3, ADR-0054). `values` are the
+/// present rows' values in row order. The distinct values are sorted ascending
+/// and written once; each present row then stores a `uvarint` index into that
+/// dictionary. Identical `values` produce byte-identical output, so a block
+/// re-encodes deterministically.
+fn encode_dict(values: &[&[u8]]) -> Vec<u8> {
+    let mut distinct: Vec<&[u8]> = values.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let mut out = Vec::new();
+    put_uvarint(&mut out, distinct.len() as u64);
+    for d in &distinct {
+        put_uvarint(&mut out, d.len() as u64);
+        out.extend_from_slice(d);
+    }
+    for v in values {
+        // `distinct` is sorted and deduped, so every value is found.
+        let idx = distinct.partition_point(|d| d < v);
+        put_uvarint(&mut out, idx as u64);
+    }
+    out
+}
+
+/// Decodes a block-local dictionary column back to its present-row values (the
+/// write-side [`encode_dict`]). Untrusted: rejects a non-`Dict` encoding, a
+/// dictionary count over the cap, a non-ascending or duplicated dictionary
+/// (the encoding is canonical, so a valid one is strictly ascending), an index
+/// out of range, truncation, and trailing bytes.
+fn decode_dict(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, SpanSegError> {
+    if enc != Enc::Dict {
+        return Err(SpanSegError::Corrupted("service_name page not Dict".into()));
+    }
+    let mut pos = 0usize;
+    let dict_count = get_uvarint(bytes, &mut pos)?;
+    if dict_count > MAX_DICT_VALUES {
+        return Err(SpanSegError::Corrupted(format!(
+            "dict value count {dict_count} over cap {MAX_DICT_VALUES}"
+        )));
+    }
+    let dict_count = dict_count as usize;
+    let mut dict: Vec<Vec<u8>> = Vec::with_capacity(dict_count.min(1 << 16));
+    let mut prev: Option<Vec<u8>> = None;
+    for _ in 0..dict_count {
+        let len = usize::try_from(get_uvarint(bytes, &mut pos)?)
+            .map_err(|_| SpanSegError::Corrupted("dict value len range".into()))?;
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| SpanSegError::Corrupted("dict value overflow".into()))?;
+        let slice = bytes
+            .get(pos..end)
+            .ok_or_else(|| SpanSegError::Corrupted("dict value truncated".into()))?
+            .to_vec();
+        if prev
+            .as_ref()
+            .is_some_and(|p| p.as_slice() >= slice.as_slice())
+        {
+            return Err(SpanSegError::Corrupted(
+                "dict values not strictly ascending".into(),
+            ));
+        }
+        prev = Some(slice.clone());
+        dict.push(slice);
+        pos = end;
+    }
+    let mut out = Vec::with_capacity(count.min(1 << 16));
+    for _ in 0..count {
+        let idx = usize::try_from(get_uvarint(bytes, &mut pos)?)
+            .map_err(|_| SpanSegError::Corrupted("dict index range".into()))?;
+        let value = dict
+            .get(idx)
+            .ok_or_else(|| SpanSegError::Corrupted(format!("dict index {idx} out of range")))?;
+        out.push(value.clone());
+    }
+    expect_consumed(pos, bytes.len())?;
     Ok(out)
 }
 
@@ -892,6 +1031,89 @@ mod tests {
         let rows = vec![span(1, 0, i64::MIN, i64::MAX)];
         assert!(matches!(
             write_block(&rows, 3),
+            Err(SpanSegError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn service_name_lifted_into_column_not_duplicated_in_attrs_blob() {
+        // Two rows share a service; a third has none. The dictionary collapses
+        // the shared value, and the attrs blob never carries "service.name".
+        let mut rows = Vec::new();
+        for (i, svc) in [Some("checkout"), Some("checkout"), None]
+            .iter()
+            .enumerate()
+        {
+            let mut r = span(1, i as u8, i as i64, i as i64 + 1);
+            let mut attrs = vec![("http.method".to_string(), "GET".to_string())];
+            if let Some(s) = svc {
+                attrs.push(("service.name".to_string(), (*s).to_string()));
+            }
+            r.attrs = attrs;
+            rows.push(r);
+        }
+        let out = write_block(&rows, 3).expect("write");
+        let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
+
+        // The column decodes per row (present rows only).
+        assert_eq!(dec.service_name(0).as_deref(), Some(b"checkout".as_slice()));
+        assert_eq!(dec.service_name(1).as_deref(), Some(b"checkout".as_slice()));
+        assert_eq!(dec.service_name(2), None);
+
+        // The rebuilt record re-inserts service.name into attrs (faithful round
+        // trip), and http.method survives.
+        for (i, want) in rows.iter().enumerate() {
+            assert_eq!(&dec.record(i).expect("record"), want);
+        }
+
+        // The stored attrs blob for row 0 does NOT contain "service.name": the
+        // value lives only in the dictionary column (ADR-0054).
+        let blob = crate::record::encode_attrs_without_service_name(&rows[0].attrs);
+        let decoded_blob = crate::record::decode_attrs(&blob).expect("decode blob");
+        assert!(
+            !decoded_blob.iter().any(|(k, _)| k == "service.name"),
+            "attrs blob must not carry service.name"
+        );
+    }
+
+    #[test]
+    fn service_name_column_absent_when_no_row_has_it() {
+        // No row carries service.name: the column stages nothing and decodes as
+        // absent for every row, and records round-trip unchanged.
+        let rows = vec![span(1, 0, 0, 1), span(1, 1, 1, 2)];
+        let out = write_block(&rows, 3).expect("write");
+        let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
+        assert_eq!(dec.service_name(0), None);
+        assert_eq!(dec.service_name(1), None);
+        for (i, want) in rows.iter().enumerate() {
+            assert_eq!(&dec.record(i).expect("record"), want);
+        }
+    }
+
+    #[test]
+    fn dict_codec_roundtrips_and_rejects_bad_index() {
+        // Direct dictionary codec round trip with duplicates.
+        let vals: Vec<&[u8]> = vec![b"b", b"a", b"b", b"c", b"a"];
+        let encoded = encode_dict(&vals);
+        let decoded = decode_dict(Enc::Dict, &encoded, vals.len()).expect("decode");
+        let want: Vec<Vec<u8>> = vals.iter().map(|v| v.to_vec()).collect();
+        assert_eq!(decoded, want);
+
+        // Wrong enc tag is rejected.
+        assert!(matches!(
+            decode_dict(Enc::Plain, &encoded, vals.len()),
+            Err(SpanSegError::Corrupted(_))
+        ));
+
+        // An out-of-range index is rejected, never a panic. Hand-build: dict of
+        // one value, one index pointing at slot 1.
+        let mut bad = Vec::new();
+        put_uvarint(&mut bad, 1); // dict_count
+        put_uvarint(&mut bad, 1); // value len
+        bad.push(b'x');
+        put_uvarint(&mut bad, 1); // index 1, but only slot 0 exists
+        assert!(matches!(
+            decode_dict(Enc::Dict, &bad, 1),
             Err(SpanSegError::Corrupted(_))
         ));
     }

@@ -11,6 +11,7 @@ thiserror = { workspace = true }
 zstd = { workspace = true }
 crc32c = { workspace = true }
 prost = { workspace = true }
+ravel-codec = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
