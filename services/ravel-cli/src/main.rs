@@ -209,6 +209,28 @@ enum ProvisionCommand {
         #[arg(long, value_enum)]
         signal: Option<SignalArg>,
     },
+    /// Reshard a (tenant, signal) online (ADR-0052): append a new shard
+    /// generation to its provisioning record under CasVersion and write a
+    /// control-plane audit record. Existing data is never moved or re-keyed;
+    /// only future data (from the activation hour onward) routes with the new
+    /// count. The activation is placed `--lead-hours` in the future, which must
+    /// be at least ceil(C) + 1 = 2 hours so every live writer observes the new
+    /// generation before it activates or fail-stops on record staleness.
+    Reshard {
+        /// Tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        /// The signal to reshard.
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        /// The new shard_count for the appended generation (1..=10000).
+        #[arg(long)]
+        shard_count: u32,
+        /// Hours ahead of now to activate the new generation. Must be >= 2
+        /// (ceil(C) + 1 with the default 60s refresh interval C). Defaults to 2.
+        #[arg(long, default_value_t = 2)]
+        lead_hours: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -640,6 +662,25 @@ async fn main() -> anyhow::Result<()> {
                 &tenant,
                 shards,
                 signal,
+                now_ns()?,
+            )
+            .await
+        }
+        Command::Provision {
+            command:
+                ProvisionCommand::Reshard {
+                    tenant,
+                    signal,
+                    shard_count,
+                    lead_hours,
+                },
+        } => {
+            ravel_cli::provision::reshard(
+                store::build_store(&cli.store)?,
+                &tenant,
+                signal,
+                shard_count,
+                lead_hours,
                 now_ns()?,
             )
             .await

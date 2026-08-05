@@ -104,6 +104,12 @@ pub struct IngestMetrics {
     /// `shard_count` and makes a permanently degraded process observable
     /// (docs/ingest.md "Metrics (self-observability)", a8-F03).
     shard_deaths: AtomicU64,
+    /// Flushes failed closed because the router's cached provisioning view for
+    /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
+    /// The load-bearing staleness signal: a nonzero, growing value means the
+    /// background refresher is not keeping views current and writes are being
+    /// refused rather than routed on a possibly-missed activation.
+    stale_provisioning_flushes: AtomicU64,
 }
 
 /// Point-in-time copy of [`IngestMetrics`] for scraping. See the
@@ -124,6 +130,7 @@ pub struct IngestMetricsSnapshot {
     pub shard_deaths: u64,
     pub exemplars_written_total: u64,
     pub exemplars_dropped_total: u64,
+    pub stale_provisioning_flushes: u64,
 }
 
 impl IngestMetrics {
@@ -184,6 +191,14 @@ impl IngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush refused because the router's cached provisioning view for the
+    /// tenant exceeded the refresh interval `C` (ADR-0052 section 3, fail
+    /// closed).
+    pub(crate) fn record_stale_provisioning_flush(&self) {
+        self.stale_provisioning_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> IngestMetricsSnapshot {
         IngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -200,6 +215,7 @@ impl IngestMetrics {
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
+            stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
         }
     }
 }

@@ -46,6 +46,7 @@ pub mod discover;
 pub mod error;
 pub mod gc_config;
 pub mod legal_hold;
+pub mod provision_audit;
 pub mod publish;
 pub mod query_audit;
 pub mod read;
@@ -69,6 +70,7 @@ pub use gc_config::{
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };
+pub use provision_audit::write_reshard_audit;
 pub use publish::PublishOutcome;
 pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, write_query_audit};
 pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};

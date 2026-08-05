@@ -84,6 +84,9 @@ pub struct LogIngestMetrics {
     /// Counted once per shard on the first observation, so it never exceeds
     /// `shard_count` and makes a permanently degraded process observable.
     shard_deaths: AtomicU64,
+    /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
+    /// the log-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
+    stale_provisioning_flushes: AtomicU64,
     /// Objects flushed carrying a non-empty POSTINGS section (ADR-0049, issue
     /// #511). The denominator for average section bytes per indexed object; an
     /// object whose resolved indexed-field list produced no section is not
@@ -120,6 +123,7 @@ pub struct LogIngestMetricsSnapshot {
     pub acks_err: u64,
     pub stream_id_collisions: u64,
     pub shard_deaths: u64,
+    pub stale_provisioning_flushes: u64,
     pub postings_objects: u64,
     pub postings_bytes_total: u64,
     pub postings_indexed_fields_total: u64,
@@ -176,6 +180,11 @@ impl LogIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_stale_provisioning_flush(&self) {
+        self.stale_provisioning_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Fold one flushed object's write-side POSTINGS counters
     /// ([`ravel_logseg::writer::WriteStats`]) into the cumulative totals
     /// (ADR-0049, issue #511). An object with no POSTINGS section
@@ -211,6 +220,7 @@ impl LogIngestMetrics {
             acks_err: self.acks_err.load(Ordering::Relaxed),
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             postings_objects: self.postings_objects.load(Ordering::Relaxed),
             postings_bytes_total: self.postings_bytes_total.load(Ordering::Relaxed),
             postings_indexed_fields_total: self

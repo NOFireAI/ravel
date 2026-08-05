@@ -33,6 +33,12 @@ pub enum SpanWriteError {
     /// retrying identical input will fail again.
     #[error("segment build failed: {0}")]
     SegmentBuild(String),
+    /// The router's cached provisioning-record view for this tenant is older
+    /// than the refresh interval `C`, so it fails the flush closed rather than
+    /// route on a view that could have missed a shard-generation activation
+    /// (ADR-0052 section 3). Retryable once the background refresher re-reads.
+    #[error("provisioning view stale: refusing to route on a view older than the refresh interval")]
+    StaleProvisioningView,
 }
 
 impl SpanWriteError {
@@ -45,6 +51,7 @@ impl SpanWriteError {
             SpanWriteError::ShardUnavailable
                 | SpanWriteError::AckTimeout
                 | SpanWriteError::Abandoned(_)
+                | SpanWriteError::StaleProvisioningView
         )
     }
 }

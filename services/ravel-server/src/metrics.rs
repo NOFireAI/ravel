@@ -468,6 +468,9 @@ pub struct IngestPipelineSnapshot {
     pub acks_err: u64,
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
+    /// Flushes failed closed because the router's cached provisioning view for
+    /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
+    pub stale_provisioning_flushes: u64,
     /// Write-side POSTINGS counters (ADR-0049, issue #511). `Some` only for the
     /// log pipeline; `None` for metrics and spans, which build no POSTINGS
     /// section, so the postings family renders no sample for them.
@@ -504,6 +507,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.series_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
         }
     }
@@ -523,6 +527,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: Some(PostingsCounters {
                 objects: snapshot.postings_objects,
                 bytes_total: snapshot.postings_bytes_total,
@@ -548,6 +553,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
+            stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
         }
     }
@@ -741,6 +747,22 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_shard_deaths_total",
             &labels(mode, pipeline.signal),
             pipeline.shard_deaths,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_stale_provisioning_flushes_total",
+        "Flushes failed closed because the router's cached shard-generation view was older than \
+         the refresh interval C (ADR-0052 section 3), by signal.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_stale_provisioning_flushes_total",
+            &labels(mode, pipeline.signal),
+            pipeline.stale_provisioning_flushes,
         );
     }
 }

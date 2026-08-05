@@ -4424,6 +4424,7 @@ dependencies = [
  "futures",
  "hex",
  "proptest",
+ "prost",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",

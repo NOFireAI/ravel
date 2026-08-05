@@ -46,6 +46,26 @@ Channel: `tokio::sync::mpsc` bounded (default 256 messages per shard).
 `send` awaiting on a full channel IS the backpressure mechanism; the gateway
 holds the request open and its own concurrency limits bound global memory.
 
+### Generation live switch (ADR-0052)
+
+`shard_count` is no longer fixed for a router's whole life: it is
+generation-versioned per (tenant, signal) in the provisioning record
+(`crates/ravel-catalog/src/provisioning.rs`). Each router holds a
+`GenerationSwitch` that keeps one shard-actor set per distinct active
+`shard_count` and routes a write with the count of the latest generation whose
+`activation_hour` is at or before the write's wall-clock hour
+(`ravel_catalog::active_shard_count`). A reshard's activation spawns the new
+generation's set and routes subsequent writes to it while the old set keeps
+draining and flushing under its original shard indices; no data is moved or
+re-keyed. A router routes on its cached generation view while it is younger than
+the refresh interval `C` (default 60s); once older, it re-reads the provisioning
+record before routing and fails the flush closed (typed error, the
+`ravel_ingest_stale_provisioning_flushes_total` counter) if that re-read cannot
+complete, so it never routes on a stale view. Operators append a generation with
+`ravel-cli provision reshard`; the record enforces the append-only,
+future-activation mutation model. See ADR-0052 for the full design (the read-side
+scan rule is EK2, not implemented here).
+
 ## Shard actor
 
 Single task per shard. No locks on the hot path; all state actor-local:
