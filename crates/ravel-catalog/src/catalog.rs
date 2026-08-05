@@ -451,9 +451,18 @@ impl Catalog {
     ///
     /// `now_ns` is always caller-supplied: this crate never reads a clock.
     ///
-    /// The (shard, hour) loop issues one LIST per pair (Phase 1, ADR-0003);
-    /// callers must keep `range`/`now_ns` and `config.shard_count` bounded
-    /// or this call issues a very large number of LIST requests.
+    /// Wide windows are traversed by a single per-shard recursive prefix LIST
+    /// rather than one LIST per (shard, ingest-hour) bucket (ADR-0056): the
+    /// per-bucket loop's cost is `shard_count * hours` and grows with window
+    /// width, while the prefix scan is `O(objects / page_size)` and does not.
+    /// The prefix path carries a runtime request cap: a scan that would issue
+    /// more than
+    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
+    /// LISTs is refused with [`CatalogError::WindowTooWide`] (issue #635's
+    /// request bound, enforced at runtime; ADR-0044 decision 3 as amended for
+    /// ADR-0056). A wide-but-sparse window is served cheaply; only a scan whose
+    /// actual object volume is unsustainable is refused. Callers should still
+    /// keep `config.shard_count` bounded.
     pub async fn resolve(
         &self,
         tenant: &TenantHash,
@@ -582,6 +591,17 @@ impl Catalog {
         // `enforce_provisioning_once` above fails on a scalar mismatch: a
         // malformed generation history must never be read as "assume
         // generation 0" and silently under-scan.
+        //
+        // Issue #635's original pre-execution refusal (a window whose
+        // per-(shard, hour) estimate exceeded `max_catalog_list_requests` was
+        // refused here, before any store read) is superseded by issue #636's
+        // prefix-path routing below (ADR-0056, "INTERACTION 1"): an
+        // hour-counting estimate would refuse a wide-but-sparse window whose
+        // real cost the prefix scan proves is tiny, the wrong direction to
+        // fail closed in. Admission now happens where cost is actually
+        // knowable -- routed to the prefix path when the per-bucket estimate
+        // would be expensive, and capped at runtime by real LIST count if the
+        // prefix scan itself turns out to be too large.
         let generations = self.read_scan_generations(tenant, signal).await?;
 
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
@@ -632,42 +652,99 @@ impl Catalog {
                 }
                 _ => window_start_hour,
             };
-            // The (shard, hour) listing pass used to issue its LISTs one
-            // await at a time; run them concurrently under the resolve-wide
-            // semaphore instead (#278 item 2). Each bucket resolves into its
-            // own map (bucket keys never collide across buckets), and the
-            // per-bucket maps are merged back in the buffered (input) order so
-            // the resulting segment set is byte-identical to the sequential
-            // pass before the final deterministic sort.
-            // Each hour's shard fan-out is its own `scan_count(h)` derived from
-            // the generation history (ADR-0052 section 4), not one static
-            // `shard_count` for the whole range: a hour before a reshard scans
-            // the old count, a hour at/after an increase scans the wider new
-            // count, and a hour in a decrease's slack window scans the retiring
-            // larger count so a straggler is still found.
-            let mut bucket_coords = Vec::new();
-            for hour in listing_start_hour..=window_end_hour {
-                let scan = crate::provisioning::scan_count(
-                    &generations,
-                    hour,
-                    crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
-                );
-                for shard in 0..scan {
-                    bucket_coords.push((shard, hour));
-                }
-            }
-            let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
-                stream::iter(bucket_coords)
-                    .map(|(shard, hour)| async move {
-                        self.list_hour_bucket(tenant, signal, shard, hour, range, accounting)
-                            .await
-                    })
-                    .buffered(MAX_CONCURRENT_REQUESTS)
-                    .collect()
-                    .await;
-            for bucket in bucket_maps {
-                for (key, segment_ref) in bucket? {
+            // Traversal choice (ADR-0056), on the listing suffix actually to be
+            // scanned (`[listing_start_hour, window_end_hour]`, after any folded
+            // snapshot watermark shortened the low end). The per-bucket loop
+            // issues one LIST per (shard, hour) bucket -- one per empty bucket
+            // included -- so its cost is `shard_count * listing_hours`; the
+            // prefix scan issues `O(objects / page_size)` LISTs regardless of
+            // width. Switch to the prefix scan once the suffix is wide enough
+            // (config crossover), or once the per-bucket loop would exceed the
+            // request ceiling. The latter replaces issue #635's pre-execution
+            // refusal: instead of refusing an over-wide window, route it to the
+            // non-amplifying prefix path (runtime-capped inside
+            // `list_window_by_prefix`), so a wide-but-sparse window is served
+            // rather than refused (issue #636 INTERACTION 1). The per-bucket
+            // loop is chosen only when the suffix is within the ceiling, so it
+            // can never exceed it.
+            //
+            // The per-bucket estimate must use the same generation-aware shard
+            // bound the prefix path will actually scan (ADR-0052 section 4,
+            // issue #659), not the static `self.config.shard_count`: on a
+            // shard-count DECREASE the retiring larger generation's higher
+            // shard indices stay in scope for `DEFAULT_SCAN_SLACK_HOURS` past
+            // the successor's activation, and both this crossover/ceiling
+            // decision and `list_window_by_prefix`'s shard loop must agree on
+            // that wider bound so the decision stays consistent with what is
+            // scanned.
+            let suffix_scan_shards = crate::provisioning::max_scan_count_over_range(
+                &generations,
+                listing_start_hour,
+                window_end_hour,
+                crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+            );
+            let listing_suffix_buckets = u64::from(suffix_scan_shards).saturating_mul(
+                u64::from(window_end_hour.saturating_sub(listing_start_hour)).saturating_add(1),
+            );
+            let use_prefix = listing_start_hour <= window_end_hour
+                && (listing_suffix_buckets >= self.config.prefix_list_crossover_requests
+                    || listing_suffix_buckets > self.config.max_catalog_list_requests);
+
+            if use_prefix {
+                let listed = self
+                    .list_window_by_prefix(
+                        tenant,
+                        signal,
+                        listing_start_hour,
+                        window_end_hour,
+                        range,
+                        &generations,
+                        accounting,
+                    )
+                    .await?;
+                for (key, segment_ref) in listed {
                     segments.entry(key).or_insert(segment_ref);
+                }
+            } else {
+                // The (shard, hour) listing pass used to issue its LISTs one
+                // await at a time; run them concurrently under the
+                // resolve-wide semaphore instead (#278 item 2). Each bucket
+                // resolves into its own map (bucket keys never collide across
+                // buckets), and the per-bucket maps are merged back in the
+                // buffered (input) order so the resulting segment set is
+                // byte-identical to the sequential pass before the final
+                // deterministic sort.
+                // Each hour's shard fan-out is its own `scan_count(h)`
+                // derived from the generation history (ADR-0052 section 4),
+                // not one static `shard_count` for the whole range: a hour
+                // before a reshard scans the old count, a hour at/after an
+                // increase scans the wider new count, and a hour in a
+                // decrease's slack window scans the retiring larger count so
+                // a straggler is still found.
+                let mut bucket_coords = Vec::new();
+                for hour in listing_start_hour..=window_end_hour {
+                    let scan = crate::provisioning::scan_count(
+                        &generations,
+                        hour,
+                        crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+                    );
+                    for shard in 0..scan {
+                        bucket_coords.push((shard, hour));
+                    }
+                }
+                let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
+                    stream::iter(bucket_coords)
+                        .map(|(shard, hour)| async move {
+                            self.list_hour_bucket(tenant, signal, shard, hour, range, accounting)
+                                .await
+                        })
+                        .buffered(MAX_CONCURRENT_REQUESTS)
+                        .collect()
+                        .await;
+                for bucket in bucket_maps {
+                    for (key, segment_ref) in bucket? {
+                        segments.entry(key).or_insert(segment_ref);
+                    }
                 }
             }
         }
@@ -727,6 +804,27 @@ impl Catalog {
     /// are not included here: which records exist, and how many, is only
     /// knowable after a LIST actually runs, so they cannot be bounded before
     /// resolve starts.
+    ///
+    /// This number is a true upper envelope of what `resolve` actually issues
+    /// on either traversal path (ADR-0044 decision 3, amended for ADR-0056):
+    ///
+    /// - The per-bucket loop issues exactly this many LISTs (one per bucket,
+    ///   under the sparse-bucket assumption of at most `page_size` objects per
+    ///   `(shard, hour)` -- the same assumption that lets this formula count
+    ///   one LIST per bucket and ignore intra-bucket pagination).
+    /// - The prefix scan (ADR-0056) issues `O(objects / page_size)` LISTs,
+    ///   strictly fewer than the per-bucket loop's `shard_count * hours` base
+    ///   for any window it is chosen for, so this bound still holds over it.
+    ///
+    /// It is reported for cost accounting (ADR-0044 decision 3, threaded
+    /// through `ravel-query`/`ravel-sql`) and is no longer itself the
+    /// admission gate for wide windows: rather than refuse a window whose
+    /// per-bucket cost would exceed
+    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests),
+    /// `resolve` routes it to the non-amplifying prefix path and caps that
+    /// path's LIST count at the same ceiling at runtime (issue #635's request
+    /// bound preserved; issue #636). It remains an upper envelope and never a
+    /// prediction; a folded tenant's real LIST count is far lower.
     pub fn estimated_catalog_requests(&self, range: TimeRange, now_ns: i64) -> u64 {
         match self.window_hour_bounds(range, now_ns) {
             Some((start_hour, end_hour)) => {
@@ -781,6 +879,10 @@ impl Catalog {
         Some((start_hour, end_hour))
     }
 
+    /// List one `(shard, ingest-hour)` bucket and resolve it into its segment
+    /// contribution: one `guarded_list_all` over the bucket prefix, then
+    /// [`Catalog::process_bucket`]. The per-bucket-loop path
+    /// (docs/catalog-and-mvcc.md "Snapshot resolution (Phase 1)").
     #[allow(clippy::too_many_arguments)]
     async fn list_hour_bucket(
         &self,
@@ -791,9 +893,35 @@ impl Catalog {
         range: TimeRange,
         accounting: &QueryAccounting,
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
-        let mut out: HashMap<String, SegmentRef> = HashMap::new();
         let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
         let objects = self.guarded_list_all(tenant, &prefix, accounting).await?;
+        self.process_bucket(tenant, signal, shard, hour, objects, range, accounting)
+            .await
+    }
+
+    /// Resolve one `(shard, ingest-hour)` bucket's already-listed keys into its
+    /// segment contribution (docs/catalog-and-mvcc.md steps 2-4). Shared
+    /// verbatim by both traversal paths (ADR-0056): the per-bucket loop passes
+    /// the keys from its per-bucket LIST, the prefix scan passes the keys it
+    /// grouped by `(shard, hour)` from its per-shard recursive LIST. The
+    /// per-bucket compaction/tombstone/interlock logic is a pure function of
+    /// the set of keys in one bucket, so grouping a wider listing by bucket and
+    /// running this per group yields the identical snapshot the per-bucket loop
+    /// yields -- the property the differential test (issue #636 deliverable 3a)
+    /// pins.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_bucket(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+        objects: Vec<ObjectMeta>,
+        range: TimeRange,
+        accounting: &QueryAccounting,
+    ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+        let mut out: HashMap<String, SegmentRef> = HashMap::new();
+        let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
 
         // Partition the listed keys by shape (docs/catalog-and-mvcc.md step
         // 2). An unrecognized shape is a fail-loud error, never a silent
@@ -920,6 +1048,146 @@ impl Catalog {
                 let segment_ref = build_segment_ref(key, &record)?;
                 out.entry(segment_ref.data_object_key.clone())
                     .or_insert(segment_ref);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The prefix-scan traversal path (ADR-0056): one drained recursive prefix
+    /// LIST per shard over [`keys::commit_shard_prefix`], grouped client-side
+    /// by `(shard, ingest-hour)` and resolved through
+    /// [`Catalog::process_bucket`], for the window buckets in
+    /// `[listing_start_hour, window_end_hour]`.
+    ///
+    /// Cost is `O(objects / page_size)`, independent of window width, versus
+    /// the per-bucket loop's one LIST per bucket (ADR-0056 measurement). The
+    /// store's `list` cannot seek past a prefix (continuation token only, no
+    /// start-after), so the scan reads every commit key in each shard subtree,
+    /// including hours below `listing_start_hour`; those are dropped by the
+    /// client-side filter, exactly the buckets the per-bucket loop would have
+    /// skipped. The range scanned is unchanged, only the scan method (issue
+    /// #636 INTERACTION 2): a key in any in-range bucket, however far below the
+    /// window end, is still grouped and resolved.
+    ///
+    /// A running LIST count is capped at
+    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
+    /// and aborts with [`CatalogError::WindowTooWide`] before issuing a page
+    /// that would exceed it. This is issue #635's request bound, enforced at
+    /// runtime on the one path whose cost is not knowable before listing: a
+    /// wide-but-sparse window is served, and only a scan whose actual object
+    /// volume is unsustainable is refused.
+    #[allow(clippy::too_many_arguments)]
+    async fn list_window_by_prefix(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        listing_start_hour: u32,
+        window_end_hour: u32,
+        range: TimeRange,
+        generations: &[crate::provisioning::ShardGeneration],
+        accounting: &QueryAccounting,
+    ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+        // One recursive LIST per shard, grouping keys by (shard, hour). The
+        // LISTs drain sequentially so the runtime request cap is checked
+        // deterministically page by page; the expensive per-bucket record GETs
+        // are what run concurrently below, mirroring the per-bucket loop's
+        // concurrency model (#278 item 2).
+        let mut grouped: HashMap<(u32, u32), Vec<ObjectMeta>> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut lists_issued: u64 = 0;
+        let cap = self.config.max_catalog_list_requests;
+        let tenant_prefix = format!("t/{}/", tenant.to_hex());
+        // Shard bound is the union scan set over every hour in the listing
+        // suffix (ADR-0052 section 4, issue #659), not the static
+        // `self.config.shard_count`. `max_scan_count_over_range` keeps a
+        // retiring larger generation's higher shard indices in scope for
+        // `DEFAULT_SCAN_SLACK_HOURS` past its successor's activation, so on a
+        // shard-count decrease a straggler routed under the old count into an
+        // early successor hour is still listed. Matches the per-bucket path's
+        // per-hour `scan_count`; a per-shard recursive LIST cannot vary the
+        // bound per hour, so it takes the max over the range.
+        let scan_shards = crate::provisioning::max_scan_count_over_range(
+            generations,
+            listing_start_hour,
+            window_end_hour,
+            crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+        );
+        for shard in 0..scan_shards {
+            let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+            let mut page_token = None;
+            loop {
+                // Refuse before issuing a page that would exceed the ceiling,
+                // so at most `cap` LISTs are ever issued (issue #635's bound).
+                if lists_issued >= cap {
+                    return Err(CatalogError::WindowTooWide {
+                        estimate: lists_issued.saturating_add(1),
+                        limit: cap,
+                    });
+                }
+                let page = {
+                    let _permit = self.request_semaphore.acquire().await.map_err(|_| {
+                        StoreError::Transient("catalog request semaphore closed".to_string())
+                    })?;
+                    let page = self.store.list(&prefix, page_token).await;
+                    accounting.record_s3_request(AccountedOp::List);
+                    lists_issued += 1;
+                    page?
+                };
+                for meta in page.objects {
+                    // ADR-0050 §2 isolation assertion, identical to
+                    // `guarded_list_all`: every returned key is under this
+                    // tenant's prefix or the scan hard-fails.
+                    if !meta.key.starts_with(&tenant_prefix) {
+                        self.record_isolation_breach();
+                        return Err(CatalogError::FieldMismatch {
+                            key: prefix.clone(),
+                            field: "list_prefix",
+                            expected: tenant_prefix,
+                            actual: meta.key,
+                        });
+                    }
+                    // Dedup by key across pages (the cross-page listing
+                    // guarantee: a key MAY repeat across pages), matching
+                    // `guarded_list_all` so the grouped key set is identical to
+                    // the per-bucket loop's.
+                    if !seen.insert(meta.key.clone()) {
+                        continue;
+                    }
+                    let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
+                        BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
+                        BucketEntry::CompactionRecord(k) => (k.shard, k.ingest_hour_bucket),
+                        BucketEntry::Tombstone(k) => (k.shard, k.ingest_hour_bucket),
+                    };
+                    if bhour < listing_start_hour || bhour > window_end_hour {
+                        continue;
+                    }
+                    grouped.entry((bshard, bhour)).or_default().push(meta);
+                }
+                match page.next {
+                    Some(next) => page_token = Some(next),
+                    None => break,
+                }
+            }
+        }
+
+        // Resolve each surviving bucket through the shared per-bucket path,
+        // concurrently under the resolve-wide semaphore. Bucket keys never
+        // collide across buckets, and resolve_impl's final deterministic sort
+        // makes the result independent of merge order.
+        let coords: Vec<((u32, u32), Vec<ObjectMeta>)> = grouped.into_iter().collect();
+        let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
+            stream::iter(coords)
+                .map(|((shard, hour), objs)| async move {
+                    self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
+                        .await
+                })
+                .buffered(MAX_CONCURRENT_REQUESTS)
+                .collect()
+                .await;
+        let mut out: HashMap<String, SegmentRef> = HashMap::new();
+        for bucket in bucket_maps {
+            for (key, segment_ref) in bucket? {
+                out.entry(key).or_insert(segment_ref);
             }
         }
         Ok(out)

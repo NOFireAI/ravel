@@ -209,6 +209,13 @@ impl SqlError {
     pub fn class(&self) -> ErrorClass {
         match self {
             SqlError::Validation(_) | SqlError::CrossSignalQuery => ErrorClass::BadRequest,
+            // An over-wide window refused before any LIST (issue #635) is a
+            // resource-budget rejection, the same class as the segment/sample
+            // budgets below: a well-formed request the server declines to
+            // serve at this size (422), not a storage fault (503). Handled
+            // ahead of the generic `Catalog(_)` arm so it does not collapse
+            // into the transient-unavailable redaction.
+            SqlError::Catalog(CatalogError::WindowTooWide { .. }) => ErrorClass::Unsupported,
             SqlError::Catalog(_)
             | SqlError::Fetch(_)
             | SqlError::LogFetch(_)
@@ -239,6 +246,11 @@ impl SqlError {
             SqlError::Validation(e) => e.to_string(),
             // Safe to echo: the text names only the two fixed table names.
             SqlError::CrossSignalQuery => self.to_string(),
+            // Safe to echo: `WindowTooWide` carries only the estimate and the
+            // limit (counts, no object key or tenant identity), and its text
+            // tells the caller to narrow the window (issue #635). Same
+            // treatment as the budget errors below.
+            SqlError::Catalog(catalog @ CatalogError::WindowTooWide { .. }) => catalog.to_string(),
             SqlError::Catalog(catalog) => redact_catalog(catalog).to_string(),
             SqlError::Fetch(fetch) => match fetch {
                 FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
@@ -466,6 +478,30 @@ mod tests {
         assert!(err.client_message().contains("logs"));
         // It carries no server state to redact.
         assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn window_too_wide_is_a_422_that_keeps_its_counts() {
+        // Issue #635: an over-wide window refused before any LIST is a
+        // resource-budget rejection (422 Unsupported), not a storage fault
+        // (503). Its text carries only the estimate and the limit, so it is
+        // echoed to the client verbatim like the other budget errors, and it
+        // is redaction-safe (no key, no tenant hash).
+        let err = SqlError::Catalog(CatalogError::WindowTooWide {
+            estimate: 496_089,
+            limit: 100_000,
+        });
+        assert_eq!(err.class(), ErrorClass::Unsupported);
+        // The client sees the inner catalog message (the counts and the
+        // "narrow the window" guidance), without the "snapshot resolution
+        // failed:" wrapper the server logs.
+        assert!(err.client_message().contains("496089"));
+        assert!(err.client_message().contains("100000"));
+        assert!(err.client_message().contains("narrow"));
+        assert_redacted(&err.client_message());
+        // Distinct from the transient/corrupt catalog classes.
+        assert_ne!(err.client_message(), MSG_UNAVAILABLE);
+        assert_ne!(err.client_message(), MSG_CORRUPT);
     }
 
     #[test]

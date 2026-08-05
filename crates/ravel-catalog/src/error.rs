@@ -74,6 +74,19 @@ pub enum CatalogError {
         "fold gave up after {attempts} HEAD CAS attempts at watermark_hour={watermark_hour}: a concurrent folder keeps winning"
     )]
     FoldCasRetriesExhausted { attempts: u32, watermark_hour: u32 },
+    /// The window's pre-execution catalog-request estimate (ADR-0044
+    /// decision 3, amended 2026-08-05 for issue #635) exceeds the configured
+    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
+    /// ceiling. Fail-closed admission control: the resolve is refused before
+    /// any LIST is issued, never silently narrowed, so an unbounded client
+    /// window cannot make one request fan out to hundreds of thousands of
+    /// LISTs. `estimate` and `limit` are counts only (no object key, no tenant
+    /// identity), so the message is safe to surface to a client and lets a
+    /// caller narrow its window and retry knowing by how much it was over.
+    #[error(
+        "query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry"
+    )]
+    WindowTooWide { estimate: u64, limit: u64 },
     /// The configured `shard_count` disagrees with the (tenant, signal)'s
     /// durable provisioning record, or the record could not be read/decoded
     /// (ADR-0050 section 5, EC5). Fails the resolve rather than iterating

@@ -285,10 +285,27 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 
 `Catalog::resolve(tenant, signal, range, min_tokens, now_ns) -> Snapshot`
 
-1. For each shard 0..shard_count, for each ingest_hour bucket overlapping
-   `[range.start_ns - max_ingest_lag, now_ns + clock_skew_allowance]`
-   (max_ingest_lag default 2 h, clock_skew_allowance default 5 m, config):
-   LIST `t/<th>/m/c/<shard>/<hour>/` (paginated; callers dedup keys).
+1. Discover the commit keys for every shard 0..shard_count and every
+   ingest_hour bucket overlapping `[range.start_ns - max_ingest_lag, now_ns +
+   clock_skew_allowance]` (max_ingest_lag default 2 h, clock_skew_allowance
+   default 5 m, config). Two traversals produce the identical key set
+   (ADR-0056); resolve picks between them on the width of the listing suffix:
+   - **Per-bucket loop** (narrow/warm windows): LIST
+     `t/<th>/m/c/<shard>/<hour>/` per bucket (paginated; callers dedup keys).
+     Cost `shard_count * hours`, one LIST per bucket, empty buckets included.
+     Prunes best behind a folded snapshot watermark, which shortens the listed
+     suffix to the post-watermark buckets.
+   - **Prefix scan** (wide windows, at or above
+     `prefix_list_crossover_requests` suffix buckets, default 720): one drained
+     recursive LIST per shard over `t/<th>/m/c/<shard>/` (paginated), grouping
+     the returned keys client-side by `(shard, ingest_hour)` and keeping the
+     buckets in the window. Cost `O(objects / page_size)`, independent of
+     window width, so an epoch-width window over a sparse tenant costs a
+     handful of pages instead of one LIST per empty hour. The store's LIST
+     takes only a prefix and a continuation token (no start-after), so the scan
+     reads every key in the shard subtree, including hours the window excludes;
+     those are dropped client-side.
+   Both traversals then partition the keys identically (step 2 onward).
 2. Partition the listed keys by shape (L0 commit record, compaction
    record, tombstone; ADR-0018, ADR-0019, docs/compaction-retention-plan.md
    §3.5). A key matching none of the three shapes is a fail-loud error, not
@@ -341,6 +358,36 @@ The listing window is sound because admission bounds event-time skew
 (default 10 m) or `event_ts < ingest_ts - max_ingest_lag` are rejected at
 ingest. Late arrivals within bounds land in the current ingest hour and
 stay discoverable via the `now`-anchored upper bound.
+
+The window's upper bound is anchored on `now_ns`, not on `range.end_ns`, so a
+client-supplied `range.start_ns` near the epoch spans one bucket per (shard,
+ingest_hour) from that start all the way to the current hour, regardless of
+how narrow `range.end_ns` is. The per-bucket loop's cost for that is
+`shard_count * hour_buckets`, growing by one every wall-clock hour; the
+prefix scan collapses it to `O(objects / page_size)`, which is exactly why
+resolve switches to the prefix scan for wide windows (ADR-0056).
+
+`Catalog::estimated_catalog_requests` still reports the per-bucket worst case
+`shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` (issue
+#635, ADR-0044 decision 3): it is a true upper envelope of whichever
+traversal runs (the prefix scan issues strictly fewer requests than the
+per-bucket loop it replaces) and is threaded into the cost accounting. It is
+no longer the admission gate for wide windows. Instead:
+
+- A window whose per-bucket cost would exceed
+  `CatalogConfig::max_catalog_list_requests` (default 100,000) is routed to
+  the prefix scan rather than refused, because the prefix scan does not
+  amplify one-object-worth-of-data into thousands of empty LISTs.
+- The prefix scan carries a runtime LIST cap at the same ceiling: it aborts
+  with `WindowTooWide` before issuing a page that would take it over, so a
+  single resolve still never issues more than `max_catalog_list_requests`
+  catalog LISTs. Only a scan whose *actual object volume* is unsustainable is
+  refused; a wide-but-sparse window is served.
+
+The refusal is never a silent narrowing to a partial result (exact semantics
+by default). The typed error carries the count and the limit so the caller
+can narrow its own range and retry; it maps to HTTP 422 on every query
+endpoint.
 
 ## Snapshot resolution (Phase 2)
 

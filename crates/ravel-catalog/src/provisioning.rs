@@ -348,6 +348,81 @@ pub fn scan_count(generations: &[ShardGeneration], hour: u32, slack_hours: u32) 
     }
 }
 
+/// The union shard-index domain a reader must scan for *every* ingest-hour
+/// bucket in `[start_hour, end_hour]` (inclusive): the range generalization of
+/// [`scan_count`]. Used by the prefix-scan traversal path (ADR-0056,
+/// `catalog::list_window_by_prefix`), which lists one per-shard subtree at a
+/// time and so needs a single shard bound covering the whole window, not a
+/// per-hour count.
+///
+/// A generation `g`'s per-hour scan-set is the half-open hour interval
+///
+/// ```text
+/// [ activation_hour(g), successor_activation(g) + S )
+/// ```
+///
+/// exactly the interval [`scan_count`] checks per hour (`activation_hour(g) <=
+/// h` and `h < successor_activation(g) + S`, with a nonexistent successor
+/// activating at infinity). `g` contributes to the range result iff that
+/// interval intersects `[start_hour, end_hour]`, i.e.
+///
+/// ```text
+/// activation_hour(g) <= end_hour   &&   start_hour < successor_activation(g) + S
+/// ```
+///
+/// and the result is the max `shard_count` over every contributing generation.
+/// This equals `max over h in [start_hour, end_hour] of scan_count(h)` (the
+/// max of a max over hours is the max over the generations relevant to any of
+/// those hours), but is computed in O(generations), never O(hours): the whole
+/// point of the prefix path is to avoid work that scales with window width.
+///
+/// `generations` must be the normalized, validated history
+/// [`read_generations`] returns (non-empty, dense, activation-increasing,
+/// generation 0 at `activation_hour` 0). Returns generation 0's count as a
+/// defensive floor for an empty slice, matching [`scan_count`]; a validated
+/// history always has the latest generation activated at or before `end_hour`
+/// with an unbounded (or wider-than-`start_hour`) successor bound, so the floor
+/// branch is unreachable for one.
+pub fn max_scan_count_over_range(
+    generations: &[ShardGeneration],
+    start_hour: u32,
+    end_hour: u32,
+    slack_hours: u32,
+) -> u32 {
+    let mut max_count = 0u32;
+    for (idx, g) in generations.iter().enumerate() {
+        // Lower end of g's scan interval past the range: g has not activated
+        // by any hour in the range, so it contributes nothing.
+        if g.activation_hour > end_hour {
+            continue;
+        }
+        // Upper end of g's scan interval (exclusive): its successor's
+        // activation plus the slack window; a nonexistent successor activates
+        // at infinity. `u64` keeps `activation + slack` from overflowing `u32`,
+        // matching `scan_count`.
+        let successor_activation = generations
+            .get(idx + 1)
+            .map_or(u64::MAX, |s| u64::from(s.activation_hour));
+        let upper = successor_activation.saturating_add(u64::from(slack_hours));
+        // Interval `[activation_hour(g), upper)` intersects `[start_hour,
+        // end_hour]` iff its lower end is `<= end_hour` (checked above) and its
+        // upper end is `> start_hour`.
+        if u64::from(start_hour) < upper {
+            max_count = max_count.max(g.shard_count);
+        }
+    }
+    if max_count == 0 {
+        // Only reachable for an empty (never-validated) slice, exactly as in
+        // `scan_count`: for a validated history the latest generation with
+        // `activation_hour <= end_hour` always qualifies (its successor, if
+        // any, activates strictly after `end_hour >= start_hour`, so the upper
+        // bound exceeds `start_hour`).
+        generations.first().map_or(1, |g| g.shard_count)
+    } else {
+        max_count
+    }
+}
+
 /// The fold-time fan-out ceiling (ADR-0052 section 5): `max { count(g) :
 /// activation_hour(g) <= watermark_hour }`, with **no** slack-window upper
 /// bound. This is the value a fold stamps into `SnapshotHead.shard_count` /
@@ -1477,6 +1552,115 @@ mod tests {
         );
         assert_eq!(scan_count(&gens, 201, 2), 8, "still inside gen1's slack");
         assert_eq!(scan_count(&gens, 202, 2), 2, "slack closed: gen2's count");
+    }
+
+    /// `max_scan_count_over_range`: a single implicit generation scans its
+    /// whole count for any range.
+    #[test]
+    fn max_scan_range_single_generation() {
+        let gens = [sg(0, 4, 0)];
+        assert_eq!(
+            max_scan_count_over_range(&gens, 0, 0, DEFAULT_SCAN_SLACK_HOURS),
+            4
+        );
+        assert_eq!(
+            max_scan_count_over_range(&gens, 10, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            4
+        );
+    }
+
+    /// An increase: a range spanning the activation sees the wider new count; a
+    /// range fully before it sees only the old count; a range fully after sees
+    /// the new count. Equivalent to the per-hour `max` of `scan_count`.
+    #[test]
+    fn max_scan_range_increase() {
+        // gen0 count 4 @0; gen1 count 8 @100. S = 2.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100)];
+        assert_eq!(
+            max_scan_count_over_range(&gens, 0, 99, 2),
+            4,
+            "range fully before the increase: old count only"
+        );
+        assert_eq!(
+            max_scan_count_over_range(&gens, 0, 100, 2),
+            8,
+            "range spanning the activation: wider new count"
+        );
+        assert_eq!(
+            max_scan_count_over_range(&gens, 200, 300, 2),
+            8,
+            "range fully after the increase: new count"
+        );
+    }
+
+    /// A decrease: the retiring, larger count is in scope for exactly `S` hours
+    /// past the successor's activation. A range whose only hours touching the
+    /// old generation lie inside that slack window still yields the larger
+    /// count (the record-inside case); a range entirely past the slack window
+    /// yields only the new count (the record-outside case).
+    #[test]
+    fn max_scan_range_decrease_inside_vs_outside_slack() {
+        // gen0 count 8 @0; gen1 count 4 @100. S = 2. gen0's scan interval is
+        // [0, 100 + 2) = [0, 102); gen1's is [100, inf).
+        let gens = [sg(0, 8, 0), sg(1, 4, 100)];
+        assert_eq!(
+            max_scan_count_over_range(&gens, 100, 101, 2),
+            8,
+            "range inside the slack window intersects gen0's interval: larger count"
+        );
+        assert_eq!(
+            max_scan_count_over_range(&gens, 101, 101, 2),
+            8,
+            "single hour still inside the slack window: larger count"
+        );
+        assert_eq!(
+            max_scan_count_over_range(&gens, 102, 200, 2),
+            4,
+            "range entirely past the slack window: new count only"
+        );
+        assert_eq!(
+            max_scan_count_over_range(&gens, 200, 300, 2),
+            4,
+            "far past the decrease: new count"
+        );
+    }
+
+    /// A range fully before, spanning, and fully after an activation, pinned
+    /// against the equivalent per-hour `max` of `scan_count` so the O(gens)
+    /// range formula provably matches the O(hours) definition.
+    #[test]
+    fn max_scan_range_matches_per_hour_max() {
+        // gen0 count 4 @0; gen1 count 8 @100; gen2 count 2 @200. S = 2.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100), sg(2, 2, 200)];
+        for (start, end) in [(0u32, 50u32), (0, 100), (50, 205), (150, 205), (203, 400)] {
+            let per_hour_max = (start..=end)
+                .map(|h| scan_count(&gens, h, 2))
+                .max()
+                .expect("non-empty range");
+            assert_eq!(
+                max_scan_count_over_range(&gens, start, end, 2),
+                per_hour_max,
+                "range [{start}, {end}] must equal the per-hour max of scan_count"
+            );
+        }
+    }
+
+    /// With `S = 0` the retiring count leaves the scan set the instant the
+    /// successor activates, so a range starting at the activation hour sees
+    /// only the new count.
+    #[test]
+    fn max_scan_range_zero_slack() {
+        let gens = [sg(0, 8, 0), sg(1, 4, 100)];
+        assert_eq!(
+            max_scan_count_over_range(&gens, 99, 99, 0),
+            8,
+            "before activation: old count"
+        );
+        assert_eq!(
+            max_scan_count_over_range(&gens, 100, 200, 0),
+            4,
+            "from activation with no slack: new count only"
+        );
     }
 
     /// A large `activation_hour` near `u32::MAX` must not overflow when the

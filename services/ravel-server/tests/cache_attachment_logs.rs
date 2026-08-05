@@ -37,6 +37,21 @@ use uuid::Uuid;
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const NOW_NS: i64 = 4 * NS_PER_HOUR;
 
+/// A clock frozen at [`NOW_NS`]. `build_sql_state` defaults to a real
+/// `SystemClock`; left as-is, this test's `start: 0.0` window would list one
+/// prefix per (shard, ingest-hour) from the epoch to the real current hour
+/// (about half a million LISTs) and now trip the issue #635 window-cost
+/// ceiling with a 422. Freezing the clock keeps the resolved listing window an
+/// ordinary four hours: the epoch-width span was incidental to what this test
+/// asserts (cache attachment on the log path), not part of it, so narrowing it
+/// is not "changing the test to fit the code".
+struct FixedClock;
+impl ravel_ingest::Clock for FixedClock {
+    fn now_ns(&self) -> i64 {
+        NOW_NS
+    }
+}
+
 fn cache_enabled_cli() -> Cli {
     Cli::try_parse_from(["ravel-server"]).expect("default flags parse")
 }
@@ -178,7 +193,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
     let mut tokens = HashMap::new();
     tokens.insert("acme-token".to_string(), tenant.clone());
     let catalog = build_catalog(Arc::clone(&store), 1).expect("catalog");
-    let sql_state = build_sql_state(
+    let mut sql_state = build_sql_state(
         catalog,
         store,
         Arc::new(StaticBearerTokenResolver::new(tokens)),
@@ -189,6 +204,9 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         )),
     )
     .expect("sql state");
+    // Freeze the clock so the epoch-start window resolves to an ordinary
+    // four-hour span rather than tripping the issue #635 cost ceiling.
+    sql_state.clock = Arc::new(FixedClock);
     let app = ravel_server::sql::router(sql_state);
 
     let (status, body) =
