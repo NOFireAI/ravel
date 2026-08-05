@@ -347,12 +347,26 @@ wrapper.
 
 Each phase span also records the per-span byte/request counts ADR-0044
 decision 5 requires, scoped to that call's own work rather than the whole
-query and recorded from the `QueryAccounting` delta once the phase returns:
-`s3_requests`/`s3_bytes` on `catalog_resolve`, `segment_open`, and
+query. Except on `catalog_resolve`, these come from values local to the
+phase — the bytes and request count of the GET/decode calls that
+invocation makes itself — not from a before/after `QueryAccounting`
+snapshot delta. A delta would be wrong for every fetch/decode phase: the
+segment futures run concurrently over one shared `QueryAccounting` handle
+(`buffer_unordered` in `engine.rs`), so a sibling segment's GETs land
+between one phase's two snapshots and the delta would fold their cost into
+this span. `segment_open` sums the byte length and count of its own one or
+two `guarded_get` calls; `page_fetch` records the count and bytes
+`ensure_ranges` reports for the coalesced GETs it issued on that call;
+`decode` sums each `decode_run`/`decode_histogram_run`'s own decompressed
+output. Only `catalog_resolve` still uses a snapshot delta, and correctly:
+it runs once per query handle, sequentially, before any concurrent fetch
+work starts, so nothing else writes the handle across its window. The
+fields: `s3_requests`/`s3_bytes` on `catalog_resolve`, `segment_open`, and
 `page_fetch`; `segments_pruned` on `catalog_resolve`; `series_matched` on
 `catalog_decode`; `decompressed_bytes` on `decode`. The log-signal path
-(`LogSegmentFetcher::fetch`/`fetch_accounted`) carries the same
-`page_fetch` (recording its one whole-object GET) and `decode` span names.
+(`LogSegmentFetcher::fetch_accounted` and the production
+`fetch_accounted_with_tenant`) carries the same `page_fetch` (recording
+its one whole-object GET, or zero on a cache hit) and `decode` span names.
 
 Span fields otherwise carry only bounded values — `tenant_hash` as a hex
 string, `object_size`, matcher/series counts, and fixed-set kind strings

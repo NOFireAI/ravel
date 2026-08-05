@@ -17,7 +17,10 @@ use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+};
 use ravel_query::http::{AppState, StaticBearerTokenResolver, router};
 use ravel_query::{EngineConfig, QueryEngine};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment};
@@ -261,29 +264,109 @@ async fn instant_query_returns_expected_value() {
     assert_eq!(value_string(&results[0]), "42");
 }
 
-/// A `tracing` layer that records the name of every span opened while it is the
-/// default subscriber, so a test can assert exactly which query-path phase
-/// spans fired. Exact span-name equality is deliberate: a substring check would
-/// let `catalog_decode` satisfy an assertion for `decode`, so removing the
-/// `decode` span would not fail the test (ADR-0044 decision 5, issue #642).
-#[derive(Clone, Default)]
-struct SpanNameCollector(Arc<std::sync::Mutex<Vec<String>>>);
+/// One span's captured identity and per-span count fields (ADR-0044 decision
+/// 5). `name` and `tenant_hash` are read from the span's creation attributes;
+/// the count fields are `None` until the phase records them via `span.record`
+/// and are captured in [`SpanCollector::on_record`].
+#[derive(Clone, Default, Debug)]
+struct CapturedSpan {
+    name: String,
+    tenant_hash: Option<String>,
+    s3_requests: Option<u64>,
+    s3_bytes: Option<u64>,
+    decompressed_bytes: Option<u64>,
+}
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanNameCollector {
+/// Visits a span's fields, capturing only the ones the phase-span assertions
+/// care about. The count fields arrive as `u64`; `tenant_hash` is a `Display`
+/// value, which `tracing` routes through `record_debug` as the formatted
+/// `format_args!` (its `Debug` renders the hex string with no quotes).
+struct SpanFieldVisitor<'a>(&'a mut CapturedSpan);
+
+impl tracing::field::Visit for SpanFieldVisitor<'_> {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "s3_requests" => self.0.s3_requests = Some(value),
+            "s3_bytes" => self.0.s3_bytes = Some(value),
+            "decompressed_bytes" => self.0.decompressed_bytes = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "tenant_hash" {
+            self.0.tenant_hash = Some(format!("{value:?}"));
+        }
+    }
+}
+
+/// A `tracing` layer that records the name of every span opened while it is the
+/// default subscriber, plus the per-span count fields each phase records, so a
+/// test can assert both which query-path phase spans fired and that their
+/// recorded counts hold plausible values (ADR-0044 decision 5, issue #642).
+///
+/// `names` keeps every span name for exact-name presence assertions (a
+/// substring check would let `catalog_decode` satisfy an assertion for
+/// `decode`). `live` tracks each open span's captured fields by id while it is
+/// recording; on close the entry moves into `completed`, so a later span that
+/// reuses the freed id cannot overwrite a finished span's captured counts. A
+/// quantitative test filters `completed` by span name and `tenant_hash` to
+/// isolate its own query's spans from sibling tests sharing this one global
+/// collector.
+#[derive(Clone, Default)]
+struct SpanCollector {
+    names: Arc<std::sync::Mutex<Vec<String>>>,
+    live: Arc<std::sync::Mutex<HashMap<u64, CapturedSpan>>>,
+    completed: Arc<std::sync::Mutex<Vec<CapturedSpan>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanCollector {
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
+        id: &tracing::span::Id,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if let Ok(mut names) = self.0.lock() {
-            names.push(attrs.metadata().name().to_string());
+        let mut captured = CapturedSpan {
+            name: attrs.metadata().name().to_string(),
+            ..CapturedSpan::default()
+        };
+        attrs.record(&mut SpanFieldVisitor(&mut captured));
+        if let Ok(mut names) = self.names.lock() {
+            names.push(captured.name.clone());
+        }
+        if let Ok(mut live) = self.live.lock() {
+            live.insert(id.into_u64(), captured);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Ok(mut live) = self.live.lock()
+            && let Some(captured) = live.get_mut(&id.into_u64())
+        {
+            values.record(&mut SpanFieldVisitor(captured));
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let taken = self
+            .live
+            .lock()
+            .ok()
+            .and_then(|mut live| live.remove(&id.into_u64()));
+        if let (Some(captured), Ok(mut completed)) = (taken, self.completed.lock()) {
+            completed.push(captured);
         }
     }
 }
 
 /// The collector installed as this test binary's global tracing subscriber.
-static SPAN_COLLECTOR: std::sync::OnceLock<SpanNameCollector> = std::sync::OnceLock::new();
+static SPAN_COLLECTOR: std::sync::OnceLock<SpanCollector> = std::sync::OnceLock::new();
 
 /// Installs a collecting subscriber as the process-global default exactly once
 /// for this test binary, returning its collector.
@@ -295,11 +378,11 @@ static SPAN_COLLECTOR: std::sync::OnceLock<SpanNameCollector> = std::sync::OnceL
 /// neither deterministically once a sibling has run. `set_global_default`
 /// rebuilds the interest cache and the max-level gate against this subscriber,
 /// so the phase spans are enabled regardless of test ordering or parallelism.
-fn install_span_collector() -> SpanNameCollector {
+fn install_span_collector() -> SpanCollector {
     use tracing_subscriber::layer::SubscriberExt;
     SPAN_COLLECTOR
         .get_or_init(|| {
-            let collector = SpanNameCollector::default();
+            let collector = SpanCollector::default();
             let subscriber = tracing_subscriber::registry().with(collector.clone());
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no other global tracing subscriber in this test binary");
@@ -358,7 +441,7 @@ async fn instant_query_emits_all_six_phase_spans() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
 
-    let names = collector.0.lock().expect("span-name lock").clone();
+    let names = collector.names.lock().expect("span-name lock").clone();
     for span_name in [
         "catalog_resolve",
         "segment_open",
@@ -372,6 +455,202 @@ async fn instant_query_emits_all_six_phase_spans() {
             "expected the `{span_name}` phase span to fire on an instant query; captured spans: {names:?}"
         );
     }
+}
+
+/// A store wrapper that sleeps before every `get`, delegating everything else
+/// to the inner store unchanged. Used only by
+/// [`segment_open_span_bytes_are_per_segment_not_the_shared_query_total`] to
+/// widen each segment's GET window so several segments' fetches reliably
+/// overlap. That overlap is what distinguishes the fixed per-span accounting
+/// (each `segment_open` records only its own segment's GET bytes) from the old
+/// shared-`QueryAccounting` delta (which, while one segment's GET is in flight,
+/// folds sibling segments' concurrent GETs into that segment's span).
+struct DelayStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    get_delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for DelayStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        tokio::time::sleep(self.get_delay).await;
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// One tenant, an arbitrary backing store, and a capturing cost recorder. The
+/// `store` seam (over the plain `MemoryStore` of [`one_tenant_app_with_recorder`])
+/// lets a test interpose a [`DelayStore`].
+fn one_tenant_app_with_recorder_and_store(
+    backend: Arc<dyn ObjectStoreBackend>,
+    engine_config: EngineConfig,
+    tenant_id: &TenantId,
+    token: &str,
+    recorder: Arc<CapturingRecorder>,
+) -> Router {
+    let catalog =
+        Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+    let engine = Arc::new(QueryEngine::new(catalog, backend, engine_config));
+    let mut tokens = HashMap::new();
+    tokens.insert(token.to_string(), tenant_id.clone());
+    let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)))
+        .with_cost_recorder(recorder);
+    router(state)
+}
+
+/// ADR-0044 decision 5 (issue #642), the count-value regression F1 was missing:
+/// each `segment_open` span's recorded `s3_bytes` must reflect only that
+/// segment's own GET, not a delta off the shared `QueryAccounting` handle that
+/// concurrent sibling segments also write. The invariant asserted is cheap and
+/// one the buggy delta version violates under concurrency: the sum of every
+/// `segment_open` span's `s3_bytes` cannot exceed the query's own total S3 GET
+/// bytes, because each segment's bytes are counted once. The old delta double-
+/// counted -- while segment A's GET was in flight, segments B/C bumped the
+/// shared counter, so A's "after - before" delta swept in B's and C's bytes,
+/// and summed across all three spans blew well past the true total.
+///
+/// Three segments (not one) and a [`DelayStore`] are both load-bearing: one
+/// segment has no sibling to race, and without the GET delay the in-memory
+/// fetches may not overlap, so neither would distinguish the bug from the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn segment_open_span_bytes_are_per_segment_not_the_shared_query_total() {
+    let collector = install_span_collector();
+
+    let store = Arc::new(MemoryStore::new());
+    // A tenant unique to this test, so its `segment_open` spans can be told
+    // apart from sibling tests' spans in the shared global collector by the
+    // `tenant_hash` field every `segment_open` span carries.
+    let tid = tenant("tenant-segment-open-bytes");
+    let th = tid.hash();
+    let now = now_ns();
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+    // Three separate segments, each one series, all within the instant query's
+    // lookback. The engine opens all three concurrently.
+    for (i, method) in ["get", "post", "put"].iter().enumerate() {
+        let series = vec![series_input(
+            &tid,
+            "http_requests_total",
+            &[("method", method)],
+            &[(now - NS_PER_MIN, 42.0 + i as f64)],
+        )];
+        publish_segment(
+            &store,
+            th,
+            0,
+            Uuid::new_v4(),
+            1,
+            1,
+            1 + i as u64,
+            hour_bucket,
+            now,
+            series,
+        )
+        .await;
+    }
+
+    let recorder = Arc::new(CapturingRecorder::default());
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(DelayStore {
+        inner: store,
+        get_delay: std::time::Duration::from_millis(5),
+    });
+    let app = one_tenant_app_with_recorder_and_store(
+        backend,
+        EngineConfig::default(),
+        &tid,
+        "secret-a",
+        Arc::clone(&recorder),
+    );
+    let query = encode_query_param("http_requests_total");
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK, "query failed: {body}");
+    assert_eq!(vector_results(&body).len(), 3, "three series expected");
+
+    // The query's own authoritative total, from the same accounting handle the
+    // response body and `/metrics` are fed from.
+    let query_total_s3_bytes = {
+        let calls = recorder.calls.lock().expect("recorder mutex");
+        assert_eq!(calls.len(), 1, "exactly one query recorded");
+        calls[0].0.total_s3_bytes()
+    };
+    assert!(query_total_s3_bytes > 0, "the query fetched real bytes");
+
+    // This query's `segment_open` spans, isolated from any sibling test's by
+    // tenant. Read from `completed` so spans closed before this point are
+    // preserved even if their ids were reused.
+    let want_tenant = th.to_hex();
+    let segment_open_bytes: Vec<u64> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "segment_open")
+            .filter(|s| {
+                s.tenant_hash
+                    .as_deref()
+                    .is_some_and(|t| t.contains(&want_tenant))
+            })
+            .map(|s| s.s3_bytes.expect("segment_open must record s3_bytes"))
+            .collect()
+    };
+
+    assert!(
+        segment_open_bytes.len() >= 2,
+        "expected at least two segment_open spans for this query's tenant, got {}: {segment_open_bytes:?}",
+        segment_open_bytes.len()
+    );
+    for bytes in &segment_open_bytes {
+        assert!(
+            *bytes > 0,
+            "each segment_open span records its own non-zero GET bytes; got {segment_open_bytes:?}"
+        );
+    }
+    let sum: u64 = segment_open_bytes.iter().sum();
+    assert!(
+        sum <= query_total_s3_bytes,
+        "sum of per-segment segment_open s3_bytes ({sum}) must not exceed the query's \
+         own total s3 GET bytes ({query_total_s3_bytes}); a value above the total means a \
+         span counted bytes belonging to a concurrent sibling segment (ADR-0044 decision 5)"
+    );
 }
 
 #[tokio::test]
