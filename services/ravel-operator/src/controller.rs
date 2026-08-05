@@ -148,6 +148,65 @@ async fn secret_resource_version(
     Ok(secret.resource_version())
 }
 
+/// Read the `resourceVersion` of every credential Secret the spec references,
+/// keyed by Secret name: the shared `storage.s3.credentialsSecretRef` plus each
+/// per-tier `credentialsSecretRef` override (ADR-0055 section 5).
+///
+/// Each distinct Secret is read once (two tiers pointing at the same override,
+/// or an override equal to the shared credential, collapse to one `get`). A
+/// missing Secret surfaces as [`Error::SecretNotFound`], the same as the shared
+/// credential does, so a typo in an override name is reported rather than
+/// silently ignored. The resulting map feeds each tier's pod-template checksum
+/// in [`crate::reconcile`].
+async fn resolve_credential_resource_versions(
+    client: &Client,
+    namespace: &str,
+    spec: &crate::crd::RavelClusterSpec,
+) -> Result<std::collections::BTreeMap<String, String>, Error> {
+    let mut versions = std::collections::BTreeMap::new();
+    let refs = [
+        (
+            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            "storage.s3.credentialsSecretRef",
+        ),
+        (
+            spec.gateway
+                .credentials_secret_ref
+                .as_ref()
+                .map(|r| r.name.as_str())
+                .unwrap_or(""),
+            "gateway.credentialsSecretRef",
+        ),
+        (
+            spec.query
+                .credentials_secret_ref
+                .as_ref()
+                .map(|r| r.name.as_str())
+                .unwrap_or(""),
+            "query.credentialsSecretRef",
+        ),
+        (
+            spec.maintain
+                .credentials_secret_ref
+                .as_ref()
+                .map(|r| r.name.as_str())
+                .unwrap_or(""),
+            "maintain.credentialsSecretRef",
+        ),
+    ];
+    for (name, field) in refs {
+        // Empty name means the tier has no override; skip. Already-read names
+        // (shared == override, or two identical overrides) are read once.
+        if name.is_empty() || versions.contains_key(name) {
+            continue;
+        }
+        if let Some(rv) = secret_resource_version(client, namespace, name, field).await? {
+            versions.insert(name.to_string(), rv);
+        }
+    }
+    Ok(versions)
+}
+
 /// Map a Secret `get` error: a 404 becomes [`Error::SecretNotFound`] naming the
 /// Secret and the spec field that referenced it; anything else stays a
 /// [`Error::Kube`].
@@ -160,24 +219,6 @@ fn secret_error(err: kube::Error, name: &str, field: &str) -> Error {
     } else {
         Error::Kube(err)
     }
-}
-
-/// A deterministic change-detection checksum over the Secrets the pods depend
-/// on, built from their `resourceVersion`s.
-///
-/// A Secret's `resourceVersion` changes exactly when its content changes and is
-/// stable otherwise, so this value is stable across reconciles that see the
-/// same Secrets (it does not churn pods every reconcile) and changes the moment
-/// a token is rotated or a credential is rewritten. The hash is
-/// `DefaultHasher` (SipHash with fixed keys), which is deterministic across
-/// processes, so an operator restart does not roll pods. It is not a security
-/// boundary, only a signal.
-fn compute_secrets_checksum(token_rv: Option<&str>, credentials_rv: Option<&str>) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    token_rv.unwrap_or("").hash(&mut hasher);
-    credentials_rv.unwrap_or("").hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 /// Server-side-apply a typed object. The object's `apiVersion`/`kind` are set
@@ -258,22 +299,20 @@ async fn reconcile_inner(
         obj.spec.tenant_tokens_secret_ref.as_ref(),
     )
     .await?;
-    // The credentials Secret is always referenced; read its resourceVersion so
-    // a credential rotation also rolls pods via the checksum.
-    let credentials_rv = secret_resource_version(
-        client,
-        namespace,
-        &obj.spec.storage.s3.credentials_secret_ref.name,
-        "storage.s3.credentialsSecretRef",
-    )
-    .await?;
-    let secrets_checksum = compute_secrets_checksum(
-        token_secret.resource_version.as_deref(),
-        credentials_rv.as_deref(),
-    );
+    // Read the resourceVersion of every credential Secret the spec references:
+    // the shared storage.s3 credential plus any per-tier override (ADR-0055
+    // section 5). Each Deployment's pod-template checksum is later computed (in
+    // reconcile) from the one Secret its tier resolves to, so a per-role
+    // credential rotation rolls only the Deployment(s) that consume it. The
+    // shared credential is always referenced (some tier falls back to it unless
+    // all three override); reading it always keeps the no-override path
+    // identical to before.
+    let credential_resource_versions =
+        resolve_credential_resource_versions(client, namespace, &obj.spec).await?;
     let render_ctx = RenderCtx {
         tenant_names: token_secret.tenant_names,
-        secrets_checksum,
+        token_resource_version: token_secret.resource_version,
+        credential_resource_versions,
     };
 
     let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
@@ -552,32 +591,6 @@ pub async fn run() -> Result<(), Error> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn secrets_checksum_changes_with_content_and_is_otherwise_stable() {
-        // Stable across reconciles seeing the same resourceVersions: no pod
-        // churn when nothing changed.
-        let a = compute_secrets_checksum(Some("100"), Some("200"));
-        let a_again = compute_secrets_checksum(Some("100"), Some("200"));
-        assert_eq!(a, a_again, "same inputs must yield the same checksum");
-
-        // A token Secret content change (its resourceVersion bumps) changes the
-        // checksum, so pods roll.
-        let token_rotated = compute_secrets_checksum(Some("101"), Some("200"));
-        assert_ne!(a, token_rotated, "token rotation must change the checksum");
-
-        // A credentials Secret content change likewise.
-        let creds_rotated = compute_secrets_checksum(Some("100"), Some("201"));
-        assert_ne!(
-            a, creds_rotated,
-            "credential change must change the checksum"
-        );
-
-        // Absent token Secret is a distinct, stable value.
-        let none = compute_secrets_checksum(None, Some("200"));
-        assert_eq!(none, compute_secrets_checksum(None, Some("200")));
-        assert_ne!(none, a);
-    }
 
     #[test]
     fn rfc3339_formats_known_instants() {

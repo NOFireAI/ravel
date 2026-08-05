@@ -31,6 +31,20 @@
                     },
                     "description": "Gateway (ingest + query API) tier.",
                     "properties": {
+                      "credentialsSecretRef": {
+                        "description": "Per-role S3 credential override for the gateway tier (ADR-0055 section 5).\nWhen set, the gateway Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the gateway to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.",
+                        "nullable": true,
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      },
                       "fold": {
                         "description": "Catalog fold tuning. Fold is a pure query-cost optimization and only\nruns in the gateway tier, so it is a gateway-only field.",
                         "nullable": true,
@@ -98,6 +112,20 @@
                     },
                     "description": "Background maintenance tier (compaction, retention, GC). Single replica,\n`Recreate` strategy, no replica field (ADR-0034 decision 3).",
                     "properties": {
+                      "credentialsSecretRef": {
+                        "description": "Per-role S3 credential override for the maintain tier (ADR-0055 section 5).\nWhen set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.\nMaintain is the only role ADR-0055 grants delete, so this is where an\noperator points the delete-capable credential. Falls back to the shared\ncredential when unset, so existing single-credential clusters are\nunaffected.",
+                        "nullable": true,
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      },
                       "enabled": {
                         "default": true,
                         "description": "Whether the maintain Deployment exists at all. Defaults to true.",
@@ -142,6 +170,20 @@
                     },
                     "description": "Query tier.",
                     "properties": {
+                      "credentialsSecretRef": {
+                        "description": "Per-role S3 credential override for the query tier (ADR-0055 section 5).\nWhen set, the query Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the query tier to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.",
+                        "nullable": true,
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      },
                       "replicas": {
                         "default": 1,
                         "description": "Replica count for the query Deployment.",

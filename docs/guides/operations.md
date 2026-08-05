@@ -420,6 +420,452 @@ a real bucket, region, and credentials:
 Ravel does not use the AWS credential chain (profiles, instance roles,
 `AWS_ACCESS_KEY_ID`). It reads only the `RAVEL_S3_*` flags/env above.
 
+The examples above use one credential for everything, which is the simplest
+deployment and still fully supported. It is not the only option. Each Ravel
+process only ever touches the subset of the bucket its role needs, so you can
+hand each process a distinct, narrower S3 credential instead of one
+bucket-wide key. The `RAVEL_S3_*` contract does not change: every process
+still reads exactly one access-key/secret pair; you just provision a
+different, tighter pair per role. See "Storage credential roles" immediately
+below for the four roles and their exact IAM/MinIO policies.
+
+## Storage credential roles (ADR-0055)
+
+Every Ravel process holds one S3 credential and uses it for every object-store
+call it makes. With a single bucket-wide credential, a leak from any one
+process can read, overwrite, or delete anything in the bucket. ADR-0055 scopes
+credentials to the process roles the system already has, so a leaked credential
+can only do what that one role legitimately does, and only Maintain can delete
+anything at all.
+
+This is enforced entirely at the storage backend's own IAM/bucket-policy layer
+(AWS IAM, or MinIO policies for dev/CI). Ravel's code is unchanged: there is no
+in-process authorization check, no new service, and no change to the
+`RAVEL_S3_*` flag contract. You provision a narrower credential per role the
+same way you already provision the bucket, and attach the policies below.
+
+### The four roles
+
+| Role | Process / `--mode` | Deployment | What it does |
+|---|---|---|---|
+| **Gateway** | `--mode gateway` (and the gateway half of `--mode all`) | `<name>-gateway` | Serves OTLP ingest: writes L0 segments and their L0 commit records, idempotency markers, and the tenant's provisioning record on adopt. Also runs the catalog fold task, so it writes catalog snapshot parts, `HEAD`, and name-postings index objects. |
+| **Query** | `--mode query` (and the query half of `--mode all`) | `<name>-query` | Serves `/api/v1/*` reads: lists and reads commit records and catalog objects. Also runs fold (same catalog writes as Gateway) and appends query-audit records. |
+| **Maintain** | `--mode maintain` | `<name>-maintain` | Runs the background maintenance loop: compaction (writes L1 parts and compaction records), retention (writes tombstones), and the sweeper. **The only role that may delete anything**, and only under `l0/`, `l1/`, `c/`, `idem/`. |
+| **Admin** | `ravel-cli` subcommands | none (out of band) | One-off bootstrap and mutation commands (`store qualify`, `gc-config set`, `provision adopt`/`reshard`, `hold set`/`clear`). Invoked by an operator or CI job, never a long-running server. It is the broadest of the four credentials and is **not** managed by the Kubernetes operator; see "The Admin credential" below. |
+
+Gateway and Query both run the catalog fold task (`fold::spawn` runs in every
+mode except Maintain), which is why both hold the same catalog write grants,
+not just Query. This is not a bug in the split; it matches what the shipped
+topology actually does.
+
+### Object-key layout these policies reference
+
+The policies below map the ADR's per-role grants onto the actual object-key
+layout (docs/catalog-and-mvcc.md). All tenant data lives under
+`t/<tenant_hash>/`; a single bucket holds every tenant, so the policies use
+`t/*` to span all tenants. `<sig>` is the one-letter signal segment (`m`
+metrics, `l` logs, `s` spans). Control objects live at the bucket root under
+`sys/`.
+
+| ADR shorthand | Actual key prefix | Wildcard used below |
+|---|---|---|
+| `l0/` | `t/<hash>/<sig>/l0/…` | `t/*/*/l0/*` |
+| `c/` (commit / compaction / tombstone) | `t/<hash>/<sig>/c/…` | `t/*/*/c/*` |
+| `l1/` | `t/<hash>/<sig>/l1/…` | `t/*/*/l1/*` |
+| `idem/` | `t/<hash>/<sig>/idem/…` | `t/*/*/idem/*` |
+| `maint/<shard>/cursor` | `t/<hash>/<sig>/maint/…` | `t/*/*/maint/*` |
+| `prov` | `t/<hash>/<sig>/prov` | `t/*/*/prov` |
+| `catalog/<sig>/…` | `t/<hash>/catalog/<sig>/…` | `t/*/catalog/*/*` |
+| audit prefix (`u/…`) | `t/<hash>/u/…` | `t/*/u/*` |
+| `sys/tenancy`, `sys/qualification`, `sys/gc` | bucket root | as written |
+
+The `c/` commit prefix (`t/<hash>/<sig>/c/…`) and the catalog prefix
+(`t/<hash>/catalog/<sig>/…`) are distinct paths: no wildcard for one matches
+the other, so Maintain's delete grant on `c/` never reaches catalog objects.
+
+`CreateIfAbsent`, `CasVersion`, and plain `Put` are all `s3:PutObject` at the
+IAM layer; the difference between them is a request precondition header
+(`If-None-Match`, a version id), not a separate IAM action. So a role's write
+grant is a `PutObject` allow on its write prefixes; the create-only / CAS
+semantics are enforced by Ravel's own request, not by the policy. The one
+place this matters: Gateway writes only L0 commit records under `c/` (never
+compaction records), but both are `.cmt` objects under the same `c/` prefix,
+so the policy grants `PutObject` on `c/` as a whole and the L0-only restriction
+is a code invariant, not an IAM one.
+
+### AWS IAM policies
+
+One policy per role. Replace `my-ravel-bucket` with your bucket. Attach each to
+the IAM principal (user or role) whose access key you put in that role's
+Kubernetes Secret. Every policy — including Gateway's, Query's, and Admin's,
+which have no delete grant at all — carries the same explicit `Deny` on
+`s3:DeleteObject`/`s3:DeleteObjectVersion` over the six protected prefixes
+(ADR-0055 section 3). An explicit `Deny` overrides any `Allow`, so this makes
+those prefixes undeletable even by a role that otherwise has delete rights
+(Maintain).
+
+**Gateway:**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GatewayList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-ravel-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["t/*/*/l0/*", "t/*/*/c/*", "t/*/catalog/*/*"]
+        }
+      }
+    },
+    {
+      "Sid": "GatewayRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc"
+      ]
+    },
+    {
+      "Sid": "GatewayWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy"
+      ]
+    },
+    {
+      "Sid": "DenyDeleteProtected",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+      ]
+    }
+  ]
+}
+```
+
+`GatewayRead` includes `t/*/catalog/*/*`: fold runs in Gateway mode as well
+as Query mode (it is not a query-only responsibility, ADR-0055 section 1),
+and folding incrementally means reading the prior HEAD, snapshot parts, and
+name postings before writing the next ones — not only writing new output.
+
+**Query:**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "QueryList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-ravel-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["t/*/*/c/*", "t/*/catalog/*/*"]
+        }
+      }
+    },
+    {
+      "Sid": "QueryRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc"
+      ]
+    },
+    {
+      "Sid": "QueryWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy"
+      ]
+    },
+    {
+      "Sid": "DenyDeleteProtected",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+      ]
+    }
+  ]
+}
+```
+
+`QueryRead` includes `t/*/*/l0/*` and `t/*/*/l1/*`: the query fetchers GET
+segment data directly (footer-first ranged reads) once Phase 1 resolve has
+found the relevant commit records under `c/*` — `c/*` alone names the
+records, it is not the data those records point at.
+
+**Maintain:**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MaintainList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-ravel-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["t/*/*/l0/*", "t/*/*/c/*", "t/*/*/l1/*", "t/*/*/idem/*"]
+        }
+      }
+    },
+    {
+      "Sid": "MaintainRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/maint/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc"
+      ]
+    },
+    {
+      "Sid": "MaintainWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/maint/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy"
+      ]
+    },
+    {
+      "Sid": "MaintainDelete",
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*"
+      ]
+    },
+    {
+      "Sid": "DenyDeleteProtected",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+      ]
+    }
+  ]
+}
+```
+
+Maintain's `MaintainDelete` grants delete on `l0/`, `l1/`, `c/`, `idem/` — the
+same four prefixes Ravel's own sweep and retention code deletes from today.
+The `DenyDeleteProtected` block still applies to Maintain: its `c/` delete
+grant covers commit records, compaction records, and tombstones
+(`t/<hash>/<sig>/c/…`), but the catalog objects at `t/<hash>/catalog/<sig>/…`
+are a different path the `Deny` protects, so Maintain cannot delete them.
+`MaintainRead` includes `t/*/*/l1/*` (the lost-CAS-race convergence path
+HEADs a compacted part to re-verify it exists before retrying a publish) and
+`t/*/*/maint/*` (the advisory scan cursor is read before its own CAS
+mutation).
+
+**Admin (`ravel-cli`):**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AdminList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-ravel-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["t/*", "sys/*"]
+        }
+      }
+    },
+    {
+      "Sid": "AdminRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/*"
+      ]
+    },
+    {
+      "Sid": "AdminWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualify/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+      ]
+    },
+    {
+      "Sid": "DenyDeleteProtected",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+      ]
+    }
+  ]
+}
+```
+
+Admin reads everything (broad `GetObject` on `t/*` and `sys/*`, including the
+single-key `idem/` inspect) and writes only the control objects its commands
+mutate. It has no delete grant: delete stays exclusively Maintain's.
+`AdminWrite` includes `sys/qualify/*`: `ravel-cli store qualify` writes
+transient scratch objects under `sys/qualify/<run-id>/` while running its
+conformance suite, not only the final `sys/qualification` record. Since
+Admin's policy grants no delete anywhere, that scratch is never cleaned up
+by the credential itself — it is bounded (one run's worth of small objects
+per `store qualify` invocation) and harmless to leave, but an operator who
+runs `store qualify` repeatedly against the same bucket will see it
+accumulate.
+
+### MinIO policies (dev / CI)
+
+MinIO's policy language **is** the AWS IAM JSON above, verbatim: same `Action`
+names (`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`),
+same `arn:aws:s3:::<bucket>/<prefix>` resources, same explicit `Deny`
+semantics. To apply the four roles to a MinIO deployment, save each policy
+document above to a file and load it with `mc`:
+
+```sh
+# one policy document per role, saved from the JSON above
+mc admin policy create myminio ravel-gateway  gateway-policy.json
+mc admin policy create myminio ravel-query    query-policy.json
+mc admin policy create myminio ravel-maintain maintain-policy.json
+mc admin policy create myminio ravel-admin    admin-policy.json
+
+# one MinIO user per role, each attached to its policy
+mc admin user add myminio gateway-key  gateway-secret
+mc admin policy attach myminio ravel-gateway --user gateway-key
+# ...repeat for query, maintain, admin
+```
+
+`scripts/kind-up.sh` already provisions a MinIO backend for the local kind
+environment (`RAVEL_FAKE_S3_BACKEND=minio`), but it uses a single shared
+credential across all pods for development convenience. That is fine for dev
+and CI: the per-role split is a production hardening, and nothing in the dev
+environment needs it. The policies above are how you would apply the same
+four-role model against a MinIO-backed staging or production deployment; do not
+modify `kind-up.sh` to adopt them for local development.
+
+### First deployment against a fresh bucket
+
+Two control objects are written by whichever process boots first against an
+empty bucket, so their write grants are slightly broader than the strict
+per-role tables imply (ADR-0055 section 4). You need to know this before your
+first deployment against a fresh bucket:
+
+- **`sys/tenancy`** is created (`CreateIfAbsent`) by whichever of the three
+  server roles reaches a fresh bucket first — that is why Gateway, Query, and
+  Maintain all carry a `PutObject` grant on `sys/tenancy`, not just Admin. This
+  does not weaken the delete-deny boundary: `CreateIfAbsent` cannot overwrite
+  or delete an existing object, and `sys/tenancy` is in the `Deny`-delete set
+  for every role. The effect is only that a fresh operator-managed cluster
+  boots without requiring you to run a manual `ravel-cli` bootstrap step first.
+- **`sys/gc`** is bootstrapped (`CreateIfAbsent`) by Maintain on a fresh bucket
+  — hence Maintain's `PutObject` grant on `sys/gc`. The *mutation* path that
+  changes an existing `sys/gc` (`ravel-cli gc-config set`, a `CasVersion`
+  overwrite) is Admin-only, matching that it is already an explicit
+  CLI-operator action, not something any server does on its own.
+
+`sys/qualification` gets no such exception. It is written exactly once, by
+Admin's `ravel-cli store qualify` run, which a fresh production deployment must
+run before any server can start (see "Store qualification" below). No server
+role writes it, and no server-role policy grants `PutObject` on it.
+
+### The Admin credential
+
+`ravel-cli` uses the Admin role, and unlike the three server roles it is **not**
+provisioned by the Kubernetes operator. There is no `RavelCluster` field for
+it, and no pod runs it. It is the broadest of the four credentials — it can
+read every prefix and write every control object — so treat it as a privileged
+operator credential, not a service credential:
+
+- Store it wherever your operators or CI jobs get their `RAVEL_S3_*` values for
+  running `ravel-cli` (a CI secret store, an operator's short-lived session),
+  never in a long-running Deployment or a Secret the operator mounts into a
+  server pod.
+- It is used only by out-of-band operator/CI invocations: `store qualify`,
+  `gc-config set`, `provision adopt`/`reshard`, legal holds, and the read-only
+  inspection subcommands. No continuously-running process should ever hold it.
+- Even the Admin credential cannot delete any of the six protected prefixes
+  (its policy carries the same `DenyDeleteProtected` block), and it cannot
+  delete anything else either — it has no delete grant at all. A leaked Admin
+  key can forge or overwrite control objects within its write grant, but it
+  cannot make existing data disappear.
+
 ## Store qualification (ADR-0050 section 6)
 
 Ravel's commit protocol and catalog assume the backing store honors conditional
