@@ -89,6 +89,7 @@ pub(super) async fn statement_stream(
     ticket: FlightTicket,
     config: &FlightSqlConfig,
     recorder: Arc<dyn QueryCostRecorder>,
+    span: tracing::Span,
 ) -> Result<DoGetStream, Status> {
     // Re-run the security gate on redemption. The statement is carried in
     // bytes a client holds, and the gate is cheap; running it again means a
@@ -138,6 +139,7 @@ pub(super) async fn statement_stream(
         recorder,
         accounting,
         tenant,
+        span,
     };
 
     // Post-emission rule: any vanished segment from here on is terminal.
@@ -191,12 +193,25 @@ struct RecordOnStreamEnd {
     recorder: Arc<dyn QueryCostRecorder>,
     accounting: QueryAccounting,
     tenant: TenantHash,
+    /// The request-level `flight_sql_statement` span (crate::flight::service).
+    /// The query's final store totals are recorded on it here, from the same
+    /// snapshot folded into `/metrics`, so the span and the scrape agree.
+    span: tracing::Span,
 }
 
 impl Drop for RecordOnStreamEnd {
     fn drop(&mut self) {
+        let snapshot = self.accounting.snapshot();
+        // Record the query's final store totals on the request-level span
+        // (ADR-0044 section 5). These are the only two count fields the span's
+        // closed allowlist permits, and they are taken from the same snapshot
+        // the aggregator fold below uses so the span and `/metrics` never
+        // disagree for one query.
+        self.span
+            .record("s3_requests", snapshot.total_s3_requests());
+        self.span.record("s3_bytes", snapshot.total_s3_bytes());
         self.recorder.record(
-            &self.accounting.snapshot(),
+            &snapshot,
             &CostEstimate::new(0, 0, 0, 0, 0),
             self.tenant,
             QueryWorkloadClass::Interactive,
