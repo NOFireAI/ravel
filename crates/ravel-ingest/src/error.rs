@@ -47,6 +47,13 @@ pub enum WriteError {
     /// identical input reproduces the same mismatch.
     #[error("series value-kind mismatch: {0}")]
     SeriesValueKindMismatch(String),
+    /// The router's cached provisioning-record view for this tenant is older
+    /// than the refresh interval `C`, so it fails the flush closed rather than
+    /// route on a view that could have missed a shard-generation activation
+    /// (ADR-0052 section 3). Retryable: once the background refresher re-reads
+    /// the record, the tenant's next write routes on a current view.
+    #[error("provisioning view stale: refusing to route on a view older than the refresh interval")]
+    StaleProvisioningView,
 }
 
 impl WriteError {
@@ -56,7 +63,10 @@ impl WriteError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            WriteError::ShardUnavailable | WriteError::AckTimeout | WriteError::Abandoned(_)
+            WriteError::ShardUnavailable
+                | WriteError::AckTimeout
+                | WriteError::Abandoned(_)
+                | WriteError::StaleProvisioningView
         )
     }
 }

@@ -10,12 +10,12 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::NormalizedPoint;
 use ravel_types::{CommitToken, Signal, TenantId, shard_for};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::error::WriteError;
+use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::metrics::IngestMetrics;
 use crate::shard::{ShardActor, ShardMsg};
 use crate::value::{IngestExemplar, IngestPoint};
@@ -38,7 +38,6 @@ pub struct WriteReceipt {
 
 struct ShardHandle {
     tx: mpsc::Sender<ShardMsg>,
-    task: JoinHandle<()>,
     /// Set once the router first observes this shard's channel closed (send
     /// half or a strict-mode ack failing because the actor task is gone).
     /// The actor is never restarted, so this only ever flips false to true;
@@ -46,14 +45,19 @@ struct ShardHandle {
     dead: AtomicBool,
 }
 
-/// Owns `shard_count` shard actor tasks and routes writes to them by
-/// `shard_for(series_id, shard_count)`.
+/// Routes writes to generation-versioned shard-actor sets (ADR-0052).
 ///
-/// Exactly one `tokio::spawn` per shard happens here, in `new`; no code path
-/// spawns a task per message or per point, so task count is fixed at
-/// construction and independent of write volume.
+/// The generation-0 set of `config.shard_count` shard actors is spawned once at
+/// construction; a reshard's activation spawns the new generation's set lazily
+/// through the [`GenerationSwitch`] factory and routes subsequent writes to it,
+/// while the old set keeps draining. Task count is bounded by the sum of live
+/// generations' shard counts, not by write volume: no path spawns a task per
+/// message or per point.
 pub struct IngestRouter {
-    shards: Vec<ShardHandle>,
+    switch: GenerationSwitch<ShardHandle>,
+    store: Arc<dyn ObjectStoreBackend>,
+    signal: Signal,
+    clock: Arc<dyn Clock>,
     metrics: Arc<IngestMetrics>,
     config: IngestConfig,
 }
@@ -66,34 +70,47 @@ impl IngestRouter {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let metrics = Arc::new(IngestMetrics::default());
-        let writer_id = Uuid::new_v4();
-        let epoch = u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
-
-        let shards = (0..config.shard_count)
-            .map(|shard| {
-                let (tx, rx) = mpsc::channel(config.channel_depth);
-                let actor = ShardActor::new(
-                    shard,
-                    signal,
-                    writer_id,
-                    epoch,
-                    Arc::clone(&store),
-                    Arc::clone(&clock),
-                    config,
-                    Arc::clone(&metrics),
-                    rx,
-                );
-                let task = tokio::spawn(actor.run());
-                ShardHandle {
-                    tx,
-                    task,
-                    dead: AtomicBool::new(false),
-                }
-            })
-            .collect();
+        // Each generation's shard-actor set gets a fresh writer identity, so
+        // two sets never collide on a commit key for the same shard index.
+        let factory = {
+            let store = Arc::clone(&store);
+            let clock = Arc::clone(&clock);
+            let metrics = Arc::clone(&metrics);
+            move |shard_count: u32| -> Vec<ShardHandle> {
+                let writer_id = Uuid::new_v4();
+                let epoch =
+                    u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+                (0..shard_count)
+                    .map(|shard| {
+                        let (tx, rx) = mpsc::channel(config.channel_depth);
+                        let actor = ShardActor::new(
+                            shard,
+                            signal,
+                            writer_id,
+                            epoch,
+                            Arc::clone(&store),
+                            Arc::clone(&clock),
+                            config,
+                            Arc::clone(&metrics),
+                            rx,
+                        );
+                        tokio::spawn(actor.run());
+                        ShardHandle {
+                            tx,
+                            dead: AtomicBool::new(false),
+                        }
+                    })
+                    .collect()
+            }
+        };
+        let switch =
+            GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory);
 
         IngestRouter {
-            shards,
+            switch,
+            store,
+            signal,
+            clock,
             metrics,
             config,
         }
@@ -101,6 +118,49 @@ impl IngestRouter {
 
     pub fn metrics(&self) -> &IngestMetrics {
         &self.metrics
+    }
+
+    /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
+    /// re-reading the provisioning record when the cached view is older than the
+    /// refresh interval `C` (ADR-0052 section 3). Fails closed on an
+    /// unreadable/untrusted record rather than routing on a stale view.
+    async fn active_set(
+        &self,
+        tenant: ravel_types::TenantHash,
+        now_ns: i64,
+    ) -> Result<Arc<Vec<ShardHandle>>, WriteError> {
+        match self.switch.route_cached(tenant, now_ns) {
+            Routed::Fresh(set) => Ok(set),
+            Routed::Stale => {
+                match load_generations(
+                    self.store.as_ref(),
+                    self.signal,
+                    &tenant,
+                    self.switch.default_count(),
+                )
+                .await
+                {
+                    Ok(generations) => Ok(self.switch.refresh(tenant, generations, now_ns)),
+                    Err(_) => {
+                        self.metrics.record_stale_provisioning_flush();
+                        Err(WriteError::StaleProvisioningView)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update a tenant's cached shard-generation view (ADR-0052 section 2). The
+    /// server's background refresher calls this on interval `C` with the
+    /// tenant's decoded provisioning history so an activation is observed before
+    /// it takes effect and the staleness guard stays satisfied.
+    pub fn refresh_generations(
+        &self,
+        tenant: ravel_types::TenantHash,
+        generations: Vec<ravel_catalog::ShardGeneration>,
+        now_ns: i64,
+    ) {
+        self.switch.refresh(tenant, generations, now_ns);
     }
 
     pub fn shard_count(&self) -> u32 {
@@ -171,7 +231,16 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<WriteReceipt, WriteError> {
-        let shard_count = self.config.shard_count;
+        // An empty write never routes and never fails: nothing to flush, so a
+        // stale provisioning view is irrelevant to it.
+        if points.is_empty() && exemplars.is_empty() {
+            return Ok(WriteReceipt::default());
+        }
+        // Route this write against the tenant's current generation view,
+        // re-reading the provisioning record when the cache is older than `C`
+        // and failing closed if that read cannot complete (ADR-0052 section 3).
+        let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<IngestPoint>> = HashMap::new();
         for point in points {
             let shard = shard_for(&point.series_id, shard_count);
@@ -186,10 +255,6 @@ impl IngestRouter {
             let shard = shard_for(&exemplar.series_id, shard_count);
             exemplars_by_shard.entry(shard).or_default().push(exemplar);
         }
-        if by_shard.is_empty() && exemplars_by_shard.is_empty() {
-            return Ok(WriteReceipt::default());
-        }
-
         let mut shard_ids: Vec<u32> = by_shard
             .keys()
             .chain(exemplars_by_shard.keys())
@@ -228,12 +293,12 @@ impl IngestRouter {
                 exemplars: exemplars_by_shard.remove(&shard).unwrap_or_default(),
                 ack,
             };
-            if self.shards[shard as usize].tx.send(msg).await.is_err() {
+            if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver
                 // while alive), so this shard is dead. Count it once and
                 // surface the typed error rather than acking as if the points
                 // landed (a8-F03).
-                self.mark_shard_dead(shard);
+                self.mark_shard_dead(&set[shard as usize]);
                 return Err(WriteError::ShardUnavailable);
             }
         }
@@ -254,7 +319,7 @@ impl IngestRouter {
             let inner = match result {
                 Ok(inner) => inner,
                 Err(_) => {
-                    self.mark_shard_dead(shard);
+                    self.mark_shard_dead(&set[shard as usize]);
                     return Err(WriteError::ShardUnavailable);
                 }
             };
@@ -266,11 +331,8 @@ impl IngestRouter {
     /// Records the first observation of a shard actor's death, deduped so a
     /// permanently dead shard is counted once no matter how many later writes
     /// route to it (docs/ingest.md "Metrics (self-observability)", a8-F03).
-    fn mark_shard_dead(&self, shard: u32) {
-        if !self.shards[shard as usize]
-            .dead
-            .swap(true, Ordering::Relaxed)
-        {
+    fn mark_shard_dead(&self, handle: &ShardHandle) {
+        if !handle.dead.swap(true, Ordering::Relaxed) {
             self.metrics.record_shard_death();
         }
     }
@@ -279,11 +341,14 @@ impl IngestRouter {
     /// graceful shutdown paths that need durability without waiting on
     /// `max_flush_delay`.
     pub async fn flush_all(&self) {
-        let mut dones = Vec::with_capacity(self.shards.len());
-        for shard in &self.shards {
-            let (tx, rx) = oneshot::channel();
-            if shard.tx.send(ShardMsg::FlushNow { done: tx }).await.is_ok() {
-                dones.push(rx);
+        let sets = self.switch.all_sets();
+        let mut dones = Vec::new();
+        for set in &sets {
+            for shard in set.iter() {
+                let (tx, rx) = oneshot::channel();
+                if shard.tx.send(ShardMsg::FlushNow { done: tx }).await.is_ok() {
+                    dones.push(rx);
+                }
             }
         }
         for rx in dones {
@@ -291,20 +356,23 @@ impl IngestRouter {
         }
     }
 
-    /// Flushes every shard's buffered tenants, then stops and joins every
-    /// shard actor task.
+    /// Flushes every live generation's shard actors, across all generations, so
+    /// a retiring generation's buffers drain too (ADR-0052 section 2). The actor
+    /// tasks end on their own once their channels close after the drain; the
+    /// `done` acknowledgement fires after the flush, so durability holds without
+    /// joining the detached tasks.
     pub async fn shutdown(self) {
-        let mut dones = Vec::with_capacity(self.shards.len());
-        for shard in &self.shards {
-            let (tx, rx) = oneshot::channel();
-            let _ = shard.tx.send(ShardMsg::Shutdown { done: tx }).await;
-            dones.push(rx);
+        let sets = self.switch.all_sets();
+        let mut dones = Vec::new();
+        for set in &sets {
+            for shard in set.iter() {
+                let (tx, rx) = oneshot::channel();
+                let _ = shard.tx.send(ShardMsg::Shutdown { done: tx }).await;
+                dones.push(rx);
+            }
         }
         for rx in dones {
             let _ = rx.await;
-        }
-        for shard in self.shards {
-            let _ = shard.task.await;
         }
     }
 }

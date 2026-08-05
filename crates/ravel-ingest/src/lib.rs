@@ -9,6 +9,7 @@ mod admission;
 mod clock;
 mod config;
 mod error;
+mod generation;
 mod idempotency;
 mod log_error;
 mod log_metrics;
@@ -32,6 +33,7 @@ pub use config::{
     IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
 };
 pub use error::WriteError;
+pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed};
 pub use idempotency::{
     IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, IdempotencyReceipt, LookupOutcome, MARKER_SUFFIX,
     MarkerError, MarkerWriteError, WriteOutcome, decode_marker, keyhash32, marker_key, read_marker,

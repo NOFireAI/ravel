@@ -39,6 +39,12 @@ pub enum LogWriteError {
     /// same collision.
     #[error("stream id collision: {0}")]
     StreamIdCollision(String),
+    /// The router's cached provisioning-record view for this tenant is older
+    /// than the refresh interval `C`, so it fails the flush closed rather than
+    /// route on a view that could have missed a shard-generation activation
+    /// (ADR-0052 section 3). Retryable once the background refresher re-reads.
+    #[error("provisioning view stale: refusing to route on a view older than the refresh interval")]
+    StaleProvisioningView,
 }
 
 impl LogWriteError {
@@ -51,6 +57,7 @@ impl LogWriteError {
             LogWriteError::ShardUnavailable
                 | LogWriteError::AckTimeout
                 | LogWriteError::Abandoned(_)
+                | LogWriteError::StaleProvisioningView
         )
     }
 }

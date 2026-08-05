@@ -64,6 +64,9 @@ pub struct SpanIngestMetrics {
     /// Distinct span shard actors observed dead by the router. Counted once
     /// per shard on the first observation, so it never exceeds `shard_count`.
     shard_deaths: AtomicU64,
+    /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
+    /// the span-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
+    stale_provisioning_flushes: AtomicU64,
 }
 
 /// Point-in-time copy of [`SpanIngestMetrics`] for scraping. See the
@@ -81,6 +84,7 @@ pub struct SpanIngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub shard_deaths: u64,
+    pub stale_provisioning_flushes: u64,
 }
 
 impl SpanIngestMetrics {
@@ -128,6 +132,11 @@ impl SpanIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_stale_provisioning_flush(&self) {
+        self.stale_provisioning_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> SpanIngestMetricsSnapshot {
         SpanIngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -141,6 +150,7 @@ impl SpanIngestMetrics {
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
         }
     }
 }

@@ -1480,6 +1480,7 @@ mod tests {
             signal: sysproto::Signal::Metrics as i32,
             shard_count,
             created_unix_ns: 1,
+            generations: Vec::new(),
         };
         store
             .put(

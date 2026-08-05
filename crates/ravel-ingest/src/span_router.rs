@@ -16,11 +16,11 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_types::CommitToken;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::IngestConfig;
+use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::router::WriteMode;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
@@ -75,21 +75,21 @@ pub struct SpanWriteReceipt {
 /// `pub(crate)` across an unrelated boundary for one shared shape.
 struct SpanShardHandle {
     tx: mpsc::Sender<SpanShardMsg>,
-    task: JoinHandle<()>,
     /// Set once the router first observes this shard's channel closed. The
     /// actor is never restarted, so this only flips false to true; it dedups
     /// the `shard_deaths` counter to one increment per shard.
     dead: AtomicBool,
 }
 
-/// Owns `shard_count` span shard actor tasks and routes writes to them by
-/// [`shard_for_span`].
-///
-/// Exactly one `tokio::spawn` per shard happens here, in [`Self::new`]; no code
-/// path spawns a task per message or per span, so task count is fixed at
-/// construction and independent of write volume.
+/// Routes span writes to generation-versioned shard-actor sets (ADR-0052), the
+/// span-pipeline counterpart of [`crate::router::IngestRouter`]. The
+/// generation-0 set is spawned at construction; a reshard's activation spawns
+/// the new set lazily via the [`GenerationSwitch`] factory while the old set
+/// drains.
 pub struct SpanIngestRouter {
-    shards: Vec<SpanShardHandle>,
+    switch: GenerationSwitch<SpanShardHandle>,
+    store: Arc<dyn ObjectStoreBackend>,
+    clock: Arc<dyn Clock>,
     metrics: Arc<SpanIngestMetrics>,
     config: IngestConfig,
 }
@@ -101,33 +101,43 @@ impl SpanIngestRouter {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let metrics = Arc::new(SpanIngestMetrics::default());
-        let writer_id = Uuid::new_v4();
-        let epoch = u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
-
-        let shards = (0..config.shard_count)
-            .map(|shard| {
-                let (tx, rx) = mpsc::channel(config.channel_depth);
-                let actor = SpanShardActor::new(
-                    shard,
-                    writer_id,
-                    epoch,
-                    Arc::clone(&store),
-                    Arc::clone(&clock),
-                    config,
-                    Arc::clone(&metrics),
-                    rx,
-                );
-                let task = tokio::spawn(actor.run());
-                SpanShardHandle {
-                    tx,
-                    task,
-                    dead: AtomicBool::new(false),
-                }
-            })
-            .collect();
+        let factory = {
+            let store = Arc::clone(&store);
+            let clock = Arc::clone(&clock);
+            let metrics = Arc::clone(&metrics);
+            move |shard_count: u32| -> Vec<SpanShardHandle> {
+                let writer_id = Uuid::new_v4();
+                let epoch =
+                    u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+                (0..shard_count)
+                    .map(|shard| {
+                        let (tx, rx) = mpsc::channel(config.channel_depth);
+                        let actor = SpanShardActor::new(
+                            shard,
+                            writer_id,
+                            epoch,
+                            Arc::clone(&store),
+                            Arc::clone(&clock),
+                            config,
+                            Arc::clone(&metrics),
+                            rx,
+                        );
+                        tokio::spawn(actor.run());
+                        SpanShardHandle {
+                            tx,
+                            dead: AtomicBool::new(false),
+                        }
+                    })
+                    .collect()
+            }
+        };
+        let switch =
+            GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory);
 
         SpanIngestRouter {
-            shards,
+            switch,
+            store,
+            clock,
             metrics,
             config,
         }
@@ -135,6 +145,46 @@ impl SpanIngestRouter {
 
     pub fn metrics(&self) -> &SpanIngestMetrics {
         &self.metrics
+    }
+
+    /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
+    /// re-reading the provisioning record when the cached view is older than the
+    /// refresh interval `C` (ADR-0052 section 3). Fails closed on an
+    /// unreadable/untrusted record rather than routing on a stale view.
+    async fn active_set(
+        &self,
+        tenant: ravel_types::TenantHash,
+        now_ns: i64,
+    ) -> Result<Arc<Vec<SpanShardHandle>>, SpanWriteError> {
+        match self.switch.route_cached(tenant, now_ns) {
+            Routed::Fresh(set) => Ok(set),
+            Routed::Stale => {
+                match load_generations(
+                    self.store.as_ref(),
+                    ravel_types::Signal::Spans,
+                    &tenant,
+                    self.switch.default_count(),
+                )
+                .await
+                {
+                    Ok(generations) => Ok(self.switch.refresh(tenant, generations, now_ns)),
+                    Err(_) => {
+                        self.metrics.record_stale_provisioning_flush();
+                        Err(SpanWriteError::StaleProvisioningView)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update a tenant's cached shard-generation view (ADR-0052 section 2).
+    pub fn refresh_generations(
+        &self,
+        tenant: ravel_types::TenantHash,
+        generations: Vec<ravel_catalog::ShardGeneration>,
+        now_ns: i64,
+    ) {
+        self.switch.refresh(tenant, generations, now_ns);
     }
 
     pub fn shard_count(&self) -> u32 {
@@ -152,7 +202,14 @@ impl SpanIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<SpanWriteReceipt, SpanWriteError> {
-        let shard_count = self.config.shard_count;
+        if spans.is_empty() {
+            return Ok(SpanWriteReceipt::default());
+        }
+        // Route against the tenant's current generation view, re-reading the
+        // provisioning record when the cache is older than `C` and failing
+        // closed if that read cannot complete (ADR-0052 section 3).
+        let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<NormalizedSpan>> = HashMap::new();
         for span in spans {
             let shard = shard_for_span(&span.trace_id, shard_count);
@@ -186,12 +243,12 @@ impl SpanIngestRouter {
                 spans,
                 ack,
             };
-            if self.shards[shard as usize].tx.send(msg).await.is_err() {
+            if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver
                 // while alive), so this shard is dead. Count it once and
                 // surface the typed error rather than acking as if the spans
                 // landed.
-                self.mark_shard_dead(shard);
+                self.mark_shard_dead(&set[shard as usize]);
                 return Err(SpanWriteError::ShardUnavailable);
             }
         }
@@ -212,7 +269,7 @@ impl SpanIngestRouter {
             let inner = match result {
                 Ok(inner) => inner,
                 Err(_) => {
-                    self.mark_shard_dead(shard);
+                    self.mark_shard_dead(&set[shard as usize]);
                     return Err(SpanWriteError::ShardUnavailable);
                 }
             };
@@ -224,11 +281,8 @@ impl SpanIngestRouter {
     /// Records the first observation of a shard actor's death, deduped so a
     /// permanently dead shard is counted once no matter how many later writes
     /// route to it.
-    fn mark_shard_dead(&self, shard: u32) {
-        if !self.shards[shard as usize]
-            .dead
-            .swap(true, Ordering::Relaxed)
-        {
+    fn mark_shard_dead(&self, handle: &SpanShardHandle) {
+        if !handle.dead.swap(true, Ordering::Relaxed) {
             self.metrics.record_shard_death();
         }
     }
@@ -237,16 +291,19 @@ impl SpanIngestRouter {
     /// graceful shutdown paths that need durability without waiting on
     /// `max_flush_delay`.
     pub async fn flush_all(&self) {
-        let mut dones = Vec::with_capacity(self.shards.len());
-        for shard in &self.shards {
-            let (tx, rx) = oneshot::channel();
-            if shard
-                .tx
-                .send(SpanShardMsg::FlushNow { done: tx })
-                .await
-                .is_ok()
-            {
-                dones.push(rx);
+        let sets = self.switch.all_sets();
+        let mut dones = Vec::new();
+        for set in &sets {
+            for shard in set.iter() {
+                let (tx, rx) = oneshot::channel();
+                if shard
+                    .tx
+                    .send(SpanShardMsg::FlushNow { done: tx })
+                    .await
+                    .is_ok()
+                {
+                    dones.push(rx);
+                }
             }
         }
         for rx in dones {
@@ -254,20 +311,22 @@ impl SpanIngestRouter {
         }
     }
 
-    /// Flushes every shard's buffered tenants, then stops and joins every
-    /// shard actor task.
+    /// Flushes every live generation's span shard actors so a retiring
+    /// generation's buffers drain too (ADR-0052 section 2). The detached actor
+    /// tasks end on their own after the drain; the `done` acknowledgement fires
+    /// after the flush, so durability holds without joining them.
     pub async fn shutdown(self) {
-        let mut dones = Vec::with_capacity(self.shards.len());
-        for shard in &self.shards {
-            let (tx, rx) = oneshot::channel();
-            let _ = shard.tx.send(SpanShardMsg::Shutdown { done: tx }).await;
-            dones.push(rx);
+        let sets = self.switch.all_sets();
+        let mut dones = Vec::new();
+        for set in &sets {
+            for shard in set.iter() {
+                let (tx, rx) = oneshot::channel();
+                let _ = shard.tx.send(SpanShardMsg::Shutdown { done: tx }).await;
+                dones.push(rx);
+            }
         }
         for rx in dones {
             let _ = rx.await;
-        }
-        for shard in self.shards {
-            let _ = shard.task.await;
         }
     }
 }
@@ -486,5 +545,187 @@ mod tests {
         let prefix = format!("t/{}/s/l0/", tenant.hash().to_hex());
         let objects = list_all(store.as_ref(), &prefix).await.expect("list");
         assert_eq!(objects.len(), 1, "the shutdown drain flushed the buffer");
+    }
+
+    // ---- ADR-0052 router live-switch integration tests ----
+    //
+    // These drive the real router (spawning real actors and writing to a
+    // MemoryStore) to prove the generation switch is wired into the write path.
+    // The switch mechanism itself is unit-tested generically in
+    // `crate::generation`; the three routers embed the same `GenerationSwitch`,
+    // so this per-router integration test also stands in for the metrics and
+    // log routers (ADR-0052 allows one shared test when the routers share
+    // structure, which they do).
+
+    use crate::generation::DEFAULT_REFRESH_INTERVAL_NS;
+    use ravel_catalog::ShardGeneration;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// A clock whose reading a test sets explicitly, so routing hour and
+    /// staleness age are deterministic.
+    #[derive(Debug)]
+    struct ManualClock(AtomicI64);
+    impl ManualClock {
+        fn new(now_ns: i64) -> Self {
+            ManualClock(AtomicI64::new(now_ns))
+        }
+        fn set(&self, now_ns: i64) {
+            self.0.store(now_ns, Ordering::SeqCst);
+        }
+    }
+    impl crate::clock::Clock for ManualClock {
+        fn now_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn sg(generation: u32, shard_count: u32, activation_hour: u32) -> ShardGeneration {
+        ShardGeneration {
+            generation,
+            shard_count,
+            activation_hour,
+            appended_unix_ns: 0,
+        }
+    }
+
+    /// A reshard activation switches the router's routing to the new
+    /// generation's shard-actor set: after activation a write can land on a
+    /// shard index only the larger set has, while a write on the old set before
+    /// the switch stays valid and durable (the old actors are not force-closed).
+    #[tokio::test]
+    async fn activation_routes_to_new_generation_set() {
+        let store = Arc::new(MemoryStore::new());
+        let clock = Arc::new(ManualClock::new(50 * NS_PER_HOUR)); // hour 50
+        let router = SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                target_bytes: 1, // flush every write immediately
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            clock.clone(),
+        );
+        let tenant = TenantId::new("acme");
+        let history = vec![sg(0, 4, 0), sg(1, 8, 100)]; // reshard 4 -> 8 at hour 100
+
+        // Before activation (hour 50): routes at count 4, so every shard index
+        // is < 4.
+        router.refresh_generations(tenant.hash(), history.clone(), clock.now_ns());
+        let before = router
+            .write(
+                tenant.clone(),
+                (0..32).map(|i| norm_span(trace_id(i), 1, 1_000)).collect(),
+                WriteMode::Strict,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("write before activation");
+        assert!(
+            before.tokens.iter().all(|t| t.shard < 4),
+            "before activation every shard index is < 4"
+        );
+
+        // Advance past the activation hour and refresh the view (the background
+        // refresher's job): routing now uses count 8.
+        clock.set(100 * NS_PER_HOUR);
+        router.refresh_generations(tenant.hash(), history, clock.now_ns());
+        let after = router
+            .write(
+                tenant.clone(),
+                (0..64)
+                    .map(|i| norm_span(trace_id(1_000 + i), 1, 1_000))
+                    .collect(),
+                WriteMode::Strict,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("write after activation");
+        assert!(
+            after.tokens.iter().any(|t| t.shard >= 4),
+            "after activation a write reaches a shard index only the count-8 set has"
+        );
+
+        // Both generations' data is durable: the old set was not force-closed.
+        router.shutdown().await;
+        let prefix = format!("t/{}/s/l0/", tenant.hash().to_hex());
+        let objects = list_all(store.as_ref(), &prefix).await.expect("list");
+        let shards: std::collections::BTreeSet<String> = objects
+            .iter()
+            .filter_map(|o| o.key.strip_prefix(&prefix))
+            .filter_map(|rest| rest.split('/').next())
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            shards.iter().any(|s| s.parse::<u32>().unwrap_or(0) >= 4),
+            "objects exist under a shard index from the new generation"
+        );
+    }
+
+    /// Staleness fail-closed: once the router's cached view for a tenant ages
+    /// past `C`, the router re-reads the provisioning record before routing; if
+    /// that re-read cannot complete (here a store fault on the record GET), the
+    /// write fails closed with the typed error and the metrics counter
+    /// increments, rather than routing on a stale view (ADR-0052 section 3).
+    #[tokio::test]
+    async fn stale_view_fails_flush_closed() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+        // The record GET always faults, so a stale view can never be refreshed.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("prov unavailable".into()))
+                .with_key_contains("/prov"),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let t0 = 10 * NS_PER_HOUR;
+        let clock = Arc::new(ManualClock::new(t0));
+        let router = SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                target_bytes: 1,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            clock.clone(),
+        );
+        let tenant = TenantId::new("acme");
+        router.refresh_generations(tenant.hash(), vec![sg(0, 4, 0)], t0);
+
+        // Age the cached view past C: the next write must re-read, which faults,
+        // so it fails closed.
+        clock.set(t0 + DEFAULT_REFRESH_INTERVAL_NS + 1);
+        let err = router
+            .write(
+                tenant.clone(),
+                vec![norm_span(trace_id(1), 1, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a stale view whose record re-read fails must fail closed");
+        assert!(
+            matches!(err, SpanWriteError::StaleProvisioningView),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            router.metrics().snapshot().stale_provisioning_flushes,
+            1,
+            "the stale-flush counter must increment"
+        );
+
+        // A successful refresh (the background refresher's job) clears
+        // staleness; the next write routes again without touching the store.
+        router.refresh_generations(tenant.hash(), vec![sg(0, 4, 0)], clock.now_ns());
+        router
+            .write(
+                tenant.clone(),
+                vec![norm_span(trace_id(1), 1, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("after a refresh the write routes again");
+        router.shutdown().await;
     }
 }

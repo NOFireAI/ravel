@@ -13,11 +13,19 @@ ravel-object-store = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-logseg = { workspace = true }
+# The router live switch (ADR-0052, EK1) consumes the shard-generation history
+# and the pure routing rule (`active_shard_count`) from ravel-catalog's
+# provisioning module, so ravel-catalog is a build-time dependency, not only a
+# dev one. ravel-catalog does not depend on ravel-ingest, so this is acyclic.
+ravel-catalog = { workspace = true }
 # ravel-rspan (ADR-0041) is new and not yet listed in the workspace
 # [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
 # this is a version-pinned path dependency (the pin keeps cargo-deny from
 # counting it as a wildcard, matching the workspace's path-dep convention).
 ravel-rspan = { path = "../ravel-rspan", version = "0.1.0" }
+# The router live switch (ADR-0052) decodes the provisioning record read for a
+# generation refresh; prost's Message trait provides `decode`.
+prost = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 crc32c = { workspace = true }
@@ -30,7 +38,6 @@ futures = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
-ravel-catalog = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 tokio = { workspace = true }

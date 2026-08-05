@@ -82,18 +82,51 @@ enum Signal {
 // of shards.
 //
 // This is its own top-level message, keyed under the tenant's own prefix (not
-// a bucket-root `sys/` object). shard_count is immutable per (tenant, signal)
-// in this decision; resharding is deferred to its own ADR (ADR-0050 section 5,
-// epic EK) and would add a field here, never mutate this one.
+// a bucket-root `sys/` object). The scalar `shard_count` (field 4) is the
+// pinned count of generation 0; ADR-0052 (epic EK) makes the record
+// append-only under CasVersion, adding the `generations` history (field 6)
+// additively. Every existing byte of a written record stays immutable; a
+// reshard only appends one ShardGeneration.
 message ProvisioningRecord {
   // Format floor: the minimum reader version that understands this record. A
   // reader that only knows a lower version refuses rather than misreading a
   // future layout as v1 (matching TenancyMarker's format_version guard). = 1.
+  //
+  // Adding `generations` (field 6) is additive and does NOT bump this floor:
+  // a pre-ADR-0052 reader that skips the unknown field 6 still reads the
+  // scalar `shard_count` as generation 0's count, and a post-0052 reader with
+  // an empty `generations` list reads exactly the same single implicit
+  // generation. There is no layout a v1 reader would misread, so the floor
+  // stays 1 (ADR-0052 section 1, "Sequencing with EC5").
   uint32 format_version = 1;
   bytes tenant_hash = 2;       // 16 bytes; the `t/<tenant_hash>/` prefix owner
   Signal signal = 3;
-  uint32 shard_count = 4;      // the pinned shard count for this (tenant, signal)
+  // The pinned shard count for this (tenant, signal). When `generations` is
+  // non-empty this MUST equal `generations[0].shard_count`; when it is empty
+  // this is the single implicit generation 0. Never mutated once written.
+  uint32 shard_count = 4;
   sfixed64 created_unix_ns = 5;  // informational; when the record was first written
+  // Append-only shard-generation history (ADR-0052 section 1). Empty on every
+  // record EC5 wrote, read as the single implicit generation 0 with
+  // activation_hour 0 and count `shard_count`. A reshard appends exactly one
+  // ShardGeneration whose activation_hour is strictly in the future, via a
+  // CasVersion read-append-write. Decode enforces: dense 0-based generations,
+  // strictly increasing activation_hour, adjacent counts differing, and
+  // generations[0].shard_count == the scalar shard_count above. A record
+  // violating any of these is a typed decode error (fail closed).
+  repeated ShardGeneration generations = 6;
+}
+
+// One entry in a ProvisioningRecord's append-only shard-generation history
+// (ADR-0052 section 1). Immutable once appended; a reshard adds a new entry,
+// never edits an existing one. Old generations remain valid under their
+// original shard indices forever (no data is ever moved or re-keyed).
+message ShardGeneration {
+  uint32 generation      = 1;  // dense, 0-based
+  uint32 shard_count     = 2;  // 1..=10000 (the 4-digit key field caps it)
+  uint32 activation_hour = 3;  // unix hours; ingest hours >= this route with
+                               // this generation's count
+  int64  appended_unix_ns = 4; // audit only; when this generation was appended
 }
 
 // The durable, deployment-wide GC configuration at the bucket root `sys/gc`

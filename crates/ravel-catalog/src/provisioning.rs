@@ -21,7 +21,7 @@
 //! record disagree.
 
 use prost::Message;
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
 
@@ -129,6 +129,252 @@ pub enum ProvisioningError {
         configured: u32,
         observed_shard: u32,
     },
+    /// The record's append-only shard-generation history (ADR-0052 section 1)
+    /// violates a structural invariant. Fail closed, same discipline as every
+    /// other corrupt-input path: a malformed history could route or scan over
+    /// the wrong shard set. `defect` names the exact rule broken.
+    #[error(
+        "provisioning record {key:?} has a corrupt shard-generation history: {defect} \
+         (ADR-0052 section 1)"
+    )]
+    CorruptGenerations {
+        key: String,
+        defect: GenerationDefect,
+    },
+    /// `provision reshard` was asked to append to a (tenant, signal) that has
+    /// no provisioning record yet. A reshard extends an existing record's
+    /// history; a tenant with no record has nothing to reshard (its first
+    /// write pins generation 0).
+    #[error(
+        "cannot reshard tenant {tenant_hash} signal {signal}: no provisioning record exists at \
+         {key:?}. A reshard appends to an existing record; the record is created on the tenant's \
+         first ingest for this signal (ADR-0050 section 5, ADR-0052 section 1)"
+    )]
+    NoRecordToReshard {
+        key: String,
+        tenant_hash: String,
+        signal: &'static str,
+    },
+    /// The reshard's computed `activation_hour` is not strictly in the future
+    /// against the server clock at append time (ADR-0052 section 3). Rejected
+    /// so a live writer either observes the new generation before it activates
+    /// or has already fail-stopped on record staleness.
+    #[error(
+        "reshard activation_hour {activation_hour} is not in the future (current hour {now_hour}): \
+         the lead time must place activation strictly ahead of the append (ADR-0052 section 3); \
+         refusing to append"
+    )]
+    ActivationInPast { activation_hour: u32, now_hour: u32 },
+    /// The reshard's new `shard_count` equals the currently-active generation's
+    /// count, so the append would be a no-op "reshard" (ADR-0052 section 1:
+    /// adjacent generations' counts must differ).
+    #[error(
+        "reshard to shard_count {shard_count} is a no-op: it equals the current generation's count; \
+         adjacent generations must differ (ADR-0052 section 1); refusing to append"
+    )]
+    ReshardSameCount { shard_count: u32 },
+    /// The reshard's new `shard_count` is outside the legal `1..=10000` range
+    /// the 4-digit shard key field caps it to (ADR-0052 section 1/7).
+    #[error(
+        "reshard shard_count {shard_count} is out of range: it must be 1..=10000 (the 4-digit \
+         shard key field caps it); refusing to append"
+    )]
+    ReshardCountOutOfRange { shard_count: u32 },
+    /// A concurrent append moved the record's version between this reshard's
+    /// read and its CasVersion write (ADR-0052 section 1, the EC4 set_gc_config
+    /// pattern). The loser re-reads rather than silently overwriting the winner.
+    #[error(
+        "a concurrent reshard changed provisioning record {key:?} since this one read it \
+         (CasVersion precondition failed): re-read and retry rather than overwrite the other \
+         append"
+    )]
+    ReshardCasConflict { key: String },
+}
+
+/// The exact structural rule a corrupt shard-generation history broke
+/// (ADR-0052 section 1). Each is a fail-closed decode error, never a silent
+/// normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationDefect {
+    /// `generations[0].shard_count` disagrees with the scalar `shard_count`.
+    ScalarMismatch,
+    /// Generation numbers are not a dense 0-based sequence (0, 1, 2, ...).
+    NotDense,
+    /// `activation_hour` is not strictly increasing across the list.
+    ActivationNotIncreasing,
+    /// Two adjacent generations have equal `shard_count` (a no-op reshard).
+    AdjacentEqualCount,
+    /// A generation's `shard_count` is outside `1..=10000`.
+    CountOutOfRange,
+}
+
+impl std::fmt::Display for GenerationDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            GenerationDefect::ScalarMismatch => {
+                "generations[0].shard_count does not equal the scalar shard_count"
+            }
+            GenerationDefect::NotDense => "generation numbers are not dense 0-based (0, 1, 2, ...)",
+            GenerationDefect::ActivationNotIncreasing => {
+                "activation_hour is not strictly increasing across generations"
+            }
+            GenerationDefect::AdjacentEqualCount => {
+                "adjacent generations have equal shard_count (a no-op reshard)"
+            }
+            GenerationDefect::CountOutOfRange => "a generation shard_count is outside 1..=10000",
+        };
+        f.write_str(s)
+    }
+}
+
+/// The inclusive upper bound on `shard_count`, set by the 4-digit zero-padded
+/// shard key field (ADR-0052 section 7; `l0/0000/`..`l0/9999/`).
+pub const MAX_SHARD_COUNT: u32 = 10_000;
+
+/// Nanoseconds per unix hour, the unit `activation_hour` and `ingest_hour_bucket`
+/// count in. Held here so the reshard append can derive the current hour from a
+/// `now_ns` reading without depending on ravel-ingest.
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// One entry of a provisioning record's append-only shard-generation history,
+/// decoded into a plain struct so the routing rule ([`active_shard_count`]) and
+/// the router live switch never touch the proto type (ADR-0052 section 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardGeneration {
+    /// Dense, 0-based generation number.
+    pub generation: u32,
+    /// The shard count this generation routes and scans under (`1..=10000`).
+    pub shard_count: u32,
+    /// The unix hour at and after which ingest routes with this generation's
+    /// count.
+    pub activation_hour: u32,
+    /// Audit only: when this generation was appended.
+    pub appended_unix_ns: i64,
+}
+
+/// The write-side routing rule (ADR-0052 section 2): the shard count of the
+/// latest generation whose `activation_hour` is `<= hour`. `generations` must be
+/// the normalized, validated history [`read_generations`] returns (non-empty,
+/// dense, activation-increasing), so generation 0 (activation_hour 0) always
+/// covers every hour and the result is well-defined.
+///
+/// A pure function with no I/O: the router calls it per flush against its cached
+/// view, and EK2's read side will call the same rule to derive per-hour scan
+/// sets. Returns generation 0's count for an empty slice as a defensive floor
+/// (the divisor is never zero), but a validated history is never empty.
+pub fn active_shard_count(generations: &[ShardGeneration], hour: u32) -> u32 {
+    generations
+        .iter()
+        .filter(|g| g.activation_hour <= hour)
+        .max_by_key(|g| g.generation)
+        .or_else(|| generations.first())
+        .map(|g| g.shard_count)
+        .unwrap_or(1)
+}
+
+/// Decode and validate a record's shard-generation history into the normalized
+/// form the routing rule consumes (ADR-0052 section 1). An empty `generations`
+/// list (every record EC5 wrote) becomes the single implicit generation 0 with
+/// `activation_hour = 0` and the scalar `shard_count`, so a pre-ADR-0052 record
+/// decodes identically before and after this change. A non-empty list is
+/// validated fail-closed: dense 0-based generations, strictly increasing
+/// `activation_hour`, adjacent counts differing, every count in `1..=10000`, and
+/// `generations[0].shard_count == shard_count`. Any violation is a typed
+/// [`ProvisioningError::CorruptGenerations`], never a panic or a silent fix.
+pub fn read_generations(
+    record: &sysproto::ProvisioningRecord,
+    key: &str,
+) -> Result<Vec<ShardGeneration>, ProvisioningError> {
+    if record.generations.is_empty() {
+        if !(1..=MAX_SHARD_COUNT).contains(&record.shard_count) {
+            let corrupt = |defect: GenerationDefect| ProvisioningError::CorruptGenerations {
+                key: key.to_string(),
+                defect,
+            };
+            return Err(corrupt(GenerationDefect::CountOutOfRange));
+        }
+        return Ok(vec![ShardGeneration {
+            generation: 0,
+            shard_count: record.shard_count,
+            activation_hour: 0,
+            appended_unix_ns: record.created_unix_ns,
+        }]);
+    }
+
+    let corrupt = |defect: GenerationDefect| ProvisioningError::CorruptGenerations {
+        key: key.to_string(),
+        defect,
+    };
+
+    let gens = &record.generations;
+    if gens[0].shard_count != record.shard_count {
+        return Err(corrupt(GenerationDefect::ScalarMismatch));
+    }
+    let mut out = Vec::with_capacity(gens.len());
+    for (idx, g) in gens.iter().enumerate() {
+        if g.generation as usize != idx {
+            return Err(corrupt(GenerationDefect::NotDense));
+        }
+        if !(1..=MAX_SHARD_COUNT).contains(&g.shard_count) {
+            return Err(corrupt(GenerationDefect::CountOutOfRange));
+        }
+        if idx > 0 {
+            let prev = &gens[idx - 1];
+            if g.activation_hour <= prev.activation_hour {
+                return Err(corrupt(GenerationDefect::ActivationNotIncreasing));
+            }
+            if g.shard_count == prev.shard_count {
+                return Err(corrupt(GenerationDefect::AdjacentEqualCount));
+            }
+        }
+        out.push(ShardGeneration {
+            generation: g.generation,
+            shard_count: g.shard_count,
+            activation_hour: g.activation_hour,
+            appended_unix_ns: g.appended_unix_ns,
+        });
+    }
+    Ok(out)
+}
+
+/// [`read_generations`], plus the same format-version and (tenant, signal)
+/// misfile guard [`validate_record`] applies before it ever calls
+/// `read_generations`. `read_generations` alone trusts that the record was
+/// already resolved under the right key; a caller that decodes a record it
+/// read directly (the ingest router's live-switch refresh, which does not go
+/// through [`validate_or_adopt`]) has not had that guard applied yet, so a
+/// record from a future format or a misfiled/corrupted record for a different
+/// tenant or signal must be refused here rather than misread as this tenant's
+/// generation history.
+pub fn read_generations_checked(
+    record: &sysproto::ProvisioningRecord,
+    key: &str,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+) -> Result<Vec<ShardGeneration>, ProvisioningError> {
+    if record.format_version > PROVISIONING_FORMAT_VERSION {
+        return Err(ProvisioningError::UnsupportedVersion {
+            key: key.to_string(),
+            got: record.format_version,
+        });
+    }
+    if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
+        return Err(ProvisioningError::CorruptRecord {
+            key: key.to_string(),
+            field: "tenant_hash",
+            expected: tenant_hash.to_hex(),
+            actual: hex::encode(&record.tenant_hash),
+        });
+    }
+    if record.signal != to_sys_signal(signal) as i32 {
+        return Err(ProvisioningError::CorruptRecord {
+            key: key.to_string(),
+            field: "signal",
+            expected: format!("{:?}", to_sys_signal(signal)),
+            actual: format!("{}", record.signal),
+        });
+    }
+    read_generations(record, key)
 }
 
 impl ProvisioningError {
@@ -248,6 +494,13 @@ fn validate_record(
             actual: record.shard_count,
         });
     }
+    // The scalar `shard_count` is generation 0's count and the configured value
+    // still equals it (a reshard never touches gen 0). But the append-only
+    // generation history (ADR-0052 section 1) must also be structurally sound on
+    // every touch: a corrupt history could route or scan over the wrong shard
+    // set. Validate it here so any consumer fails closed, exactly as it does on
+    // a `shard_count` disagreement.
+    read_generations(record, key)?;
     Ok(())
 }
 
@@ -306,6 +559,11 @@ fn build_record(
         signal: to_sys_signal(signal) as i32,
         shard_count,
         created_unix_ns: now_ns,
+        // A first-write/adoption record has no reshard history: the empty list
+        // is read as the single implicit generation 0 (ADR-0052 section 1), and
+        // encoding omits the field entirely, so this record is byte-identical to
+        // one an EC5 build wrote before ADR-0052.
+        generations: Vec::new(),
     }
 }
 
@@ -417,6 +675,145 @@ pub async fn validate_or_adopt(
             // Pre-ADR data, all shard indices in range: safe to adopt.
             write_record_race_safe(store, &key, tenant_hash, signal, shard_count, now_ns).await
         }
+    }
+}
+
+/// The outcome of a successful [`append_generation`] reshard append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReshardOutcome {
+    /// The generation number the append created (dense, one past the prior
+    /// last).
+    pub generation: u32,
+    /// The full normalized history after the append, generation 0 first.
+    pub generations: Vec<ShardGeneration>,
+}
+
+/// Append one shard generation to a (tenant, signal)'s provisioning record
+/// under `CasVersion` (ADR-0052 section 1, mirroring EC4's `set_gc_config`).
+/// This is the only legal mutation of the record: it appends exactly one
+/// generation whose `activation_hour` is strictly in the future, and never
+/// touches an existing byte of history.
+///
+/// Enforced fail-closed before any write:
+/// - the record must already exist ([`ProvisioningError::NoRecordToReshard`]);
+/// - its existing history must decode and validate ([`read_generations`]);
+/// - `new_shard_count` must be `1..=10000`
+///   ([`ProvisioningError::ReshardCountOutOfRange`]);
+/// - `new_shard_count` must differ from the current last generation's count
+///   ([`ProvisioningError::ReshardSameCount`]);
+/// - `activation_hour` must exceed both the current last generation's
+///   activation and the current server hour
+///   ([`ProvisioningError::ActivationInPast`]).
+///
+/// When the record's history is still the implicit empty list, generation 0 is
+/// materialized explicitly (count = the scalar `shard_count`, activation_hour 0)
+/// before the new generation is appended, so the persisted list stays dense and
+/// self-describing. The scalar `shard_count` is never changed.
+///
+/// A concurrent append that moved the version is a typed
+/// [`ProvisioningError::ReshardCasConflict`]: the loser re-reads, never
+/// silently overwrites the winner.
+pub async fn append_generation(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    new_shard_count: u32,
+    activation_hour: u32,
+    now_ns: i64,
+) -> Result<ReshardOutcome, ProvisioningError> {
+    if !(1..=MAX_SHARD_COUNT).contains(&new_shard_count) {
+        return Err(ProvisioningError::ReshardCountOutOfRange {
+            shard_count: new_shard_count,
+        });
+    }
+    let now_hour = u32::try_from(now_ns.div_euclid(NS_PER_HOUR).max(0)).unwrap_or(u32::MAX);
+    let key = provisioning_key(tenant_hash, signal);
+
+    let (record, version) = match store.get(&key, GetRange::Full).await {
+        Ok(outcome) => {
+            let record =
+                sysproto::ProvisioningRecord::decode(outcome.data.as_ref()).map_err(|source| {
+                    ProvisioningError::Decode {
+                        key: key.clone(),
+                        source,
+                    }
+                })?;
+            (record, outcome.version)
+        }
+        Err(StoreError::NotFound) => {
+            return Err(ProvisioningError::NoRecordToReshard {
+                key,
+                tenant_hash: tenant_hash.to_hex(),
+                signal: signal.key_prefix(),
+            });
+        }
+        Err(err) => return Err(ProvisioningError::store(&key, err)),
+    };
+
+    // Version, misfile, and history-corruption guard, then normalize the
+    // existing history (fail closed on any of these) before extending it. A
+    // record misfiled under the wrong tenant or signal must never be extended
+    // as if it were this (tenant, signal)'s history: append_generation writes
+    // the record back, so trusting a misfiled read here would durably corrupt
+    // it rather than merely misread it.
+    let mut history = read_generations_checked(&record, &key, tenant_hash, signal)?;
+    let last = history.last().copied().unwrap_or(ShardGeneration {
+        generation: 0,
+        shard_count: record.shard_count,
+        activation_hour: 0,
+        appended_unix_ns: record.created_unix_ns,
+    });
+
+    if new_shard_count == last.shard_count {
+        return Err(ProvisioningError::ReshardSameCount {
+            shard_count: new_shard_count,
+        });
+    }
+    if activation_hour <= last.activation_hour || activation_hour <= now_hour {
+        return Err(ProvisioningError::ActivationInPast {
+            activation_hour,
+            now_hour,
+        });
+    }
+
+    let new_generation = last.generation + 1;
+    history.push(ShardGeneration {
+        generation: new_generation,
+        shard_count: new_shard_count,
+        activation_hour,
+        appended_unix_ns: now_ns,
+    });
+
+    // Persist the full, now-explicit history. The scalar shard_count stays
+    // generation 0's count; every prior generation is carried verbatim.
+    let mut new_record = record;
+    new_record.generations = history
+        .iter()
+        .map(|g| sysproto::ShardGeneration {
+            generation: g.generation,
+            shard_count: g.shard_count,
+            activation_hour: g.activation_hour,
+            appended_unix_ns: g.appended_unix_ns,
+        })
+        .collect();
+
+    match store
+        .put(
+            &key,
+            new_record.encode_to_vec().into(),
+            PutOptions {
+                mode: PutMode::CasVersion(version),
+                checksum: None,
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(ReshardOutcome {
+            generation: new_generation,
+            generations: history,
+        }),
+        Err(StoreError::PreconditionFailed) => Err(ProvisioningError::ReshardCasConflict { key }),
+        Err(err) => Err(ProvisioningError::store(&key, err)),
     }
 }
 
@@ -812,6 +1209,352 @@ mod tests {
         assert_eq!(
             store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::NotFoundBlip),
             1
+        );
+    }
+
+    // ---- ADR-0052 generation-versioning tests ----
+
+    fn sg(generation: u32, shard_count: u32, activation_hour: u32) -> ShardGeneration {
+        ShardGeneration {
+            generation,
+            shard_count,
+            activation_hour,
+            appended_unix_ns: 0,
+        }
+    }
+
+    /// `active_shard_count`: single implicit generation covers every hour.
+    #[test]
+    fn active_shard_count_single_generation() {
+        let gens = [sg(0, 4, 0)];
+        assert_eq!(active_shard_count(&gens, 0), 4);
+        assert_eq!(active_shard_count(&gens, 1_000), 4);
+    }
+
+    /// `active_shard_count`: at and around each activation boundary the latest
+    /// generation whose activation_hour <= hour wins.
+    #[test]
+    fn active_shard_count_multiple_generations_at_boundaries() {
+        // gen0 count 4 from hour 0; gen1 count 8 from hour 100; gen2 count 2
+        // from hour 200.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100), sg(2, 2, 200)];
+        assert_eq!(active_shard_count(&gens, 0), 4);
+        assert_eq!(active_shard_count(&gens, 99), 4, "just before gen1");
+        assert_eq!(active_shard_count(&gens, 100), 8, "at gen1 activation");
+        assert_eq!(active_shard_count(&gens, 199), 8, "just before gen2");
+        assert_eq!(active_shard_count(&gens, 200), 2, "at gen2 activation");
+        assert_eq!(active_shard_count(&gens, 10_000), 2, "far after the last");
+    }
+
+    /// The decode-compatibility test the ADR mandates: a record with the exact
+    /// byte shape EC5 wrote (no `generations` field set) decodes as generation 0
+    /// with the scalar `shard_count`, identical to before ADR-0052. Proven at the
+    /// byte level: the encoded bytes are unchanged and the decode yields one
+    /// implicit generation.
+    #[test]
+    fn empty_generations_decode_as_implicit_generation_zero() {
+        // An EC5-shaped record: no generations field.
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 1_234,
+            generations: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let gens = read_generations(&record, &key).expect("empty history is valid");
+        assert_eq!(gens.len(), 1, "read as a single implicit generation");
+        assert_eq!(gens[0].generation, 0);
+        assert_eq!(gens[0].shard_count, 4);
+        assert_eq!(gens[0].activation_hour, 0);
+        assert_eq!(
+            active_shard_count(&gens, 999_999),
+            4,
+            "routes at the scalar count for every hour, exactly as before ADR-0052"
+        );
+        // And the routing behaviour is identical to a record with no history at
+        // all: build_record must still encode to the pre-ADR-0052 byte shape
+        // (no field 6), so an old reader is unaffected.
+        let built = build_record(&tenant(), Signal::Metrics, 4, 1_234);
+        assert!(
+            built.generations.is_empty(),
+            "a freshly built record carries no explicit generations"
+        );
+    }
+
+    /// A zero (or out-of-range) `shard_count` on a record with no explicit
+    /// generation history is refused, exactly as an explicit generation entry
+    /// with an out-of-range count already was. Left unchecked, this becomes an
+    /// index-out-of-bounds panic on the ingest hot path once a router uses the
+    /// resulting `active_shard_count() == 0` to size its shard-actor set.
+    #[test]
+    fn empty_generations_rejects_zero_shard_count() {
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 0,
+            created_unix_ns: 0,
+            generations: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let err = read_generations(&record, &key).expect_err("shard_count 0 must be refused");
+        assert!(matches!(
+            err,
+            ProvisioningError::CorruptGenerations {
+                defect: GenerationDefect::CountOutOfRange,
+                ..
+            }
+        ));
+    }
+
+    /// [`read_generations_checked`] refuses a record from a future format
+    /// version before ever trusting its generation history, matching the guard
+    /// [`validate_record`] already applies on the [`validate_or_adopt`] path.
+    #[test]
+    fn read_generations_checked_rejects_future_format_version() {
+        let record = sysproto::ProvisioningRecord {
+            format_version: PROVISIONING_FORMAT_VERSION + 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
+            .expect_err("a future format version must be refused");
+        assert!(matches!(err, ProvisioningError::UnsupportedVersion { .. }));
+    }
+
+    /// [`read_generations_checked`] refuses a record misfiled for a different
+    /// tenant: a correctly-shaped record at the wrong key must never be
+    /// misread as this tenant's generation history and used to route its
+    /// writes at another tenant's shard count.
+    #[test]
+    fn read_generations_checked_rejects_misfiled_tenant() {
+        let other = TenantHash([0xEE; 16]);
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: other.0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
+            .expect_err("a record for a different tenant must be refused");
+        assert!(matches!(
+            err,
+            ProvisioningError::CorruptRecord {
+                field: "tenant_hash",
+                ..
+            }
+        ));
+    }
+
+    /// [`read_generations_checked`] refuses a record misfiled for a different
+    /// signal, the sibling of the tenant-misfile guard above.
+    #[test]
+    fn read_generations_checked_rejects_misfiled_signal() {
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Logs as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
+            .expect_err("a record for a different signal must be refused");
+        assert!(matches!(
+            err,
+            ProvisioningError::CorruptRecord {
+                field: "signal",
+                ..
+            }
+        ));
+    }
+
+    /// Each compatibility-rule violation is a typed `CorruptGenerations` decode
+    /// error naming the exact defect, never a panic.
+    #[test]
+    fn corrupt_generation_histories_are_typed_errors() {
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let base =
+            |gens: Vec<sysproto::ShardGeneration>, scalar: u32| sysproto::ProvisioningRecord {
+                format_version: 1,
+                tenant_hash: tenant().0.to_vec(),
+                signal: sysproto::Signal::Metrics as i32,
+                shard_count: scalar,
+                created_unix_ns: 0,
+                generations: gens,
+            };
+        let g = |generation, shard_count, activation_hour| sysproto::ShardGeneration {
+            generation,
+            shard_count,
+            activation_hour,
+            appended_unix_ns: 0,
+        };
+        let expect_defect = |record: &sysproto::ProvisioningRecord, defect: GenerationDefect| {
+            match read_generations(record, &key) {
+                Err(ProvisioningError::CorruptGenerations { defect: got, .. }) => {
+                    assert_eq!(got, defect, "wrong defect");
+                }
+                other => panic!("expected CorruptGenerations({defect:?}), got {other:?}"),
+            }
+        };
+
+        // generations[0].shard_count != scalar shard_count.
+        expect_defect(&base(vec![g(0, 8, 0)], 4), GenerationDefect::ScalarMismatch);
+        // Non-dense generation numbers (0, then 2).
+        expect_defect(
+            &base(vec![g(0, 4, 0), g(2, 8, 100)], 4),
+            GenerationDefect::NotDense,
+        );
+        // activation_hour not strictly increasing (100, then 100).
+        expect_defect(
+            &base(vec![g(0, 4, 0), g(1, 8, 0)], 4),
+            GenerationDefect::ActivationNotIncreasing,
+        );
+        // Adjacent equal counts (4, then 4).
+        expect_defect(
+            &base(vec![g(0, 4, 0), g(1, 4, 100)], 4),
+            GenerationDefect::AdjacentEqualCount,
+        );
+        // A count outside 1..=10000.
+        expect_defect(
+            &base(vec![g(0, 4, 0), g(1, 20_000, 100)], 4),
+            GenerationDefect::CountOutOfRange,
+        );
+    }
+
+    /// A successful reshard append: valid future activation, differing count,
+    /// materializes an explicit generation 0 and appends generation 1. The
+    /// scalar shard_count is unchanged.
+    #[tokio::test]
+    async fn append_generation_succeeds_and_materializes_history() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        // now = hour 10 (10 * NS_PER_HOUR); activate at hour 12.
+        let now_ns = 10 * NS_PER_HOUR;
+        let out = append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 12, now_ns)
+            .await
+            .expect("a valid reshard appends");
+        assert_eq!(out.generation, 1);
+        assert_eq!(out.generations.len(), 2);
+        assert_eq!(out.generations[0].generation, 0);
+        assert_eq!(out.generations[0].shard_count, 4);
+        assert_eq!(out.generations[0].activation_hour, 0);
+        assert_eq!(out.generations[1].shard_count, 8);
+        assert_eq!(out.generations[1].activation_hour, 12);
+
+        // Re-read: scalar unchanged, history persisted and valid.
+        let record = read_record(
+            store.as_ref(),
+            &provisioning_key(&tenant(), Signal::Metrics),
+        )
+        .await
+        .expect("read")
+        .expect("present");
+        assert_eq!(record.shard_count, 4, "scalar shard_count never changes");
+        let gens = read_generations(&record, "k").expect("valid history");
+        assert_eq!(gens.len(), 2);
+        assert_eq!(active_shard_count(&gens, 11), 4, "before activation");
+        assert_eq!(active_shard_count(&gens, 12), 8, "at activation");
+    }
+
+    /// A reshard whose activation_hour is not strictly in the future is refused.
+    #[tokio::test]
+    async fn append_generation_rejects_past_activation() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        let now_ns = 10 * NS_PER_HOUR; // hour 10
+        // Activation at hour 10 is not strictly in the future.
+        let err = append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 10, now_ns)
+            .await
+            .expect_err("activation in the past must be refused");
+        assert!(
+            matches!(err, ProvisioningError::ActivationInPast { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// A reshard to the same count is a no-op and refused (adjacent counts must
+    /// differ).
+    #[tokio::test]
+    async fn append_generation_rejects_same_count() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        let err = append_generation(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            4,
+            12,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect_err("a same-count reshard must be refused");
+        assert!(
+            matches!(err, ProvisioningError::ReshardSameCount { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// A reshard on a (tenant, signal) with no provisioning record is refused.
+    #[tokio::test]
+    async fn append_generation_rejects_missing_record() {
+        let store = mem();
+        let err = append_generation(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            8,
+            12,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect_err("no record to reshard must be refused");
+        assert!(
+            matches!(err, ProvisioningError::NoRecordToReshard { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// A concurrent append racing the same (tenant, signal): the first CAS wins,
+    /// the second reads the same version and its stale CAS write is rejected as a
+    /// typed `ReshardCasConflict`, never silently overwriting the winner. Proven
+    /// with `FaultStore` stalling the loser's CAS `put` until after the winner
+    /// commits.
+    #[tokio::test]
+    async fn append_generation_cas_conflict_on_concurrent_append() {
+        let inner = MemoryStore::new();
+        seed_record(&inner, &tenant(), Signal::Metrics, 4).await;
+        // Inject a rejected conditional write on the CAS `put` of the prov key,
+        // exactly what a concurrent append that moved the version would cause:
+        // under `CasVersion` this surfaces as `PreconditionFailed`.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains("/prov"),
+        );
+        let store = FaultStore::new(inner, plan);
+        let err = append_generation(&store, &tenant(), Signal::Metrics, 8, 12, 10 * NS_PER_HOUR)
+            .await
+            .expect_err("a CAS precondition failure must surface as a typed conflict");
+        assert!(
+            matches!(err, ProvisioningError::ReshardCasConflict { .. }),
+            "got: {err}"
+        );
+        assert_eq!(
+            store.fault_count(
+                Op::Put,
+                ravel_object_store::fault::FaultKind::FailedConditionalWrite
+            ),
+            1,
+            "the injected precondition failure must have fired"
         );
     }
 }
