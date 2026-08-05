@@ -121,6 +121,11 @@ flight-sql = [
 proptest = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+# Dev-only: the Flight SQL request-span test (tests/flight_span.rs) captures
+# `tracing` output through a `MakeWriter` and asserts the `flight_sql_statement`
+# span's bounded fields (ADR-0044 section 5), the same way
+# services/ravel-server's own span tests do.
+tracing-subscriber = { workspace = true }
 # The endpoint-level tests drive a real `Catalog`, so they publish real
 # commit records rather than hand-building `Snapshot`s.
 ravel-commit = { workspace = true }

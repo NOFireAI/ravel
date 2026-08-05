@@ -43,6 +43,7 @@ use ravel_types::TenantHash;
 use ravel_types::accounting::{QueryAccounting, QueryCostRecorder, QueryWorkloadClass};
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
 use rand::Rng as _;
 
@@ -391,6 +392,41 @@ impl FlightSqlService for RavelFlightSqlService {
         // path likewise audits the executor's result before the encoder runs.
         let now_ns = self.clock.now_ns();
         let query_text = decoded.statement.clone();
+
+        // A request-level span carrying only bounded values (ADR-0044 section
+        // 5), the Flight SQL counterpart of the `sql_query`/`analytics_query`
+        // spans the HTTP handlers build: the tenant hash, the workload class,
+        // and -- once the query finishes -- its final store request and byte
+        // counts. No statement text, label values, or object keys ever become
+        // span fields; the allowlist (ADR-0044 section 4: tenant_hash, signal,
+        // mode, op, error_kind, workload_class, level, plus the two count
+        // fields) is closed. Every Flight SQL statement is an interactive,
+        // client-driven query.
+        //
+        // Unlike the HTTP path, execution here is streamed. `statement_stream`
+        // returns after only the first batch is pulled, and the query's cost
+        // keeps rising as the client drains the rest, so the two count fields
+        // are recorded not here but when the stream ends -- from the same
+        // snapshot the cost recorder folds into `/metrics` -- so the span and
+        // the scrape report the same totals for one query (crate::flight::
+        // stream::RecordOnStreamEnd). `.instrument` scopes only the setup
+        // future (through the first batch) under the span, matching the way
+        // sql.rs instruments its executor call.
+        //
+        // `workload_class` is stamped as the literal "interactive": the label
+        // spelling lives on `services/ravel-server`'s `WorkloadClass::name`,
+        // which this crate cannot name, and `QueryWorkloadClass` in
+        // `ravel-types` carries no spelling. The string matches what that
+        // method renders for `QueryWorkloadClass::Interactive`, which is the
+        // class the cost fold below already stamps.
+        let span = tracing::info_span!(
+            "flight_sql_statement",
+            tenant_hash = %tenant.to_hex(),
+            workload_class = "interactive",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+
         let result = statement_stream(
             &self.executor,
             Arc::clone(&self.clock),
@@ -398,7 +434,9 @@ impl FlightSqlService for RavelFlightSqlService {
             decoded,
             &self.config,
             Arc::clone(&self.recorder),
+            span.clone(),
         )
+        .instrument(span.clone())
         .await;
         let status = match &result {
             Ok(_) => QueryStatus::Ok,
