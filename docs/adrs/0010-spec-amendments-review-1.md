@@ -65,9 +65,15 @@ findings live in the review record; this ADR fixes the decisions.
    configurable). The catalog listing window derives its correctness from
    these admission bounds plus a clock_skew_allowance pad on `now`.
 
-9. shard_count is immutable per (tenant, signal) in v1 and recorded in a
-   per-tenant manifest object; resolvers read it from there (Phase 1:
-   config, documented as immutable until the manifest lands).
+9. shard_count is immutable per generation; the generation history is
+   append-only; the shard-index domain of hour `h` is `0..scan_count(h)`
+   (ADR-0052, online resharding, supersedes this item's original "immutable
+   per (tenant, signal) in v1"). The durable provisioning record
+   (`t/<tenant_hash>/<signal>/prov`, ADR-0050 §5) holds the scalar
+   `shard_count` and an append-only `generations` history; resolvers derive
+   the per-hour shard set from it. A reshard appends a new generation with a
+   future `activation_hour` under `CasVersion`; existing data is never moved
+   or re-keyed.
 
 10. Commit-record cache: keyed by full object key, entries validated
     against expected tenant_hash/signal/shard on hit, bounded per tenant,

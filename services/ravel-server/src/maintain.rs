@@ -466,7 +466,40 @@ pub async fn run_tick(
             );
             continue;
         }
-        for shard in 0..shard_count {
+
+        // Generation-aware scan range (ADR-0052 section 4): maintenance must
+        // compact and sweep every shard any generation ever wrote, not just
+        // `0..shard_count` (this process's static config value). The scan set
+        // is the union of every generation's range, i.e. the largest
+        // `shard_count` across the history: after an increase this covers the
+        // new, wider shards; after a decrease it keeps covering the old, wider
+        // shards until retention ages their hours out. Read fresh and uncached
+        // each tick (this is a separate read from the `validate_or_adopt`
+        // check above, which validates the scalar gen-0 count, not the scan
+        // range). An empty high shard lists cheaply and is tolerated. Absent
+        // record: the single implicit generation at the configured count.
+        let scan_shards =
+            match ravel_catalog::read_generations_from_store(store, tenant, signal).await {
+                Ok(Some(generations)) => generations
+                    .iter()
+                    .map(|g| g.shard_count)
+                    .max()
+                    .unwrap_or(shard_count),
+                Ok(None) => shard_count,
+                Err(err) => {
+                    crate::provisioning::note_provisioning_failure(&err);
+                    tracing::error!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        error = %err,
+                        "maintenance: shard-generation history read failed; skipping this \
+                         (tenant, signal) this tick rather than maintaining a possibly-truncated \
+                         shard range"
+                    );
+                    continue;
+                }
+            };
+        for shard in 0..scan_shards {
             match scan_and_maintain_with_memo(
                 memo, store, &clock, compactor, retention, &hold, *tenant, signal, shard,
             )
@@ -829,6 +862,135 @@ mod tests {
         publish::publish(store, &rec, &RetryPolicy::default())
             .await
             .expect("publish");
+    }
+
+    /// Publish one below-threshold (terminal) sealed bucket into a specific
+    /// `(tenant, Metrics, shard)` at ingest hour 0 (1970, always sealed vs the
+    /// real `WallClock`), for the resharding scan-range test. Mirrors
+    /// [`publish_terminal_bucket`] but lets the caller place data in a shard
+    /// index outside the process's static `shard_count`.
+    async fn publish_terminal_bucket_at_shard(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        shard: u32,
+    ) {
+        let tenant_hash = tenant.hash();
+        let metric = "up";
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, metric, &label_set).expect("series id"),
+            labels: label_set,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(u128::from(7_000 + shard));
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// ADR-0052 section 4: `run_tick` must maintain the post-reshard shard
+    /// range, not the pre-reshard one. With a provisioning record recording an
+    /// increase (generation 0 count 2, generation 1 count 4) and a bucket
+    /// placed in shard 3 -- outside the process's static `shard_count` of 2 --
+    /// the tick must still discover and evaluate that bucket. Under the old
+    /// static `0..shard_count` loop shard 3 was never scanned; the
+    /// generation-aware union range (max count across generations = 4) reaches
+    /// it.
+    #[tokio::test]
+    async fn run_tick_maintains_post_reshard_shard_range() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // Record generation 0 (count 2) before any out-of-range data exists,
+        // then append generation 1 (count 4) activating at hour 1.
+        ravel_catalog::validate_or_adopt(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            2,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        ravel_catalog::append_generation(&store, &tenant, Signal::Metrics, 4, 1, 0)
+            .await
+            .expect("append generation 1");
+
+        // A terminal bucket in shard 3: reachable only under the widened count.
+        publish_terminal_bucket_at_shard(&store, &tenant_id, 3).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // Static shard_count is 2, matching generation 0's count; the scan
+        // range must nonetheless cover shard 3 via the generation history.
+        let report = run_tick(
+            &store, &tenant, &compactor, &retention, 2, &mut memo, &safety,
+        )
+        .await;
+
+        assert_eq!(
+            report.already_done, 1,
+            "the shard-3 bucket (outside the static count-2 range) must be evaluated"
+        );
+        assert_eq!(
+            memo.len(),
+            1,
+            "exactly the shard-3 terminal bucket is memoized; the pre-reshard \
+             0..2 loop would have found nothing"
+        );
     }
 
     /// A second `run_tick` with the same memo (a second tick) skips the buckets

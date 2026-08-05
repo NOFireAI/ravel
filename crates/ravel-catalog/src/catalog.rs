@@ -207,6 +207,38 @@ impl Catalog {
         Ok(())
     }
 
+    /// The (tenant, signal)'s shard-generation history for the read-side scan
+    /// rule (ADR-0052 section 4), read fresh and uncached on every resolve
+    /// (and fold): a stale-in-the-wrong-direction cached view could silently
+    /// under-scan, so the scan set is always derived from the current record.
+    ///
+    /// When provisioning enforcement is off, there is no provisioning record
+    /// to consult and `shard_count` is a static process config, so this
+    /// returns the single implicit generation 0 at the configured count with
+    /// no store read: `scan_count` over it is `config.shard_count` for every
+    /// hour, exactly the pre-ADR-0052 `0..shard_count` fan-out. The many
+    /// in-crate and `ravel-query`/`ravel-sql` callers that build a `Catalog`
+    /// directly are therefore unchanged; only a process that opted into
+    /// enforcement (the server's `build_catalog`) reads the record and gets
+    /// generation-aware scanning. An absent record under enforcement is the
+    /// same single implicit generation (a tenant whose first write has not
+    /// landed yet).
+    pub(crate) async fn read_scan_generations(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+    ) -> Result<Vec<crate::provisioning::ShardGeneration>, CatalogError> {
+        if !self.enforce_provisioning {
+            return Ok(vec![implicit_generation_zero(self.config.shard_count)]);
+        }
+        match crate::provisioning::read_generations_from_store(self.store.as_ref(), tenant, signal)
+            .await?
+        {
+            Some(generations) => Ok(generations),
+            None => Ok(vec![implicit_generation_zero(self.config.shard_count)]),
+        }
+    }
+
     /// One store GET bounded by the resolve-wide in-flight semaphore (#278
     /// item 2). The permit is released the moment the GET resolves and is
     /// never held across another guarded request, so a resolve fanning out
@@ -544,6 +576,14 @@ impl Catalog {
         // it omits. A no-op unless enforcement was opted into.
         self.enforce_provisioning_once(tenant, signal).await?;
 
+        // The generation history for the per-hour scan rule (ADR-0052 section
+        // 4), read fresh (see `read_scan_generations`). A corrupt or misfiled
+        // record fails the resolve here as a hard `CatalogError`, exactly as
+        // `enforce_provisioning_once` above fails on a scalar mismatch: a
+        // malformed generation history must never be read as "assume
+        // generation 0" and silently under-scan.
+        let generations = self.read_scan_generations(tenant, signal).await?;
+
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
         let mut segments_pruned = 0u64;
 
@@ -558,9 +598,23 @@ impl Catalog {
             // the postings object is only ever consulted for an equality
             // `__name__` filter, so a query without one never fetches or
             // decodes it.
-            let window = self
-                .resolve_snapshot_window(tenant, signal, now_ns, name_filter.is_some(), accounting)
+            let (window, revalidated_generations) = self
+                .resolve_snapshot_window(
+                    tenant,
+                    signal,
+                    now_ns,
+                    name_filter.is_some(),
+                    &generations,
+                    accounting,
+                )
                 .await?;
+            // Finding 4: when head validation performed a one-shot record
+            // re-read, its fresher generation history (never staler than the
+            // one that validated the head) must drive the Phase 1 scan-set
+            // computation below too. Otherwise the listing suffix would scan
+            // the stale, narrower range the re-read exists to correct, silently
+            // omitting data that landed in a wider generation's shards.
+            let generations = revalidated_generations.unwrap_or(generations);
             let listing_start_hour = match &window {
                 Some(window) if window.watermark_hour >= window_start_hour => {
                     let snapshot_end_hour = window_end_hour.min(window.watermark_hour);
@@ -585,9 +639,20 @@ impl Catalog {
             // per-bucket maps are merged back in the buffered (input) order so
             // the resulting segment set is byte-identical to the sequential
             // pass before the final deterministic sort.
+            // Each hour's shard fan-out is its own `scan_count(h)` derived from
+            // the generation history (ADR-0052 section 4), not one static
+            // `shard_count` for the whole range: a hour before a reshard scans
+            // the old count, a hour at/after an increase scans the wider new
+            // count, and a hour in a decrease's slack window scans the retiring
+            // larger count so a straggler is still found.
             let mut bucket_coords = Vec::new();
-            for shard in 0..self.config.shard_count {
-                for hour in listing_start_hour..=window_end_hour {
+            for hour in listing_start_hour..=window_end_hour {
+                let scan = crate::provisioning::scan_count(
+                    &generations,
+                    hour,
+                    crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+                );
+                for shard in 0..scan {
                     bucket_coords.push((shard, hour));
                 }
             }
@@ -665,8 +730,31 @@ impl Catalog {
     pub fn estimated_catalog_requests(&self, range: TimeRange, now_ns: i64) -> u64 {
         match self.window_hour_bounds(range, now_ns) {
             Some((start_hour, end_hour)) => {
-                let hours = u64::from(end_hour - start_hour) + 1;
-                let list_requests = u64::from(self.config.shard_count).saturating_mul(hours);
+                // One LIST per (shard, hour) pair, but the per-hour shard
+                // fan-out is now `scan_count(h)`, not a constant (ADR-0052
+                // section 4), so this sums `scan_count(h)` over the window's
+                // hours instead of multiplying a single count.
+                //
+                // This is a pure, I/O-free planner input (ADR-0044 decision 3:
+                // computed before resolve runs, from inputs the planner already
+                // holds), so it cannot read the provisioning record `resolve`
+                // reads fresh. It sums over the process's configured baseline
+                // (the single implicit generation 0 at `shard_count`), which
+                // equals the pre-ADR-0052 `shard_count * hours`. After a
+                // reshard-increase the true per-hour fan-out `resolve` computes
+                // can exceed this; the value stays an advisory estimate, not a
+                // hard bound (the real fan-out is bounded by resolve's own
+                // generation-aware loop, which reads the record).
+                let generations = [implicit_generation_zero(self.config.shard_count)];
+                let mut list_requests: u64 = 0;
+                for hour in start_hour..=end_hour {
+                    let scan = crate::provisioning::scan_count(
+                        &generations,
+                        hour,
+                        crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+                    );
+                    list_requests = list_requests.saturating_add(u64::from(scan));
+                }
                 list_requests.saturating_add(SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND)
             }
             None => 0,
@@ -1149,6 +1237,21 @@ impl Catalog {
 /// carry `writer_epoch`/`writer_seq` == 0 and `writer_id` == nil, so they
 /// order by their record's `created_unix_ns` then, past the level tag, by
 /// `input_set_hash` then `part_index`.
+/// The single implicit generation 0 at `shard_count`, activation hour 0: the
+/// generation history of a (tenant, signal) with no reshard, and the fallback
+/// a read path uses when provisioning enforcement is off or no provisioning
+/// record exists yet (ADR-0052 section 1). `scan_count` over it is
+/// `shard_count` for every hour, identical to the pre-ADR-0052 `0..shard_count`
+/// fan-out.
+fn implicit_generation_zero(shard_count: u32) -> crate::provisioning::ShardGeneration {
+    crate::provisioning::ShardGeneration {
+        generation: 0,
+        shard_count,
+        activation_hour: 0,
+        appended_unix_ns: 0,
+    }
+}
+
 fn segment_sort_key(s: &SegmentRef) -> (i64, u64, u64, u32, Uuid, u8, [u8; 32], u32) {
     let (level_tag, input_set_hash, part_index) = match &s.level {
         SegmentLevel::L0 => (0u8, [0u8; 32], 0u32),
@@ -1543,6 +1646,196 @@ mod tests {
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
             .expect("enforcement off: resolve ignores the provisioning record");
+    }
+
+    /// Finding 2 (end to end): an older HEAD (`shard_generation_count` lower
+    /// than the reader's history) whose own watermark reaches into hours a
+    /// newer, wider generation was already active for must NOT be served
+    /// silently. The reader forces one record re-read and, finding the head
+    /// still inconsistent, fails closed with a loud `shard_count` mismatch --
+    /// never a completed query over the narrower range (which would silently
+    /// omit data that landed in the widened shards within the head's watermark).
+    #[tokio::test]
+    async fn resolve_rejects_older_head_reaching_unknown_generation_hours() {
+        let store = Arc::new(MemoryStore::new());
+        // gen0 count 4 @ hour 0, then an increase to count 8 @ hour 5.
+        crate::provisioning::validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            4,
+            0,
+            crate::provisioning::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        crate::provisioning::append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 5, 0)
+            .await
+            .expect("append generation 1");
+
+        // A HEAD that knew only generation 0 (shard_generation_count 1,
+        // shard_count 4) at watermark 10 -- well past gen1's activation at 5.
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as u32,
+            shard_count: 4,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: "unused-part-never-loaded".to_string(),
+                blake3: vec![0u8; 32],
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), Signal::Metrics),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(4))
+            .expect("catalog")
+            .with_provisioning_enforcement();
+        let now = 12 * NS_PER_HOUR;
+        let range = TimeRange {
+            start_ns: 0,
+            end_ns: now,
+        };
+        let err = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect_err(
+                "an older head reaching into an unknown generation's active hours must fail closed",
+            );
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "shard_count"),
+            other => panic!("expected a shard_count FieldMismatch, got {other:?}"),
+        }
+    }
+
+    /// Finding 4 (end to end): when head validation performs a one-shot record
+    /// re-read, the fresher generation history it validated against must drive
+    /// the Phase 1 listing scan set, not the stale view the resolve first read.
+    /// A `NotFoundBlip` on the resolve's own generation read makes its initial
+    /// view the single implicit generation 0 (count 4); the HEAD (folded knowing
+    /// the reshard, `shard_generation_count` 2) forces a re-read that recovers
+    /// the wide view (count 8). The query must then scan shard 5 -- in the
+    /// widened range, at an hour past the watermark -- and return the segment
+    /// there, not miss it by listing only `0..4`.
+    #[tokio::test]
+    async fn resolve_reread_widens_listing_scan_set() {
+        let inner = MemoryStore::new();
+        // gen0 count 4 @ 0, increase to count 8 @ hour 10.
+        crate::provisioning::validate_or_adopt(
+            &inner,
+            &tenant(),
+            Signal::Metrics,
+            4,
+            0,
+            crate::provisioning::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        crate::provisioning::append_generation(&inner, &tenant(), Signal::Metrics, 8, 10, 0)
+            .await
+            .expect("append generation 1");
+
+        // Data in shard 5 at hour 11 -- reachable only under the widened count 8.
+        let hour = 11u32;
+        let event_ts = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+        let record = publish_segment(&inner, 5, 1, hour, event_ts, event_ts, event_ts).await;
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+
+        // A valid, empty snapshot part at watermark 10, and a HEAD that knows
+        // both generations (shard_generation_count 2, fan-out ceiling 8).
+        let signal_num = signal::to_proto(Signal::Metrics) as u32;
+        let part_bytes = crate::snapshot_format::encode_part(tenant().0, signal_num, 8, 10, &[])
+            .expect("encode part");
+        let part_hash = *blake3::hash(&part_bytes).as_bytes();
+        let part_key = format!("t/{}/catalog/m/snap/empty.csnap", tenant().to_hex());
+        inner
+            .put(
+                &part_key,
+                Bytes::from(part_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put part");
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: part_key,
+                blake3: part_hash.to_vec(),
+                size: part_bytes.len() as u64,
+                entry_count: 0,
+                watermark_hour: 10,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 2,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        inner
+            .put(
+                &crate::fold::head_object_key(&tenant(), Signal::Metrics),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        // Blip the SECOND `/prov` GET (the resolve's own scan-generations read):
+        // GET #1 is enforcement's validate, #2 is scan-generations (blipped to
+        // NotFound -> the implicit gen0 view), #3 is the head-validation re-read
+        // (recovers the wide record).
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains("/prov")
+                .with_occurrence(ravel_object_store::fault::Occurrence::Nth(2)),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(4))
+            .expect("catalog")
+            .with_provisioning_enforcement();
+
+        let now = 12 * NS_PER_HOUR;
+        let range = TimeRange {
+            start_ns: 0,
+            end_ns: now,
+        };
+        let snapshot = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect("resolve must succeed once the re-read recovers the wide view");
+
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the blip must have fired, exercising the stale-then-re-read path"
+        );
+        assert!(
+            snapshot
+                .segments
+                .iter()
+                .any(|s| s.data_object_key == data_key),
+            "the shard-5 segment (in the widened range, past the watermark) must be \
+             returned: the re-read's wide generation view must drive the listing scan set"
+        );
     }
 
     /// Finding 2 regression: a `FreshNoData` result (no record yet) must not be

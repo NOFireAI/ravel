@@ -231,6 +231,26 @@ impl std::fmt::Display for GenerationDefect {
 /// shard key field (ADR-0052 section 7; `l0/0000/`..`l0/9999/`).
 pub const MAX_SHARD_COUNT: u32 = 10_000;
 
+/// The read-side scan slack window `S`, in ingest hours (ADR-0052 sections 3
+/// and 4). A flush pins its ingest-hour bucket `h` at wall-clock time `t`, but
+/// its records were routed up to `max_flush_delay` earlier and the flush lives
+/// at most `max_flush_lifetime`, plus inter-writer clock skew; ADR-0052 section
+/// 3 defines `S = ceil(max_flush_delay + max_flush_lifetime + max tolerated
+/// clock skew)` in hours. A straggler routed under a retiring (larger) count
+/// into an early hour of the successor generation therefore lands in a shard
+/// index above the successor's range, and the scan rule ([`scan_count`]) must
+/// keep the retiring generation's count in the scan set for `S` hours past the
+/// successor's activation so that straggler is still found. With today's ingest
+/// defaults (`max_flush_delay` 500ms + `max_flush_lifetime` 3600s), `S = 2`.
+///
+/// This is a manually-chosen constant local to `ravel-catalog`, deliberately
+/// not a cross-crate reference to `ravel-ingest`'s flush config:
+/// `ravel-catalog` must not depend on `ravel-ingest` (the dependency runs the
+/// other way). If ingest's flush bounds ever change materially, this constant
+/// must be revisited in lockstep; the derivation above is recorded so that
+/// review is possible.
+pub const DEFAULT_SCAN_SLACK_HOURS: u32 = 2;
+
 /// Nanoseconds per unix hour, the unit `activation_hour` and `ingest_hour_bucket`
 /// count in. Held here so the reshard append can derive the current hour from a
 /// `now_ns` reading without depending on ravel-ingest.
@@ -269,6 +289,97 @@ pub fn active_shard_count(generations: &[ShardGeneration], hour: u32) -> u32 {
         .max_by_key(|g| g.generation)
         .or_else(|| generations.first())
         .map(|g| g.shard_count)
+        .unwrap_or(1)
+}
+
+/// The read-side scan rule (ADR-0052 section 4): the size of the shard-index
+/// domain a reader must scan for ingest-hour bucket `hour`. The read-side
+/// sibling of [`active_shard_count`] (the write-side rule): same generation
+/// history, different formula. Normatively,
+///
+/// ```text
+/// scan_count(h) = max over generations g of count(g)
+///                 where activation_hour(g) <= h
+///                   and h < activation_hour(g+1) + S
+///                 (activation_hour of a nonexistent successor = infinity)
+/// ```
+///
+/// where `S` is `slack_hours` ([`DEFAULT_SCAN_SLACK_HOURS`]). A generation is
+/// in the scan set for hour `h` once it has activated (`activation_hour(g) <=
+/// h`) and until `S` hours past its successor's activation. The latest
+/// activated generation always qualifies (its nonexistent-or-future successor
+/// makes the upper bound infinite for it), so on an increase the wider new
+/// range already covers a straggler routed under the old, smaller count; on a
+/// decrease the retiring, larger count stays in the set for `S` hours so a
+/// straggler routed under it into an early successor hour is still found.
+///
+/// A pure function with no I/O, called per hour by the resolve fan-out
+/// (`catalog.rs`), the fold's bucket enumeration (`fold.rs`), and the maintain
+/// scan loop (`services/ravel-server`). `generations` must be the normalized,
+/// validated history [`read_generations`] returns (non-empty, dense,
+/// activation-increasing, generation 0 at `activation_hour` 0). Returns
+/// generation 0's count as a defensive floor for an empty slice (never a zero
+/// divisor / empty scan range), but a validated history is never empty and the
+/// floor branch is unreachable for one.
+pub fn scan_count(generations: &[ShardGeneration], hour: u32, slack_hours: u32) -> u32 {
+    let mut max_count = 0u32;
+    for (idx, g) in generations.iter().enumerate() {
+        if g.activation_hour > hour {
+            continue;
+        }
+        // A nonexistent successor activates at infinity, so the last generation
+        // (and any generation whose successor has not yet activated) has no
+        // upper bound. `u64` keeps `activation + slack` from overflowing `u32`.
+        let successor_activation = generations
+            .get(idx + 1)
+            .map_or(u64::MAX, |s| u64::from(s.activation_hour));
+        let upper = successor_activation.saturating_add(u64::from(slack_hours));
+        if u64::from(hour) < upper {
+            max_count = max_count.max(g.shard_count);
+        }
+    }
+    if max_count == 0 {
+        // Only reachable for an empty (never-validated) slice; a validated
+        // history always has generation 0 at activation_hour 0, which every
+        // hour satisfies, so the latest activated generation always qualifies.
+        generations.first().map_or(1, |g| g.shard_count)
+    } else {
+        max_count
+    }
+}
+
+/// The fold-time fan-out ceiling (ADR-0052 section 5): `max { count(g) :
+/// activation_hour(g) <= watermark_hour }`, with **no** slack-window upper
+/// bound. This is the value a fold stamps into `SnapshotHead.shard_count` /
+/// `SnapshotPartHeader.shard_count`, the union shard range a rebuild must list,
+/// and the value a reader must reproduce to validate a head. Both the writer
+/// (`fold::fold_shard_ceiling`) and the reader
+/// (`snapshot_resolve::head_generations_acceptable`) call this one function so
+/// the two can never diverge (the fix for the read/write ceiling disagreement:
+/// a decrease followed by a fold past the slack window used to have the writer
+/// stamp the pre-decrease count while the reader recomputed the narrower
+/// post-slack `scan_count`, hard-failing every query permanently).
+///
+/// Unlike [`scan_count`] -- a per-hour scan-set size that drops a retired
+/// generation once its slack window closes -- the ceiling is monotonic in the
+/// watermark: once a generation has activated at or before the watermark, its
+/// count is included forever. A HEAD summarizes every hour up to its watermark,
+/// including the hours in which a since-retired generation was the widest, so
+/// its parts already carry that generation's shards and the reader must expect
+/// the wider ceiling. The slack window never pulls in a generation whose
+/// activation is past the watermark, so no upper bound is needed here.
+///
+/// `generations` must be the normalized, validated history [`read_generations`]
+/// returns (non-empty, generation 0 at `activation_hour` 0). Returns 1 as a
+/// defensive floor for an empty (never-validated) slice, matching
+/// [`scan_count`]; a validated history always has generation 0 active for every
+/// hour, so the floor branch is unreachable for one.
+pub fn shard_ceiling(generations: &[ShardGeneration], watermark_hour: u32) -> u32 {
+    generations
+        .iter()
+        .filter(|g| g.activation_hour <= watermark_hour)
+        .map(|g| g.shard_count)
+        .max()
         .unwrap_or(1)
 }
 
@@ -375,6 +486,40 @@ pub fn read_generations_checked(
         });
     }
     read_generations(record, key)
+}
+
+/// Read and normalize a (tenant, signal)'s shard-generation history straight
+/// from the store, fresh and uncached, for the read-side scan rule (ADR-0052
+/// section 4). `Ok(None)` when no provisioning record exists yet: the caller
+/// treats absence as the single implicit generation 0 at its configured
+/// `shard_count`, identical to a pre-ADR-0050 process (and to an empty
+/// `generations` list, [`read_generations`]). A present record is fully
+/// version/misfile/history-checked via [`read_generations_checked`], so a
+/// corrupt or misfiled record fails closed rather than being read as
+/// "assume generation 0".
+///
+/// The read paths (resolve, fold, maintain) call this on every operation
+/// rather than caching a view (ADR-0052 section 4 design note): a
+/// stale-in-the-wrong-direction cached view could silently under-scan a query,
+/// and the operations are already GET-bounded, so the fresh GET is accepted in
+/// preference to a second staleness/caching policy with its own proof
+/// obligations. It does not route through the catalog's query-accounting GET
+/// funnel, matching the existing [`validate_or_adopt`] provisioning read.
+pub async fn read_generations_from_store(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+) -> Result<Option<Vec<ShardGeneration>>, ProvisioningError> {
+    let key = provisioning_key(tenant_hash, signal);
+    match read_record(store, &key).await? {
+        Some(record) => Ok(Some(read_generations_checked(
+            &record,
+            &key,
+            tenant_hash,
+            signal,
+        )?)),
+        None => Ok(None),
+    }
 }
 
 impl ProvisioningError {
@@ -1244,6 +1389,107 @@ mod tests {
         assert_eq!(active_shard_count(&gens, 199), 8, "just before gen2");
         assert_eq!(active_shard_count(&gens, 200), 2, "at gen2 activation");
         assert_eq!(active_shard_count(&gens, 10_000), 2, "far after the last");
+    }
+
+    /// `scan_count`: a single implicit generation scans its whole count for
+    /// every hour, exactly like the pre-ADR-0052 static `0..shard_count`.
+    #[test]
+    fn scan_count_single_generation() {
+        let gens = [sg(0, 4, 0)];
+        assert_eq!(scan_count(&gens, 0, DEFAULT_SCAN_SLACK_HOURS), 4);
+        assert_eq!(scan_count(&gens, 1_000, DEFAULT_SCAN_SLACK_HOURS), 4);
+    }
+
+    /// `scan_count` at an increase boundary: before the activation only the old
+    /// count is scanned; at and after it the new (wider) count is scanned. The
+    /// slack window adds nothing on an increase because the old, smaller count
+    /// is a subset of the new range, so the `max` is unchanged (ADR-0052
+    /// section 3: "Increase: no slack needed").
+    #[test]
+    fn scan_count_increase_boundary() {
+        // gen0 count 4 from hour 0; gen1 count 8 from hour 100. S = 2.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100)];
+        assert_eq!(scan_count(&gens, 99, 2), 4, "just before the increase");
+        assert_eq!(scan_count(&gens, 100, 2), 8, "at the increase activation");
+        assert_eq!(scan_count(&gens, 101, 2), 8, "just inside the slack window");
+        assert_eq!(scan_count(&gens, 102, 2), 8, "past the slack window");
+        assert_eq!(scan_count(&gens, 10_000, 2), 8, "far after the increase");
+    }
+
+    /// `scan_count` at a decrease boundary: the retiring, larger count must stay
+    /// in the scan set for exactly `S` hours past the successor's activation,
+    /// then drop to the new, smaller count (ADR-0052 section 3: "Decrease: the
+    /// retiring generation's count must remain in the scan set for `S` hours").
+    #[test]
+    fn scan_count_decrease_slack_window() {
+        // gen0 count 8 from hour 0; gen1 count 4 from hour 100. S = 2.
+        let gens = [sg(0, 8, 0), sg(1, 4, 100)];
+        assert_eq!(
+            scan_count(&gens, 99, 2),
+            8,
+            "before the decrease: old count"
+        );
+        assert_eq!(
+            scan_count(&gens, 100, 2),
+            8,
+            "at activation: straggler under the old count still scanned"
+        );
+        assert_eq!(
+            scan_count(&gens, 101, 2),
+            8,
+            "one hour into the slack window: old count still scanned"
+        );
+        assert_eq!(
+            scan_count(&gens, 102, 2),
+            4,
+            "exactly S hours past activation: slack closed, new count only"
+        );
+        assert_eq!(scan_count(&gens, 200, 2), 4, "far past the decrease");
+    }
+
+    /// `scan_count` with `S = 0`: the retiring count drops the instant the
+    /// successor activates, so a decrease has no straggler window at all. Pins
+    /// that the slack argument, not a hard-coded constant, controls the window.
+    #[test]
+    fn scan_count_zero_slack_has_no_straggler_window() {
+        let gens = [sg(0, 8, 0), sg(1, 4, 100)];
+        assert_eq!(scan_count(&gens, 99, 0), 8);
+        assert_eq!(
+            scan_count(&gens, 100, 0),
+            4,
+            "successor takes over immediately"
+        );
+    }
+
+    /// `scan_count` across three generations, an increase then a decrease, with
+    /// overlapping slack windows resolved by `max`.
+    #[test]
+    fn scan_count_three_generations() {
+        // gen0 count 4 @0; gen1 count 8 @100; gen2 count 2 @200. S = 2.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100), sg(2, 2, 200)];
+        assert_eq!(scan_count(&gens, 50, 2), 4);
+        assert_eq!(scan_count(&gens, 100, 2), 8, "increase to 8");
+        assert_eq!(scan_count(&gens, 199, 2), 8);
+        assert_eq!(
+            scan_count(&gens, 200, 2),
+            8,
+            "decrease boundary: gen1's 8 held by slack"
+        );
+        assert_eq!(scan_count(&gens, 201, 2), 8, "still inside gen1's slack");
+        assert_eq!(scan_count(&gens, 202, 2), 2, "slack closed: gen2's count");
+    }
+
+    /// A large `activation_hour` near `u32::MAX` must not overflow when the
+    /// slack is added: the arithmetic is done in `u64`.
+    #[test]
+    fn scan_count_no_overflow_near_u32_max() {
+        let gens = [sg(0, 4, 0), sg(1, 8, u32::MAX - 1)];
+        assert_eq!(
+            scan_count(&gens, u32::MAX, 2),
+            8,
+            "last generation, no successor"
+        );
+        assert_eq!(scan_count(&gens, 0, 2), 4);
     }
 
     /// The decode-compatibility test the ADR mandates: a record with the exact

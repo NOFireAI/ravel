@@ -25,9 +25,10 @@ pub use config::{
 pub use error::CatalogError;
 pub use fold::{FoldReport, Transaction};
 pub use provisioning::{
-    AbsentPolicy, GenerationDefect, MAX_SHARD_COUNT, PROVISIONING_FORMAT_VERSION,
-    ProvisioningCheck, ProvisioningError, ReshardOutcome, ShardGeneration, active_shard_count,
-    append_generation, provisioning_key, read_generations, read_generations_checked,
+    AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, GenerationDefect, MAX_SHARD_COUNT,
+    PROVISIONING_FORMAT_VERSION, ProvisioningCheck, ProvisioningError, ReshardOutcome,
+    ShardGeneration, active_shard_count, append_generation, provisioning_key, read_generations,
+    read_generations_checked, read_generations_from_store, scan_count, shard_ceiling,
     validate_or_adopt,
 };
 pub use snapshot::{SegmentLevel, SegmentRef, Snapshot};

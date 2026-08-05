@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::catalog::Catalog;
 use crate::error::CatalogError;
 use crate::fold::head_object_key;
+use crate::provisioning::{ShardGeneration, shard_ceiling};
 use crate::snapshot::{SegmentLevel, SegmentRef};
 use crate::snapshot_format::{self, DecodedPart, DecodedPostings, PartLimits, PostingsLimits};
 
@@ -175,20 +176,40 @@ impl Catalog {
     /// fetches or decodes it. Passing `false` is equivalent to postings being
     /// absent, which `extract_into` already handles by considering every
     /// entry.
+    /// Returns the resolved window (or `None` when no snapshot is usable) plus
+    /// the generation history the head was ultimately validated against when a
+    /// one-shot record re-read was performed (`Some(fresh)`), or `None` when
+    /// the head validated under the caller's passed-in `generations`. The
+    /// caller (`resolve_impl`) must build its Phase 1 scan set from `fresh`
+    /// whenever it is present, so the listing suffix is never scanned over a
+    /// staler generation view than the one that validated the head (Finding 4).
+    /// The re-read's fresher view is propagated even when the window itself
+    /// turns out unusable, so a fall-back-to-listing pass still scans the
+    /// correct range.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resolve_snapshot_window(
         &self,
         tenant: &TenantHash,
         signal: Signal,
         now_ns: i64,
         want_postings: bool,
+        generations: &[ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<Option<SnapshotWindow>, CatalogError> {
+    ) -> Result<(Option<SnapshotWindow>, Option<Vec<ShardGeneration>>), CatalogError> {
         let head_key = head_object_key(tenant, signal);
-        let Some(head) = self
-            .read_head(tenant, signal, &head_key, now_ns, false, accounting)
+        let Some((head, revalidated)) = self
+            .read_head(
+                tenant,
+                signal,
+                &head_key,
+                now_ns,
+                false,
+                generations,
+                accounting,
+            )
             .await?
         else {
-            return Ok(None);
+            return Ok((None, None));
         };
         match self.load_snapshot_parts(tenant, &head, accounting).await {
             PartLoadOutcome::Loaded(parts) => {
@@ -198,24 +219,39 @@ impl Catalog {
                 } else {
                     None
                 };
-                Ok(Some(SnapshotWindow {
-                    watermark_hour: head.watermark_hour,
-                    parts,
-                    postings,
-                }))
+                Ok((
+                    Some(SnapshotWindow {
+                        watermark_hour: head.watermark_hour,
+                        parts,
+                        postings,
+                    }),
+                    revalidated,
+                ))
             }
-            PartLoadOutcome::Unusable => Ok(None),
+            PartLoadOutcome::Unusable => Ok((None, revalidated)),
             PartLoadOutcome::IsolationBreach(err) => Err(err),
             PartLoadOutcome::NotFoundRace => {
                 // At most one HEAD re-read (docs/metric-index-plan.md 5.1
                 // step 2): bypass the TTL cache so a part GC'd since the
                 // cached HEAD was read is not raced again.
-                let Some(fresh_head) = self
-                    .read_head(tenant, signal, &head_key, now_ns, true, accounting)
+                let Some((fresh_head, fresh_revalidated)) = self
+                    .read_head(
+                        tenant,
+                        signal,
+                        &head_key,
+                        now_ns,
+                        true,
+                        generations,
+                        accounting,
+                    )
                     .await?
                 else {
-                    return Ok(None);
+                    return Ok((None, revalidated));
                 };
+                // Prefer the re-read HEAD's own re-validated generations; fall
+                // back to the first read's if the re-read validated under the
+                // passed-in view.
+                let revalidated = fresh_revalidated.or(revalidated);
                 match self
                     .load_snapshot_parts(tenant, &fresh_head, accounting)
                     .await
@@ -227,14 +263,19 @@ impl Catalog {
                         } else {
                             None
                         };
-                        Ok(Some(SnapshotWindow {
-                            watermark_hour: fresh_head.watermark_hour,
-                            parts,
-                            postings,
-                        }))
+                        Ok((
+                            Some(SnapshotWindow {
+                                watermark_hour: fresh_head.watermark_hour,
+                                parts,
+                                postings,
+                            }),
+                            revalidated,
+                        ))
                     }
                     PartLoadOutcome::IsolationBreach(err) => Err(err),
-                    PartLoadOutcome::Unusable | PartLoadOutcome::NotFoundRace => Ok(None),
+                    PartLoadOutcome::Unusable | PartLoadOutcome::NotFoundRace => {
+                        Ok((None, revalidated))
+                    }
                 }
             }
         }
@@ -352,13 +393,20 @@ impl Catalog {
     /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure
     /// short of a `shard_count` or `tenant_hash` mismatch is logged and
     /// folded into `None` (fall back to listing). A `shard_count` mismatch
-    /// is a loud error (docs/metric-index-plan.md 5.1 step 1: "shard_count
-    /// mismatch is a loud/hard error"), since it means this catalog's own
-    /// config disagrees with the index it is about to trust. A
-    /// `tenant_hash` mismatch is likewise loud (ADR-0050 §2): a HEAD naming
-    /// a different tenant is an isolation breach, so it hard-fails instead
-    /// of silently falling back to a listing pass that could still be
-    /// influenced by the wrong index.
+    /// is a loud error (docs/metric-index-plan.md 5.1 step 1), but under
+    /// ADR-0052 section 5 "mismatch" no longer means "not equal to this
+    /// process's static `shard_count`": the head's `shard_count` is the
+    /// fan-out ceiling at fold time, so it is validated against the ceiling
+    /// this reader computes from the generation history (`generations`) for
+    /// the head's watermark hour, and an older head that simply predates a
+    /// reshard (a lower `shard_generation_count`) is accepted because Phase 1
+    /// listing covers the newer hours it lacks. A head claiming more
+    /// generations than this reader knows forces exactly one fresh record
+    /// re-read before failing closed (see
+    /// [`Self::validate_head_against_generations`]). A `tenant_hash` mismatch
+    /// is likewise loud (ADR-0050 §2): a HEAD naming a different tenant is an
+    /// isolation breach, so it hard-fails instead of silently falling back to
+    /// a listing pass that could still be influenced by the wrong index.
     #[allow(clippy::too_many_arguments)]
     async fn read_head(
         &self,
@@ -367,8 +415,9 @@ impl Catalog {
         head_key: &str,
         now_ns: i64,
         bypass_cache: bool,
+        generations: &[ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<Option<Arc<SnapshotHead>>, CatalogError> {
+    ) -> Result<Option<(Arc<SnapshotHead>, Option<Vec<ShardGeneration>>)>, CatalogError> {
         if !bypass_cache
             && let Some(cached) = self.head_cache().get(
                 tenant,
@@ -378,7 +427,9 @@ impl Catalog {
                 accounting,
             )
         {
-            return Ok(Some(cached));
+            // A cached head was validated when first admitted; the caller keeps
+            // its own generation view (`None`).
+            return Ok(Some((cached, None)));
         }
 
         let got = match self.guarded_get(head_key, GetRange::Full, accounting).await {
@@ -409,14 +460,9 @@ impl Catalog {
             tracing::warn!(key = %head_key, "HEAD signal mismatch, falling back to listing");
             return Ok(None);
         }
-        if head.shard_count != self.config().shard_count {
-            return Err(CatalogError::FieldMismatch {
-                key: head_key.to_string(),
-                field: "shard_count",
-                expected: self.config().shard_count.to_string(),
-                actual: head.shard_count.to_string(),
-            });
-        }
+        let revalidated = self
+            .validate_head_against_generations(tenant, signal, head_key, &head, generations)
+            .await?;
 
         let bytes = got.data.len() as u64;
         let head = Arc::new(head);
@@ -428,7 +474,65 @@ impl Catalog {
             now_ns,
             self.config().head_cache_capacity,
         );
-        Ok(Some(head))
+        Ok(Some((head, revalidated)))
+    }
+
+    /// Validate a HEAD's `shard_count` against the generation history under
+    /// the ADR-0052 section 5 rule. `generations` is the reader's already-read
+    /// view. A head is accepted if its `shard_count` equals the ceiling this
+    /// reader computes for the head's watermark hour, or if the head predates
+    /// the reader's view (`shard_generation_count` lower than the reader's
+    /// generation count -- Phase 1 listing covers the newer hours it lacks).
+    ///
+    /// Two situations force exactly one fresh, uncached record re-read before
+    /// failing closed:
+    ///
+    /// - the head claims *more* generations than the reader knows: the reader's
+    ///   record view may be stale, and serving from a fewer-generation view
+    ///   could under-scan; or
+    /// - the head knew *fewer* generations than the reader but its own
+    ///   watermark reaches into hours an unknown-to-the-head generation was
+    ///   already active for (Finding 2): silently accepting would omit data
+    ///   that landed in the newer, possibly-wider range within the head's own
+    ///   watermark. `head_generations_acceptable` already rejected this case,
+    ///   so it lands here rather than being served.
+    ///
+    /// Both reduce to "the head's generation count differs from the reader's".
+    /// A head whose generation count *equals* the reader's yet whose ceiling
+    /// disagrees is a genuine mismatch (not a staleness case): fail closed
+    /// immediately without the extra read.
+    ///
+    /// Returns the generation history the head was ultimately validated
+    /// against: `None` when the head was acceptable under the passed-in
+    /// `generations` (the caller keeps its own view), or `Some(fresh)` when a
+    /// re-read was performed and accepted -- the caller must then use `fresh`
+    /// (never staler than the passed-in view) for its Phase 1 scan set, so the
+    /// listing suffix is never scanned over a staler generation history than
+    /// the one that validated the head (Finding 4).
+    async fn validate_head_against_generations(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        head_key: &str,
+        head: &SnapshotHead,
+        generations: &[ShardGeneration],
+    ) -> Result<Option<Vec<ShardGeneration>>, CatalogError> {
+        if head_generations_acceptable(head, generations) {
+            return Ok(None);
+        }
+        let reader_gen_count = generations.len() as u32;
+        if head.shard_generation_count == reader_gen_count {
+            // Same generation count, ceiling disagrees: a genuine mismatch, not
+            // a staleness case, so fail closed now without a re-read.
+            return Err(head_shard_count_mismatch(head_key, head, generations));
+        }
+        // Re-read once, bypassing any caching (the read is uncached by
+        // construction), and recompute before failing.
+        let fresh = self.read_scan_generations(tenant, signal).await?;
+        if head_generations_acceptable(head, &fresh) {
+            return Ok(Some(fresh));
+        }
+        Err(head_shard_count_mismatch(head_key, head, &fresh))
     }
 
     /// Load and verify every part HEAD names, through the immutable part
@@ -551,6 +655,83 @@ enum OnePartOutcome {
     Unusable,
     /// This part's header names a foreign tenant (ADR-0050 §2, #527).
     IsolationBreach(CatalogError),
+}
+
+/// The ADR-0052 section 5 acceptance predicate for a HEAD's `shard_count`
+/// against a reader's generation view. A head is acceptable if either:
+///
+/// - its `shard_count` equals the reader's fan-out ceiling
+///   ([`shard_ceiling`], the same function the writer stamped it with) for the
+///   head's watermark hour; or
+/// - it is an *older* head (it knew fewer generations than the reader) **and**
+///   its watermark predates the activation of the first generation it didn't
+///   know about, so Phase 1 listing genuinely covers every hour the head lacks.
+///
+/// The watermark check on the older-head arm is the Finding 2 fix: without it,
+/// this arm accepted any lower-`shard_generation_count` head unconditionally,
+/// so a head whose own watermark reached into hours a newer, wider generation
+/// was already active for would be served silently, omitting data that landed
+/// in the new shard range within the head's own watermark -- a completed query
+/// with a wrong answer.
+///
+/// A pre-ADR-0052 head carries `shard_generation_count` 0 as the "absent"
+/// sentinel, yet it still knew the single implicit generation 0, so it is
+/// treated as having known one generation: the first generation it didn't know
+/// about is index `max(shard_generation_count, 1)`. (A modern fold stamps
+/// `shard_generation_count = generations.len()`, so both 0 and 1 mean "knew
+/// generation 0 only"; the first unknown is index 1 for both.) When that index
+/// is at or past the end of the reader's history, the head claims to know
+/// every generation the reader does -- there is no unknown generation left to
+/// blame the ceiling disagreement on, so it is NOT covered by the
+/// older-head/staleness rationale at all. This is reachable in practice for a
+/// pre-ADR-0052 head (`shard_generation_count` absent, i.e. 0) read by a
+/// reader whose own history is exactly one generation deep: the disagreement
+/// is then a genuine `shard_count` mismatch between the head and generation
+/// 0's own count, the same class of error the pre-ADR-0052 equality check
+/// always raised loudly. Trusting it here would silently omit data below the
+/// head's own watermark, for both enforcing and non-enforcing readers -- a
+/// completed query returning an incomplete, unexplained answer.
+fn head_generations_acceptable(head: &SnapshotHead, generations: &[ShardGeneration]) -> bool {
+    if head.shard_count == shard_ceiling(generations, head.watermark_hour) {
+        return true;
+    }
+    let reader_gen_count = generations.len() as u32;
+    if head.shard_generation_count >= reader_gen_count {
+        // Not an older head (it knew at least as many generations as the
+        // reader): the ceiling disagreement is a genuine mismatch, not a
+        // covered-by-listing staleness case.
+        return false;
+    }
+    // Older head. Safe only if its watermark predates the activation of the
+    // first generation it didn't know about; otherwise its parts don't cover
+    // the wider range those unknown-to-the-head hours were written under.
+    let first_unknown = head.shard_generation_count.max(1) as usize;
+    match generations.get(first_unknown) {
+        Some(first_unknown_gen) => head.watermark_hour < first_unknown_gen.activation_hour,
+        // No generation past `first_unknown` exists: there's nothing unknown
+        // to explain the disagreement away, so it's an unexplained mismatch,
+        // not a covered-by-listing staleness case. Reject, matching the
+        // `>=` branch above.
+        None => false,
+    }
+}
+
+/// The loud `FieldMismatch` a HEAD that fails [`head_generations_acceptable`]
+/// yields, naming the reader's computed ceiling as `expected` and the head's
+/// own `shard_count` as `actual`. Uses the same [`shard_ceiling`] the writer
+/// stamped the head with. Stays excluded from listing fallback, exactly as the
+/// equality check it replaces.
+fn head_shard_count_mismatch(
+    head_key: &str,
+    head: &SnapshotHead,
+    generations: &[ShardGeneration],
+) -> CatalogError {
+    CatalogError::FieldMismatch {
+        key: head_key.to_string(),
+        field: "shard_count",
+        expected: shard_ceiling(generations, head.watermark_hour).to_string(),
+        actual: head.shard_count.to_string(),
+    }
 }
 
 fn build_segment_ref_from_entry(
@@ -725,6 +906,7 @@ mod tests {
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             postings: None,
+            shard_generation_count: 1,
         }
     }
 
@@ -867,6 +1049,7 @@ mod tests {
             folder_id: Uuid::new_v4().into_bytes().to_vec(),
             created_unix_ns: 0,
             postings: None,
+            shard_generation_count: 1,
         };
         let head_bytes = snapshot_format::encode_head(&head).expect("encode head");
         let head_key = head_object_key(&tenant, Signal::Metrics);
@@ -950,5 +1133,189 @@ mod tests {
             other => panic!("expected FieldMismatch, got {other:?}"),
         }
         assert_eq!(catalog.isolation_breaches(), 1);
+    }
+
+    // ---- ADR-0052 section 5: HEAD generation-aware validation predicate ----
+
+    fn sg(generation: u32, shard_count: u32, activation_hour: u32) -> ShardGeneration {
+        ShardGeneration {
+            generation,
+            shard_count,
+            activation_hour,
+            appended_unix_ns: 0,
+        }
+    }
+
+    /// The ADR-0052 section 5 acceptance predicate, covering: a head whose
+    /// shard_count equals the reader's ceiling (accepted); a head with the
+    /// wrong count and no lower generation count (rejected); a genuinely older
+    /// head (lower `shard_generation_count`, including the pre-ADR-0052
+    /// absent/0 case) whose watermark predates the activation of the
+    /// generation(s) it didn't know about (accepted -- Phase 1 listing covers
+    /// those newer hours); a head with a lower `shard_generation_count` but a
+    /// count mismatch that no unknown-to-it generation can explain, because the
+    /// reader's own history has nothing past what the head already claims to
+    /// know (rejected -- not covered by the older-head rationale, an
+    /// unexplained mismatch); and a head claiming more generations than the
+    /// reader (rejected by the predicate, which routes the caller to the
+    /// one-shot record re-read).
+    #[test]
+    fn head_generations_predicate_covers_all_arms() {
+        let mut head = head_with_tenant(tenant().0);
+        head.watermark_hour = 50;
+        head.parts[0].watermark_hour = 50;
+
+        // Single-generation reader (no reshard): ceiling for any hour is 4.
+        let one = [sg(0, 4, 0)];
+        head.shard_count = 4;
+        head.shard_generation_count = 1;
+        assert!(
+            head_generations_acceptable(&head, &one),
+            "shard_count equals the ceiling"
+        );
+
+        head.shard_count = 8;
+        head.shard_generation_count = 1;
+        assert!(
+            !head_generations_acceptable(&head, &one),
+            "wrong count, not an older head: rejected"
+        );
+
+        head.shard_generation_count = 0;
+        assert!(
+            !head_generations_acceptable(&head, &one),
+            "sgc 0 (pre-ADR-0052 absent sentinel) against a single-generation \
+             reader has no unknown generation to explain the count mismatch: \
+             not covered by the older-head rationale, so rejected, not silently \
+             trusted (NEW-1 regression: this exact case used to be accepted, \
+             silently dropping data below the head's watermark)"
+        );
+
+        // Two-generation reader (an increase 4 -> 8 at hour 100).
+        let two = [sg(0, 4, 0), sg(1, 8, 100)];
+        // At the head's watermark 50 the ceiling is still 4 (gen1 not yet
+        // active), so a head that recorded 4 with the full generation count is
+        // accepted.
+        head.shard_count = 4;
+        head.shard_generation_count = 2;
+        assert!(
+            head_generations_acceptable(&head, &two),
+            "ceiling at the watermark hour matches"
+        );
+
+        head.shard_count = 99;
+        head.shard_generation_count = 2;
+        assert!(
+            !head_generations_acceptable(&head, &two),
+            "same generation count, wrong ceiling: rejected"
+        );
+
+        head.shard_count = 99;
+        head.shard_generation_count = 3;
+        assert!(
+            !head_generations_acceptable(&head, &two),
+            "head claims more generations than the reader and its count does not \
+             match: predicate rejects so the caller forces one record re-read \
+             before failing closed"
+        );
+    }
+
+    /// Finding 1: after a decrease followed by a fold past the slack window, the
+    /// fold-time ceiling the writer stamps and the ceiling the reader recomputes
+    /// must agree, or every query hard-fails forever. gen0 count 4 @ hour 0,
+    /// gen1 count 2 @ hour 500000 (a decrease); a fold at watermark 500010 is
+    /// well past the slack window (500000 + S). The writer's shared
+    /// `shard_ceiling` and the reader's acceptance predicate now use the same
+    /// formula, so the head validates.
+    #[test]
+    fn decrease_past_slack_head_validates_against_reader_ceiling() {
+        let gens = [sg(0, 4, 0), sg(1, 2, 500_000)];
+        let watermark = 500_010;
+
+        // The writer (fold) stamps the union-max ceiling: 4 (gen0, activated at
+        // or before the watermark, is included with no slack cutoff).
+        let ceiling = shard_ceiling(&gens, watermark);
+        assert_eq!(ceiling, 4);
+
+        // The point-in-time scan_count at the watermark drops the retired gen0
+        // once its slack window has closed -> 2. Before the fix the reader
+        // validated the head against this, disagreeing with the writer's 4 and
+        // hard-failing every query permanently.
+        assert_eq!(
+            crate::provisioning::scan_count(
+                &gens,
+                watermark,
+                crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+            ),
+            2,
+            "scan_count at the watermark excludes the slack-expired generation"
+        );
+
+        let mut head = head_with_tenant(tenant().0);
+        head.watermark_hour = watermark;
+        head.parts[0].watermark_hour = watermark;
+        head.shard_count = ceiling; // exactly what the (fixed) writer stamps
+        head.shard_generation_count = gens.len() as u32;
+
+        assert!(
+            head_generations_acceptable(&head, &gens),
+            "a head stamped with the writer's ceiling must validate against the \
+             reader's ceiling computed the same way"
+        );
+    }
+
+    /// Finding 2: the older-head accept arm must not accept a head whose own
+    /// watermark reaches into hours an unknown-to-the-head generation was
+    /// already active for. Reader knows gen0 (count 4 @ 0) and gen1 (count 8 @
+    /// 500000, an increase); a non-enforcing fold wrote a head that knew only
+    /// gen0 (`shard_generation_count` 1) at watermark 500002 -- past gen1's
+    /// activation. Accepting it would silently omit data that landed in the new
+    /// range within the head's own watermark.
+    #[test]
+    fn older_head_reaching_unknown_generation_active_hours_is_rejected() {
+        let gens = [sg(0, 4, 0), sg(1, 8, 500_000)];
+        let mut head = head_with_tenant(tenant().0);
+        head.shard_count = 4; // stamped under gen0 only
+        head.shard_generation_count = 1;
+
+        head.watermark_hour = 500_002; // reaches past gen1's activation
+        head.parts[0].watermark_hour = 500_002;
+        assert!(
+            !head_generations_acceptable(&head, &gens),
+            "an older head whose watermark reaches into an unknown generation's \
+             active hours must not be silently accepted"
+        );
+
+        // The same older head with a watermark BEFORE gen1 activated is safe:
+        // Phase 1 listing covers the newer hours it lacks. Make shard_count
+        // disagree with the ceiling so acceptance can only come from the
+        // older-head arm, not the equality arm.
+        head.shard_count = 999;
+        head.watermark_hour = 499_999;
+        head.parts[0].watermark_hour = 499_999;
+        assert!(
+            head_generations_acceptable(&head, &gens),
+            "an older head whose watermark predates the unknown generation's \
+             activation is safe to accept"
+        );
+
+        // A pre-ADR-0052 head (shard_generation_count 0 sentinel) still knew the
+        // implicit generation 0, so the first generation it didn't know is index
+        // 1 (not 0): the same watermark rule applies, not an off-by-one reject.
+        head.shard_generation_count = 0;
+        head.shard_count = 4;
+        head.watermark_hour = 499_999;
+        head.parts[0].watermark_hour = 499_999;
+        assert!(
+            head_generations_acceptable(&head, &gens),
+            "a pre-reshard head with a watermark predating gen1 is accepted"
+        );
+        head.watermark_hour = 500_002;
+        head.parts[0].watermark_hour = 500_002;
+        assert!(
+            !head_generations_acceptable(&head, &gens),
+            "a pre-reshard head whose watermark reaches into gen1's active hours \
+             is rejected, same as a modern older head"
+        );
     }
 }

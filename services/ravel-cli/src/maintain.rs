@@ -16,7 +16,7 @@ use ravel_maintain::{
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::{CompactionRecord, RetentionTombstone};
-use ravel_types::{Signal, TenantId};
+use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
 /// CLI signal selector for the `--signal` flag.
@@ -241,6 +241,39 @@ pub async fn status(
     Ok(())
 }
 
+/// The generation-aware shard scan range for one (tenant, signal): the union
+/// of every generation's shard range, i.e. the largest `shard_count` across the
+/// tenant's shard-generation history (ADR-0052 section 4). This mirrors the
+/// server maintain loop (`ravel_server::maintain::run_tick`): after an increase
+/// it covers the new, wider shards; after a decrease it keeps covering the old,
+/// wider shards until retention ages their hours out. An empty high shard lists
+/// cheaply and is tolerated by the per-shard loops. Read fresh and uncached.
+///
+/// Fail-closed on a read error: a CLI maintenance pass over a possibly-truncated
+/// shard range would silently skip live shards, so this refuses rather than
+/// scanning `0..configured_shards` blindly. An absent record (`Ok(None)`) is
+/// the single implicit generation at the configured `--shards`, unchanged from
+/// pre-ADR-0052 behavior.
+async fn generation_scan_shards(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    configured_shards: u32,
+) -> anyhow::Result<u32> {
+    match ravel_catalog::read_generations_from_store(store, tenant, signal).await {
+        Ok(Some(generations)) => Ok(generations
+            .iter()
+            .map(|g| g.shard_count)
+            .max()
+            .unwrap_or(configured_shards)),
+        Ok(None) => Ok(configured_shards),
+        Err(err) => Err(anyhow::anyhow!(
+            "shard-generation history read failed for signal {signal:?}: {err}; refusing to \
+             scan a possibly-truncated shard range (ADR-0052 section 4)"
+        )),
+    }
+}
+
 /// `maintain audit-versions`: a safety audit of the on-object format versions
 /// live for a tenant, across all three signals (issue #115 rescoped text,
 /// extended to spans by #355). For RSEG (metrics) it confirms the ADR-0027
@@ -278,9 +311,15 @@ pub async fn audit_versions(
                 ));
             }
         };
+        // Generation-aware scan range (ADR-0052 section 4), not the static
+        // `--shards`: a reshard-increase widens the live shard set, and this
+        // audit must visit every shard any generation ever wrote or it would
+        // silently skip live objects in the new range.
+        let scan_shards =
+            generation_scan_shards(store.as_ref(), &tenant_hash, signal, shards).await?;
         // version -> (l0_count, l1_count)
         let mut hist: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
-        for shard in 0..shards {
+        for shard in 0..scan_shards {
             let prefix = keys::commit_shard_prefix(&tenant_hash, signal, shard)
                 .map_err(|err| anyhow::anyhow!("failed to build shard prefix: {err}"))?;
             let metas = list_all(store.as_ref(), &prefix)
@@ -436,7 +475,13 @@ pub async fn verify_custody(
 
     for signal in [Signal::Metrics, Signal::Logs] {
         println!("== signal {:?} ==", signal);
-        for shard in 0..shards {
+        // Generation-aware scan range (ADR-0052 section 4), not the static
+        // `--shards`: custody must be verified across every shard any
+        // generation ever wrote, so a reshard-increase's new shards are not
+        // silently skipped.
+        let scan_shards =
+            generation_scan_shards(store.as_ref(), &tenant_hash, signal, shards).await?;
+        for shard in 0..scan_shards {
             // A compaction record's input identities carry only
             // (writer_id, epoch, seq), never a content hash, so they cannot be
             // reconstructed into a content-addressed L0 key directly. List the
@@ -665,4 +710,98 @@ pub fn decode_retention_tombstone(bytes: &[u8]) -> anyhow::Result<()> {
     println!("retention_window_ns: {}", tombstone.retention_window_ns);
     println!("record_count_observed: {}", tombstone.record_count_observed);
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::memory::MemoryStore;
+
+    /// Publish one commit record (and its data object) at `shard` for Metrics
+    /// with the given `segment_format_version`, so the version audit has a live
+    /// object to classify.
+    async fn publish_commit_at(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        shard: u32,
+        version: u32,
+    ) {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let ingest_hour_bucket = 100u32;
+        // The commit builder cross-checks ingest_hour_bucket against
+        // created_unix_ns's hour, so keep them consistent.
+        let created_unix_ns = i64::from(ingest_hour_bucket) * NS_PER_HOUR;
+        let writer_id = Uuid::new_v4();
+        let payload = format!("seg-{shard}-{writer_id}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: version,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        publish::put_data_object(store, &data_key, bytes::Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &commit, &RetryPolicy::default())
+            .await
+            .expect("publish commit record");
+    }
+
+    /// Finding 5: the CLI `maintain audit-versions` loop must visit the
+    /// generation-aware shard range (ADR-0052 section 4), not the static
+    /// `--shards`. With an increase reshard (gen0 count 2, gen1 count 4) and a
+    /// live object in shard 3 -- outside `--shards=2` -- the audit must still
+    /// list shard 3 and surface the unsupported-version anomaly. Under the old
+    /// static `0..shards` loop shard 3 was never listed and the audit passed.
+    #[tokio::test]
+    async fn audit_versions_visits_post_reshard_shard_range() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-reshard";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        ravel_catalog::validate_or_adopt(
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            2,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        ravel_catalog::append_generation(store.as_ref(), &tenant_hash, Signal::Metrics, 4, 1, 0)
+            .await
+            .expect("append generation 1");
+
+        // An unsupported-version live object in shard 3 (reachable only under
+        // the widened count 4).
+        publish_commit_at(&store, &tenant_hash, 3, 99).await;
+
+        let err = audit_versions(store.clone(), tenant, 2)
+            .await
+            .expect_err("audit must visit the post-reshard shard 3 and find the anomaly");
+        assert!(
+            err.to_string().contains("unsupported version"),
+            "expected an unsupported-version anomaly, got: {err}"
+        );
+    }
 }

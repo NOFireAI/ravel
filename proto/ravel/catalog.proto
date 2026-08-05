@@ -47,6 +47,15 @@ message SnapshotHead {
   // postings index has been built yet, or when the last fold's postings
   // build failed; readers must never treat absence as an error.
   SnapshotPostingsRef postings = 9;
+  // Additive, ADR-0052 section 5 (online resharding). Number of shard
+  // generations known at fold time. shard_count (field 4) is reinterpreted
+  // as the fan-out ceiling at fold time (max scan_count over hours up to the
+  // watermark); this field lets a reader tell an older, pre-reshard head
+  // (lower generation count, or absent/0 for a head written before ADR-0052)
+  // from one that claims more generations than the reader's own provisioning
+  // record view. Absent/0 = pre-reshard head; readers must never treat
+  // absence as an error.
+  uint32 shard_generation_count = 10;
 }
 
 message SnapshotPartRef {
