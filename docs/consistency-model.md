@@ -218,6 +218,58 @@ ingestion.
   is always safe. Raising the admission lag alone admits records the listing
   window then fails to discover on any non-token query.
 
+## Online resharding (ADR-0052)
+
+`shard_count` is changeable online, per generation, with ingest running. A
+reshard never moves, rewrites, or re-keys existing data: it appends a new
+`(generation, shard_count, activation_hour)` entry to the tenant's provisioning
+record, and only data ingested from `activation_hour` onward routes with the new
+count. Old generations stay readable under their original shard indices until
+retention ages their hours out. The operator command is:
+
+```
+ravel-cli provision reshard --tenant <t> --signal <s> --shard-count <n> [--lead-hours <L>]
+```
+
+- **Activation lead time.** Activation is denominated in ingest-hour buckets and
+  is placed `L` hours in the future: `activation_hour = now_hour + L`. `L` must
+  satisfy `L >= ceil(C) + 1` hours, where `C` is the router's provisioning-record
+  refresh interval (default 60 s, so the floor is 2 hours). The CLI refuses a
+  shorter lead. The reason: every live writer re-reads the record at least once
+  per `C`, so a lead of at least `ceil(C) + 1` guarantees each writer either
+  observes the new generation before it activates or has already fail-stopped on
+  record staleness. Never route past an activation a writer has not seen.
+
+- **What a writer observes.** A writer routes new data with the count of the
+  latest generation whose `activation_hour <= hour(now)`. It refreshes its view
+  of the record on the bounded interval `C`; a writer whose cached view is older
+  than `C` and cannot re-read the record fails the flush closed (typed error,
+  metrics counter), rather than route on a stale view. So a writer during the
+  transition either sees the new generation before it activates or fail-stops --
+  it never silently writes to the wrong shard set.
+
+- **What a reader observes.** A reader derives its per-hour scan set from the
+  generation history read fresh on every resolve, so its fan-out widens (increase)
+  or narrows (decrease) automatically once its own record view is current, with
+  no coordination with writers. A query spanning the activation hour returns
+  complete results from both the old and new shard ranges: the query engine
+  already merges a series' samples from any set of segments by series identity,
+  and the scan rule guarantees every written shard index for each hour is listed.
+  A snapshot HEAD folded before the reshard (a lower generation count than the
+  reader's) is accepted, not rejected, when its watermark predates the activation
+  of the first generation it did not know about: the reader lists the newer hours
+  the HEAD predates. A pre-reshard HEAD whose watermark instead reaches into hours
+  an unknown generation was already active for is rejected loudly (fail-closed
+  `FieldMismatch`), because its parts cannot carry the wider shard range those
+  hours were written under; serving it would silently omit data below its own
+  watermark.
+
+Commit tokens are unaffected: a token minted under any generation resolves
+forever, because token resolution reconstructs the exact key from the token's own
+fields and never consults `shard_count` (ADR-0052 section 6). Read-your-write
+holds across a reshard in either direction. See docs/ingest.md for the
+decrease-specific straggler slack window.
+
 ## Crash matrix (strict mode)
 
 | Crash point | Data object | Commit record | Ack | Outcome |
