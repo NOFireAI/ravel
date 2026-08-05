@@ -404,6 +404,7 @@ fn base_head() -> SnapshotHead {
         postings: None,
         folder_id: vec![0x33; 16],
         created_unix_ns: 1_000,
+        shard_generation_count: 1,
     }
 }
 

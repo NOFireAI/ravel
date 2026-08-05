@@ -56,19 +56,26 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
 
 /// Catalog configuration.
 ///
-/// `shard_count` is immutable per (tenant, signal) (ADR-0010 §9): once
-/// segments for a (tenant, signal) exist, changing this value is a data-loss
-/// operation (segments already routed to a shard index become unreachable if
-/// the shard count changes) and is forbidden. It is no longer merely a static
-/// process config that resolvers trust blindly: ADR-0050 section 5 makes it a
-/// durable, startup-checked property. A (tenant, signal)'s first write pins the
-/// configured value in an immutable provisioning record at
+/// `shard_count` is immutable per generation; the generation history is
+/// append-only; the shard-index domain of hour `h` is `0..scan_count(h)`
+/// (ADR-0052, online resharding, superseding ADR-0010 §9's "immutable per
+/// (tenant, signal)"). Existing data is never moved or re-keyed by a reshard;
+/// a reshard appends a new `(generation, shard_count, activation_hour)` entry
+/// to the durable provisioning record under `CasVersion`, and readers derive
+/// the per-hour shard fan-out from that history via
+/// [`crate::scan_count`] rather than from this single value.
+///
+/// This field is the process's configured baseline, equal to generation 0's
+/// count. It is not merely a static config that resolvers trust blindly:
+/// ADR-0050 section 5 makes it a durable, startup-checked property. A
+/// (tenant, signal)'s first write pins it in a provisioning record at
 /// `t/<tenant_hash>/<sig>/prov` ([`crate::validate_or_adopt`]); every later
-/// ingest, catalog, and maintain touch validates this configured value against
-/// that record and refuses (static tenant) or fails the request (dynamic
-/// tenant) on disagreement, rather than silently resolving over a subset of
-/// shards. This field is therefore the configured value validated against the
-/// durable record, not an unchecked source of truth.
+/// ingest, catalog, and maintain touch validates this configured value
+/// against that record's scalar `shard_count` and refuses (static tenant) or
+/// fails the request (dynamic tenant) on disagreement. The read-side scan set
+/// for any hour, however, comes from the generation history, not this field,
+/// so a resharded tenant is resolved over the correct per-hour shard range
+/// even though this configured baseline never changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogConfig {
     /// Number of shards for the (tenant, signal) this catalog serves. See

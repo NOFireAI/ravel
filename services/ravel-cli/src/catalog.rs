@@ -29,8 +29,15 @@ pub async fn fold(
         shard_count,
         ..CatalogConfig::default()
     };
+    // Enforcing, exactly as the server's query path (`ravel_server::query`) is:
+    // an enforcing fold reads the tenant's real shard-generation history and
+    // stamps a correct `shard_generation_count` and fan-out ceiling, instead of
+    // short-circuiting to the single implicit generation 0 and enumerating only
+    // `0..--shards` (ADR-0052 sections 4/5, Finding 3). Without this the fold is
+    // blind to any reshard and writes an under-scanning HEAD.
     let catalog = ravel_catalog::Catalog::new(store, catalog_config)
-        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
+        .with_provisioning_enforcement();
 
     let tenant_hash = TenantId::new(tenant).hash();
     let now = crate::now_ns()?;
@@ -256,4 +263,63 @@ pub async fn verify(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow:
     }
     println!("catalog verify: snapshot matches the sealed commit history");
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// Finding 3: the CLI `catalog fold` path must be enforcing, so it reads the
+    /// tenant's real shard-generation history and stamps a correct
+    /// `shard_generation_count`, rather than short-circuiting to the single
+    /// implicit generation 0. A tenant with a reshard history (gen0, gen1) must
+    /// produce a HEAD with `shard_generation_count` 2; a non-enforcing fold would
+    /// stamp 1 (blind to the reshard) and under-scan.
+    #[tokio::test]
+    async fn fold_is_enforcing_and_stamps_real_generation_count() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-fold-enforcing";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        ravel_catalog::validate_or_adopt(
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            1,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        let now = crate::now_ns().expect("now");
+        let activation = (now / NS_PER_HOUR) as u32 + 10;
+        ravel_catalog::append_generation(
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            2,
+            activation,
+            now,
+        )
+        .await
+        .expect("append generation 1");
+
+        fold(store.clone(), tenant, 1).await.expect("cli fold");
+
+        let head_bytes = store
+            .get(&head_key(&tenant_hash, Signal::Metrics), GetRange::Full)
+            .await
+            .expect("HEAD present after fold")
+            .data;
+        let head = ravel_catalog::decode_head(&head_bytes).expect("decode head");
+        assert_eq!(
+            head.shard_generation_count, 2,
+            "an enforcing CLI fold reads the real generation history (sgc 2), not \
+             the implicit generation 0 (sgc 1)"
+        );
+    }
 }

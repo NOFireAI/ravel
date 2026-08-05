@@ -1386,8 +1386,14 @@ async fn catalog_list(
         shard_count,
         ..ravel_catalog::CatalogConfig::default()
     };
+    // Enforcing, matching the server's query path (`ravel_server::query`): an
+    // enforcing resolve reads the tenant's real shard-generation history and
+    // scans the per-hour generation-aware shard set, instead of short-circuiting
+    // to the single implicit generation 0 and under-scanning `0..--shards` after
+    // a reshard-increase (ADR-0052 section 4, Finding 3).
     let catalog = ravel_catalog::Catalog::new(store, catalog_config)
-        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
+        .with_provisioning_enforcement();
 
     let tenant_hash = TenantId::new(tenant).hash();
     let now = now_ns()?;

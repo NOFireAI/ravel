@@ -41,9 +41,10 @@ transient probe fixtures, not durable state, and carry no lifecycle
 guarantee beyond the run that created them.
 
 `t/<tenant_hash>/<signal>/prov` (ADR-0050 §5, EC5) is the durable
-`shard_count` provisioning record: an immutable per-(tenant, signal) object
-holding `tenant_hash`, `signal`, `shard_count`, a `format_version` floor,
-and `created_unix_ns` (proto/ravel/sys.proto `ProvisioningRecord`). It is
+`shard_count` provisioning record: a per-(tenant, signal) object holding
+`tenant_hash`, `signal`, `shard_count`, a `format_version` floor,
+`created_unix_ns`, and an append-only `generations` history (ADR-0052)
+(proto/ravel/sys.proto `ProvisioningRecord`). It is
 written with `CreateIfAbsent` at the tenant's first write for that signal
 (`ravel_catalog::validate_or_adopt`), so a racing loser re-reads and
 validates against the winner rather than erroring. It lives under the
@@ -56,8 +57,14 @@ never resolves over a subset of shards. A (tenant, signal) with pre-ADR data
 but no record is adopted once (the record is written from config) only when
 every observed shard index is below the configured `shard_count`; a higher
 observed index proves the value would hide data and refuses without writing.
-`shard_count` is immutable per (tenant, signal); resharding is deferred to
-its own ADR (epic EK) and would add a field here, never mutate `shard_count`.
+`shard_count` is immutable per generation; the generation history is
+append-only; the shard-index domain of hour `h` is `0..scan_count(h)`
+(ADR-0052, online resharding). A reshard appends a
+`(generation, shard_count, activation_hour)` entry to this record under
+`CasVersion` (`ravel_catalog::append_generation`); every existing byte of
+history is immutable, and the scalar `shard_count` field stays equal to
+generation 0's count. Readers derive the per-hour shard fan-out from the
+history via `ravel_catalog::scan_count` rather than a single static count.
 
 - `keyhash32` (idempotency marker keys only, ADR-0051 §5): 32 lowercase hex
   chars, the first 16 bytes of `blake3("ravel-idem-v1" || tenant_id ||
@@ -125,8 +132,11 @@ its own ADR (epic EK) and would add a field here, never mutate `shard_count`.
   Alerts `a` and audit `u` (ADR-0040) share `l`'s RLOG segment format
   verbatim - no new byte layout, only two new signal-keyspace prefixes.
 - `shard`: zero-padded 4-digit decimal. `shard_count` is immutable per
-  (tenant, signal) in v1 (ADR-0010 §9); Phase 1 reads it from config and
-  treats changing it as a data-loss operation (forbidden).
+  generation; the generation history is append-only; the shard-index domain
+  of hour `h` is `0..scan_count(h)` (ADR-0052, superseding ADR-0010 §9's
+  "immutable per (tenant, signal)"). A reshard appends a new generation with
+  a future `activation_hour`; existing data is never moved or re-keyed, and
+  reads derive the per-hour shard set from the history.
 - `ingest_hour`: `YYYYMMDDTHH` UTC formatted from the pinned
   `ingest_hour_bucket` (unix hours) of the flush. Never recomputed on retry.
 - `writer_id`: UUIDv4 assigned per process start. MUST be freshly random;

@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::catalog::Catalog;
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
+use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{self, HEAD_FORMAT_VERSION, NamePostings, PartLimits};
 
 /// RSEG section kinds needed to decode a segment's catalog
@@ -352,19 +353,34 @@ fn fold_in_entry(
 }
 
 /// (shard, hour) pairs newly sealed since `watermark_hour_old`, exclusive of
-/// the old watermark and inclusive of the new one, across every shard.
+/// the old watermark and inclusive of the new one. Each hour's shard fan-out
+/// is its own `scan_count(h)` derived from the generation history (ADR-0052
+/// section 4), not one static count for the whole range, so a fold enumerates
+/// exactly the shard set a live resolve would list for the same hours.
 fn incremental_buckets(
-    shard_count: u32,
+    generations: &[ShardGeneration],
     watermark_hour_old: u32,
     watermark_hour_new: u32,
 ) -> Vec<(u32, u32)> {
     let mut buckets = Vec::new();
-    for shard in 0..shard_count {
-        for hour in (watermark_hour_old + 1)..=watermark_hour_new {
+    for hour in (watermark_hour_old + 1)..=watermark_hour_new {
+        let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
+        for shard in 0..scan {
             buckets.push((shard, hour));
         }
     }
     buckets
+}
+
+/// The fan-out ceiling at fold time (ADR-0052 section 5). Delegates to the one
+/// shared [`crate::provisioning::shard_ceiling`] that the reader's head
+/// validation (`snapshot_resolve::head_generations_acceptable`) also calls, so
+/// the value a fold stamps into `SnapshotHead.shard_count` and the value a
+/// reader recomputes to validate that head can never diverge (a decrease
+/// followed by a fold past the slack window used to have the two disagree and
+/// hard-fail every query permanently).
+fn fold_shard_ceiling(generations: &[ShardGeneration], watermark_hour: u32) -> u32 {
+    crate::provisioning::shard_ceiling(generations, watermark_hour)
 }
 
 impl Catalog {
@@ -407,7 +423,12 @@ impl Catalog {
         _transactions: &[Transaction],
     ) -> Result<FoldReport, CatalogError> {
         let head_key = head_object_key(tenant, signal);
-        let shard_count = self.config().shard_count;
+        // The generation history for the read-side scan rule (ADR-0052 section
+        // 4/5), read fresh (see `Catalog::read_scan_generations`). A fold must
+        // enumerate the same per-hour shard set a resolve would, and records
+        // the fan-out ceiling and generation count into the HEAD it writes.
+        let generations = self.read_scan_generations(tenant, signal).await?;
+        let shard_generation_count = generations.len() as u32;
         let mut counters = RequestCounters::default();
         let mut attempt: u32 = 0;
         // Fold never runs on the query path (module docs above) and keeps
@@ -435,7 +456,7 @@ impl Catalog {
                 {
                     Ok(entries) => {
                         let buckets =
-                            incremental_buckets(shard_count, head.watermark_hour, watermark_hour);
+                            incremental_buckets(&generations, head.watermark_hour, watermark_hour);
                         let previous_entries_len = entries.len();
                         (entries, buckets, false, previous_entries_len)
                     }
@@ -449,7 +470,7 @@ impl Catalog {
                             .discover_buckets(
                                 tenant,
                                 signal,
-                                shard_count,
+                                &generations,
                                 watermark_hour,
                                 &mut counters,
                             )
@@ -462,7 +483,7 @@ impl Catalog {
                         .discover_buckets(
                             tenant,
                             signal,
-                            shard_count,
+                            &generations,
                             watermark_hour,
                             &mut counters,
                         )
@@ -599,10 +620,13 @@ impl Catalog {
             });
 
             let signal_num = signal::to_proto(signal) as u32;
+            // The part/HEAD `shard_count` is the fan-out ceiling at fold time
+            // (ADR-0052 section 5), not this process's static config value.
+            let shard_ceiling = fold_shard_ceiling(&generations, watermark_hour);
             let part_bytes = snapshot_format::encode_part(
                 tenant.0,
                 signal_num,
-                shard_count,
+                shard_ceiling,
                 watermark_hour,
                 &entries,
             )?;
@@ -751,7 +775,7 @@ impl Catalog {
                 format_version: HEAD_FORMAT_VERSION,
                 tenant_hash: tenant.0.to_vec(),
                 signal: signal_num,
-                shard_count,
+                shard_count: shard_ceiling,
                 watermark_hour,
                 parts: vec![SnapshotPartRef {
                     key: part_key,
@@ -763,6 +787,7 @@ impl Catalog {
                 postings: postings_ref,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
+                shard_generation_count,
             };
             let head_bytes = snapshot_format::encode_head(&new_head)?;
             let head_crc = crc32c::crc32c(&head_bytes);
@@ -1106,17 +1131,25 @@ impl Catalog {
     /// Enumerate every (shard, hour) commit bucket at or before
     /// `watermark_hour` by listing the commit-hour directories directly,
     /// rather than trusting a previous snapshot (HEAD absent, corrupt, or
-    /// unreadable).
+    /// unreadable). The shard range is the fold-time fan-out ceiling
+    /// (ADR-0052 section 5), i.e. the union of every generation activated by
+    /// the watermark, so a rebuild lists every shard any generation ever
+    /// wrote (a shard a generation never used lists empty, which is cheap and
+    /// which `list_shard_hours`-style listing already tolerates). Data only
+    /// ever lands in hours `<= watermark` under a generation active at or
+    /// before those hours, so this ceiling is complete; listing is the ground
+    /// truth here, so a discovered (shard, hour) is always kept.
     async fn discover_buckets(
         &self,
         tenant: &TenantHash,
         signal: Signal,
-        shard_count: u32,
+        generations: &[ShardGeneration],
         watermark_hour: u32,
         counters: &mut RequestCounters,
     ) -> Result<Vec<(u32, u32)>, CatalogError> {
+        let scan_shards = fold_shard_ceiling(generations, watermark_hour);
         let mut buckets = Vec::new();
-        for shard in 0..shard_count {
+        for shard in 0..scan_shards {
             let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
             let listing = self.store().list_delimited(&prefix).await?;
             counters.list_requests += 1;
