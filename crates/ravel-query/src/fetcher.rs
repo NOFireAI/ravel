@@ -14,7 +14,7 @@ use ravel_segment::{
     decode_catalog_v5_chunked, decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix,
     plan_ranges_v4,
 };
-use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 
 /// Section kinds from docs/segment-format.md (not exported by
@@ -28,42 +28,19 @@ const SECTION_SERIES_META: u32 = 6;
 const SECTION_SERIES_IDX: u32 = 8;
 const SECTION_SERIES_META_CHUNKS: u32 = 9;
 
-/// Records the S3 request/byte cost one phase incurred onto the current span
-/// (ADR-0044 decision 5's per-span counts). `before` is the `accounting`
-/// snapshot taken at the phase's start; the after-minus-before delta is this
-/// call's own store cost, scoped to the phase rather than the whole query (a
-/// `segment_open` span records that segment's own GETs, not the query total).
-/// The span must declare `s3_requests`/`s3_bytes` as `tracing::field::Empty`.
-fn record_span_s3(before: &QueryAccountingSnapshot, accounting: &QueryAccounting) {
-    let after = accounting.snapshot();
-    let span = tracing::Span::current();
-    span.record(
-        "s3_requests",
-        after
-            .total_s3_requests()
-            .saturating_sub(before.total_s3_requests()),
-    );
-    span.record(
-        "s3_bytes",
-        after
-            .total_s3_bytes()
-            .saturating_sub(before.total_s3_bytes()),
-    );
-}
-
-/// Records the decompressed-byte cost one decode phase produced onto the
-/// current span (ADR-0044 decision 5). `before` is the `accounting` snapshot
-/// taken at the phase's start; the delta is this decode's own decompressed
-/// output. The span must declare `decompressed_bytes` as
-/// `tracing::field::Empty`.
-fn record_span_decompressed(before: &QueryAccountingSnapshot, accounting: &QueryAccounting) {
-    let after = accounting.snapshot();
-    tracing::Span::current().record(
-        "decompressed_bytes",
-        after
-            .decompressed_bytes
-            .saturating_sub(before.decompressed_bytes),
-    );
+/// Store-GET cost one `ensure_ranges` call incurred, returned so the
+/// page-fetch spans can record their own coalesced GET cost (ADR-0044
+/// decision 5's per-span counts) from values local to the call rather than a
+/// shared-`QueryAccounting` delta. A delta is wrong here: `engine.rs` runs one
+/// segment future per `buffer_unordered` slot against the same accounting
+/// handle, so between one phase's before- and after-snapshot a sibling
+/// segment's GETs bump the shared counters and the delta captures their bytes
+/// too. `requests` is the number of `guarded_get` calls this invocation
+/// issued; `bytes` is the sum of the bytes they returned.
+#[derive(Default)]
+struct RangeFetchCost {
+    requests: u64,
+    bytes: u64,
 }
 
 /// Absolute `(offset, len)` of a section by kind, from the footer.
@@ -575,7 +552,7 @@ impl SegmentFetcher {
         needed: &[(u64, u64)],
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
-    ) -> Result<(), FetchError> {
+    ) -> Result<RangeFetchCost, FetchError> {
         let mut reused_bytes: u64 = 0;
         let missing: Vec<(u64, u64)> = needed
             .iter()
@@ -593,7 +570,7 @@ impl SegmentFetcher {
             accounting.add_bytes_reused(reused_bytes);
         }
         if missing.is_empty() {
-            return Ok(());
+            return Ok(RangeFetchCost::default());
         }
         // Fetch the coalesced ranges concurrently rather than one await at a
         // time (#278 item 2): a multi-page selection over a large segment
@@ -616,11 +593,14 @@ impl SegmentFetcher {
             },
         ))
         .await;
+        let mut cost = RangeFetchCost::default();
         for got in gets {
             let (start, data) = got?;
+            cost.requests += 1;
+            cost.bytes = cost.bytes.saturating_add(data.len() as u64);
             regions.insert(start, data);
         }
-        Ok(())
+        Ok(cost)
     }
 
     /// Opens a segment: suffix-GET, chase `NeedRange` for the footer if
@@ -652,7 +632,13 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         accounting: &QueryAccounting,
     ) -> Result<(Footer, u64, Etag, FetchedRegions), FetchError> {
-        let before = accounting.snapshot();
+        // This segment's own GET cost, accumulated from the `guarded_get`
+        // calls this invocation makes itself rather than diffed from the
+        // shared `QueryAccounting`: concurrent sibling segments share that
+        // handle, so a delta would fold their GETs into this span (ADR-0044
+        // decision 5).
+        let mut span_requests: u64 = 0;
+        let mut span_bytes: u64 = 0;
         let key = &seg_ref.data_object_key;
         // Size-aware first GET (#278 item 5): the commit record already
         // carries the exact object size, so a small object is read whole in
@@ -669,6 +655,8 @@ impl SegmentFetcher {
         let first = self
             .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
             .await?;
+        span_requests += 1;
+        span_bytes = span_bytes.saturating_add(first.data.len() as u64);
         let total_size = first.total_size;
         let suffix_etag = first.etag.clone();
         let mut regions = FetchedRegions::default();
@@ -689,6 +677,8 @@ impl SegmentFetcher {
                         accounting,
                     )
                     .await?;
+                span_requests += 1;
+                span_bytes = span_bytes.saturating_add(got.data.len() as u64);
                 regions.insert(offset, got.data.clone());
                 match open_from_suffix(&got.data, total_size, self.limits)
                     .map_err(|source| corrupt(key, source))?
@@ -717,7 +707,9 @@ impl SegmentFetcher {
         accounting.add_segments_opened(1);
         // This segment's own GET cost (suffix read plus any footer-chase or
         // whole-object read above), scoped to the span, not the query total.
-        record_span_s3(&before, accounting);
+        let span = tracing::Span::current();
+        span.record("s3_requests", span_requests);
+        span.record("s3_bytes", span_bytes);
         Ok((footer, total_size, suffix_etag, regions))
     }
 
@@ -961,7 +953,6 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
-        let before = accounting.snapshot();
         let key = seg_ref.data_object_key.as_str();
         let planned = plan_ranges_v4(footer, scalar).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
@@ -973,17 +964,21 @@ impl SegmentFetcher {
                 ]
             })
             .collect();
-        self.ensure_ranges(
-            seg_ref,
-            tenant_hash,
-            suffix_etag,
-            &page_ranges,
-            regions,
-            accounting,
-        )
-        .await?;
-        // This call's own page-range GET cost, scoped to the span.
-        record_span_s3(&before, accounting);
+        let cost = self
+            .ensure_ranges(
+                seg_ref,
+                tenant_hash,
+                suffix_etag,
+                &page_ranges,
+                regions,
+                accounting,
+            )
+            .await?;
+        // This call's own coalesced page-range GET cost, from the GETs
+        // `ensure_ranges` issued for this invocation, scoped to the span.
+        let span = tracing::Span::current();
+        span.record("s3_requests", cost.requests);
+        span.record("s3_bytes", cost.bytes);
         Ok(planned)
     }
 
@@ -1015,7 +1010,6 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
-        let before = accounting.snapshot();
         let key = seg_ref.data_object_key.as_str();
         let planned = plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
@@ -1027,17 +1021,21 @@ impl SegmentFetcher {
                 ]
             })
             .collect();
-        self.ensure_ranges(
-            seg_ref,
-            tenant_hash,
-            suffix_etag,
-            &page_ranges,
-            regions,
-            accounting,
-        )
-        .await?;
-        // This call's own page-range GET cost, scoped to the span.
-        record_span_s3(&before, accounting);
+        let cost = self
+            .ensure_ranges(
+                seg_ref,
+                tenant_hash,
+                suffix_etag,
+                &page_ranges,
+                regions,
+                accounting,
+            )
+            .await?;
+        // This call's own coalesced page-range GET cost, from the GETs
+        // `ensure_ranges` issued for this invocation, scoped to the span.
+        let span = tracing::Span::current();
+        span.record("s3_requests", cost.requests);
+        span.record("s3_bytes", cost.bytes);
         Ok(planned)
     }
 
@@ -1056,7 +1054,7 @@ impl SegmentFetcher {
         timestamps: &mut Vec<i64>,
         values: &mut Vec<f64>,
         accounting: &QueryAccounting,
-    ) -> Result<ValPageKind, FetchError> {
+    ) -> Result<(ValPageKind, u64), FetchError> {
         let ts_bytes = regions
             .slice(plan.ts_range.0, plan.ts_range.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
@@ -1080,8 +1078,13 @@ impl SegmentFetcher {
         // expose the latter without an out-of-scope change (docs/query-engine.md
         // "Cost accounting").
         let added = (timestamps.len() - before) as u64;
-        accounting.add_decompressed_bytes(added * 16);
-        Ok(kind)
+        // Query-level accounting still needs this increment to the shared
+        // handle; the decode span's own count is summed locally by the caller
+        // from the returned value, not diffed off this shared handle (ADR-0044
+        // decision 5).
+        let decompressed = added * 16;
+        accounting.add_decompressed_bytes(decompressed);
+        Ok((kind, decompressed))
     }
 
     /// Histogram counterpart to [`decode_run`](Self::decode_run) (#218):
@@ -1100,7 +1103,7 @@ impl SegmentFetcher {
         timestamps: &mut Vec<i64>,
         values: &mut Vec<HistogramValue>,
         accounting: &QueryAccounting,
-    ) -> Result<(), FetchError> {
+    ) -> Result<u64, FetchError> {
         let ts_bytes = regions
             .slice(plan.ts_range.0, plan.ts_range.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
@@ -1117,7 +1120,7 @@ impl SegmentFetcher {
             values.push(sample.value);
         }
         accounting.add_decompressed_bytes(added_bytes);
-        Ok(())
+        Ok(added_bytes)
     }
 
     /// Core of `fetch`/`fetch_soa`: decodes every matched scalar series into
@@ -1217,7 +1220,12 @@ impl SegmentFetcher {
         count_stats: bool,
         accounting: &QueryAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
-        let before = accounting.snapshot();
+        // Summed locally from each `decode_run`'s own output rather than
+        // diffed off the shared `QueryAccounting`: sibling segments decode
+        // concurrently on other threads against the same handle, so a delta
+        // would fold their decompressed bytes into this span (ADR-0044
+        // decision 5).
+        let mut span_decompressed: u64 = 0;
         let mut stats = FetchStats::default();
         let mut scratch = Vec::new();
         let mut out = Vec::with_capacity(scalar.len());
@@ -1240,7 +1248,7 @@ impl SegmentFetcher {
                             .ok_or_else(|| {
                                 corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
                             })?;
-                        let kind = self.decode_run(
+                        let (kind, decoded) = self.decode_run(
                             key,
                             &entry.entry.series_id,
                             run,
@@ -1251,6 +1259,7 @@ impl SegmentFetcher {
                             &mut values,
                             accounting,
                         )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
                         if count_stats {
                             stats.record_val_page(kind, plan.val_range.1 as usize);
                         }
@@ -1276,7 +1285,7 @@ impl SegmentFetcher {
                             })?;
                         let mut timestamps = Vec::new();
                         let mut values = Vec::new();
-                        let kind = self.decode_run(
+                        let (kind, decoded) = self.decode_run(
                             key,
                             &entry.entry.series_id,
                             run,
@@ -1287,6 +1296,7 @@ impl SegmentFetcher {
                             &mut values,
                             accounting,
                         )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
                         if count_stats {
                             stats.record_val_page(kind, plan.val_range.1 as usize);
                         }
@@ -1304,7 +1314,7 @@ impl SegmentFetcher {
             }
         }
         // This decode pass's own decompressed-byte output, scoped to the span.
-        record_span_decompressed(&before, accounting);
+        tracing::Span::current().record("decompressed_bytes", span_decompressed);
         Ok((out, stats))
     }
 
@@ -1384,7 +1394,10 @@ impl SegmentFetcher {
         regions: &FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<RunHistogramDecode>, FetchError> {
-        let before = accounting.snapshot();
+        // Summed locally from each `decode_histogram_run`'s own output rather
+        // than diffed off the shared `QueryAccounting`, for the same
+        // cross-thread reason as the scalar path (ADR-0044 decision 5).
+        let mut span_decompressed: u64 = 0;
         let mut out = Vec::with_capacity(histogram.len());
         for entry in histogram {
             match &seg_ref.level {
@@ -1398,7 +1411,7 @@ impl SegmentFetcher {
                             .ok_or_else(|| {
                                 corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
                             })?;
-                        self.decode_histogram_run(
+                        let decoded = self.decode_histogram_run(
                             key,
                             &entry.entry.series_id,
                             run,
@@ -1408,6 +1421,7 @@ impl SegmentFetcher {
                             &mut values,
                             accounting,
                         )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
                     }
                     out.push(RunHistogramDecode {
                         series_id: entry.entry.series_id,
@@ -1430,7 +1444,7 @@ impl SegmentFetcher {
                             })?;
                         let mut timestamps = Vec::new();
                         let mut values = Vec::new();
-                        self.decode_histogram_run(
+                        let decoded = self.decode_histogram_run(
                             key,
                             &entry.entry.series_id,
                             run,
@@ -1440,6 +1454,7 @@ impl SegmentFetcher {
                             &mut values,
                             accounting,
                         )?;
+                        span_decompressed = span_decompressed.saturating_add(decoded);
                         out.push(RunHistogramDecode {
                             series_id: entry.entry.series_id,
                             labels: entry.entry.labels.clone(),
@@ -1454,7 +1469,7 @@ impl SegmentFetcher {
             }
         }
         // This decode pass's own decompressed-byte output, scoped to the span.
-        record_span_decompressed(&before, accounting);
+        tracing::Span::current().record("decompressed_bytes", span_decompressed);
         Ok(out)
     }
 

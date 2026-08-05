@@ -363,10 +363,12 @@ impl LogSegmentFetcher {
         // Two separable phases here (ADR-0044 decision 5, issue #642): the
         // whole-object GET, then the STREAM_DIR resolve + `RlogReader` scan in
         // `scan_bytes`. They are named `page_fetch` and `decode` to match the
-        // metric path's phase names. The spans live on this shared body, which
-        // both the unaccounted `fetch` and the accounted `fetch_accounted`
-        // reach, so production traffic (still on `fetch`, issue #424) is
-        // spanned too, not only the accounted variant.
+        // metric path's phase names. This entry point is reached by the
+        // unaccounted `fetch` (and by tests); the real production log/alerts/
+        // audit callers in `ravel-sql` go through
+        // `fetch_accounted_with_tenant`, which carries its own copy of these
+        // spans over its own (cache-aware) GET path. Wiring those callers onto
+        // an accounted funnel at all is issue #424, still open.
         let fetch_span = tracing::debug_span!(
             "page_fetch",
             signal = "logs",
@@ -427,36 +429,66 @@ impl LogSegmentFetcher {
         }
         let key = &seg_ref.data_object_key;
 
+        // Same two phases as `fetch_accounted`, spanned on the path production
+        // log/alerts/audit traffic actually takes (ADR-0044 decision 5, issue
+        // #642): the whole-object GET (`page_fetch`), then the STREAM_DIR
+        // resolve + `RlogReader` scan in `scan_bytes` (`decode`). Duplicated
+        // rather than shared with `fetch_accounted` because the byte-fetch
+        // differs -- this one is cache-aware and may serve a hit with no store
+        // GET at all -- while only the `scan_bytes` tail is common. The
+        // recorded `s3_requests`/`s3_bytes` reflect this call's own store GETs:
+        // one on the uncached or cache-miss path, zero on a cache hit (the
+        // served bytes are cache, not S3).
+        let fetch_span = tracing::debug_span!(
+            "page_fetch",
+            signal = "logs",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+
         let Some(cache) = &self.cache else {
-            let got = self
-                .store
-                .get(key, GetRange::Full)
-                .await
-                .map_err(|source| LogFetchError::Store {
-                    key: key.to_string(),
-                    source,
-                })?;
+            let got = async {
+                self.store
+                    .get(key, GetRange::Full)
+                    .await
+                    .map_err(|source| LogFetchError::Store {
+                        key: key.to_string(),
+                        source,
+                    })
+            }
+            .instrument(fetch_span.clone())
+            .await?;
             accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-            return self.scan_bytes(key, &got.data, query);
+            fetch_span.record("s3_requests", 1u64);
+            fetch_span.record("s3_bytes", got.data.len() as u64);
+            return tracing::debug_span!("decode", signal = "logs")
+                .in_scope(|| self.scan_bytes(key, &got.data, query));
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
         let bytes = if let Some(bytes) = cache.get(&cache_key) {
             accounting.record_cache_hit();
             accounting.add_cache_bytes(bytes.len() as u64);
+            // Served from cache: no S3 GET on this call.
+            fetch_span.record("s3_requests", 0u64);
+            fetch_span.record("s3_bytes", 0u64);
             bytes
         } else {
             accounting.record_cache_miss();
-            cache
-                .get_or_fetch(cache_key, || async move {
-                    let got = self.store.get(key, GetRange::Full).await?;
-                    accounting.record_s3_request(AccountedOp::Get);
-                    accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-                    Ok(got.data)
-                })
-                .await
-                .map_err(|err| LogFetchError::Store {
+            let bytes = async {
+                cache
+                    .get_or_fetch(cache_key, || async move {
+                        let got = self.store.get(key, GetRange::Full).await?;
+                        accounting.record_s3_request(AccountedOp::Get);
+                        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                        Ok(got.data)
+                    })
+                    .await
+            }
+            .instrument(fetch_span.clone())
+            .await
+            .map_err(|err| LogFetchError::Store {
                     key: key.to_string(),
                     source: match err {
                         SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Store(
@@ -478,9 +510,18 @@ impl LogSegmentFetcher {
                             "cache single-flight leader lost before producing a result".to_string(),
                         ),
                     },
-                })?
+                })?;
+            // A miss issues one store GET for the resulting bytes. A
+            // single-flight follower that rode another caller's GET is the
+            // rare exception; recording one GET here still bounds this call's
+            // own attribution and never under-counts the query total, which is
+            // what the span is for.
+            fetch_span.record("s3_requests", 1u64);
+            fetch_span.record("s3_bytes", bytes.len() as u64);
+            bytes
         };
-        self.scan_bytes(key, &bytes, query)
+        tracing::debug_span!("decode", signal = "logs")
+            .in_scope(|| self.scan_bytes(key, &bytes, query))
     }
 
     /// Shared tail of both fetch entry points: resolve stream-attribute
