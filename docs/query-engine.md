@@ -354,11 +354,20 @@ snapshot delta. A delta would be wrong for every fetch/decode phase: the
 segment futures run concurrently over one shared `QueryAccounting` handle
 (`buffer_unordered` in `engine.rs`), so a sibling segment's GETs land
 between one phase's two snapshots and the delta would fold their cost into
-this span. `segment_open` sums the byte length and count of its own one or
-two `guarded_get` calls; `page_fetch` records the count and bytes
-`ensure_ranges` reports for the coalesced GETs it issued on that call;
-`decode` sums each `decode_run`/`decode_histogram_run`'s own decompressed
-output. Only `catalog_resolve` still uses a snapshot delta, and correctly:
+this span. These GET counts are store-sourced only: `guarded_get` routes
+cache-eligible ranges through the ADR-0046 read cache, and a cache hit
+serves bytes with no store round trip at all (`record_cache_hit`, never an
+`AccountedOp::Get`), so it contributes zero requests and zero bytes to the
+span. Each `guarded_get` call returns its own `{requests, bytes}` cost —
+`{1, len}` for a store GET (the uncached path, a cache miss's leader, or a
+single-flight follower riding another caller's in-flight GET, matching the
+log path's rule below), `{0, 0}` for a cache hit — and the caller folds
+those in, so the store-vs-cache decision lives once, at the seam that
+already knows it. `segment_open` sums the store-sourced cost of its own one
+or two `guarded_get` calls (both zero on a fully warm cache); `page_fetch`
+records the store-sourced count and bytes `ensure_ranges` reports for the
+coalesced GETs it issued on that call (a warm range adds nothing); `decode`
+sums each `decode_run`/`decode_histogram_run`'s own decompressed output. Only `catalog_resolve` still uses a snapshot delta, and correctly:
 it runs once per query handle, sequentially, before any concurrent fetch
 work starts, so nothing else writes the handle across its window. The
 fields: `s3_requests`/`s3_bytes` on `catalog_resolve`, `segment_open`, and
