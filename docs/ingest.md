@@ -63,8 +63,41 @@ record before routing and fails the flush closed (typed error, the
 `ravel_ingest_stale_provisioning_flushes_total` counter) if that re-read cannot
 complete, so it never routes on a stale view. Operators append a generation with
 `ravel-cli provision reshard`; the record enforces the append-only,
-future-activation mutation model. See ADR-0052 for the full design (the read-side
-scan rule is EK2, not implemented here).
+future-activation mutation model. See ADR-0052 for the full design.
+
+#### Decrease and the straggler slack window `S`
+
+On a decrease (say 8 shards down to 4), a write routed under the retiring,
+larger generation lands in a shard index the successor's range does not cover
+(e.g. shard 6). Such a straggler stays findable: a flush pins its ingest-hour
+bucket at flush-open, but its records were routed up to `max_flush_delay`
+earlier and the flush lives at most `max_flush_lifetime`, plus inter-writer
+clock skew, so a write routed just before the activation can land in an
+ingest-hour bucket just after it. The read side keeps the retiring generation's
+count in the scan set for `S = ceil(max_flush_delay + max_flush_lifetime + max
+clock skew)` hours past the successor's activation
+(`ravel_catalog::DEFAULT_SCAN_SLACK_HOURS`, `S = 2` with today's defaults), so a
+straggler that lands within `S` hours of the activation is still scanned and
+returned. On an increase no slack is needed: the old, smaller range is a subset
+of the new one.
+
+Operationally: do **not** decrease `shard_count` and immediately assume every
+prior write is now under the new, narrower range. For `S` hours past the
+activation, queries still fan out over the wider retiring range for the affected
+hours (a bounded number of extra, mostly-empty LISTs). A commit token minted
+before the decrease resolves regardless of `S` -- it names its exact object -- so
+read-your-write never depends on the window. Reshard with:
+
+```
+ravel-cli provision reshard --tenant <t> --signal <s> --shard-count <n> [--lead-hours <L>]
+```
+
+`--lead-hours L` places the activation `L` hours out and must satisfy `L >=
+ceil(C) + 1` (the CLI refuses less), so every live writer refreshes its record
+view within `C` and observes the new generation before it activates -- or
+fail-stops. `C` bounds when writers pick up the change; `S` bounds how long
+readers keep scanning the old range after it. See docs/consistency-model.md,
+"Online resharding", for the reader/writer transition contract.
 
 ## Shard actor
 
