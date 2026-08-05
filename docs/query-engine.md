@@ -364,9 +364,21 @@ single-flight follower riding another caller's in-flight GET, matching the
 log path's rule below), `{0, 0}` for a cache hit — and the caller folds
 those in, so the store-vs-cache decision lives once, at the seam that
 already knows it. `segment_open` sums the store-sourced cost of its own one
-or two `guarded_get` calls (both zero on a fully warm cache); `page_fetch`
+or two `guarded_get` calls; which of those can reach zero on a warm cache
+depends on the first GET's shape. A segment at or below
+`DEFAULT_WHOLE_OBJECT_THRESHOLD` reads its whole object with a
+`GetRange::Full` first GET, which is cache-eligible, so both its GETs (and
+thus the whole `segment_open` cost) are zero on a fully warm cache. A
+segment above the threshold reads its footer with a `GetRange::Suffix`
+first GET, which `guarded_get`'s `cacheable_range` never routes through the
+cache (a suffix has no total size to fabricate a hit from), so that GET
+crosses the network on every run and `segment_open`'s cost is never zero
+for such a segment regardless of cache warmth. `page_fetch`
 records the store-sourced count and bytes `ensure_ranges` reports for the
-coalesced GETs it issued on that call (a warm range adds nothing); `decode`
+coalesced GETs it issued on that call; those are `GetRange::Range` GETs,
+which are cache-eligible, so this phase's cost is the one that reaches zero
+on a warm cache even for an above-threshold segment (a warm range adds
+nothing); `decode`
 sums each `decode_run`/`decode_histogram_run`'s own decompressed output. Only `catalog_resolve` still uses a snapshot delta, and correctly:
 it runs once per query handle, sequentially, before any concurrent fetch
 work starts, so nothing else writes the handle across its window. The

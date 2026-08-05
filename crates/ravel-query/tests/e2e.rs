@@ -846,6 +846,228 @@ async fn warm_cache_query_records_zero_store_bytes_on_fetch_spans() {
     );
 }
 
+/// Copy of [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] (`fetcher.rs`, 512 KiB), which
+/// `ravel-query` does not re-export. A segment strictly larger than this takes
+/// `open_segment`'s footer-`Suffix` path instead of the whole-object `Full`
+/// path, which is what routes the page bytes through `ensure_ranges`'
+/// `join_all` accumulation rather than resolving them from the one whole-object
+/// buffer. The fixture below asserts its own object clears this bound so the
+/// test can never silently regress onto the whole-object path.
+const WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
+
+/// ADR-0044 decision 5 (issue #642): the `page_fetch` phase's cache attribution,
+/// specifically the `ensure_ranges` `join_all` accumulation that
+/// [`warm_cache_query_records_zero_store_bytes_on_fetch_spans`] does not reach.
+///
+/// That test's fixture segment is small enough to fall under
+/// [`WHOLE_OBJECT_THRESHOLD`], so `open_segment` takes one `GetRange::Full` GET
+/// and inserts the whole object into `regions` up front. Every later
+/// `ensure_ranges` call then finds its ranges already covered and returns early
+/// via its `missing.is_empty()` check, without ever running the `join_all`
+/// cost-accumulation loop -- so that test's `page_fetch` numbers are true
+/// whether or not the accumulation counts only store-sourced bytes, and prove
+/// nothing about it (they hold even against the pre-fix accumulation shape).
+///
+/// This fixture is a segment strictly larger than [`WHOLE_OBJECT_THRESHOLD`]
+/// (one series, ~100k high-entropy samples so the value pages do not compress
+/// below raw f64). `open_segment` reads only its 64 KiB footer suffix, so the
+/// page bytes are genuinely missing from `regions` and the subsequent
+/// `page_fetch` runs the real `ensure_ranges` `join_all` loop. Its
+/// `Range`-typed page GETs are cache-eligible, so a warm run serves them from
+/// the ADR-0046 read cache for `{0, 0}` store cost -- but the segment's first
+/// read is a `GetRange::Suffix`, which `guarded_get`'s `cacheable_range` never
+/// routes through the cache, so it crosses the network on every run. Hence the
+/// warm assertions here differ from the whole-object test: the warm `page_fetch`
+/// span records zero store requests and bytes, while the warm query's own
+/// `total_s3_bytes` stays non-zero (the footer suffix), not zero.
+///
+/// A dedicated thread-local `SpanCollector` (installed via `set_default` for the
+/// duration of this test, over the global collector that
+/// [`install_span_collector`] leaves in place to keep the debug phase-span
+/// callsites enabled) captures only this test's own spans: the `page_fetch`
+/// span carries no `tenant_hash` field, so it cannot be told apart from a
+/// sibling test's `page_fetch` in the shared global collector, and a thread-local
+/// subscriber is the isolation the `tenant_hash` filter provides for
+/// `segment_open`.
+#[tokio::test]
+async fn warm_cache_page_fetch_span_records_zero_store_bytes_on_ensure_ranges_path() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Keep the process-global default a real subscriber so the debug phase-span
+    // callsites stay enabled (interest cache + max-level gate); the local
+    // collector below then captures only this thread's spans.
+    install_span_collector();
+    let collector = SpanCollector::default();
+    let subscriber = tracing_subscriber::registry().with(collector.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-warm-cache-page-fetch-zero");
+    let th = tid.hash();
+    let now = now_ns();
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+    // One series, ~100k samples ending at `now`, 1 ms apart. High-entropy
+    // values (golden-ratio-scrambled bit patterns) so Gorilla cannot beat raw
+    // f64 and the writer keeps the VAL pages at 8 bytes/sample -- ~800 KiB of
+    // value bytes alone, comfortably past the 512 KiB whole-object threshold.
+    const N: usize = 100_000;
+    const NS_PER_MS: i64 = NS_PER_SEC / 1000;
+    let mut samples: Vec<(i64, f64)> = Vec::with_capacity(N);
+    for i in 0..N {
+        let ts = now - ((N - 1 - i) as i64) * NS_PER_MS;
+        let bits = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        let mut v = f64::from_bits(bits);
+        if !v.is_finite() {
+            v = i as f64;
+        }
+        samples.push((ts, v));
+    }
+    let series = vec![series_input(
+        &tid,
+        "http_requests_total",
+        &[("method", "get")],
+        &samples,
+    )];
+    let (_token, data_key) = publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
+
+    // Guard the fixture: if the object ever fell to or below the threshold,
+    // `open_segment` would take the whole-object `Full` path and this test would
+    // silently stop exercising `ensure_ranges`' `join_all` loop.
+    let object_size = store
+        .get(&data_key, GetRange::Full)
+        .await
+        .expect("read published object")
+        .data
+        .len() as u64;
+    assert!(
+        object_size > WHOLE_OBJECT_THRESHOLD,
+        "fixture object ({object_size} bytes) must exceed the whole-object threshold \
+         ({WHOLE_OBJECT_THRESHOLD} bytes) so open_segment takes the Suffix path"
+    );
+
+    let recorder = Arc::new(CapturingRecorder::default());
+    let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+        64 * 1024 * 1024,
+        1024,
+        16 * 1024 * 1024,
+    )));
+    let app = one_tenant_app_with_recorder_and_cache(
+        store,
+        EngineConfig::default(),
+        &tid,
+        "secret-warm-pf",
+        Arc::clone(&recorder),
+        cache,
+    );
+    let query = encode_query_param("http_requests_total{method=\"get\"}");
+    let uri = format!("/api/v1/query?query={query}&time={}", now / NS_PER_SEC);
+
+    // Cold run: populates the cache and must drive real store GETs through the
+    // page-fetch loop.
+    let (status, body) = call(&app, &uri, Some("secret-warm-pf")).await;
+    assert_eq!(status, StatusCode::OK, "cold query failed: {body}");
+    assert_eq!(vector_results(&body).len(), 1, "one series expected (cold)");
+
+    let cold_total_s3_bytes = {
+        let calls = recorder.calls.lock().expect("recorder mutex");
+        assert_eq!(calls.len(), 1, "exactly one query recorded after cold run");
+        calls[0].0.total_s3_bytes()
+    };
+    assert!(
+        cold_total_s3_bytes > 0,
+        "the cold query must fetch real bytes"
+    );
+
+    // The cold run's page_fetch span must show the `join_all` loop actually
+    // issued store GETs: if the page ranges were (wrongly) already covered by
+    // the suffix, this would be zero and the warm assertion below would prove
+    // nothing. Read from the isolated collector, so only this test's spans are
+    // present.
+    let cold_page_fetch: Vec<CapturedSpan> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "page_fetch")
+            .cloned()
+            .collect()
+    };
+    assert!(
+        cold_page_fetch
+            .iter()
+            .any(|s| s.s3_requests.unwrap_or(0) > 0 && s.s3_bytes.unwrap_or(0) > 0),
+        "expected the cold page_fetch span to record real store GETs through ensure_ranges' \
+         join_all loop; got {cold_page_fetch:?}"
+    );
+    let cold_page_fetch_count = cold_page_fetch.len();
+
+    // Warm run: identical query. The page ranges are now cache-resident; only
+    // the footer suffix still crosses the network.
+    let (status, body) = call(&app, &uri, Some("secret-warm-pf")).await;
+    assert_eq!(status, StatusCode::OK, "warm query failed: {body}");
+    assert_eq!(vector_results(&body).len(), 1, "one series expected (warm)");
+
+    let warm_total_s3_bytes = {
+        let calls = recorder.calls.lock().expect("recorder mutex");
+        assert_eq!(
+            calls.len(),
+            2,
+            "exactly two queries recorded after warm run"
+        );
+        calls[1].0.total_s3_bytes()
+    };
+    // Unlike the whole-object test, the warm total is NOT zero: the segment's
+    // first read is a Suffix GET, which is never cache-routed, so the footer
+    // crosses the network on every run.
+    assert!(
+        warm_total_s3_bytes > 0,
+        "the warm query still reads the uncacheable footer suffix, so its total store bytes \
+         must stay non-zero (got {warm_total_s3_bytes})"
+    );
+
+    // This warm run's page_fetch spans (everything past the cold run's count).
+    let warm_page_fetch: Vec<CapturedSpan> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "page_fetch")
+            .skip(cold_page_fetch_count)
+            .cloned()
+            .collect()
+    };
+    assert!(
+        !warm_page_fetch.is_empty(),
+        "expected a warm-run page_fetch span; got none"
+    );
+    for span in &warm_page_fetch {
+        assert_eq!(
+            span.s3_bytes.expect("page_fetch must record s3_bytes"),
+            0,
+            "warm-run page_fetch served entirely from cache must record zero store bytes; a \
+             non-zero value means ensure_ranges counted cache-served bytes as S3 traffic \
+             (ADR-0044 decision 5)"
+        );
+        assert_eq!(
+            span.s3_requests
+                .expect("page_fetch must record s3_requests"),
+            0,
+            "warm-run page_fetch served entirely from cache must record zero store requests"
+        );
+    }
+}
+
 #[tokio::test]
 async fn range_query_returns_expected_grid() {
     let store = Arc::new(MemoryStore::new());
