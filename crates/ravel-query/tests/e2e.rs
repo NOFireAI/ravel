@@ -653,6 +653,199 @@ async fn segment_open_span_bytes_are_per_segment_not_the_shared_query_total() {
     );
 }
 
+/// One tenant, a capturing recorder, and an ADR-0046 read cache wired into the
+/// engine's fetcher exactly as `services/ravel-server/src/query.rs` wires it
+/// (`QueryEngine::with_cache` -> `SegmentFetcher::with_cache`). The returned
+/// `Router` holds the engine, so the cache persists across every `call` made
+/// against it: a first (cold) query populates it, a second (warm) query serves
+/// from it.
+fn one_tenant_app_with_recorder_and_cache(
+    store: Arc<MemoryStore>,
+    engine_config: EngineConfig,
+    tenant_id: &TenantId,
+    token: &str,
+    recorder: Arc<CapturingRecorder>,
+    cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>,
+) -> Router {
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let catalog =
+        Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+    let engine = Arc::new(QueryEngine::new(catalog, backend, engine_config).with_cache(cache));
+    let mut tokens = HashMap::new();
+    tokens.insert(token.to_string(), tenant_id.clone());
+    let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)))
+        .with_cost_recorder(recorder);
+    router(state)
+}
+
+/// ADR-0044 decision 5 (issue #642), the cache-attribution regression the F1
+/// fix's per-span counting introduced: `open_segment`/`ensure_ranges` must count
+/// only *store-sourced* bytes on their `segment_open`/`page_fetch` spans, not
+/// bytes served from the ADR-0046 read cache. F1's local counters incremented
+/// unconditionally for every `guarded_get` that returned, but a cache hit
+/// returns bytes with no store round trip at all, so a fully warm query -- which
+/// makes zero real S3 GETs -- still reported the segment's whole object size on
+/// its `segment_open` span.
+///
+/// The prior phase-attribution tests configure no cache (the default
+/// `SegmentFetcher::new` path), which is why the bug slipped past them. This one
+/// wires a cache in and runs the same query twice: cold to populate it, warm to
+/// serve from it. On the warm run the query's own `total_s3_bytes` is zero (all
+/// hits), and every `segment_open`/`page_fetch` span's recorded `s3_bytes` must
+/// sum to that same zero -- not to the segment's real object size. Against the
+/// pre-fix code the warm `segment_open` span reports the whole object size while
+/// the query total is zero, so `warm_span_bytes_sum <= warm_total` fails.
+#[tokio::test]
+async fn warm_cache_query_records_zero_store_bytes_on_fetch_spans() {
+    let collector = install_span_collector();
+
+    let store = Arc::new(MemoryStore::new());
+    // A tenant unique to this test so its spans are separable in the shared
+    // global collector, and so this test's warm-run spans can be sliced off the
+    // tenant-filtered `completed` list after the cold run's spans.
+    let tid = tenant("tenant-warm-cache-zero-store-bytes");
+    let th = tid.hash();
+    let now = now_ns();
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+    // One small segment (one series). Small enough that `open_segment` takes the
+    // whole-object `GetRange::Full` path, which -- unlike a suffix GET -- is
+    // cache-eligible, so a warm run serves the entire segment from cache with no
+    // store GET whatsoever.
+    let series = vec![series_input(
+        &tid,
+        "http_requests_total",
+        &[("method", "get")],
+        &[(now - NS_PER_MIN, 42.0)],
+    )];
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
+
+    let recorder = Arc::new(CapturingRecorder::default());
+    // Generous limits: admit the whole segment as one entry and keep it resident
+    // between the two queries.
+    let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+        64 * 1024 * 1024,
+        1024,
+        16 * 1024 * 1024,
+    )));
+    let app = one_tenant_app_with_recorder_and_cache(
+        store,
+        EngineConfig::default(),
+        &tid,
+        "secret-warm",
+        Arc::clone(&recorder),
+        cache,
+    );
+    let query = encode_query_param("http_requests_total");
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
+
+    // Cold run: populates the cache. Must make real S3 GETs.
+    let (status, body) = call(&app, &uri, Some("secret-warm")).await;
+    assert_eq!(status, StatusCode::OK, "cold query failed: {body}");
+    assert_eq!(vector_results(&body).len(), 1, "one series expected (cold)");
+
+    let want_tenant = th.to_hex();
+    let cold_total_s3_bytes = {
+        let calls = recorder.calls.lock().expect("recorder mutex");
+        assert_eq!(calls.len(), 1, "exactly one query recorded after cold run");
+        calls[0].0.total_s3_bytes()
+    };
+    assert!(
+        cold_total_s3_bytes > 0,
+        "the cold query must fetch real bytes from the store"
+    );
+    // The count of this tenant's completed spans after the cold run: the warm
+    // run's spans are everything this tenant pushes past this point.
+    let cold_span_count = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "segment_open" || s.name == "page_fetch")
+            .filter(|s| {
+                s.tenant_hash
+                    .as_deref()
+                    .is_some_and(|t| t.contains(&want_tenant))
+            })
+            .count()
+    };
+
+    // Warm run: identical query, now fully served from the populated cache.
+    let (status, body) = call(&app, &uri, Some("secret-warm")).await;
+    assert_eq!(status, StatusCode::OK, "warm query failed: {body}");
+    assert_eq!(vector_results(&body).len(), 1, "one series expected (warm)");
+
+    let warm_total_s3_bytes = {
+        let calls = recorder.calls.lock().expect("recorder mutex");
+        assert_eq!(
+            calls.len(),
+            2,
+            "exactly two queries recorded after warm run"
+        );
+        calls[1].0.total_s3_bytes()
+    };
+    assert_eq!(
+        warm_total_s3_bytes, 0,
+        "the warm query is fully cache-served: it must make zero store GET bytes"
+    );
+
+    // This warm run's fetch spans: the tenant-filtered fetch spans past the cold
+    // run's count. Their recorded store-byte counts must sum to the warm query's
+    // own zero total -- not to the segment's real object size, which is what the
+    // pre-fix unconditional per-`guarded_get` increment recorded.
+    let warm_span_bytes: Vec<(String, u64)> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "segment_open" || s.name == "page_fetch")
+            .filter(|s| {
+                s.tenant_hash
+                    .as_deref()
+                    .is_some_and(|t| t.contains(&want_tenant))
+            })
+            .skip(cold_span_count)
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.s3_bytes.expect("fetch span must record s3_bytes"),
+                )
+            })
+            .collect()
+    };
+    assert!(
+        warm_span_bytes.iter().any(|(n, _)| n == "segment_open"),
+        "expected a warm-run segment_open span for this tenant; got {warm_span_bytes:?}"
+    );
+    for (name, bytes) in &warm_span_bytes {
+        assert_eq!(
+            *bytes, 0,
+            "warm-run {name} span served entirely from cache must record zero store bytes, \
+             got {bytes} (a non-zero value means it counted cache-served bytes as S3 traffic)"
+        );
+    }
+    let warm_span_sum: u64 = warm_span_bytes.iter().map(|(_, b)| *b).sum();
+    assert!(
+        warm_span_sum <= warm_total_s3_bytes,
+        "sum of warm-run fetch-span s3_bytes ({warm_span_sum}) must not exceed the warm query's \
+         own total store GET bytes ({warm_total_s3_bytes}); a value above it means a span counted \
+         cache-served bytes as S3 traffic (ADR-0044 decision 5)"
+    );
+}
+
 #[tokio::test]
 async fn range_query_returns_expected_grid() {
     let store = Arc::new(MemoryStore::new());

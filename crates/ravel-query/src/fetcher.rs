@@ -28,17 +28,31 @@ const SECTION_SERIES_META: u32 = 6;
 const SECTION_SERIES_IDX: u32 = 8;
 const SECTION_SERIES_META_CHUNKS: u32 = 9;
 
-/// Store-GET cost one `ensure_ranges` call incurred, returned so the
-/// page-fetch spans can record their own coalesced GET cost (ADR-0044
-/// decision 5's per-span counts) from values local to the call rather than a
-/// shared-`QueryAccounting` delta. A delta is wrong here: `engine.rs` runs one
-/// segment future per `buffer_unordered` slot against the same accounting
-/// handle, so between one phase's before- and after-snapshot a sibling
-/// segment's GETs bump the shared counters and the delta captures their bytes
-/// too. `requests` is the number of `guarded_get` calls this invocation
-/// issued; `bytes` is the sum of the bytes they returned.
-#[derive(Default)]
-struct RangeFetchCost {
+/// Store-sourced GET cost, either of a single `guarded_get` call or accumulated
+/// across the coalesced GETs of one `ensure_ranges` call. It scopes ADR-0044
+/// decision 5's per-span `s3_requests`/`s3_bytes` to bytes that actually
+/// crossed the network, so the `segment_open`/`page_fetch` spans never count
+/// cache-served bytes as S3 traffic.
+///
+/// `guarded_get` routes cache-eligible ranges through `cached_get`, which on a
+/// hit returns bytes with no store round trip at all
+/// (`accounting.record_cache_hit`, never an `AccountedOp::Get`). A cache hit
+/// therefore contributes `{0, 0}` here. A store GET -- the uncached path, a
+/// cache miss's leader, or a single-flight follower riding another caller's
+/// in-flight GET -- contributes `{1, bytes_len}`, matching `log_fetcher.rs`'s
+/// `fetch_accounted_with_tenant`: a follower still attributes one logical GET,
+/// which bounds this call's own attribution and never under-counts the query
+/// total, which is what the span is for.
+///
+/// A local per-call value is used rather than a before/after `QueryAccounting`
+/// delta because `engine.rs` runs one segment future per `buffer_unordered`
+/// slot against the same accounting handle, so between one phase's before- and
+/// after-snapshot a sibling segment's GETs would bump the shared counters and
+/// the delta would capture their bytes too. `requests` is the number of
+/// store-sourced GETs (cache hits excluded); `bytes` is the sum of the bytes
+/// those store GETs returned.
+#[derive(Default, Clone, Copy)]
+struct GetCost {
     requests: u64,
     bytes: u64,
 }
@@ -416,6 +430,15 @@ impl SegmentFetcher {
     /// would silently disable the check for bytes that came straight from
     /// the store in this same call, purely because a cache happened to be
     /// attached. See `cached_get` for where that check runs.
+    ///
+    /// Returns the `GetOutcome` alongside the [`GetCost`] this single call
+    /// contributes to its caller's per-span S3 counts: `{1, bytes_len}` when
+    /// the bytes came from the store (this uncached path, or a cache
+    /// miss/follower inside `cached_get`), `{0, 0}` on a cache hit. The caller
+    /// folds that cost in rather than re-deriving hit-vs-miss, so the
+    /// store-vs-cache branch lives once, at the seam that already knows the
+    /// answer (`store_get` for the store round trip, `cached_get`'s explicit
+    /// `cache.get` for the hit check).
     async fn guarded_get(
         &self,
         seg_ref: &SegmentRef,
@@ -423,7 +446,7 @@ impl SegmentFetcher {
         range: GetRange,
         expected_etag: Option<&Etag>,
         accounting: &QueryAccounting,
-    ) -> Result<GetOutcome, FetchError> {
+    ) -> Result<(GetOutcome, GetCost), FetchError> {
         let key = seg_ref.data_object_key.as_str();
 
         let cacheable_range = match range {
@@ -446,6 +469,8 @@ impl SegmentFetcher {
                 .await;
         }
 
+        // No cache, or a suffix GET that always bypasses it: this is an
+        // unconditional store round trip, so it always contributes one GET.
         let got = self
             .store_get(key, range, accounting)
             .await
@@ -460,7 +485,11 @@ impl SegmentFetcher {
                 key: key.to_string(),
             });
         }
-        Ok(got)
+        let cost = GetCost {
+            requests: 1,
+            bytes: got.data.len() as u64,
+        };
+        Ok((got, cost))
     }
 
     /// The cache-routed half of `guarded_get`. `range` is the exact
@@ -499,14 +528,20 @@ impl SegmentFetcher {
         end: u64,
         expected_etag: Option<&Etag>,
         accounting: &QueryAccounting,
-    ) -> Result<GetOutcome, FetchError> {
+    ) -> Result<(GetOutcome, GetCost), FetchError> {
         let key = seg_ref.data_object_key.as_str();
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, end - start);
 
         if let Some(bytes) = cache.get(&cache_key) {
             accounting.record_cache_hit();
             accounting.add_cache_bytes(bytes.len() as u64);
-            return Ok(placeholder_outcome(bytes, seg_ref.object_size));
+            // Bytes were resident in the cache before this call asked, so no
+            // store round trip happened and this call adds nothing to its
+            // span's S3 counts (ADR-0044 decision 5).
+            return Ok((
+                placeholder_outcome(bytes, seg_ref.object_size),
+                GetCost::default(),
+            ));
         }
         accounting.record_cache_miss();
 
@@ -541,7 +576,19 @@ impl SegmentFetcher {
                     ),
                 },
             })?;
-        Ok(placeholder_outcome(bytes, seg_ref.object_size))
+        // A miss issued one store GET for these bytes (leader), or rode another
+        // caller's in-flight GET (follower). Either way attribute one logical
+        // GET, as `log_fetcher.rs`'s `fetch_accounted_with_tenant` does: it does
+        // not try to distinguish the rare follower, since recording one GET
+        // bounds this call's own attribution and never under-counts the query
+        // total. `record_cache_hit` above (the only zero-cost path) is the sole
+        // case that came from cache, so this arm always crossed the network from
+        // this caller's point of view.
+        let cost = GetCost {
+            requests: 1,
+            bytes: bytes.len() as u64,
+        };
+        Ok((placeholder_outcome(bytes, seg_ref.object_size), cost))
     }
 
     async fn ensure_ranges(
@@ -552,7 +599,7 @@ impl SegmentFetcher {
         needed: &[(u64, u64)],
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
-    ) -> Result<RangeFetchCost, FetchError> {
+    ) -> Result<GetCost, FetchError> {
         let mut reused_bytes: u64 = 0;
         let missing: Vec<(u64, u64)> = needed
             .iter()
@@ -570,7 +617,7 @@ impl SegmentFetcher {
             accounting.add_bytes_reused(reused_bytes);
         }
         if missing.is_empty() {
-            return Ok(RangeFetchCost::default());
+            return Ok(GetCost::default());
         }
         // Fetch the coalesced ranges concurrently rather than one await at a
         // time (#278 item 2): a multi-page selection over a large segment
@@ -580,7 +627,7 @@ impl SegmentFetcher {
         // `regions` insert order is identical to the old sequential loop.
         let gets = join_all(coalesce_ranges(missing, self.coalesce_gap).into_iter().map(
             |(start, end)| async move {
-                let got = self
+                let (got, got_cost) = self
                     .guarded_get(
                         seg_ref,
                         tenant_hash,
@@ -589,15 +636,19 @@ impl SegmentFetcher {
                         accounting,
                     )
                     .await?;
-                Ok::<(u64, Bytes), FetchError>((start, got.data))
+                Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
             },
         ))
         .await;
-        let mut cost = RangeFetchCost::default();
+        // Each coalesced GET reports its own store-vs-cache cost, so a range
+        // served from a warm cache adds nothing here while a store GET adds one
+        // request and its bytes (ADR-0044 decision 5). Summing the per-call
+        // costs never sweeps in a cache hit's served bytes.
+        let mut cost = GetCost::default();
         for got in gets {
-            let (start, data) = got?;
-            cost.requests += 1;
-            cost.bytes = cost.bytes.saturating_add(data.len() as u64);
+            let (start, data, got_cost) = got?;
+            cost.requests = cost.requests.saturating_add(got_cost.requests);
+            cost.bytes = cost.bytes.saturating_add(got_cost.bytes);
             regions.insert(start, data);
         }
         Ok(cost)
@@ -652,11 +703,13 @@ impl SegmentFetcher {
             } else {
                 GetRange::Suffix(self.suffix_len)
             };
-        let first = self
+        let (first, first_cost) = self
             .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
             .await?;
-        span_requests += 1;
-        span_bytes = span_bytes.saturating_add(first.data.len() as u64);
+        // Only this GET's store-sourced cost: zero on a warm cache hit (the
+        // whole-object `Full` first GET is cache-eligible), one GET otherwise.
+        span_requests = span_requests.saturating_add(first_cost.requests);
+        span_bytes = span_bytes.saturating_add(first_cost.bytes);
         let total_size = first.total_size;
         let suffix_etag = first.etag.clone();
         let mut regions = FetchedRegions::default();
@@ -668,7 +721,7 @@ impl SegmentFetcher {
         {
             FooterOutcome::Ready(loc) => loc.footer,
             FooterOutcome::NeedRange { offset, len } => {
-                let got = self
+                let (got, got_cost) = self
                     .guarded_get(
                         seg_ref,
                         tenant_hash,
@@ -677,8 +730,10 @@ impl SegmentFetcher {
                         accounting,
                     )
                     .await?;
-                span_requests += 1;
-                span_bytes = span_bytes.saturating_add(got.data.len() as u64);
+                // Same store-vs-cache scoping as the first GET: a warm cache
+                // serves this footer-chase range for zero S3 cost.
+                span_requests = span_requests.saturating_add(got_cost.requests);
+                span_bytes = span_bytes.saturating_add(got_cost.bytes);
                 regions.insert(offset, got.data.clone());
                 match open_from_suffix(&got.data, total_size, self.limits)
                     .map_err(|source| corrupt(key, source))?
