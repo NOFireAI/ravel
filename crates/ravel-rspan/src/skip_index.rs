@@ -16,9 +16,27 @@
 //! sound: a block is dropped only when its bounds prove no record in it can
 //! match.
 
+use ravel_codec::bloom_section::BloomSection;
+use ravel_codec::tokenizer::tokens;
+
 use crate::error::SpanSegError;
 use crate::record::TRACE_ID_WIDTH;
 use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
+
+/// A bloom-backed equality predicate for [`SkipIndex::candidate_blocks_with_bloom`].
+///
+/// `field_id` is the bloom field the literal is scoped to: `COL_NAME` (3) for a
+/// `name = <literal>` predicate, `COL_SERVICE_NAME` (9) for a
+/// `service_name = <literal>` predicate (docs/span-segment-format.md "BLOOM",
+/// ADR-0054). A caller in another crate (for example ravel-sql, issue #650)
+/// builds this from a plain `u32` and `&str` and needs no RSPAN-internal type.
+#[derive(Clone, Copy, Debug)]
+pub struct BloomPredicate<'a> {
+    /// The bloom field id (`COL_NAME` or `COL_SERVICE_NAME`).
+    pub field_id: u32,
+    /// The equality literal, tokenized with the shared tokenizer.
+    pub literal: &'a str,
+}
 
 /// `status_mask` bit: the block has at least one record with `StatusCode::Unset`.
 pub const STATUS_BIT_UNSET: u8 = 0b0000_0001;
@@ -86,6 +104,75 @@ impl SkipIndex {
             out.push(i);
         }
         out
+    }
+
+    /// [`SkipIndex::candidate_blocks`] with an additional bloom-backed prune
+    /// over `service_name`/`name` equality predicates (ADR-0054). `bloom` is
+    /// the object's parsed BLOOM section (entry `i` covers block `i`); each
+    /// `predicate` names a bloom field id and an equality literal.
+    ///
+    /// A bloom is false-positive-only (ADR-0013 widen-only rule): a negative
+    /// probe proves the token absent and excludes the block; a positive probe
+    /// changes nothing and the block still survives to exact re-evaluation. The
+    /// literal is tokenized with the shared tokenizer and the block is dropped
+    /// only when the bloom proves some token of some predicate absent (the
+    /// conjunctive AND-of-proofs, matching [`block_pruned`]). A literal that
+    /// tokenizes to nothing cannot prune. A per-entry crc mismatch inside the
+    /// bloom, or a bloom whose entry count does not match the block count, is a
+    /// typed `Corrupted` error, never a panic.
+    ///
+    /// This is the surface ravel-sql's span pushdown (issue #650) calls: it
+    /// passes a parsed [`BloomSection`] (obtained through this crate's public
+    /// `open`/`read_section` on the BLOOM descriptor) and a slice of
+    /// [`BloomPredicate`]s built from plain `u32`/`&str`, constructing no
+    /// RSPAN-internal value.
+    // The signature is `candidate_blocks`'s five pruning axes plus the two
+    // bloom inputs; keeping them positionally parallel to `candidate_blocks`
+    // (rather than bundling into a struct) is the clearer surface for a caller
+    // that already builds the axes for the non-bloom path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn candidate_blocks_with_bloom(
+        &self,
+        trace_id: Option<&[u8; 16]>,
+        ts_min: i64,
+        ts_max: i64,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        bloom: &BloomSection<'_>,
+        predicates: &[BloomPredicate<'_>],
+    ) -> Result<Vec<usize>, SpanSegError> {
+        if bloom.len() != self.blocks.len() {
+            return Err(SpanSegError::Corrupted(format!(
+                "bloom entry count {} != block count {}",
+                bloom.len(),
+                self.blocks.len()
+            )));
+        }
+        let base = self.candidate_blocks(trace_id, ts_min, ts_max, duration_ns, status_mask);
+        if predicates.is_empty() {
+            return Ok(base);
+        }
+        // Tokenize each literal once up front (the token set is reused across
+        // every candidate block).
+        let tokenized: Vec<(u32, Vec<Vec<u8>>)> = predicates
+            .iter()
+            .map(|p| (p.field_id, tokens(p.literal)))
+            .collect();
+
+        let mut out = Vec::with_capacity(base.len());
+        for i in base {
+            let view = bloom.entry(i)?;
+            // Survives unless some predicate's tokens are all provably present
+            // is false for at least one token: a single absent token proves the
+            // literal cannot be in the block (no false negatives), so prune.
+            let pruned = tokenized.iter().any(|(field_id, toks)| {
+                !toks.is_empty() && !toks.iter().all(|t| view.may_contain(*field_id, t))
+            });
+            if !pruned {
+                out.push(i);
+            }
+        }
+        Ok(out)
     }
 
     /// Serializes the section in its uncompressed form.
@@ -374,6 +461,164 @@ mod tests {
                 assert!(status_only.contains(&i), "block {i} must survive");
             }
         }
+    }
+
+    /// Builds a BLOOM container over per-block `(field_id, token)` corpora,
+    /// one entry per block. Mirrors what the writer emits.
+    fn bloom_bytes(per_block: &[Vec<(u32, &str)>]) -> Vec<u8> {
+        use ravel_codec::bloom::BloomBuilder;
+        use ravel_codec::bloom_section::encode_bloom_section;
+        use ravel_codec::tokenizer::tokens;
+        let entries: Vec<Vec<u8>> = per_block
+            .iter()
+            .map(|corpus| {
+                let mut b = BloomBuilder::new(0);
+                for (field, text) in corpus {
+                    for tok in tokens(text) {
+                        b.insert(*field, &tok);
+                    }
+                }
+                b.finish()
+            })
+            .collect();
+        encode_bloom_section(&entries)
+    }
+
+    const FIELD_SERVICE: u32 = crate::record::COL_SERVICE_NAME;
+    const FIELD_NAME: u32 = crate::record::COL_NAME;
+
+    #[test]
+    fn bloom_prunes_and_is_sound() {
+        // Three blocks, wide-open time/trace so only the bloom distinguishes.
+        let idx = SkipIndex::new(vec![
+            entry(0, 0, 1000),
+            entry(0, 0, 1000),
+            entry(0, 0, 1000),
+        ]);
+        let raw = bloom_bytes(&[
+            vec![(FIELD_SERVICE, "checkout"), (FIELD_NAME, "GET /cart")],
+            vec![(FIELD_SERVICE, "payments"), (FIELD_NAME, "charge card")],
+            vec![(FIELD_SERVICE, "checkout"), (FIELD_NAME, "POST /order")],
+        ]);
+        let bloom = BloomSection::parse(&raw).expect("parse");
+
+        // service_name = "payments": only block 1 can match. No false negative.
+        let pred = [BloomPredicate {
+            field_id: FIELD_SERVICE,
+            literal: "payments",
+        }];
+        let cands = idx
+            .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &pred)
+            .expect("prune");
+        assert_eq!(cands, vec![1], "only the payments block survives");
+
+        // service_name = "checkout": blocks 0 and 2 survive.
+        let pred = [BloomPredicate {
+            field_id: FIELD_SERVICE,
+            literal: "checkout",
+        }];
+        let cands = idx
+            .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &pred)
+            .expect("prune");
+        assert_eq!(cands, vec![0, 2]);
+
+        // An absent service prunes every block (a bloom negative is proof).
+        let pred = [BloomPredicate {
+            field_id: FIELD_SERVICE,
+            literal: "nonexistent-service-xyz",
+        }];
+        let cands = idx
+            .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &pred)
+            .expect("prune");
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn bloom_field_scoping_and_conjunction() {
+        let idx = SkipIndex::new(vec![entry(0, 0, 1000), entry(0, 0, 1000)]);
+        let raw = bloom_bytes(&[
+            vec![(FIELD_SERVICE, "checkout"), (FIELD_NAME, "charge")],
+            vec![(FIELD_SERVICE, "payments"), (FIELD_NAME, "charge")],
+        ]);
+        let bloom = BloomSection::parse(&raw).expect("parse");
+
+        // A span-name token probed under the service field must not match: the
+        // two blooms are field-scoped by distinct field ids.
+        let pred = [BloomPredicate {
+            field_id: FIELD_SERVICE,
+            literal: "charge",
+        }];
+        let cands = idx
+            .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &pred)
+            .expect("prune");
+        assert!(cands.is_empty(), "'charge' is a name token, not a service");
+
+        // service_name = "checkout" AND name = "charge": only block 0 has the
+        // service, both blocks have the name -> conjunction keeps block 0 only.
+        let preds = [
+            BloomPredicate {
+                field_id: FIELD_SERVICE,
+                literal: "checkout",
+            },
+            BloomPredicate {
+                field_id: FIELD_NAME,
+                literal: "charge",
+            },
+        ];
+        let cands = idx
+            .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &preds)
+            .expect("prune");
+        assert_eq!(cands, vec![0]);
+    }
+
+    #[test]
+    fn bloom_empty_literal_cannot_prune() {
+        let idx = SkipIndex::new(vec![entry(0, 0, 1000)]);
+        let raw = bloom_bytes(&[vec![(FIELD_SERVICE, "checkout")]]);
+        let bloom = BloomSection::parse(&raw).expect("parse");
+        // A literal with no tokens (all separators) proves nothing: keep all.
+        let pred = [BloomPredicate {
+            field_id: FIELD_SERVICE,
+            literal: "  --  ",
+        }];
+        let cands = idx
+            .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &pred)
+            .expect("prune");
+        assert_eq!(cands, vec![0]);
+    }
+
+    #[test]
+    fn bloom_count_mismatch_is_error() {
+        let idx = SkipIndex::new(vec![entry(0, 0, 1000), entry(0, 0, 1000)]);
+        // One bloom entry for a two-block index: a mandatory-invariant violation.
+        let raw = bloom_bytes(&[vec![(FIELD_SERVICE, "checkout")]]);
+        let bloom = BloomSection::parse(&raw).expect("parse");
+        let pred = [BloomPredicate {
+            field_id: FIELD_SERVICE,
+            literal: "checkout",
+        }];
+        assert!(matches!(
+            idx.candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &pred),
+            Err(SpanSegError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn bloom_corrupt_entry_is_error() {
+        let idx = SkipIndex::new(vec![entry(0, 0, 1000)]);
+        let mut raw = bloom_bytes(&[vec![(FIELD_SERVICE, "checkout")]]);
+        // Flip a byte in the last entry payload; its per-entry crc must catch it.
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        let bloom = BloomSection::parse(&raw).expect("parse container");
+        let pred = [BloomPredicate {
+            field_id: FIELD_SERVICE,
+            literal: "checkout",
+        }];
+        assert!(matches!(
+            idx.candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &pred),
+            Err(SpanSegError::Corrupted(_))
+        ));
     }
 
     #[test]

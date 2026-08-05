@@ -1,11 +1,22 @@
 # RSPAN: Ravel Span Segment Format
 
 Persistent contract (ADR-0041). Any change bumps the trailer version. The
-current trailer version is 2 (ADR-0045 decision 2 added per-block duration
-bounds and a status mask to SKIP_IDX for trace-investigation pruning).
+current trailer version is 3 (ADR-0054 added a mandatory per-block BLOOM
+section over `service.name` and span-name tokens, and a block-local
+dictionary-encoded `service_name` column, id 9). Trailer version history:
+
+| version | ADR | added |
+|---|---|---|
+| 1 | ADR-0041 | initial RSPAN format (BLOCKS, SKIP_IDX) |
+| 2 | ADR-0045 decision 2 | per-block duration bounds and a status mask in SKIP_IDX |
+| 3 | ADR-0054 | mandatory BLOOM section and the `service_name` column |
+
 Ravel is pre-release: one supported version at a time, earlier versions
 rejected with the same typed `Corrupted` error as an unknown future version,
-never carried by a dual reader (ADR-0045 decision 4, ADR-0027 precedent).
+never carried by a dual reader (ADR-0045 decision 4, ADR-0054 decision 1,
+ADR-0027 precedent). A v1 or v2 object outside development buckets must be
+compacted (which rewrites to the current version) before v3 ships if it is
+meant to remain queryable.
 Parsers treat every offset, length, count, and tag read from stored bytes as
 untrusted input: bounds-check everything, overflow-check every accumulation,
 fuzz all decoders. No `unsafe`. Every violation is a typed `Corrupted` error,
@@ -36,14 +47,22 @@ both driven by the shape of span data rather than by a new mechanism:
    containment. A query window `[T1, T2]` prunes a block when
    `max_end_ts < T1 || min_start_ts > T2`.
 
-RSPAN is deliberately leaner than RLOG: it has **no BLOOM section** (v1 has no
-content-search requirement over span names; trace_id is found via the sorted
-skip index, not a bloom probe), **no STREAM_DIR** (no derived stream identity
-to catalog), and **no FIELD_DIR** (the merged attribute map is a single
-`Map<Utf8, Utf8>` with one value type and no attr-level pruning in v1, so it is
-stored as one canonical blob per row rather than split into per-key columns).
-The skip index is a single level, since a span object is one sorted run with no
-second (stream-ref) dimension to summarize.
+RSPAN is deliberately leaner than RLOG: it has **no STREAM_DIR** (no derived
+stream identity to catalog) and **no FIELD_DIR** (the merged attribute map is a
+single `Map<Utf8, Utf8>` with one value type and no attr-level pruning, so it
+is stored as one canonical blob per row rather than split into per-key
+columns). The skip index is a single level, since a span object is one sorted
+run with no second (stream-ref) dimension to summarize.
+
+As of v3 (ADR-0054) RSPAN does carry a **BLOOM section**: service dependency
+queries make `service.name` equality the entry point of most trace
+investigation, and a linear attrs scan is the wrong tradeoff for it. The bloom
+is a per-block token filter over `service.name` and span-name tokens; unlike
+RLOG's degrade-on-corrupt bloom, RSPAN's BLOOM is mandatory and a missing or
+malformed section is a typed `Corrupted` error, the same as a missing
+SKIP_IDX. The `service.name` value is also lifted out of the attrs blob into
+its own dictionary-encoded column (id 9) so a query reads it directly rather
+than scanning the map. Span-events/links remain out of scope.
 
 ## Object layout
 
@@ -51,20 +70,22 @@ second (stream-ref) dimension to summarize.
 +---------------------------------------------------+
 | BLOCKS       row blocks (column pages)            |  kind 1
 | SKIP_IDX     interval + trace_id min/max index    |  kind 2
+| BLOOM        per-block service/name token bloom   |  kind 3
 | footer: SpanFooter protobuf bytes                 |
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 2)                       |
+|   version:      u16   (= 3)                       |
 |   signal:       u8    (3 = spans)                 |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RSP1"                   |
 +---------------------------------------------------+
 ```
 
-Writers emit the sections physically in kind order (1..2); readers rely only on
+Writers emit the sections physically in kind order (1..3); readers rely only on
 the footer's section offsets, never on adjacency. Bytes between sections are
-permitted and MUST be `0x00`; readers never interpret them.
+permitted and MUST be `0x00`; readers never interpret them. All three sections
+are mandatory: the reader rejects an object missing any of them as `Corrupted`.
 
 `footer_crc32c` is computed over: the `SpanFooter` bytes, then `footer_len`
 (u32 LE), `version` (u16 LE), `signal`, `reserved`, `magic`. Every trailer byte
@@ -82,8 +103,9 @@ Identical in shape to RLOG/RSEG:
    GET.
 4. Verify `footer_crc32c` (over the bytes defined above) before decoding the
    footer.
-5. Validate the section table: both kinds present, at most one of each, every
-   range inside the section area, every `uncompressed_len` within the cap.
+5. Validate the section table: all three mandatory kinds present, at most one
+   of each, every range inside the section area, every `uncompressed_len`
+   within the cap.
 
 ## SpanFooter
 
@@ -126,7 +148,8 @@ ids (there are no dynamic columns):
 | 5  | end_ts_ns       | i64 (ns)            | always present |
 | 6  | status_code     | u8                  | OTLP status: 0 Unset, 1 Ok, 2 Error |
 | 7  | status_message  | Utf8                | nullable |
-| 8  | attrs           | Map<Utf8, Utf8>     | always present; canonical blob per row |
+| 8  | attrs           | Map<Utf8, Utf8>     | always present; canonical blob per row, minus `service.name` |
+| 9  | service_name    | Utf8                | v3, ADR-0054; nullable; block-local dictionary |
 
 The `attrs` column merges the resource, scope, and span attribute sets into one
 map, following the exact resource+scope-wins-over-record convention
@@ -136,6 +159,15 @@ resource wins over scope. `ravel_rspan::merge_attrs` builds it. The map is
 stored per row as one canonical blob (`uvarint(count)` then, per pair,
 `uvarint(klen) key uvarint(vlen) value`, sorted ascending by key with unique
 keys), so identical maps encode byte-identically.
+
+**`service_name` (id 9, v3, ADR-0054).** The `service.name` value is lifted out
+of the merged map into its own column at write time and is **not** duplicated
+in the `attrs` blob. `merge_attrs` is unchanged and still produces the full
+map; the extraction happens after. The reader re-inserts `service.name` into
+the map when it rebuilds a `SpanRecord`, so a record round-trips byte-
+identically. The column is nullable (a span whose merged attrs carry no
+`service.name` has no value) and its id (9) also scopes the `service.name`
+bloom (see BLOOM below). Its encoding is block-local dictionary (see BLOCKS).
 
 **Span events and links** (OTLP's nested repeated fields) are out of scope for
 v1. They are never decoded into first-class columns; if a producer decodes them
@@ -154,7 +186,7 @@ block:
   uvarint  page_count
   page_descs[page_count]:
     uvarint  column_id
-    u8       enc          (1 Plain, 2 Bitmap, 3 FixedWidth)
+    u8       enc          (1 Plain, 2 Bitmap, 3 FixedWidth, 4 Dict)
     u8       comp         (0 none, 2 zstd)
     uvarint  len          (stored, possibly compressed)
     uvarint  uncomp_len
@@ -166,13 +198,35 @@ A nullable column that is present in some but not all rows of the block carries
 a presence bitmap page (`enc = Bitmap`) immediately before its value page; a
 nullable column absent from every row of the block occupies zero bytes.
 
-Value encodings in v1 are plain (integers as ivarints; strings as
-`uvarint(len)`-prefixed blobs; fixed-width values concatenated). Each page is
-independently wrapped in a zstd envelope (`comp = zstd`) when its encoded form
-is at least 512 bytes and zstd is strictly smaller, else stored raw. The `enc`
-tag is stored per page so a later version can add richer codecs without a reader
-rewrite. A block's crc32c lives in its SKIP_IDX entry, not inline; the reader
-verifies it before decoding anything.
+Value encodings are plain (integers as ivarints; strings as
+`uvarint(len)`-prefixed blobs; fixed-width values concatenated) except the
+`service_name` column, which is dictionary-encoded (`enc = Dict`, v3). Each page
+is independently wrapped in a zstd envelope (`comp = zstd`) when its encoded
+form is at least 512 bytes and zstd is strictly smaller, else stored raw. The
+`enc` tag is stored per page so a later version can add richer codecs without a
+reader rewrite. A block's crc32c lives in its SKIP_IDX entry, not inline; the
+reader verifies it before decoding anything.
+
+The `service_name` column (id 9) uses a **block-local dictionary** (`enc =
+Dict`, v3, ADR-0054). RSPAN has no segment-wide FIELD_DIR/STREAM_DIR to hold a
+shared dictionary, and a block-local one needs no new section: the distinct
+values of the block are written once, and each present row stores an index into
+them. The page is:
+
+```
+dict page (enc = Dict):
+  uvarint  dict_count
+  values[dict_count]:  uvarint(len) bytes   (distinct, strictly ascending)
+  indices[present]:    uvarint index         (< dict_count, one per present row)
+```
+
+The values are strictly ascending and deduplicated, so the encoding is
+canonical and a block re-encodes byte-identically. Being nullable, the column
+carries a presence bitmap page before the value page when it is present in some
+but not all rows of the block, and occupies zero bytes when no row has a
+`service.name` (the same nullable-column rule as `parent_span_id` and
+`status_message`). The reader rejects a `dict_count` over its cap, a
+non-ascending dictionary, and an out-of-range index as `Corrupted`.
 
 ## SKIP_IDX
 
@@ -249,16 +303,66 @@ A corrupt SKIP_IDX is
 a loud `Corrupted` error, not a degrade: its bytes carry the block framing and
 per-block checksums, so without it no block can be located or verified.
 
+## BLOOM
+
+One blocked token bloom filter per row block, positionally addressed: entry `i`
+covers block `i` (v3, ADR-0054). The section is built and read through
+`ravel-codec`'s `bloom_section` and `bloom` modules, shared with RLOG and not
+reimplemented here. Each block's filter is blocked on 512-bit blocks, `k = 7`,
+`m_bits = next_pow2(max(512, ceil(n * 9.585)))` for `n` distinct staged keys,
+with three 64-bit hashes read from disjoint BLAKE3 digest ranges keyed by
+`seed || field_id || token`. The seed is a fixed constant (0), stored inside
+each serialized entry, so a reader recovers it from the bytes and a query never
+needs it.
+
+```
+bloom section:
+  u32 LE   entry_count            (one per block)
+  entries[entry_count]:
+    uvarint  entry_len
+    u32 LE   entry_crc32c         (over the entry bytes)
+    entry:   uvarint m_bits, u8 k, u64 LE seed, bit array (m_bits/8 bytes)
+```
+
+Two logical fields share the one section, distinguished by the `field_id`
+hashed into every key:
+
+- **`service.name`** tokens, under field id 9 (`COL_SERVICE_NAME`).
+- **span `name`** tokens, under field id 3 (`COL_NAME`).
+
+Tokens follow `ravel-codec`'s normative tokenizer (lowercase, split on any
+non-alphanumeric character, 64-byte per-token truncation on a character
+boundary), reused verbatim so a service-name or span-name equality query hits
+the right field's bloom through one code path.
+
+A bloom is false-positive-only (the widen-only pruning rule, ADR-0013): a
+negative probe proves a token absent and lets a block be pruned; a positive
+probe is no proof and the block is still scanned and re-evaluated exactly. For
+an equality predicate `service_name = <lit>` or `name = <lit>`, the reader
+tokenizes the literal and prunes a block only when the bloom proves some token
+absent; a literal that tokenizes to nothing cannot prune.
+`SkipIndex::candidate_blocks_with_bloom` applies this after the skip-index
+prune, ANDing each predicate's proof exactly as the interval/trace/duration/
+status axes do.
+
+Unlike RLOG's bloom, RSPAN's BLOOM is **mandatory**: a missing section, a
+whole-section crc mismatch, a per-entry crc mismatch, a truncated container, or
+an entry count that disagrees with the block count is a typed `Corrupted`
+error, never a silent degrade and never a panic.
+
 ## Checksum coverage
 
 Same per-section/per-block crc32c discipline as RLOG/RSEG. Each section's
 `crc32c` covers its stored bytes; each block's `crc32c` (in its SKIP_IDX entry)
 covers the whole block; `footer_crc32c` covers the footer and trailer as defined
-above. There is no separate BLOOM checksum surface because there is no BLOOM
-section. The v2 `min_duration_ns`/`max_duration_ns`/`status_mask` fields add no
-new checksum surface of their own: SKIP_IDX is read and verified as one
-whole-section zstd blob under its `Section.crc32c`, so the new fields inherit
-that existing coverage exactly as the v1 fields did.
+above. The BLOOM section (v3) has its own `Section.crc32c` over its stored bytes
+like every other section, and additionally carries a per-entry `crc32c` in its
+container framing, verified before an entry is probed; the shared
+`bloom_section` code provides both and RSPAN adds no bloom checksum of its own.
+The v2 `min_duration_ns`/`max_duration_ns`/`status_mask` fields add no new
+checksum surface of their own: SKIP_IDX is read and verified as one
+whole-section zstd blob under its `Section.crc32c`, so those fields inherit that
+existing coverage exactly as the v1 fields did.
 
 ## Compaction (L0 → L1)
 

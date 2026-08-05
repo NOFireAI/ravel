@@ -1,4 +1,7 @@
-//! RSPAN v1: Ravel's columnar span segment format (ADR-0041).
+//! RSPAN: Ravel's columnar span segment format (ADR-0041). Trailer version 3
+//! (ADR-0054): a mandatory per-block BLOOM section over `service.name` and
+//! span-name tokens, and a block-local dictionary-encoded `service_name`
+//! column (id 9), on top of v2's SKIP_IDX duration/status bounds (ADR-0045).
 //!
 //! A self-describing immutable object holding span records in columnar row
 //! blocks, with an interval-aware skip index. RSPAN is a sibling of RLOG (crate
@@ -38,5 +41,12 @@ pub use error::SpanSegError;
 pub use footer::{SpanFooter, SuffixOutcome, open, open_from_suffix, read_section};
 pub use ranged::{RspanRangeReader, TraceBlockSpan};
 pub use reader::{RspanReader, ScanStats, SpanQuery};
-pub use record::{SpanRecord, StatusCode, merge_attrs};
+pub use record::{COL_NAME, COL_SERVICE_NAME, SpanRecord, StatusCode, merge_attrs};
+pub use skip_index::{BloomPredicate, SkipIndex};
 pub use writer::{ObjectIdentity, RspanConfig, RspanWriter};
+
+/// Re-exported so a bloom-pruning caller (for example ravel-sql, issue #650)
+/// can parse the BLOOM section this crate hands it and call
+/// [`SkipIndex::candidate_blocks_with_bloom`] without depending on
+/// `ravel-codec` directly or constructing any RSPAN-internal type.
+pub use ravel_codec::bloom_section::BloomSection;

@@ -23,3 +23,16 @@ pub enum SpanSegError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// The shared `ravel-codec` crate (the blocked bloom filter and its section
+/// framing, ADR-0054) reports every violation as `CodecError::Corrupted`.
+/// Convert it into this crate's `Corrupted` at the boundary so every
+/// `?`-based call site in the BLOOM read path returns a typed `SpanSegError`,
+/// exactly as `ravel-logseg` does for its own reuse of the same code.
+impl From<ravel_codec::error::CodecError> for SpanSegError {
+    fn from(e: ravel_codec::error::CodecError) -> Self {
+        match e {
+            ravel_codec::error::CodecError::Corrupted(s) => SpanSegError::Corrupted(s),
+        }
+    }
+}

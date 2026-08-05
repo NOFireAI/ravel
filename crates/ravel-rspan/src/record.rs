@@ -28,6 +28,18 @@ pub const COL_END_TS: u32 = 5;
 pub const COL_STATUS_CODE: u32 = 6;
 pub const COL_STATUS_MESSAGE: u32 = 7;
 pub const COL_ATTRS: u32 = 8;
+/// `service_name` (v3, ADR-0054): the value of the `service.name` attribute,
+/// lifted out of [`COL_ATTRS`] into its own block-local dictionary-encoded
+/// column. Nullable: a span whose merged attrs carry no `service.name` has no
+/// value here. This id also scopes the `service.name` bloom
+/// (docs/span-segment-format.md "BLOOM").
+pub const COL_SERVICE_NAME: u32 = 9;
+
+/// The attribute key lifted into [`COL_SERVICE_NAME`] (v3, ADR-0054). The
+/// writer removes this key from the stored [`COL_ATTRS`] blob so the value is
+/// not duplicated on disk; the reader re-inserts it when rebuilding the record,
+/// so a `SpanRecord` round-trips byte-identically.
+pub const SERVICE_NAME_KEY: &str = "service.name";
 
 /// Fixed byte width of a trace id.
 pub const TRACE_ID_WIDTH: usize = 16;
@@ -132,6 +144,37 @@ pub fn merge_attrs(
 pub fn encode_attrs(attrs: &[(String, String)]) -> Vec<u8> {
     let map: BTreeMap<&str, &str> = attrs
         .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mut out = Vec::new();
+    put_uvarint(&mut out, map.len() as u64);
+    for (k, v) in map {
+        put_uvarint(&mut out, k.len() as u64);
+        out.extend_from_slice(k.as_bytes());
+        put_uvarint(&mut out, v.len() as u64);
+        out.extend_from_slice(v.as_bytes());
+    }
+    out
+}
+
+/// The `service.name` value in a merged attribute map, if present. Used by the
+/// writer to fill the [`COL_SERVICE_NAME`] column and to seed the block's
+/// `service.name` bloom (docs/span-segment-format.md "BLOOM", ADR-0054).
+pub fn service_name_of(attrs: &[(String, String)]) -> Option<&str> {
+    attrs
+        .iter()
+        .find(|(k, _)| k == SERVICE_NAME_KEY)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Encodes an attribute map to its canonical stored form (as [`encode_attrs`])
+/// with the [`SERVICE_NAME_KEY`] pair removed. The `service.name` value lives
+/// in [`COL_SERVICE_NAME`] instead of the attrs blob (v3, ADR-0054), so it is
+/// never duplicated on disk; the reader re-inserts it from the column.
+pub fn encode_attrs_without_service_name(attrs: &[(String, String)]) -> Vec<u8> {
+    let map: BTreeMap<&str, &str> = attrs
+        .iter()
+        .filter(|(k, _)| k != SERVICE_NAME_KEY)
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let mut out = Vec::new();
