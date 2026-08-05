@@ -14,7 +14,7 @@ use ravel_segment::{
     decode_catalog_v5_chunked, decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix,
     plan_ranges_v4,
 };
-use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 
 /// Section kinds from docs/segment-format.md (not exported by
@@ -27,6 +27,44 @@ const SECTION_SERIES_IDS: u32 = 5;
 const SECTION_SERIES_META: u32 = 6;
 const SECTION_SERIES_IDX: u32 = 8;
 const SECTION_SERIES_META_CHUNKS: u32 = 9;
+
+/// Records the S3 request/byte cost one phase incurred onto the current span
+/// (ADR-0044 decision 5's per-span counts). `before` is the `accounting`
+/// snapshot taken at the phase's start; the after-minus-before delta is this
+/// call's own store cost, scoped to the phase rather than the whole query (a
+/// `segment_open` span records that segment's own GETs, not the query total).
+/// The span must declare `s3_requests`/`s3_bytes` as `tracing::field::Empty`.
+fn record_span_s3(before: &QueryAccountingSnapshot, accounting: &QueryAccounting) {
+    let after = accounting.snapshot();
+    let span = tracing::Span::current();
+    span.record(
+        "s3_requests",
+        after
+            .total_s3_requests()
+            .saturating_sub(before.total_s3_requests()),
+    );
+    span.record(
+        "s3_bytes",
+        after
+            .total_s3_bytes()
+            .saturating_sub(before.total_s3_bytes()),
+    );
+}
+
+/// Records the decompressed-byte cost one decode phase produced onto the
+/// current span (ADR-0044 decision 5). `before` is the `accounting` snapshot
+/// taken at the phase's start; the delta is this decode's own decompressed
+/// output. The span must declare `decompressed_bytes` as
+/// `tracing::field::Empty`.
+fn record_span_decompressed(before: &QueryAccountingSnapshot, accounting: &QueryAccounting) {
+    let after = accounting.snapshot();
+    tracing::Span::current().record(
+        "decompressed_bytes",
+        after
+            .decompressed_bytes
+            .saturating_sub(before.decompressed_bytes),
+    );
+}
 
 /// Absolute `(offset, len)` of a section by kind, from the footer.
 fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
@@ -601,7 +639,12 @@ impl SegmentFetcher {
         level = "debug",
         name = "segment_open",
         skip_all,
-        fields(tenant_hash = %tenant_hash.to_hex(), object_size = seg_ref.object_size),
+        fields(
+            tenant_hash = %tenant_hash.to_hex(),
+            object_size = seg_ref.object_size,
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        ),
     )]
     async fn open_segment(
         &self,
@@ -609,6 +652,7 @@ impl SegmentFetcher {
         seg_ref: &SegmentRef,
         accounting: &QueryAccounting,
     ) -> Result<(Footer, u64, Etag, FetchedRegions), FetchError> {
+        let before = accounting.snapshot();
         let key = &seg_ref.data_object_key;
         // Size-aware first GET (#278 item 5): the commit record already
         // carries the exact object size, so a small object is read whole in
@@ -671,6 +715,9 @@ impl SegmentFetcher {
             }
         }
         accounting.add_segments_opened(1);
+        // This segment's own GET cost (suffix read plus any footer-chase or
+        // whole-object read above), scoped to the span, not the query total.
+        record_span_s3(&before, accounting);
         Ok((footer, total_size, suffix_etag, regions))
     }
 
@@ -700,7 +747,11 @@ impl SegmentFetcher {
         level = "debug",
         name = "catalog_decode",
         skip_all,
-        fields(matcher_count = matchers.len(), total_size),
+        fields(
+            matcher_count = matchers.len(),
+            total_size,
+            series_matched = tracing::field::Empty,
+        ),
     )]
     async fn decode_selected(
         &self,
@@ -783,6 +834,11 @@ impl SegmentFetcher {
             .filter(|e| matches_series(matchers, &e.entry.labels))
             .collect();
         accounting.add_series_matched(matched.len() as u64);
+        // The catalog decode fetches only catalog sections, not page bytes, so
+        // series matched is the meaningful count here rather than decompressed
+        // page bytes (ADR-0044 decision 5: "record decompressed_bytes if
+        // applicable, or series_matched"). Recorded from this call's own count.
+        tracing::Span::current().record("series_matched", matched.len() as u64);
         Ok(matched)
     }
 
@@ -887,7 +943,12 @@ impl SegmentFetcher {
         level = "debug",
         name = "page_fetch",
         skip_all,
-        fields(page_kind = "scalar", series_count = scalar.len()),
+        fields(
+            page_kind = "scalar",
+            series_count = scalar.len(),
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        ),
     )]
     #[allow(clippy::too_many_arguments)]
     async fn fetch_scalar_pages(
@@ -900,6 +961,7 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
+        let before = accounting.snapshot();
         let key = seg_ref.data_object_key.as_str();
         let planned = plan_ranges_v4(footer, scalar).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
@@ -920,6 +982,8 @@ impl SegmentFetcher {
             accounting,
         )
         .await?;
+        // This call's own page-range GET cost, scoped to the span.
+        record_span_s3(&before, accounting);
         Ok(planned)
     }
 
@@ -933,7 +997,12 @@ impl SegmentFetcher {
         level = "debug",
         name = "page_fetch",
         skip_all,
-        fields(page_kind = "histogram", series_count = histogram.len()),
+        fields(
+            page_kind = "histogram",
+            series_count = histogram.len(),
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        ),
     )]
     #[allow(clippy::too_many_arguments)]
     async fn fetch_histogram_pages(
@@ -946,6 +1015,7 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
+        let before = accounting.snapshot();
         let key = seg_ref.data_object_key.as_str();
         let planned = plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
         let page_ranges: Vec<(u64, u64)> = planned
@@ -966,6 +1036,8 @@ impl SegmentFetcher {
             accounting,
         )
         .await?;
+        // This call's own page-range GET cost, scoped to the span.
+        record_span_s3(&before, accounting);
         Ok(planned)
     }
 
@@ -1129,7 +1201,11 @@ impl SegmentFetcher {
         level = "debug",
         name = "decode",
         skip_all,
-        fields(page_kind = "scalar", series_count = scalar.len()),
+        fields(
+            page_kind = "scalar",
+            series_count = scalar.len(),
+            decompressed_bytes = tracing::field::Empty,
+        ),
     )]
     fn build_scalar_decodes(
         &self,
@@ -1141,6 +1217,7 @@ impl SegmentFetcher {
         count_stats: bool,
         accounting: &QueryAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
+        let before = accounting.snapshot();
         let mut stats = FetchStats::default();
         let mut scratch = Vec::new();
         let mut out = Vec::with_capacity(scalar.len());
@@ -1226,6 +1303,8 @@ impl SegmentFetcher {
                 }
             }
         }
+        // This decode pass's own decompressed-byte output, scoped to the span.
+        record_span_decompressed(&before, accounting);
         Ok((out, stats))
     }
 
@@ -1290,7 +1369,11 @@ impl SegmentFetcher {
         level = "debug",
         name = "decode",
         skip_all,
-        fields(page_kind = "histogram", series_count = histogram.len()),
+        fields(
+            page_kind = "histogram",
+            series_count = histogram.len(),
+            decompressed_bytes = tracing::field::Empty,
+        ),
     )]
     fn build_histogram_decodes(
         &self,
@@ -1301,6 +1384,7 @@ impl SegmentFetcher {
         regions: &FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<RunHistogramDecode>, FetchError> {
+        let before = accounting.snapshot();
         let mut out = Vec::with_capacity(histogram.len());
         for entry in histogram {
             match &seg_ref.level {
@@ -1369,6 +1453,8 @@ impl SegmentFetcher {
                 }
             }
         }
+        // This decode pass's own decompressed-byte output, scoped to the span.
+        record_span_decompressed(&before, accounting);
         Ok(out)
     }
 

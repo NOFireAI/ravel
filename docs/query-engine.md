@@ -332,17 +332,33 @@ enforced: nothing in this change rejects a query that runs today.
 
 ### Tracing spans
 
-`tracing::instrument` spans on the query path, named for the phase they
-cover: `catalog_resolve` (`resolve_bounded`), `segment_open`
-(`open_segment`), `catalog_decode` (`decode_selected`), `page_fetch`
+`tracing::instrument`/`debug_span!` spans on the query path, named for the
+phase they cover: `catalog_resolve` (`Catalog::resolve_impl` in
+`ravel-catalog`), `segment_open` (`open_segment`), `catalog_decode`
+(`decode_selected`), `page_fetch`
 (`fetch_scalar_pages`/`fetch_histogram_pages`), `decode`
 (`build_scalar_decodes`/`build_histogram_decodes`), `evaluate` (wrapping
-the evaluator call in `instant_inner`/`range_inner`). Span fields carry
-only bounded values — `tenant_hash` as a hex string, `object_size`,
-matcher/series counts, and fixed-set kind strings (`page_kind`,
-`eval_kind`) — never query text, label values, object keys, or `shard`
-(ADR-0044 decision 5's rejected alternative 6: shard is not a label),
-the same allowlist ADR-0044 sets for `/metrics` labels.
+the evaluator call in `instant_inner`/`range_inner`). `catalog_resolve`
+lives on the catalog's own resolve body rather than ravel-query's
+`resolve_bounded` wrapper, so every caller of `Catalog::resolve*` gets it
+— including ravel-sql's executor, which calls
+`resolve_pruned_with_accounting` directly and never reaches the ravel-query
+wrapper.
+
+Each phase span also records the per-span byte/request counts ADR-0044
+decision 5 requires, scoped to that call's own work rather than the whole
+query and recorded from the `QueryAccounting` delta once the phase returns:
+`s3_requests`/`s3_bytes` on `catalog_resolve`, `segment_open`, and
+`page_fetch`; `segments_pruned` on `catalog_resolve`; `series_matched` on
+`catalog_decode`; `decompressed_bytes` on `decode`. The log-signal path
+(`LogSegmentFetcher::fetch`/`fetch_accounted`) carries the same
+`page_fetch` (recording its one whole-object GET) and `decode` span names.
+
+Span fields otherwise carry only bounded values — `tenant_hash` as a hex
+string, `object_size`, matcher/series counts, and fixed-set kind strings
+(`page_kind`, `eval_kind`) — never query text, label values, object keys,
+or `shard` (ADR-0044 decision 5's rejected alternative 6: shard is not a
+label), the same allowlist ADR-0044 sets for `/metrics` labels.
 
 ### JSON response shape
 

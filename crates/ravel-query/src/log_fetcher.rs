@@ -46,6 +46,7 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::logstream::canonical_attr_bytes;
+use tracing::Instrument;
 
 /// Upper bound on STREAM_DIR entries accepted when decoding the directory out
 /// of band (mirrors the reader's own internal cap). A directory claiming more
@@ -359,17 +360,37 @@ impl LogSegmentFetcher {
             return Ok(None);
         }
         let key = &seg_ref.data_object_key;
-        let got = self
-            .store
-            .get(key, GetRange::Full)
-            .await
-            .map_err(|source| LogFetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
+        // Two separable phases here (ADR-0044 decision 5, issue #642): the
+        // whole-object GET, then the STREAM_DIR resolve + `RlogReader` scan in
+        // `scan_bytes`. They are named `page_fetch` and `decode` to match the
+        // metric path's phase names. The spans live on this shared body, which
+        // both the unaccounted `fetch` and the accounted `fetch_accounted`
+        // reach, so production traffic (still on `fetch`, issue #424) is
+        // spanned too, not only the accounted variant.
+        let fetch_span = tracing::debug_span!(
+            "page_fetch",
+            signal = "logs",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        let got = async {
+            self.store
+                .get(key, GetRange::Full)
+                .await
+                .map_err(|source| LogFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })
+        }
+        .instrument(fetch_span.clone())
+        .await?;
         accounting.record_s3_request(AccountedOp::Get);
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-        self.scan_bytes(key, &got.data, query)
+        // This funnel issues exactly one whole-object GET per call.
+        fetch_span.record("s3_requests", 1u64);
+        fetch_span.record("s3_bytes", got.data.len() as u64);
+        tracing::debug_span!("decode", signal = "logs")
+            .in_scope(|| self.scan_bytes(key, &got.data, query))
     }
 
     /// Cache-aware counterpart of [`fetch_accounted`](Self::fetch_accounted):
