@@ -261,6 +261,119 @@ async fn instant_query_returns_expected_value() {
     assert_eq!(value_string(&results[0]), "42");
 }
 
+/// A `tracing` layer that records the name of every span opened while it is the
+/// default subscriber, so a test can assert exactly which query-path phase
+/// spans fired. Exact span-name equality is deliberate: a substring check would
+/// let `catalog_decode` satisfy an assertion for `decode`, so removing the
+/// `decode` span would not fail the test (ADR-0044 decision 5, issue #642).
+#[derive(Clone, Default)]
+struct SpanNameCollector(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanNameCollector {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Ok(mut names) = self.0.lock() {
+            names.push(attrs.metadata().name().to_string());
+        }
+    }
+}
+
+/// The collector installed as this test binary's global tracing subscriber.
+static SPAN_COLLECTOR: std::sync::OnceLock<SpanNameCollector> = std::sync::OnceLock::new();
+
+/// Installs a collecting subscriber as the process-global default exactly once
+/// for this test binary, returning its collector.
+///
+/// A thread-local `set_default` is not enough here: the other tests in this
+/// binary exercise the same query path first, under the default `NoSubscriber`,
+/// which both caches each phase span's callsite interest as "never" and leaves
+/// the process-global DEBUG max-level gate closed. A scoped default reopens
+/// neither deterministically once a sibling has run. `set_global_default`
+/// rebuilds the interest cache and the max-level gate against this subscriber,
+/// so the phase spans are enabled regardless of test ordering or parallelism.
+fn install_span_collector() -> SpanNameCollector {
+    use tracing_subscriber::layer::SubscriberExt;
+    SPAN_COLLECTOR
+        .get_or_init(|| {
+            let collector = SpanNameCollector::default();
+            let subscriber = tracing_subscriber::registry().with(collector.clone());
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global tracing subscriber in this test binary");
+            collector
+        })
+        .clone()
+}
+
+/// ADR-0044 decision 5 (issue #642): a real instant query must open all six
+/// query-path phase spans. This asserts each of `catalog_resolve`,
+/// `segment_open`, `catalog_decode`, `page_fetch`, `decode`, and `evaluate`
+/// fires at least once. Removing any one of the six span attributes makes this
+/// fail (the missing name is never collected).
+#[tokio::test]
+async fn instant_query_emits_all_six_phase_spans() {
+    // Installed before the query runs, so its spans dispatch to the collector.
+    // Sibling tests may add their own names to the same shared collector; this
+    // only asserts presence, never absence, so their concurrent writes are
+    // harmless.
+    let collector = install_span_collector();
+
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    let now = now_ns();
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+
+    let series = vec![series_input(
+        &tid,
+        "http_requests_total",
+        &[("method", "get")],
+        &[(now - NS_PER_MIN, 42.0)],
+    )];
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
+
+    let app = one_tenant_app(store, EngineConfig::default(), &tid, "secret-a");
+    let query = encode_query_param("http_requests_total{method=\"get\"}");
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
+
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+
+    let names = collector.0.lock().expect("span-name lock").clone();
+    for span_name in [
+        "catalog_resolve",
+        "segment_open",
+        "catalog_decode",
+        "page_fetch",
+        "decode",
+        "evaluate",
+    ] {
+        assert!(
+            names.iter().any(|n| n == span_name),
+            "expected the `{span_name}` phase span to fire on an instant query; captured spans: {names:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn range_query_returns_expected_grid() {
     let store = Arc::new(MemoryStore::new());

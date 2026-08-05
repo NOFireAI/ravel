@@ -757,12 +757,12 @@ impl QueryEngine {
         }
     }
 
-    #[tracing::instrument(
-        level = "debug",
-        name = "catalog_resolve",
-        skip_all,
-        fields(tenant_hash = %tenant_hash.to_hex()),
-    )]
+    // The `catalog_resolve` span now lives on `Catalog::resolve_impl`
+    // (crates/ravel-catalog/src/catalog.rs), so every caller of
+    // `Catalog::resolve*` gets it, including ravel-sql's executor which calls
+    // `resolve_pruned_with_accounting` directly and never reaches this wrapper
+    // (ADR-0044 decision 5, issue #642). Instrumenting here too would span a
+    // resolve reached through ravel-query twice.
     async fn resolve_bounded(
         &self,
         tenant_hash: TenantHash,

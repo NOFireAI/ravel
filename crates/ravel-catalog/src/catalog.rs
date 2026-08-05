@@ -17,6 +17,7 @@ use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, S
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::cache::{CompactionRecordCache, HeadCache, PartCache, PostingsCache, RecordCache};
@@ -567,8 +568,73 @@ impl Catalog {
         .await
     }
 
+    /// Instruments the whole LIST/GET fan-out with the `catalog_resolve` span
+    /// (ADR-0044 decision 5, issue #642). The span lives here rather than on
+    /// ravel-query's `resolve_bounded` wrapper so that every caller of
+    /// `Catalog::resolve*` gets it, including ravel-sql's executor which calls
+    /// `resolve_pruned_with_accounting` directly. Per-call `s3_requests`,
+    /// `s3_bytes`, and `segments_pruned` are recorded from this resolve's own
+    /// `accounting` delta once the fan-out returns, mirroring the
+    /// record-after-call pattern in `services/ravel-server`'s request spans.
+    /// Only ADR-0044 section 4 allowlist fields (`tenant_hash`) plus per-span
+    /// count fields are recorded; never a query, object key, or shard number.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_impl(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<Snapshot, CatalogError> {
+        let span = tracing::debug_span!(
+            "catalog_resolve",
+            tenant_hash = %tenant.to_hex(),
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+            segments_pruned = tracing::field::Empty,
+        );
+        let before = accounting.snapshot();
+        let result = self
+            .resolve_fanout(
+                tenant,
+                signal,
+                range,
+                min_tokens,
+                now_ns,
+                name_filter,
+                accounting,
+            )
+            .instrument(span.clone())
+            .await;
+        // The counts this resolve alone added: its LIST/GET fan-out increments
+        // `accounting`, so the after-minus-before delta is this call's own S3
+        // cost, not the whole query's (a query fetches segments afterwards on
+        // the same handle). `segments_pruned` is read straight off the returned
+        // snapshot.
+        let after = accounting.snapshot();
+        span.record(
+            "s3_requests",
+            after
+                .total_s3_requests()
+                .saturating_sub(before.total_s3_requests()),
+        );
+        span.record(
+            "s3_bytes",
+            after
+                .total_s3_bytes()
+                .saturating_sub(before.total_s3_bytes()),
+        );
+        if let Ok(snapshot) = &result {
+            span.record("segments_pruned", snapshot.segments_pruned);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_fanout(
         &self,
         tenant: &TenantHash,
         signal: Signal,

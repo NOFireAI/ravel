@@ -41,6 +41,10 @@ tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }
 criterion = { workspace = true }
 async-trait = { workspace = true }
+# Query-path tracing-span capture (ADR-0044 decision 5, issue #642): the e2e
+# span test installs a scoped fmt subscriber over a buffer and asserts each
+# phase span fires. Version comes from [workspace.dependencies].
+tracing-subscriber = { workspace = true }
 # The OIDC resolver tests build a local oct (HMAC) JWKS: base64url-encode the
 # signing secret into the JWK `k` field. No network, no keypair generation.
 base64 = { workspace = true }
