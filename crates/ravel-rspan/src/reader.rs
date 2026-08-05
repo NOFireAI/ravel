@@ -82,6 +82,19 @@ impl<'a> RspanReader<'a> {
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
         let bloom_desc = section(&footer, kind::BLOOM)?;
         let bloom_raw = read_section(bytes, bloom_desc, cfg.max_uncomp_section)?;
+        // Structural validation at open time, not deferred to the first
+        // `bloom()` call: BLOOM is mandatory (docs/span-segment-format.md
+        // "Pruning soundness"), so a truncated container or an entry count
+        // that disagrees with the block count must fail here, the same as a
+        // corrupt SKIP_IDX does above, rather than opening clean and only
+        // surfacing on a query that happens to probe the bloom.
+        let bloom_entry_count = BloomSection::parse(&bloom_raw)?.len();
+        if bloom_entry_count != skip.blocks.len() {
+            return Err(SpanSegError::Corrupted(format!(
+                "bloom entry count {bloom_entry_count} disagrees with block count {}",
+                skip.blocks.len()
+            )));
+        }
         let blocks = *section(&footer, kind::BLOCKS)?;
         Ok(RspanReader {
             bytes,
@@ -345,10 +358,17 @@ mod tests {
         };
         let skip_raw = SkipIndex::new(vec![entry]).encode();
 
-        // A minimal valid (empty, zero-entry) BLOOM section: scan never parses
-        // it, but it must be present and pass read_section for open to succeed
-        // (BLOOM is mandatory as of v3, ADR-0054).
-        let bloom_raw: Vec<u8> = 0u32.to_le_bytes().to_vec();
+        // A minimal valid BLOOM section with one entry, matching the one skip
+        // entry above: scan never parses it, but `RspanReader::new` checks the
+        // entry count against the block count at open time (BLOOM is
+        // mandatory as of v3, ADR-0054), so an empty, zero-entry section here
+        // would fail to open before this test ever reaches the block-range
+        // bug it exists to pin.
+        let bloom_raw: Vec<u8> = {
+            use ravel_codec::bloom::BloomBuilder;
+            use ravel_codec::bloom_section::encode_bloom_section;
+            encode_bloom_section(&[BloomBuilder::new(0).finish()])
+        };
 
         let mut obj = Vec::new();
         obj.extend_from_slice(&blocks_bytes);
@@ -432,6 +452,123 @@ mod tests {
             RspanReader::new(&corrupt, &cfg),
             Err(SpanSegError::Corrupted(_))
         ));
+    }
+
+    /// A structurally valid, whole-section-crc-correct BLOOM container whose
+    /// entry count disagrees with the block count must still fail at open,
+    /// not open clean and silently under-prune or panic the first time
+    /// something indexes past its entries (issue #649 checkpoint review:
+    /// this was checked only lazily at the first bloom probe, never at open,
+    /// so a short BLOOM body opened and scanned clean). Built manually
+    /// (like `block_range_past_blocks_section_is_error` above) rather than
+    /// patching a real writer object, so the section crc is computed over
+    /// the actually-short content and only the entry-count check can catch
+    /// the mismatch.
+    #[test]
+    fn bloom_entry_count_mismatch_fails_open() {
+        use crate::footer::{COMP_NONE, SectionDesc, write_footer_and_trailer};
+        use crate::skip_index::BlockEntry;
+        use ravel_codec::bloom::BloomBuilder;
+        use ravel_codec::bloom_section::encode_bloom_section;
+
+        let cfg = RspanConfig::default();
+        let blocks_bytes = vec![0u8; 8];
+        let entries = vec![
+            BlockEntry {
+                block_offset: 0,
+                block_len: 4,
+                block_crc32c: 0,
+                record_count: 1,
+                min_trace_id: [0u8; 16],
+                max_trace_id: [0u8; 16],
+                min_start_ts: 0,
+                max_end_ts: 1,
+                min_duration_ns: 0,
+                max_duration_ns: 1,
+                status_mask: 0,
+            },
+            BlockEntry {
+                block_offset: 4,
+                block_len: 4,
+                block_crc32c: 0,
+                record_count: 1,
+                min_trace_id: [1u8; 16],
+                max_trace_id: [1u8; 16],
+                min_start_ts: 1,
+                max_end_ts: 2,
+                min_duration_ns: 0,
+                max_duration_ns: 1,
+                status_mask: 0,
+            },
+        ];
+        let skip_raw = SkipIndex::new(entries).encode();
+
+        // Two blocks, but only one bloom entry: a genuine entry-count
+        // mismatch, correctly checksummed so only the count check fires.
+        let bloom_raw = encode_bloom_section(&[BloomBuilder::new(0).finish()]);
+
+        let mut obj = Vec::new();
+        obj.extend_from_slice(&blocks_bytes);
+        let skip_off = obj.len() as u64;
+        obj.extend_from_slice(&skip_raw);
+        let bloom_off = obj.len() as u64;
+        obj.extend_from_slice(&bloom_raw);
+
+        let sections = vec![
+            SectionDesc {
+                kind: kind::BLOCKS,
+                offset: 0,
+                len: blocks_bytes.len() as u64,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: blocks_bytes.len() as u64,
+            },
+            SectionDesc {
+                kind: kind::SKIP_IDX,
+                offset: skip_off,
+                len: skip_raw.len() as u64,
+                crc32c: crc32c::crc32c(&skip_raw),
+                comp: COMP_NONE,
+                uncomp_len: skip_raw.len() as u64,
+            },
+            SectionDesc {
+                kind: kind::BLOOM,
+                offset: bloom_off,
+                len: bloom_raw.len() as u64,
+                crc32c: crc32c::crc32c(&bloom_raw),
+                comp: COMP_NONE,
+                uncomp_len: bloom_raw.len() as u64,
+            },
+        ];
+        let footer = SpanFooter {
+            tenant_hash: [0u8; 16],
+            shard: 0,
+            writer_id: [0u8; 16],
+            writer_epoch: 0,
+            writer_seq: 0,
+            min_start_ts_ns: 0,
+            max_end_ts_ns: 2,
+            record_count: 2,
+            block_count: 2,
+            min_trace_id: [0u8; 16],
+            max_trace_id: [1u8; 16],
+            sections,
+            level: 0,
+            input_set_hash: Vec::new(),
+            part_index: 0,
+        };
+        write_footer_and_trailer(&mut obj, &footer);
+
+        match RspanReader::new(&obj, &cfg) {
+            Err(SpanSegError::Corrupted(msg)) => {
+                assert!(
+                    msg.contains("bloom entry count"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected Corrupted(bloom entry count ...), opened successfully"),
+            Err(other) => panic!("expected Corrupted(bloom entry count ...), got {other:?}"),
+        }
     }
 }
 
