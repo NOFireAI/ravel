@@ -3,7 +3,8 @@
 //! test needs the printed error text and exit status, not just a typed
 //! `Result`, so exercising the real CLI is the only way to check both).
 //!
-//! RSPAN v1 is the frozen contract in `docs/span-segment-format.md` (ADR-0041).
+//! RSPAN is the frozen contract in `docs/span-segment-format.md` (ADR-0041,
+//! currently trailer v3 per ADR-0054).
 //! `ravel-rspan` has no on-disk golden object yet, so this test builds one
 //! deterministically with `RspanWriter` (the writer's output is byte-identical
 //! for identical input) and pins the expected `rspan inspect` stdout as a golden
@@ -89,7 +90,7 @@ fn build_object() -> Vec<u8> {
 }
 
 #[test]
-fn v2_output_matches_golden_fixture() {
+fn v3_output_matches_golden_fixture() {
     let path = temp_path("golden");
     std::fs::write(&path, build_object()).expect("writes object");
     let output = run_inspect(&path);
@@ -105,7 +106,7 @@ fn v2_output_matches_golden_fixture() {
     assert_eq!(
         stdout, expected,
         "`rspan inspect` output regressed; the RSPAN format is frozen \
-         (docs/span-segment-format.md, currently trailer v2) -- this must not \
+         (docs/span-segment-format.md, currently trailer v3) -- this must not \
          change without a version bump and ADR"
     );
     assert!(
