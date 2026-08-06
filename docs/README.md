@@ -31,6 +31,11 @@ Start here to run Ravel, ingest into it, or query it.
   allowlist and the `tenant_hash="other"` fold, how to read the per-query
   cost estimate against the actual, and three worked diagnosis procedures.
   Read this to understand a sample on `/metrics`.
+- [guides/tracing.md](guides/tracing.md): the query-path `tracing` spans --
+  the request-level and phase spans, the fields each records, the `RUST_LOG`
+  filter that turns the debug phase spans on, and how to read span byte and
+  request counts to attribute a slow query to a phase. Read this to place a
+  slow query's time in a phase.
 - [guides/caching.md](guides/caching.md): the ADR-0046 read cache -- what it
   stores, its CLI flags, startup warmup, its `/metrics` counters, and its
   known gaps (the disk tier, spans, `alerts`/`audit`). Read this to size or
