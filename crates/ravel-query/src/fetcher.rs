@@ -16,6 +16,7 @@ use ravel_segment::{
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
+use tracing::Instrument;
 
 /// Section kinds from docs/segment-format.md (not exported by
 /// `ravel-segment`). LABEL_DICT + SERIES_IDS + SERIES_META are the catalog
@@ -666,106 +667,113 @@ impl SegmentFetcher {
     /// L1 part ref has no writer identity of its own, so the footer's
     /// tenant/shard/ingest_hour/input_set_hash/part_index (and `level == 1`)
     /// are verified against the compaction record's fields the ref carries.
-    #[tracing::instrument(
-        level = "debug",
-        name = "segment_open",
-        skip_all,
-        fields(
-            tenant_hash = %tenant_hash.to_hex(),
-            object_size = seg_ref.object_size,
-            s3_requests = tracing::field::Empty,
-            s3_bytes = tracing::field::Empty,
-        ),
-    )]
     async fn open_segment(
         &self,
         tenant_hash: TenantHash,
         seg_ref: &SegmentRef,
         accounting: &QueryAccounting,
     ) -> Result<(Footer, u64, Etag, FetchedRegions), FetchError> {
-        // This segment's own GET cost, accumulated from the `guarded_get`
-        // calls this invocation makes itself rather than diffed from the
-        // shared `QueryAccounting`: concurrent sibling segments share that
-        // handle, so a delta would fold their GETs into this span (ADR-0044
-        // decision 5).
-        let mut span_requests: u64 = 0;
-        let mut span_bytes: u64 = 0;
-        let key = &seg_ref.data_object_key;
-        // Size-aware first GET (#278 item 5): the commit record already
-        // carries the exact object size, so a small object is read whole in
-        // one request (its footer, catalog, and pages then all come from that
-        // buffer, never a second probe), while a large one keeps the
-        // footer-suffix read that touches only the tail. `whole_object_threshold
-        // == 0` disables the whole-object path.
-        let first_range =
-            if seg_ref.object_size != 0 && seg_ref.object_size <= self.whole_object_threshold {
-                GetRange::Full
-            } else {
-                GetRange::Suffix(self.suffix_len)
-            };
-        let (first, first_cost) = self
-            .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
-            .await?;
-        // Only this GET's store-sourced cost: zero on a warm cache hit (the
-        // whole-object `Full` first GET is cache-eligible), one GET otherwise.
-        span_requests = span_requests.saturating_add(first_cost.requests);
-        span_bytes = span_bytes.saturating_add(first_cost.bytes);
-        let total_size = first.total_size;
-        let suffix_etag = first.etag.clone();
-        let mut regions = FetchedRegions::default();
-        let first_start = total_size.saturating_sub(first.data.len() as u64);
-        regions.insert(first_start, first.data.clone());
+        // Created and recorded on directly, never through
+        // `tracing::Span::current()` (ADR-0044 decision 5): this span is
+        // debug-level, so at an INFO production level it is disabled, and
+        // `current()` would resolve to the nearest *enabled* ancestor -- the
+        // request-level span, which declares the same `s3_requests`/
+        // `s3_bytes` field names -- silently overwriting that span's
+        // whole-request total with just this segment's own cost. Recording on
+        // a disabled span handle is a no-op, which is correct.
+        let span = tracing::debug_span!(
+            "segment_open",
+            tenant_hash = %tenant_hash.to_hex(),
+            object_size = seg_ref.object_size,
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        async {
+            // This segment's own GET cost, accumulated from the `guarded_get`
+            // calls this invocation makes itself rather than diffed from the
+            // shared `QueryAccounting`: concurrent sibling segments share that
+            // handle, so a delta would fold their GETs into this span (ADR-0044
+            // decision 5).
+            let mut span_requests: u64 = 0;
+            let mut span_bytes: u64 = 0;
+            let key = &seg_ref.data_object_key;
+            // Size-aware first GET (#278 item 5): the commit record already
+            // carries the exact object size, so a small object is read whole in
+            // one request (its footer, catalog, and pages then all come from that
+            // buffer, never a second probe), while a large one keeps the
+            // footer-suffix read that touches only the tail. `whole_object_threshold
+            // == 0` disables the whole-object path.
+            let first_range =
+                if seg_ref.object_size != 0 && seg_ref.object_size <= self.whole_object_threshold {
+                    GetRange::Full
+                } else {
+                    GetRange::Suffix(self.suffix_len)
+                };
+            let (first, first_cost) = self
+                .guarded_get(seg_ref, tenant_hash, first_range, None, accounting)
+                .await?;
+            // Only this GET's store-sourced cost: zero on a warm cache hit (the
+            // whole-object `Full` first GET is cache-eligible), one GET otherwise.
+            span_requests = span_requests.saturating_add(first_cost.requests);
+            span_bytes = span_bytes.saturating_add(first_cost.bytes);
+            let total_size = first.total_size;
+            let suffix_etag = first.etag.clone();
+            let mut regions = FetchedRegions::default();
+            let first_start = total_size.saturating_sub(first.data.len() as u64);
+            regions.insert(first_start, first.data.clone());
 
-        let footer = match open_from_suffix(&first.data, total_size, self.limits)
-            .map_err(|source| corrupt(key, source))?
-        {
-            FooterOutcome::Ready(loc) => loc.footer,
-            FooterOutcome::NeedRange { offset, len } => {
-                let (got, got_cost) = self
-                    .guarded_get(
-                        seg_ref,
-                        tenant_hash,
-                        GetRange::Range(offset, offset + len),
-                        Some(&suffix_etag),
-                        accounting,
-                    )
-                    .await?;
-                // Same store-vs-cache scoping as the first GET: a warm cache
-                // serves this footer-chase range for zero S3 cost.
-                span_requests = span_requests.saturating_add(got_cost.requests);
-                span_bytes = span_bytes.saturating_add(got_cost.bytes);
-                regions.insert(offset, got.data.clone());
-                match open_from_suffix(&got.data, total_size, self.limits)
-                    .map_err(|source| corrupt(key, source))?
-                {
-                    FooterOutcome::Ready(loc) => loc.footer,
-                    FooterOutcome::NeedRange { .. } => {
-                        return Err(corrupt(key, ravel_segment::SegmentError::Truncated));
+            let footer = match open_from_suffix(&first.data, total_size, self.limits)
+                .map_err(|source| corrupt(key, source))?
+            {
+                FooterOutcome::Ready(loc) => loc.footer,
+                FooterOutcome::NeedRange { offset, len } => {
+                    let (got, got_cost) = self
+                        .guarded_get(
+                            seg_ref,
+                            tenant_hash,
+                            GetRange::Range(offset, offset + len),
+                            Some(&suffix_etag),
+                            accounting,
+                        )
+                        .await?;
+                    // Same store-vs-cache scoping as the first GET: a warm cache
+                    // serves this footer-chase range for zero S3 cost.
+                    span_requests = span_requests.saturating_add(got_cost.requests);
+                    span_bytes = span_bytes.saturating_add(got_cost.bytes);
+                    regions.insert(offset, got.data.clone());
+                    match open_from_suffix(&got.data, total_size, self.limits)
+                        .map_err(|source| corrupt(key, source))?
+                    {
+                        FooterOutcome::Ready(loc) => loc.footer,
+                        FooterOutcome::NeedRange { .. } => {
+                            return Err(corrupt(key, ravel_segment::SegmentError::Truncated));
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        match &seg_ref.level {
-            SegmentLevel::L0 => {
-                let expected = expected_identity(tenant_hash, seg_ref);
-                check_identity(&footer, &expected).map_err(|source| corrupt(key, source))?;
+            match &seg_ref.level {
+                SegmentLevel::L0 => {
+                    let expected = expected_identity(tenant_hash, seg_ref);
+                    check_identity(&footer, &expected).map_err(|source| corrupt(key, source))?;
+                }
+                SegmentLevel::L1 {
+                    input_set_hash,
+                    part_index,
+                } => {
+                    verify_l1_identity(&footer, tenant_hash, seg_ref, input_set_hash, *part_index)
+                        .map_err(|source| corrupt(key, source))?;
+                }
             }
-            SegmentLevel::L1 {
-                input_set_hash,
-                part_index,
-            } => {
-                verify_l1_identity(&footer, tenant_hash, seg_ref, input_set_hash, *part_index)
-                    .map_err(|source| corrupt(key, source))?;
-            }
+            accounting.add_segments_opened(1);
+            // This segment's own GET cost (suffix read plus any footer-chase or
+            // whole-object read above), scoped to the span, not the query total.
+            span.record("s3_requests", span_requests);
+            span.record("s3_bytes", span_bytes);
+            Ok((footer, total_size, suffix_etag, regions))
         }
-        accounting.add_segments_opened(1);
-        // This segment's own GET cost (suffix read plus any footer-chase or
-        // whole-object read above), scoped to the span, not the query total.
-        let span = tracing::Span::current();
-        span.record("s3_requests", span_requests);
-        span.record("s3_bytes", span_bytes);
-        Ok((footer, total_size, suffix_etag, regions))
+        .instrument(span.clone())
+        .await
     }
 
     /// Decodes the catalog and returns the run-major series matching
@@ -790,16 +798,6 @@ impl SegmentFetcher {
     /// page ranges are absolute-in-object on every path, so that step is
     /// identical regardless of which catalog path ran here.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(
-        level = "debug",
-        name = "catalog_decode",
-        skip_all,
-        fields(
-            matcher_count = matchers.len(),
-            total_size,
-            series_matched = tracing::field::Empty,
-        ),
-    )]
     async fn decode_selected(
         &self,
         seg_ref: &SegmentRef,
@@ -811,82 +809,97 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntryV4>, FetchError> {
-        let key = seg_ref.data_object_key.as_str();
-        let entries = if let Some((sm_off, sm_len)) = section_range(footer, SECTION_SERIES_META) {
-            let (ld_off, ld_len) = section_range(footer, SECTION_LABEL_DICT).ok_or_else(|| {
-                corrupt(
-                    key,
-                    ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`.
+        let span = tracing::debug_span!(
+            "catalog_decode",
+            matcher_count = matchers.len(),
+            total_size,
+            series_matched = tracing::field::Empty,
+        );
+        async {
+            let key = seg_ref.data_object_key.as_str();
+            let entries = if let Some((sm_off, sm_len)) = section_range(footer, SECTION_SERIES_META)
+            {
+                let (ld_off, ld_len) =
+                    section_range(footer, SECTION_LABEL_DICT).ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("LABEL_DICT"),
+                        )
+                    })?;
+                let (si_off, si_len) =
+                    section_range(footer, SECTION_SERIES_IDS).ok_or_else(|| {
+                        corrupt(
+                            key,
+                            ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
+                        )
+                    })?;
+                self.ensure_ranges(
+                    seg_ref,
+                    tenant_hash,
+                    suffix_etag,
+                    &[
+                        (ld_off, ld_off + ld_len),
+                        (si_off, si_off + si_len),
+                        (sm_off, sm_off + sm_len),
+                    ],
+                    regions,
+                    accounting,
                 )
-            })?;
-            let (si_off, si_len) = section_range(footer, SECTION_SERIES_IDS).ok_or_else(|| {
-                corrupt(
-                    key,
-                    ravel_segment::SegmentError::MissingSection("SERIES_IDS"),
+                .await?;
+                let dict = regions
+                    .slice(ld_off, ld_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let ids = regions
+                    .slice(si_off, si_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let meta = regions
+                    .slice(sm_off, sm_len)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
+                    .map_err(|source| corrupt(key, source))?
+            } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
+                self.decode_sparse_catalog(
+                    seg_ref,
+                    tenant_hash,
+                    footer,
+                    suffix_etag,
+                    regions,
+                    &sparse,
+                    accounting,
                 )
-            })?;
-            self.ensure_ranges(
-                seg_ref,
-                tenant_hash,
-                suffix_etag,
-                &[
-                    (ld_off, ld_off + ld_len),
-                    (si_off, si_off + si_len),
-                    (sm_off, sm_off + sm_len),
-                ],
-                regions,
-                accounting,
-            )
-            .await?;
-            let dict = regions
-                .slice(ld_off, ld_len)
-                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-            let ids = regions
-                .slice(si_off, si_len)
-                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-            let meta = regions
-                .slice(sm_off, sm_len)
-                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-            decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
-                .map_err(|source| corrupt(key, source))?
-        } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
-            self.decode_sparse_catalog(
-                seg_ref,
-                tenant_hash,
-                footer,
-                suffix_etag,
-                regions,
-                &sparse,
-                accounting,
-            )
-            .await?
-        } else {
-            self.ensure_ranges(
-                seg_ref,
-                tenant_hash,
-                suffix_etag,
-                &[(0, total_size)],
-                regions,
-                accounting,
-            )
-            .await?;
-            let object = regions
-                .slice(0, total_size)
-                .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-            decode_catalog_v5(footer, &object, self.limits)
-                .map_err(|source| corrupt(key, source))?
-        };
-        let matched: Vec<SeriesEntryV4> = entries
-            .into_iter()
-            .filter(|e| matches_series(matchers, &e.entry.labels))
-            .collect();
-        accounting.add_series_matched(matched.len() as u64);
-        // The catalog decode fetches only catalog sections, not page bytes, so
-        // series matched is the meaningful count here rather than decompressed
-        // page bytes (ADR-0044 decision 5: "record decompressed_bytes if
-        // applicable, or series_matched"). Recorded from this call's own count.
-        tracing::Span::current().record("series_matched", matched.len() as u64);
-        Ok(matched)
+                .await?
+            } else {
+                self.ensure_ranges(
+                    seg_ref,
+                    tenant_hash,
+                    suffix_etag,
+                    &[(0, total_size)],
+                    regions,
+                    accounting,
+                )
+                .await?;
+                let object = regions
+                    .slice(0, total_size)
+                    .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                decode_catalog_v5(footer, &object, self.limits)
+                    .map_err(|source| corrupt(key, source))?
+            };
+            let matched: Vec<SeriesEntryV4> = entries
+                .into_iter()
+                .filter(|e| matches_series(matchers, &e.entry.labels))
+                .collect();
+            accounting.add_series_matched(matched.len() as u64);
+            // The catalog decode fetches only catalog sections, not page bytes, so
+            // series matched is the meaningful count here rather than decompressed
+            // page bytes (ADR-0044 decision 5: "record decompressed_bytes if
+            // applicable, or series_matched"). Recorded from this call's own count.
+            span.record("series_matched", matched.len() as u64);
+            Ok(matched)
+        }
+        .instrument(span.clone())
+        .await
     }
 
     /// Decides whether a sparse (SERIES_META-absent) v5 object takes the
@@ -986,17 +999,6 @@ impl SegmentFetcher {
     /// Coalesced page ranges for the scalar runs of `selected` (histogram
     /// runs carry no scalar samples and are skipped), fetched into `regions`.
     /// Returns the plan for every run of every scalar series.
-    #[tracing::instrument(
-        level = "debug",
-        name = "page_fetch",
-        skip_all,
-        fields(
-            page_kind = "scalar",
-            series_count = scalar.len(),
-            s3_requests = tracing::field::Empty,
-            s3_bytes = tracing::field::Empty,
-        ),
-    )]
     #[allow(clippy::too_many_arguments)]
     async fn fetch_scalar_pages(
         &self,
@@ -1008,33 +1010,45 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
-        let key = seg_ref.data_object_key.as_str();
-        let planned = plan_ranges_v4(footer, scalar).map_err(|source| corrupt(key, source))?;
-        let page_ranges: Vec<(u64, u64)> = planned
-            .iter()
-            .flat_map(|p| {
-                [
-                    (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
-                    (p.val_range.0, p.val_range.0 + p.val_range.1),
-                ]
-            })
-            .collect();
-        let cost = self
-            .ensure_ranges(
-                seg_ref,
-                tenant_hash,
-                suffix_etag,
-                &page_ranges,
-                regions,
-                accounting,
-            )
-            .await?;
-        // This call's own coalesced page-range GET cost, from the GETs
-        // `ensure_ranges` issued for this invocation, scoped to the span.
-        let span = tracing::Span::current();
-        span.record("s3_requests", cost.requests);
-        span.record("s3_bytes", cost.bytes);
-        Ok(planned)
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`.
+        let span = tracing::debug_span!(
+            "page_fetch",
+            page_kind = "scalar",
+            series_count = scalar.len(),
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        async {
+            let key = seg_ref.data_object_key.as_str();
+            let planned = plan_ranges_v4(footer, scalar).map_err(|source| corrupt(key, source))?;
+            let page_ranges: Vec<(u64, u64)> = planned
+                .iter()
+                .flat_map(|p| {
+                    [
+                        (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                        (p.val_range.0, p.val_range.0 + p.val_range.1),
+                    ]
+                })
+                .collect();
+            let cost = self
+                .ensure_ranges(
+                    seg_ref,
+                    tenant_hash,
+                    suffix_etag,
+                    &page_ranges,
+                    regions,
+                    accounting,
+                )
+                .await?;
+            // This call's own coalesced page-range GET cost, from the GETs
+            // `ensure_ranges` issued for this invocation, scoped to the span.
+            span.record("s3_requests", cost.requests);
+            span.record("s3_bytes", cost.bytes);
+            Ok(planned)
+        }
+        .instrument(span.clone())
+        .await
     }
 
     /// Histogram counterpart to [`fetch_scalar_pages`](Self::fetch_scalar_pages)
@@ -1043,17 +1057,6 @@ impl SegmentFetcher {
     /// histogram run's `hist_range` (and leaves `val_range` a `(0, 0)`
     /// sentinel), so this fetches the TS and HIST byte ranges the histogram
     /// decode path reads.
-    #[tracing::instrument(
-        level = "debug",
-        name = "page_fetch",
-        skip_all,
-        fields(
-            page_kind = "histogram",
-            series_count = histogram.len(),
-            s3_requests = tracing::field::Empty,
-            s3_bytes = tracing::field::Empty,
-        ),
-    )]
     #[allow(clippy::too_many_arguments)]
     async fn fetch_histogram_pages(
         &self,
@@ -1065,33 +1068,46 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
-        let key = seg_ref.data_object_key.as_str();
-        let planned = plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
-        let page_ranges: Vec<(u64, u64)> = planned
-            .iter()
-            .flat_map(|p| {
-                [
-                    (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
-                    (p.hist_range.0, p.hist_range.0 + p.hist_range.1),
-                ]
-            })
-            .collect();
-        let cost = self
-            .ensure_ranges(
-                seg_ref,
-                tenant_hash,
-                suffix_etag,
-                &page_ranges,
-                regions,
-                accounting,
-            )
-            .await?;
-        // This call's own coalesced page-range GET cost, from the GETs
-        // `ensure_ranges` issued for this invocation, scoped to the span.
-        let span = tracing::Span::current();
-        span.record("s3_requests", cost.requests);
-        span.record("s3_bytes", cost.bytes);
-        Ok(planned)
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`.
+        let span = tracing::debug_span!(
+            "page_fetch",
+            page_kind = "histogram",
+            series_count = histogram.len(),
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        async {
+            let key = seg_ref.data_object_key.as_str();
+            let planned =
+                plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
+            let page_ranges: Vec<(u64, u64)> = planned
+                .iter()
+                .flat_map(|p| {
+                    [
+                        (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
+                        (p.hist_range.0, p.hist_range.0 + p.hist_range.1),
+                    ]
+                })
+                .collect();
+            let cost = self
+                .ensure_ranges(
+                    seg_ref,
+                    tenant_hash,
+                    suffix_etag,
+                    &page_ranges,
+                    regions,
+                    accounting,
+                )
+                .await?;
+            // This call's own coalesced page-range GET cost, from the GETs
+            // `ensure_ranges` issued for this invocation, scoped to the span.
+            span.record("s3_requests", cost.requests);
+            span.record("s3_bytes", cost.bytes);
+            Ok(planned)
+        }
+        .instrument(span.clone())
+        .await
     }
 
     /// Decodes one scalar run's TS/VAL pages into `timestamps`/`values`
@@ -1255,16 +1271,6 @@ impl SegmentFetcher {
     /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) share
     /// one decode body rather than drifting apart (#278 item 1).
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(
-        level = "debug",
-        name = "decode",
-        skip_all,
-        fields(
-            page_kind = "scalar",
-            series_count = scalar.len(),
-            decompressed_bytes = tracing::field::Empty,
-        ),
-    )]
     fn build_scalar_decodes(
         &self,
         key: &str,
@@ -1275,6 +1281,17 @@ impl SegmentFetcher {
         count_stats: bool,
         accounting: &QueryAccounting,
     ) -> Result<(Vec<RunDecode>, FetchStats), FetchError> {
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`. Synchronous function, so
+        // an entered guard (not `.instrument()`) covers the whole body; no
+        // `.await` point can invalidate it.
+        let span = tracing::debug_span!(
+            "decode",
+            page_kind = "scalar",
+            series_count = scalar.len(),
+            decompressed_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         // Summed locally from each `decode_run`'s own output rather than
         // diffed off the shared `QueryAccounting`: sibling segments decode
         // concurrently on other threads against the same handle, so a delta
@@ -1369,7 +1386,7 @@ impl SegmentFetcher {
             }
         }
         // This decode pass's own decompressed-byte output, scoped to the span.
-        tracing::Span::current().record("decompressed_bytes", span_decompressed);
+        span.record("decompressed_bytes", span_decompressed);
         Ok((out, stats))
     }
 
@@ -1430,16 +1447,6 @@ impl SegmentFetcher {
     /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) and the combined
     /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) (#278
     /// item 1).
-    #[tracing::instrument(
-        level = "debug",
-        name = "decode",
-        skip_all,
-        fields(
-            page_kind = "histogram",
-            series_count = histogram.len(),
-            decompressed_bytes = tracing::field::Empty,
-        ),
-    )]
     fn build_histogram_decodes(
         &self,
         key: &str,
@@ -1449,6 +1456,17 @@ impl SegmentFetcher {
         regions: &FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<Vec<RunHistogramDecode>, FetchError> {
+        // See `open_segment`'s comment: recorded on this handle directly,
+        // never through `tracing::Span::current()`. Synchronous function, so
+        // an entered guard (not `.instrument()`) covers the whole body; no
+        // `.await` point can invalidate it.
+        let span = tracing::debug_span!(
+            "decode",
+            page_kind = "histogram",
+            series_count = histogram.len(),
+            decompressed_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         // Summed locally from each `decode_histogram_run`'s own output rather
         // than diffed off the shared `QueryAccounting`, for the same
         // cross-thread reason as the scalar path (ADR-0044 decision 5).
@@ -1524,7 +1542,7 @@ impl SegmentFetcher {
             }
         }
         // This decode pass's own decompressed-byte output, scoped to the span.
-        tracing::Span::current().record("decompressed_bytes", span_decompressed);
+        span.record("decompressed_bytes", span_decompressed);
         Ok(out)
     }
 
@@ -2811,5 +2829,118 @@ mod tests {
         assert!(regions.covers(12, 18));
         assert!(!regions.covers(8, 12), "a straddling range is not covered");
         assert!(regions.slice(8, 4).is_none());
+    }
+
+    /// A `Layer` that records every `record()` call's field names, keyed by
+    /// which span it landed on (by name), so a test can assert a field never
+    /// lands on the wrong span.
+    #[derive(Clone, Default)]
+    struct RecordCollector {
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(String, &'static str)>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for RecordCollector
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct FieldNames(Vec<&'static str>);
+            impl tracing::field::Visit for FieldNames {
+                fn record_u64(&mut self, field: &tracing::field::Field, _value: u64) {
+                    self.0.push(field.name());
+                }
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+            }
+            let mut names = FieldNames(Vec::new());
+            values.record(&mut names);
+            let span_name = ctx
+                .span(id)
+                .map(|s| s.name().to_string())
+                .unwrap_or_default();
+            if let Ok(mut hits) = self.hits.lock() {
+                for name in names.0 {
+                    hits.push((span_name.clone(), name));
+                }
+            }
+        }
+    }
+
+    /// Discriminating regression test for the checkpoint-review bug: the
+    /// phase functions (`open_segment`, `decode_selected`,
+    /// `fetch_scalar_pages`, `build_scalar_decodes`, ...) used to record their
+    /// per-phase `s3_requests`/`s3_bytes`/`series_matched`/
+    /// `decompressed_bytes` fields via `tracing::Span::current()`. Every phase
+    /// span is `debug`-level; at INFO (the production default) they are
+    /// disabled, and entering a disabled span is a no-op that never changes
+    /// what `Span::current()` returns. `Span::current()` would then resolve to
+    /// the nearest *enabled* ancestor -- in production, the `sql_query`/
+    /// `analytics_query` request-level span, which declares the identical
+    /// field names -- and a phase's `record()` call would land there instead,
+    /// visible to any subscriber that observes intermediate `on_record`
+    /// events (a live/streaming trace exporter, not just a backend that reads
+    /// the span once it closes).
+    ///
+    /// This installs an INFO-only filter (so every phase span here is
+    /// disabled, matching production) with a "request_span" standing in for
+    /// `sql_query`/`analytics_query`, entered around the fetch exactly as
+    /// `services/ravel-server/src/sql.rs` enters its own request span. It
+    /// asserts no `s3_requests`/`s3_bytes` field is ever recorded onto
+    /// anything: the fix's `debug_span!`/`.instrument()` (or, for the sync
+    /// decode functions, `span.enter()`) handles mean every phase's `record()`
+    /// call targets its own (disabled, so silently dropped) span, never the
+    /// ambient one. Before the fix, this test fails: the collector observes
+    /// `s3_requests`/`s3_bytes` recorded on `"request_span"`.
+    #[tokio::test]
+    async fn phase_spans_never_record_onto_the_ambient_span_when_disabled() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let collector = RecordCollector::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(collector.clone());
+        let _guard = subscriber.set_default();
+
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend);
+
+        // Stands in for `sql_query`/`analytics_query`: INFO level, so
+        // enabled, declaring the same field names the phase spans do.
+        let request_span = tracing::info_span!(
+            "request_span",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        async {
+            fetcher
+                .fetch_soa(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("fetch_soa succeeds")
+        }
+        .instrument(request_span.clone())
+        .await;
+
+        let hits = collector.hits.lock().expect("lock").clone();
+        let leaked: Vec<_> = hits
+            .iter()
+            .filter(|(_, field)| *field == "s3_requests" || *field == "s3_bytes")
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a disabled phase span's s3_requests/s3_bytes record() call must \
+             never land on any other span (production's request-level span \
+             declares the same field names): got {leaked:?}"
+        );
     }
 }
