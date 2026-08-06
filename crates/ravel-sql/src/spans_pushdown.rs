@@ -7,7 +7,7 @@
 //! DataFusion always re-applies the originals above the scan; exactness comes
 //! from that residual.
 //!
-//! Five shapes are recognized (everything else contributes nothing and widens):
+//! Six shapes are recognized (everything else contributes nothing and widens):
 //!
 //! - **ts window**: top-level AND conjuncts of the bare `start_ts` or `end_ts`
 //!   column compared to a literal timestamp (`>=`, `>`, `<`, `<=`, `=`), and
@@ -35,9 +35,13 @@
 //!   one `ravel_rspan::skip_index` status bit, and multiple conjuncts
 //!   AND-intersect into [`SpansPushdown::status_mask`].
 //! - **service_name equality** `service_name = <literal>`: last-writer-wins,
-//!   mirroring `trace_id`.
+//!   mirroring `trace_id`. Feeds a `COL_SERVICE_NAME` bloom probe (ADR-0054):
+//!   a block whose bloom proves the token absent is skipped before decode.
+//! - **name equality** `name = <literal>`: last-writer-wins, the span-name
+//!   sibling of `service_name`. Feeds a `COL_NAME` bloom probe (ADR-0054), the
+//!   other field the v3 per-block bloom is built over.
 //!
-//! All five are conjunctive-only (ADR-0045 decision 5): a disjunction anywhere
+//! All six are conjunctive-only (ADR-0045 decision 5): a disjunction anywhere
 //! in a conjunct's own subtree ([`contains_or`]) drops that whole conjunct
 //! rather than being soundly pushed, since refusing to push is always
 //! widen-safe (the `Inexact` residual re-applies it). This crate does not
@@ -102,8 +106,13 @@ pub struct SpansPushdown {
     /// [`status_code_equality`]'s doc).
     pub status_mask: Option<u8>,
     /// The single service name an exact `service_name = <literal>` equality
-    /// pinned, if any (last writer wins, mirroring [`Self::trace_id`]).
+    /// pinned, if any (last writer wins, mirroring [`Self::trace_id`]). Drives a
+    /// `ravel_rspan::record::COL_SERVICE_NAME` bloom probe (ADR-0054).
     pub service_name: Option<String>,
+    /// The single span name an exact `name = <literal>` equality pinned, if any
+    /// (last writer wins, mirroring [`Self::service_name`]). Drives a
+    /// `ravel_rspan::record::COL_NAME` bloom probe (ADR-0054).
+    pub name: Option<String>,
 }
 
 impl SpansPushdown {
@@ -230,9 +239,9 @@ fn contains_or(expr: &Expr) -> bool {
 fn handle_binary(be: &BinaryExpr, out: &mut SpansPushdown) {
     // A ts (start_ts/end_ts) vs literal-timestamp comparison folds into the
     // window; a `duration_ns` comparison folds into the duration window; a
-    // `trace_id =`, `status_code =`, or `service_name =` equality pins its
-    // respective axis. Every other binary shape contributes nothing and
-    // widens. Column names are disjoint, so at most one branch ever matches.
+    // `trace_id =`, `status_code =`, `service_name =`, or `name =` equality
+    // pins its respective axis. Every other binary shape contributes nothing
+    // and widens. Column names are disjoint, so at most one branch ever matches.
     if let Some((op, ts_ns)) = ts_comparison(be) {
         apply_ts_bound(out, op, ts_ns);
     } else if let Some((op, dur_ns)) = duration_comparison(be) {
@@ -254,10 +263,13 @@ fn handle_binary(be: &BinaryExpr, out: &mut SpansPushdown) {
             Some(cur) => cur & bit,
             None => bit,
         });
-    } else if let Some(name) = service_name_equality(be) {
-        // Last writer wins, mirroring trace_id: two different names ANDed
-        // are unsatisfiable, and pinning either still drops no needed row.
-        out.service_name = Some(name);
+    } else if let Some(service) = service_name_equality(be) {
+        // Last writer wins, mirroring trace_id: two different service names
+        // ANDed are unsatisfiable, and pinning either still drops no needed row.
+        out.service_name = Some(service);
+    } else if let Some(name) = name_equality(be) {
+        // Last writer wins, mirroring service_name.
+        out.name = Some(name);
     }
 }
 
@@ -582,6 +594,28 @@ fn is_service_name_col(e: &Expr) -> bool {
     matches!(e, Expr::Column(c) if c.name == "service_name")
 }
 
+// --- name equality extraction (mirrors service_name) ---
+
+/// A `name = <literal>` equality (either operand order) -> the span name
+/// string. Anything else (wrong operator, non-`name` column, non-string
+/// literal) yields `None` and widens.
+fn name_equality(be: &BinaryExpr) -> Option<String> {
+    if be.op != Operator::Eq {
+        return None;
+    }
+    if is_name_col(&be.left) {
+        lit_utf8(&be.right)
+    } else if is_name_col(&be.right) {
+        lit_utf8(&be.left)
+    } else {
+        None
+    }
+}
+
+fn is_name_col(e: &Expr) -> bool {
+    matches!(e, Expr::Column(c) if c.name == "name")
+}
+
 fn lit_utf8(e: &Expr) -> Option<String> {
     let sv = match e {
         Expr::Literal(sv, _) => sv,
@@ -765,6 +799,35 @@ mod tests {
     fn service_name_equality_is_last_writer_wins() {
         let p = extract_spans(&[col("service_name").eq(lit("checkout"))]);
         assert_eq!(p.service_name, Some("checkout".to_string()));
+
+        // Last writer wins across two conjuncts, mirroring trace_id.
+        let p = extract_spans(&[
+            col("service_name").eq(lit("checkout")),
+            col("service_name").eq(lit("payments")),
+        ]);
+        assert_eq!(p.service_name, Some("payments".to_string()));
+    }
+
+    #[test]
+    fn name_equality_is_extracted_last_writer_wins() {
+        // Either operand order.
+        let p = extract_spans(&[col("name").eq(lit("GET /cart"))]);
+        assert_eq!(p.name, Some("GET /cart".to_string()));
+        let p = extract_spans(&[lit("GET /cart").eq(col("name"))]);
+        assert_eq!(p.name, Some("GET /cart".to_string()));
+
+        // Last writer wins; service_name and name are independent axes.
+        let p = extract_spans(&[
+            col("name").eq(lit("a")),
+            col("name").eq(lit("b")),
+            col("service_name").eq(lit("checkout")),
+        ]);
+        assert_eq!(p.name, Some("b".to_string()));
+        assert_eq!(p.service_name, Some("checkout".to_string()));
+
+        // A non-string literal is rejected (widen).
+        let p = extract_spans(&[col("name").eq(lit(7i64))]);
+        assert_eq!(p.name, None);
     }
 
     #[test]
@@ -911,8 +974,8 @@ mod tests {
 
     #[test]
     fn unrecognized_shapes_contribute_nothing() {
-        // A binary that is neither a ts comparison nor a trace_id equality.
-        let be = BinaryExpr::new(Box::new(col("name")), Operator::Eq, Box::new(lit("x")));
+        // A binary on a column no shape recognizes (`span_id` has no pushdown).
+        let be = BinaryExpr::new(Box::new(col("span_id")), Operator::Eq, Box::new(lit("x")));
         let p = extract_spans(&[Expr::BinaryExpr(be)]);
         assert_eq!(p, SpansPushdown::default());
     }

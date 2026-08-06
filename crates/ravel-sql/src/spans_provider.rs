@@ -8,7 +8,8 @@
 //! (crate::spans_pushdown), prunes the snapshot's segments by ts overlap
 //! against the extracted window, compiles the pushdown into one
 //! [`ravel_rspan::SpanQuery`] (the trace fast path when a `trace_id =` equality
-//! was pushed, else a bare window scan), and builds a single
+//! was pushed, else a bare window scan) plus the optional `service_name`/`name`
+//! bloom-probe literals (ADR-0054, per-block bloom pruning), and builds a single
 //! [`SpansScanExec`] leaf.
 //!
 //! `supports_filters_pushdown` returns `Inexact` for every filter, exactly like
@@ -100,6 +101,8 @@ impl SpansTableProvider {
             &segments,
             target_partitions,
             pushdown.span_query(),
+            pushdown.service_name.clone(),
+            pushdown.name.clone(),
         )?;
         Ok(Arc::new(scan))
     }

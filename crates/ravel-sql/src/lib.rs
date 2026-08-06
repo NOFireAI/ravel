@@ -123,7 +123,7 @@ pub use session::{
     EmptyObjectStoreRegistry, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session,
     session_config,
 };
-pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanSegmentFetcher};
+pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
 pub use spans_provider::SpansTableProvider;
 pub use spans_pushdown::{SpansPushdown, extract_spans};
 pub use spans_scan::SpansScanExec;
