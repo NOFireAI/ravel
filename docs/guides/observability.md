@@ -24,6 +24,11 @@ breaker runbook, and the durable GC config. Read it to decide what to page on
 and how to respond. This guide does not repeat those procedures. It links to
 them.
 
+The [tracing guide](tracing.md) covers the query-path `tracing` spans. Metrics
+here answer "how much" in aggregate across the process; the per-request spans
+answer "where the time went" for one query. Read the tracing guide to
+attribute a slow query to a phase.
+
 ## The route
 
 `ravel-server` serves `GET /metrics` in every mode, next to `/healthz` and
