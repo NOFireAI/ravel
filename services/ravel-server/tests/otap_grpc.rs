@@ -64,6 +64,7 @@ async fn start_test_server() -> ravel_server::Running {
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
         indexed_fields: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
@@ -112,6 +113,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
         indexed_fields: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
@@ -140,6 +142,7 @@ fn otap_gauge_batch(
             time_unix_nano: ts_ns,
             value: VALUE,
             flags: 0,
+            exemplars: vec![],
             attrs: vec![],
         }],
     }];
@@ -193,6 +196,7 @@ fn otap_stream_batches(specs: &[&[&str]], ts_ns: i64) -> Vec<BatchArrowRecords> 
                         time_unix_nano: ts_ns,
                         value: VALUE,
                         flags: 0,
+                        exemplars: vec![],
                         attrs: vec![],
                     }],
                 })
@@ -221,6 +225,7 @@ fn encode_point_batch(
             time_unix_nano: ts_ns + i as i64,
             value: VALUE + i as f64,
             flags: 0,
+            exemplars: vec![],
             attrs: vec![],
         })
         .collect();
