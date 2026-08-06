@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 
 use ravel_types::logstream::LogStreamId;
 use ravel_types::{SeriesId, Signal, TenantHash, TenantId};
+use uuid::Uuid;
 
 use crate::Clock;
 
@@ -238,6 +239,12 @@ struct EpochIdSet<T> {
     current: HashSet<T>,
     previous: HashSet<T>,
     active_count: u64,
+    /// Monotonic count of genuinely new identities admitted over this set's
+    /// lifetime (never decremented on rotation). The reconciliation snapshot
+    /// (ADR-0057) reports the delta of this since its previous snapshot as
+    /// `series_creation_consumed_since_last_snapshot`: a flow, not the stock
+    /// `active_count` tracks.
+    created_total: u64,
 }
 
 impl<T: Eq + Hash + Copy> EpochIdSet<T> {
@@ -247,6 +254,7 @@ impl<T: Eq + Hash + Copy> EpochIdSet<T> {
             current: HashSet::new(),
             previous: HashSet::new(),
             active_count: 0,
+            created_total: 0,
         }
     }
 
@@ -297,6 +305,7 @@ impl<T: Eq + Hash + Copy> EpochIdSet<T> {
         if cap.admits_one_more(self.active_count) {
             self.current.insert(id);
             self.active_count += 1;
+            self.created_total = self.created_total.saturating_add(1);
             true
         } else {
             false
@@ -312,6 +321,12 @@ struct SignalUsage {
     requests_rejected_series_rate_total: u64,
     series_admitted_total: u64,
     series_rejected_cap_total: u64,
+    /// Fleet-admission reconciliation read failures for this (tenant, signal)
+    /// (ADR-0057 section 3): a LIST or GET of the sibling snapshots failed, so
+    /// this process kept its last-computed `local_soft_threshold` rather than
+    /// failing admission closed. Surfaced as
+    /// `ravel_admission_reconciliation_failures_total`.
+    reconciliation_failures_total: u64,
 }
 
 /// One (tenant, signal) row of the usage snapshot (ADR-0051 section 6).
@@ -346,6 +361,9 @@ pub struct TenantUsage {
     pub requests_rejected_byte_rate_total: u64,
     pub requests_rejected_series_rate_total: u64,
     pub series_rejected_cap_total: u64,
+    /// Fleet-admission reconciliation read failures (ADR-0057 section 3),
+    /// per (tenant, signal). See [`SignalUsage::reconciliation_failures_total`].
+    pub reconciliation_failures_total: u64,
 }
 
 struct TenantState {
@@ -355,6 +373,25 @@ struct TenantState {
     byte_rate: Option<TokenBucket>,
     creation_rate: Option<TokenBucket>,
     usage: HashMap<Signal, SignalUsage>,
+    /// Effective fleet-reconciled count caps (ADR-0057 section 2). These, not
+    /// `limits.max_active_series`/`max_active_streams`, are what the hot-path
+    /// `admit_series`/`admit_streams` compare against. They start equal to the
+    /// configured caps, so before the first reconciliation cycle (and after a
+    /// limits change) enforcement is byte-identical to ADR-0051's per-process
+    /// behavior. A successful reconciliation overwrites them with
+    /// `local_soft_threshold`; a failed one leaves them at their last-known
+    /// value (never fails closed to zero, ADR-0057 section 3). The rate caps
+    /// are reconciled in place on the `byte_rate`/`creation_rate` buckets'
+    /// `rate_per_sec`, so no separate effective field is needed for them.
+    fleet_max_active_series: CountLimit,
+    fleet_max_active_streams: CountLimit,
+    /// Cumulative byte flow captured at this tenant's previous reconciliation
+    /// snapshot, so the next snapshot reports the delta since it (ADR-0057
+    /// section 1: a delta, not a running total).
+    snapshot_baseline_bytes: u64,
+    /// Cumulative new-identity (series + streams) creation flow captured at the
+    /// previous snapshot, for the same delta reason.
+    snapshot_baseline_created: u64,
 }
 
 impl TenantState {
@@ -374,6 +411,10 @@ impl TenantState {
             byte_rate,
             creation_rate,
             usage: HashMap::new(),
+            fleet_max_active_series: limits.max_active_series,
+            fleet_max_active_streams: limits.max_active_streams,
+            snapshot_baseline_bytes: 0,
+            snapshot_baseline_created: 0,
         }
     }
 
@@ -381,7 +422,9 @@ impl TenantState {
     /// burst capacity under the new rate: limits load once at startup
     /// (ADR-0051 section 3, "changing limits is a restart"), so there is no
     /// live-traffic case where preserving a bucket's partial fill across a
-    /// limit change matters.
+    /// limit change matters. The effective fleet caps are reset to the new
+    /// configured caps, so a limits change never leaves a stale reconciled
+    /// value in force until the next reconciliation cycle.
     fn set_limits(&mut self, limits: AdmissionLimits, now_ns: i64) {
         self.byte_rate = match limits.ingest_byte_rate {
             RateLimit::Bounded { per_sec, burst } => Some(TokenBucket::new(per_sec, burst, now_ns)),
@@ -391,6 +434,8 @@ impl TenantState {
             RateLimit::Bounded { per_sec, burst } => Some(TokenBucket::new(per_sec, burst, now_ns)),
             RateLimit::Unlimited => None,
         };
+        self.fleet_max_active_series = limits.max_active_series;
+        self.fleet_max_active_streams = limits.max_active_streams;
         self.limits = limits;
     }
 }
@@ -409,6 +454,13 @@ pub struct AdmissionController {
     clock: Arc<dyn Clock>,
     defaults: AdmissionLimits,
     tenants: Mutex<HashMap<TenantId, TenantState>>,
+    /// A value stable for this process's lifetime and unique fleet-wide
+    /// (ADR-0057 section 1). It names the one snapshot key this process owns and
+    /// alone ever writes, `t/<tenant_hash>/<sig>/admission/<process_id>.snapshot`,
+    /// and is how a reconciling reader excludes its own snapshot from the
+    /// sibling sum. Generated once at construction; it need not be meaningful
+    /// outside this mechanism.
+    process_id: Uuid,
 }
 
 impl AdmissionController {
@@ -417,7 +469,15 @@ impl AdmissionController {
             clock,
             defaults,
             tenants: Mutex::new(HashMap::new()),
+            process_id: Uuid::new_v4(),
         }
+    }
+
+    /// This process's stable, fleet-unique snapshot-key owner id (ADR-0057
+    /// section 1). Used by the reconciliation task to name its own key and to
+    /// exclude it from the sibling sum.
+    pub fn process_id(&self) -> Uuid {
+        self.process_id
     }
 
     fn now_ns(&self) -> i64 {
@@ -536,7 +596,10 @@ impl AdmissionController {
     ) -> IdentityAdmission<SeriesId> {
         self.with_tenant(tenant, now_ns, |state| {
             state.series.rotate(now_ns);
-            let cap = state.limits.max_active_series;
+            // The effective fleet-reconciled cap (ADR-0057 section 2), which
+            // starts equal to `limits.max_active_series` and is updated only by
+            // reconciliation off the hot path. Same field read, same cost.
+            let cap = state.fleet_max_active_series;
             let usage = state.usage.entry(Signal::Metrics).or_default();
             admit_batch(&mut state.series, candidate_series, cap, usage)
         })
@@ -552,7 +615,9 @@ impl AdmissionController {
     ) -> IdentityAdmission<LogStreamId> {
         self.with_tenant(tenant, now_ns, |state| {
             state.streams.rotate(now_ns);
-            let cap = state.limits.max_active_streams;
+            // The effective fleet-reconciled cap (ADR-0057 section 2), as in
+            // `admit_series`.
+            let cap = state.fleet_max_active_streams;
             let usage = state.usage.entry(Signal::Logs).or_default();
             admit_batch(&mut state.streams, candidate_streams, cap, usage)
         })
@@ -584,11 +649,202 @@ impl AdmissionController {
                     requests_rejected_byte_rate_total: usage.requests_rejected_byte_rate_total,
                     requests_rejected_series_rate_total: usage.requests_rejected_series_rate_total,
                     series_rejected_cap_total: usage.series_rejected_cap_total,
+                    reconciliation_failures_total: usage.reconciliation_failures_total,
                 });
             }
         }
         out
     }
+
+    // ----- Fleet-global admission reconciliation (ADR-0057) -----
+    //
+    // The hooks the periodic reconciliation task in [`crate::reconcile`] drives.
+    // Both lock the tenant map briefly and do NO I/O and NO `.await` under the
+    // lock (the same discipline as the hot-path checks): the task does its
+    // object-store LIST/GET between these two calls, holding no lock.
+
+    /// Capture every tracked tenant's current usage for one reconciliation
+    /// cycle (ADR-0057 sections 1-2). Each returned entry carries the flow
+    /// deltas "since the previous snapshot" and the running totals those deltas
+    /// were computed from, but does **not** advance the flow baselines: the
+    /// baseline only commits once this tenant's reconciliation cycle actually
+    /// succeeds, in [`Self::apply_reconciliation`] (which the caller reaches
+    /// only after a successful sibling read). If the read fails, the caller
+    /// skips the apply and the baseline stays put, so this interval's delta is
+    /// rolled into the next successful interval rather than silently dropped --
+    /// a given delta is counted in exactly one interval's threshold
+    /// computation, never dropped and never double-counted. Returns one entry
+    /// per tenant that has any recorded activity; the caller writes a per-signal
+    /// snapshot for each and reads the siblings.
+    pub(crate) fn snapshot_for_reconciliation(&self, now_ns: i64) -> Vec<TenantReconcileState> {
+        let mut tenants = lock(&self.tenants);
+        let mut out = Vec::with_capacity(tenants.len());
+        for (tenant, state) in tenants.iter_mut() {
+            if state.usage.is_empty() {
+                continue;
+            }
+            state.series.rotate(now_ns);
+            state.streams.rotate(now_ns);
+
+            // Tenant-wide flow: bytes admitted across every signal, and new
+            // identities created across series and streams. Both buckets are
+            // per-tenant (ADR-0051), so the deltas are tenant-wide, carried
+            // identically in each of the tenant's per-signal snapshots.
+            let bytes_total: u64 = state
+                .usage
+                .values()
+                .map(|u| u.bytes_admitted_total)
+                .fold(0u64, u64::saturating_add);
+            let created_total = state
+                .series
+                .created_total
+                .saturating_add(state.streams.created_total);
+            let byte_delta = bytes_total.saturating_sub(state.snapshot_baseline_bytes);
+            let creation_delta = created_total.saturating_sub(state.snapshot_baseline_created);
+            // Baselines are NOT advanced here: they commit in
+            // `apply_reconciliation`, only after this tenant's sibling read
+            // succeeds. The running totals ride along so that commit can pin the
+            // baseline to exactly the totals this delta was measured against
+            // (traffic that arrives between here and the commit is attributed to
+            // the next interval, not this one).
+
+            let mut signals: Vec<Signal> = state.usage.keys().copied().collect();
+            signals.sort_by_key(|s| s.key_prefix());
+
+            out.push(TenantReconcileState {
+                tenant: tenant.clone(),
+                tenant_hash: tenant.hash(),
+                configured_series: state.limits.max_active_series,
+                configured_streams: state.limits.max_active_streams,
+                configured_byte_rate: state.limits.ingest_byte_rate,
+                configured_creation_rate: state.limits.series_creation_rate,
+                active_series: state.series.active_count,
+                active_streams: state.streams.active_count,
+                byte_delta,
+                creation_delta,
+                snapshot_bytes_total: bytes_total,
+                snapshot_created_total: created_total,
+                signals,
+            });
+        }
+        out
+    }
+
+    /// Install one tenant's freshly-computed `local_soft_threshold`s (ADR-0057
+    /// section 2) and commit its flow baselines. A `None` cap field is left
+    /// unchanged (its configured cap is unlimited, so there is no fleet cap to
+    /// enforce). Called only after a successful reconciliation read; a failed
+    /// read never reaches here, so the last-known thresholds stay in force
+    /// (ADR-0057 section 3) and the flow baselines stay put so the skipped
+    /// interval's delta is rolled into the next successful one rather than
+    /// dropped (the commit half of [`Self::snapshot_for_reconciliation`]'s
+    /// exactly-once contract).
+    pub(crate) fn apply_reconciliation(&self, update: &TenantReconcileApply) {
+        let mut tenants = lock(&self.tenants);
+        let Some(state) = tenants.get_mut(&update.tenant) else {
+            return;
+        };
+        // Commit the flow baselines to the totals the snapshot's deltas were
+        // measured against, now that this tenant's cycle has succeeded.
+        state.snapshot_baseline_bytes = update.baseline_bytes;
+        state.snapshot_baseline_created = update.baseline_created;
+        if let Some(cap) = update.series_cap {
+            state.fleet_max_active_series = cap;
+        }
+        if let Some(cap) = update.streams_cap {
+            state.fleet_max_active_streams = cap;
+        }
+        // Rate caps are reconciled in place on the existing buckets'
+        // `rate_per_sec` (ADR-0057 section 2): the hot-path `try_take` reads
+        // whatever rate is set, unchanged in cost. Tokens and capacity (burst)
+        // are left untouched, so an in-flight burst allowance is preserved.
+        if let (Some(per_sec), Some(bucket)) = (update.byte_rate_per_sec, state.byte_rate.as_mut())
+        {
+            bucket.rate_per_sec = per_sec;
+        }
+        if let (Some(per_sec), Some(bucket)) =
+            (update.creation_rate_per_sec, state.creation_rate.as_mut())
+        {
+            bucket.rate_per_sec = per_sec;
+        }
+    }
+
+    /// Record a reconciliation read failure for one (tenant, signal) (ADR-0057
+    /// section 3): the LIST or a GET of the sibling snapshots failed, so the
+    /// last-computed threshold stays in force and this counter increments so a
+    /// sustained failure is observable.
+    pub(crate) fn record_reconciliation_failure(&self, tenant: &TenantId, signal: Signal) {
+        let now_ns = self.now_ns();
+        self.with_tenant(tenant, now_ns, |state| {
+            state
+                .usage
+                .entry(signal)
+                .or_default()
+                .reconciliation_failures_total += 1;
+        });
+    }
+
+    /// The effective (fleet-reconciled) active-series cap now in force for a
+    /// tenant, or `None` if the tenant has no state yet. Test-only observation
+    /// hook for the reconciliation tests; the hot path reads this same field.
+    #[cfg(test)]
+    pub(crate) fn effective_max_active_series(&self, tenant: &TenantId) -> Option<CountLimit> {
+        lock(&self.tenants)
+            .get(tenant)
+            .map(|state| state.fleet_max_active_series)
+    }
+
+    /// The effective (fleet-reconciled) ingest byte-rate `rate_per_sec` now in
+    /// force for a tenant, or `None` if the tenant has no state or no bounded
+    /// byte-rate bucket. Test-only observation hook for the rate-reconciliation
+    /// tests; the hot-path `try_take` reads this same bucket field.
+    #[cfg(test)]
+    pub(crate) fn effective_byte_rate_per_sec(&self, tenant: &TenantId) -> Option<u64> {
+        lock(&self.tenants)
+            .get(tenant)
+            .and_then(|state| state.byte_rate.as_ref())
+            .map(|bucket| bucket.rate_per_sec)
+    }
+}
+
+/// One tenant's usage captured for a reconciliation cycle (ADR-0057). Owned and
+/// lock-free, so the reconciliation task can do its object-store I/O without
+/// holding the controller's mutex.
+pub(crate) struct TenantReconcileState {
+    pub(crate) tenant: TenantId,
+    pub(crate) tenant_hash: TenantHash,
+    pub(crate) configured_series: CountLimit,
+    pub(crate) configured_streams: CountLimit,
+    pub(crate) configured_byte_rate: RateLimit,
+    pub(crate) configured_creation_rate: RateLimit,
+    pub(crate) active_series: u64,
+    pub(crate) active_streams: u64,
+    pub(crate) byte_delta: u64,
+    pub(crate) creation_delta: u64,
+    /// The running byte/creation totals `byte_delta`/`creation_delta` were
+    /// measured against. Carried so [`AdmissionController::apply_reconciliation`]
+    /// can commit the flow baselines to exactly these values once the cycle
+    /// succeeds (ADR-0057; a failed read leaves the baselines untouched so this
+    /// interval's delta is not dropped).
+    pub(crate) snapshot_bytes_total: u64,
+    pub(crate) snapshot_created_total: u64,
+    pub(crate) signals: Vec<Signal>,
+}
+
+/// The thresholds one reconciliation cycle computed for one tenant, applied by
+/// [`AdmissionController::apply_reconciliation`]. A `None` means "leave
+/// unchanged" (configured unlimited, or nothing to reconcile).
+pub(crate) struct TenantReconcileApply {
+    pub(crate) tenant: TenantId,
+    pub(crate) series_cap: Option<CountLimit>,
+    pub(crate) streams_cap: Option<CountLimit>,
+    pub(crate) byte_rate_per_sec: Option<u64>,
+    pub(crate) creation_rate_per_sec: Option<u64>,
+    /// The flow baselines to commit for this tenant now that its reconciliation
+    /// cycle succeeded (ADR-0057). These are the running totals captured in
+    /// [`AdmissionController::snapshot_for_reconciliation`], not the deltas.
+    pub(crate) baseline_bytes: u64,
+    pub(crate) baseline_created: u64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

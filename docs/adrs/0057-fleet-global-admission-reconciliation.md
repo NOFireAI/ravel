@@ -134,24 +134,69 @@ count.
 On the same interval `R`, each process lists the
 `t/<tenant_hash>/<sig>/admission/` prefix for every (tenant, signal) it is
 itself currently tracking usage for, GETs every sibling snapshot found,
-and computes:
+and computes a threshold that replaces the raw configured cap as the
+value `AdmissionController`'s existing hot-path check compares against,
+for this (tenant, signal), until the next reconciliation. The hot-path
+check itself is **unchanged**: same mutex, same hashmap, same token
+bucket and `EpochIdSet` logic, same sub-microsecond cost -- only the
+number it compares against now comes from the last reconciliation instead
+of being the static configured limit. `configured_fleet_cap` is the value
+an operator sets once, meaning the fleet-wide total, not per-process --
+closing the exact gap issue #656 names: sizing a cap no longer requires
+dividing by replica count.
+
+Count and rate caps need different formulas, because one is a stock and
+the other is a flow.
+
+**Count caps** (`active_series`, `active_streams`) use additive headroom:
 
 ```
-fleet_used(cap) = own_current_usage(cap) + sum(sibling_snapshot.usage(cap) for each sibling)
+fleet_used(cap) = own_current_usage(cap) + sum(sibling_snapshot.usage(cap) for each non-stale sibling)
 fleet_remaining(cap) = configured_fleet_cap(cap) - fleet_used(cap)
 local_soft_threshold(cap) = own_current_usage(cap) + max(0, fleet_remaining(cap))
 ```
 
-`local_soft_threshold` replaces the raw configured cap as the value
-`AdmissionController`'s existing hot-path check compares against, for
-this (tenant, signal), until the next reconciliation. The hot-path check
-itself is **unchanged**: same mutex, same hashmap, same token bucket and
-`EpochIdSet` logic, same sub-microsecond cost -- only the number it
-compares against now comes from the last reconciliation instead of being
-the static configured limit. `configured_fleet_cap` is the value an
-operator sets once, meaning the fleet-wide total, not per-process --
-closing the exact gap issue #656 names: sizing a cap no longer requires
-dividing by replica count.
+This is correct for a stock: `own_current_usage` only grows through
+admissions this same threshold gates, so once the fleet is at or over
+cap, the threshold collapses to `own_current_usage` -- this process
+admits nothing further, and the value doesn't move again until a
+tenant's usage actually drops. A stable fixed point.
+
+**Rate caps** (`ingest_byte_rate`, `series_creation_rate`) do not have
+that property, and using the same formula for them was a bug the
+checkpoint reviewing EF-T1 caught before it landed (2026-08-06):
+`own_current_usage` for a rate cap is a *measured* flow rate, not a
+stock the threshold controls. Once the fleet crosses the configured cap,
+every process's `own` reading is "whatever I'm already sending," so the
+additive-headroom formula pins every process's threshold to its current
+rate and never reduces it -- the fleet sustains the sum of everyone's
+uncapped rate indefinitely, not for one interval.
+
+Rate caps instead use an equal fleet-share of the configured cap:
+
+```
+N(cap) = 1 (self) + count of non-stale siblings that reported a snapshot for this (tenant, signal), regardless of whether their reported delta for this cap was itself zero
+local_soft_rate_threshold(cap) = configured_fleet_cap(cap) / N(cap)      // integer division, floor
+```
+
+Every process computes `N` from the same non-stale sibling set it already
+reads for the count formula, so once every process's view of `N` agrees
+-- which happens within one interval `R` of the last change to who's
+live -- the sum of every process's `local_soft_rate_threshold` is at most
+`configured_fleet_cap` (floor-rounding can only lose up to `N - 1` total
+from the cap, never exceed it). This is deliberately the boring choice:
+it is stable under reconciliation lag, since a process's threshold at a
+given `N` is a fixed value rather than something recomputed against
+siblings' possibly-stale demand every interval -- an oscillation risk a
+demand-proportional split (e.g. weighting each process's share by its own
+measured rate) would carry, since every process would be scaling itself
+down against a denominator that is itself up to `2R` stale, all at once,
+every interval. The cost is that an idle process's fair share sits unused
+rather than being reallocated to a busy sibling; making the split
+demand-aware is left to a future ADR if that waste is ever shown to
+matter in practice, and nothing here blocks it -- this is a private
+helper internal to reconciliation, not a wire-format or hot-path
+commitment.
 
 ### 3. Staleness: fail closed on caps, not on flow
 
@@ -183,10 +228,13 @@ narrow.
 ### 4. The reconciliation interval `R` and the overshoot bound
 
 `R` defaults to 10 seconds. The bound this ADR gives up in exchange for
-zero hot-path cost: in the worst case, every process's local view is
-exactly `R` stale relative to its siblings, so the true fleet-wide total
-can exceed the configured cap by at most the sum, across all processes,
-of what each could admit in one interval `R` under its own
+zero hot-path cost differs in shape between count caps and rate caps,
+because their formulas differ (section 2).
+
+**Count caps:** in the worst case, every process's local view is exactly
+`R` stale relative to its siblings, so the true fleet-wide total can
+exceed the configured cap by at most the sum, across all processes, of
+what each could admit in one interval `R` under its own
 `local_soft_threshold` at the moment reconciliation last ran. This is
 bounded, not unbounded, and shrinks to the configured cap within one
 further interval once any process observes the overage. It is the same
@@ -194,6 +242,22 @@ shape of tradeoff ADR-0052 section 3 makes for its slack window `S`:
 a stated, finite window instead of either "perfectly exact" or
 "unbounded," chosen because the alternative (a hot-path round-trip) has
 already been rejected for good reason.
+
+**Rate caps:** the overshoot here is driven by disagreement over `N`
+rather than by any one process's own admitted delta. A process that just
+joined the fleet contributes no snapshot until its own first
+reconciliation write, so existing siblings continue enforcing their
+share of the *old*, smaller `N` until their own next tick observes the
+newcomer -- for at most one interval `R` after a join, the fleet's
+combined enforced rate can be as high as `N_old * (cap / N_old) + cap /
+N_new` (the existing siblings' unchanged shares, plus the newcomer's own,
+already-correct share), which is at most one extra full `N`-th share
+above the steady-state `configured_fleet_cap`. It converges to at most
+`configured_fleet_cap` once every process's next tick lands, within a
+further `R`. A process leaving or going stale has the opposite,
+safe-direction transient: the remaining processes briefly under-use their
+true fair share until their own next tick raises `N`'s denominator back
+down, never an overage.
 
 `R = 10s` is chosen to keep the LIST-then-N-GETs reconciliation read cheap
 (a realistic gateway replica count is single digits to low tens per the
@@ -281,13 +345,15 @@ note in the eventual docs, not a redesign of this ADR.
 - **The hot path is unchanged.** Same mutex, same hashmap, same token
   bucket, same sub-microsecond cost. The only new cost is a background
   task per process, off the request path, on interval `R`.
-- **The configured cap becomes genuinely fleet-wide**, within a bounded
-  overshoot window of at most one reconciliation interval's worth of
-  admission per process, instead of an operator-computed per-process
-  fraction. Operators no longer divide a business cap by replica count
-  (`docs/guides/admission-limits.md`'s existing manual-division guidance,
-  from ADR-0051, is superseded and should be corrected in the same
-  wave this lands).
+- **The configured cap becomes genuinely fleet-wide.** Count caps are
+  bounded by at most one reconciliation interval's worth of admission per
+  process (section 4); rate caps converge to the configured cap within
+  one interval of the fleet's live-process set settling (also section
+  4) -- both a stated, finite overshoot window, not an operator-computed
+  per-process fraction. Operators no longer divide a business cap by
+  replica count (`docs/guides/admission-limits.md`'s existing
+  manual-division guidance, from ADR-0051, is superseded and corrected in
+  this same commit).
 - **A new object-store keyspace**, `t/<hash>/<sig>/admission/<process_id>.
   snapshot`, small, per-process, self-owned, no CAS. Falls under
   Maintain's existing write/delete grant in ADR-0055's role model for any
@@ -308,3 +374,15 @@ note in the eventual docs, not a redesign of this ADR.
   an outage on its own.
 - **Does not close #491** (the ravel-ingest/ravel-server default
   discrepancy) -- unrelated, already tracked separately.
+
+## Correction (2026-08-06)
+
+The rate-cap formula in section 2 and the rate-cap overshoot bound in
+section 4 were corrected before this ADR's first implementation (issue
+#677) landed. The originally accepted text applied the count-cap
+additive-headroom formula to rate caps unmodified; a checkpoint review of
+the implementation caught that this formula does not converge for a flow
+quantity (see section 2's "Rate caps" subsection for the failure mode and
+the corrected equal-fleet-share formula). No deployment ever ran the
+original formula -- issue #677's implementation was blocked on this
+finding before landing.

@@ -334,6 +334,9 @@ async fn main() -> anyhow::Result<()> {
         store_probe_interval: cli
             .parse_store_probe_interval()
             .context("failed to parse --store-probe-interval")?,
+        admission_reconcile_interval: cli
+            .parse_admission_reconcile_interval()
+            .context("failed to parse --admission-reconcile-interval")?,
         indexed_fields,
         disable_cache: cli.disable_cache,
         cache_max_bytes: cli.cache_max_bytes,

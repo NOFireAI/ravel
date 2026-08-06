@@ -1332,6 +1332,7 @@ struct AdmissionAcc {
     rejected_byte_rate: u64,
     rejected_series_rate: u64,
     rejected_series_cap: u64,
+    reconciliation_failures: u64,
 }
 
 impl AdmissionAcc {
@@ -1380,6 +1381,9 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         acc.rejected_series_cap = acc
             .rejected_series_cap
             .saturating_add(row.series_rejected_cap_total);
+        acc.reconciliation_failures = acc
+            .reconciliation_failures
+            .saturating_add(row.reconciliation_failures_total);
     }
 
     // A HashMap iterates in an unspecified order; Prometheus does not require
@@ -1467,6 +1471,28 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
                 acc.rejected(reason),
             );
         }
+    }
+
+    // Fleet-global reconciliation read failures (ADR-0057 section 3). Same
+    // {mode, tenant_hash, signal} labels as the rest of this family. A sustained
+    // nonzero rate means a process is repeatedly unable to read its siblings'
+    // snapshots and is falling back to its last-computed soft threshold rather
+    // than a fresh fleet view; admission never fails closed on it, so this is
+    // the signal that fleet-wide accuracy is degrading, not that ingest is down.
+    write_header(
+        out,
+        "ravel_admission_reconciliation_failures_total",
+        "Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, \
+         by tenant and signal; the last-known soft threshold stays in force (ADR-0057 section 3).",
+        "counter",
+    );
+    for ((hash, signal), acc) in &ordered {
+        write_sample(
+            out,
+            "ravel_admission_reconciliation_failures_total",
+            &labels(mode, *hash, *signal),
+            acc.reconciliation_failures,
+        );
     }
 }
 
@@ -2903,6 +2929,7 @@ mod tests {
             requests_rejected_byte_rate_total: 0,
             requests_rejected_series_rate_total: 0,
             series_rejected_cap_total: 0,
+            reconciliation_failures_total: 0,
         }
     }
 

@@ -248,6 +248,22 @@ pub struct Cli {
     #[arg(long = "metrics-tenant-labels")]
     pub metrics_tenant_labels: bool,
 
+    /// How often the fleet-global admission reconciliation task runs (interval
+    /// `R`), as a humantime duration (e.g. `10s`), ADR-0057 section 4. Each
+    /// process writes its own admission usage to a self-owned object-store key
+    /// and reads every sibling's on this interval, so the configured admission
+    /// caps become genuinely fleet-wide (not per-process x replica count),
+    /// within a bounded overshoot window of at most one interval's admission per
+    /// process. A shorter `R` tightens that window at the cost of more
+    /// reconciliation requests; a longer one the reverse. Runs only in the
+    /// ingest-serving modes (`all`, `gateway`). Matches the humantime-duration
+    /// convention of `--store-probe-interval`. Omitted defaults to
+    /// `ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL` (10s); a zero or
+    /// unparseable duration fails startup rather than reconciling in a tight
+    /// loop.
+    #[arg(long = "admission-reconcile-interval", value_name = "DURATION")]
+    pub admission_reconcile_interval: Option<String>,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -616,6 +632,29 @@ impl Cli {
                     anyhow::bail!(
                         "--store-probe-interval '{s}' must be a positive duration: a zero \
                          interval would probe the store in a tight loop"
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--admission-reconcile-interval` into a duration (ADR-0057 section
+    /// 4), defaulting to [`ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL`]
+    /// when unset. Rejects a zero or unparseable duration rather than
+    /// reconciling in a tight loop or silently doing nothing, mirroring
+    /// [`Self::parse_store_probe_interval`].
+    pub fn parse_admission_reconcile_interval(&self) -> anyhow::Result<Duration> {
+        match self.admission_reconcile_interval.as_deref() {
+            None => Ok(ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL),
+            Some(s) => {
+                let dur = humantime::parse_duration(s).map_err(|e| {
+                    anyhow::anyhow!("invalid --admission-reconcile-interval '{s}': {e}")
+                })?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--admission-reconcile-interval '{s}' must be a positive duration: a zero \
+                         interval would reconcile in a tight loop"
                     );
                 }
                 Ok(dur)
