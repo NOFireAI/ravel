@@ -1264,6 +1264,18 @@ fn rspan_section_kind_name(kind: u32) -> &'static str {
     }
 }
 
+/// Human-readable name for an RSPAN [`StatusCode`] (docs/span-segment-format.md
+/// `status_code` column: 0=unset 1=ok 2=error). The names mirror the
+/// `StatusCode` variants so the per-record listing cannot drift from the stored
+/// status byte definitions.
+fn rspan_status_code_name(code: ravel_rspan::StatusCode) -> &'static str {
+    match code {
+        ravel_rspan::StatusCode::Unset => "unset",
+        ravel_rspan::StatusCode::Ok => "ok",
+        ravel_rspan::StatusCode::Error => "error",
+    }
+}
+
 /// Human-readable name for an RSPAN section `comp` tag (0=none, 2=zstd).
 fn rspan_comp_name(comp: u8) -> &'static str {
     match comp {
@@ -1274,10 +1286,12 @@ fn rspan_comp_name(comp: u8) -> &'static str {
 }
 
 /// Inspects a whole RSPAN object (docs/span-segment-format.md): footer identity
-/// and summary, the section table, and the interval-aware skip index (one line
-/// per block). Every decode is the reader's own path, so a corrupt SKIP_IDX or a
-/// section crc mismatch surfaces as a typed error with a non-zero exit, never a
-/// panic.
+/// and summary, the section table, the interval-aware skip index (one line per
+/// block), and, for a v3 object (ADR-0054), the BLOOM section's coverage (the
+/// block count it spans, not its bits) and one line per decoded span record
+/// carrying the `service_name` column value alongside the other span columns.
+/// Every decode is the reader's own path, so a corrupt SKIP_IDX, BLOOM, or block
+/// surfaces as a typed error with a non-zero exit, never a panic.
 fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     let footer = ravel_rspan::open(bytes)
         .map_err(|err| anyhow::anyhow!("failed to parse rspan segment: {err}"))?;
@@ -1346,6 +1360,59 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
             entry.status_mask,
             rspan_status_mask_names(entry.status_mask),
         );
+    }
+
+    // BLOOM section and service_name column (v3, ADR-0054). Both are present
+    // only from v3 on, so gate on the BLOOM section descriptor: an older object
+    // without it still inspects its footer, sections, and skip index above.
+    // Decoding goes through `RspanReader`, the reader's own crc-verify path, so
+    // a corrupt BLOOM or block is a typed error with a non-zero exit here, the
+    // same discipline the skip index decode above applies.
+    if footer.section(ravel_rspan::footer::kind::BLOOM).is_some() {
+        let reader = ravel_rspan::RspanReader::new(bytes, &ravel_rspan::RspanConfig::default())
+            .map_err(|err| anyhow::anyhow!("failed to open rspan reader: {err}"))?;
+        // The bloom carries one entry per block (the reader verifies this count
+        // against the skip index at open time). Report that coverage, not the
+        // bloom bits themselves.
+        let bloom = reader
+            .bloom()
+            .map_err(|err| anyhow::anyhow!("failed to parse bloom section: {err}"))?;
+        println!("bloom ({} block(s))", bloom.len());
+
+        // One line per span, in the object's stored (trace_id, start_ts) order.
+        // `service_name` is the v3 dictionary column lifted out of the attrs
+        // blob (ADR-0054); print it as its own column and list the remaining
+        // attrs with `service.name` filtered out, mirroring the on-disk split
+        // rather than the reader-reconstructed record where it is re-inserted.
+        let (records, _stats) = reader
+            .scan(&ravel_rspan::SpanQuery::ts_range(i64::MIN, i64::MAX))
+            .map_err(|err| anyhow::anyhow!("failed to scan span records: {err}"))?;
+        println!("records ({}):", records.len());
+        for (i, rec) in records.iter().enumerate() {
+            let service = ravel_rspan::record::service_name_of(&rec.attrs).unwrap_or("");
+            let attrs = rec
+                .attrs
+                .iter()
+                .filter(|(k, _)| k != ravel_rspan::record::SERVICE_NAME_KEY)
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "  record[{i}] trace_id={} span_id={} parent_span_id={} name={} \
+                 start_ts_ns={} end_ts_ns={} status={} status_message={} \
+                 service_name={} attrs={}",
+                hex::encode(rec.trace_id),
+                hex::encode(rec.span_id),
+                rec.parent_span_id.map(hex::encode).unwrap_or_default(),
+                rec.name,
+                rec.start_ts_ns,
+                rec.end_ts_ns,
+                rspan_status_code_name(rec.status_code),
+                rec.status_message.as_deref().unwrap_or(""),
+                service,
+                attrs,
+            );
+        }
     }
 
     Ok(())

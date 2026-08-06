@@ -89,6 +89,44 @@ fn build_object() -> Vec<u8> {
     w.finish().expect("finish")
 }
 
+/// v3 (ADR-0054) added a mandatory BLOOM section and a `service_name` column.
+/// `rspan inspect` must report the bloom's block coverage (its stats, not its
+/// bits) and print each span's `service_name` column value alongside the other
+/// span columns. This pins both against real command output; the exact bytes
+/// are also covered by [`v3_output_matches_golden_fixture`], but this test
+/// states the v3 contract directly so a future edit that drops either surfaces
+/// as a named failure rather than only a golden-diff.
+#[test]
+fn prints_v3_bloom_presence_and_service_name_column() {
+    let path = temp_path("v3-bloom-service");
+    std::fs::write(&path, build_object()).expect("writes object");
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        output.status.success(),
+        "ravel-cli rspan inspect failed on a known-good v3 object, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+
+    // The BLOOM section covers one entry per block; the object has two blocks.
+    assert!(
+        stdout.contains("bloom (2 block(s))"),
+        "expected the BLOOM section's block coverage, got:\n{stdout}"
+    );
+    // Every span carries its `service_name` column value (the fixture's spans
+    // set service.name to svc<trace>), lifted into its own column.
+    assert!(
+        stdout.contains("service_name=svc1") && stdout.contains("service_name=svc2"),
+        "expected per-record service_name column values, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("records (4):"),
+        "expected a per-record listing, got:\n{stdout}"
+    );
+}
+
 #[test]
 fn v3_output_matches_golden_fixture() {
     let path = temp_path("golden");
