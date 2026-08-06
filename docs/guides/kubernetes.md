@@ -281,7 +281,7 @@ Each of the operator's three Deployments maps to one role:
 
 | Tier / Deployment | `--mode` | Role | Scope in one line |
 |---|---|---|---|
-| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes. No delete. |
+| `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes, plus fleet-admission reconciliation snapshots (ADR-0057). No delete. |
 | `<name>-query` | `query` | Query | Reads commit and catalog objects, runs fold, appends query audit. No delete. |
 | `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only tier granted any delete, and only over `l0/`, `l1/`, `c/`, `idem/`. |
 

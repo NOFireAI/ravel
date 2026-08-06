@@ -474,6 +474,7 @@ metrics, `l` logs, `s` spans). Control objects live at the bucket root under
 | `l1/` | `t/<hash>/<sig>/l1/…` | `t/*/*/l1/*` |
 | `idem/` | `t/<hash>/<sig>/idem/…` | `t/*/*/idem/*` |
 | `maint/<shard>/cursor` | `t/<hash>/<sig>/maint/…` | `t/*/*/maint/*` |
+| `admission/` | `t/<hash>/<sig>/admission/<process_id>.snapshot` | `t/*/*/admission/*` |
 | `prov` | `t/<hash>/<sig>/prov` | `t/*/*/prov` |
 | `catalog/<sig>/…` | `t/<hash>/catalog/<sig>/…` | `t/*/catalog/*/*` |
 | audit prefix (`u/…`) | `t/<hash>/u/…` | `t/*/u/*` |
@@ -517,7 +518,7 @@ those prefixes undeletable even by a role that otherwise has delete rights
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["t/*/*/l0/*", "t/*/*/c/*", "t/*/catalog/*/*"]
+          "s3:prefix": ["t/*/*/l0/*", "t/*/*/c/*", "t/*/*/admission/*", "t/*/catalog/*/*"]
         }
       }
     },
@@ -530,6 +531,7 @@ those prefixes undeletable even by a role that otherwise has delete rights
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/admission/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
@@ -544,6 +546,7 @@ those prefixes undeletable even by a role that otherwise has delete rights
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/admission/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
@@ -572,6 +575,21 @@ those prefixes undeletable even by a role that otherwise has delete rights
 as Query mode (it is not a query-only responsibility, ADR-0055 section 1),
 and folding incrementally means reading the prior HEAD, snapshot parts, and
 name postings before writing the next ones — not only writing new output.
+
+Gateway also carries `t/*/*/admission/*` on all three of list, read, and
+write (ADR-0057): the fleet-global admission reconciliation loop writes this
+process's own usage snapshot every reconciliation interval, and lists then
+reads every sibling process's snapshot under the same per-(tenant, signal)
+prefix to compute the fleet-wide share the local admission check enforces
+against. Each snapshot key is owned exclusively by one process
+(`t/<hash>/<sig>/admission/<process_id>.snapshot`), so the write is a plain
+overwrite with no CAS. Query does not get this grant: reconciliation is
+wired only in Gateway (and the gateway half of `--mode all`), the same modes
+that construct the `AdmissionController` at all, so Query and Maintain never
+run it. This keyspace is not one of ADR-0055's six protected prefixes and is
+absent from `DenyDeleteProtected`: nothing deletes it (ADR-0057 section 5
+leaves stale snapshots to staleness detection rather than a sweep), so no
+role holds a delete grant for it to need denying.
 
 **Query:**
 
