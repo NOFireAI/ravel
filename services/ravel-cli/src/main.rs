@@ -1259,6 +1259,7 @@ fn rspan_section_kind_name(kind: u32) -> &'static str {
     match kind {
         ravel_rspan::footer::kind::BLOCKS => "BLOCKS",
         ravel_rspan::footer::kind::SKIP_IDX => "SKIP_IDX",
+        ravel_rspan::footer::kind::BLOOM => "BLOOM",
         _ => "UNKNOWN",
     }
 }
