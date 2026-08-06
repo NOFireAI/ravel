@@ -111,6 +111,108 @@ async fn compact_once() -> (String, Vec<u8>, Vec<(String, Vec<u8>)>) {
     (record_key, record_bytes, parts)
 }
 
+/// v3 coverage (issue #651, ADR-0054): merge two inputs with disjoint service
+/// names and span names, then prove the compacted output's BLOOM section and
+/// `service_name` column were rebuilt from the merged union. A bloom or column
+/// copied from one input would answer/decode correctly for only that input's
+/// records; this seeds distinct services per input so a copy shows up as a
+/// wrong membership answer or a wrong decoded value.
+#[tokio::test]
+async fn v3_bloom_and_service_name_column_rebuilt_from_union() {
+    use common::{rspan_bloom_survives, span_record_with_service, span_service_name};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_rspan::{COL_NAME, COL_SERVICE_NAME, RspanConfig, RspanReader, SpanQuery};
+
+    let store = MemoryStore::new();
+    let a = vec![
+        span_record_with_service(0, 0, 10, 20, "read", "checkout"),
+        span_record_with_service(1, 0, 11, 21, "read", "checkout"),
+    ];
+    let b = vec![
+        span_record_with_service(2, 0, 12, 22, "write", "payments"),
+        span_record_with_service(3, 0, 13, 23, "write", "payments"),
+    ];
+    seed_rspan_input(&store, Uuid::from_u128(1), EPOCH, 1, &a).await;
+    seed_rspan_input(&store, Uuid::from_u128(2), EPOCH, 2, &b).await;
+
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = spans_bucket();
+    compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket)
+        .await
+        .expect("compact");
+
+    // Read the single compaction record and its one part.
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    let rec_key = list_all(&store, &prefix)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .find(|k| {
+            matches!(
+                keys::partition_bucket_entry(k),
+                Ok(keys::BucketEntry::CompactionRecord(_))
+            )
+        })
+        .expect("record key");
+    let rec_bytes = store.get(&rec_key, GetRange::Full).await.unwrap().data;
+    let record = ravel_proto::commit::v1::CompactionRecord::decode(rec_bytes.as_ref()).unwrap();
+    assert_eq!(record.parts.len(), 1, "small corpus fits one part");
+    let part_key = keys::reconstruct_l1_part_key(&record, &record.parts[0]).unwrap();
+    let part = store.get(&part_key, GetRange::Full).await.unwrap().data;
+
+    // Both inputs' service and span names are provably present in the rebuilt
+    // bloom, not just the last-merged input's.
+    for service in ["checkout", "payments"] {
+        assert!(
+            rspan_bloom_survives(part.as_ref(), COL_SERVICE_NAME, service),
+            "merged bloom must answer membership for service {service}"
+        );
+    }
+    for name in ["read", "write"] {
+        assert!(
+            rspan_bloom_survives(part.as_ref(), COL_NAME, name),
+            "merged bloom must answer membership for span name {name}"
+        );
+    }
+    // Negative controls: tokens in neither input are proven absent.
+    assert!(
+        !rspan_bloom_survives(part.as_ref(), COL_SERVICE_NAME, "billing"),
+        "absent service must be pruned by the rebuilt bloom"
+    );
+    assert!(
+        !rspan_bloom_survives(part.as_ref(), COL_NAME, "delete"),
+        "absent span name must be pruned by the rebuilt bloom"
+    );
+
+    // The service_name column decodes each input's value post-merge.
+    let cfg = RspanConfig::default();
+    let reader = RspanReader::new(part.as_ref(), &cfg).expect("open part");
+    let (rows, _) = reader
+        .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+        .expect("scan");
+    assert_eq!(rows.len(), 4, "all four merged spans present");
+    for r in &rows {
+        let want = if r.trace_id == [0u8; 16] || r.trace_id == [1u8; 16] {
+            "checkout"
+        } else {
+            "payments"
+        };
+        assert_eq!(
+            span_service_name(r),
+            Some(want),
+            "service_name column decodes per input for trace {:?}",
+            r.trace_id
+        );
+    }
+}
+
 #[tokio::test]
 async fn same_inputs_same_bytes_and_keys() {
     let (rk_a, rb_a, parts_a) = compact_once().await;

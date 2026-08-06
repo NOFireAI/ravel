@@ -518,6 +518,61 @@ pub fn span_record(t: u8, s: u8, start: i64, end: i64) -> ravel_rspan::SpanRecor
     }
 }
 
+/// A synthetic span carrying an explicit `service.name` attribute and a chosen
+/// span `name`, so the writer's v3 `service_name` column and the block bloom
+/// over name/service tokens are populated (issue #651, ADR-0054). Unlike
+/// [`span_record`] (which uses a plain "svc" attr key) this drives the v3
+/// lifted-column path.
+pub fn span_record_with_service(
+    t: u8,
+    s: u8,
+    start: i64,
+    end: i64,
+    name: &str,
+    service: &str,
+) -> ravel_rspan::SpanRecord {
+    ravel_rspan::SpanRecord {
+        trace_id: [t; 16],
+        span_id: [s; 8],
+        parent_span_id: None,
+        name: name.to_string(),
+        start_ts_ns: start,
+        end_ts_ns: end,
+        status_code: ravel_rspan::StatusCode::Ok,
+        status_message: None,
+        attrs: vec![("service.name".to_string(), service.to_string())],
+    }
+}
+
+/// Whether any block of an RSPAN part survives the bloom prune for a
+/// `field_id = literal` equality predicate (v3 BLOOM, ADR-0054): true means the
+/// bloom does not prove the literal absent, false means it proves it absent
+/// across the whole part. A bloom is false-positive-only, so a `false` here is
+/// a proof of absence. Used to assert a compacted part's rebuilt bloom answers
+/// membership for the merged inputs' service/span-name tokens.
+pub fn rspan_bloom_survives(part: &[u8], field_id: u32, literal: &str) -> bool {
+    use ravel_rspan::{BloomPredicate, RspanConfig, RspanReader};
+    let cfg = RspanConfig::default();
+    let reader = RspanReader::new(part, &cfg).expect("open rspan part");
+    let bloom = reader.bloom().expect("bloom parses");
+    let preds = [BloomPredicate { field_id, literal }];
+    !reader
+        .skip_index()
+        .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &preds)
+        .expect("bloom prune")
+        .is_empty()
+}
+
+/// The decoded `service.name` value of an RSPAN span record, if present. Reads
+/// it out of the attrs map the reader re-inserts the v3 `service_name` column
+/// into on decode (so a wrong column value surfaces here).
+pub fn span_service_name(r: &ravel_rspan::SpanRecord) -> Option<&str> {
+    r.attrs
+        .iter()
+        .find(|(k, _)| k == "service.name")
+        .map(|(_, v)| v.as_str())
+}
+
 /// Seed one L0 `.rspan` input (data object + commit record) for the spans
 /// bucket, exactly as a span ingest shard would. Returns the commit key.
 pub async fn seed_rspan_input(

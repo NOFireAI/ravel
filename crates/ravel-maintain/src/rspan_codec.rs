@@ -343,7 +343,10 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
     use ravel_proto::commit::v1::CompactionRecord;
-    use ravel_rspan::{RspanConfig, RspanReader, RspanWriter, SpanQuery, StatusCode};
+    use ravel_rspan::{
+        BloomPredicate, COL_NAME, COL_SERVICE_NAME, RspanConfig, RspanReader, RspanWriter,
+        SpanQuery, StatusCode,
+    };
     use ravel_rspan::{SpanRecord, writer::ObjectIdentity};
     use ravel_types::{Signal, TenantHash, TenantId};
     use uuid::Uuid;
@@ -584,6 +587,143 @@ mod tests {
         let mut direct = decode_all(&a_bytes);
         direct.extend(decode_all(&b_bytes));
         assert_eq!(canon_multiset(&l1), canon_multiset(&direct));
+    }
+
+    /// A synthetic span carrying an explicit `service.name` attribute and a
+    /// chosen span `name`, so the writer's v3 `service_name` column and the
+    /// block bloom over span-name/service-name tokens are populated. The
+    /// default [`span`] helper above uses a plain "svc" attr key, which is not
+    /// the lifted `service.name` key and so leaves the v3 column empty.
+    fn span_svc(t: u8, s: u8, start: i64, end: i64, name: &str, service: &str) -> SpanRecord {
+        SpanRecord {
+            trace_id: [t; 16],
+            span_id: [s; 8],
+            parent_span_id: None,
+            name: name.to_string(),
+            start_ts_ns: start,
+            end_ts_ns: end,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![("service.name".to_string(), service.to_string())],
+        }
+    }
+
+    /// The v3 keystone (issue #651, ADR-0054): merge inputs with pairwise
+    /// disjoint service names and span names, then prove the compacted output's
+    /// BLOOM section and `service_name` column were rebuilt from the merged
+    /// union, not copied from whichever input's blooms happened to be around.
+    ///
+    /// A bloom copied from one input would answer membership for only that
+    /// input's tokens; a `service_name` column copied from one input would
+    /// decode the wrong value for the other inputs' records. Both would pass a
+    /// plain "record union is complete" check (the attrs blob still round-trips
+    /// via the reader's re-insertion), so this test probes the derived
+    /// artifacts directly.
+    #[tokio::test]
+    async fn compaction_rebuilds_bloom_and_service_name_column() {
+        let store = MemoryStore::new();
+        // Three L0 inputs, each one service and one span name over its own
+        // traces, all disjoint across inputs.
+        let a = vec![
+            span_svc(0, 0, 10, 20, "read", "checkout"),
+            span_svc(1, 0, 11, 21, "read", "checkout"),
+        ];
+        let b = vec![
+            span_svc(2, 0, 12, 22, "write", "payments"),
+            span_svc(3, 0, 13, 23, "write", "payments"),
+        ];
+        let c = vec![
+            span_svc(4, 0, 14, 24, "flush", "inventory"),
+            span_svc(5, 0, 15, 25, "flush", "inventory"),
+        ];
+        seed(&store, Uuid::from_u128(1), 1, &a).await;
+        seed(&store, Uuid::from_u128(2), 2, &b).await;
+        seed(&store, Uuid::from_u128(3), 3, &c).await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1, "small corpus fits one part");
+
+        let cfg = RspanConfig::default();
+        let reader = RspanReader::new(parts[0].as_ref(), &cfg).expect("open l1");
+        let bloom = reader.bloom().expect("bloom parses, not degraded");
+        let skip = reader.skip_index();
+
+        // Does *some* block of the part survive the bloom prune for a
+        // `field_id = literal` equality predicate? A surviving block means the
+        // bloom does not prove the literal absent (present, up to a false
+        // positive); zero survivors means the bloom proves it absent across the
+        // whole part (a bloom is false-positive-only, so a negative is a
+        // proof).
+        let survives = |field_id: u32, literal: &str| -> bool {
+            let preds = [BloomPredicate { field_id, literal }];
+            !skip
+                .candidate_blocks_with_bloom(None, i64::MIN, i64::MAX, None, None, &bloom, &preds)
+                .expect("bloom prune")
+                .is_empty()
+        };
+
+        // Every input's service name and span name is provably present in the
+        // merged bloom -- not just the last-merged input's. A copied bloom
+        // would fail this for two of the three services.
+        for service in ["checkout", "payments", "inventory"] {
+            assert!(
+                survives(COL_SERVICE_NAME, service),
+                "merged bloom must answer membership for service {service}"
+            );
+        }
+        for name in ["read", "write", "flush"] {
+            assert!(
+                survives(COL_NAME, name),
+                "merged bloom must answer membership for span name {name}"
+            );
+        }
+
+        // Negative controls: a service and a span name in no input are proven
+        // absent (the bloom prunes every block). This distinguishes a real
+        // rebuilt bloom from an all-ones (vacuously-present) or copied bloom,
+        // both of which would still pass the positive asserts above.
+        assert!(
+            !survives(COL_SERVICE_NAME, "billing"),
+            "absent service must be pruned by the rebuilt bloom"
+        );
+        assert!(
+            !survives(COL_NAME, "delete"),
+            "absent span name must be pruned by the rebuilt bloom"
+        );
+
+        // The service_name column decodes the input's value for every merged
+        // record. The reader lifts COL_SERVICE_NAME back into attrs on decode
+        // (block.rs), so a wrong column value surfaces as a wrong service.name
+        // attr here.
+        let expected: BTreeMap<[u8; 16], &str> = [
+            ([0u8; 16], "checkout"),
+            ([1u8; 16], "checkout"),
+            ([2u8; 16], "payments"),
+            ([3u8; 16], "payments"),
+            ([4u8; 16], "inventory"),
+            ([5u8; 16], "inventory"),
+        ]
+        .into_iter()
+        .collect();
+        let l1 = decode_all(&parts[0]);
+        assert_eq!(l1.len(), 6, "all six merged spans present");
+        for r in &l1 {
+            let got = r
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "service.name")
+                .map(|(_, v)| v.as_str());
+            assert_eq!(
+                got,
+                expected.get(&r.trace_id).copied(),
+                "service_name column decodes the input's value for trace {:?}",
+                r.trace_id
+            );
+        }
     }
 
     #[tokio::test]
