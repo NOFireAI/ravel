@@ -1,6 +1,7 @@
 //! ravel-server: gateway + ingest + query in one binary for development
 //! (`--mode all|gateway|query`). Crate boundaries keep the split honest.
 
+pub mod admission_reconcile;
 pub mod alert_sink;
 pub mod alerting;
 pub mod analytics;
@@ -203,6 +204,14 @@ pub struct ServerConfig {
     /// reachability flag `/readyz` reads. Not mode-scoped: every mode builds a
     /// store handle and runs the probe.
     pub store_probe_interval: Duration,
+    /// The fleet-global admission reconciliation interval `R` (ADR-0057 section
+    /// 4), from `--admission-reconcile-interval` (default 10s). [`start`] spawns
+    /// one reconciliation task per process at this cadence in the ingest-serving
+    /// modes ([`Mode::All`]/[`Mode::Gateway`]); it writes this process's
+    /// admission usage to a self-owned key and reads every sibling's to make the
+    /// configured caps fleet-wide. Not spawned in query/maintain modes, which
+    /// serve no ingest admission.
+    pub admission_reconcile_interval: Duration,
     /// Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
     /// issue #511), resolved from `--indexed-field` / `--indexed-field-tenant`.
     /// [`start`] wraps it in an `Arc` and hands it to the log ingest router,
@@ -248,6 +257,7 @@ pub struct Running {
     alert_tasks: alerting::AlertEvalTasks,
     jwks_refresh_task: tenant::JwksRefreshTask,
     store_probe_task: store_probe::StoreProbeTask,
+    admission_reconcile_task: admission_reconcile::AdmissionReconcileTask,
 }
 
 impl Running {
@@ -312,6 +322,7 @@ impl Running {
         self.alert_tasks.shutdown().await;
         self.jwks_refresh_task.shutdown().await;
         self.store_probe_task.shutdown().await;
+        self.admission_reconcile_task.shutdown().await;
 
         Ok(())
     }
@@ -972,6 +983,23 @@ pub async fn start(
     // real outage once the probe has observed one.
     let store_probe_task = store_probe::spawn(store.clone(), config.store_probe_interval);
 
+    // Fleet-global admission reconciliation (ADR-0057): one task per process,
+    // only in the ingest-serving modes (a query/maintain process runs no
+    // admission, so it has nothing to reconcile). Shares the same
+    // `AdmissionController` every ingest path enforces against and the same
+    // store handle, so the effective caps this task computes are exactly the
+    // ones the hot-path checks read. Off the request path entirely, like the
+    // fold and probe tasks above.
+    let admission_reconcile_task = if matches!(config.mode, Mode::All | Mode::Gateway) {
+        admission_reconcile::spawn(
+            admission.clone(),
+            store.clone(),
+            config.admission_reconcile_interval,
+        )
+    } else {
+        admission_reconcile::AdmissionReconcileTask::none()
+    };
+
     Ok(Running {
         http_addr,
         grpc_addr,
@@ -990,5 +1018,6 @@ pub async fn start(
         alert_tasks,
         jwks_refresh_task,
         store_probe_task,
+        admission_reconcile_task,
     })
 }

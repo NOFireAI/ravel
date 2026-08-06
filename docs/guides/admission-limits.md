@@ -171,17 +171,40 @@ follows between writers and folders
 normative statement of this rule lives in
 [consistency-model.md](../consistency-model.md#late-and-skewed-data).
 
-## Per-process enforcement and replica count
+## Fleet-wide enforcement via reconciliation
 
-Admission state (the active-series/stream sets and the token buckets) is
-**per process**, not fleet-global. With N ingest replicas the effective
-fleet-wide bound on a cap is N times its configured value. This is a
-deliberate trade-off, not an oversight: Ravel's compute processes are
-disposable and share no state except object storage, and putting an S3
-round-trip into every admission decision to make a cap globally exact would
-add latency and request cost to the hottest path in the system to defend
-against a factor (replica count) the operator already controls. An operator
-sizing a hard business cap divides the target by the ingest replica count.
+Every configured limit is a **fleet-wide** total, not a per-process one.
+The value you set is what the whole fleet enforces, regardless of how many
+ingest replicas run behind the load balancer: you do not divide a target by
+replica count.
+
+The hot-path check stays per-process and sub-microsecond; there is no S3
+round-trip on any admission decision. Instead each process reconciles its
+effective caps off the hot path on a fixed interval, reading every sibling's
+usage from object storage and adjusting the number its local check compares
+against ([ADR-0057](../adrs/0057-fleet-global-admission-reconciliation.md)).
+The interval is set by `--admission-reconcile-interval` (default 10s, the
+value of `ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL`).
+
+The two kinds of cap converge differently:
+
+- **Count caps** (`max_active_series`, `max_active_streams`) are a safe
+  overestimate. Reconciliation sums each replica's own active set without
+  deduplicating a series that two replicas both hold, so it can only drive a
+  replica to reject *sooner* than the configured cap, never admit more than
+  it. The fleet total is bounded within one reconciliation interval's worth
+  of admission per process (ADR-0057 section 4).
+- **Rate caps** (`ingest_bytes_per_sec`, `series_creation_rate_per_sec`)
+  converge to the configured cap as a fleet-wide total by equal-share
+  division: each of the `N` live processes enforces `cap / N`, so their sum
+  is at most the configured cap (ADR-0057 section 2). When a replica joins
+  or leaves, the fleet total settles back to the cap within one interval.
+
+Until a process's first reconciliation cycle completes (and briefly after a
+replica count change), enforcement falls back to per-process behavior, so a
+newly started fleet can transiently admit above the cap by a bounded,
+self-correcting margin. See ADR-0057 for the exact overshoot bounds and the
+reasoning behind keeping reconciliation off the hot path.
 
 ## Flush cadence: cost, not rejection
 

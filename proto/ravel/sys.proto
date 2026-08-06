@@ -170,3 +170,40 @@ message GcConfig {
   // `gc-config set`).
   sfixed64 created_unix_ns = 6;
 }
+
+// One process's periodic self-owned admission-usage snapshot for fleet-global
+// admission reconciliation (ADR-0057). Written to
+// `t/<tenant_hash>/<sig>/admission/<process_id>.snapshot` with
+// PutMode::Overwrite: the key has exactly one writer (the owning process), so
+// there is no concurrent writer to race and no CAS. Every reconciliation
+// interval R each process writes its own current usage here and reads every
+// sibling's key to compute the fleet-wide picture (ADR-0057 sections 1-2).
+//
+// Its own top-level message, sharing no field number with the markers above.
+// `active_series_count`/`active_streams_count` are per-signal stocks (a
+// Metrics snapshot fills the first and leaves the second 0; a Logs snapshot the
+// reverse), summed across siblings as a deliberate upper bound (ADR-0057
+// Context: cardinality caps over-count, never under-count). The two
+// `*_consumed_since_last_snapshot` deltas are tenant-wide flow (the byte-rate
+// and creation-rate buckets are per-tenant, shared across signals per
+// ADR-0051), carried identically in every one of a tenant's signal snapshots so
+// any prefix yields the complete tenant flow once siblings are deduplicated by
+// process_id; they are naturally additive across processes.
+message AdmissionUsageSnapshot {
+  // Format floor: the minimum reader version that understands this record,
+  // matching the guard TenancyMarker/ProvisioningRecord/GcConfig use. = 1.
+  uint32 format_version = 1;
+  // Active series tracked for the active-series cap (Signal::Metrics snapshots).
+  uint64 active_series_count = 2;
+  // Active streams tracked for the active-streams cap (Signal::Logs snapshots).
+  uint64 active_streams_count = 3;
+  // Ingest bytes admitted since this process's previous snapshot (tenant-wide).
+  uint64 byte_rate_consumed_since_last_snapshot = 4;
+  // New series/stream identities admitted since the previous snapshot
+  // (tenant-wide: the creation-rate bucket is shared across signals).
+  uint64 series_creation_consumed_since_last_snapshot = 5;
+  // This process's own clock at write time, for staleness exclusion on the
+  // reading side (a sibling older than 2*R is treated as contributing zero,
+  // ADR-0057 section 3).
+  sfixed64 snapshot_unix_ns = 6;
+}
