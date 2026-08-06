@@ -22,3 +22,9 @@ sections:
 skip_index (2 block(s)):
   block[0] offset=0 len=149 crc32c=3f6bdbad record_count=2 trace_id_range=[01010101010101010101010101010101, 01010101010101010101010101010101] start_ts_min=100 end_ts_max=200 duration_ns=[60, 100] status_mask=011 (unset|ok)
   block[1] offset=149 len=170 crc32c=4eeeb76a record_count=2 trace_id_range=[02020202020202020202020202020202, 02020202020202020202020202020202] start_ts_min=150 end_ts_max=400 duration_ns=[140, 250] status_mask=110 (ok|error)
+bloom (2 block(s))
+records (4):
+  record[0] trace_id=01010101010101010101010101010101 span_id=0000000000000000 parent_span_id= name=GET /api start_ts_ns=100 end_ts_ns=200 status=ok status_message= service_name=svc1 attrs=
+  record[1] trace_id=01010101010101010101010101010101 span_id=0101010101010101 parent_span_id=0000000000000000 name=db.query start_ts_ns=120 end_ts_ns=180 status=unset status_message= service_name=svc1 attrs=
+  record[2] trace_id=02020202020202020202020202020202 span_id=0000000000000000 parent_span_id= name=POST /login start_ts_ns=150 end_ts_ns=400 status=error status_message=boom service_name=svc2 attrs=
+  record[3] trace_id=02020202020202020202020202020202 span_id=0101010101010101 parent_span_id=0000000000000000 name=auth.check start_ts_ns=160 end_ts_ns=300 status=ok status_message= service_name=svc2 attrs=
