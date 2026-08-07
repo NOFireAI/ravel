@@ -86,10 +86,13 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Maintain { .. }
         | Command::Hold { .. }
         | Command::Provision { .. } => true,
+        // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
+        // `--tenant`, so it needs the bucket's scheme resolved first; the
+        // other `commit` variants take an explicit key/path and do not.
+        Command::Commit { command } => matches!(command, CommitCommand::Reconstruct { .. }),
         Command::Segment { .. }
         | Command::Rlog { .. }
         | Command::Rspan { .. }
-        | Command::Commit { .. }
         | Command::Store { .. }
         | Command::Idem { .. }
         | Command::Tenancy { .. }
@@ -340,6 +343,19 @@ enum CommitCommand {
         /// Local file path or object store key.
         key: String,
     },
+    /// Reconstruct lost L0 commit records for one shard from the record-less
+    /// data objects' own footers (ADR-0058 decision 2, issue #693). Scoped to
+    /// a single (tenant, signal, shard) to bound blast radius. Writes
+    /// CreateIfAbsent only, never overwrites or deletes an existing record;
+    /// exits nonzero if any candidate failed.
+    Reconstruct {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        #[arg(long)]
+        shard: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -495,6 +511,22 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let bytes = store::read_bytes(&cli.store, &key).await?;
             maintain::decode_retention_tombstone(&bytes)
+        }
+        Command::Commit {
+            command:
+                CommitCommand::Reconstruct {
+                    tenant,
+                    signal,
+                    shard,
+                },
+        } => {
+            ravel_cli::reconstruct::reconstruct(
+                store::build_store(&cli.store)?,
+                &tenant,
+                signal,
+                shard,
+            )
+            .await
         }
         Command::Catalog {
             command:

@@ -32,5 +32,11 @@ hex = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 
+[dev-dependencies]
+# Implementing a small `ObjectStoreBackend` test wrapper (hide one key from
+# LIST) needs the same async-trait the trait itself uses. Already a workspace
+# pin; adds no new external crate.
+async-trait = { workspace = true }
+
 [lints]
 workspace = true

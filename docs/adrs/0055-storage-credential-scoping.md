@@ -156,7 +156,7 @@ to reject an in-process authorization side channel.
 | **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | none |
 | **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `sys/tenancy` (CreateIfAbsent, first-boot race) | none |
 | **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep) — **the only role with any delete grant at all** |
-| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only) | none (Admin never deletes; delete stays exclusively Maintain's) |
+| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see Amendment 2026-08-07) | none (Admin never deletes; delete stays exclusively Maintain's) |
 
 **Correction (2026-08-06), found during epic EE wave 1's adversarial checkpoint:**
 the table above was missing four read/write grants in its first accepted
@@ -443,3 +443,37 @@ stays the documented, informationally-probed gap ADR-0042 already named.
 - **Does not close S4-04 (per-tenant KMS)** or any other program finding.
   This ADR is scoped to who can reach which storage operations, not to
   encryption-at-rest posture, which stays epic EL's (#462) scope.
+
+## Amendment (2026-08-07): Admin gains `c/**cmt` write for commit reconstruction
+
+Epic ED (issue #693, grouped under ADR-0058) ships
+`ravel-cli commit reconstruct`, which rebuilds lost L0 commit records for a
+shard from the record-less data objects' own footers and writes each rebuilt
+record `CreateIfAbsent`. That write lands under the `c/` prefix
+(`t/<hash>/<sig>/c/…`), which §1's original table did not grant Admin any
+write on at all: without this amendment the tool would fail its own PUT with
+an access-denied error the moment it tried to publish a rebuilt record. This
+gap was called out in ADR-0058's own "The ADR-0055 gap" section as something
+to decide here rather than discover at decompose time.
+
+Admin's write column in §1's role table therefore gains `s3:PutObject` on
+`t/*/*/c/*` — the same prefix Gateway already writes L0 commit records to
+(§1, Gateway row), scoped the same way. This is additive and narrow:
+
+- It is a create-only write in practice (the tool only ever writes
+  `CreateIfAbsent` and reports a conflict rather than overwriting an existing
+  record), though at the IAM layer `CreateIfAbsent` is a plain `s3:PutObject`
+  exactly as §1 already notes for every other create-only grant.
+- It grants **no delete**. Admin still has no delete grant anywhere; delete
+  stays exclusively Maintain's (§2), and the `DenyDeleteProtected` boundary
+  (§3) is unchanged — `c/` was never one of the deny-delete prefixes, since
+  Maintain legitimately deletes superseded and retention-swept records there.
+- No other role's grants change, and no server role gains this: reconstruction
+  is an out-of-band operator action, like every other Admin-only write.
+
+This is amended in place rather than left wrong with a note, following the
+same rationale as the 2026-08-06 Correction above: ADR-0055's role split has
+not yet been deployed against a narrower Admin credential (epic EE's own
+landing is still in flight), so nothing has provisioned an Admin policy
+without this grant yet. The matching IAM policy JSON in
+`docs/guides/operations.md` (`AdminWrite`) is updated in the same change.

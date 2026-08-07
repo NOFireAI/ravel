@@ -777,6 +777,7 @@ mutation).
         "arn:aws:s3:::my-ravel-bucket/sys/qualify/*",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
       ]
     },
@@ -808,6 +809,17 @@ by the credential itself — it is bounded (one run's worth of small objects
 per `store qualify` invocation) and harmless to leave, but an operator who
 runs `store qualify` repeatedly against the same bucket will see it
 accumulate.
+
+`AdminWrite` includes `t/*/*/c/*`: `ravel-cli commit reconstruct` (ADR-0058,
+the commit-record reconstruction tool) writes rebuilt L0 commit records back
+under the `c/` prefix, the same prefix Gateway writes L0 commit records to at
+ingest time. This is the one Admin write that touches a tenant data prefix
+rather than a `sys/`, `prov`, or audit object. It is create-only in practice
+(the tool only ever writes `CreateIfAbsent` and reports a conflict rather than
+overwriting an existing record), and it grants no delete: `c/` is not one of
+the deny-delete prefixes (Maintain legitimately sweeps superseded records
+there), so Admin's continued absence from any delete grant is unchanged. See
+ADR-0055's 2026-08-07 amendment for the rationale.
 
 ### MinIO policies (dev / CI)
 
@@ -1055,8 +1067,13 @@ no special shutdown sequence:
   election, no consensus round. Any process can serve any request for any
   tenant, as long as it has the right `--tenant-token`/S3 credentials.
 - **Nothing to back up** besides the object store bucket itself: no local
-  volumes, no WAL, no on-disk state directory. To back up Ravel, back up
-  the bucket (or rely on its durability).
+  volumes, no WAL, no on-disk state directory. The bucket, however, is a
+  single point of loss, and Ravel ships no backup mechanism, no cross-region
+  failover, and no RTO/RPO guarantee of its own. What exists today, what does
+  not, and the one failure mode (commit-record loss) the reconstruction tool
+  recovers from are documented honestly in
+  [disaster-recovery.md](disaster-recovery.md); read it before relying on
+  "just back up the bucket."
 
 ## Garbage collection and retention
 
@@ -1360,6 +1377,63 @@ this design)**:
   shard) is evaluated in isolation, so loss spread thin across many
   shards can stay under every single shard's threshold even though the
   total loss across the tenant or the deployment is large.
+
+### Stop maintenance before restoring or reconstructing commit records
+
+If commit records for a shard have been lost out of band (an accidental
+delete, a bad S3 lifecycle rule, a fat-fingered prefix delete), the data
+objects they named are invisible to readers and, once past the orphan grace
+horizon, will be physically deleted by the sweeper's orphan-GC rule. The
+recovery path is `ravel-cli commit reconstruct` (ADR-0058), which rebuilds
+each record-less L0 data object's commit record from the object's own footer.
+Before running it, stop maintenance for the affected tenant so the sweeper is
+not racing your restore: a running `--mode maintain` loop keeps sweeping every
+tick, and its orphan-GC rule deletes the very objects you are trying to
+reattach.
+
+1. **Stop or restrict maintenance for the tenant.** Either stop the
+   `--mode maintain` process entirely, or restart it restricted to other
+   tenants with `--maintain-tenant` (the tenant you are repairing must not be
+   in that set). Do not rely on the mass-orphan breaker to hold the shard
+   open: it is not self-clearing in the way an operator expects (see the
+   runbook above), and small-scale record loss may never trip it at all.
+2. **Reconstruct the missing records**, one shard at a time:
+
+   ```sh
+   ravel-cli commit reconstruct --tenant <name> --signal <metrics|logs> --shard <n>
+   ```
+
+   The command lists the shard's record-less L0 data objects, rebuilds a
+   commit record for each from its footer, and writes it `CreateIfAbsent`
+   (it never overwrites an existing record, and never deletes). It prints a
+   per-object report (reconstructed / already-present-skipped / failed) and
+   exits nonzero if any candidate failed. Repeat per shard for the affected
+   range.
+3. **Verify custody and catalog state** before resuming maintenance:
+
+   ```sh
+   ravel-cli maintain verify-custody --tenant <name>
+   ravel-cli catalog verify --tenant <name>
+   ```
+
+   `verify-custody` re-hashes every live data object against its key and
+   confirms every surviving record's data is present; `catalog verify`
+   re-lists sealed records and diffs them against the snapshot. Both must be
+   clean (exit zero) before you trust the repair.
+4. **Resume maintenance.** Restart the `--mode maintain` process without the
+   `--maintain-tenant` restriction (or restart the stopped one). The sweeper
+   now sees the reconstructed records and treats their data objects as
+   referenced, not as orphans.
+
+Reconstruction rebuilds two fields as honest approximations rather than exact
+copies of the original record: `created_unix_ns` (from the data object's own
+`last_modified`, since it is in no footer) and, for logs, `ingest_hour_bucket`
+(derived from the earliest observed sample, since RLOG footers do not carry
+it). Both are argued safe for every downstream consumer in ADR-0058; the
+rebuilt record is honestly a reconstruction, not a claim of byte-for-byte
+provenance. Reconstruction also does not detect bit rot: it rebuilds a record
+describing whatever bytes are currently stored (use `verify-custody` for the
+content-hash check).
 
 ## Known limitations
 
