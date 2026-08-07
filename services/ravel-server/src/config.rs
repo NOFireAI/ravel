@@ -430,6 +430,24 @@ pub struct AuthResolverSettings {
 }
 
 impl Cli {
+    /// The OTLP trace-export config `main.rs` passes to
+    /// `ravel_tracing_export::init` (ADR-0060), or `None` when
+    /// `--otlp-trace-endpoint` is absent. A single function so the binary's
+    /// startup path and its own integration tests derive the same
+    /// `ravel.mode` resource attribute from `crate::metrics::mode_name` --
+    /// the exact spelling `/metrics`'s `mode` label already uses (decision
+    /// 5) -- rather than each independently re-deriving it and risking the
+    /// two silently drifting apart on a future `Mode` variant.
+    pub fn otlp_export_config(&self) -> Option<ravel_tracing_export::OtlpExportConfig> {
+        self.otlp_trace_endpoint
+            .as_ref()
+            .map(|endpoint| ravel_tracing_export::OtlpExportConfig {
+                endpoint: endpoint.clone(),
+                service_name: "ravel-server".to_string(),
+                mode: crate::metrics::mode_name(self.mode).to_string(),
+            })
+    }
+
     pub fn parse_tenant_tokens(&self) -> anyhow::Result<HashMap<String, TenantId>> {
         let mut map = HashMap::new();
         for pair in &self.tenant_tokens {
