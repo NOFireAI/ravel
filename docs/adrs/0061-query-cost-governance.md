@@ -156,6 +156,30 @@ segment finishes and cancel the rest, instead of waiting for all of them:
   run's does not distinguish real cancellation from a check that fires
   after the fact.
 
+## Amendment (2026-08-07): the config surface is `--limits-file`, not a new flag
+
+EF-3 (#723) implemented the config surface described above and found the
+name wrong: there is no `--query-limits-file` flag, and this ADR should
+never have implied a new one. `services/ravel-server`'s existing
+`--limits-file` TOML (ADR-0051 section 3, `[defaults]`/`[tenants.<id>]`
+tables) already carries the ingest admission limits in exactly the shape
+this decision asked for; EF-3 added `max_bytes_scanned` to the same
+tables rather than inventing a second file and flag. This is a naming
+correction only — the `[defaults]`/`[tenants.<id>]` structure and
+lifecycle (loaded once at startup, changing a limit is a restart) is
+unchanged from what this decision specified.
+
+The per-tenant half of that structure is not yet enforced: the query
+engine holds one process-wide `EngineConfig`, so only the `[defaults]`
+value binds today. A `[tenants.<id>]` override for `max_bytes_scanned`
+is parsed and validated but has no effect beyond a startup warning
+naming the ineffective tenant (`docs/guides/admission-limits.md` carries
+the operator-facing version of this note). True per-tenant enforcement
+needs a tenant-aware `EngineConfig` lookup inside `ravel-query`, tracked
+as a follow-up rather than blocking this decision's wave-2 landing —
+the epic's stated acceptance (a query under a configured threshold is
+cancelled) does not require per-tenant differentiation to be satisfied.
+
 ### 2. Fleet-global query concurrency ceiling via ADR-0057's count-cap reconciliation pattern
 
 A new, independent controller — not an addition to `AdmissionController`,
