@@ -1,0 +1,35 @@
+[package]
+name = "ravel-tracing-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The subscriber shape both service binaries install (ADR-0060 decision 1).
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The OTLP export layer and its exporter (ADR-0060 decisions 1, 2, 6, 7).
+tracing-opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+# opentelemetry and opentelemetry_sdk are pinned directly here, not through
+# `[workspace.dependencies]`: ADR-0060's implementing task adds only
+# opentelemetry-otlp and tracing-opentelemetry to the workspace dependency
+# table. These two are the 0.32 line opentelemetry-proto already fixes
+# transitively (opentelemetry 0.32.0, opentelemetry_sdk 0.32.1); pinning them
+# here keeps this crate's own trait imports (TracerProvider, the SDK batch
+# processor, Resource) on that same resolved version.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+
+[dev-dependencies]
+# The mock OTLP collector the acceptance tests stand up implements the same
+# TraceService trait services/ravel-server/src/otlp_grpc_traces.rs implements
+# for ingest, so the test proves export against a real gRPC server.
+opentelemetry-proto = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tonic = { workspace = true, features = ["channel"] }
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true

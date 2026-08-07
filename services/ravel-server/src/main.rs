@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use ravel_maintain::{CompactorConfig, RetentionConfig};
 use ravel_server::alert_sink::DEFAULT_SINK_TIMEOUT;
 use ravel_server::alerting::{DEFAULT_QUERY_DEADLINE, load_rules_file};
@@ -31,11 +31,29 @@ fn now_unix_ns() -> i64 {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Trace subscriber (ADR-0060). The filter is exactly today's:
+    // RUST_LOG when set, else `info`. With --otlp-trace-endpoint absent,
+    // `init` installs the same bare `fmt` subscriber this called inline
+    // before, byte-for-byte (decision 1); with it set, the same subscriber
+    // gains an OTLP/gRPC export layer sharing that one filter (decision 2).
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let otlp_config = cli.otlp_trace_endpoint.as_ref().map(|endpoint| {
+        ravel_tracing_export::OtlpExportConfig {
+            endpoint: endpoint.clone(),
+            service_name: "ravel-server".to_string(),
+            // The `ravel.mode` resource attribute mirrors the `/metrics` `mode`
+            // label (ADR-0060 decision 5). Both derive from clap's ValueEnum
+            // rendering of `Mode`, the same source `--mode` parses and
+            // `metrics::mode_name` mirrors, so there is one spelling, not a
+            // second.
+            mode: cli
+                .mode
+                .to_possible_value()
+                .map(|value| value.get_name().to_string())
+                .unwrap_or_default(),
+        }
+    });
+    let trace_guard = ravel_tracing_export::init(filter, otlp_config);
 
     // Cross-flag startup invariants (ADR-0050 section 1): the dev-header
     // loopback rule plus every --mtls-listener misconfiguration. Every case
@@ -358,6 +376,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("shutdown signal received, draining");
     running.shutdown().await?;
     tracing::info!("shutdown complete");
+    // Flush the OTLP trace exporter AFTER draining (ADR-0060 decision 7): a
+    // span for the last request the server handled closes as that request
+    // drains, so flushing once the drain has completed gives it the best
+    // chance of having been recorded and enqueued before the exporter shuts
+    // down. A no-op when --otlp-trace-endpoint was absent. `ExportGuard`'s
+    // `Drop` is the backstop if an earlier `?` returns before this line.
+    trace_guard.flush();
     Ok(())
 }
 
