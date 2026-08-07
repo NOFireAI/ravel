@@ -48,8 +48,9 @@ is visible in config review rather than being the silent default.
 
 ## The limits
 
-All limits are per tenant. Rates are token buckets (a sustained `per_sec`
-plus an instantaneous `burst`).
+All limits are per tenant except `max_bytes_scanned` (see the note below
+the table). Rates are token buckets (a sustained `per_sec` plus an
+instantaneous `burst`).
 
 | Knob | Shipped default | Config key |
 |---|---|---|
@@ -58,10 +59,20 @@ plus an instantaneous `burst`).
 | Active-series cap (metrics) | 200,000 | `max_active_series` |
 | Active-stream cap (logs) | 200,000 | `max_active_streams` |
 | Series-creation rate / burst | 10,000/s / 100,000 | `series_creation_rate_per_sec` / `series_creation_burst` |
+| Query bytes-scanned budget | unlimited | `max_bytes_scanned` |
 | Event-time future skew | 10 m | not configurable (`ravel-otlp` default) |
 | Event-time ingest lag | 2 h | not configurable (`ravel-otlp` default) |
 | Idle flush delay | 10 s | not configurable (shard default) |
 | Min flush bytes | 64 KiB | not configurable (shard default) |
+
+`max_bytes_scanned` (ADR-0061 decision 1) lives in the same `[defaults]`/
+`[tenants.<id>]` tables as the ingest limits above, but is not yet
+tenant-parameterized at enforcement time: the query engine holds one
+process-wide budget, so only the `[defaults]` value is actually enforced.
+A `[tenants.<id>]` override for this key is parsed and validated, but has
+no effect beyond a startup warning naming the ineffective tenant. True
+per-tenant query enforcement needs a tenant-aware engine config lookup,
+tracked separately from this ingest-side admission mechanism.
 
 The active-series/stream default is 200,000, not the 1,000,000 ADR-0051
 section 3 names: issue #491 measured the real per-entry cost of the exact
