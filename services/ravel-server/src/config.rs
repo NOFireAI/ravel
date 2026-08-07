@@ -264,6 +264,19 @@ pub struct Cli {
     #[arg(long = "admission-reconcile-interval", value_name = "DURATION")]
     pub admission_reconcile_interval: Option<String>,
 
+    /// The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime
+    /// duration (e.g. `7d`). The content-tier scrubber rotates through the
+    /// whole object corpus once per `P`, so sustained scrub read bandwidth is
+    /// bounded at `corpus_bytes / P` bytes/sec: an operator sizes this against
+    /// their own corpus the same way `--admission-reconcile-interval` (`R`) is
+    /// sized. Runs only in `--mode maintain`, the one mode that runs background
+    /// housekeeping over durable objects. Matches the humantime-duration
+    /// convention of `--store-probe-interval`. Omitted defaults to
+    /// [`crate::scrub::DEFAULT_SCRUB_PERIOD`] (7 days); a zero or unparseable
+    /// duration fails startup rather than rotating in a tight loop.
+    #[arg(long = "scrub-period", value_name = "DURATION")]
+    pub scrub_period: Option<String>,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -655,6 +668,27 @@ impl Cli {
                     anyhow::bail!(
                         "--admission-reconcile-interval '{s}' must be a positive duration: a zero \
                          interval would reconcile in a tight loop"
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--scrub-period` into a duration (ADR-0059 decision 1), defaulting
+    /// to [`crate::scrub::DEFAULT_SCRUB_PERIOD`] when unset. Rejects a zero or
+    /// unparseable duration rather than rotating the scrubber in a tight loop,
+    /// mirroring [`Self::parse_admission_reconcile_interval`].
+    pub fn parse_scrub_period(&self) -> anyhow::Result<Duration> {
+        match self.scrub_period.as_deref() {
+            None => Ok(crate::scrub::DEFAULT_SCRUB_PERIOD),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --scrub-period '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--scrub-period '{s}' must be a positive duration: a zero period would \
+                         rotate the scrubber in a tight loop"
                     );
                 }
                 Ok(dur)

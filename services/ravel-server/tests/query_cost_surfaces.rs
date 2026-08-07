@@ -179,6 +179,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         catalog,
         tenant_discovery: None,
         maintenance_safety: None,
+        scrub: None,
         cache_metrics: None,
         catalog_cache_metrics: None,
         admission: Arc::new(AdmissionController::new(
@@ -557,6 +558,7 @@ mod flight {
             ),
             tenant_discovery: None,
             maintenance_safety: None,
+            scrub: None,
             cache_metrics: None,
             catalog_cache_metrics: None,
             admission: Arc::new(AdmissionController::new(
