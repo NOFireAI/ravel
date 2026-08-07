@@ -51,8 +51,11 @@ pub struct EngineConfig {
     pub max_segments: usize,
     pub max_series: usize,
     pub max_samples: usize,
-    /// Per-tenant cap on total S3 bytes a single query may scan, checked
-    /// incrementally during fetch (ADR-0061 decision 1). Defaults to
+    /// Per-tenant cap on total S3 bytes a single query may scan, checked once
+    /// per completed segment fetch inside the engine's two fetch fan-outs
+    /// (`fetch_all_series` and `fetch_all_samples_and_histograms`), the stage
+    /// that owns segment concurrency, so a tripped budget cancels the
+    /// remaining in-flight fetches mid-scan (ADR-0061 decision 1). Defaults to
     /// [`ByteLimit::Unlimited`]: a bounded default would silently start
     /// rejecting existing deployments' large-but-legitimate queries on
     /// upgrade with no config change, so opting in is explicit.
