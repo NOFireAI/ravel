@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::{
     TraceService, TraceServiceServer,
 };
@@ -27,8 +28,9 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
 
-use super::{OtlpExportConfig, build};
+use super::{OtlpExportConfig, build, build_provider};
 
 /// Every `ExportTraceServiceRequest` the mock collector received.
 type Received = Arc<Mutex<Vec<ExportTraceServiceRequest>>>;
@@ -311,4 +313,114 @@ async fn an_unreachable_collector_never_blocks_or_errors_the_caller() {
     .await
     .expect("flushing against an unreachable collector must return, not hang");
     flush.expect("flush must not panic against an unreachable collector");
+}
+
+/// Every WARN-level event the capture layer saw, as `"target::message"`.
+type CapturedWarnings = Arc<Mutex<Vec<String>>>;
+
+/// A `tracing` layer that records each WARN event's target and message. This is
+/// the event-level counterpart to the mock collector above: where the collector
+/// captures exported spans, this captures the `tracing::warn!` line the runtime
+/// export-failure signal (issue #711) emits, so the test can assert on it.
+struct WarnCaptureLayer {
+    warnings: CapturedWarnings,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.warnings
+            .lock()
+            .push(format!("{}::{}", event.metadata().target(), visitor.0));
+    }
+}
+
+/// Pulls the `message` field out of a `tracing` event as a string.
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+/// Issue #711: a reachable-but-wrong endpoint (built fine, refused at send time)
+/// must surface a `tracing::warn!` line, not fail silently. Point the exporter at
+/// a refused port, emit a span, force an export attempt, and assert the crate
+/// logged its distinct runtime-failure warning.
+///
+/// The warning is emitted from the `BatchSpanProcessor`'s background export
+/// thread, which carries no thread-local dispatcher, so it routes to the process
+/// GLOBAL default subscriber (unlike the other tests here, which scope a
+/// thread-local default). This test therefore installs the global default once;
+/// no other test in this binary sets a global default, so the single call
+/// succeeds. The subscriber mirrors the one `build` installs (an `EnvFilter`
+/// over an `fmt` layer and the OTLP layer) plus a `WarnCaptureLayer` to observe
+/// the warning.
+#[tokio::test]
+async fn a_refused_collector_logs_a_runtime_export_failure_warning() {
+    // Bind then drop a listener to obtain a port with nothing listening on it,
+    // the same refused-port technique the non-blocking test above uses.
+    let refused_addr = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind to find a free port");
+        listener.local_addr().expect("addr")
+    };
+    let endpoint = format!("http://{refused_addr}");
+
+    let provider = build_provider(&config_for(endpoint))
+        .expect("a syntactically valid endpoint builds; the failure is at send time");
+    let tracer = provider.tracer("ravel-tracing-export");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let warnings: CapturedWarnings = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry()
+        .with(EnvFilter::new("info"))
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel_layer)
+        .with(WarnCaptureLayer {
+            warnings: Arc::clone(&warnings),
+        });
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("this is the only test in the binary that sets a global default");
+
+    // Emit a span. With the global default installed, it routes to the OTLP
+    // layer and is buffered by the batch processor.
+    {
+        let span = tracing::info_span!("sql_query", tenant_hash = "deadbeef");
+        let _entered = span.enter();
+    }
+
+    // Force an export attempt off the test's runtime. The export dials the
+    // refused endpoint, fails, and the wrapper logs its one-shot warning on the
+    // background thread, which reaches the global default installed above.
+    tokio::task::spawn_blocking(move || {
+        let _ = provider.shutdown();
+    })
+    .await
+    .expect("shutdown join");
+
+    let matched = |w: &str| {
+        w.starts_with("ravel_tracing_export::")
+            && w.contains("OTLP trace export is failing at runtime")
+    };
+    assert!(
+        wait_until(
+            || warnings.lock().iter().any(|w| matched(w)),
+            Duration::from_secs(10)
+        ),
+        "expected a runtime export-failure warning, captured: {:?}",
+        warnings.lock()
+    );
 }

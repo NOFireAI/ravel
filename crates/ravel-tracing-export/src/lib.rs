@@ -11,11 +11,15 @@
 //! blocks the span-emitting caller (decision 6); [`ExportGuard`] flushes
 //! buffered spans on a clean shutdown (decision 7).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use tracing::Dispatch;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -144,6 +148,16 @@ fn fmt_only(filter: EnvFilter) -> Dispatch {
 /// 1 and 6). The batch processor exports off a background task, so a span
 /// emitted while the collector is unreachable never errors, panics, or adds
 /// latency to the caller; the exporter dials the collector lazily, not here.
+///
+/// A syntactically valid endpoint whose collector is unreachable at send time
+/// (connection refused, DNS failure, timeout) is not caught here: `build`
+/// succeeds and the failure only surfaces when the background export task
+/// first dials. [`WarnOnExportFailure`] wraps the exporter to turn that
+/// otherwise-silent runtime failure into a one-shot `tracing::warn!`, distinct
+/// from the build-time "OTLP trace export disabled" message [`init`] emits
+/// (issue #711). The wrapper only observes the export result on the same
+/// background task the SDK already runs, so it adds no blocking or latency to
+/// the span-emitting path or to shutdown (decision 6).
 fn build_provider(
     config: &OtlpExportConfig,
 ) -> Result<SdkTracerProvider, opentelemetry_otlp::ExporterBuildError> {
@@ -158,9 +172,77 @@ fn build_provider(
         .build();
 
     Ok(SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
+        .with_batch_exporter(WarnOnExportFailure::new(exporter))
         .with_resource(resource)
         .build())
+}
+
+/// A [`SpanExporter`] decorator that surfaces a runtime export failure as a
+/// `tracing::warn!` line (issue #711).
+///
+/// `opentelemetry_otlp::SpanExporter` dials the collector lazily, so an
+/// endpoint that is syntactically valid but unreachable (connection refused,
+/// DNS failure, timeout) builds without error and then fails silently on every
+/// background export attempt: today nothing surfaces it, and an operator who
+/// set the flag and saw no startup warning reasonably assumes export works.
+/// This wrapper delegates every call to the inner exporter unchanged and, when
+/// `export` returns `Err`, emits one warning. It never alters the returned
+/// result, so the best-effort, non-blocking guarantee (ADR-0060 decision 6) is
+/// untouched: `export` runs only on the `BatchSpanProcessor`'s background task,
+/// and the span-emitting caller and the shutdown flush see exactly the same
+/// behavior as before.
+///
+/// The warning fires at most once per process (`warned`): a broken endpoint
+/// fails on every batch interval, and a line per interval forever would drown
+/// the log the signal is meant to reach. The SDK itself already emits an
+/// internal `error`-level event per failed export (its `internal-logs` feature
+/// is on via defaults), so the recurring detail is not lost; this adds the
+/// single, plainly worded operator-facing signal that event lacks.
+#[derive(Debug)]
+struct WarnOnExportFailure {
+    inner: opentelemetry_otlp::SpanExporter,
+    warned: AtomicBool,
+}
+
+impl WarnOnExportFailure {
+    fn new(inner: opentelemetry_otlp::SpanExporter) -> Self {
+        Self {
+            inner,
+            warned: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SpanExporter for WarnOnExportFailure {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        let result = self.inner.export(batch).await;
+        if let Err(err) = &result {
+            // `swap` returns the previous value: warn only on the first failure
+            // this process sees.
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "OTLP trace export is failing at runtime: {err}. The exporter built \
+                     successfully, so the endpoint is well-formed, but the collector could \
+                     not be reached (connection refused, DNS failure, or timeout) and spans \
+                     are being dropped. Export stays best-effort and non-blocking; this \
+                     warns once per process."
+                );
+            }
+        }
+        result
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
 }
 
 #[cfg(test)]
