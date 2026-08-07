@@ -447,6 +447,16 @@ maintenance family.
 - `ravel_scrub_postings_disagreement_total{signal}` (counter): objects whose
   covering name-postings object omitted a `__name__` the object really carries
   (S2-09's false negative).
+- `ravel_scrub_seal_divergence_total{signal,reason}` (counter, ADR-0059 decision
+  2): divergences between the folded snapshot and the re-listed sealed commit
+  history, checked once per tick on the fold cadence (metadata-cost, not gated
+  behind the content-tier cursor). `reason="missing"` is a sealed commit record
+  absent from the snapshot (a folder under-count, S2-04); `reason="mismatched"`
+  is a snapshot entry whose `content_hash` disagrees with the sealed record.
+  Orphaned entries — a snapshot entry with no surviving commit record — are the
+  expected shape once retention deletes a folded commit record and are never
+  counted (no `reason="orphaned"` value exists). This is the scheduled form of
+  `ravel-cli catalog verify`, which stays for manual/ad-hoc use.
 - `ravel_scrub_cursor_position{signal}` (gauge, `[0,1]`): fraction of the
   current rotation the content-tier cursor has covered so far.
 
@@ -454,6 +464,7 @@ maintenance family.
 |---|---|---|
 | Checksum mismatch | `increase(ravel_scrub_checksum_mismatch_total[1h]) > 0` | There is no redundant copy to repair from, so any nonzero increase is at-rest corruption an operator must investigate immediately, not a rate to threshold. |
 | Postings disagreement | `increase(ravel_scrub_postings_disagreement_total[1h]) > 0` | A false negative means a query filtering on that name silently skips matching data; any nonzero increase is a correctness bug to page on. |
+| Seal divergence | `increase(ravel_scrub_seal_divergence_total[1h]) > 0` | A `missing` or `mismatched` divergence means the folded snapshot under-counts the sealed commit history (late-commit seal loss, S2-04); a query reading the snapshot silently omits committed data. Page on any nonzero increase. |
 | Scrub falling behind | `ravel_scrub_cursor_position` stuck near 0 across a period longer than `P` | A rotation that never advances means scrubbing is not keeping pace with `P`; the effective staleness bound is no longer `P`. |
 
 ### Storage credential impact (ADR-0055)
