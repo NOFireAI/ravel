@@ -12,6 +12,7 @@ pub mod idem;
 pub mod maintain;
 pub mod provision;
 pub mod qualify;
+pub mod reconstruct;
 pub mod store;
 pub mod tenancy;
 
