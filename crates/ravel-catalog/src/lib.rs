@@ -7,6 +7,7 @@
 mod cache;
 mod catalog;
 mod config;
+mod covering_postings;
 mod error;
 mod fold;
 mod provisioning;
@@ -24,6 +25,7 @@ pub use config::{
     DEFAULT_MAX_INGEST_LAG_NS, DEFAULT_POSTINGS_CACHE_ENTRIES,
     DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS, DEFAULT_SNAPSHOT_CACHE_PARTS,
 };
+pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
 pub use error::CatalogError;
 pub use fold::{FoldReport, PostingsBuildError, Transaction, fetch_segment_names};
 pub use provisioning::{

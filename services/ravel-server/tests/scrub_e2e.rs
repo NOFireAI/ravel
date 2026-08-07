@@ -368,6 +368,141 @@ async fn seal_divergence_surfaces_on_metrics_through_the_real_scrub_task() {
     );
 }
 
+/// A real postings disagreement (S2-09 false negative), injected at rest,
+/// surfaces on `/metrics` through the real scheduled scrub task (ADR-0059
+/// decision 1, issue #708). A tenant's real data is folded so a real,
+/// correctly-bound name-postings object exists at `head.postings`; then a NEW,
+/// internally valid postings object that omits a name the folded segment really
+/// carries is written over the real postings key and the HEAD's postings ref is
+/// repointed at it (matching blake3), so `load_covering_postings` accepts it
+/// instead of degrading to `None`. The running `Mode::Maintain` server's scrub
+/// task loads it, re-derives the segment's true name set on the content tier's
+/// read, and reports the disagreement as
+/// `ravel_scrub_postings_disagreement_total 1`.
+#[tokio::test]
+async fn postings_disagreement_surfaces_on_metrics_through_the_real_scrub_task() {
+    let tenant = TenantId::new("scrub-postings-e2e");
+    let store = Arc::new(MemoryStore::new());
+    let now = now_ns();
+    let created = now - SEALED_AGE_NS;
+
+    // One real sealed segment carrying "cpu" and "mem", folded into a real HEAD
+    // whose postings correctly claim both names for the single covered entry.
+    publish_sealed_segment(store.as_ref(), &tenant, 1, created).await;
+    let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        store_dyn.clone(),
+        CatalogConfig {
+            shard_count: 1,
+            ..CatalogConfig::default()
+        },
+    )
+    .expect("catalog")
+    .with_provisioning_enforcement();
+    catalog
+        .fold(&tenant.hash(), Signal::Metrics, Uuid::new_v4(), now, &[])
+        .await
+        .expect("fold produces a HEAD with postings");
+
+    // Read the folded HEAD and the covered part(s)' blake3, then encode a NEW,
+    // internally valid postings object claiming only "cpu" for ordinal 0 --
+    // omitting "mem", which the segment really carries. This is a genuine false
+    // negative, not a bit flip: a raw flip would trip StructuralCorruption, but
+    // a validly-encoded object with wrong claims is exactly what the postings
+    // tier exists to catch.
+    let head_key = format!(
+        "t/{}/catalog/{}/HEAD",
+        tenant.hash().to_hex(),
+        Signal::Metrics.key_prefix(),
+    );
+    let head_bytes = store
+        .get(&head_key, GetRange::Full)
+        .await
+        .expect("head present after fold")
+        .data;
+    let mut head = ravel_catalog::decode_head(&head_bytes).expect("decode head");
+    let part_blake3: Vec<[u8; 32]> = head
+        .parts
+        .iter()
+        .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).expect("32-byte part blake3"))
+        .collect();
+    let names = vec![ravel_catalog::NamePostings {
+        name: "cpu".to_string(),
+        ordinals: vec![0],
+    }];
+    let tampered = ravel_catalog::encode_postings(
+        tenant.hash().0,
+        Signal::Metrics as u32,
+        &part_blake3,
+        1,
+        &names,
+    )
+    .expect("encode tampered postings");
+    let tampered_hash = *blake3::hash(&tampered).as_bytes();
+
+    // Overwrite the postings object over its real key, then repoint the HEAD's
+    // postings ref at it with the matching blake3/size so the load accepts it.
+    let postings_ref = head.postings.as_mut().expect("postings ref after fold");
+    store
+        .put(
+            &postings_ref.key,
+            bytes::Bytes::from(tampered.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("overwrite postings object over its real key");
+    postings_ref.blake3 = tampered_hash.to_vec();
+    postings_ref.size = tampered.len() as u64;
+    let rewritten = ravel_catalog::encode_head(&head).expect("re-encode head");
+    store
+        .put(
+            &head_key,
+            bytes::Bytes::from(rewritten),
+            PutOptions::default(),
+        )
+        .await
+        .expect("overwrite head");
+
+    let running = ravel_server::start(
+        maintain_config(Mode::Maintain, &tenant),
+        store_dyn,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("maintain server starts");
+
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let mut detected = false;
+    for _ in 0..60 {
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("metrics body");
+        if body.contains(
+            "ravel_scrub_postings_disagreement_total{mode=\"maintain\",signal=\"metrics\"} 1",
+        ) {
+            detected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
+    assert!(
+        detected,
+        "the omitted-name postings disagreement must surface as \
+         ravel_scrub_postings_disagreement_total on /metrics within one scrub cycle, through the \
+         real spawned ScrubTask"
+    );
+}
+
 /// The scrub metrics family is exposed only in `Mode::Maintain`, the one mode
 /// that spawns the scrubber (mirrors the maintain discovery/safety families'
 /// Maintain-only gating). A query- or gateway-mode process spawns no scrub task

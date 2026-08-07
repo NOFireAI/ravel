@@ -305,6 +305,28 @@ pub async fn run_cycle(
     let clock = WallClock;
     for tenant in &outcome.maintained {
         for signal in MAINTAINED_SIGNALS {
+            // Resolve the covering name-postings object once per (tenant,
+            // signal) per tick (issue #708): postings cover a whole snapshot
+            // HEAD (one `head.postings` bound to every part), not one per shard,
+            // so it is loaded here, before the shard loop, and the owned data is
+            // threaded by reference into every shard's tick. A load failure or
+            // an absent postings ref yields `None`, which every shard's tick
+            // treats as "no postings tier this tick" exactly as before this
+            // wiring landed (the documented "no postings ref yet" case,
+            // ADR-0059). A `tenant_hash`-binding breach (ADR-0050 §2) is logged
+            // and likewise degrades to `None` for this tick, never wedging the
+            // content and structural tiers that do not depend on postings.
+            let covering = match ravel_catalog::load_covering_postings(store, tenant, signal).await
+            {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(), signal = ?signal, error = %err,
+                        "scrub: covering-postings load failed; postings tier skipped this tick, retried"
+                    );
+                    None
+                }
+            };
             let scan_shards = scan_shards(store, tenant, signal, shard_count).await;
             for shard in 0..scan_shards {
                 run_shard_tick(
@@ -315,6 +337,7 @@ pub async fn run_cycle(
                     shard,
                     period_secs,
                     tick_secs,
+                    covering.as_ref(),
                     metrics,
                 )
                 .await;
@@ -424,6 +447,7 @@ async fn run_shard_tick(
     shard: u32,
     period_secs: u64,
     tick_secs: u64,
+    covering: Option<&ravel_catalog::LoadedCoveringPostings>,
     metrics: &ScrubMetrics,
 ) {
     // Build the corpus: every L0 data object referenced by a surviving commit
@@ -517,18 +541,29 @@ async fn run_shard_tick(
     let budget: ScrubBudget = per_tick_byte_budget(total_bytes, period_secs, tick_secs);
     let slice = advance_cursor(&cursor, &corpus, budget, clock.now_ns());
 
+    // Build the borrowing `CoveringPostings` once for this signal's tick from
+    // the owned data loaded per (tenant, signal) in `run_cycle` (issue #708).
+    // `CoveringPostings` is `Copy`, so it is passed by value into each object's
+    // scrub. When no covering postings resolved (no postings ref yet, or a
+    // degrade-to-None load), this stays `None` and `scrub_one_object` runs only
+    // the structural and content tiers, exactly as before this wiring landed.
+    let covering_postings = covering.map(|loaded| ravel_maintain::CoveringPostings {
+        bytes: &loaded.bytes,
+        part_blake3: &loaded.part_blake3,
+        covered_entries: &loaded.covered_entries,
+        max_postings_bytes: ravel_catalog::DEFAULT_MAX_POSTINGS_BYTES,
+    });
+
     for key in &slice.scrub_keys {
         let Some(record) = records.get(key) else {
             continue;
         };
-        // `covering: None` runs the structural + content tiers (footer crc
-        // re-verify, then whole-object blake3 vs the recorded content hash).
-        // The postings tier is skipped: resolving a covering name-postings
-        // object from the live catalog snapshot is not wired here, so the
-        // postings-disagreement counter is in place but only fires once that
-        // resolution lands (acceptable per ADR-0059 / issue #694: `None` skips
-        // the postings tier for an object with no resolved postings ref).
-        match scrub_one_object(store, clock, record, None).await {
+        // The structural + content tiers always run (footer crc re-verify, then
+        // whole-object blake3 vs the recorded content hash). The postings tier
+        // runs additionally when `covering_postings` is `Some`: the object's
+        // true `__name__` set is re-derived and diffed against what the covering
+        // postings object claims for it (S2-09 false-negative check).
+        match scrub_one_object(store, clock, record, covering_postings).await {
             ScrubResult::Clean => {}
             ScrubResult::ChecksumMismatch { .. } => {
                 tracing::error!(
@@ -881,5 +916,146 @@ mod tests {
         run_cycle(&store, None, 4, 1, 1, &metrics).await;
         assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
         assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
+    }
+
+    /// HEAD object key for `(tenant, Metrics)` (docs/catalog-and-mvcc.md key
+    /// layout), duplicated for the tests the same way the production modules do.
+    fn head_key_for(tenant_hash: &TenantHash) -> String {
+        format!(
+            "t/{}/catalog/{}/HEAD",
+            tenant_hash.to_hex(),
+            Signal::Metrics.key_prefix(),
+        )
+    }
+
+    /// Fold `(tenant, Metrics)` at `now_ns` so a real HEAD with a real,
+    /// correctly-bound name-postings object exists to load. `now_ns` must be
+    /// past the seal margins for the published segment's hour.
+    async fn fold(store: Arc<MemoryStore>, now_ns: i64) {
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store;
+        let catalog = ravel_catalog::Catalog::new(
+            dyn_store,
+            ravel_catalog::CatalogConfig {
+                shard_count: 1,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .expect("catalog")
+        .with_provisioning_enforcement();
+        catalog
+            .fold(
+                &tenant().hash(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+            )
+            .await
+            .expect("fold produces a HEAD with postings");
+    }
+
+    /// A clean folded snapshot: `run_shard_tick` loads the real covering
+    /// postings and passes `Some(covering)` to `scrub_one_object`, but the
+    /// postings accurately describe the segment, so no disagreement is recorded.
+    /// This proves the `Some` path is wired without false positives.
+    #[tokio::test]
+    async fn folded_clean_postings_record_no_disagreement() {
+        let store = Arc::new(MemoryStore::new());
+        // publish_segment fixes the segment's hour at 500_000; fold three hours
+        // later so the record is sealed and folded (past the ~20min margins).
+        publish_segment(store.as_ref(), 1, &["cpu", "mem"]).await;
+        let now = 500_003 * NS_PER_HOUR;
+        fold(store.clone(), now).await;
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics).await;
+
+        assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
+        assert_eq!(
+            metrics.postings_disagreement(Signal::Metrics),
+            0,
+            "accurate postings must not record a disagreement"
+        );
+    }
+
+    /// A real postings disagreement, injected at rest: the covering postings
+    /// object is replaced with a valid, correctly-bound object whose claims omit
+    /// a name the segment really carries, and the HEAD's postings ref is pointed
+    /// at it (matching blake3) so the load accepts it. `run_shard_tick` must
+    /// then pass `Some(covering)` to `scrub_one_object`, which re-derives the
+    /// segment's true name set and records the S2-09 false negative. This is the
+    /// direct `MemoryStore`-backed proof that the `Some(covering)` path fires.
+    #[tokio::test]
+    async fn postings_disagreement_surfaces_through_run_shard_tick() {
+        let store = Arc::new(MemoryStore::new());
+        publish_segment(store.as_ref(), 1, &["cpu", "mem"]).await;
+        let now = 500_003 * NS_PER_HOUR;
+        fold(store.clone(), now).await;
+
+        // Read the folded HEAD and its covered part(s)' blake3.
+        let head_key = head_key_for(&tenant().hash());
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head present")
+            .data;
+        let mut head = ravel_catalog::decode_head(&head_bytes).expect("decode head");
+        let part_blake3: Vec<[u8; 32]> = head
+            .parts
+            .iter()
+            .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).expect("32-byte part blake3"))
+            .collect();
+
+        // Encode a NEW, internally valid postings object that claims only "cpu"
+        // for ordinal 0, omitting "mem" (which the segment really carries): a
+        // genuine false negative, not a bit flip. A raw bit flip would surface
+        // as StructuralCorruption; this must surface as PostingsDisagreement.
+        let names = vec![ravel_catalog::NamePostings {
+            name: "cpu".to_string(),
+            ordinals: vec![0],
+        }];
+        let tampered = ravel_catalog::encode_postings(
+            tenant().hash().0,
+            Signal::Metrics as u32,
+            &part_blake3,
+            1,
+            &names,
+        )
+        .expect("encode tampered postings");
+        let tampered_hash = *blake3::hash(&tampered).as_bytes();
+
+        // Overwrite the postings object over its real key, then repoint the
+        // HEAD's postings ref at it with the matching blake3/size so
+        // load_covering_postings accepts it instead of degrading to None.
+        let postings_ref = head.postings.as_mut().expect("postings ref after fold");
+        store
+            .put(
+                &postings_ref.key,
+                Bytes::from(tampered.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite postings object");
+        postings_ref.blake3 = tampered_hash.to_vec();
+        postings_ref.size = tampered.len() as u64;
+        let rewritten = ravel_catalog::encode_head(&head).expect("re-encode head");
+        store
+            .put(&head_key, Bytes::from(rewritten), PutOptions::default())
+            .await
+            .expect("overwrite head");
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics).await;
+
+        assert_eq!(
+            metrics.postings_disagreement(Signal::Metrics),
+            1,
+            "the omitted name must surface as a postings disagreement through the real tick"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics),
+            0,
+            "the segment data is untouched: no checksum mismatch"
+        );
     }
 }
