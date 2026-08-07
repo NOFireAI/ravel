@@ -196,6 +196,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,
+            ..LimitsConfig::default()
         },
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),

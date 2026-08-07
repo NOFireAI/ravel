@@ -63,7 +63,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub use alerting::AlertEvalConfig;
-pub use config::limits::LimitsConfig;
+pub use config::limits::{LimitsConfig, QueryLimits};
 pub use config::{Cli, Mode, StoreKind};
 pub use fold::FoldTaskConfig;
 pub use maintain::MaintenanceTaskConfig;
@@ -657,9 +657,16 @@ pub async fn start(
         // The real query engine's deadline is the value `main` validated
         // against `sys/gc` (ADR-0050 section 4, EC4), not an independent
         // `EngineConfig::default()`: the deadline validated is the deadline
-        // enforced. Every other engine limit stays at its default.
+        // enforced. The bytes-scanned budget (ADR-0061 decision 1) is resolved
+        // the same way from `--limits-file`'s `[defaults]` table and threaded
+        // here into the one process-wide engine both query surfaces share, so
+        // the configured budget is the enforced budget on the PromQL/HTTP and
+        // SQL/HTTP paths alike (both `build_app_state` and `build_sql_state`
+        // below take this same value). Every other engine limit stays at its
+        // default.
         let engine_config = ravel_query::EngineConfig {
             deadline: config.query_deadline,
+            max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
             ..ravel_query::EngineConfig::default()
         };
         let app_state = query::build_app_state(

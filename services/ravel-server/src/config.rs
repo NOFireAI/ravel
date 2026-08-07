@@ -1023,6 +1023,7 @@ pub mod limits {
     use std::fmt;
 
     use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
+    use ravel_query::ByteLimit;
     use ravel_types::TenantId;
     use serde::Deserialize;
     use serde::de::{self, Visitor};
@@ -1068,16 +1069,61 @@ pub mod limits {
         }
     }
 
+    /// The per-tenant query cost governance limits resolved from the same
+    /// `--limits-file` tables (ADR-0061 decision 1). One field today, the
+    /// bytes-scanned budget, kept in its own struct (mirroring the ADR's
+    /// `QueryLimits { max_bytes_scanned }`) so a future query-side cap slots in
+    /// beside it the same way `AdmissionLimits` carries the ingest caps.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct QueryLimits {
+        /// Cap on the total S3 bytes a single query may scan for this tenant,
+        /// or [`ByteLimit::Unlimited`] to opt out. Fed into the query engine's
+        /// [`ravel_query::EngineConfig::max_bytes_scanned`].
+        pub max_bytes_scanned: ByteLimit,
+    }
+
+    /// This service's shipped query-limit defaults, applied to every tenant
+    /// with no `max_bytes_scanned` set anywhere. `Unlimited` matches
+    /// [`ravel_query::EngineConfig::default`]: a bounded default would silently
+    /// start rejecting an existing deployment's large-but-legitimate queries on
+    /// upgrade with no config change, so opting in to a bound is explicit.
+    pub fn shipped_query_defaults() -> QueryLimits {
+        QueryLimits {
+            max_bytes_scanned: ByteLimit::Unlimited,
+        }
+    }
+
     /// The result of loading `--limits-file`: the resolved defaults (the
     /// shipped defaults when no file, or no `[defaults]` table, sets a given
     /// field) plus one resolved `AdmissionLimits` per configured tenant,
     /// already overlaid on those defaults. `main.rs` feeds `defaults` to
     /// `AdmissionController::new` and each `tenants` entry to
     /// `AdmissionController::set_tenant_limits` at startup.
+    ///
+    /// `query_defaults`/`query_tenants` carry the query-side bytes-scanned
+    /// budget (ADR-0061 decision 1) resolved from the same tables. `start`
+    /// feeds `query_defaults.max_bytes_scanned` into the process-wide
+    /// `EngineConfig` both query surfaces share; see that field's note for why
+    /// per-tenant overrides are parsed here but not yet enforced per tenant.
     #[derive(Debug, Clone)]
     pub struct LimitsConfig {
         pub defaults: AdmissionLimits,
         pub tenants: HashMap<TenantId, AdmissionLimits>,
+        /// Query bytes-scanned budget for every tenant with no
+        /// `[tenants.<id>]` override (ADR-0061 decision 1).
+        pub query_defaults: QueryLimits,
+        /// Per-tenant query bytes-scanned overrides, already overlaid on
+        /// `query_defaults`.
+        ///
+        /// Parsed and validated here so operators write the budget in the same
+        /// `[tenants.<id>]` shape they already use for ingest admission, but
+        /// the process-wide `QueryEngine` holds a single `EngineConfig` and is
+        /// not tenant-parameterized, so it enforces `query_defaults` for every
+        /// tenant. A per-tenant override recorded here is therefore not yet
+        /// enforced differently from the default; `main` warns at startup when
+        /// one is set. Enforcing it needs a tenant-aware `EngineConfig` lookup
+        /// inside `ravel-query`, out of scope for the server-side wiring.
+        pub query_tenants: HashMap<TenantId, QueryLimits>,
     }
 
     impl Default for LimitsConfig {
@@ -1085,6 +1131,8 @@ pub mod limits {
             LimitsConfig {
                 defaults: shipped_defaults(),
                 tenants: HashMap::new(),
+                query_defaults: shipped_query_defaults(),
+                query_tenants: HashMap::new(),
             }
         }
     }
@@ -1152,6 +1200,12 @@ pub mod limits {
         ingest_byte_burst: Option<u64>,
         series_creation_rate_per_sec: Option<LimitValue>,
         series_creation_burst: Option<u64>,
+        /// Query bytes-scanned budget (ADR-0061 decision 1): a positive byte
+        /// count, or the string `"unlimited"`. Absent inherits the base table
+        /// (the shipped `Unlimited` for `[defaults]`, the resolved default for
+        /// a `[tenants.<id>]` table). Lives in the same table as the ingest
+        /// admission caps so an operator configures both in one familiar file.
+        max_bytes_scanned: Option<LimitValue>,
     }
 
     #[derive(Debug, Clone, Default, Deserialize)]
@@ -1171,16 +1225,49 @@ pub mod limits {
     pub fn parse_limits_file(text: &str) -> anyhow::Result<LimitsConfig> {
         let file: LimitsFileToml = toml::from_str(text)?;
         let defaults = merge_limits(shipped_defaults(), &file.defaults, "[defaults]")?;
+        let query_defaults =
+            merge_query_limits(shipped_query_defaults(), &file.defaults, "[defaults]")?;
         let mut tenants = HashMap::new();
+        let mut query_tenants = HashMap::new();
         for (id, overrides) in &file.tenants {
             if id.is_empty() {
                 anyhow::bail!("[tenants] has an entry with an empty tenant id");
             }
             let context = format!("[tenants.{id}]");
             let limits = merge_limits(defaults, overrides, &context)?;
+            let query_limits = merge_query_limits(query_defaults, overrides, &context)?;
             tenants.insert(TenantId::new(id), limits);
+            query_tenants.insert(TenantId::new(id), query_limits);
         }
-        Ok(LimitsConfig { defaults, tenants })
+        Ok(LimitsConfig {
+            defaults,
+            tenants,
+            query_defaults,
+            query_tenants,
+        })
+    }
+
+    /// Overlay a table's `max_bytes_scanned` onto `base`, validating it
+    /// (ADR-0061 decision 1). Mirrors [`merge_limits`] for the query-side
+    /// budget: an absent field inherits `base` unchanged, a bounded value must
+    /// be positive, and `"unlimited"` opts out of the cap.
+    fn merge_query_limits(
+        base: QueryLimits,
+        overrides: &LimitsTableToml,
+        context: &str,
+    ) -> anyhow::Result<QueryLimits> {
+        let mut limits = base;
+        if let Some(v) = overrides.max_bytes_scanned {
+            limits.max_bytes_scanned = to_byte_limit(v, "max_bytes_scanned", context)?;
+        }
+        Ok(limits)
+    }
+
+    fn to_byte_limit(v: LimitValue, field: &str, context: &str) -> anyhow::Result<ByteLimit> {
+        match v {
+            LimitValue::Unlimited => Ok(ByteLimit::Unlimited),
+            LimitValue::Bounded(n) => Ok(ByteLimit::Bounded(validate_positive(n, field, context)?)),
+        }
     }
 
     /// Overlay `overrides`'s set fields onto `base`, validating each one.
@@ -1426,6 +1513,112 @@ pub mod limits {
                 max_active_series = 100
             "#;
             parse_limits_file(text).expect_err("an empty tenant id must fail startup");
+        }
+
+        #[test]
+        fn absent_max_bytes_scanned_is_unlimited_everywhere() {
+            // ADR-0061 decision 1: the shipped default is Unlimited, so a file
+            // that never mentions the budget leaves every tenant uncapped,
+            // byte-identical to before the knob existed.
+            let text = r#"
+                [defaults]
+                max_active_series = 100
+
+                [tenants.acme]
+            "#;
+            let parsed = parse_limits_file(text).expect("valid limits file parses");
+            assert_eq!(
+                parsed.query_defaults.max_bytes_scanned,
+                ByteLimit::Unlimited
+            );
+            let acme = parsed
+                .query_tenants
+                .get(&TenantId::new("acme"))
+                .expect("acme query limits present");
+            assert_eq!(acme.max_bytes_scanned, ByteLimit::Unlimited);
+        }
+
+        #[test]
+        fn bounded_default_max_bytes_scanned_parses_and_is_inherited() {
+            let text = r#"
+                [defaults]
+                max_bytes_scanned = 1048576
+
+                [tenants.quiet]
+            "#;
+            let parsed = parse_limits_file(text).expect("valid limits file parses");
+            assert_eq!(
+                parsed.query_defaults.max_bytes_scanned,
+                ByteLimit::Bounded(1_048_576)
+            );
+            // A tenant with no override inherits the resolved default budget.
+            let quiet = parsed
+                .query_tenants
+                .get(&TenantId::new("quiet"))
+                .expect("quiet query limits present");
+            assert_eq!(quiet.max_bytes_scanned, ByteLimit::Bounded(1_048_576));
+        }
+
+        #[test]
+        fn per_tenant_bounded_max_bytes_scanned_overrides_the_default() {
+            let text = r#"
+                [defaults]
+                max_bytes_scanned = 1048576
+
+                [tenants.acme]
+                max_bytes_scanned = 4096
+            "#;
+            let parsed = parse_limits_file(text).expect("valid limits file parses");
+            let acme = parsed
+                .query_tenants
+                .get(&TenantId::new("acme"))
+                .expect("acme query limits present");
+            assert_eq!(
+                acme.max_bytes_scanned,
+                ByteLimit::Bounded(4096),
+                "the per-tenant override replaces the default budget"
+            );
+        }
+
+        #[test]
+        fn per_tenant_unlimited_opts_a_tenant_out_of_a_bounded_default() {
+            let text = r#"
+                [defaults]
+                max_bytes_scanned = 1048576
+
+                [tenants.trusted]
+                max_bytes_scanned = "unlimited"
+            "#;
+            let parsed = parse_limits_file(text).expect("valid limits file parses");
+            let trusted = parsed
+                .query_tenants
+                .get(&TenantId::new("trusted"))
+                .expect("trusted query limits present");
+            assert_eq!(
+                trusted.max_bytes_scanned,
+                ByteLimit::Unlimited,
+                "\"unlimited\" is the config-review-visible opt-out from a bounded default"
+            );
+        }
+
+        #[test]
+        fn zero_max_bytes_scanned_is_rejected() {
+            let text = r#"
+                [defaults]
+                max_bytes_scanned = 0
+            "#;
+            let err =
+                parse_limits_file(text).expect_err("a zero byte budget is not a meaningful limit");
+            assert!(err.to_string().contains("max_bytes_scanned"));
+        }
+
+        #[test]
+        fn negative_max_bytes_scanned_is_rejected() {
+            let text = r#"
+                [defaults]
+                max_bytes_scanned = -1
+            "#;
+            parse_limits_file(text).expect_err("a negative byte budget must fail startup");
         }
     }
 }

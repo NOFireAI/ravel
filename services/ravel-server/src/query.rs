@@ -189,6 +189,45 @@ pub fn build_sql_state(
 mod catalog_cache_tests {
     use super::*;
     use ravel_object_store::memory::MemoryStore;
+    use ravel_query::ByteLimit;
+    use ravel_query::http::StaticBearerTokenResolver;
+    use std::collections::HashMap;
+
+    /// ADR-0061 decision 1: the bytes-scanned budget resolved from
+    /// `--limits-file` must reach the PromQL/HTTP engine `build_app_state`
+    /// builds, not be dropped to the `EngineConfig::default()` `Unlimited`.
+    /// Asserts on the engine's own `config()`, the value the fetch fan-outs
+    /// actually check.
+    #[test]
+    fn build_app_state_threads_the_byte_budget_into_the_engine() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+        )
+        .expect("catalog");
+        let engine_config = EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(4096),
+            ..EngineConfig::default()
+        };
+        let state = build_app_state(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            engine_config,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+        );
+        assert_eq!(
+            state.engine.config().max_bytes_scanned,
+            ByteLimit::Bounded(4096),
+            "the PromQL engine must enforce the configured byte budget, not the default Unlimited"
+        );
+    }
 
     /// Issue #553: `--disable-cache` (passed as `disable_cache: true`) must
     /// build a catalog with no byte cache constructed, the byte-cache analogue
@@ -282,6 +321,45 @@ mod tests {
             state.max_deadline, non_default.deadline,
             "build_sql_state's max_deadline must be the resolved value passed in, \
              not an independent EngineConfig::default()"
+        );
+    }
+
+    /// ADR-0061 decision 1: the SQL/HTTP surface must enforce the same
+    /// bytes-scanned budget the PromQL surface does, so the value threaded into
+    /// `build_sql_state`'s `EngineConfig` must survive into the executor's
+    /// `SqlConfig.engine` (where `RsegScanExec::prepare_partition` checks it),
+    /// not be dropped to `SqlConfig::default()`'s `Unlimited`.
+    #[test]
+    fn build_sql_state_threads_the_byte_budget_into_the_executor() {
+        use ravel_query::ByteLimit;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+        )
+        .expect("catalog");
+        let engine_config = EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(4096),
+            ..EngineConfig::default()
+        };
+        let state = build_sql_state(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            engine_config,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+        )
+        .expect("sql state builds");
+        assert_eq!(
+            state.executor.config().engine.max_bytes_scanned,
+            ByteLimit::Bounded(4096),
+            "the SQL executor must enforce the configured byte budget, not the default Unlimited"
         );
     }
 }

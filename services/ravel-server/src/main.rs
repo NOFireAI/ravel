@@ -247,11 +247,38 @@ async fn main() -> anyhow::Result<()> {
         tenant_overrides = limits.tenants.len(),
         max_active_series = ?limits.defaults.max_active_series,
         max_active_streams = ?limits.defaults.max_active_streams,
+        max_bytes_scanned = ?limits.query_defaults.max_bytes_scanned,
         "admission limits resolved from {}",
         cli.limits_file
             .as_deref()
             .map_or_else(|| "shipped defaults".to_string(), |p| p.display().to_string())
     );
+    // ADR-0061 decision 1: per-tenant query bytes-scanned overrides are parsed
+    // and validated from the same file, but the process-wide `QueryEngine`
+    // holds a single `EngineConfig` and is not tenant-parameterized, so it
+    // enforces the resolved default budget for every tenant. Warn (not silently
+    // ignore, per this repo's "looks configured, is actually inert" rule) when
+    // a tenant's override differs from the default it will actually run under,
+    // naming each affected tenant. Enforcing a per-tenant query byte budget
+    // needs a tenant-aware `EngineConfig` lookup inside `ravel-query`, out of
+    // scope for the server-side config wiring.
+    let ineffective_query_overrides: Vec<&str> = limits
+        .query_tenants
+        .iter()
+        .filter(|(_, q)| q.max_bytes_scanned != limits.query_defaults.max_bytes_scanned)
+        .map(|(tenant, _)| tenant.as_str())
+        .collect();
+    if !ineffective_query_overrides.is_empty() {
+        tracing::warn!(
+            tenants = ?ineffective_query_overrides,
+            default_budget = ?limits.query_defaults.max_bytes_scanned,
+            "per-tenant [tenants.<id>] max_bytes_scanned overrides are parsed but not yet \
+             enforced per tenant: the query engine applies one process-wide budget (the \
+             [defaults] value) to every tenant. These tenants will run under the default \
+             budget, not their override. Set the intended budget in [defaults] until \
+             tenant-aware query budgets land."
+        );
+    }
     // Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
     // issue #511). An empty or duplicate field name fails startup here rather
     // than silently indexing the wrong set. `ravel_server::start` hands this to
