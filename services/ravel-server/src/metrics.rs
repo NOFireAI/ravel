@@ -1132,6 +1132,15 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// gauge alone must never be read as "the breaker cleared, so the data
     /// loss is resolved."
     pub orphans_withheld: u64,
+    /// Orphan candidates the most recent sweep pass found, tripped or not
+    /// (ADR-0058 decision 1): `orphans_deleted + orphans_withheld`. Nonzero
+    /// for small-scale commit-record loss the breaker's ratio/count thresholds
+    /// are deliberately too coarse to trip on, which is why it is a distinct
+    /// gauge from `orphans_withheld` (that one stays `0` precisely when the
+    /// breaker does not trip). Like `orphans_withheld` it reflects only the
+    /// most recent pass and drops as candidates are deleted or their records
+    /// restored; a drop is not "resolved," just this pass's count.
+    pub orphans_present: u64,
 }
 
 /// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6;
@@ -1222,6 +1231,24 @@ fn render_maintain_safety_family(
             "ravel_maintain_orphans_withheld",
             &labels(mode, signal.signal),
             signal.orphans_withheld,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_orphans_present",
+        "Orphan candidates the most recent sweep pass found, by signal, whether or not the \
+         mass-orphan breaker tripped. Nonzero flags small-scale commit-record loss the breaker's \
+         thresholds are too coarse to catch (ADR-0058). A drop is not resolution, only this \
+         pass's count.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_orphans_present",
+            &labels(mode, signal.signal),
+            signal.orphans_present,
         );
     }
 }
@@ -1981,6 +2008,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                         conservation_aborts: metrics.conservation_aborts(signal),
                         orphan_breaker_trips: metrics.orphan_breaker_trips(signal),
                         orphans_withheld: metrics.orphans_withheld(signal),
+                        orphans_present: metrics.orphans_present(signal),
                     })
                     .collect(),
             });
@@ -2640,12 +2668,14 @@ mod tests {
                     conservation_aborts: 1,
                     orphan_breaker_trips: 2,
                     orphans_withheld: 7,
+                    orphans_present: 9,
                 },
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Logs,
                     conservation_aborts: 0,
                     orphan_breaker_trips: 0,
                     orphans_withheld: 0,
+                    orphans_present: 0,
                 },
             ],
         };
@@ -2684,6 +2714,14 @@ mod tests {
             ),
             "missing orphans_withheld sample:\n{body}"
         );
+        assert!(
+            body.contains("ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 9"),
+            "missing orphans_present sample:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_maintain_orphans_present gauge"),
+            "orphans_present must carry a gauge TYPE header:\n{body}"
+        );
         // The zero-valued signal (logs) still renders, not omitted, matching
         // every other family's zero-is-not-absence discipline.
         assert!(
@@ -2713,6 +2751,7 @@ mod tests {
                 conservation_aborts: 1,
                 orphan_breaker_trips: 1,
                 orphans_withheld: 1,
+                orphans_present: 1,
             }],
         };
         let body = render(
@@ -2735,6 +2774,7 @@ mod tests {
                 } else if line.starts_with("ravel_maintain_conservation_aborts_total")
                     || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
                     || line.starts_with("ravel_maintain_orphans_withheld")
+                    || line.starts_with("ravel_maintain_orphans_present")
                 {
                     vec!["mode", "signal"]
                 } else {
