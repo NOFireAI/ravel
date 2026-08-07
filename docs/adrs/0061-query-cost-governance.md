@@ -97,6 +97,65 @@ Cancellation must release everything a normal completion releases
 memory-pool half of this for SQL; this ADR's acceptance test proves the
 new byte-budget half.
 
+## Amendment (2026-08-07): PromQL's enforcement site cannot deliver mid-scan cancellation
+
+Decision 1's PromQL location clause — "alongside the existing
+`max_series`/`max_samples` checks in `engine.rs`'s three merge functions"
+— is incompatible with the same paragraph's own requirement ("checked
+incrementally... once per completed segment fetch"). EF-1 (#721)
+implemented the location clause exactly as written and its Stage 4
+checkpoint caught the contradiction: `engine.rs`'s merge functions
+(`build_series_by_id`, `merge_soa_runs`, `merge_histogram_soa_runs`) run
+only after `fetch_all_series` / `fetch_all_samples_and_histograms` have
+already drained every segment's fetch via
+`stream::iter(...).buffer_unordered(concurrency).collect().await`
+(`engine.rs:824-912`). By the time a merge function's loop runs, every
+segment's bytes are already paid for — a bounded budget still issues
+every GET and holds the full decoded result before returning an error.
+The check moves the point of failure, not the point of cost.
+
+SQL does not share this defect. `RsegScanExec::prepare_partition`
+(`crates/ravel-sql/src/scan.rs:328-411`) is already a sequential
+`for seg in &segs` loop that checks `max_series` and grows a memory
+reservation once per completed segment, before fetching the next one —
+genuinely incremental. Decision 1's SQL location clause is unchanged by
+this amendment.
+
+`QueryAccounting::add_s3_bytes` (`crates/ravel-types/src/accounting.rs`)
+is an `Arc<Inner>` of atomics: every clone handed into a segment's fetch
+task observes and contributes to the same live counters, so the running
+total genuinely grows as each segment completes inside the
+`buffer_unordered` stream, concurrently with its siblings still in
+flight. The fetch functions can therefore check the budget as each
+segment finishes and cancel the rest, instead of waiting for all of them:
+
+- PromQL's enforcement site moves to `fetch_all_series` and
+  `fetch_all_samples_and_histograms` (`engine.rs:824-912`) themselves.
+  Replace each function's `.buffer_unordered(concurrency).collect().await`
+  with a short-circuiting consumption (e.g. a manual loop over
+  `StreamExt::next()`, or `try_for_each`) that, after each segment's
+  result arrives, checks `accounting.snapshot().total_s3_bytes()` against
+  `max_bytes_scanned` and returns the typed byte-budget error immediately
+  if tripped. Dropping the stream at that point stops polling the
+  remaining segment futures, cancelling their in-flight fetches
+  cooperatively — the same release shape the memory-pool budget already
+  proves for SQL. The `max_series`/`max_samples` checks in the merge
+  functions are unaffected and stay where they are; this amendment only
+  relocates the new byte check.
+- A single-selector query (`plans.len() == 1`, the common case and the
+  one S4-06 describes) has no sibling plans still fetching once its own
+  segments are exhausted, so threading a live `&QueryAccounting` into the
+  merge functions instead of a frozen `u64` snapshot would not recover
+  mid-scan cancellation for it — the fix must sit in the fetch stage
+  itself, not the merge stage, regardless of how the value is threaded.
+- The acceptance test must prove cancellation stops in-flight work, not
+  only that a bounded run returns an error: assert, via a fault-injecting
+  or counting store, that fewer GETs were issued than the snapshot has
+  segments when the budget trips partway through a multi-segment fetch.
+  A test that only compares a bounded run's result against an unbounded
+  run's does not distinguish real cancellation from a check that fires
+  after the fact.
+
 ### 2. Fleet-global query concurrency ceiling via ADR-0057's count-cap reconciliation pattern
 
 A new, independent controller — not an addition to `AdmissionController`,
