@@ -300,6 +300,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         limits: LimitsConfig {
             defaults: ravel_server::config::limits::shipped_defaults(),
             tenants,
+            ..LimitsConfig::default()
         },
     };
     ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)

@@ -167,7 +167,26 @@ distinct from the count-cap errors. The default is `Unlimited` so an
 existing deployment is never silently rejected on upgrade; opting in to a
 bound is explicit. Like every count cap, enforcement is per completed
 segment, so a single very large segment can overshoot the bound by up to
-its own size before the next check fires. The point cap is
+its own size before the next check fires.
+
+An operator configures the budget in `ravel-server`'s `--limits-file`, the
+same TOML file that already carries the ingest admission caps (ADR-0051
+section 3): a `max_bytes_scanned` key in the `[defaults]` table, set to a
+positive byte count or the string `"unlimited"`, sits beside
+`max_active_series` and the other per-tenant knobs. It is read once at
+startup and threaded into the one process-wide `EngineConfig` that both the
+PromQL/HTTP and SQL/HTTP query surfaces share, so the configured budget is
+the enforced budget on both. Absent, it stays `Unlimited`. A
+`[tenants.<id>]` table accepts the same key in the operator-familiar
+per-tenant shape, but the process-wide engine holds a single `EngineConfig`
+and is not tenant-parameterized: it enforces the `[defaults]` budget for
+every tenant, so a per-tenant override is parsed and validated but not yet
+enforced differently from the default (the server logs a startup warning
+naming any tenant that set one). Enforcing a distinct budget per tenant
+needs a tenant-aware `EngineConfig` lookup inside the engine, not yet built;
+until then, set the budget in `[defaults]`.
+
+The point cap is
 enforced independently at every subquery evaluation node (`expr[5m:1m]`),
 checked against that node's own grid before it is built, so a nested
 subquery whose own grid alone exceeds the cap is rejected before any
