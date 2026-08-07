@@ -19,7 +19,8 @@ use bytes::Bytes;
 use ravel_commit::keys::{self, BucketEntry, KeyError};
 use ravel_commit::signal;
 use ravel_object_store::{
-    GetRange, PutMode, PutOptions, StoreError, UploadChecksum, Version, list_all,
+    GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum, Version,
+    list_all,
 };
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
@@ -45,7 +46,7 @@ use crate::snapshot_format::{self, HEAD_FORMAT_VERSION, NamePostings, PartLimits
 /// approximate postings object (ravel CLAUDE.md: "Exact semantics by
 /// default").
 #[derive(Debug, thiserror::Error)]
-enum PostingsBuildError {
+pub enum PostingsBuildError {
     #[error("store error: {0}")]
     Store(#[from] StoreError),
     #[error("key error: {0}")]
@@ -1024,11 +1025,11 @@ impl Catalog {
             .map(|np| (np.name, np.ordinals))
             .collect();
         for (ordinal, entry) in entries.iter().enumerate().skip(decode_start) {
-            let names = match self
-                .fetch_entry_names(tenant, signal, entry, counters)
-                .await
-            {
-                Ok(names) => names,
+            let names = match fetch_segment_names(self.store(), tenant, signal, entry).await {
+                Ok(names) => {
+                    counters.get_requests += 1;
+                    names
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -1053,80 +1054,10 @@ impl Catalog {
         )
     }
 
-    /// Fetch one entry's segment and return the distinct `__name__` values
-    /// among its series. The segment is fetched in full (rather than the
-    /// footer-suffix-then-range-chase protocol `ravel-query`'s fetcher uses
-    /// for query-time page reads): a fold reads every newly-covered entry's
-    /// catalog exactly once and needs no page data, so the extra bytes of a
-    /// single full GET are cheaper than the extra round trips a suffix
-    /// chase would add here.
-    async fn fetch_entry_names(
-        &self,
-        tenant: &TenantHash,
-        signal: Signal,
-        entry: &SnapshotEntry,
-        counters: &mut RequestCounters,
-    ) -> Result<HashSet<String>, PostingsBuildError> {
-        let content_hash: [u8; 32] = entry
-            .content_hash
-            .as_slice()
-            .try_into()
-            .map_err(|_| PostingsBuildError::BadContentHashLen(entry.content_hash.len()))?;
-        let writer_id_bytes: [u8; 16] = entry
-            .writer_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| PostingsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
-        let writer_id = Uuid::from_bytes(writer_id_bytes);
-        let data_key = keys::data_key(
-            tenant,
-            signal,
-            entry.shard,
-            writer_id,
-            entry.writer_epoch,
-            entry.writer_seq,
-            &content_hash,
-        )?;
-        let got = self.store().get(&data_key, GetRange::Full).await?;
-        counters.get_requests += 1;
-
-        let limits = ReaderLimits::default();
-        let location = ravel_segment::open_from_full(&got.data, limits)?;
-        let expected = ExpectedIdentity {
-            tenant_hash: tenant.0,
-            shard: entry.shard,
-            writer_id: writer_id.to_string(),
-            writer_epoch: entry.writer_epoch,
-            writer_seq: entry.writer_seq,
-        };
-        ravel_segment::check_identity(&location.footer, &expected)?;
-
-        // ADR-0027: v6 is the only supported version (`open_from_full` above
-        // has already rejected anything else). The chunked v5-shaped catalog
-        // (unchanged by the v6 EXEMPLARS addition) spans sections, so it is
-        // decoded over the whole object -- already in hand here via the
-        // `GetRange::Full` GET -- and folded to the per-series `SeriesEntry`
-        // view the postings build consumes.
-        let series: Vec<ravel_segment::SeriesEntry> = match location.version {
-            ravel_segment::VERSION_V6 => {
-                ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
-                    .into_iter()
-                    .map(|e| e.entry)
-                    .collect()
-            }
-            other => return Err(PostingsBuildError::UnsupportedSegmentVersion(other)),
-        };
-
-        let mut names = HashSet::new();
-        for s in &series {
-            let name = s
-                .labels
-                .get(METRIC_NAME_LABEL)
-                .ok_or(PostingsBuildError::MissingMetricName)?;
-            names.insert(name.to_string());
-        }
-        Ok(names)
-    }
+    // The per-entry `__name__` derivation the postings build consumes is the
+    // free `fetch_segment_names` function (after this impl block), extracted so
+    // `ravel-maintain`'s scrubber re-derives names exactly the way the fold
+    // that wrote the postings did (ADR-0059 decision 3).
 
     /// Enumerate every (shard, hour) commit bucket at or before
     /// `watermark_hour` by listing the commit-hour directories directly,
@@ -1172,6 +1103,87 @@ impl Catalog {
         buckets.sort_unstable();
         Ok(buckets)
     }
+}
+
+/// Fetch one entry's segment and return the distinct `__name__` values among
+/// its series. The segment is fetched in full (rather than the
+/// footer-suffix-then-range-chase protocol `ravel-query`'s fetcher uses for
+/// query-time page reads): a fold reads every newly-covered entry's catalog
+/// exactly once and needs no page data, so the extra bytes of a single full
+/// GET are cheaper than the extra round trips a suffix chase would add here.
+///
+/// This is the one authoritative derivation of a segment's true `__name__`
+/// set from a [`SnapshotEntry`]: [`Catalog::build_postings`] uses it to build
+/// the name-postings index, and `ravel-maintain`'s content-tier scrubber
+/// (ADR-0059 decision 1) uses it to re-derive the same set at rest and diff it
+/// against what a covering postings object claims for the object. Keeping a
+/// single implementation is deliberate: two copies that must always agree
+/// would be a maintenance hazard, since a scrub is only meaningful if it
+/// derives names exactly the way the fold that wrote the postings did.
+pub async fn fetch_segment_names(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    entry: &SnapshotEntry,
+) -> Result<HashSet<String>, PostingsBuildError> {
+    let content_hash: [u8; 32] = entry
+        .content_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| PostingsBuildError::BadContentHashLen(entry.content_hash.len()))?;
+    let writer_id_bytes: [u8; 16] = entry
+        .writer_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| PostingsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
+    let writer_id = Uuid::from_bytes(writer_id_bytes);
+    let data_key = keys::data_key(
+        tenant,
+        signal,
+        entry.shard,
+        writer_id,
+        entry.writer_epoch,
+        entry.writer_seq,
+        &content_hash,
+    )?;
+    let got = store.get(&data_key, GetRange::Full).await?;
+
+    let limits = ReaderLimits::default();
+    let location = ravel_segment::open_from_full(&got.data, limits)?;
+    let expected = ExpectedIdentity {
+        tenant_hash: tenant.0,
+        shard: entry.shard,
+        writer_id: writer_id.to_string(),
+        writer_epoch: entry.writer_epoch,
+        writer_seq: entry.writer_seq,
+    };
+    ravel_segment::check_identity(&location.footer, &expected)?;
+
+    // ADR-0027: v6 is the only supported version (`open_from_full` above has
+    // already rejected anything else). The chunked v5-shaped catalog
+    // (unchanged by the v6 EXEMPLARS addition) spans sections, so it is
+    // decoded over the whole object -- already in hand here via the
+    // `GetRange::Full` GET -- and folded to the per-series `SeriesEntry` view
+    // the postings build consumes.
+    let series: Vec<ravel_segment::SeriesEntry> = match location.version {
+        ravel_segment::VERSION_V6 => {
+            ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
+                .into_iter()
+                .map(|e| e.entry)
+                .collect()
+        }
+        other => return Err(PostingsBuildError::UnsupportedSegmentVersion(other)),
+    };
+
+    let mut names = HashSet::new();
+    for s in &series {
+        let name = s
+            .labels
+            .get(METRIC_NAME_LABEL)
+            .ok_or(PostingsBuildError::MissingMetricName)?;
+        names.insert(name.to_string());
+    }
+    Ok(names)
 }
 
 fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldReport {

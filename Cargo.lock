@@ -4471,6 +4471,7 @@ dependencies = [
  "hex",
  "proptest",
  "prost",
+ "ravel-catalog",
  "ravel-commit",
  "ravel-ingest",
  "ravel-logseg",

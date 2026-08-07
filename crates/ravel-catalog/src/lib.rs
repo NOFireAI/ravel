@@ -24,7 +24,7 @@ pub use config::{
     DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS, DEFAULT_SNAPSHOT_CACHE_PARTS,
 };
 pub use error::CatalogError;
-pub use fold::{FoldReport, Transaction};
+pub use fold::{FoldReport, PostingsBuildError, Transaction, fetch_segment_names};
 pub use provisioning::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, GenerationDefect, MAX_SHARD_COUNT,
     PROVISIONING_FORMAT_VERSION, ProvisioningCheck, ProvisioningError, ReshardOutcome,

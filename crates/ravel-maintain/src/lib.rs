@@ -54,6 +54,7 @@ pub mod retention;
 pub mod rlog;
 pub mod rspan_codec;
 pub mod scan;
+pub mod scrub;
 pub mod sweep;
 
 pub use bucket::Bucket;
@@ -77,6 +78,10 @@ pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
 pub use scan::{MaintainReport, ScanReport, scan_and_compact, scan_and_maintain};
+pub use scrub::{
+    CoveringPostings, ScrubBudget, ScrubCursor, ScrubResult, ScrubSlice, ScrubTarget,
+    advance_cursor, per_tick_byte_budget, scrub_one_object,
+};
 pub use sweep::{
     IdemSweepOutcome, LeaseCheck, NoLeases, OrphanSweepOutcome, SweepReport,
     sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_superseded,
