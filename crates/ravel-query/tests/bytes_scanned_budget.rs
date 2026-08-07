@@ -29,6 +29,7 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
+use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -185,10 +186,14 @@ async fn publish_segment(
 
 /// Publishes `SEGMENTS` segments onto a fresh store, then wraps that store in a
 /// GET-counting double. Returns the engine, the wrapper's GET counter, and the
-/// per-segment commit tokens. `fetch_concurrency` is 1 so segments are fetched
-/// one at a time: a tripped budget then short-circuits deterministically after
-/// exactly one data-object GET, and the assertion "GETs < segments" is exact
-/// rather than racing the buffered fan-out.
+/// per-segment commit tokens. `fetch_concurrency` is 1 here, but that is not
+/// what makes "GETs < segments" a meaningful assertion: against a synchronous
+/// `MemoryStore`, `buffer_unordered` polls the first pushed future to
+/// completion before any other future is polled at all regardless of the
+/// configured concurrency, so this setup alone cannot distinguish "the
+/// remaining fetches were cancelled" from "the remaining fetches were simply
+/// never started". `setup_gated` below, combined with a real hold/release
+/// gate, is what proves cancellation of fetches that are genuinely in flight.
 async fn setup(
     max_bytes_scanned: ByteLimit,
 ) -> (QueryEngine, Arc<AtomicUsize>, Vec<CommitToken>, TenantHash) {
@@ -259,8 +264,10 @@ async fn bytes_budget_trips_and_cancels_remaining_segment_fetches() {
     );
     assert_eq!(
         issued, 1,
-        "with fetch_concurrency=1 the budget trips after the first segment, so exactly one \
-         data-object GET is issued (got {issued})"
+        "with fetch_concurrency=1 and a synchronous backend, the first pushed future runs to \
+         completion before any other is polled, so exactly one data-object GET is issued \
+         (got {issued}); this does not by itself prove cancellation of genuinely in-flight \
+         work -- see bytes_budget_cancels_genuinely_in_flight_concurrent_fetches for that"
     );
 }
 
@@ -359,5 +366,150 @@ async fn empty_matching_labels_query_still_trips_budget() {
     assert!(
         gets.load(Ordering::SeqCst) < SEGMENTS,
         "the tripped budget must cancel the remaining segment fetches on the labels path too"
+    );
+}
+
+/// Number of segments for the gated concurrency proof below: large enough
+/// that, at `GATED_CONCURRENCY`, several fetches are genuinely in flight
+/// simultaneously when the budget trips.
+const GATED_SEGMENTS: usize = 8;
+/// `fetch_concurrency` for the gated test: `buffer_unordered` must actually
+/// have this many futures polled and pending at once for the assertions below
+/// to mean anything.
+const GATED_CONCURRENCY: usize = 4;
+
+/// Publishes `GATED_SEGMENTS` segments and wraps the store in both the
+/// GET-counting double and a [`FaultStore`] hold gate on every data-object GET
+/// (`Op::Get`, key contains `"rseg"` -- the data-key suffix, so catalog/commit
+/// reads are never gated). `FaultStore::get` calls its gate before delegating
+/// to the inner (counting) store, so a held call has not yet been counted and
+/// never will be unless released.
+async fn setup_gated(
+    max_bytes_scanned: ByteLimit,
+) -> (
+    QueryEngine,
+    ravel_object_store::fault::GateHandle,
+    Arc<AtomicUsize>,
+    Vec<CommitToken>,
+    TenantHash,
+) {
+    let tenant_id = TenantId::new("tenant-gated".to_string());
+    let tenant_hash = tenant_id.hash();
+
+    let inner = MemoryStore::new();
+    let mut tokens = Vec::with_capacity(GATED_SEGMENTS);
+    let mut data_keys = HashSet::with_capacity(GATED_SEGMENTS);
+    for seq in 0..GATED_SEGMENTS as u64 {
+        let (token, data_key) = publish_segment(&inner, &tenant_id, tenant_hash, seq).await;
+        tokens.push(token);
+        data_keys.insert(data_key);
+    }
+
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counting = GetCountingStore {
+        inner,
+        data_keys,
+        gets: Arc::clone(&gets),
+    };
+    let fault_store = FaultStore::new(counting, FaultPlan::default());
+    let gate = fault_store.hold(Op::Get, Some("rseg".to_string()), Occurrence::Always);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(fault_store);
+
+    let catalog =
+        Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+    let config = EngineConfig {
+        max_bytes_scanned,
+        fetch_concurrency: GATED_CONCURRENCY,
+        ..Default::default()
+    };
+    let engine = QueryEngine::new(catalog, backend, config);
+    (engine, gate, gets, tokens, tenant_hash)
+}
+
+/// The property the prior tests in this file cannot prove: a tripped budget
+/// cancels fetches that are genuinely still in flight at the moment it trips,
+/// not merely fetches that had not started yet. `GATED_CONCURRENCY` segment
+/// GETs are held open simultaneously by a real hold/release gate before any
+/// of them is allowed to complete; exactly one is then released, which trips
+/// a one-byte budget. The query must return promptly -- proving the engine
+/// did not wait on the other `GATED_CONCURRENCY - 1` held calls, which this
+/// test deliberately never releases. An engine that drained the fan-out
+/// before checking the budget (the pre-fix behavior) would hang on those
+/// held calls forever; the `tokio::time::timeout` below turns that hang into
+/// a clean test failure instead of a stuck CI job. A weaker regression --
+/// per-segment fetches spawned onto independent tasks the stream drop cannot
+/// reach -- would not hang, so the final assertion releases the abandoned
+/// holds and proves that no fetch resumes behind the query's back.
+#[tokio::test]
+async fn bytes_budget_cancels_genuinely_in_flight_concurrent_fetches() {
+    let (engine, gate, gets, tokens, tenant_hash) = setup_gated(ByteLimit::Bounded(1)).await;
+
+    let t_ms = SAMPLE_TS_NS / 1_000_000;
+    let query = tokio::spawn(async move {
+        engine
+            .instant(
+                tenant_hash,
+                METRIC,
+                t_ms,
+                &tokens,
+                SAMPLE_TS_NS,
+                Duration::from_secs(30),
+            )
+            .await
+    });
+
+    // Wait for `GATED_CONCURRENCY` segment GETs to be genuinely in flight
+    // (parked on the gate) at once -- proves the fan-out really did start
+    // several concurrent fetches, not just one.
+    gate.wait_until_held(GATED_CONCURRENCY).await;
+    assert_eq!(
+        gate.held_count(),
+        GATED_CONCURRENCY,
+        "expected exactly {GATED_CONCURRENCY} concurrent segment GETs held"
+    );
+
+    // Release exactly one: its bytes get accounted, tripping the one-byte
+    // budget. The other GATED_CONCURRENCY - 1 held calls are deliberately
+    // never released.
+    let held_ids = gate.held();
+    assert!(gate.release(held_ids[0]), "the held call must still exist");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), query)
+        .await
+        .expect("query must return promptly instead of hanging on the abandoned held GETs")
+        .expect("query task must not panic");
+
+    assert!(
+        matches!(result, Err(QueryError::TooManyBytesScanned { .. })),
+        "expected TooManyBytesScanned, got {result:?}"
+    );
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        1,
+        "only the one released GET should have reached the counting store; the rest were \
+         cancelled while still held, never released, never counted"
+    );
+    assert_eq!(
+        gate.held_count(),
+        GATED_CONCURRENCY - 1,
+        "the other {} held calls remain registered as held (never released) -- the query \
+         returned without them, proving their futures were dropped rather than awaited",
+        GATED_CONCURRENCY - 1
+    );
+
+    // Discriminator: release the abandoned holds now. Real cancellation
+    // dropped their futures, so the release signal lands on a dead receiver
+    // and no GET can ever reach the counting store. An implementation that
+    // merely detached the work (spawning each fetch onto an independent task
+    // the stream drop cannot reach) would resume here and count the rest.
+    for id in gate.held() {
+        gate.release(id);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        1,
+        "releasing the abandoned holds must be a no-op: their futures were dropped, not \
+         merely detached from the stream"
     );
 }
