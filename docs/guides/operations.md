@@ -38,6 +38,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--disable-cache` | | off | Disables the ADR-0046 read cache entirely. Query behavior becomes byte-for-byte identical to a build with no read cache wiring at all. |
 | `--metrics-tenant-labels` | | off | Emits real per-tenant `tenant_hash` labels on the `ravel_admission_*` family at `/metrics` (ADR-0051 section 6) instead of folding every tenant into `tenant_hash="other"`. A deliberate cardinality trade; off by default so `/metrics` cardinality never scales with tenant count unless an operator opts in. See "Admission usage" above. |
 | `--store-probe-interval <duration>` | | `30s` | How often the background store-reachability probe GETs `sys/tenancy` (ADR-0050 section 7), as a humantime duration, jittered. After four consecutive failures `/readyz` returns 503; one success recovers it. See "Store reachability probe and `/readyz`" below. |
+| `--scrub-period <duration>` | | `7d` | Used only in `--mode maintain`. The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime duration. The content-tier scrubber rotates through the whole object corpus once per `P`, so sustained scrub read bandwidth is bounded at `corpus_bytes / P`. A zero or unparseable duration fails startup. See "At-rest integrity scrubber" below. |
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (through
 flag or env) fails at startup with an explicit error that names the missing
@@ -397,6 +398,75 @@ Prune selectivity is `blocks_survived` divided by `blocks_total`. A ratio of
 1.0 means the query pruned no blocks. A lower ratio means POSTINGS did more
 work.
 
+## At-rest integrity scrubber (ADR-0059)
+
+Ravel's checksum hierarchy (whole-object blake3 at write time, footer/section
+crc32c on read) is otherwise verified only when a query happens to touch the
+covered bytes, so bytes nobody queries are never checked. The scrubber
+re-verifies them on a schedule instead. It runs only in `--mode maintain` (the
+one mode that runs background housekeeping over durable objects, independent of
+ingest and query traffic), spawned per process alongside the maintenance loop.
+
+Each tick it re-discovers tenants from storage and, for every `(tenant, signal,
+shard)`, verifies a bounded slice of the shard's committed L0 data objects: a
+footer/section crc re-check plus a whole-object blake3 rehash against the
+recorded content hash. A persisted per-shard cursor
+(`t/<hash>/<sig>/maint/scrub/<shard>.cursor`) advances the slice each tick so a
+full rotation over the corpus completes in about the configured period `P`.
+Detection only: an anomaly is reported, never auto-repaired (there is no
+redundant copy to repair a corrupt segment from, ADR-0058).
+
+### Sizing `--scrub-period`
+
+`P` is the operator-facing budget knob. Because the content tier must read each
+object in full to rehash it, sustained scrub read bandwidth is
+
+```
+sustained scrub read bandwidth = corpus_bytes / P
+```
+
+so a larger corpus or a shorter `P` costs proportionally more read bandwidth,
+and `P` is the worst-case staleness before any given object is re-verified.
+Default `P = 7d`. This is the first scheduled task whose cost scales with data
+volume rather than metadata volume (ADR-0059 consequences): size `P` against
+the corpus the same way `--admission-reconcile-interval` (`R`) is sized, and
+watch `ravel_scrub_cursor_position` (below) to confirm rotations keep pace.
+
+### Metrics
+
+Rendered at `GET /metrics` only in `--mode maintain`. Every sample carries a
+`mode` label and a `signal` label; there is deliberately no `tenant_hash` label
+on this unauthenticated route (ADR-0044 section 4), matching every other
+maintenance family.
+
+- `ravel_scrub_checksum_mismatch_total{signal}` (counter): data objects that
+  failed at-rest integrity re-verification — a whole-object blake3 mismatch
+  against the recorded content hash (bit rot or a partial write), or a
+  footer/section crc failure. Both are data-object corruption, so both land on
+  this one counter.
+- `ravel_scrub_postings_disagreement_total{signal}` (counter): objects whose
+  covering name-postings object omitted a `__name__` the object really carries
+  (S2-09's false negative).
+- `ravel_scrub_cursor_position{signal}` (gauge, `[0,1]`): fraction of the
+  current rotation the content-tier cursor has covered so far.
+
+| Alarm | Rule | Why this rule |
+|---|---|---|
+| Checksum mismatch | `increase(ravel_scrub_checksum_mismatch_total[1h]) > 0` | There is no redundant copy to repair from, so any nonzero increase is at-rest corruption an operator must investigate immediately, not a rate to threshold. |
+| Postings disagreement | `increase(ravel_scrub_postings_disagreement_total[1h]) > 0` | A false negative means a query filtering on that name silently skips matching data; any nonzero increase is a correctness bug to page on. |
+| Scrub falling behind | `ravel_scrub_cursor_position` stuck near 0 across a period longer than `P` | A rotation that never advances means scrubbing is not keeping pace with `P`; the effective staleness bound is no longer `P`. |
+
+### Storage credential impact (ADR-0055)
+
+The scrubber's reads (commit records under `c/`, data objects under `l0/`) are
+already covered by the Maintain role's existing `MaintainRead`/`MaintainList`
+grants. Its one write — the per-shard cursor — is placed under the existing
+`maint/` control prefix (`t/<hash>/<sig>/maint/scrub/<shard>.cursor`), so it
+falls under the Maintain role's existing `t/*/*/maint/*` `PutObject` grant with
+**no new IAM prefix**: ADR-0055's Maintain grants are explicit per-prefix (not a
+blanket `t/*/*/`), and `maint/` is one they already name. No storage-policy
+change is required to enable the scrubber.
+
 ## Storage backend configuration
 
 **MinIO (local development):** see
@@ -474,6 +544,7 @@ metrics, `l` logs, `s` spans). Control objects live at the bucket root under
 | `l1/` | `t/<hash>/<sig>/l1/…` | `t/*/*/l1/*` |
 | `idem/` | `t/<hash>/<sig>/idem/…` | `t/*/*/idem/*` |
 | `maint/<shard>/cursor` | `t/<hash>/<sig>/maint/…` | `t/*/*/maint/*` |
+| `maint/scrub/<shard>.cursor` | `t/<hash>/<sig>/maint/scrub/…` | `t/*/*/maint/*` |
 | `admission/` | `t/<hash>/<sig>/admission/<process_id>.snapshot` | `t/*/*/admission/*` |
 | `prov` | `t/<hash>/<sig>/prov` | `t/*/*/prov` |
 | `catalog/<sig>/…` | `t/<hash>/catalog/<sig>/…` | `t/*/catalog/*/*` |

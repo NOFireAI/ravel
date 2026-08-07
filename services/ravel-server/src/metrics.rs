@@ -1253,6 +1253,97 @@ fn render_maintain_safety_family(
     }
 }
 
+/// One signal's at-rest scrubber counters for one scrape (ADR-0059 decisions
+/// 1, 3; issue #694).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrubSignalSnapshot {
+    pub signal: Signal,
+    /// Objects that failed at-rest integrity re-verification for this signal:
+    /// a whole-object blake3 mismatch against the recorded content hash (bit
+    /// rot / partial write, S2-08) or a footer/section crc failure. Both are
+    /// data-object corruption, so both increment this one counter.
+    pub checksum_mismatch: u64,
+    /// Objects where the covering name-postings object omitted a `__name__`
+    /// the object really carries (S2-09's false negative). Wired but only
+    /// nonzero once covering-postings resolution lands in the scrub task.
+    pub postings_disagreement: u64,
+    /// Fraction of the current rotation the content-tier cursor has covered so
+    /// far for this signal, in `[0.0, 1.0]` (operator visibility into cadence).
+    pub cursor_position: f64,
+}
+
+/// One scrape's at-rest scrubber counters (ADR-0059 decisions 1, 3; issue
+/// #694), per signal. `Some` only in [`Mode::Maintain`], the one mode that runs
+/// the scrubber.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrubSnapshot {
+    pub signals: Vec<ScrubSignalSnapshot>,
+}
+
+/// The at-rest scrubber family (ADR-0059 decision 3, issue #694). Follows
+/// [`render_maintain_safety_family`]'s conventions exactly: per-signal series
+/// under `{mode, signal}` and deliberately no `tenant_hash` label (ADR-0044
+/// section 4 blocks any per-tenant series on this unauthenticated route). The
+/// two anomaly counters carry the same zero-is-not-absence discipline every
+/// other family keeps (a series per maintained signal even at zero), so an
+/// alert can fire on `increase(...) > 0`; `cursor_position` is a gauge.
+fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
+    fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
+        [Label::Mode(mode), Label::Signal(signal)]
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_checksum_mismatch_total",
+        "Data objects that failed at-rest integrity re-verification (whole-object blake3 mismatch \
+         or footer/section crc failure), by signal (ADR-0059). Alert on increase() > 0: there is \
+         no redundant copy to repair from, so any nonzero increase is corruption an operator must \
+         investigate.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_scrub_checksum_mismatch_total",
+            &labels(mode, signal.signal),
+            signal.checksum_mismatch,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_postings_disagreement_total",
+        "Objects whose covering name-postings object omitted a __name__ the object really carries \
+         (S2-09 false negative), by signal (ADR-0059).",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_scrub_postings_disagreement_total",
+            &labels(mode, signal.signal),
+            signal.postings_disagreement,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_cursor_position",
+        "Fraction of the current scrub rotation the content-tier cursor has covered so far, by \
+         signal, in [0,1] (ADR-0059 decision 3). A rotation completes in about the configured \
+         --scrub-period P; a value stuck near 0 means scrubbing is not keeping pace with P.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample_f64(
+            out,
+            "ravel_scrub_cursor_position",
+            &labels(mode, signal.signal),
+            signal.cursor_position,
+        );
+    }
+}
+
 /// The ADR-0046 read caches' counters (issues #445, #502, #553). Two caches
 /// share this one family: the query fetchers' RAM cache (`fetch`) and the
 /// catalog's content-addressed byte cache (`catalog`), told apart by the
@@ -1871,6 +1962,7 @@ pub fn render(
     catalog: &CatalogCountersSnapshot,
     maintain: Option<&MaintenanceDiscoverySnapshot>,
     maintain_safety: Option<&MaintenanceSafetySnapshot>,
+    scrub: Option<&ScrubSnapshot>,
     cache: Option<&CacheMetricsSnapshot>,
     catalog_cache: Option<&CacheMetricsSnapshot>,
     admission: &AdmissionCountersSnapshot,
@@ -1902,6 +1994,9 @@ pub fn render(
     if let Some(snapshot) = maintain_safety {
         render_maintain_safety_family(&mut out, mode, snapshot);
     }
+    if let Some(snapshot) = scrub {
+        render_scrub_family(&mut out, mode, snapshot);
+    }
     if cache.is_some() || catalog_cache.is_some() {
         render_cache_family(&mut out, mode, cache, catalog_cache);
     }
@@ -1928,6 +2023,9 @@ pub struct MetricsState {
     /// `Some` only in [`Mode::Maintain`], alongside `tenant_discovery` above
     /// (ADR-0048 decisions 1, 4, 6; issue #517).
     pub maintenance_safety: Option<Arc<crate::maintain::MaintenanceSafetyMetrics>>,
+    /// `Some` only in [`Mode::Maintain`], alongside `maintenance_safety` above,
+    /// the one mode that spawns the at-rest scrubber (ADR-0059, issue #694).
+    pub scrub: Option<Arc<crate::scrub::ScrubMetrics>>,
     /// The ADR-0046 fetcher cache's counters handle (issues #445, #502), or
     /// `None` when `--disable-cache` leaves no fetcher cache constructed at all.
     /// Rendered under `cache="fetch"`.
@@ -2013,6 +2111,18 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                     .collect(),
             });
 
+    let scrub_snapshot = state.scrub.as_ref().map(|metrics| ScrubSnapshot {
+        signals: crate::maintain::MAINTAINED_SIGNALS
+            .iter()
+            .map(|&signal| ScrubSignalSnapshot {
+                signal,
+                checksum_mismatch: metrics.checksum_mismatch(signal),
+                postings_disagreement: metrics.postings_disagreement(signal),
+                cursor_position: metrics.cursor_position(signal),
+            })
+            .collect(),
+    });
+
     let cache_snapshot = state
         .cache_metrics
         .as_ref()
@@ -2041,6 +2151,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &catalog_snapshot,
         maintain_snapshot.as_ref(),
         maintain_safety_snapshot.as_ref(),
+        scrub_snapshot.as_ref(),
         cache_snapshot.as_ref(),
         catalog_cache_snapshot.as_ref(),
         &admission_snapshot,
@@ -2103,6 +2214,7 @@ mod tests {
             &snapshot,
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2218,6 +2330,7 @@ mod tests {
             &populated_store_snapshot(),
             &ingest,
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2341,6 +2454,7 @@ mod tests {
             &store,
             &ingest,
             &catalog,
+            None,
             None,
             None,
             None,
@@ -2494,6 +2608,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2511,6 +2626,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2568,6 +2684,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2607,6 +2724,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2634,6 +2752,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -2688,6 +2807,7 @@ mod tests {
             Some(&snapshot),
             None,
             None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
         );
@@ -2732,6 +2852,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_includes_scrub_family() {
+        let snapshot = ScrubSnapshot {
+            signals: vec![
+                ScrubSignalSnapshot {
+                    signal: Signal::Metrics,
+                    checksum_mismatch: 2,
+                    postings_disagreement: 1,
+                    cursor_position: 0.5,
+                },
+                ScrubSignalSnapshot {
+                    signal: Signal::Logs,
+                    checksum_mismatch: 0,
+                    postings_disagreement: 0,
+                    cursor_position: 0.0,
+                },
+            ],
+        };
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            Some(&snapshot),
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+        );
+
+        assert!(
+            body.contains(
+                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\"} 2"
+            ),
+            "missing checksum_mismatch sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_scrub_postings_disagreement_total{mode=\"maintain\",signal=\"metrics\"} 1"
+            ),
+            "missing postings_disagreement sample:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_scrub_cursor_position{mode=\"maintain\",signal=\"metrics\"} 0.5"),
+            "missing cursor_position gauge sample:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_scrub_cursor_position gauge"),
+            "cursor_position must carry a gauge TYPE header:\n{body}"
+        );
+        // Zero-valued signal (logs) still renders: zero-is-not-absence.
+        assert!(
+            body.contains(
+                "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+        // No tenant_hash label on this unauthenticated route (ADR-0044 §4).
+        for line in body.lines().filter(|l| l.starts_with("ravel_scrub_")) {
+            assert!(
+                !line.contains("tenant_hash"),
+                "scrub family must never render a tenant_hash label: {line}"
+            );
+        }
+    }
+
+    /// A `None` scrub snapshot (every non-Maintain mode) renders no scrub
+    /// series at all, matching the maintain families' Maintain-only gating.
+    #[test]
+    fn render_omits_scrub_family_when_absent() {
+        let body = render(
+            Mode::Query,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+        );
+        assert!(
+            !body.contains("ravel_scrub_"),
+            "no scrub series should render when the snapshot is absent:\n{body}"
+        );
+    }
+
     /// ADR-0044 section 4's allowlist is closed at the `Label` type (see
     /// `exposition_renders_store_metrics_and_rejects_unlisted_labels`), but
     /// that only proves a label *could* be constructed safely, not that this
@@ -2761,6 +2972,7 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
             None,
             None,
             &AdmissionCountersSnapshot::default(),
@@ -2824,6 +3036,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             Some(&fetch),
@@ -2920,6 +3133,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&catalog),
             &AdmissionCountersSnapshot::default(),
             &[],
@@ -2943,6 +3157,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -3023,6 +3238,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &snapshot,
             &[],
         );
@@ -3084,6 +3300,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,
@@ -3156,6 +3373,7 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
             None,
             None,
             None,

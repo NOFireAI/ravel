@@ -170,6 +170,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         catalog,
         tenant_discovery: None,
         maintenance_safety: None,
+        scrub: None,
         cache_metrics: None,
         catalog_cache_metrics,
         admission: Arc::new(AdmissionController::new(

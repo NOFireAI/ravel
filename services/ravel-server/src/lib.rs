@@ -30,6 +30,7 @@ pub mod qualification;
 pub mod query;
 pub mod query_postings_metrics;
 pub mod remote_write;
+pub mod scrub;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod store;
@@ -212,6 +213,14 @@ pub struct ServerConfig {
     /// configured caps fleet-wide. Not spawned in query/maintain modes, which
     /// serve no ingest admission.
     pub admission_reconcile_interval: Duration,
+    /// The at-rest scrub period `P` (ADR-0059 decision 1), from `--scrub-period`
+    /// (default 7 days). [`start`] spawns one scrub task per process at a
+    /// cadence derived from this, only in [`Mode::Maintain`] (the one mode that
+    /// runs background housekeeping over durable objects); it rotates the
+    /// content-tier integrity check through the whole object corpus once per
+    /// `P`, so sustained scrub read bandwidth is bounded at `corpus_bytes / P`.
+    /// Not spawned in ingest/query modes, whose job is the hot path.
+    pub scrub_period: Duration,
     /// Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
     /// issue #511), resolved from `--indexed-field` / `--indexed-field-tenant`.
     /// [`start`] wraps it in an `Arc` and hands it to the log ingest router,
@@ -258,6 +267,7 @@ pub struct Running {
     jwks_refresh_task: tenant::JwksRefreshTask,
     store_probe_task: store_probe::StoreProbeTask,
     admission_reconcile_task: admission_reconcile::AdmissionReconcileTask,
+    scrub_task: scrub::ScrubTask,
 }
 
 impl Running {
@@ -323,6 +333,7 @@ impl Running {
         self.jwks_refresh_task.shutdown().await;
         self.store_probe_task.shutdown().await;
         self.admission_reconcile_task.shutdown().await;
+        self.scrub_task.shutdown().await;
 
         Ok(())
     }
@@ -596,6 +607,14 @@ pub async fn start(
     let maintenance_safety_metrics = matches!(config.mode, Mode::Maintain)
         .then(|| Arc::new(maintain::MaintenanceSafetyMetrics::default()));
 
+    // Same sharing rationale as `maintenance_safety_metrics` above, for the
+    // at-rest scrubber counters (ADR-0059 decisions 1, 3; issue #694). `Some`
+    // only in Mode::Maintain, the one mode that spawns `scrub::spawn` below and
+    // therefore has scrub anomalies and a cursor position to render. Built here
+    // so both the `/metrics` state and the scrub task share the same instance.
+    let scrub_metrics =
+        matches!(config.mode, Mode::Maintain).then(|| Arc::new(scrub::ScrubMetrics::default()));
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
@@ -609,6 +628,7 @@ pub async fn start(
         catalog: catalog.clone(),
         tenant_discovery: tenant_discovery_metrics.clone(),
         maintenance_safety: maintenance_safety_metrics.clone(),
+        scrub: scrub_metrics.clone(),
         cache_metrics: cache.as_ref().map(|c| c.metrics()),
         catalog_cache_metrics: catalog.byte_cache_metrics(),
         admission: admission.clone(),
@@ -1000,6 +1020,25 @@ pub async fn start(
         admission_reconcile::AdmissionReconcileTask::none()
     };
 
+    // At-rest integrity scrubber (ADR-0059, issue #694): one task per process,
+    // only in Mode::Maintain. Scrubbing is background housekeeping over durable
+    // objects, the same class as compaction/retention/sweep (which lib gates on
+    // Mode::Maintain just above), and independent of ingest/query traffic; its
+    // persisted per-shard cursor also assumes a single writer, which the
+    // Maintain-only gating guarantees. It shares the same store handle and
+    // storage-derived tenant restriction the maintenance loop uses, and the
+    // scrub metrics instance the `/metrics` state above holds.
+    let scrub_task = match (matches!(config.mode, Mode::Maintain), &scrub_metrics) {
+        (true, Some(metrics)) => scrub::spawn(
+            store.clone(),
+            config.fold_tenants.clone(),
+            config.scrub_period,
+            config.shard_count,
+            metrics.clone(),
+        ),
+        _ => scrub::ScrubTask::none(),
+    };
+
     Ok(Running {
         http_addr,
         grpc_addr,
@@ -1019,5 +1058,6 @@ pub async fn start(
         jwks_refresh_task,
         store_probe_task,
         admission_reconcile_task,
+        scrub_task,
     })
 }

@@ -337,6 +337,9 @@ async fn main() -> anyhow::Result<()> {
         admission_reconcile_interval: cli
             .parse_admission_reconcile_interval()
             .context("failed to parse --admission-reconcile-interval")?,
+        scrub_period: cli
+            .parse_scrub_period()
+            .context("failed to parse --scrub-period")?,
         indexed_fields,
         disable_cache: cli.disable_cache,
         cache_max_bytes: cli.cache_max_bytes,
