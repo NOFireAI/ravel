@@ -46,6 +46,7 @@ ravel-ingest = { path = "crates/ravel-ingest", version = "0.1.0" }
 ravel-promql = { path = "crates/ravel-promql", version = "0.1.0" }
 ravel-query = { path = "crates/ravel-query", version = "0.1.0" }
 ravel-analytics = { path = "crates/ravel-analytics", version = "0.1.0" }
+ravel-tracing-export = { path = "crates/ravel-tracing-export", version = "0.1.0" }
 
 # async runtime / rpc / http
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
@@ -128,6 +129,15 @@ humantime = "2"
 # observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Query-path OTLP trace export (ADR-0060), used only by ravel-tracing-export.
+# Both pin the 0.32 line already fixed by opentelemetry-proto's transitive
+# opentelemetry 0.32.0 / opentelemetry_sdk 0.32.1. opentelemetry-otlp uses the
+# `grpc-tonic` transport so it reuses the workspace's tonic 0.14 rather than
+# pulling a second HTTP client stack (ADR-0060 decision 1, rejected
+# alternative 4). tracing-opentelemetry 0.33 is the release that targets
+# opentelemetry 0.32.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
 
 # kubernetes operator (services/ravel-operator, ADR-0034). These four are the
 # only new external dependencies the operator introduces. kube pulls in the

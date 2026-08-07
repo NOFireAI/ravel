@@ -71,6 +71,11 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Query-path OTLP trace export (ADR-0060). Owns the subscriber construction
+# `main` installs; with no --otlp-trace-endpoint it builds today's bare fmt
+# subscriber, so the default build's behavior and runtime dependency footprint
+# are unchanged.
+ravel-tracing-export = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }

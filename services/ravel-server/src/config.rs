@@ -391,6 +391,15 @@ pub struct Cli {
     /// `store_probe::DEFAULT_STORE_PROBE_INTERVAL` (30s).
     #[arg(long, value_name = "DURATION")]
     pub store_probe_interval: Option<String>,
+
+    /// OTLP/gRPC endpoint this process exports its own query-path `tracing`
+    /// spans to (ADR-0060). Absent by default: with no endpoint the subscriber
+    /// is byte-identical to before, spans stay on the local log stream only.
+    /// Set it to a collector URL (e.g. `http://otel-collector:4317`) to also
+    /// ship every span the `RUST_LOG` filter already admits, best-effort and
+    /// never blocking a query (ADR-0060 decisions 3 and 6).
+    #[arg(long = "otlp-trace-endpoint", value_name = "URL")]
+    pub otlp_trace_endpoint: Option<String>,
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
