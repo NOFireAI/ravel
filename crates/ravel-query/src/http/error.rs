@@ -99,7 +99,8 @@ impl From<QueryError> for ApiError {
             QueryError::Unsupported { .. } => ApiError::Unsupported(e.to_string()),
             QueryError::TooManySegments { .. }
             | QueryError::TooManySeries { .. }
-            | QueryError::TooManySamples { .. } => ApiError::Unsupported(e.to_string()),
+            | QueryError::TooManySamples { .. }
+            | QueryError::TooManyBytesScanned { .. } => ApiError::Unsupported(e.to_string()),
             // An over-wide window refused before any LIST (issue #635) is a
             // resource-budget rejection, grouped with the budget classes above
             // under the same 422 "execution" mapping. Its text carries only the
@@ -587,6 +588,10 @@ mod tests {
             || QueryError::TooManySegments { count: 9, max: 3 },
             || QueryError::TooManySeries { count: 9, max: 3 },
             || QueryError::TooManySamples { count: 9, max: 3 },
+            || QueryError::TooManyBytesScanned {
+                scanned: 9_000,
+                max: 3_000,
+            },
             || QueryError::DeadlineExceeded {
                 deadline: Duration::from_secs(1),
             },

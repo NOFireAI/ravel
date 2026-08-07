@@ -35,6 +35,8 @@ pub enum QueryError {
     TooManySeries { count: usize, max: usize },
     #[error("query matched {count} samples, exceeding the limit of {max}")]
     TooManySamples { count: usize, max: usize },
+    #[error("query scanned {scanned} bytes, exceeding the budget of {max}")]
+    TooManyBytesScanned { scanned: u64, max: u64 },
     #[error("query exceeded its deadline of {deadline:?}")]
     DeadlineExceeded { deadline: Duration },
     #[error("snapshot invalidated by a concurrent GC/compaction; retry also failed")]

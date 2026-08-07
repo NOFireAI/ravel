@@ -22,7 +22,7 @@ use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
 };
 
-use crate::config::EngineConfig;
+use crate::config::{ByteLimit, EngineConfig};
 use crate::error::QueryError;
 use crate::fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
@@ -513,12 +513,15 @@ impl QueryEngine {
             let fetched = self
                 .fetch_all_series(tenant_hash, &snapshot, matchers, &accounting)
                 .await?;
+            let bytes_scanned = accounting.snapshot().total_s3_bytes();
             let by_id = build_series_by_id(
                 fetched
                     .into_iter()
                     .flatten()
                     .map(|entry| (entry.series_id, entry.labels)),
                 self.config.max_series,
+                bytes_scanned,
+                self.config.max_bytes_scanned,
             )?;
             Ok((by_id.into_iter().collect(), FetchStats::default()))
         };
@@ -579,6 +582,7 @@ impl QueryEngine {
         let name_filter = shared_equality_name_filter(plans);
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
+        let max_bytes_scanned = self.config.max_bytes_scanned;
         let concurrency = self.config.fetch_concurrency.max(1);
         // One independent fetch per selector against the same snapshot
         // (below): an N-selector query re-opens every snapshot segment up to
@@ -614,9 +618,25 @@ impl QueryEngine {
                                 accounting,
                             )
                             .await?;
-                        let scalar = merge_soa_runs(scalar_fetched, max_series, max_samples)?;
-                        let histograms =
-                            merge_histogram_soa_runs(hist_fetched, max_series, max_samples)?;
+                        // Total S3 bytes charged to this query so far, across
+                        // every selector's concurrent fetch into the shared
+                        // accounting handle: the byte budget bounds the whole
+                        // query's scan, not one selector's.
+                        let bytes_scanned = accounting.snapshot().total_s3_bytes();
+                        let scalar = merge_soa_runs(
+                            scalar_fetched,
+                            max_series,
+                            max_samples,
+                            bytes_scanned,
+                            max_bytes_scanned,
+                        )?;
+                        let histograms = merge_histogram_soa_runs(
+                            hist_fetched,
+                            max_series,
+                            max_samples,
+                            bytes_scanned,
+                            max_bytes_scanned,
+                        )?;
                         Ok::<PerPlan, QueryError>((scalar, histograms, page_stats))
                     }
                 })
@@ -901,16 +921,29 @@ impl QueryEngine {
 fn build_series_by_id(
     entries: impl IntoIterator<Item = (SeriesId, LabelSet)>,
     max_series: usize,
-) -> Result<HashMap<SeriesId, LabelSet>, SeriesCapExceeded> {
+    bytes_scanned: u64,
+    max_bytes_scanned: ByteLimit,
+) -> Result<HashMap<SeriesId, LabelSet>, SeriesBuildError> {
     let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();
     for (series_id, series_labels) in entries {
         if !by_id.contains_key(&series_id) && by_id.len() >= max_series {
-            return Err(SeriesCapExceeded {
+            return Err(SeriesBuildError::TooManySeries(SeriesCapExceeded {
                 by_id,
                 max: max_series,
-            });
+            }));
         }
         by_id.entry(series_id).or_insert(series_labels);
+        // Bytes-scanned budget (ADR-0061 decision 1), after the count cap
+        // above: the covering segments' S3 bytes are already accounted by the
+        // time this map build runs, so a bounded budget trips here and
+        // cancels the query with a typed, distinguishable error. Same release
+        // shape as the count cap: `return` drops the partial `by_id` map.
+        if max_bytes_scanned.is_exceeded_by(bytes_scanned) {
+            return Err(SeriesBuildError::too_many_bytes(
+                bytes_scanned,
+                max_bytes_scanned,
+            ));
+        }
     }
     Ok(by_id)
 }
@@ -924,12 +957,66 @@ struct SeriesCapExceeded {
     max: usize,
 }
 
+/// Why [`build_series_by_id`] stopped early: either the incremental
+/// `max_series` count cap or the per-tenant bytes-scanned budget
+/// (ADR-0061 decision 1). Two variants rather than one so a caller (or a
+/// metric label) can tell a count-cap trip apart from a byte-budget trip,
+/// the same distinction the [`QueryError`] variants preserve.
+#[derive(Debug)]
+enum SeriesBuildError {
+    TooManySeries(SeriesCapExceeded),
+    TooManyBytesScanned { scanned: u64, max: u64 },
+}
+
+impl SeriesBuildError {
+    /// Builds the byte-budget variant from the tripped snapshot and cap. Only
+    /// called under a [`ByteLimit::Bounded`] that `bytes_scanned` has already
+    /// passed; `Unlimited` reduces the cap to `u64::MAX`, which the caller's
+    /// [`ByteLimit::is_exceeded_by`] guard never reaches.
+    fn too_many_bytes(bytes_scanned: u64, max_bytes_scanned: ByteLimit) -> Self {
+        let max = match max_bytes_scanned {
+            ByteLimit::Bounded(max) => max,
+            ByteLimit::Unlimited => u64::MAX,
+        };
+        SeriesBuildError::TooManyBytesScanned {
+            scanned: bytes_scanned,
+            max,
+        }
+    }
+}
+
 impl From<SeriesCapExceeded> for QueryError {
     fn from(e: SeriesCapExceeded) -> Self {
         QueryError::TooManySeries {
             count: e.by_id.len() + 1,
             max: e.max,
         }
+    }
+}
+
+impl From<SeriesBuildError> for QueryError {
+    fn from(e: SeriesBuildError) -> Self {
+        match e {
+            SeriesBuildError::TooManySeries(inner) => inner.into(),
+            SeriesBuildError::TooManyBytesScanned { scanned, max } => {
+                QueryError::TooManyBytesScanned { scanned, max }
+            }
+        }
+    }
+}
+
+/// Returns the bytes-scanned budget error (ADR-0061 decision 1) when
+/// `bytes_scanned` has passed a bounded `max_bytes_scanned`, else `None`.
+/// Checked once per completed segment fetch inside each merge loop, the same
+/// granularity every existing count cap already accepts; [`ByteLimit::Unlimited`]
+/// never trips, so a caller that does not opt in behaves exactly as before.
+fn bytes_scanned_exceeded(bytes_scanned: u64, max_bytes_scanned: ByteLimit) -> Option<QueryError> {
+    match max_bytes_scanned {
+        ByteLimit::Bounded(max) if bytes_scanned > max => Some(QueryError::TooManyBytesScanned {
+            scanned: bytes_scanned,
+            max,
+        }),
+        _ => None,
     }
 }
 
@@ -1195,6 +1282,8 @@ fn merge_soa_runs(
     fetched: Vec<Vec<FetchedSeriesSoa>>,
     max_series: usize,
     max_samples: usize,
+    bytes_scanned: u64,
+    max_bytes_scanned: ByteLimit,
 ) -> Result<Vec<SeriesData>, QueryError> {
     let mut by_series: HashMap<SeriesId, (LabelSet, Vec<SeriesRun>)> = HashMap::new();
     for segment_series in fetched {
@@ -1213,6 +1302,13 @@ fn merge_soa_runs(
                 values: fs.values,
                 prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
             });
+        }
+        // Bytes-scanned budget (ADR-0061 decision 1), after the per-segment
+        // count cap above: same `return`-drops-`by_series` release shape as
+        // the `max_series` check, on the tenant's `max_bytes_scanned` instead
+        // of a count.
+        if let Some(err) = bytes_scanned_exceeded(bytes_scanned, max_bytes_scanned) {
+            return Err(err);
         }
     }
 
@@ -1573,6 +1669,8 @@ fn merge_histogram_soa_runs(
     fetched: Vec<Vec<FetchedHistogramSeries>>,
     max_series: usize,
     max_samples: usize,
+    bytes_scanned: u64,
+    max_bytes_scanned: ByteLimit,
 ) -> Result<Vec<HistogramSeriesData>, QueryError> {
     let mut by_series: HashMap<SeriesId, (LabelSet, Vec<HistogramSeriesRun>)> = HashMap::new();
     for segment_series in fetched {
@@ -1591,6 +1689,12 @@ fn merge_histogram_soa_runs(
                 values: fs.values,
                 prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
             });
+        }
+        // Bytes-scanned budget (ADR-0061 decision 1), enforced exactly as on
+        // the scalar path in `merge_soa_runs`: same per-segment granularity,
+        // same `return`-drops-`by_series` release shape.
+        if let Some(err) = bytes_scanned_exceeded(bytes_scanned, max_bytes_scanned) {
+            return Err(err);
         }
     }
 
@@ -1712,7 +1816,7 @@ mod merge_tests {
 
     /// Merges with generous budgets and returns the per-series output.
     fn merge(segments: Vec<Vec<FetchedSeriesSoa>>) -> Vec<SeriesData> {
-        merge_soa_runs(segments, 10_000, usize::MAX).expect("merge")
+        merge_soa_runs(segments, 10_000, usize::MAX, 0, ByteLimit::Unlimited).expect("merge")
     }
 
     /// Merges a single-series, single-timestamp scenario and returns the raw
@@ -1836,7 +1940,7 @@ mod merge_tests {
         // Three distinct samples, budget of 2: the merge must error on the
         // third yielded sample, reporting count = max + 1 exactly.
         let seg = vec![vec![run(1, &[1, 2, 3], &[1.0, 2.0, 3.0], 0, 0, 0)]];
-        let err = merge_soa_runs(seg, 10_000, 2).expect_err("over budget");
+        let err = merge_soa_runs(seg, 10_000, 2, 0, ByteLimit::Unlimited).expect_err("over budget");
         match err {
             QueryError::TooManySamples { count, max } => {
                 assert_eq!(count, 3);
@@ -1853,7 +1957,8 @@ mod merge_tests {
         // three. A count-materialized budget would have seen six.
         let a = run(1, &[1, 2, 3], &[1.0, 2.0, 3.0], 1, 0, 0);
         let b = run(1, &[1, 2, 3], &[9.0, 9.0, 9.0], 2, 0, 0);
-        let out = merge_soa_runs(vec![vec![a], vec![b]], 10_000, 3).expect("within budget");
+        let out = merge_soa_runs(vec![vec![a], vec![b]], 10_000, 3, 0, ByteLimit::Unlimited)
+            .expect("within budget");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].samples.len(), 3);
     }
@@ -1864,9 +1969,16 @@ mod merge_tests {
         // identical because it counts yielded, not iteration order.
         let a = run(1, &[1, 3], &[1.0, 3.0], 0, 0, 0);
         let b = run(1, &[2, 4], &[2.0, 4.0], 0, 0, 0);
-        let e1 = merge_soa_runs(vec![vec![a.clone()], vec![b.clone()]], 10_000, 3)
+        let e1 = merge_soa_runs(
+            vec![vec![a.clone()], vec![b.clone()]],
+            10_000,
+            3,
+            0,
+            ByteLimit::Unlimited,
+        )
+        .expect_err("over budget");
+        let e2 = merge_soa_runs(vec![vec![b], vec![a]], 10_000, 3, 0, ByteLimit::Unlimited)
             .expect_err("over budget");
-        let e2 = merge_soa_runs(vec![vec![b], vec![a]], 10_000, 3).expect_err("over budget");
         let count = |e: &QueryError| match e {
             QueryError::TooManySamples { count, .. } => *count,
             other => panic!("expected TooManySamples, got {other:?}"),
@@ -1881,7 +1993,8 @@ mod merge_tests {
             run(1, &[1], &[1.0], 0, 0, 0),
             run(2, &[1], &[1.0], 0, 0, 0),
         ]];
-        let err = merge_soa_runs(seg, 1, usize::MAX).expect_err("too many series");
+        let err = merge_soa_runs(seg, 1, usize::MAX, 0, ByteLimit::Unlimited)
+            .expect_err("too many series");
         match err {
             QueryError::TooManySeries { count, max } => {
                 assert_eq!(count, 2);
@@ -1889,6 +2002,95 @@ mod merge_tests {
             }
             other => panic!("expected TooManySeries, got {other:?}"),
         }
+    }
+
+    /// Acceptance test for issue #721 / ADR-0061 decision 1: a query whose
+    /// covering segments' fetched bytes exceed the tenant's
+    /// `max_bytes_scanned` is cancelled with the new typed error, even though
+    /// `max_series` and `max_samples` are both `usize::MAX` here so neither
+    /// count cap could trip first.
+    #[test]
+    fn bytes_scanned_budget_trips_and_releases() {
+        // Two series, three samples total: trivially small by count, so the
+        // count caps never fire. Only the bytes-scanned budget can reject it.
+        let seg = || {
+            vec![vec![
+                run(1, &[1, 2], &[1.0, 2.0], 0, 0, 0),
+                run(2, &[3], &[3.0], 0, 0, 0),
+            ]]
+        };
+        // The covering segments' accounted S3 bytes (16 KiB) exceed the 4 KiB
+        // budget.
+        let scanned = 16 * 1024;
+        let err = merge_soa_runs(
+            seg(),
+            usize::MAX,
+            usize::MAX,
+            scanned,
+            ByteLimit::Bounded(4 * 1024),
+        )
+        .expect_err("bytes-scanned budget must trip");
+        // Distinguishable typed error, never TooManySeries/TooManySamples: a
+        // caller or a metric label can tell a cost cancellation apart from a
+        // count-cap trip.
+        match err {
+            QueryError::TooManyBytesScanned { scanned: got, max } => {
+                assert_eq!(got, scanned);
+                assert_eq!(max, 4 * 1024);
+            }
+            other => panic!("expected TooManyBytesScanned, got {other:?}"),
+        }
+
+        // Release shape identical to the count-cap trip proven by
+        // `max_series_enforced`: the merge returns `Err` through the same
+        // early `return`, dropping the partial `by_series` map and every
+        // `SeriesRun` it holds instead of materializing them into a returned
+        // `Vec<SeriesData>`. An unbounded budget over the identical input
+        // produces the two series the trip suppressed, showing the input was
+        // otherwise fully mergeable and only the budget stopped it.
+        let ok = merge_soa_runs(seg(), usize::MAX, usize::MAX, scanned, ByteLimit::Unlimited)
+            .expect("unlimited budget must not trip");
+        assert_eq!(
+            ok.len(),
+            2,
+            "the series the byte-budget trip suppressed are produced when unbounded"
+        );
+    }
+
+    /// No-regression companion to `bytes_scanned_budget_trips_and_releases`:
+    /// a caller that does not opt in (`Unlimited`), or one whose bound sits
+    /// far above the scan, gets byte-for-byte the pre-ADR-0061 behavior.
+    #[test]
+    fn bytes_scanned_unlimited_matches_prior_behavior() {
+        let seg = || {
+            vec![vec![
+                run(1, &[1, 2], &[1.0, 2.0], 0, 0, 0),
+                run(2, &[3], &[3.0], 0, 0, 0),
+            ]]
+        };
+        let scanned = 1_000_000;
+        let unlimited =
+            merge_soa_runs(seg(), usize::MAX, usize::MAX, scanned, ByteLimit::Unlimited)
+                .expect("unlimited never trips");
+        let generous = merge_soa_runs(
+            seg(),
+            usize::MAX,
+            usize::MAX,
+            scanned,
+            ByteLimit::Bounded(u64::MAX),
+        )
+        .expect("a budget above the scan never trips");
+        let sample_lens = |v: &[SeriesData]| {
+            let mut l: Vec<usize> = v.iter().map(|s| s.samples.len()).collect();
+            l.sort_unstable();
+            l
+        };
+        assert_eq!(sample_lens(&unlimited), vec![1, 2]);
+        assert_eq!(
+            sample_lens(&unlimited),
+            sample_lens(&generous),
+            "Unlimited and an above-the-scan bound must merge identically"
+        );
     }
 
     #[test]
@@ -1900,8 +2102,14 @@ mod merge_tests {
         // instead of surfacing the corruption.
         let a = run(1, &[5, 3], &[50.0, 30.0], 100, 0, 0);
         let b = run(1, &[3], &[99.0], 1, 0, 0);
-        let err = merge_soa_runs(vec![vec![a], vec![b]], 10_000, usize::MAX)
-            .expect_err("non-ascending run must error, not emit reordered data");
+        let err = merge_soa_runs(
+            vec![vec![a], vec![b]],
+            10_000,
+            usize::MAX,
+            0,
+            ByteLimit::Unlimited,
+        )
+        .expect_err("non-ascending run must error, not emit reordered data");
         match err {
             QueryError::NonMonotonicSamples { prev, next } => {
                 assert_eq!(prev, 5);
@@ -2003,7 +2211,14 @@ mod merge_tests {
     /// result to the same label-keyed `(ts, value.to_bits())` shape as
     /// [`oracle`], for a bit-exact, order-independent comparison.
     fn production_map(segments: &[Vec<FetchedSeriesSoa>]) -> HashMap<LabelSet, Vec<(i64, u64)>> {
-        let out = merge_soa_runs(segments.to_vec(), usize::MAX, usize::MAX).expect("merge");
+        let out = merge_soa_runs(
+            segments.to_vec(),
+            usize::MAX,
+            usize::MAX,
+            0,
+            ByteLimit::Unlimited,
+        )
+        .expect("merge");
         out.into_iter()
             .map(|s| {
                 let samples = s
@@ -2210,15 +2425,20 @@ mod tests {
         // rejecting. Asserting on the partial map itself (not just the
         // error's `count` field) proves construction actually stopped at
         // the cap instead of merely reporting a small number afterward.
-        let err = build_series_by_id(series_ids(10_000), 3).expect_err("cap exceeded");
+        let err = build_series_by_id(series_ids(10_000), 3, 0, ByteLimit::Unlimited)
+            .expect_err("cap exceeded");
+        let cap = match err {
+            SeriesBuildError::TooManySeries(cap) => cap,
+            other => panic!("expected TooManySeries, got {other:?}"),
+        };
         assert_eq!(
-            err.by_id.len(),
+            cap.by_id.len(),
             3,
             "map must never grow past max_series before rejecting"
         );
-        assert_eq!(err.max, 3);
+        assert_eq!(cap.max, 3);
 
-        let query_err: QueryError = err.into();
+        let query_err: QueryError = SeriesBuildError::TooManySeries(cap).into();
         match query_err {
             QueryError::TooManySeries { count, max } => {
                 assert_eq!(count, 4);
@@ -2230,8 +2450,27 @@ mod tests {
 
     #[test]
     fn max_series_exactly_at_cap_succeeds() {
-        let by_id = build_series_by_id(series_ids(3), 3).expect("exactly at cap must succeed");
+        let by_id = build_series_by_id(series_ids(3), 3, 0, ByteLimit::Unlimited)
+            .expect("exactly at cap must succeed");
         assert_eq!(by_id.len(), 3);
+    }
+
+    #[test]
+    fn bytes_scanned_budget_trips_build_series_by_id() {
+        // max_series set high enough it never trips; the byte budget is what
+        // rejects. Proves the two caps are independently enforced on the
+        // labels/series path, and that the byte trip surfaces its own typed,
+        // distinguishable error rather than a TooManySeries.
+        let scanned = 4_096;
+        let err = build_series_by_id(series_ids(2), 10_000, scanned, ByteLimit::Bounded(1_000))
+            .expect_err("bytes-scanned budget must trip");
+        match err {
+            SeriesBuildError::TooManyBytesScanned { scanned: got, max } => {
+                assert_eq!(got, scanned);
+                assert_eq!(max, 1_000);
+            }
+            other => panic!("expected TooManyBytesScanned, got {other:?}"),
+        }
     }
 }
 
@@ -2543,7 +2782,8 @@ mod histogram_source_tests {
 
     fn source(segments: Vec<Vec<FetchedHistogramSeries>>) -> MergedSource {
         let histogram_series =
-            merge_histogram_soa_runs(segments, 10_000, usize::MAX).expect("merge");
+            merge_histogram_soa_runs(segments, 10_000, usize::MAX, 0, ByteLimit::Unlimited)
+                .expect("merge");
         MergedSource {
             series: Vec::new(),
             histogram_series,

@@ -11,8 +11,8 @@ pub mod http;
 mod log_fetcher;
 
 pub use config::{
-    DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SAMPLES, DEFAULT_MAX_SEGMENTS,
-    DEFAULT_MAX_SERIES, EngineConfig,
+    ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SAMPLES,
+    DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig,
 };
 pub use engine::{QueryEngine, QueryStats};
 pub use error::QueryError;
