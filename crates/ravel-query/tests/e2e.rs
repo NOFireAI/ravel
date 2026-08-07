@@ -12,18 +12,22 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
-use ravel_catalog::{Catalog, CatalogConfig};
+use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_query::http::{AppState, StaticBearerTokenResolver, router};
-use ravel_query::{EngineConfig, QueryEngine};
+use ravel_query::{EngineConfig, LogQuery, LogSegmentFetcher, QueryEngine};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment};
+use ravel_types::accounting::QueryAccounting;
+use ravel_types::logstream::log_stream_id;
 use ravel_types::{CommitToken, Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -272,9 +276,18 @@ async fn instant_query_returns_expected_value() {
 struct CapturedSpan {
     name: String,
     tenant_hash: Option<String>,
+    /// Present on the logs read path's `page_fetch`/`decode` spans (`"logs"`),
+    /// absent on the metric path's, whose spans carry no `signal` field. Lets a
+    /// logs-signal assertion isolate its own spans from the metric path's, which
+    /// reuses the same two span names (issue #720).
+    signal: Option<String>,
     s3_requests: Option<u64>,
     s3_bytes: Option<u64>,
     decompressed_bytes: Option<u64>,
+    /// The logs `decode` span's block-scan counts (issue #720). The metric
+    /// `decode` span records `decompressed_bytes` here instead.
+    blocks_scanned: Option<u64>,
+    blocks_total: Option<u64>,
 }
 
 /// Visits a span's fields, capturing only the ones the phase-span assertions
@@ -289,7 +302,17 @@ impl tracing::field::Visit for SpanFieldVisitor<'_> {
             "s3_requests" => self.0.s3_requests = Some(value),
             "s3_bytes" => self.0.s3_bytes = Some(value),
             "decompressed_bytes" => self.0.decompressed_bytes = Some(value),
+            // The logs `decode` span records these as `u32`; `tracing` widens a
+            // `u32` field value to `record_u64` (issue #720).
+            "blocks_scanned" => self.0.blocks_scanned = Some(value),
+            "blocks_total" => self.0.blocks_total = Some(value),
             _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "signal" {
+            self.0.signal = Some(value.to_string());
         }
     }
 
@@ -453,6 +476,147 @@ async fn instant_query_emits_all_six_phase_spans() {
         assert!(
             names.iter().any(|n| n == span_name),
             "expected the `{span_name}` phase span to fire on an instant query; captured spans: {names:?}"
+        );
+    }
+}
+
+/// Writes a small single-stream RLOG object (12 records) onto a fresh
+/// `MemoryStore` and returns it with a matching L0 `SegmentRef`, mirroring the
+/// recipe `cache_correctness.rs` uses. The `decode`-span test below scans it
+/// through `LogSegmentFetcher::fetch_accounted` and asserts the logs `decode`
+/// span records real block-scan counts (issue #720).
+async fn write_log_segment_for_span_test() -> (Arc<MemoryStore>, SegmentRef) {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("logs-span-test".to_string()),
+    )];
+    let stream_id = log_stream_id(&resource, "scope", "1.0", &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+    let records: Vec<LogRecord> = (0..12)
+        .map(|i| LogRecord {
+            stream_id,
+            stream_attrs: stream_attrs.clone(),
+            ts_ns: i,
+            observed_ts_ns: i,
+            severity_num: 9,
+            severity_text: "INFO".to_string(),
+            body: format!("line {i}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .collect();
+
+    let identity = ObjectIdentity {
+        tenant_hash: [21u8; 16],
+        shard: 0,
+        writer_id: [22u8; 16],
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for record in &records {
+        writer.push(record.clone()).expect("push record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+    let size = bytes.len() as u64;
+
+    let store = Arc::new(MemoryStore::new());
+    let key = "test/logs-decode-span-segment.rlog";
+    store
+        .put(key, Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put log segment object");
+
+    let seg_ref = SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: size,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: 11,
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [19u8; 32],
+        writer_id: Uuid::from_u128(6),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+    };
+    (store, seg_ref)
+}
+
+/// Issue #720: the logs read path's `decode` span must record a real, non-empty
+/// count field. Before this fix it carried only `signal = "logs"` and zero count
+/// fields, unlike every other phase span. It now records `blocks_scanned` and
+/// `blocks_total` from the reader's `ScanStats` (a decompressed-byte count is not
+/// cheaply available on this path; see `log_fetcher.rs` and
+/// docs/guides/tracing.md). This scans a real RLOG object through
+/// `LogSegmentFetcher::fetch_accounted` and asserts the logs-signal `decode`
+/// span captured non-empty block counts.
+#[tokio::test]
+async fn logs_decode_span_records_block_scan_counts() {
+    let collector = install_span_collector();
+
+    let (store, seg_ref) = write_log_segment_for_span_test().await;
+    let fetcher = LogSegmentFetcher::new(store);
+    let query = LogQuery::new(0, 11);
+    let accounting = QueryAccounting::new();
+
+    let out = fetcher
+        .fetch_accounted(&seg_ref, &query, &accounting)
+        .await
+        .expect("fetch_accounted")
+        .expect("segment overlaps the query range");
+    assert_eq!(out.records.len(), 12, "all 12 records fall in range");
+    // The reader scanned the object's sole block; it is the source of the span's
+    // recorded counts.
+    assert!(out.stats.blocks_total >= 1, "object has at least one block");
+    assert!(
+        out.stats.blocks_scanned >= 1,
+        "at least one block was scanned"
+    );
+
+    // Isolate this scan's logs `decode` span from any sibling metric-path
+    // `decode` span in the shared global collector: only the logs path sets
+    // `signal = "logs"` and records the block counts.
+    let logs_decode: Vec<CapturedSpan> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| s.name == "decode" && s.signal.as_deref() == Some("logs"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        !logs_decode.is_empty(),
+        "expected a logs-signal `decode` span to fire; captured decode spans: {:?}",
+        collector
+            .completed
+            .lock()
+            .expect("completed lock")
+            .iter()
+            .filter(|s| s.name == "decode")
+            .collect::<Vec<_>>()
+    );
+    for span in &logs_decode {
+        let scanned = span
+            .blocks_scanned
+            .expect("logs decode span records blocks_scanned");
+        let total = span
+            .blocks_total
+            .expect("logs decode span records blocks_total");
+        assert!(
+            total >= 1 && scanned >= 1,
+            "logs decode span must record non-empty block counts, got \
+             blocks_scanned={scanned} blocks_total={total}"
+        );
+        // The metric path's `decode` field must not leak onto the logs span.
+        assert!(
+            span.decompressed_bytes.is_none(),
+            "logs decode span carries no decompressed_bytes field"
         );
     }
 }
