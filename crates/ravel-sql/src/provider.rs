@@ -125,6 +125,7 @@ impl RavelTableProvider {
             matchers,
             series_ids,
             self.config.engine.max_series,
+            self.config.engine.max_bytes_scanned,
             self.accounting.clone(),
         )?);
         let scan_schema = scan.schema();

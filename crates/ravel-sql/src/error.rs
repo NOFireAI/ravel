@@ -169,6 +169,18 @@ pub enum SqlError {
     #[error("query matches too many series: {count} exceeds max {max}")]
     TooManySeries { count: usize, max: usize },
 
+    /// The per-tenant bytes-scanned budget was exhausted mid-scan while a
+    /// partition was still fetching segments (ADR-0061 decision 1, issue
+    /// #722). Distinct from [`SqlError::ResourcesExhausted`]: that bounds the
+    /// query's decoded-memory pool, this bounds total S3 bytes scanned, a
+    /// different resource, and the ADR requires the two stay distinguishable.
+    /// Mirrors `ravel_query::QueryError::TooManyBytesScanned` so both query
+    /// languages surface the same trip the same way. `scanned` and `max` are
+    /// byte counts an operator needs, no server state, so it is echoed
+    /// verbatim like the other budget errors.
+    #[error("query scanned too many bytes: {scanned} exceeds max {max}")]
+    TooManyBytesScanned { scanned: u64, max: u64 },
+
     /// The per-query or per-tenant byte budget was exhausted. The detail is
     /// the pool's own message (byte counts and limits only).
     #[error("query memory budget exhausted: {0}")]
@@ -226,6 +238,7 @@ impl SqlError {
             SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
             | SqlError::TooManySeries { .. }
+            | SqlError::TooManyBytesScanned { .. }
             | SqlError::ResourcesExhausted(_)
             | SqlError::Plan(_)
             | SqlError::Execution(_)
@@ -272,6 +285,7 @@ impl SqlError {
             | SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
             | SqlError::TooManySeries { .. }
+            | SqlError::TooManyBytesScanned { .. }
             | SqlError::ResourcesExhausted(_) => self.to_string(),
             SqlError::Plan(_) => MSG_PLAN.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
