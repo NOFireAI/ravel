@@ -214,10 +214,14 @@ other object.
 **Observability and faults.** `InstrumentedStore` passes `put_multipart`
 through uncounted: a multipart upload is a handle, not a call, and no `StoreOp`
 describes its parts. `put()`'s own above-threshold multipart path is counted,
-as one `put`, because that is what the caller invoked. `FaultStore` likewise
-passes through: multipart operations are not fault sites today, so no fault
-test can be built on one (like reordered completion). Both gaps are
-observability/testing gaps, not correctness ones.
+as one `put`, because that is what the caller invoked. `FaultStore` carries no
+scripted (`Rule`/`Sequence`) fault on a multipart part, but part completions
+are hold sites for its test-only completion-ordering gate (ADR-0059 decision
+5): `complete()` can hold each submitted part until a `GateHandle` releases it,
+so a test can drive parts completing out of submission order and confirm the
+assembled object stays byte-correct. The scripted-fault gap is an
+observability/testing gap, not a correctness one, and no production path
+depends on part completion order.
 
 ### Upload checksums (best effort, never startup-gating)
 
@@ -349,9 +353,16 @@ already holds production data.
    snapshot-pinning caller must abort), `NotFound` blips, transient/permanent
    errors. Every fault site counted; plans scriptable per-operation-index and
    per-key-pattern, and as ordered per-key sequences (a distinct outcome on
-   each successive matching call). Reordered completion is deliberately NOT
-   implemented: it is an aspiration recorded in the fault module docs, not an
-   injectable fault, so no reordering test can be built on this store today.
+   each successive matching call). Completion ordering is controlled by a
+   separate, test-only hold-and-release primitive (ADR-0059 decision 5), not by
+   the scripted fault plan: `FaultStore::hold` registers a gate that matches a
+   call the same way a rule does (`op` + key substring + occurrence) and blocks
+   the matching call inside the store until a `GateHandle` releases that
+   specific held call. It controls *when* a concurrently in-flight call's result
+   becomes visible to its caller, composing with rather than replacing a
+   scripted fault. This is a test primitive on the wrapper, not a general store
+   capability, and its existence is not a claim that production code depends on
+   completion order (it does not, per ADR-0059).
 3. `S3Store`: `object_store` crate adapter (AWS S3 + MinIO via endpoint
    override), honoring every MUST above.
 
