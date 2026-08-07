@@ -148,6 +148,69 @@ no more than the query's authoritative total. This is why a `segment_open`
 span's `s3_bytes` can be trusted to attribute one segment's I/O rather than the
 whole query's.
 
+## OTLP trace export
+
+By default the spans this guide documents stay on the process's own log stream,
+readable only by whoever can watch that process's stdout. Export is an opt-in
+way to also ship those same spans to an OTLP collector, so spans from a fleet of
+processes land in one place and outlive any single process's log buffer. It is
+an addition, not a replacement: the local log stream behaves exactly as before,
+and export sends the same spans in parallel.
+
+### Turning it on
+
+Both `ravel-server` and `ravel-operator` take a `--otlp-trace-endpoint <URL>`
+flag, absent by default. Point it at a collector's OTLP/gRPC endpoint (for
+example `http://otel-collector:4317`) to enable export for that process. The two
+binaries are configured independently, each with its own flag rather than a
+shared config file, because they are separately deployed processes that each
+already carry their own CLI surface
+([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 3). Set the
+flag on each process you want exporting.
+
+There is no second verbosity knob. The OTLP layer is gated by the same
+`EnvFilter` as the log stream ([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md)
+decision 2), so the `RUST_LOG` filter [Turning them on](#turning-them-on)
+already teaches is exactly what export ships: whatever that filter admits to the
+log stream is what reaches the collector. Widen `RUST_LOG` to add phase spans to
+the exported stream the same way you would to see them locally.
+
+### What gets exported
+
+Exactly the spans and fields the [span tables above](#the-spans) already
+document, and nothing more. Export adds a transport, not new content: no query
+text, no metric or label values, no object keys
+([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 4). Nothing
+crosses to the collector that was not already on the `debug`-level log stream.
+
+Each exported span carries two resource attributes:
+
+- `service.name`: `ravel-server` or `ravel-operator`, the binary that emitted
+  the span.
+- `ravel.mode`: for `ravel-server`, the same value its `/metrics` `mode` label
+  renders (`all`, `gateway`, `query`, or `maintain`), derived from the process's
+  `--mode`. `ravel-operator` has no mode selection and always reports the fixed
+  literal `operator`.
+
+Together they distinguish spans from a fleet in the collector the same way
+`/metrics` scrapes are distinguished today.
+
+### Best-effort, never blocking
+
+Export is best-effort. A down, slow, or unreachable collector drops spans and
+never blocks a query, an ingest write, or a `/metrics` scrape, and never
+surfaces an error to the caller
+([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 6); the ADR
+covers the batch-processor mechanism behind that guarantee.
+
+One limitation to know (issue #711, open): a well-formed but unreachable or
+wrong-collector endpoint currently exports nothing and prints no warning. Only a
+malformed URL, which fails the exporter build at startup, produces an "OTLP
+trace export disabled" warning; a syntactically valid URL is dialed lazily in
+the background, so a wrong host or a down collector is silent. Until #711 adds a
+reachability signal, confirm export is working by checking the collector, not
+the process log.
+
 ## Known gaps
 
 - The `fmt` subscriber the server installs does not emit per-span
@@ -156,5 +219,3 @@ whole query's.
   a running process requires a subscriber configured to emit span-close
   events. The programmatic capture in the acceptance test is the supported way
   to observe the span set and its recorded count fields today.
-- There is no span export to an OTLP trace backend; spans are local to the
-  process log stream.
