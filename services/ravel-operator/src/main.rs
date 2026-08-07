@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use ravel_operator::controller;
 use ravel_operator::ravel_cluster_crd;
+use ravel_tracing_export::OtlpExportConfig;
 use tracing_subscriber::EnvFilter;
 
 /// Ravel Kubernetes operator.
@@ -28,6 +29,34 @@ struct Cli {
     /// dependency.
     #[arg(long)]
     print_crd: bool,
+
+    /// OTLP/gRPC endpoint this process exports its own `tracing` spans to
+    /// (ADR-0060). Absent by default: with no endpoint the subscriber is
+    /// byte-identical to before, spans stay on the local log stream only.
+    /// Set it to a collector URL (e.g. `http://otel-collector:4317`) to also
+    /// ship every span the `RUST_LOG` filter already admits, best-effort and
+    /// never blocking a reconcile (ADR-0060 decisions 3 and 6).
+    #[arg(long = "otlp-trace-endpoint", value_name = "URL")]
+    otlp_trace_endpoint: Option<String>,
+}
+
+impl Cli {
+    /// The OTLP trace-export config `main` passes to
+    /// `ravel_tracing_export::init` (ADR-0060), or `None` when
+    /// `--otlp-trace-endpoint` is absent. Unlike `ravel-server`, the operator
+    /// has no `Mode` enum and renders no `/metrics` `mode` label, so `mode` is
+    /// the fixed literal `"operator"` (documented by issue #707); `main` and
+    /// this crate's own test derive the config through this one method so the
+    /// two cannot drift.
+    fn otlp_export_config(&self) -> Option<OtlpExportConfig> {
+        self.otlp_trace_endpoint
+            .as_ref()
+            .map(|endpoint| OtlpExportConfig {
+                endpoint: endpoint.clone(),
+                service_name: "ravel-operator".to_string(),
+                mode: "operator".to_string(),
+            })
+    }
 }
 
 #[tokio::main]
@@ -47,17 +76,69 @@ async fn main() -> ExitCode {
         };
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Trace subscriber (ADR-0060). The filter is exactly today's: RUST_LOG
+    // when set, else `info`. With --otlp-trace-endpoint absent, `init`
+    // installs the same bare `fmt` subscriber this called inline before,
+    // byte-for-byte (decision 1); with it set, the same subscriber gains an
+    // OTLP/gRPC export layer sharing that one filter (decision 2).
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let trace_guard = ravel_tracing_export::init(filter, cli.otlp_export_config());
 
-    match controller::run().await {
+    // Compute the exit code first, then flush the exporter on the single path
+    // both arms flow through. `main` returns `ExitCode` from a match rather
+    // than propagating `?`, so there is no early return to route around; a
+    // shared flush point after the match runs on both the success and error
+    // exits without duplicating it in each arm.
+    let exit_code = match controller::run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("operator exited with error: {error}");
             ExitCode::FAILURE
         }
+    };
+
+    // Flush the OTLP trace exporter before returning (ADR-0060 decision 7). A
+    // no-op when --otlp-trace-endpoint was absent. `flush` is a blocking call
+    // (both ravel-server and this crate's own tests wrap it in
+    // `spawn_blocking` for the same reason); running it directly on this async
+    // task would hold a runtime worker for up to the exporter's shutdown
+    // timeout. The discarded `Result` is a `JoinError` should `flush()` panic,
+    // not an export error -- `flush()` already swallows those by design
+    // (decision 6). `ExportGuard`'s `Drop` is the backstop regardless.
+    let _ = tokio::task::spawn_blocking(move || trace_guard.flush()).await;
+    exit_code
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// #706: `--otlp-trace-endpoint` threads through to
+    /// `ravel_tracing_export::init` as a `Some(OtlpExportConfig)` stamping the
+    /// operator's fixed `service_name` and `mode` (the literal `"operator"`,
+    /// documented by #707). This proves the operator's own wiring; #705 already
+    /// proved the shared exporter end-to-end.
+    #[test]
+    fn otlp_endpoint_flag_derives_export_config() {
+        let cli = Cli::parse_from([
+            "ravel-operator",
+            "--otlp-trace-endpoint",
+            "http://otel-collector:4317",
+        ]);
+        let config = cli
+            .otlp_export_config()
+            .expect("--otlp-trace-endpoint set derives Some(OtlpExportConfig)");
+        assert_eq!(config.endpoint, "http://otel-collector:4317");
+        assert_eq!(config.service_name, "ravel-operator");
+        assert_eq!(config.mode, "operator");
+    }
+
+    /// The flag absent leaves export off: `init` gets `None` and installs the
+    /// pre-ADR-0060 bare `fmt` subscriber unchanged (decision 1).
+    #[test]
+    fn no_otlp_endpoint_flag_derives_none() {
+        let cli = Cli::parse_from(["ravel-operator"]);
+        assert!(cli.otlp_export_config().is_none());
     }
 }

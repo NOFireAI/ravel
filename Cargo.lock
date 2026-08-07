@@ -4532,6 +4532,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kube-runtime",
+ "ravel-tracing-export",
  "schemars",
  "serde",
  "serde_json",
