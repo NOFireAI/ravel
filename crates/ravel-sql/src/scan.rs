@@ -101,7 +101,7 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
-use ravel_query::SegmentFetcher;
+use ravel_query::{ByteLimit, SegmentFetcher};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, TenantHash};
 
@@ -159,6 +159,11 @@ pub struct RsegScanExec {
     /// Per-partition distinct-series_id budget (issue #187); see the module
     /// doc for why this is per-partition, not a cross-partition total.
     max_series: usize,
+    /// Per-tenant bytes-scanned budget (ADR-0061 decision 1, issue #722),
+    /// checked once per completed segment fetch against the running
+    /// `QueryAccounting` total. `Unlimited` never trips, so a caller that does
+    /// not opt in behaves exactly as before this budget existed.
+    max_bytes_scanned: ByteLimit,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), cloned into every
@@ -169,8 +174,9 @@ pub struct RsegScanExec {
 impl RsegScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given
-    /// pushdown matchers, optional `series_id` allow-set, and per-partition
-    /// `max_series` budget (issue #187).
+    /// pushdown matchers, optional `series_id` allow-set, per-partition
+    /// `max_series` budget (issue #187), and per-tenant `max_bytes_scanned`
+    /// budget (ADR-0061 decision 1, issue #722).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_hash: TenantHash,
@@ -180,6 +186,7 @@ impl RsegScanExec {
         matchers: Arc<Vec<LabelMatcher>>,
         series_ids: Option<Arc<HashSet<[u8; 16]>>>,
         max_series: usize,
+        max_bytes_scanned: ByteLimit,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -196,6 +203,7 @@ impl RsegScanExec {
             matchers,
             series_ids,
             max_series,
+            max_bytes_scanned,
             schema,
             properties,
             accounting,
@@ -298,6 +306,7 @@ impl ExecutionPlan for RsegScanExec {
             matchers,
             series_ids,
             self.max_series,
+            self.max_bytes_scanned,
             reservation,
             self.accounting.clone(),
         ));
@@ -319,11 +328,13 @@ struct Prepared {
 /// decode each into its own ts/provenance-sorted run, and collect per-series
 /// labels. Applies the `series_id` allow-set as a post-fetch row filter.
 ///
-/// Enforces two budgets before the next segment is ever fetched: the
-/// distinct-series count against `max_series` (issue #187), and the
-/// reservation's byte budget against this segment's decoded size (issue
-/// #188). `reservation` is threaded through and returned so the caller's
-/// batch phase continues growing the same one (see module doc).
+/// Enforces three budgets before the next segment is ever fetched: the
+/// per-tenant bytes-scanned budget against the running `QueryAccounting`
+/// total (ADR-0061 decision 1, issue #722), the distinct-series count against
+/// `max_series` (issue #187), and the reservation's byte budget against this
+/// segment's decoded size (issue #188). `reservation` is threaded through and
+/// returned so the caller's batch phase continues growing the same one (see
+/// module doc).
 #[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: SegmentFetcher,
@@ -332,6 +343,7 @@ async fn prepare_partition(
     matchers: Arc<Vec<LabelMatcher>>,
     series_ids: Option<Arc<HashSet<[u8; 16]>>>,
     max_series: usize,
+    max_bytes_scanned: ByteLimit,
     reservation: MemoryReservation,
     accounting: QueryAccounting,
 ) -> DFResult<(Prepared, MemoryReservation)> {
@@ -343,6 +355,20 @@ async fn prepare_partition(
             .fetch_soa_accounted(tenant, seg, &matchers, &accounting)
             .await
             .map_err(SqlError::from)?;
+        // Per-tenant bytes-scanned budget (ADR-0061 decision 1): this fetch
+        // has just charged its S3 bytes into the shared `accounting` handle,
+        // so check the running total against the tenant's cap here, once per
+        // completed segment fetch, before decoding this segment or fetching
+        // the next one. This loop is genuinely sequential, so a trip here
+        // straightforwardly means the remaining segments' GETs never happen.
+        let scanned = accounting.snapshot().total_s3_bytes();
+        if max_bytes_scanned.is_exceeded_by(scanned) {
+            let max = match max_bytes_scanned {
+                ByteLimit::Bounded(max) => max,
+                ByteLimit::Unlimited => scanned,
+            };
+            return Err(SqlError::TooManyBytesScanned { scanned, max }.into());
+        }
         let mut run: Vec<ScanRow> = Vec::new();
         for fs in series {
             let sid = fs.series_id.0;

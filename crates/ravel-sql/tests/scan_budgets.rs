@@ -27,7 +27,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{EngineConfig, SegmentFetcher};
+use ravel_query::{ByteLimit, EngineConfig, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{RavelTableProvider, SqlConfig, TenantMemoryAccountant};
 use ravel_types::accounting::QueryAccounting;
@@ -284,6 +284,125 @@ async fn max_series_rejects_before_every_segment_is_fetched() {
         capped_gets < baseline_gets,
         "a tripped max_series must stop fetching before every segment is \
          pulled (capped={capped_gets}, baseline={baseline_gets})"
+    );
+}
+
+/// Total rows the five-segments-two-series snapshot yields post-dedup: 5
+/// segments x 2 series x 1 sample each, none repeated across segments.
+fn total_rows(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> usize {
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+/// The per-tenant bytes-scanned budget (ADR-0061 decision 1, issue #722) must
+/// reject a partition before every remaining segment is fetched, not only
+/// after every segment's bytes have already been paid for. Proven the same
+/// way `max_series` is: compare GET counts between an `Unlimited` baseline
+/// (every segment fetched) and a bounded cap that trips partway through. The
+/// scan loop is genuinely sequential (one partition via `plan(1)`), so a
+/// tripped budget means the segments after the trip point never issue a GET.
+#[tokio::test]
+async fn max_bytes_scanned_rejects_before_every_segment_is_fetched() {
+    let specs = five_segments_two_series_each();
+    let raw_store = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(raw_store.as_ref(), &specs).await;
+
+    // Baseline: Unlimited fetches every one of the 5 segments. Hold a clone of
+    // the accounting handle so the total S3 bytes it scanned is readable after
+    // the run, to size the bounded cap below.
+    let baseline_store = CountingStore::wrap(raw_store.clone());
+    let baseline_fetcher =
+        SegmentFetcher::new(Arc::clone(&baseline_store) as Arc<dyn ObjectStoreBackend>);
+    let baseline_config = EngineConfig {
+        max_bytes_scanned: ByteLimit::Unlimited,
+        ..EngineConfig::default()
+    };
+    let baseline_acc = QueryAccounting::new();
+    let baseline_provider = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        baseline_fetcher,
+        baseline_config,
+        baseline_acc.clone(),
+    );
+    let baseline_plan = baseline_provider.plan(1).expect("plan");
+    collect(baseline_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("Unlimited must not trip");
+    let baseline_gets = baseline_store.gets();
+    let total_bytes = baseline_acc.snapshot().total_s3_bytes();
+    assert!(
+        baseline_gets > 1,
+        "the baseline must fetch more than one segment for an early exit to be \
+         observable (baseline_gets={baseline_gets})"
+    );
+    assert!(total_bytes > 0, "the baseline must have scanned some bytes");
+
+    // Capped: a budget at half the baseline's total bytes trips at a segment
+    // boundary partway through, so the later segments are never fetched.
+    let capped_store = CountingStore::wrap(raw_store.clone());
+    let capped_fetcher =
+        SegmentFetcher::new(Arc::clone(&capped_store) as Arc<dyn ObjectStoreBackend>);
+    let capped_config = EngineConfig {
+        max_bytes_scanned: ByteLimit::Bounded(total_bytes / 2),
+        ..EngineConfig::default()
+    };
+    let capped_provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        capped_fetcher,
+        capped_config,
+        QueryAccounting::new(),
+    );
+    let capped_plan = capped_provider.plan(1).expect("plan");
+    let err = collect(capped_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect_err("a bounded byte budget below the scan total must trip");
+    let msg = format!("{err}");
+    assert!(msg.contains("too many bytes"), "got: {msg}");
+
+    let capped_gets = capped_store.gets();
+    assert!(
+        capped_gets > 0,
+        "at least the first segment must have been fetched (capped_gets={capped_gets})"
+    );
+    assert!(
+        capped_gets < baseline_gets,
+        "a tripped bytes-scanned budget must stop fetching before every segment \
+         is pulled (capped={capped_gets}, baseline={baseline_gets})"
+    );
+}
+
+/// No-regression: an `Unlimited` bytes-scanned budget must fetch every segment
+/// and return the identical full row set the scan produced before this budget
+/// existed. `Unlimited` is the code path every pre-#722 caller already took.
+#[tokio::test]
+async fn unlimited_bytes_scanned_matches_prior_behavior() {
+    let specs = five_segments_two_series_each();
+    let raw_store = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(raw_store.as_ref(), &specs).await;
+
+    let store = CountingStore::wrap(raw_store);
+    let fetcher = SegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+    let config = EngineConfig {
+        max_bytes_scanned: ByteLimit::Unlimited,
+        ..EngineConfig::default()
+    };
+    let provider =
+        RavelTableProvider::new(snapshot, TENANT, fetcher, config, QueryAccounting::new());
+    let plan = provider.plan(1).expect("plan");
+    let batches = collect(plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("Unlimited must not trip");
+
+    // 5 segments x 2 distinct series x 1 sample each = 10 rows, none deduped.
+    assert_eq!(
+        total_rows(&batches),
+        10,
+        "Unlimited must return the full, unmodified row set"
+    );
+    assert!(
+        store.gets() > 0,
+        "Unlimited must genuinely fetch the snapshot's segments"
     );
 }
 
