@@ -125,6 +125,7 @@ pub struct MaintenanceSafetyMetrics {
     conservation_aborts: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphan_breaker_trips: [AtomicU64; MAINTAINED_SIGNALS.len()],
     orphans_withheld: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_present: [AtomicU64; MAINTAINED_SIGNALS.len()],
 }
 
 impl MaintenanceSafetyMetrics {
@@ -150,6 +151,28 @@ impl MaintenanceSafetyMetrics {
         self.orphans_withheld[signal_index(signal)].load(Ordering::Relaxed)
     }
 
+    /// Orphan candidates the most recent sweep pass for `signal` found,
+    /// whether the breaker tripped or not: `orphans_deleted + orphans_withheld`
+    /// (exactly one of those is nonzero per pass). This is the signal for
+    /// small-scale commit-record loss the breaker's ratio/count thresholds are
+    /// deliberately too coarse to catch (ADR-0058 decision 1): delete a handful
+    /// of commit records for one shard and the breaker never trips, so
+    /// `orphans_withheld` stays `0` even as the orphaned data objects march to
+    /// the grace horizon and get deleted like ordinary abandoned flushes. This
+    /// gauge is nonzero for exactly those passes.
+    ///
+    /// A gauge, not a counter, for the same reason as [`orphans_withheld`]:
+    /// it reflects only the most recent pass. A drop to a lower value (or to
+    /// `0`) is not "resolved" -- it is just this pass's candidate count, which
+    /// falls as orphans are deleted or their records restored. The durable
+    /// record that orphans were ever present is the operator's own
+    /// investigation the alert triggered, not a later reading of this gauge.
+    ///
+    /// [`orphans_withheld`]: Self::orphans_withheld
+    pub fn orphans_present(&self, signal: Signal) -> u64 {
+        self.orphans_present[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -160,17 +183,23 @@ impl MaintenanceSafetyMetrics {
     }
 
     /// One `sweep_shard` result for `signal`: increments the trip counter
-    /// when `tripped`, and always overwrites the withheld gauge with this
-    /// pass's count (`0` when not tripped), matching [`orphans_withheld`]'s
-    /// doc on why that gauge alone cannot be read as "resolved".
+    /// when `tripped`, and always overwrites the withheld and present gauges
+    /// with this pass's counts (both `store`, never `fetch_add` -- these are
+    /// gauges), matching [`orphans_withheld`]'s and [`orphans_present`]'s docs
+    /// on why neither gauge alone can be read as "resolved". `present` is the
+    /// pass's total orphan-candidate count (`orphans_deleted +
+    /// orphans_withheld`, exactly one of which is nonzero); `withheld` is `0`
+    /// unless the breaker tripped.
     ///
     /// [`orphans_withheld`]: Self::orphans_withheld
-    pub fn record_sweep(&self, signal: Signal, tripped: bool, withheld: usize) {
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn record_sweep(&self, signal: Signal, tripped: bool, withheld: usize, present: usize) {
         let index = signal_index(signal);
         if tripped {
             self.orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
         }
         self.orphans_withheld[index].store(withheld as u64, Ordering::Relaxed);
+        self.orphans_present[index].store(present as u64, Ordering::Relaxed);
     }
 }
 
@@ -580,6 +609,7 @@ pub async fn run_tick(
                         signal,
                         report.orphan_breaker_tripped,
                         report.orphans_withheld,
+                        report.orphans_deleted + report.orphans_withheld,
                     );
                 }
                 Err(err) => {
@@ -1358,11 +1388,11 @@ mod tests {
     #[test]
     fn orphan_breaker_withheld_gauge_drops_but_trip_counter_does_not() {
         let safety = MaintenanceSafetyMetrics::default();
-        safety.record_sweep(Signal::Metrics, true, 42);
+        safety.record_sweep(Signal::Metrics, true, 42, 42);
         assert_eq!(safety.orphan_breaker_trips(Signal::Metrics), 1);
         assert_eq!(safety.orphans_withheld(Signal::Metrics), 42);
 
-        safety.record_sweep(Signal::Metrics, false, 0);
+        safety.record_sweep(Signal::Metrics, false, 0, 0);
         assert_eq!(
             safety.orphan_breaker_trips(Signal::Metrics),
             1,
@@ -1378,5 +1408,49 @@ mod tests {
         assert_eq!(safety.orphan_breaker_trips(Signal::Logs), 0);
         assert_eq!(safety.conservation_aborts(Signal::Logs), 0);
         assert_eq!(safety.legal_hold_refresh_failures(), 0);
+    }
+
+    /// ADR-0058 decision 1: `orphans_present` is a last-observed-value gauge
+    /// that catches small-scale record loss the breaker never trips on. It
+    /// carries the pass's total orphan-candidate count regardless of what
+    /// happened to those candidates, and drops to whatever the latest pass
+    /// found -- it is never sticky and never monotonic.
+    #[test]
+    fn orphans_present_gauge_tracks_latest_pass_and_is_not_sticky() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // Breaker not tripped: candidates were deleted, so `present` is the
+        // deleted count while `withheld` stays 0. This is exactly the
+        // small-scale-loss case the breaker's thresholds are too coarse for.
+        safety.record_sweep(Signal::Metrics, false, 0, 3);
+        assert_eq!(safety.orphans_present(Signal::Metrics), 3);
+        assert_eq!(safety.orphans_withheld(Signal::Metrics), 0);
+        assert_eq!(
+            safety.orphan_breaker_trips(Signal::Metrics),
+            0,
+            "a below-threshold pass with orphans present must not trip the breaker"
+        );
+
+        // Breaker tripped: candidates were withheld, so `present` equals the
+        // withheld count (deleted is 0 on a tripped pass).
+        safety.record_sweep(Signal::Metrics, true, 55, 55);
+        assert_eq!(safety.orphans_present(Signal::Metrics), 55);
+        assert_eq!(safety.orphans_withheld(Signal::Metrics), 55);
+
+        // A subsequent clean pass with zero candidates resets the gauge to 0:
+        // gauge semantics, last observed value, not a monotonic counter that
+        // remembers the earlier 55.
+        safety.record_sweep(Signal::Metrics, false, 0, 0);
+        assert_eq!(
+            safety.orphans_present(Signal::Metrics),
+            0,
+            "orphans_present reflects only the most recent pass, never sticky"
+        );
+        // The trip that happened is still on the durable counter, untouched by
+        // the present gauge dropping to 0.
+        assert_eq!(safety.orphan_breaker_trips(Signal::Metrics), 1);
+
+        // A different signal is untouched throughout.
+        assert_eq!(safety.orphans_present(Signal::Logs), 0);
     }
 }

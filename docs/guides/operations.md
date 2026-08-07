@@ -1140,19 +1140,20 @@ maintenance loop uses the defaults.
 
 ### Maintenance safety metrics and alerts
 
-`--mode maintain` renders four additional samples on the existing `GET
+`--mode maintain` renders five additional samples on the existing `GET
 /metrics` endpoint (ADR-0044 section 4), alongside the tenant-discovery
 gauges (issue #504): `ravel_maintain_legal_hold_refresh_failures_total`
 (counter), `ravel_maintain_conservation_aborts_total` (counter, labeled
 by `signal`), `ravel_maintain_orphan_breaker_tripped_total` (counter,
-labeled by `signal`), and `ravel_maintain_orphans_withheld` (gauge,
+labeled by `signal`), `ravel_maintain_orphans_withheld` (gauge,
+labeled by `signal`), and `ravel_maintain_orphans_present` (gauge,
 labeled by `signal`). No new label is added to the renderer's
 compile-time-closed allowlist; these reuse the existing `mode` and
 `signal` labels only. ADR-0048 names `tenant_hash` as a label on the
 orphan-breaker-trip counter, but ADR-0044 blocks any
 `tenant_hash`-labeled sample on the unauthenticated `/metrics` route
 unless the opt-in `--metrics-tenant-labels` flag is set (see below); by
-default all four samples stay process-wide totals, not broken out per
+default all five samples stay process-wide totals, not broken out per
 tenant.
 
 ### Admission usage (ADR-0051 section 6)
@@ -1256,6 +1257,7 @@ Default alert rules:
 | Legal hold refresh failing | `increase(ravel_maintain_legal_hold_refresh_failures_total[15m]) > 0` | Every failure already skips that tenant's tick entirely (fail-closed, ADR-0048 decision 1); a sustained failure means a tenant is silently receiving no maintenance at all. |
 | Compaction conservation gate aborting | `increase(ravel_maintain_conservation_aborts_total[15m]) > 0` | Each abort means a compaction publish was refused because input and output record counts disagreed (ADR-0048 decision 6); nothing was written, but a bucket stuck retrying every tick without ever compacting needs an operator, not just a retry. |
 | Mass-orphan circuit breaker trip | `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | Fire on the **first trip**, not on a sustained condition. The trip condition can clear itself (dilution or partial restoration, see below) while the underlying record loss and the pass's withheld deletions persist; a sustained-state alert (`orphan_breaker_tripped_total` treated as a level) can clear before anyone looks. The counter only increments, so any `increase() > 0` is a real trip that happened, whether or not the shard is still tripping now. |
+| Orphans present (small-scale loss) | `ravel_maintain_orphans_present > 0` for `12h` | Catches the breaker's blind spot (ADR-0058 decision 1): delete a handful of commit records for one shard and the candidate count never reaches `orphan_breaker_min_count` or `orphan_breaker_max_ratio`, so the breaker never trips and `orphans_withheld` stays `0`, yet the orphaned data objects are deleted at the grace horizon like ordinary abandoned flushes. A sustained nonzero here is either that loss or a genuinely stuck abandoned flush; both warrant a look before the grace window (default 25h) elapses. Twelve hours is roughly half the grace window, long enough that a single normal abandoned-flush cleanup between passes doesn't page, short enough that real loss alarms with hours to spare. |
 | Discovered tenants not maintained | `ravel_maintain_tenants_maintained < ravel_maintain_tenants_discovered` for `10m` | A prefix under `t/` holds data with no maintaining owner, the exact `maintained < discovered` condition ADR-0048 decision 3 names, and the same S2-17/S5-09 finding recurring for a different reason (ADR-0048 Context). Ten minutes is two cycles at the default 300s `--maintain-interval-secs`, long enough that a single tick's transient gap (a restart, a tenant mid-onboarding) doesn't page, short enough that a real gap alarms within the hour. |
 | Tenant discovery failing | `increase(ravel_maintain_tenant_discovery_failures_total[5m]) > 0` | A failed `LIST t/` skips the *entire* cycle, every tenant, not just one (ADR-0048 decision 3): the supervisor deliberately never treats a failed enumeration as "no tenants" so it can't be confused with healthy idleness, but that means a sustained failure is a fully silent maintenance outage. Alarm on the first occurrence rather than waiting for a sustained window, faster than the gauge condition above, because a skipped cycle is worse than one tenant falling behind: nothing is being maintained at all. |
 
@@ -1266,6 +1268,23 @@ because of dilution or partial restoration (see below). It is for
 inspecting the size of the most recent withheld set once the trip
 counter has already told you a trip happened, not for detecting the
 trip itself.
+
+`ravel_maintain_orphans_present` is the companion gauge that closes the
+breaker's blind spot for small-scale loss (ADR-0058 decision 1). It
+carries the most recent pass's total orphan-candidate count
+(`orphans_deleted + orphans_withheld`, exactly one of which is nonzero),
+whether or not the breaker tripped, so it is nonzero exactly in the case
+`orphans_withheld` cannot report: a few commit records lost for one
+shard, below the breaker's count and ratio thresholds, whose orphaned
+data objects would otherwise be deleted at the grace horizon with no
+operator-visible signal. Unlike the withheld gauge it *is* an alert
+target (the `orphans present` rule above), because a sustained nonzero
+is the only warning of that loss. It is still a gauge, not a counter: it
+reflects only the latest pass and drops as candidates are deleted or
+their records restored, so a drop is not "resolved," only this pass's
+count. A genuinely abandoned flush also shows up here for a pass or two
+before orphan GC clears it, which is why the alert waits for the
+condition to sustain rather than firing on any single nonzero reading.
 
 ### Mass-orphan circuit breaker runbook
 
