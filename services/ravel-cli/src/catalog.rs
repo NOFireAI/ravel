@@ -4,7 +4,6 @@
 //! and diff against the snapshot). Built strictly against `ravel-catalog`'s
 //! public API: no new methods added to that crate for this tool.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ravel_catalog::{CatalogConfig, PartLimits};
@@ -114,11 +113,7 @@ pub async fn inspect(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow
     Ok(())
 }
 
-/// Entry identity matching `docs/metric-index-plan.md` section 4's dedup
-/// key: (shard, ingest_hour_bucket, writer_id, writer_epoch, writer_seq).
-type EntryIdentity = (u32, u32, [u8; 16], u64, u64);
-
-fn format_identity(id: &EntryIdentity) -> String {
+fn format_identity(id: &ravel_catalog::EntryIdentity) -> String {
     format!(
         "shard={} ingest_hour_bucket={} writer_id={} writer_epoch={} writer_seq={}",
         id.0,
@@ -146,119 +141,52 @@ fn format_uuid_bytes(bytes: &[u8]) -> String {
 /// not a divergence.
 pub async fn verify(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
-    let key = head_key(&tenant_hash, Signal::Metrics);
 
-    let head_bytes = match store.get(&key, GetRange::Full).await {
-        Ok(outcome) => outcome.data,
-        Err(_) => {
-            println!("no HEAD found at {key}; nothing folded yet, nothing to verify");
-            return Ok(());
-        }
-    };
-    let head = ravel_catalog::decode_head(&head_bytes)
-        .map_err(|err| anyhow::anyhow!("HEAD at {key} is corrupt: {err}"))?;
-
-    let limits = PartLimits::default();
-    let mut snapshot_entries: BTreeMap<EntryIdentity, Vec<u8>> = BTreeMap::new();
-    for part_ref in &head.parts {
-        let got = store
-            .get(&part_ref.key, GetRange::Full)
+    // The comparison itself lives in `ravel-catalog` (ADR-0059 decision 2) so
+    // the scheduled scrubber and this CLI share one implementation. This
+    // command keeps its own presentation: the `println!` report and the nonzero
+    // exit (via `anyhow::bail!`) on a real divergence.
+    let report =
+        match ravel_catalog::verify_seal_divergence(store.as_ref(), &tenant_hash, Signal::Metrics)
             .await
-            .map_err(|err| anyhow::anyhow!("failed to fetch part {}: {err}", part_ref.key))?;
-        let decoded = ravel_catalog::decode_part(&got.data, &limits)
-            .map_err(|err| anyhow::anyhow!("part {} is corrupt: {err}", part_ref.key))?;
-        for entry in decoded.entries {
-            let writer_id: [u8; 16] = entry.writer_id.as_slice().try_into().map_err(|_| {
-                anyhow::anyhow!("part {} has a malformed writer_id entry", part_ref.key)
-            })?;
-            let identity = (
-                entry.shard,
-                entry.ingest_hour_bucket,
-                writer_id,
-                entry.writer_epoch,
-                entry.writer_seq,
-            );
-            snapshot_entries.insert(identity, entry.content_hash);
-        }
-    }
-
-    let mut ground_truth: BTreeMap<EntryIdentity, Vec<u8>> = BTreeMap::new();
-    for shard in 0..head.shard_count {
-        let prefix = ravel_commit::keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, shard)
-            .map_err(|err| anyhow::anyhow!("failed to build shard prefix: {err}"))?;
-        let objects = ravel_object_store::list_all(store.as_ref(), &prefix)
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to list {prefix}: {err}"))?;
-        for object in objects {
-            let Ok(parsed) = ravel_commit::keys::parse_commit_key(&object.key) else {
-                continue;
-            };
-            if parsed.ingest_hour_bucket > head.watermark_hour {
-                continue;
+            .map_err(|err| anyhow::anyhow!("{err}"))?
+        {
+            Some(report) => report,
+            None => {
+                let key = head_key(&tenant_hash, Signal::Metrics);
+                println!("no HEAD found at {key}; nothing folded yet, nothing to verify");
+                return Ok(());
             }
-            let got = store
-                .get(&object.key, GetRange::Full)
-                .await
-                .map_err(|err| anyhow::anyhow!("failed to fetch {}: {err}", object.key))?;
-            let record = ravel_commit::record::decode(&got.data).map_err(|err| {
-                anyhow::anyhow!("commit record at {} is corrupt: {err}", object.key)
-            })?;
-            let writer_id = *Uuid::parse_str(&record.writer_id)
-                .map_err(|_| {
-                    anyhow::anyhow!("commit record at {} has an invalid writer_id", object.key)
-                })?
-                .as_bytes();
-            let identity = (
-                record.shard,
-                record.ingest_hour_bucket,
-                writer_id,
-                record.writer_epoch,
-                record.writer_seq,
-            );
-            ground_truth.insert(identity, record.content_hash);
-        }
-    }
+        };
 
-    let mut missing = Vec::new();
-    let mut mismatched = Vec::new();
-    for (identity, hash) in &ground_truth {
-        match snapshot_entries.get(identity) {
-            None => missing.push(*identity),
-            Some(snap_hash) if snap_hash != hash => mismatched.push(*identity),
-            Some(_) => {}
-        }
-    }
-    let orphaned: Vec<EntryIdentity> = snapshot_entries
-        .keys()
-        .filter(|id| !ground_truth.contains_key(*id))
-        .copied()
-        .collect();
-
-    println!("watermark_hour: {}", head.watermark_hour);
-    println!("sealed commit records (re-listed): {}", ground_truth.len());
-    println!("snapshot entries: {}", snapshot_entries.len());
-    println!("missing from snapshot: {}", missing.len());
-    for id in &missing {
+    println!("watermark_hour: {}", report.watermark_hour);
+    println!(
+        "sealed commit records (re-listed): {}",
+        report.sealed_record_count
+    );
+    println!("snapshot entries: {}", report.snapshot_entry_count);
+    println!("missing from snapshot: {}", report.missing.len());
+    for id in &report.missing {
         println!("  MISSING {}", format_identity(id));
     }
-    println!("content_hash mismatches: {}", mismatched.len());
-    for id in &mismatched {
+    println!("content_hash mismatches: {}", report.mismatched.len());
+    for id in &report.mismatched {
         println!("  MISMATCH {}", format_identity(id));
     }
     println!(
         "snapshot entries with no matching sealed commit record (expected once retention \
          deletes folded commit records): {}",
-        orphaned.len()
+        report.orphaned.len()
     );
-    for id in &orphaned {
+    for id in &report.orphaned {
         println!("  ORPHAN {}", format_identity(id));
     }
 
-    if !missing.is_empty() || !mismatched.is_empty() {
+    if report.has_divergence() {
         anyhow::bail!(
             "catalog verify found {} missing and {} mismatched entries against the sealed commit history",
-            missing.len(),
-            mismatched.len(),
+            report.missing.len(),
+            report.mismatched.len(),
         );
     }
     println!("catalog verify: snapshot matches the sealed commit history");

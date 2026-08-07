@@ -14,7 +14,8 @@
 //! variants are exhaustively `tenant_hash`, `signal`, `mode`, `op`,
 //! `error_kind`, `workload_class`, `level`, `reason`, and `cache` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
-//! family, `cache` by issue #553 to split the read-cache family into the
+//! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
+//! `cache` by issue #553 to split the read-cache family into the
 //! fetcher and catalog byte caches). Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
@@ -146,6 +147,32 @@ impl RejectReason {
     }
 }
 
+/// The `reason` label on `ravel_scrub_seal_divergence_total` (ADR-0059 decision
+/// 2, issue #695). A closed set of two values: `missing` (a sealed commit record
+/// absent from the folded snapshot, S2-04 under-count) and `mismatched` (a
+/// snapshot entry whose `content_hash` disagrees with the sealed record).
+/// `orphaned` divergences (a snapshot entry with no surviving commit record) are
+/// the expected retention-after-fold shape and deliberately have no label value:
+/// they are never counted (see [`crate::scrub`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubReason {
+    Missing,
+    Mismatched,
+}
+
+impl ScrubReason {
+    /// Both reasons, so the family renders a series per (signal, reason) even at
+    /// zero, the same zero-is-not-absence discipline every other family keeps.
+    const ALL: [ScrubReason; 2] = [ScrubReason::Missing, ScrubReason::Mismatched];
+
+    fn name(self) -> &'static str {
+        match self {
+            ScrubReason::Missing => "missing",
+            ScrubReason::Mismatched => "mismatched",
+        }
+    }
+}
+
 /// A `tenant_hash` label value: either a configured tenant's fixed-width hash
 /// or the `other` bucket every unconfigured tenant folds into (ADR-0044
 /// section 4), so per-tenant cardinality is bounded by the configured tenant
@@ -182,6 +209,7 @@ pub enum Label {
     WorkloadClass(WorkloadClass),
     Level(Level),
     RejectReason(RejectReason),
+    ScrubReason(ScrubReason),
     Cache(CacheFamily),
 }
 
@@ -217,6 +245,7 @@ impl Label {
             Label::WorkloadClass(_) => "workload_class",
             Label::Level(_) => "level",
             Label::RejectReason(_) => "reason",
+            Label::ScrubReason(_) => "reason",
             Label::Cache(_) => "cache",
         }
     }
@@ -231,6 +260,7 @@ impl Label {
             Label::WorkloadClass(class) => class.name().to_string(),
             Label::Level(level) => level.name().to_string(),
             Label::RejectReason(reason) => reason.name().to_string(),
+            Label::ScrubReason(reason) => reason.name().to_string(),
             Label::Cache(family) => family.name().to_string(),
         }
     }
@@ -1267,6 +1297,14 @@ pub struct ScrubSignalSnapshot {
     /// the object really carries (S2-09's false negative). Wired but only
     /// nonzero once covering-postings resolution lands in the scrub task.
     pub postings_disagreement: u64,
+    /// Sealed commit records absent from the folded snapshot for this signal
+    /// (S2-04 under-count): `ravel_scrub_seal_divergence_total{reason="missing"}`
+    /// (ADR-0059 decision 2, issue #695).
+    pub seal_divergence_missing: u64,
+    /// Snapshot entries whose `content_hash` disagreed with the sealed commit
+    /// record for this signal:
+    /// `ravel_scrub_seal_divergence_total{reason="mismatched"}`.
+    pub seal_divergence_mismatched: u64,
     /// Fraction of the current rotation the content-tier cursor has covered so
     /// far for this signal, in `[0.0, 1.0]` (operator visibility into cadence).
     pub cursor_position: f64,
@@ -1324,6 +1362,36 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
             &labels(mode, signal.signal),
             signal.postings_disagreement,
         );
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_seal_divergence_total",
+        "Divergences between the folded snapshot and the re-listed sealed commit history, by \
+         signal and reason (ADR-0059 decision 2): reason=\"missing\" is a sealed commit record \
+         absent from the snapshot (S2-04 under-count), reason=\"mismatched\" a snapshot entry \
+         whose content_hash disagrees with the sealed record. Orphaned entries (a snapshot entry \
+         with no surviving commit record) are the expected retention-after-fold shape and are \
+         never counted. Alert on increase() > 0.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        for reason in ScrubReason::ALL {
+            let value = match reason {
+                ScrubReason::Missing => signal.seal_divergence_missing,
+                ScrubReason::Mismatched => signal.seal_divergence_mismatched,
+            };
+            write_sample(
+                out,
+                "ravel_scrub_seal_divergence_total",
+                &[
+                    Label::Mode(mode),
+                    Label::Signal(signal.signal),
+                    Label::ScrubReason(reason),
+                ],
+                value,
+            );
+        }
     }
 
     write_header(
@@ -2118,6 +2186,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 signal,
                 checksum_mismatch: metrics.checksum_mismatch(signal),
                 postings_disagreement: metrics.postings_disagreement(signal),
+                seal_divergence_missing: metrics.seal_divergence_missing(signal),
+                seal_divergence_mismatched: metrics.seal_divergence_mismatched(signal),
                 cursor_position: metrics.cursor_position(signal),
             })
             .collect(),
@@ -2269,6 +2339,7 @@ mod tests {
             Label::WorkloadClass(WorkloadClass::Interactive),
             Label::Level(Level::Info),
             Label::RejectReason(RejectReason::ByteRate),
+            Label::ScrubReason(ScrubReason::Missing),
             Label::Cache(CacheFamily::Fetch),
         ];
         let keys: Vec<&'static str> = one_of_each
@@ -2282,6 +2353,7 @@ mod tests {
                 Label::WorkloadClass(_) => "workload_class",
                 Label::Level(_) => "level",
                 Label::RejectReason(_) => "reason",
+                Label::ScrubReason(_) => "reason",
                 Label::Cache(_) => "cache",
             })
             .collect();
@@ -2296,12 +2368,21 @@ mod tests {
                 "workload_class",
                 "level",
                 "reason",
+                // ScrubReason (ADR-0059 section 2) reuses the `reason` key, so
+                // the allowlist of distinct keys is unchanged; two variants map
+                // to it.
+                "reason",
                 "cache",
             ],
-            "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` and issue #553's \
-             `cache`; `shard` must never appear here"
+            "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
+             ADR-0059 section 2's scrub seal-divergence family) and issue #553's `cache`; \
+             `shard` must never appear here"
         );
-        assert_eq!(one_of_each.len(), 9, "exactly 9 permitted label keys");
+        assert_eq!(
+            one_of_each.len(),
+            10,
+            "exactly 10 label variants, 9 distinct keys"
+        );
     }
 
     /// The POSTINGS family (issue #511) renders one sample per metric for the
@@ -2860,12 +2941,16 @@ mod tests {
                     signal: Signal::Metrics,
                     checksum_mismatch: 2,
                     postings_disagreement: 1,
+                    seal_divergence_missing: 3,
+                    seal_divergence_mismatched: 4,
                     cursor_position: 0.5,
                 },
                 ScrubSignalSnapshot {
                     signal: Signal::Logs,
                     checksum_mismatch: 0,
                     postings_disagreement: 0,
+                    seal_divergence_missing: 0,
+                    seal_divergence_mismatched: 0,
                     cursor_position: 0.0,
                 },
             ],
@@ -2895,6 +2980,25 @@ mod tests {
                 "ravel_scrub_postings_disagreement_total{mode=\"maintain\",signal=\"metrics\"} 1"
             ),
             "missing postings_disagreement sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_scrub_seal_divergence_total{mode=\"maintain\",signal=\"metrics\",reason=\"missing\"} 3"
+            ),
+            "missing seal_divergence missing sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_scrub_seal_divergence_total{mode=\"maintain\",signal=\"metrics\",reason=\"mismatched\"} 4"
+            ),
+            "missing seal_divergence mismatched sample:\n{body}"
+        );
+        // Zero-valued signal still renders both reasons (zero-is-not-absence).
+        assert!(
+            body.contains(
+                "ravel_scrub_seal_divergence_total{mode=\"maintain\",signal=\"logs\",reason=\"missing\"} 0"
+            ),
+            "a zero-valued signal must still render both seal-divergence reasons:\n{body}"
         );
         assert!(
             body.contains("ravel_scrub_cursor_position{mode=\"maintain\",signal=\"metrics\"} 0.5"),

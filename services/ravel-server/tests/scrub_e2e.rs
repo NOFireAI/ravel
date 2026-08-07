@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ravel_catalog::CatalogConfig;
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -199,6 +200,171 @@ async fn injected_corruption_surfaces_on_metrics_through_the_real_scrub_task() {
         detected,
         "the injected corruption must surface as ravel_scrub_checksum_mismatch_total on /metrics \
          within one scrub cycle, through the real spawned ScrubTask"
+    );
+}
+
+/// System wall clock in nanoseconds, for sealing records relative to "now" the
+/// way real ingest does (the fold's seal margins are computed against the same
+/// clock the running server reads).
+fn now_ns() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos() as i64
+}
+
+/// Comfortably past the default seal margins (matches the CLI `catalog verify`
+/// suite's `SEALED_AGE_NS` and `fold_e2e.rs`'s `SEALED_AGE`), so a record
+/// created this far back is sealed by fold time.
+const SEALED_AGE_NS: i64 = 3 * NS_PER_HOUR;
+
+/// Publish a real sealed RSEG segment plus its commit record into `(tenant,
+/// Metrics, shard 0)` with the given `writer_seq` and `created_unix_ns`, so two
+/// calls with distinct `seq` produce two distinct sealed commit records.
+async fn publish_sealed_segment(
+    store: &MemoryStore,
+    tenant: &TenantId,
+    seq: u64,
+    created_unix_ns: i64,
+) {
+    let tenant_hash = tenant.hash();
+    let writer_id = Uuid::from_u128(u128::from(seq));
+    let ingest_hour_bucket = u32::try_from(created_unix_ns / NS_PER_HOUR).expect("fits u32");
+    let series: Vec<SeriesInput> = ["cpu", "mem"]
+        .iter()
+        .map(|metric| {
+            let labels = LabelSet::new(vec![Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: (*metric).to_string(),
+            }])
+            .expect("valid labels");
+            let series_id = SeriesId::compute(tenant, metric, &labels).expect("series id");
+            SeriesInput {
+                series_id,
+                labels,
+                samples: vec![Sample {
+                    ts_ns: created_unix_ns,
+                    value: 1.0,
+                }],
+            }
+        })
+        .collect();
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: seq,
+    };
+    let min_ingest_ts_ns = created_unix_ns - 1_000;
+    let max_ingest_ts_ns = created_unix_ns;
+    let bounds = IngestBounds {
+        min_ingest_ts_ns,
+        max_ingest_ts_ns,
+    };
+    let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: seq,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns,
+        max_ingest_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns,
+        ingest_hour_bucket,
+    })
+    .expect("valid record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish commit record");
+}
+
+/// A real seal divergence, injected at rest, surfaces on `/metrics` through the
+/// real scheduled scrub task (ADR-0059 decision 2, issue #695). One sealed
+/// record is folded into the snapshot; a second is sealed *after* the fold, so
+/// the snapshot under-counts against the re-listed sealed commit history (S2-04).
+/// The running `Mode::Maintain` server's scrub task detects this on a real tick
+/// and reports it as `ravel_scrub_seal_divergence_total{reason="missing"} 1`.
+#[tokio::test]
+async fn seal_divergence_surfaces_on_metrics_through_the_real_scrub_task() {
+    let tenant = TenantId::new("scrub-seal-e2e");
+    let store = Arc::new(MemoryStore::new());
+    let now = now_ns();
+    let created = now - SEALED_AGE_NS;
+
+    // One sealed record, folded into a real HEAD.
+    publish_sealed_segment(store.as_ref(), &tenant, 1, created).await;
+    let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        store_dyn.clone(),
+        CatalogConfig {
+            shard_count: 1,
+            ..CatalogConfig::default()
+        },
+    )
+    .expect("catalog")
+    .with_provisioning_enforcement();
+    catalog
+        .fold(&tenant.hash(), Signal::Metrics, Uuid::new_v4(), now, &[])
+        .await
+        .expect("fold produces a HEAD");
+
+    // A second record, sealed but published after the fold: the snapshot
+    // under-counts against the re-listed sealed commit history.
+    publish_sealed_segment(store.as_ref(), &tenant, 2, created).await;
+
+    let running = ravel_server::start(
+        maintain_config(Mode::Maintain, &tenant),
+        store_dyn,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("maintain server starts");
+
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let mut detected = false;
+    for _ in 0..60 {
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("metrics body");
+        if body.contains(
+            "ravel_scrub_seal_divergence_total{mode=\"maintain\",signal=\"metrics\",reason=\"missing\"} 1",
+        ) {
+            detected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
+    assert!(
+        detected,
+        "the sealed-after-fold record must surface as \
+         ravel_scrub_seal_divergence_total{{reason=\"missing\"}} on /metrics within one scrub \
+         cycle, through the real spawned ScrubTask"
     );
 }
 

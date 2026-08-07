@@ -10,6 +10,7 @@ mod config;
 mod error;
 mod fold;
 mod provisioning;
+mod seal_divergence;
 mod snapshot;
 mod snapshot_format;
 mod snapshot_resolve;
@@ -31,6 +32,9 @@ pub use provisioning::{
     ShardGeneration, active_shard_count, append_generation, max_scan_count_over_range,
     provisioning_key, read_generations, read_generations_checked, read_generations_from_store,
     scan_count, shard_ceiling, validate_or_adopt,
+};
+pub use seal_divergence::{
+    EntryIdentity, SealDivergenceError, SealDivergenceReport, verify_seal_divergence,
 };
 pub use snapshot::{SegmentLevel, SegmentRef, Snapshot};
 pub use snapshot_format::{

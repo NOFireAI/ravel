@@ -107,10 +107,24 @@ fn signal_index(signal: Signal) -> usize {
 /// failures of the same data object, so both increment
 /// `checksum_mismatch`; a [`ScrubResult::ReadError`] is transient and increments
 /// nothing.
+///
+/// Seal divergence (ADR-0059 decision 2, issue #695) is a distinct, metadata-cost
+/// check on the same tick: sealed commit records re-listed and diffed against the
+/// folded snapshot. `missing` and `mismatched` divergences increment
+/// `seal_divergence_*`; `orphaned` is the expected retention-after-fold shape and
+/// increments nothing.
 #[derive(Debug, Default)]
 pub struct ScrubMetrics {
     checksum_mismatch: [AtomicU64; MAINTAINED_SIGNALS.len()],
     postings_disagreement: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Sealed commit records absent from the folded snapshot (S2-04 under-count),
+    /// per signal. The `reason="missing"` value of
+    /// `ravel_scrub_seal_divergence_total`.
+    seal_divergence_missing: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Snapshot entries whose `content_hash` disagrees with the sealed commit
+    /// record, per signal. The `reason="mismatched"` value of
+    /// `ravel_scrub_seal_divergence_total`.
+    seal_divergence_mismatched: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// Objects covered so far in the current rotation, per signal (numerator of
     /// the cursor-position gauge). Last-observed value, overwritten each shard
     /// tick, matching the "most recent pass" gauge discipline `orphans_withheld`
@@ -128,6 +142,14 @@ impl ScrubMetrics {
 
     pub fn postings_disagreement(&self, signal: Signal) -> u64 {
         self.postings_disagreement[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    pub fn seal_divergence_missing(&self, signal: Signal) -> u64 {
+        self.seal_divergence_missing[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    pub fn seal_divergence_mismatched(&self, signal: Signal) -> u64 {
+        self.seal_divergence_mismatched[signal_index(signal)].load(Ordering::Relaxed)
     }
 
     /// Fraction of the current rotation covered so far for `signal`, in
@@ -150,6 +172,14 @@ impl ScrubMetrics {
 
     fn record_postings_disagreement(&self, signal: Signal) {
         self.postings_disagreement[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_seal_divergence_missing(&self, signal: Signal, count: u64) {
+        self.seal_divergence_missing[signal_index(signal)].fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_seal_divergence_mismatched(&self, signal: Signal, count: u64) {
+        self.seal_divergence_mismatched[signal_index(signal)].fetch_add(count, Ordering::Relaxed);
     }
 
     fn record_cursor_position(&self, signal: Signal, covered: u64, total: u64) {
@@ -289,6 +319,61 @@ pub async fn run_cycle(
                 )
                 .await;
             }
+            // Seal-divergence tier (ADR-0059 decision 2, issue #695): once per
+            // (tenant, signal) per tick, not per shard and not gated behind the
+            // content-tier cursor. It is metadata-cost, matching the structural
+            // tier's cost class rather than the content tier's corpus-scan
+            // budget, and `verify_seal_divergence` re-lists every shard itself.
+            run_seal_divergence_tick(store, tenant, signal, metrics).await;
+        }
+    }
+}
+
+/// One seal-divergence tick over one `(tenant, signal)` (ADR-0059 decision 2,
+/// issue #695): re-list the sealed commit records and diff them against the
+/// folded snapshot via [`ravel_catalog::verify_seal_divergence`] (the exact
+/// comparison `ravel-cli catalog verify` runs), recording missing and
+/// mismatched counts on the metrics.
+///
+/// `orphaned` divergences never increment anything: a snapshot entry with no
+/// surviving sealed commit record is the expected shape once retention deletes a
+/// folded record. An absent HEAD (nothing folded yet) is normal, not a fault. A
+/// read or decode failure is logged and skipped for this tick, never counted as
+/// an anomaly (a transient store error must not read as seal loss).
+async fn run_seal_divergence_tick(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    metrics: &ScrubMetrics,
+) {
+    match ravel_catalog::verify_seal_divergence(store, tenant, signal).await {
+        Ok(Some(report)) => {
+            if !report.missing.is_empty() {
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal,
+                    missing = report.missing.len(),
+                    "scrub: sealed commit records missing from the folded snapshot (seal divergence)"
+                );
+                metrics.record_seal_divergence_missing(signal, report.missing.len() as u64);
+            }
+            if !report.mismatched.is_empty() {
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal,
+                    mismatched = report.mismatched.len(),
+                    "scrub: snapshot entries disagree with the sealed commit record content hash"
+                );
+                metrics.record_seal_divergence_mismatched(signal, report.mismatched.len() as u64);
+            }
+        }
+        Ok(None) => {
+            // No HEAD yet for this (tenant, signal): nothing folded, nothing to
+            // verify. Normal, not a fault.
+        }
+        Err(err) => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(), signal = ?signal, error = %err,
+                "scrub: seal-divergence check failed to read or decode; skipped this tick, retried"
+            );
         }
     }
 }
