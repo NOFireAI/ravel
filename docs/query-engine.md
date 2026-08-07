@@ -151,7 +151,23 @@ range-evaluation points per query (11,000, matching the Prometheus
 resolution limit; issue #77), wall deadline (server maximum, default
 30 s). The `timeout` param can only lower the deadline: values above the
 server maximum are clamped to it (issue #58). Exceeding a budget returns a
-Prometheus-style error, never a partial silent result. The point cap is
+Prometheus-style error, never a partial silent result.
+
+Per-tenant max bytes scanned (`ByteLimit`, default `Unlimited`; ADR-0061
+decision 1, issue #721) bounds the total S3 bytes one query may fetch
+across every segment its shared snapshot resolves to, protecting against a
+selector that passes the count caps but whose covering segments are large.
+It is checked once per completed segment fetch, inside the two fetch
+fan-outs (`fetch_all_series` for the labels/series endpoints,
+`fetch_all_samples_and_histograms` for instant/range queries) rather than
+after the merge, so a tripped budget cancels the query mid-scan: returning
+early drops the fetch stream and stops polling the remaining segments'
+in-flight GETs. Exceeding it returns `TooManyBytesScanned` (HTTP 422),
+distinct from the count-cap errors. The default is `Unlimited` so an
+existing deployment is never silently rejected on upgrade; opting in to a
+bound is explicit. Like every count cap, enforcement is per completed
+segment, so a single very large segment can overshoot the bound by up to
+its own size before the next check fires. The point cap is
 enforced independently at every subquery evaluation node (`expr[5m:1m]`),
 checked against that node's own grid before it is built, so a nested
 subquery whose own grid alone exceeds the cap is rejected before any
