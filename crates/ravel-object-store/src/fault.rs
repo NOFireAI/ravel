@@ -37,17 +37,30 @@
 //!   surfaces as an `Err` (most kinds) or an `Ok` with corrupted contents
 //!   (`CorruptRange`).
 //!
-//! Deliberately out of scope: "reordered completion" is mentioned as an
-//! aspiration in the contract doc's implementation summary but is not part
-//! of this crate's fault-plan surface (see the issue's deliverable list).
+//! Beyond that synchronous fault plan, a separate hold-and-release gate
+//! controls *completion ordering* across concurrently in-flight calls
+//! (ADR-0059 decision 5). A gate registered with [`FaultStore::hold`] matches
+//! a call the same way a [`Rule`] does -- by [`Op`], optional key substring,
+//! and [`Occurrence`] -- but instead of resolving to a per-call outcome it
+//! blocks the matching call inside `FaultStore` until a test-side
+//! [`GateHandle`] releases that specific held call. This is a hold/release
+//! protocol orthogonal to the rule/sequence outcome table: a gated call still
+//! flows through the fault plan once released, so a gate composes with a
+//! scripted fault rather than replacing it. It is a test-only mechanism (not a
+//! general store capability, and no production path depends on completion
+//! order, per ADR-0059) for driving the two places completion order is
+//! contract-relevant but was never exercised before: multipart part completion
+//! and cross-shard commit-record visibility ordering.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use tokio::sync::{Notify, oneshot};
 
 use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
@@ -327,6 +340,158 @@ impl FaultPlan {
     }
 }
 
+/// A registered hold gate (ADR-0059 decision 5). Matches calls exactly as a
+/// [`Rule`] does -- by [`Op`], optional key substring, and [`Occurrence`] --
+/// but rather than resolving to an outcome it holds each firing call open
+/// until a [`GateHandle`] releases it.
+struct Gate {
+    op: Op,
+    key_contains: Option<String>,
+    occurrence: Occurrence,
+    /// Matching calls seen so far, to evaluate `Occurrence::Nth`.
+    matches: AtomicU64,
+}
+
+/// One call currently held by a gate, waiting for its release signal.
+struct HeldCall {
+    id: u64,
+    op: Op,
+    key: String,
+    /// Sending `()` unblocks the held call. A dropped receiver (the caller
+    /// cancelled) just means nobody is waiting; the send fails harmlessly.
+    release: oneshot::Sender<()>,
+}
+
+/// Shared hold/release state, owned by the `FaultStore` and every
+/// [`GateHandle`] it hands out. Independent of the synchronous fault plan:
+/// arming a gate never touches rule/sequence/counter state, so a gate and a
+/// scripted fault compose on the same call.
+#[derive(Default)]
+struct GateRegistry {
+    gates: Mutex<Vec<Gate>>,
+    held: Mutex<Vec<HeldCall>>,
+    next_id: AtomicU64,
+    /// Notified whenever a call is added to `held`, so
+    /// [`GateHandle::wait_until_held`] parks instead of busy-polling.
+    changed: Notify,
+}
+
+impl GateRegistry {
+    /// If a gate matches and fires for this call, register it as held and
+    /// return the receiver the caller must await; otherwise return `None` to
+    /// pass straight through. Never blocks: the actual await happens in the
+    /// caller, so the registry locks are only ever held across in-memory work.
+    fn arm(&self, op: Op, key: &str) -> Option<oneshot::Receiver<()>> {
+        let should_hold = {
+            let gates = self.gates.lock();
+            let mut hold = false;
+            for gate in gates.iter() {
+                if gate.op != op {
+                    continue;
+                }
+                if let Some(pattern) = &gate.key_contains
+                    && !key.contains(pattern.as_str())
+                {
+                    continue;
+                }
+                // First matching gate governs the call, same precedence rule as
+                // rules: it either holds this call or lets it pass.
+                let n = gate.matches.fetch_add(1, Ordering::SeqCst) + 1;
+                hold = match gate.occurrence {
+                    Occurrence::Always => true,
+                    Occurrence::Nth(target) => n == target,
+                };
+                break;
+            }
+            hold
+        };
+        if !should_hold {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.held.lock().push(HeldCall {
+            id,
+            op,
+            key: key.to_string(),
+            release: tx,
+        });
+        self.changed.notify_waiters();
+        Some(rx)
+    }
+}
+
+/// Test-side control over the hold gates registered on a [`FaultStore`].
+/// Cloneable and `'static` (it shares the store's gate state through an
+/// `Arc`), so a test can move clones into spawned tasks while driving release
+/// order from the outside. Every handle from one store sees the same held set,
+/// regardless of which [`FaultStore::hold`] call produced it.
+#[derive(Clone)]
+pub struct GateHandle {
+    registry: Arc<GateRegistry>,
+}
+
+impl GateHandle {
+    /// Ids of the calls currently held, in the order they were held (ascending
+    /// id). Empty once every held call has been released.
+    pub fn held(&self) -> Vec<u64> {
+        self.registry.held.lock().iter().map(|c| c.id).collect()
+    }
+
+    /// `(id, op, key)` for every currently held call, in hold order, so a test
+    /// can pick a specific call to release by the key it matched (e.g. one
+    /// shard's commit-record PUT among several concurrently held).
+    pub fn held_details(&self) -> Vec<(u64, Op, String)> {
+        self.registry
+            .held
+            .lock()
+            .iter()
+            .map(|c| (c.id, c.op, c.key.clone()))
+            .collect()
+    }
+
+    /// How many calls are held right now.
+    pub fn held_count(&self) -> usize {
+        self.registry.held.lock().len()
+    }
+
+    /// Wait until at least `n` calls are held simultaneously. Parks on a
+    /// `Notify` woken each time a call is held; no busy-polling.
+    pub async fn wait_until_held(&self, n: usize) {
+        loop {
+            let notified = self.registry.changed.notified();
+            tokio::pin!(notified);
+            // Register before checking, so a hold landing between the check and
+            // the await is not lost.
+            notified.as_mut().enable();
+            if self.registry.held.lock().len() >= n {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the held call with `id`, letting its blocked operation proceed
+    /// through the rest of the fault plan and into the backend. Returns `true`
+    /// if a call with that id was held, `false` if it was not (already
+    /// released, or never held).
+    pub fn release(&self, id: u64) -> bool {
+        let call = {
+            let mut held = self.registry.held.lock();
+            held.iter()
+                .position(|c| c.id == id)
+                .map(|pos| held.remove(pos))
+        };
+        match call {
+            Some(call) => {
+                let _ = call.release.send(());
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 struct RuleState {
     rule: Rule,
     /// Count of calls that matched this rule's `op` + `key_contains`, used
@@ -409,6 +574,11 @@ pub struct FaultStore<S> {
     rules: Vec<RuleState>,
     random: Option<RandomState>,
     counters: RwLock<HashMap<(Op, FaultKind), u64>>,
+    /// Hold-and-release gates (ADR-0059 decision 5). Separate from the fault
+    /// plan above: gates are registered at runtime via [`FaultStore::hold`],
+    /// not carried in the [`FaultPlan`], and control completion ordering rather
+    /// than per-call outcomes.
+    gates: Arc<GateRegistry>,
 }
 
 impl<S: ObjectStoreBackend> FaultStore<S> {
@@ -439,6 +609,7 @@ impl<S: ObjectStoreBackend> FaultStore<S> {
             rules,
             random,
             counters: RwLock::new(HashMap::new()),
+            gates: Arc::new(GateRegistry::default()),
         }
     }
 
@@ -474,6 +645,37 @@ impl<S: ObjectStoreBackend> FaultStore<S> {
 
     fn record(&self, op: Op, kind: FaultKind) {
         *self.counters.write().entry((op, kind)).or_insert(0) += 1;
+    }
+
+    /// Register a hold gate that blocks every matching call inside
+    /// `FaultStore` until the returned [`GateHandle`] releases it (ADR-0059
+    /// decision 5). Matching is identical to a [`Rule`]'s (`op` + optional
+    /// `key_contains` + `occurrence`), but a gate holds a concurrently
+    /// in-flight call rather than resolving it to an outcome, so it composes
+    /// with -- does not replace -- any rule or sequence on the same call.
+    /// Registering several gates shares one held-call registry: every returned
+    /// handle sees the same held set.
+    pub fn hold(&self, op: Op, key_contains: Option<String>, occurrence: Occurrence) -> GateHandle {
+        self.gates.gates.lock().push(Gate {
+            op,
+            key_contains,
+            occurrence,
+            matches: AtomicU64::new(0),
+        });
+        GateHandle {
+            registry: Arc::clone(&self.gates),
+        }
+    }
+
+    /// Block this call if a hold gate is armed for it, until released. Called
+    /// at the head of every operation, before [`FaultStore::resolve`], so the
+    /// gate's hold/release protocol stays independent of the synchronous fault
+    /// table: `resolve` still performs no I/O and needs no `await`, and a
+    /// released call still flows through whatever rule or sequence governs it.
+    async fn gate_hold(&self, op: Op, key: &str) {
+        if let Some(rx) = self.gates.arm(op, key) {
+            let _ = rx.await;
+        }
     }
 
     /// Decide whether a fault fires for this call, without performing any
@@ -543,6 +745,67 @@ impl<S: ObjectStoreBackend> FaultStore<S> {
     }
 }
 
+/// Multipart wrapper that routes each part completion through the gate
+/// registry (ADR-0059 decision 5). `put_part` forwards to the inner handle
+/// unchanged -- part ordering, size rules, and poisoning stay the inner
+/// backend's, so an ungated `FaultStore` is fully transparent (the contract
+/// suite runs its whole multipart assertion set against one). `complete` first
+/// arms one gate check per submitted part, all concurrently, modeling the
+/// parts' independent uploads completing: a gate holding this key blocks every
+/// part completion at once, and a test releases them in any order. Assembly
+/// order is fixed by submission (the inner handle buffered parts in `put_part`
+/// call order), so the completed object is byte-correct regardless of the order
+/// completions are released -- the property the object-store contract has
+/// always claimed for multipart but nothing drove until now.
+struct GatedMultipartUpload<'a> {
+    inner: Box<dyn MultipartUpload + 'a>,
+    registry: Arc<GateRegistry>,
+    key: String,
+    /// Count of accepted `put_part` calls, so `complete` arms one gate check
+    /// per part.
+    parts: u32,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for GatedMultipartUpload<'_> {
+    async fn put_part(
+        &mut self,
+        data: Bytes,
+        checksum: Option<crate::UploadChecksum>,
+    ) -> Result<(), StoreError> {
+        // Forward first: a rejected part (checksum mismatch, sequence-rule
+        // violation, backend failure) must not count toward the completion
+        // barriers `complete` arms below.
+        self.inner.put_part(data, checksum).await?;
+        self.parts += 1;
+        Ok(())
+    }
+
+    async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
+        // Arm one gate check per submitted part, concurrently, so a gate on
+        // this key holds every part completion simultaneously. `join_all` polls
+        // them together; each firing check registers a distinct held call, so a
+        // test can wait for all N to be held and release them in any order
+        // before assembly proceeds. With no gate armed, every check passes
+        // straight through and this is a plain delegated `complete`.
+        let barriers = (0..self.parts).map(|_| {
+            let registry = Arc::clone(&self.registry);
+            let key = self.key.clone();
+            async move {
+                if let Some(rx) = registry.arm(Op::Put, &key) {
+                    let _ = rx.await;
+                }
+            }
+        });
+        futures::future::join_all(barriers).await;
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<(), StoreError> {
+        self.inner.abort().await
+    }
+}
+
 fn duplicate_delivery_error() -> StoreError {
     StoreError::Transient("fault: duplicate delivery, ack lost after apply".into())
 }
@@ -561,6 +824,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
+        self.gate_hold(Op::Put, key).await;
         match self.resolve(Op::Put, key) {
             None => self.inner.put(key, data, opts).await,
             Some(ScriptedFault::PartialWriteThenError) => Err(StoreError::Transient(
@@ -588,6 +852,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.gate_hold(Op::Get, key).await;
         match self.resolve(Op::Get, key) {
             None => self.inner.get(key, range).await,
             Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
@@ -618,21 +883,30 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
         }
     }
 
-    /// Passthrough: multipart uploads carry no injectable faults today, like
-    /// reordered completion (module doc, "Deliberately out of scope"). A plan
-    /// scripted against `Op::Put` does not fire here, and the parts of a
-    /// multipart upload are not fault sites, so no test may be built on
-    /// faulting one. Delegation keeps the wrapper transparent, so a
+    /// A multipart upload carries no scripted (`Rule`/`Sequence`) fault today,
+    /// but its part completions are gate sites for the hold-and-release
+    /// primitive (ADR-0059 decision 5). The returned [`GatedMultipartUpload`]
+    /// delegates the whole part sequence to the inner handle, so an ungated
     /// `FaultStore` over a multipart-capable backend still satisfies the
-    /// multipart contract its `capabilities()` passthrough claims.
+    /// multipart contract its `capabilities()` passthrough claims; when a gate
+    /// matches this key, `complete` holds every submitted part's completion
+    /// until released. A backend that refuses multipart still refuses here (the
+    /// error propagates before any wrapper is built).
     async fn put_multipart<'a>(
         &'a self,
         key: &str,
     ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
-        self.inner.put_multipart(key).await
+        let inner = self.inner.put_multipart(key).await?;
+        Ok(Box::new(GatedMultipartUpload {
+            inner,
+            registry: Arc::clone(&self.gates),
+            key: key.to_string(),
+            parts: 0,
+        }))
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.gate_hold(Op::Head, key).await;
         match self.resolve(Op::Head, key) {
             None => self.inner.head(key).await,
             Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
@@ -656,6 +930,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.gate_hold(Op::List, prefix).await;
         match self.resolve(Op::List, prefix) {
             None => self.inner.list(prefix, page).await,
             Some(ScriptedFault::DuplicateDelivery) => {
@@ -673,6 +948,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.gate_hold(Op::List, prefix).await;
         match self.resolve(Op::List, prefix) {
             None => self.inner.list_delimited(prefix).await,
             Some(ScriptedFault::DuplicateDelivery) => {
@@ -690,6 +966,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.gate_hold(Op::Delete, key).await;
         match self.resolve(Op::Delete, key) {
             None => self.inner.delete(key).await,
             Some(ScriptedFault::DuplicateDelivery) => {
@@ -1171,5 +1448,109 @@ mod tests {
         assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
         // The out-of-range index is safe and reports zero.
         assert_eq!(store.sequence_progress(99), 0);
+    }
+
+    #[tokio::test]
+    async fn hold_gate_blocks_a_matching_call_until_released() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        store
+            .put("k", Bytes::from_static(b"v"), PutOptions::default())
+            .await
+            .expect("seed happens before the gate is registered, so it is not held");
+        let gate = store.hold(Op::Get, Some("k".into()), Occurrence::Always);
+
+        let task_store = Arc::clone(&store);
+        let task = tokio::spawn(async move { task_store.get("k", GetRange::Full).await });
+
+        // The get is genuinely in flight and parked inside the gate.
+        gate.wait_until_held(1).await;
+        assert_eq!(gate.held_count(), 1);
+        let ids = gate.held();
+        assert_eq!(ids.len(), 1);
+
+        // Releasing an unknown id is a no-op; releasing the held one unblocks it.
+        assert!(!gate.release(ids[0] + 999));
+        assert!(gate.release(ids[0]));
+        let got = task.await.expect("join").expect("get after release");
+        assert_eq!(&got.data[..], b"v");
+        assert_eq!(gate.held_count(), 0);
+        // A second release of the same id finds nothing left.
+        assert!(!gate.release(ids[0]));
+    }
+
+    #[tokio::test]
+    async fn hold_gate_releases_concurrent_calls_in_any_order() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = store.hold(Op::Put, Some("part".into()), Occurrence::Always);
+
+        // Three puts issued concurrently, every one held at once.
+        let mut tasks = Vec::new();
+        for i in 0..3u8 {
+            let task_store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                task_store
+                    .put(
+                        &format!("part-{i}"),
+                        Bytes::copy_from_slice(&[i]),
+                        PutOptions::default(),
+                    )
+                    .await
+            }));
+        }
+        gate.wait_until_held(3).await;
+        let ids = gate.held();
+        assert_eq!(ids.len(), 3, "all three puts are held simultaneously");
+
+        // Release middle, then last, then first: order fully under test control.
+        assert!(gate.release(ids[1]));
+        assert!(gate.release(ids[2]));
+        assert!(gate.release(ids[0]));
+        for task in tasks {
+            task.await.expect("join").expect("put after release");
+        }
+        assert_eq!(gate.held_count(), 0);
+
+        // Every object landed, regardless of the order completions were released.
+        for i in 0..3u8 {
+            let got = store
+                .get(&format!("part-{i}"), GetRange::Full)
+                .await
+                .expect("get");
+            assert_eq!(&got.data[..], &[i]);
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_gate_nth_holds_only_the_target_call() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        store
+            .put("k", Bytes::from_static(b"v"), PutOptions::default())
+            .await
+            .expect("seed");
+        // Only the 2nd matching get is held; the 1st and 3rd pass straight through.
+        let gate = store.hold(Op::Get, Some("k".into()), Occurrence::Nth(2));
+
+        store
+            .get("k", GetRange::Full)
+            .await
+            .expect("first get passes");
+        assert_eq!(gate.held_count(), 0);
+
+        let task_store = Arc::clone(&store);
+        let held = tokio::spawn(async move { task_store.get("k", GetRange::Full).await });
+        gate.wait_until_held(1).await;
+        assert_eq!(gate.held_count(), 1);
+
+        // A concurrent 3rd get is not held and completes on its own.
+        store
+            .get("k", GetRange::Full)
+            .await
+            .expect("third get passes");
+        assert_eq!(gate.held_count(), 1);
+
+        let ids = gate.held();
+        assert!(gate.release(ids[0]));
+        held.await.expect("join").expect("second get after release");
+        assert_eq!(gate.held_count(), 0);
     }
 }
