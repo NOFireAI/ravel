@@ -391,8 +391,7 @@ impl LogSegmentFetcher {
         // This funnel issues exactly one whole-object GET per call.
         fetch_span.record("s3_requests", 1u64);
         fetch_span.record("s3_bytes", got.data.len() as u64);
-        tracing::debug_span!("decode", signal = "logs")
-            .in_scope(|| self.scan_bytes(key, &got.data, query))
+        self.decode_spanned(key, &got.data, query)
     }
 
     /// Cache-aware counterpart of [`fetch_accounted`](Self::fetch_accounted):
@@ -462,8 +461,7 @@ impl LogSegmentFetcher {
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            return tracing::debug_span!("decode", signal = "logs")
-                .in_scope(|| self.scan_bytes(key, &got.data, query));
+            return self.decode_spanned(key, &got.data, query);
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -520,8 +518,49 @@ impl LogSegmentFetcher {
             fetch_span.record("s3_bytes", bytes.len() as u64);
             bytes
         };
-        tracing::debug_span!("decode", signal = "logs")
-            .in_scope(|| self.scan_bytes(key, &bytes, query))
+        self.decode_spanned(key, &bytes, query)
+    }
+
+    /// Runs [`scan_bytes`](Self::scan_bytes) inside the log path's `decode`
+    /// span, recording the reader's block-scan counts on it afterward.
+    ///
+    /// # Why this span's field set diverges from the metric path's `decode`
+    ///
+    /// The metric path's `decode` span (`crate::fetcher`) carries `page_kind`,
+    /// `series_count`, and `decompressed_bytes`. This one carries `signal =
+    /// "logs"` plus `blocks_scanned`/`blocks_total`, and no `decompressed_bytes`
+    /// (issue #720, documented in docs/guides/tracing.md). No decompressed-byte
+    /// count is cheaply available here: [`ScanStats`] carries block counts, not
+    /// bytes, and decompression happens per block inside
+    /// [`RlogReader::scan_pruned`] (`read_block`) where the total is never
+    /// summed. Surfacing one would need a new `ScanStats` field and a structural
+    /// change to `ravel-logseg`, out of scope for a fix confined to this crate.
+    ///
+    /// `blocks_scanned`/`blocks_total` are instead a real, already-computed
+    /// pruning-effectiveness signal -- how much of the object's block index the
+    /// scan actually had to touch after skip-index, POSTINGS, and bloom pruning
+    /// -- analogous to the metric path's `catalog_resolve` `segments_pruned`,
+    /// which is likewise a pruning count rather than a byte count. Every phase
+    /// span in the codebase carries at least one count field; before this the
+    /// logs `decode` span carried none.
+    fn decode_spanned(
+        &self,
+        key: &str,
+        bytes: &Bytes,
+        query: &LogQuery,
+    ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        let span = tracing::debug_span!(
+            "decode",
+            signal = "logs",
+            blocks_scanned = tracing::field::Empty,
+            blocks_total = tracing::field::Empty,
+        );
+        let out = span.in_scope(|| self.scan_bytes(key, bytes, query))?;
+        if let Some(output) = &out {
+            span.record("blocks_scanned", output.stats.blocks_scanned);
+            span.record("blocks_total", output.stats.blocks_total);
+        }
+        Ok(out)
     }
 
     /// Shared tail of both fetch entry points: resolve stream-attribute

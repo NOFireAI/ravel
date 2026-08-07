@@ -78,6 +78,38 @@ Field notes, all verified against the fields the code records:
   pure in-memory evaluation over already-fetched data, so its cost is time,
   not bytes.
 
+### The logs signal reuses two span names with a different field set
+
+The table above is the metric read path. The logs read path
+(`crates/ravel-query/src/log_fetcher.rs`, serving RLOG objects through
+`RlogReader`) reuses the `page_fetch` and `decode` span names for its own two
+phases, but carries a different field set under them. Both logs spans add
+`signal = "logs"`; the metric spans carry no `signal` field. Match on the span
+name alone and you will see two shapes:
+
+| Span | Signal | Fields |
+|---|---|---|
+| `page_fetch` | metric | `page_kind`, `series_count`, `s3_requests`, `s3_bytes` |
+| `page_fetch` | logs | `signal = "logs"`, `s3_requests`, `s3_bytes` |
+| `decode` | metric | `page_kind`, `series_count`, `decompressed_bytes` |
+| `decode` | logs | `signal = "logs"`, `blocks_scanned`, `blocks_total` |
+
+- The logs `page_fetch` records `s3_requests`/`s3_bytes` with the same meaning
+  as the metric one (this call's own store-GET cost: one GET on the uncached or
+  cache-miss path, zero on a cache hit). It carries no `page_kind` or
+  `series_count`: RLOG has no scalar/histogram page kinds, and its unit of
+  identity is the log stream, not the metric series, so neither field maps onto
+  this path.
+- The logs `decode` records `blocks_scanned` and `blocks_total` from the
+  reader's `ScanStats` rather than `decompressed_bytes`. No decompressed-byte
+  count is available here without a structural change to `ravel-logseg`:
+  `ScanStats` counts blocks, not bytes, and per-block decompression inside the
+  reader is never summed. `blocks_scanned`/`blocks_total` are instead a real
+  pruning-effectiveness signal (how much of the object's block index the scan
+  had to touch after skip-index, POSTINGS, and bloom pruning), analogous to
+  `catalog_resolve`'s `segments_pruned` on the metric path, which is likewise a
+  pruning count and not a byte count.
+
 ## Turning them on
 
 The request-level spans are `info`, so they are visible under the default
