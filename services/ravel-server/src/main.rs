@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use ravel_maintain::{CompactorConfig, RetentionConfig};
 use ravel_server::alert_sink::DEFAULT_SINK_TIMEOUT;
 use ravel_server::alerting::{DEFAULT_QUERY_DEADLINE, load_rules_file};
@@ -37,23 +37,7 @@ async fn main() -> anyhow::Result<()> {
     // before, byte-for-byte (decision 1); with it set, the same subscriber
     // gains an OTLP/gRPC export layer sharing that one filter (decision 2).
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let otlp_config = cli.otlp_trace_endpoint.as_ref().map(|endpoint| {
-        ravel_tracing_export::OtlpExportConfig {
-            endpoint: endpoint.clone(),
-            service_name: "ravel-server".to_string(),
-            // The `ravel.mode` resource attribute mirrors the `/metrics` `mode`
-            // label (ADR-0060 decision 5). Both derive from clap's ValueEnum
-            // rendering of `Mode`, the same source `--mode` parses and
-            // `metrics::mode_name` mirrors, so there is one spelling, not a
-            // second.
-            mode: cli
-                .mode
-                .to_possible_value()
-                .map(|value| value.get_name().to_string())
-                .unwrap_or_default(),
-        }
-    });
-    let trace_guard = ravel_tracing_export::init(filter, otlp_config);
+    let trace_guard = ravel_tracing_export::init(filter, cli.otlp_export_config());
 
     // Cross-flag startup invariants (ADR-0050 section 1): the dev-header
     // loopback rule plus every --mtls-listener misconfiguration. Every case
@@ -382,7 +366,12 @@ async fn main() -> anyhow::Result<()> {
     // chance of having been recorded and enqueued before the exporter shuts
     // down. A no-op when --otlp-trace-endpoint was absent. `ExportGuard`'s
     // `Drop` is the backstop if an earlier `?` returns before this line.
-    trace_guard.flush();
+    // `flush` is a blocking call (both test files wrap it in `spawn_blocking`
+    // for the same reason); running it directly on this async task would
+    // hold a runtime worker for up to the exporter's own shutdown timeout,
+    // risking an otherwise-graceful shutdown overrunning its termination
+    // grace period against a slow collector.
+    let _ = tokio::task::spawn_blocking(move || trace_guard.flush()).await;
     Ok(())
 }
 

@@ -280,8 +280,10 @@ fn signal_name(signal: Signal) -> &'static str {
 }
 
 /// Exhaustive: adding a [`Mode`] variant breaks this compile until it is
-/// handled here.
-fn mode_name(mode: Mode) -> &'static str {
+/// handled here. Public so `main.rs` can derive the OTLP export `ravel.mode`
+/// resource attribute (ADR-0060 decision 5) from this single spelling
+/// instead of a second, independently-derived rendering.
+pub fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::All => "all",
         Mode::Gateway => "gateway",

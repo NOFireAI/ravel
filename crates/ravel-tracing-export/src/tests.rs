@@ -298,14 +298,17 @@ async fn an_unreachable_collector_never_blocks_or_errors_the_caller() {
     );
 
     // The shutdown flush is best-effort: it returns even though the collector
-    // is unreachable, never propagating an error to the shutdown path.
+    // is unreachable, never propagating an error to the shutdown path. Two
+    // nested results to check, not one: `timeout`'s Ok means it didn't hang,
+    // and the inner `JoinHandle`'s Ok means `flush()` itself didn't panic --
+    // a bare `flush.is_ok()` on the outer result alone would pass even if
+    // `flush()` panicked, since `spawn_blocking` turns a panic into an `Err`
+    // on the *inner* result, not a timeout.
     let flush = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::task::spawn_blocking(move || guard.flush()),
     )
-    .await;
-    assert!(
-        flush.is_ok(),
-        "flushing against an unreachable collector must return, not hang"
-    );
+    .await
+    .expect("flushing against an unreachable collector must return, not hang");
+    flush.expect("flush must not panic against an unreachable collector");
 }

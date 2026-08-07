@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::{
     TraceService, TraceServiceServer,
 };
@@ -257,8 +257,11 @@ async fn sql_query_span_is_exported_to_the_configured_collector() {
     let mock = start_mock_collector();
 
     // Parse a real Cli carrying the flag, proving the CLI surface (deliverable
-    // 4) reaches `cli.otlp_trace_endpoint`, then derive the export config the
-    // exact way `main.rs` does (service.name plus the clap-rendered mode).
+    // 4) reaches `cli.otlp_trace_endpoint`, then derive the export config
+    // through `Cli::otlp_export_config` -- the same method `main.rs` calls,
+    // not a second, independently-written derivation that could drift from
+    // it (this test previously copied the expression verbatim; a change to
+    // `main.rs`'s derivation could not have failed it).
     let cli = Cli::try_parse_from([
         "ravel-server",
         "--mode",
@@ -272,18 +275,7 @@ async fn sql_query_span_is_exported_to_the_configured_collector() {
         Some(mock.endpoint().as_str())
     );
 
-    let otlp_config =
-        cli.otlp_trace_endpoint
-            .as_ref()
-            .map(|endpoint| ravel_tracing_export::OtlpExportConfig {
-                endpoint: endpoint.clone(),
-                service_name: "ravel-server".to_string(),
-                mode: cli
-                    .mode
-                    .to_possible_value()
-                    .map(|value| value.get_name().to_string())
-                    .unwrap_or_default(),
-            });
+    let otlp_config = cli.otlp_export_config();
     assert!(
         otlp_config.is_some(),
         "the flag must yield an export config"
