@@ -370,7 +370,11 @@ async fn main() -> anyhow::Result<()> {
     // for the same reason); running it directly on this async task would
     // hold a runtime worker for up to the exporter's own shutdown timeout,
     // risking an otherwise-graceful shutdown overrunning its termination
-    // grace period against a slow collector.
+    // grace period against a slow collector. The discarded `Result` is a
+    // `JoinError` should `flush()` itself ever panic, not an export error --
+    // `flush()` already swallows those by design (decision 6) -- so this
+    // deliberately does not propagate a panic into shutdown either; the
+    // process still exits cleanly either way.
     let _ = tokio::task::spawn_blocking(move || trace_guard.flush()).await;
     Ok(())
 }
