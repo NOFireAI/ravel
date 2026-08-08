@@ -137,6 +137,17 @@ piece, see [docs/adrs/](docs/adrs/).
   health routes, in every mode. It exports Ravel's own object-store, ingest,
   catalog, cache, admission, and per-query cost counters under a closed label
   allowlist. See [docs/guides/observability.md](docs/guides/observability.md).
+- **Query-path tracing spans** ([ADR-0044](docs/adrs/0044-query-cost-accounting.md)
+  decision 5): a request-level `sql_query`/`analytics_query`/
+  `flight_sql_statement` span, always visible, wrapping six `debug`-level
+  phase spans -- `catalog_resolve`, `segment_open`, `catalog_decode`,
+  `page_fetch`, `decode`, `evaluate` -- each carrying its own byte/request
+  counts, off under the default log filter until `RUST_LOG` is widened, so a
+  slow query's time attributes to a phase. Optional OTLP/gRPC export
+  ([ADR-0060](docs/adrs/0060-query-path-otlp-trace-export.md)) ships the same
+  spans to a collector, off by default via `--otlp-trace-endpoint` on
+  `ravel-server` and `ravel-operator`, best-effort and never blocking a
+  query. See [docs/guides/tracing.md](docs/guides/tracing.md).
 - **A Kubernetes operator** (`ravel-operator`): a `RavelCluster` CRD that
   reconciles the gateway, ingest, query, and maintain roles as separate
   deployments. See [docs/guides/kubernetes.md](docs/guides/kubernetes.md).
@@ -347,7 +358,7 @@ Pull the published image, or build natively on an amd64 host, instead.
 - [docs/span-segment-format.md](docs/span-segment-format.md): the RSPAN
   v1 specification (ADR-0041)
 - [docs/guides/](docs/guides/): getting started, ingest, admission limits,
-  query, operations, observability, inspecting data, Kubernetes
+  query, operations, observability, tracing, inspecting data, Kubernetes
 - [docs/adrs/](docs/adrs/): one decision record per architectural choice
 - [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
   conformance table, classifying every construct as supported,
