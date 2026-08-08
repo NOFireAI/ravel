@@ -32,6 +32,23 @@ use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
+// EH-T6 (#744) additions. The multi-part fold acceptance test drives the real
+// durable object layout (commit records, compaction records, retention
+// tombstones) through the same publish/record/key APIs the ingest flush and
+// the maintain compaction/retention tasks use, then exercises the real
+// `Catalog::fold` and `Catalog::resolve` entry points the server's fold task
+// and query engine call.
+use ravel_catalog::{
+    Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+    DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_SNAPSHOT_PART_BYTES, PartLimits, SegmentLevel,
+    SegmentRef, Snapshot, decode_head, decode_part,
+};
+use ravel_commit::{keys, signal};
+use ravel_proto::commit::v1::{
+    CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord, RetentionTombstone,
+};
+use ravel_types::{TenantHash, TimeRange};
+
 const TOKEN: &str = "testtoken";
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
@@ -531,4 +548,481 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+// ---- EH-T6 (#744): multi-part parallel fold end-to-end reachability ----
+//
+// ADR-0063 section 8 (acceptance S3-E2/E3). Drives a tenant's sealed segment
+// count past a scaled-down single-part ceiling and asserts, through the real
+// `Catalog` fold and resolve entry points, that: the fold produces multiple
+// parts under one HEAD; a whole-range query returns exactly what the
+// listing-path (never-folded) resolve returns; a late compaction supersession
+// and a retention tombstone landing in already-folded hours are reflected
+// after a reconcile pass; and every fold step keeps every part under the
+// per-part decode cap (no oversized single-part blowup).
+
+/// Seal margin under default catalog config: an ingest hour `H` is sealed once
+/// `now >= end(H) + max_flush_lifetime + clock_skew_allowance +
+/// fold_safety_margin` (docs/catalog-and-mvcc.md, ADR-0020).
+const MARGIN_NS: i64 =
+    DEFAULT_MAX_FLUSH_LIFETIME_NS + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+/// A scaled-down single-part ceiling (ADR-0063 section 8: "cap 100 entries"
+/// down here to 3): a modest, hour-partitioned segment count crosses it and
+/// forces the fold to split into several parts. Splits are always at hour
+/// boundaries, so one segment per hour makes each part hold exactly `PART_CAP`
+/// hours until the tail.
+const PART_CAP: usize = 3;
+
+/// `now_ns` at which ingest hour `hour` has exactly sealed under default
+/// margins. Mirrors the catalog fold unit tests' `now_at_seal`, kept local so
+/// this e2e test drives `Catalog::fold` with a deterministic injected clock
+/// (the crate never reads a wall clock; only the server's fold *task* does).
+fn seal_now(hour: u32) -> i64 {
+    (i64::from(hour) + 1) * NS_PER_HOUR + MARGIN_NS
+}
+
+/// Publish one real durable L0 metric segment into every store in `stores`,
+/// bucketed at sealed ingest `hour`, via the exact publish path the ingest
+/// shard's flush uses to make a segment durable (`put_data_object` for the
+/// data object, then `publish::publish` for the commit record). The payload is
+/// an opaque blob rather than a real RSEG: `Catalog::resolve` never decodes
+/// segment bytes (it resolves commit records into `SegmentRef`s), and the
+/// metrics fold's postings build tolerates an undecodable object by skipping
+/// the postings ref, so an opaque payload exercises exactly the fold/resolve
+/// paths under test. Returns the commit record so a later compaction can name
+/// its writer identity as a superseded input.
+async fn seed_metric_segment(
+    stores: &[&MemoryStore],
+    tenant: &TenantHash,
+    shard: u32,
+    writer_id: Uuid,
+    seq: u64,
+    hour: u32,
+) -> CommitRecord {
+    // Mid-hour keeps `created_hour_bucket == ingest_hour_bucket`, satisfying
+    // the commit record's ingest-hour/created-hour cross-check (ravel-commit
+    // `validate`).
+    let created_unix_ns = i64::from(hour) * NS_PER_HOUR + NS_PER_HOUR / 2;
+    let payload = format!("seg-{shard}-{writer_id}-{seq}-{hour}").into_bytes();
+    let content_hash = *blake3::hash(&payload).as_bytes();
+    let record = record::build(NewCommitRecord {
+        tenant_hash: *tenant,
+        signal: Signal::Metrics,
+        shard,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: seq,
+        object_size: payload.len() as u64,
+        content_hash,
+        sample_count: 1,
+        series_count: 1,
+        min_event_ts_ns: created_unix_ns - 1_000,
+        max_event_ts_ns: created_unix_ns,
+        min_ingest_ts_ns: created_unix_ns - 1_000,
+        max_ingest_ts_ns: created_unix_ns,
+        segment_format_version: 1,
+        created_unix_ns,
+        ingest_hour_bucket: hour,
+    })
+    .expect("valid metric commit record");
+    let data_key = keys::reconstruct_data_key(&record).expect("data key");
+    for store in stores {
+        publish::put_data_object(*store, &data_key, bytes::Bytes::from(payload.clone()))
+            .await
+            .expect("put data object");
+        publish::publish(*store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish commit record");
+    }
+    record
+}
+
+/// Publish a compaction record into `(shard, hour)` that supersedes the L0
+/// `inputs` with one L1 part, written at its reconstructed
+/// `l1.<hash>.cmt` key into every store, exactly as the maintain compaction
+/// task publishes it. Only the record object is written: both the fold and
+/// resolve read the compaction record, never the L1 part bytes (they
+/// reconstruct the part key from the record).
+async fn seed_compaction(
+    stores: &[&MemoryStore],
+    tenant: &TenantHash,
+    shard: u32,
+    hour: u32,
+    inputs: &[&CommitRecord],
+    created_unix_ns: i64,
+) -> CompactionRecord {
+    let input_ids: Vec<CompactionInputIdentity> = inputs
+        .iter()
+        .map(|r| CompactionInputIdentity {
+            writer_id: r.writer_id.clone(),
+            writer_epoch: r.writer_epoch,
+            writer_seq: r.writer_seq,
+        })
+        .collect();
+    let mut hasher = blake3::Hasher::new();
+    for id in &input_ids {
+        hasher.update(id.writer_id.as_bytes());
+        hasher.update(&id.writer_epoch.to_le_bytes());
+        hasher.update(&id.writer_seq.to_le_bytes());
+    }
+    let input_set_hash = *hasher.finalize().as_bytes();
+    let part_payload = format!("l1-{shard}-{hour}").into_bytes();
+    let part_content_hash = *blake3::hash(&part_payload).as_bytes();
+    let part = CompactionPart {
+        part_index: 0,
+        first_series_id: vec![0u8; 16],
+        last_series_id: vec![0xffu8; 16],
+        content_hash: part_content_hash.to_vec(),
+        object_size: part_payload.len() as u64,
+        sample_count: 1,
+        series_count: 1,
+        run_count: 1,
+        min_event_ts_ns: i64::from(hour) * NS_PER_HOUR + 1,
+        max_event_ts_ns: i64::from(hour) * NS_PER_HOUR + NS_PER_HOUR / 2,
+        segment_format_version: 3,
+    };
+    let record = CompactionRecord {
+        format_version: 1,
+        tenant_hash: tenant.0.to_vec(),
+        signal: signal::to_proto(Signal::Metrics).into(),
+        shard,
+        ingest_hour_bucket: hour,
+        level: 1,
+        inputs: input_ids,
+        input_set_hash: input_set_hash.to_vec(),
+        parts: vec![part],
+        created_unix_ns,
+    };
+    let key = keys::compaction_record_key_for(&record).expect("compaction key");
+    for store in stores {
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+    }
+    record
+}
+
+/// Publish a retention tombstone for `(shard, hour)` into every store, at its
+/// reconstructed `retire.tmb` key, exactly as the maintain retention task
+/// writes it. Both fold and resolve classify a bucket as tombstoned from the
+/// key shape alone, so a minimal valid record body suffices.
+async fn seed_tombstone(stores: &[&MemoryStore], tenant: &TenantHash, shard: u32, hour: u32) {
+    let record = RetentionTombstone {
+        format_version: 1,
+        tenant_hash: tenant.0.to_vec(),
+        signal: signal::to_proto(Signal::Metrics).into(),
+        shard,
+        ingest_hour_bucket: hour,
+        retired_at_ns: 0,
+        retention_window_ns: 0,
+        record_count_observed: 0,
+    };
+    let key = keys::retention_tombstone_key_for(&record).expect("tombstone key");
+    for store in stores {
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put tombstone");
+    }
+}
+
+/// The resolved segments of a snapshot, sorted by data-object key, so two
+/// resolves computed by different code paths can be compared as sets without
+/// depending on internal iteration order.
+fn sorted_segments(snap: &Snapshot) -> Vec<SegmentRef> {
+    let mut segs = snap.segments.clone();
+    segs.sort_by(|a, b| a.data_object_key.cmp(&b.data_object_key));
+    segs
+}
+
+/// Assert the HEAD's parts are all decodable under the default per-part decode
+/// cap (`DEFAULT_MAX_SNAPSHOT_PART_BYTES`, 256 MiB): a successful `decode_part`
+/// under `PartLimits::default()` is exactly the resolve-time bound, so this
+/// proves no fold step produced an oversized single-part blowup. Returns the
+/// part count for the caller's multi-part assertions.
+async fn assert_parts_under_decode_cap(store: &MemoryStore, tenant: &TenantHash) -> usize {
+    let head_key = head_key(&tenant.to_hex(), Signal::Metrics);
+    let head_bytes = store
+        .get(&head_key, GetRange::Full)
+        .await
+        .expect("HEAD present")
+        .data;
+    let head = decode_head(&head_bytes).expect("HEAD decodes");
+    for part in &head.parts {
+        assert!(
+            part.size <= DEFAULT_MAX_SNAPSHOT_PART_BYTES,
+            "part {} encoded size {} exceeds the decode cap {}",
+            part.key,
+            part.size,
+            DEFAULT_MAX_SNAPSHOT_PART_BYTES
+        );
+        let part_bytes = store
+            .get(&part.key, GetRange::Full)
+            .await
+            .expect("part object present")
+            .data;
+        decode_part(&part_bytes, &PartLimits::default()).unwrap_or_else(|err| {
+            panic!(
+                "part {} must decode under the per-part cap, got {err:?}",
+                part.key
+            )
+        });
+    }
+    head.parts.len()
+}
+
+/// The blake3 of the HEAD part that covers `hour`, or `None` if no part does.
+async fn covering_part_blake3(
+    store: &MemoryStore,
+    tenant: &TenantHash,
+    hour: u32,
+) -> Option<Vec<u8>> {
+    let head_key = head_key(&tenant.to_hex(), Signal::Metrics);
+    let head_bytes = store
+        .get(&head_key, GetRange::Full)
+        .await
+        .expect("HEAD present")
+        .data;
+    let head = decode_head(&head_bytes).expect("HEAD decodes");
+    head.parts
+        .iter()
+        .find(|p| p.min_hour <= hour && hour <= p.watermark_hour)
+        .map(|p| p.blake3.clone())
+}
+
+#[tokio::test]
+async fn multi_part_ceiling_crossing_folds_queries_and_compacts() {
+    let tenant = TenantId::new("eht6-multipart").hash();
+    let shard = 0u32;
+
+    // Two independent stores holding byte-identical durable records. `folded`
+    // is folded into a multi-part snapshot; `listing` is never folded, so its
+    // `Catalog::resolve` always runs the Phase 1 full-listing path. It is the
+    // independent oracle for every query assertion below: the listing path
+    // enumerates commit/compaction/tombstone records directly, while the
+    // folded path unions decoded snapshot-part entries and range-scopes them.
+    // Two genuinely different code paths over the same inputs, so their
+    // agreeing is a real cross-check, never circular.
+    let folded_store = Arc::new(MemoryStore::new());
+    let listing_store = Arc::new(MemoryStore::new());
+    let both: [&MemoryStore; 2] = [folded_store.as_ref(), listing_store.as_ref()];
+
+    let cfg = CatalogConfig {
+        shard_count: 1,
+        snapshot_part_max_entries: PART_CAP,
+        ..CatalogConfig::default()
+    };
+    // The folding catalog is long-lived (it runs both folds and holds a warm
+    // HEAD/part cache across them, exactly as the server's fold task does).
+    // Every *query* resolve, by contrast, uses a fresh catalog built on the
+    // same store: object storage is the source of truth and compute is
+    // disposable, so a query node reads the current durable HEAD with a cold
+    // cache. Without this, a resolve issued microseconds after a fold could
+    // serve the pre-fold HEAD from a warm cache (the accepted <=TTL staleness),
+    // masking the reconcile under test on a sub-second test clock.
+    let folded = Catalog::new(folded_store.clone(), cfg).expect("folding catalog");
+    let query_folded = || Catalog::new(folded_store.clone(), cfg).expect("query catalog");
+    let listing = Catalog::new(listing_store.clone(), cfg).expect("listing catalog");
+
+    // --- Phase A: drive the sealed segment count past the single-part ceiling.
+    // One segment per hour across eight sealed hours [30, 37]. With PART_CAP=3
+    // the fold seals parts at hour boundaries: [30,32], [33,35], and a tail.
+    const FIRST_HOUR: u32 = 30;
+    const LAST_HOUR: u32 = 37;
+    let mut records: HashMap<u32, CommitRecord> = HashMap::new();
+    for (i, hour) in (FIRST_HOUR..=LAST_HOUR).enumerate() {
+        let record =
+            seed_metric_segment(&both, &tenant, shard, Uuid::new_v4(), i as u64 + 1, hour).await;
+        records.insert(hour, record);
+    }
+
+    let whole_range = TimeRange {
+        start_ns: 0,
+        end_ns: seal_now(LAST_HOUR),
+    };
+
+    // Baseline: the listing-path resolve over the whole range, computed on the
+    // never-folded store. This is the answer the fold must reproduce exactly.
+    let now_a = seal_now(LAST_HOUR);
+    let listing_a = listing
+        .resolve(&tenant, Signal::Metrics, whole_range, &[], now_a)
+        .await
+        .expect("listing-path resolve (pre-fold)");
+    assert_eq!(
+        listing_a.segments.len(),
+        (LAST_HOUR - FIRST_HOUR + 1) as usize,
+        "one L0 per sealed hour"
+    );
+
+    // Fold: crosses the ceiling, producing a multi-part HEAD.
+    let report_a = folded
+        .fold(&tenant, Signal::Metrics, Uuid::new_v4(), now_a, &[])
+        .await
+        .expect("first fold");
+    assert!(!report_a.no_op, "sealed hours must fold");
+    assert_eq!(report_a.entry_count, (LAST_HOUR - FIRST_HOUR + 1) as u64);
+    assert!(
+        report_a.parts_total >= 2,
+        "crossing the ceiling must split into multiple parts, got {}",
+        report_a.parts_total
+    );
+
+    // Multiple parts, all under one HEAD, all under the per-part decode cap.
+    let part_count_a = assert_parts_under_decode_cap(folded_store.as_ref(), &tenant).await;
+    assert_eq!(
+        part_count_a as u64, report_a.parts_total,
+        "HEAD part count matches the fold report"
+    );
+    assert!(part_count_a >= 2, "HEAD names multiple parts");
+
+    // Query equivalence: the folded (multi-part snapshot) resolve returns
+    // exactly the listing-path result.
+    let folded_a = query_folded()
+        .resolve(&tenant, Signal::Metrics, whole_range, &[], now_a)
+        .await
+        .expect("folded resolve (post-fold)");
+    assert_eq!(
+        sorted_segments(&folded_a),
+        sorted_segments(&listing_a),
+        "multi-part fold resolve must equal the listing-path resolve"
+    );
+
+    // --- Phase B: a compaction supersession and a retention tombstone land in
+    // hours that Phase A already sealed and folded (hour 32 lives in the first
+    // sealed part, hour 34 in the second). Neither is in the tail, so only the
+    // reconcile pass -- not the incremental step -- can apply them.
+    const COMPACTED_HOUR: u32 = 32;
+    const TOMBSTONED_HOUR: u32 = 34;
+    let superseded = records
+        .get(&COMPACTED_HOUR)
+        .expect("hour 32 segment")
+        .clone();
+    let seg_before = covering_part_blake3(folded_store.as_ref(), &tenant, COMPACTED_HOUR).await;
+
+    seed_compaction(
+        &both,
+        &tenant,
+        shard,
+        COMPACTED_HOUR,
+        &[&superseded],
+        i64::from(COMPACTED_HOUR) * NS_PER_HOUR + NS_PER_HOUR / 2 + 1_000,
+    )
+    .await;
+    seed_tombstone(&both, &tenant, shard, TOMBSTONED_HOUR).await;
+
+    let now_b = seal_now(LAST_HOUR + 2);
+    let whole_range_b = TimeRange {
+        start_ns: 0,
+        end_ns: now_b,
+    };
+
+    // The listing oracle now reflects both mutations directly.
+    let listing_b = listing
+        .resolve(&tenant, Signal::Metrics, whole_range_b, &[], now_b)
+        .await
+        .expect("listing-path resolve (post-mutation)");
+
+    // Before the reconcile fold, the folded snapshot is deliberately stale:
+    // hours <= watermark are served exclusively from the (not-yet-reconciled)
+    // parts, so it still shows the pre-compaction L0 and the not-yet-tombstoned
+    // hour. This is what makes the post-reconcile agreement below meaningful
+    // rather than trivially always-equal.
+    let folded_stale = query_folded()
+        .resolve(&tenant, Signal::Metrics, whole_range_b, &[], now_b)
+        .await
+        .expect("folded resolve (pre-reconcile)");
+    assert!(
+        folded_stale
+            .segments
+            .iter()
+            .any(|s| superseded.content_hash == s.content_hash),
+        "pre-reconcile snapshot still names the superseded L0"
+    );
+    assert!(
+        folded_stale
+            .segments
+            .iter()
+            .any(|s| s.ingest_hour_bucket == TOMBSTONED_HOUR),
+        "pre-reconcile snapshot still names the soon-to-be-tombstoned hour"
+    );
+    assert_ne!(
+        sorted_segments(&folded_stale),
+        sorted_segments(&listing_b),
+        "the stale snapshot must differ from the post-mutation listing oracle"
+    );
+
+    // Reconcile fold: discovers the late compaction and tombstone within its
+    // window and rewrites only the covering sealed parts.
+    let report_b = folded
+        .fold(&tenant, Signal::Metrics, Uuid::new_v4(), now_b, &[])
+        .await
+        .expect("reconcile fold");
+    assert!(!report_b.no_op, "the watermark advanced, so not a no-op");
+    assert!(
+        !report_b.rebuilt,
+        "an incremental fold with a reconcile pass, not a full rebuild"
+    );
+
+    // Every fold step still keeps every part under the decode cap.
+    assert!(
+        assert_parts_under_decode_cap(folded_store.as_ref(), &tenant).await >= 2,
+        "the reconciled HEAD still names multiple parts, all under the cap"
+    );
+
+    // The sealed part covering hour 32 was actually rewritten (its content
+    // changed), not carried forward by reference.
+    let seg_after = covering_part_blake3(folded_store.as_ref(), &tenant, COMPACTED_HOUR).await;
+    assert!(
+        seg_before.is_some() && seg_after.is_some() && seg_before != seg_after,
+        "the reconcile pass must re-PUT the sealed part covering the compacted hour"
+    );
+
+    // Query equivalence holds again after reconcile: folded snapshot resolve
+    // equals the listing-path oracle, both now reflecting the mutations.
+    let folded_b = query_folded()
+        .resolve(&tenant, Signal::Metrics, whole_range_b, &[], now_b)
+        .await
+        .expect("folded resolve (post-reconcile)");
+    assert_eq!(
+        sorted_segments(&folded_b),
+        sorted_segments(&listing_b),
+        "post-reconcile fold resolve must equal the listing-path resolve"
+    );
+
+    // And the specific supersession and tombstone facts, read straight off the
+    // folded snapshot resolve:
+    assert!(
+        !folded_b
+            .segments
+            .iter()
+            .any(|s| superseded.content_hash == s.content_hash),
+        "the superseded L0 must be gone from the reconciled snapshot"
+    );
+    let compacted: Vec<&SegmentRef> = folded_b
+        .segments
+        .iter()
+        .filter(|s| s.ingest_hour_bucket == COMPACTED_HOUR)
+        .collect();
+    assert_eq!(compacted.len(), 1, "hour 32 now holds exactly the L1 part");
+    assert!(
+        matches!(compacted[0].level, SegmentLevel::L1 { .. }),
+        "hour 32's surviving segment is the compaction L1 part"
+    );
+    assert!(
+        !folded_b
+            .segments
+            .iter()
+            .any(|s| s.ingest_hour_bucket == TOMBSTONED_HOUR),
+        "the tombstoned hour must contribute nothing to the reconciled snapshot"
+    );
 }
