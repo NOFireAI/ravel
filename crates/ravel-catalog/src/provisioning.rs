@@ -189,6 +189,62 @@ pub enum ProvisioningError {
          append"
     )]
     ReshardCasConflict { key: String },
+    /// The record's append-only format-floor history (ADR-0066 decision 3)
+    /// violates a structural invariant. Fail closed, same discipline as the
+    /// generation history: a non-monotonic-per-family floor list could assert a
+    /// false "no old object exists" and license deleting a still-needed reader.
+    /// `defect` names the exact rule broken.
+    #[error(
+        "provisioning record {key:?} has a corrupt format-floor history: {defect} \
+         (ADR-0066 decision 3)"
+    )]
+    CorruptFloors { key: String, defect: FloorDefect },
+    /// `raise_format_floor` was called with an empty `family`. A floor governs a
+    /// named format family; an empty name governs nothing.
+    #[error("cannot raise a format floor for an empty family (ADR-0066 decision 3)")]
+    FloorFamilyEmpty,
+    /// `raise_format_floor` was asked to raise a family's floor to a value at or
+    /// below its current recorded floor. Floors are raised only, never lowered,
+    /// and a re-raise to the same value records nothing new; both are refused so
+    /// every appended entry is a genuine advance (mirroring the generation
+    /// history's same-count refusal). `current` is 0 when no floor has ever been
+    /// raised for the family.
+    #[error(
+        "cannot raise format floor for family {family:?} to {requested} in record {key:?}: it is \
+         not strictly above the current floor {current} (floors are raised only, never lowered; \
+         ADR-0066 decision 3)"
+    )]
+    FloorNotAboveCurrent {
+        key: String,
+        family: String,
+        requested: u32,
+        current: u32,
+    },
+    /// `raise_format_floor` was called on a (tenant, signal) that has no
+    /// provisioning record yet. A floor asserts a fact about a (tenant, signal)'s
+    /// live objects; a (tenant, signal) with no record has no pinned shard_count
+    /// and nothing for a floor to govern. The record is created on the tenant's
+    /// first ingest for this signal (ADR-0050 section 5), exactly as a reshard
+    /// requires ([`ProvisioningError::NoRecordToReshard`]).
+    #[error(
+        "cannot raise a format floor for tenant {tenant_hash} signal {signal}: no provisioning \
+         record exists at {key:?}. A floor extends an existing record; the record is created on \
+         the tenant's first ingest for this signal (ADR-0066 decision 3)"
+    )]
+    NoRecordForFloor {
+        key: String,
+        tenant_hash: String,
+        signal: &'static str,
+    },
+    /// A concurrent write moved the record's version between this floor raise's
+    /// read and its CasVersion write (ADR-0066 decision 3, the
+    /// [`append_generation`] CAS-conflict pattern). The loser re-reads rather
+    /// than silently overwriting the winner.
+    #[error(
+        "a concurrent write changed provisioning record {key:?} since this floor raise read it \
+         (CasVersion precondition failed): re-read and retry rather than overwrite the other write"
+    )]
+    FloorCasConflict { key: String },
 }
 
 /// The exact structural rule a corrupt shard-generation history broke
@@ -222,6 +278,38 @@ impl std::fmt::Display for GenerationDefect {
                 "adjacent generations have equal shard_count (a no-op reshard)"
             }
             GenerationDefect::CountOutOfRange => "a generation shard_count is outside 1..=10000",
+        };
+        f.write_str(s)
+    }
+}
+
+/// The exact structural rule a corrupt format-floor history broke (ADR-0066
+/// decision 3). Each is a fail-closed decode error, never a silent
+/// normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorDefect {
+    /// An entry has an empty `family` string (a floor governs a named family).
+    EmptyFamily,
+    /// An entry has `floor_version` 0. A floor of 0 asserts nothing ("no object
+    /// below version 0"), and a valid raise is always strictly above the current
+    /// (or implicit-zero) floor, so a stored 0 can never be produced by a
+    /// legitimate append.
+    ZeroFloor,
+    /// A family's floors are not strictly increasing in append order: a later
+    /// entry for a family has a `floor_version` at or below an earlier entry's
+    /// for the same family. Floors are raised only, never lowered or repeated.
+    NotIncreasing,
+}
+
+impl std::fmt::Display for FloorDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            FloorDefect::EmptyFamily => "a format-floor entry has an empty family",
+            FloorDefect::ZeroFloor => "a format-floor entry has floor_version 0 (a vacuous floor)",
+            FloorDefect::NotIncreasing => {
+                "a family's floor_version is not strictly increasing across the history \
+                 (floors are raised only)"
+            }
         };
         f.write_str(s)
     }
@@ -784,6 +872,10 @@ fn build_record(
         // encoding omits the field entirely, so this record is byte-identical to
         // one an EC5 build wrote before ADR-0052.
         generations: Vec::new(),
+        // No floor is raised at first write: the empty list is "no floor ever
+        // raised" (ADR-0066), and encoding omits the field, keeping a
+        // freshly-built record byte-identical to a pre-EM record.
+        format_floors: Vec::new(),
     }
 }
 
@@ -1033,6 +1125,298 @@ pub async fn append_generation(
             generations: history,
         }),
         Err(StoreError::PreconditionFailed) => Err(ProvisioningError::ReshardCasConflict { key }),
+        Err(err) => Err(ProvisioningError::store(&key, err)),
+    }
+}
+
+// ---- ADR-0066 format-floor history (epic EM, EM-T3) ----
+//
+// Format floors live on the SAME `ProvisioningRecord` at the SAME
+// `t/<hash>/<sig>/prov` key as the shard-generation history (field 7, additive,
+// no format_version bump; see the proto doc comment). They are implemented here
+// beside `append_generation`, not in a sibling module, precisely because they
+// share that record and key: the floor mutator reuses `provisioning_key`,
+// `read_record`, `to_sys_signal`, the tenant/signal misfile guard, and the
+// `ProvisioningError` type, and keeping both mutators of one record in one file
+// makes their shared-CAS interaction visible (a concurrent `append_generation`
+// and `raise_format_floor` race each other's version, and the loser re-reads).
+// `key_epoch.rs` became a sibling module because it is a *separate object*
+// (`t/<hash>/enc`, its own record, key, and error type); a floor is not a
+// separate object, so that precedent points the other way here.
+//
+// Shape: a flat, append-only list. The "current floor" for a family is the
+// highest recorded `floor_version` for that family. A flat list is the simplest
+// thing that matches "append-only" and needs no per-family index structure; the
+// only invariant it must carry is per-family monotonicity, enforced on decode.
+// A raise must be *strictly* above the current floor for its family: floors are
+// raised only, never lowered, and a re-raise to the same value records nothing
+// new, so it is refused — matching the generation history's same-count refusal
+// and the key-epoch history's same-key refusal.
+
+/// One entry of a provisioning record's append-only format-floor history
+/// (ADR-0066 decision 3), decoded into a plain struct so consumers (release
+/// engineering's floor checks, the migration job) never touch the proto type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatFloor {
+    /// Lowercase format-family identifier ("rseg", "rlog", "rspan", "csnap", ...).
+    pub family: String,
+    /// No live object of `family` below this version exists for this (tenant,
+    /// signal). Always `>= 1` in a valid history.
+    pub floor_version: u32,
+    /// When this floor was raised (unix ns); informational.
+    pub raised_unix_ns: i64,
+    /// The job identity that raised this floor; informational.
+    pub raised_by: String,
+}
+
+/// The outcome of a successful [`raise_format_floor`] append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorRaiseOutcome {
+    /// The family whose floor was raised.
+    pub family: String,
+    /// The new (now current) floor for that family.
+    pub floor_version: u32,
+    /// The full format-floor history after the append, in append order.
+    pub floors: Vec<FormatFloor>,
+}
+
+/// Decode and validate a record's format-floor history into a normalized list
+/// (ADR-0066 decision 3). An empty `format_floors` list (every record written
+/// before EM) is valid and decodes to an empty history: "no floor has ever been
+/// raised". A non-empty list is validated fail-closed: no empty family, no
+/// zero `floor_version`, and — per family — `floor_version` strictly increasing
+/// in append order (floors raised only). Any violation is a typed
+/// [`ProvisioningError::CorruptFloors`], never a panic or a silent fix.
+pub fn read_floors(
+    record: &sysproto::ProvisioningRecord,
+    key: &str,
+) -> Result<Vec<FormatFloor>, ProvisioningError> {
+    let corrupt = |defect: FloorDefect| ProvisioningError::CorruptFloors {
+        key: key.to_string(),
+        defect,
+    };
+    // Highest floor_version seen so far per family. For a valid (strictly
+    // increasing) history this equals the running max, so comparing each entry
+    // against it with `<=` rejects both a lower and an equal repeat; on the
+    // first violation we return, so a later corrupt entry is never reached.
+    let mut last_for_family: std::collections::HashMap<&str, u32> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(record.format_floors.len());
+    for f in &record.format_floors {
+        if f.family.is_empty() {
+            return Err(corrupt(FloorDefect::EmptyFamily));
+        }
+        if f.floor_version == 0 {
+            return Err(corrupt(FloorDefect::ZeroFloor));
+        }
+        if let Some(&prev) = last_for_family.get(f.family.as_str())
+            && f.floor_version <= prev
+        {
+            return Err(corrupt(FloorDefect::NotIncreasing));
+        }
+        last_for_family.insert(f.family.as_str(), f.floor_version);
+        out.push(FormatFloor {
+            family: f.family.clone(),
+            floor_version: f.floor_version,
+            raised_unix_ns: f.raised_unix_ns,
+            raised_by: f.raised_by.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// [`read_floors`], plus the same format-version and (tenant, signal) misfile
+/// guard [`read_generations_checked`] applies. A caller that decodes a record it
+/// read directly must refuse a record from a future format, or one
+/// misfiled/corrupted under the wrong tenant or signal, rather than reading its
+/// floors as this (tenant, signal)'s history — the same durable-corruption
+/// hazard `raise_format_floor` guards against before writing back.
+pub fn read_floors_checked(
+    record: &sysproto::ProvisioningRecord,
+    key: &str,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+) -> Result<Vec<FormatFloor>, ProvisioningError> {
+    if record.format_version > PROVISIONING_FORMAT_VERSION {
+        return Err(ProvisioningError::UnsupportedVersion {
+            key: key.to_string(),
+            got: record.format_version,
+        });
+    }
+    if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
+        return Err(ProvisioningError::CorruptRecord {
+            key: key.to_string(),
+            field: "tenant_hash",
+            expected: tenant_hash.to_hex(),
+            actual: hex::encode(&record.tenant_hash),
+        });
+    }
+    if record.signal != to_sys_signal(signal) as i32 {
+        return Err(ProvisioningError::CorruptRecord {
+            key: key.to_string(),
+            field: "signal",
+            expected: format!("{:?}", to_sys_signal(signal)),
+            actual: format!("{}", record.signal),
+        });
+    }
+    read_floors(record, key)
+}
+
+/// The current floor for `family`: the highest recorded `floor_version` for it,
+/// or `None` if no floor has ever been raised for that family. A pure function
+/// over the normalized history [`read_floors`] returns.
+pub fn current_floor(floors: &[FormatFloor], family: &str) -> Option<u32> {
+    floors
+        .iter()
+        .filter(|f| f.family == family)
+        .map(|f| f.floor_version)
+        .max()
+}
+
+/// Read and normalize a (tenant, signal)'s full format-floor history straight
+/// from the store, fresh and uncached. `Ok(None)` when no provisioning record
+/// exists yet (no floor could have been raised). A present record is fully
+/// version/misfile/history-checked via [`read_floors_checked`], so a corrupt or
+/// misfiled record fails closed rather than being read as "no floors".
+pub async fn read_floors_from_store(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+) -> Result<Option<Vec<FormatFloor>>, ProvisioningError> {
+    let key = provisioning_key(tenant_hash, signal);
+    match read_record(store, &key).await? {
+        Some(record) => Ok(Some(read_floors_checked(
+            &record,
+            &key,
+            tenant_hash,
+            signal,
+        )?)),
+        None => Ok(None),
+    }
+}
+
+/// The current floor for one `family` of a (tenant, signal), read fresh from the
+/// store. `Ok(None)` when no provisioning record exists yet, or the record
+/// exists but no floor has ever been raised for `family` — the documented "no
+/// floor" default, not an error. A present record is fully checked via
+/// [`read_floors_from_store`], so a corrupt or misfiled record fails closed.
+pub async fn current_floor_from_store(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    family: &str,
+) -> Result<Option<u32>, ProvisioningError> {
+    match read_floors_from_store(store, tenant_hash, signal).await? {
+        Some(floors) => Ok(current_floor(&floors, family)),
+        None => Ok(None),
+    }
+}
+
+/// Raise the format floor for one `family` of a (tenant, signal) by appending
+/// one [`FormatFloor`] to its provisioning record under `CasVersion` (ADR-0066
+/// decision 3, mirroring [`append_generation`]). This is the only legal mutation
+/// of the floor history: it appends exactly one entry and never touches an
+/// existing byte of history.
+///
+/// Enforced fail-closed before any write:
+/// - `family` must be non-empty ([`ProvisioningError::FloorFamilyEmpty`]);
+/// - the record must already exist ([`ProvisioningError::NoRecordForFloor`]);
+/// - the record's version, (tenant, signal), and existing floor history must
+///   decode and validate ([`read_floors_checked`]) — a record misfiled under
+///   another tenant or signal is never extended as this one's, since this writes
+///   the record back and would otherwise durably corrupt it;
+/// - `floor_version` must be strictly above the current floor for `family`
+///   ([`ProvisioningError::FloorNotAboveCurrent`]; floors are raised only, and a
+///   re-raise to the same value is refused as a no-op).
+///
+/// A concurrent write that moved the version is a typed
+/// [`ProvisioningError::FloorCasConflict`]: the loser re-reads, never silently
+/// overwrites the winner. The scalar `shard_count` and the generation history
+/// are carried through verbatim; only `format_floors` grows.
+pub async fn raise_format_floor(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    family: &str,
+    floor_version: u32,
+    raised_by: &str,
+    now_ns: i64,
+) -> Result<FloorRaiseOutcome, ProvisioningError> {
+    if family.is_empty() {
+        return Err(ProvisioningError::FloorFamilyEmpty);
+    }
+    let key = provisioning_key(tenant_hash, signal);
+
+    let (record, version) = match store.get(&key, GetRange::Full).await {
+        Ok(outcome) => {
+            let record =
+                sysproto::ProvisioningRecord::decode(outcome.data.as_ref()).map_err(|source| {
+                    ProvisioningError::Decode {
+                        key: key.clone(),
+                        source,
+                    }
+                })?;
+            (record, outcome.version)
+        }
+        Err(StoreError::NotFound) => {
+            return Err(ProvisioningError::NoRecordForFloor {
+                key,
+                tenant_hash: tenant_hash.to_hex(),
+                signal: signal.key_prefix(),
+            });
+        }
+        Err(err) => return Err(ProvisioningError::store(&key, err)),
+    };
+
+    // Version, misfile, and history-corruption guard, then normalize the
+    // existing floor history (fail closed on any of these) before extending it.
+    let mut floors = read_floors_checked(&record, &key, tenant_hash, signal)?;
+    let current = current_floor(&floors, family).unwrap_or(0);
+    if floor_version <= current {
+        return Err(ProvisioningError::FloorNotAboveCurrent {
+            key,
+            family: family.to_string(),
+            requested: floor_version,
+            current,
+        });
+    }
+
+    floors.push(FormatFloor {
+        family: family.to_string(),
+        floor_version,
+        raised_unix_ns: now_ns,
+        raised_by: raised_by.to_string(),
+    });
+
+    // Persist the full history. shard_count and generations are carried verbatim.
+    let mut new_record = record;
+    new_record.format_floors = floors
+        .iter()
+        .map(|f| sysproto::FormatFloor {
+            family: f.family.clone(),
+            floor_version: f.floor_version,
+            raised_unix_ns: f.raised_unix_ns,
+            raised_by: f.raised_by.clone(),
+        })
+        .collect();
+
+    match store
+        .put(
+            &key,
+            new_record.encode_to_vec().into(),
+            PutOptions {
+                mode: PutMode::CasVersion(version),
+                checksum: None,
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(FloorRaiseOutcome {
+            family: family.to_string(),
+            floor_version,
+            floors,
+        }),
+        Err(StoreError::PreconditionFailed) => Err(ProvisioningError::FloorCasConflict { key }),
         Err(err) => Err(ProvisioningError::store(&key, err)),
     }
 }
@@ -1691,6 +2075,7 @@ mod tests {
             shard_count: 4,
             created_unix_ns: 1_234,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let gens = read_generations(&record, &key).expect("empty history is valid");
@@ -1727,6 +2112,7 @@ mod tests {
             shard_count: 0,
             created_unix_ns: 0,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations(&record, &key).expect_err("shard_count 0 must be refused");
@@ -1751,6 +2137,7 @@ mod tests {
             shard_count: 4,
             created_unix_ns: 0,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
@@ -1772,6 +2159,7 @@ mod tests {
             shard_count: 4,
             created_unix_ns: 0,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
@@ -1796,6 +2184,7 @@ mod tests {
             shard_count: 4,
             created_unix_ns: 0,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let err = read_generations_checked(&record, &key, &tenant(), Signal::Metrics)
@@ -1822,6 +2211,7 @@ mod tests {
                 shard_count: scalar,
                 created_unix_ns: 0,
                 generations: gens,
+                format_floors: Vec::new(),
             };
         let g = |generation, shard_count, activation_hour| sysproto::ShardGeneration {
             generation,
@@ -1986,5 +2376,462 @@ mod tests {
             1,
             "the injected precondition failure must have fired"
         );
+    }
+
+    // ---- ADR-0066 format-floor tests (epic EM, EM-T3) ----
+
+    const RSEG: &str = "rseg";
+    const RLOG: &str = "rlog";
+
+    /// Read the current floor for a family straight from a record in the store.
+    async fn floor_in_store(
+        store: &dyn ObjectStoreBackend,
+        th: &TenantHash,
+        signal: Signal,
+        family: &str,
+    ) -> Option<u32> {
+        current_floor_from_store(store, th, signal, family)
+            .await
+            .expect("read floor")
+    }
+
+    /// Raising a floor for a family with no prior floor creates the first entry;
+    /// a second, higher floor for the same family appends and the read returns
+    /// the new value.
+    #[tokio::test]
+    async fn raise_first_then_higher_floor_appends_and_reads_back() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+
+        // No floor raised yet: read is None.
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Metrics, RSEG).await,
+            None,
+            "no floor raised yet"
+        );
+
+        let first = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            5,
+            "job",
+            100,
+        )
+        .await
+        .expect("first floor raises");
+        assert_eq!(first.floor_version, 5);
+        assert_eq!(first.floors.len(), 1);
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Metrics, RSEG).await,
+            Some(5)
+        );
+
+        let second = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            6,
+            "job",
+            200,
+        )
+        .await
+        .expect("a higher floor appends");
+        assert_eq!(second.floor_version, 6);
+        assert_eq!(second.floors.len(), 2);
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Metrics, RSEG).await,
+            Some(6),
+            "read returns the newly raised floor"
+        );
+
+        // The scalar shard_count and generation history are untouched.
+        let record = read_record(
+            store.as_ref(),
+            &provisioning_key(&tenant(), Signal::Metrics),
+        )
+        .await
+        .expect("read")
+        .expect("present");
+        assert_eq!(
+            record.shard_count, 4,
+            "shard_count untouched by a floor raise"
+        );
+        assert!(record.generations.is_empty(), "generations untouched");
+    }
+
+    /// Raising a floor at or below the current floor for that family is refused
+    /// with a typed error, and the record is unchanged (verified by read-back).
+    #[tokio::test]
+    async fn raise_at_or_below_current_is_refused_and_writes_nothing() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            6,
+            "job",
+            100,
+        )
+        .await
+        .expect("floor 6 raised");
+
+        // Equal: not strictly above.
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            6,
+            "job",
+            200,
+        )
+        .await
+        .expect_err("a re-raise to the same value must be refused");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::FloorNotAboveCurrent {
+                    requested: 6,
+                    current: 6,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+
+        // Lower: also refused.
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            3,
+            "job",
+            300,
+        )
+        .await
+        .expect_err("a lower floor must be refused");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::FloorNotAboveCurrent {
+                    requested: 3,
+                    current: 6,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+
+        // The record still records exactly the one floor at 6.
+        let floors = read_floors_from_store(store.as_ref(), &tenant(), Signal::Metrics)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(floors.len(), 1, "no floor was appended");
+        assert_eq!(floors[0].floor_version, 6);
+    }
+
+    /// Two families' floors are tracked independently: raising one never affects
+    /// the other's recorded value.
+    #[tokio::test]
+    async fn two_families_are_independent() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            6,
+            "job",
+            100,
+        )
+        .await
+        .expect("rseg floor");
+        raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RLOG,
+            2,
+            "job",
+            200,
+        )
+        .await
+        .expect("rlog floor");
+        // Raising rlog again does not touch rseg.
+        raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RLOG,
+            3,
+            "job",
+            300,
+        )
+        .await
+        .expect("rlog floor raised");
+
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Metrics, RSEG).await,
+            Some(6),
+            "rseg unchanged by rlog raises"
+        );
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Metrics, RLOG).await,
+            Some(3)
+        );
+        // A family with no floor reads None even when others exist.
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Metrics, "rspan").await,
+            None
+        );
+    }
+
+    /// A concurrent CAS race: the loser reads the same version and its stale CAS
+    /// write is rejected as a typed `FloorCasConflict`, never a silent overwrite.
+    /// Proven with `FaultStore` turning the loser's CAS `put` into a
+    /// `PreconditionFailed`, exactly what a concurrent write that moved the
+    /// version would cause.
+    #[tokio::test]
+    async fn raise_floor_cas_conflict_on_concurrent_write() {
+        let inner = MemoryStore::new();
+        seed_record(&inner, &tenant(), Signal::Metrics, 4).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains("/prov"),
+        );
+        let store = FaultStore::new(inner, plan);
+        let err = raise_format_floor(&store, &tenant(), Signal::Metrics, RSEG, 5, "job", 100)
+            .await
+            .expect_err("a CAS precondition failure must surface as a typed conflict");
+        assert!(
+            matches!(err, ProvisioningError::FloorCasConflict { .. }),
+            "got: {err}"
+        );
+        assert_eq!(
+            store.fault_count(
+                Op::Put,
+                ravel_object_store::fault::FaultKind::FailedConditionalWrite
+            ),
+            1,
+            "the injected precondition failure must have fired"
+        );
+    }
+
+    /// Raising a floor on a record misfiled under the wrong tenant fails closed
+    /// (the misfile guard), rather than durably corrupting it with an append.
+    #[tokio::test]
+    async fn raise_floor_rejects_misfiled_tenant() {
+        let store = mem();
+        // A well-formed record whose body names a different tenant, written under
+        // this tenant's prov key: a misfile.
+        let other = TenantHash([0xEE; 16]);
+        let record = build_record(&other, Signal::Metrics, 4, 1_000);
+        store
+            .put(
+                &provisioning_key(&tenant(), Signal::Metrics),
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put misfiled record");
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            5,
+            "job",
+            100,
+        )
+        .await
+        .expect_err("a misfiled record must be refused, not extended");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptRecord {
+                    field: "tenant_hash",
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// Raising a floor for a signal misfiled under another signal's body also
+    /// fails closed.
+    #[tokio::test]
+    async fn raise_floor_rejects_misfiled_signal() {
+        let store = mem();
+        // Record body says Logs, written under the Metrics prov key.
+        let record = build_record(&tenant(), Signal::Logs, 4, 1_000);
+        store
+            .put(
+                &provisioning_key(&tenant(), Signal::Metrics),
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put misfiled record");
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            5,
+            "job",
+            100,
+        )
+        .await
+        .expect_err("a signal-misfiled record must be refused");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptRecord {
+                    field: "signal",
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// A corrupt (non-monotonic-per-family) floor history decodes as a typed
+    /// error, never a panic — the same fail-closed discipline the generation
+    /// history follows. Also covers the empty-family and zero-floor defects.
+    #[test]
+    fn corrupt_floor_histories_are_typed_errors() {
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let base = |floors: Vec<sysproto::FormatFloor>| sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: Vec::new(),
+            format_floors: floors,
+        };
+        let ff = |family: &str, floor_version: u32| sysproto::FormatFloor {
+            family: family.to_string(),
+            floor_version,
+            raised_unix_ns: 0,
+            raised_by: String::new(),
+        };
+        let expect_defect =
+            |record: &sysproto::ProvisioningRecord, defect: FloorDefect| match read_floors(
+                record, &key,
+            ) {
+                Err(ProvisioningError::CorruptFloors { defect: got, .. }) => {
+                    assert_eq!(got, defect, "wrong defect");
+                }
+                other => panic!("expected CorruptFloors({defect:?}), got {other:?}"),
+            };
+
+        // Same family, later entry lower than earlier: not increasing.
+        expect_defect(
+            &base(vec![ff(RSEG, 6), ff(RSEG, 5)]),
+            FloorDefect::NotIncreasing,
+        );
+        // Same family, equal repeat: also not strictly increasing.
+        expect_defect(
+            &base(vec![ff(RSEG, 6), ff(RSEG, 6)]),
+            FloorDefect::NotIncreasing,
+        );
+        // Empty family.
+        expect_defect(&base(vec![ff("", 5)]), FloorDefect::EmptyFamily);
+        // Zero floor_version.
+        expect_defect(&base(vec![ff(RSEG, 0)]), FloorDefect::ZeroFloor);
+
+        // A valid interleaved history of two families decodes cleanly.
+        let ok = base(vec![ff(RSEG, 5), ff(RLOG, 2), ff(RSEG, 6), ff(RLOG, 3)]);
+        let floors = read_floors(&ok, &key).expect("a per-family-increasing history is valid");
+        assert_eq!(floors.len(), 4);
+        assert_eq!(current_floor(&floors, RSEG), Some(6));
+        assert_eq!(current_floor(&floors, RLOG), Some(3));
+    }
+
+    /// Reading the floor for a family that never had one raised returns None,
+    /// not an error, even on a record that carries floors for other families.
+    #[tokio::test]
+    async fn read_floor_for_never_raised_family_is_none() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        // No record-absent case and a present-but-unraised case both read None.
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Metrics, RSEG).await,
+            None,
+            "present record, family never raised"
+        );
+        assert_eq!(
+            floor_in_store(store.as_ref(), &tenant(), Signal::Logs, RSEG).await,
+            None,
+            "no record for this signal at all"
+        );
+    }
+
+    /// Raising a floor on a (tenant, signal) with no provisioning record is
+    /// refused: a floor extends an existing record.
+    #[tokio::test]
+    async fn raise_floor_rejects_missing_record() {
+        let store = mem();
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            RSEG,
+            5,
+            "job",
+            100,
+        )
+        .await
+        .expect_err("no record to floor must be refused");
+        assert!(
+            matches!(err, ProvisioningError::NoRecordForFloor { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// An empty family is refused up front, before any store touch.
+    #[tokio::test]
+    async fn raise_floor_rejects_empty_family() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            "",
+            5,
+            "job",
+            100,
+        )
+        .await
+        .expect_err("an empty family must be refused");
+        assert!(
+            matches!(err, ProvisioningError::FloorFamilyEmpty),
+            "got: {err}"
+        );
+    }
+
+    /// A record built at first write carries no floors, and its bytes are
+    /// unchanged by this field (additive: the empty list is omitted on encode),
+    /// so a pre-EM reader is unaffected.
+    #[test]
+    fn built_record_has_no_floors_and_is_byte_compatible() {
+        let built = build_record(&tenant(), Signal::Metrics, 4, 1_234);
+        assert!(
+            built.format_floors.is_empty(),
+            "a freshly built record carries no floors"
+        );
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let floors = read_floors(&built, &key).expect("empty floor history is valid");
+        assert!(floors.is_empty(), "empty history reads as no floors");
+        assert_eq!(current_floor(&floors, RSEG), None);
     }
 }

@@ -115,6 +115,29 @@ message ProvisioningRecord {
   // generations[0].shard_count == the scalar shard_count above. A record
   // violating any of these is a typed decode error (fail closed).
   repeated ShardGeneration generations = 6;
+  // Append-only per-(tenant, signal) format-floor history (ADR-0066 decision 3,
+  // epic EM). Empty on every record written before EM: read as "no floor has
+  // ever been raised for any family". A recorded floor F for family X asserts
+  // that no live object of family X below version F exists for this (tenant,
+  // signal); it is CAS-appended by the migration job's verification step after
+  // an audit-versions enumeration comes back clean, and floors are raised only,
+  // never lowered. The load-bearing consumer is release engineering: deleting a
+  // format version's read support is legal only when every bucket's floor for
+  // that family exceeds the retired version.
+  //
+  // Adding this field is additive and does NOT bump `format_version` (field 1),
+  // for the identical reason `generations` (field 6) did not: a reader that
+  // skips this unknown field still reads every earlier field exactly as before,
+  // and a reader that understands it sees an empty list on every pre-EM record,
+  // which reads identically to "no floors raised". There is no layout a v1
+  // reader would misread, so the floor stays 1 (ADR-0066 decision 3, citing the
+  // ADR-0052 `generations` precedent verbatim).
+  //
+  // Decode enforces, per family, that floor_version is strictly increasing in
+  // append order (floors raised only); a later entry for a family at or below an
+  // earlier entry's floor_version, an empty family, or a zero floor_version is a
+  // typed decode error (fail closed).
+  repeated FormatFloor format_floors = 7;
 }
 
 // One entry in a ProvisioningRecord's append-only shard-generation history
@@ -127,6 +150,27 @@ message ShardGeneration {
   uint32 activation_hour = 3;  // unix hours; ingest hours >= this route with
                                // this generation's count
   int64  appended_unix_ns = 4; // audit only; when this generation was appended
+}
+
+// One entry in a ProvisioningRecord's append-only format-floor history
+// (ADR-0066 decision 3, epic EM). Immutable once appended; raising a floor adds
+// a new entry, never edits an existing one. A recorded floor F for `family`
+// asserts that no live object of that format family below version F exists for
+// the (tenant, signal) the enclosing record governs.
+//
+// `family` is a lowercase format-family identifier ("rseg", "rlog", "rspan",
+// "csnap", ...). EM-T1/EM-T2 established no typed family-naming convention (their
+// `UnsupportedVersion(u16)` variants carry only a numeric version, no family
+// tag), so this string mirrors each format's own on-disk identity: the trailer
+// magics `RSG1`/`RLG1`/`RSP1` lowercased to their format short name. A free-form
+// string (rather than the ADR-0066 sketch's enum) keeps a new format family
+// addable without a proto change, matching the additive-evolution discipline
+// this whole record follows.
+message FormatFloor {
+  string family = 1;         // lowercase format-family id ("rseg", "rlog", ...)
+  uint32 floor_version = 2;  // no live object of `family` below this version; >= 1
+  sfixed64 raised_unix_ns = 3; // when this floor was raised
+  string raised_by = 4;      // job identity that raised it; informational
 }
 
 // The durable, deployment-wide GC configuration at the bucket root `sys/gc`

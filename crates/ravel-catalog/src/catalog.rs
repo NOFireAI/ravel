@@ -1961,6 +1961,7 @@ mod tests {
             shard_count,
             created_unix_ns: 1,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         store
             .put(
