@@ -709,8 +709,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// The literal metric name a single equality `__name__` matcher pins, or
 /// `None` if postings pruning must bypass (a regex/negation/absent `__name__`,
 /// or more than one `__name__` matcher). Mirrors the engine's private
-/// `equality_name_filter` so this endpoint prunes exactly as a sample query
-/// over the same selector would (docs/metric-index-plan.md P5b).
+/// `equality_name_filter` (docs/metric-index-plan.md P5b) for the equality
+/// case; unlike the engine's filter as of ADR-0061 decision 3, this one does
+/// not recognize a literal-prefix-anchored regex, so this endpoint bypasses
+/// pruning on a prefix regex a sample query over the same selector would
+/// prune on. Safe (strictly more conservative, never a false negative), just
+/// less effective; extending this to match is tracked as a follow-up.
 fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<&str> {
     let mut found: Option<&str> = None;
     for m in matchers {
