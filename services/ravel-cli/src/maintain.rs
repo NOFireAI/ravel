@@ -14,6 +14,7 @@ use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, LegalHoldCheck, PublishOutcome,
     SweepReport, compact_bucket, sweep_shard,
 };
+use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::{CompactionRecord, RetentionTombstone};
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -526,12 +527,23 @@ fn check_object_epoch(
 ///   input identity that no longer resolves to a present object. The sweeper
 ///   legitimately reclaims superseded inputs once past their protection
 ///   horizon, so this is steady-state behavior, reported as a count only.
+/// - **recoverable-prior-version** (ANOMALY, versioning-aware mode only): on a
+///   versioned bucket, a Ravel delete leaves a recoverable prior version that
+///   the content-addressed walk above cannot see (ADR-0064 §7, S4-12). Its own
+///   distinct anomaly class, separate from the four above.
+///
+/// `versioning_aware` enables the recoverable-prior-version check. It needs a
+/// versioned listing the `ObjectStoreBackend` contract does not expose, so
+/// against a real backend it reports an honest gap (not an anomaly); the check
+/// itself lives in [`check_noncurrent_versions`], which a versioning-aware
+/// fixture drives directly.
 ///
 /// Exits nonzero if any anomaly is found.
 pub async fn verify_custody(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     shards: u32,
+    versioning_aware: bool,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let mut anomalies = 0usize;
@@ -568,6 +580,7 @@ pub async fn verify_custody(
     let mut inputs_swept = 0usize; // compaction input no longer present: expected
     let mut epoch_objects_located = 0usize; // live object located in a recorded epoch
     let mut epoch_inconsistencies = 0usize; // live object outside every recorded epoch: ANOMALY
+    let mut recoverable_prior_versions = 0usize; // noncurrent version under a swept key: ANOMALY
 
     for signal in [Signal::Metrics, Signal::Logs] {
         println!("== signal {:?} ==", signal);
@@ -814,6 +827,29 @@ pub async fn verify_custody(
         }
     }
 
+    // Versioning-aware pass (ADR-0064 §7, S4-12): on a versioned bucket, list
+    // noncurrent versions under the tenant's keys and report each as the
+    // distinct recoverable-prior-version anomaly class. Against a real backend
+    // the source cannot enumerate versions, so this reports an honest gap
+    // rather than a false clean bill; a versioning-aware fixture surfaces the
+    // prior versions it holds.
+    if versioning_aware {
+        let tenant_prefix = format!("t/{}/", tenant_hash.to_hex());
+        println!("== versioning-aware: noncurrent versions under {tenant_prefix} ==");
+        let report = check_noncurrent_versions(store.as_ref(), &tenant_prefix).await?;
+        if report.supported {
+            recoverable_prior_versions = report.recoverable_versions;
+            anomalies += recoverable_prior_versions;
+        } else {
+            println!(
+                "  backend cannot enumerate noncurrent versions through the ObjectStoreBackend \
+                 contract (object_store 0.14 has no versioned listing); reporting an honest gap, \
+                 not an anomaly. On a versioned bucket, confirm noncurrent-version expiration is \
+                 configured (ADR-0064 §7) out of band"
+            );
+        }
+    }
+
     println!("verify-custody summary:");
     println!("  live data objects verified (content hash matches key): {data_objects_verified}");
     println!("  compaction inputs resolved and verified: {inputs_verified}");
@@ -826,20 +862,80 @@ pub async fn verify_custody(
         println!("  live objects located in a recorded key epoch: {epoch_objects_located}");
         println!("  key-epoch inconsistencies (ANOMALY): {epoch_inconsistencies}");
     }
+    if versioning_aware {
+        println!(
+            "  recoverable prior versions (ANOMALY, recoverable-prior-version): \
+             {recoverable_prior_versions}"
+        );
+    }
     println!("  total anomalies: {anomalies}");
 
     if anomalies > 0 {
         anyhow::bail!(
             "verify-custody found {anomalies} custody anomaly(ies): {content_mismatches} \
              content-hash mismatch(es), {missing_live_objects} live object(s) missing from the \
-             store, and {epoch_inconsistencies} key-epoch inconsistency(ies) (a mismatch is \
+             store, {epoch_inconsistencies} key-epoch inconsistency(ies), and \
+             {recoverable_prior_versions} recoverable prior version(s) (a mismatch is \
              post-write corruption; a missing live object is a surviving record whose data \
              vanished; an epoch inconsistency is a live object whose write time falls outside \
-             every recorded key epoch)"
+             every recorded key epoch; a recoverable prior version is data deleted on a versioned \
+             bucket that a prior-version restore could resurrect, ADR-0064 §7)"
         );
     }
     println!("verify-custody: content-addressed chain intact for every live object");
     Ok(())
+}
+
+/// Outcome of the versioning-aware [`check_noncurrent_versions`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoncurrentVersionReport {
+    /// Whether the source could enumerate versioned listings at all. `false`
+    /// is the honest gap through the `ObjectStoreBackend` contract, not an
+    /// anomaly.
+    pub supported: bool,
+    /// Number of noncurrent (prior) versions found: each one a distinct
+    /// recoverable-prior-version anomaly.
+    pub recoverable_versions: usize,
+}
+
+/// Versioning-aware custody check (ADR-0064 §7, S4-12): list noncurrent
+/// versions under `tenant_prefix` and report each as the distinct "deleted but
+/// recoverable as prior version" anomaly class, separate from the
+/// content-mismatch, missing-object, and epoch-inconsistency classes.
+///
+/// When the source cannot enumerate versions (`supported: false`, every
+/// production backend through the trait contract), this reports zero anomalies:
+/// it cannot see prior versions, so it neither confirms nor denies them, an
+/// honest gap rather than a false clean bill. A noncurrent version only ever
+/// exists on a versioned bucket, so a nonzero count here is proof both that the
+/// bucket is versioned and that a recoverable prior version is present.
+pub async fn check_noncurrent_versions<S: NoncurrentVersionSource + ?Sized>(
+    source: &S,
+    tenant_prefix: &str,
+) -> anyhow::Result<NoncurrentVersionReport> {
+    let listing = source
+        .list_noncurrent_versions(tenant_prefix)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("failed to list noncurrent versions under {tenant_prefix}: {err}")
+        })?;
+    if !listing.supported {
+        return Ok(NoncurrentVersionReport {
+            supported: false,
+            recoverable_versions: 0,
+        });
+    }
+    for version in &listing.versions {
+        println!(
+            "  DELETED BUT RECOVERABLE AS PRIOR VERSION {} (version_id={})  \
+             <-- ANOMALY (recoverable-prior-version)",
+            version.key, version.version_id
+        );
+    }
+    Ok(NoncurrentVersionReport {
+        supported: true,
+        recoverable_versions: listing.versions.len(),
+    })
 }
 
 /// Decode and print a `CompactionRecord` (proto), mirroring `commit decode`'s
@@ -1011,7 +1107,7 @@ mod tests {
             .await
             .expect("record epoch 0 activated before the object's write time");
 
-        verify_custody(store.clone(), tenant, 1)
+        verify_custody(store.clone(), tenant, 1, false)
             .await
             .expect("every object's write time is inside a recorded epoch");
     }
@@ -1032,7 +1128,7 @@ mod tests {
             .await
             .expect("record epoch 0 activated after the object's write time");
 
-        let err = verify_custody(store.clone(), tenant, 1)
+        let err = verify_custody(store.clone(), tenant, 1, false)
             .await
             .expect_err("an object predating the first epoch must be a custody anomaly");
         let msg = err.to_string();
@@ -1057,8 +1153,78 @@ mod tests {
 
         publish_commit_at(&store, &tenant_hash, 0, 6).await;
 
-        verify_custody(store.clone(), tenant, 1)
+        verify_custody(store.clone(), tenant, 1, false)
             .await
             .expect("no epoch record means no epoch check; the object passes clean");
+    }
+
+    /// The versioning-aware recoverable-prior-version anomaly (ADR-0064 §7,
+    /// S4-12) fires only on a versioned bucket that actually holds a noncurrent
+    /// version. A noncurrent version exists only on a versioned bucket, so a
+    /// nonzero count is proof of both conditions. When the source cannot
+    /// enumerate versions (the production trait-contract default) or holds none,
+    /// no anomaly fires.
+    #[tokio::test]
+    async fn versioning_aware_recoverable_prior_version_fires_only_when_present() {
+        use ravel_object_store::StoreError;
+        use ravel_object_store::conformance::{
+            NoncurrentVersion, NoncurrentVersionListing, NoncurrentVersionSource,
+        };
+
+        struct Fixture(NoncurrentVersionListing);
+
+        #[async_trait::async_trait]
+        impl NoncurrentVersionSource for Fixture {
+            async fn list_noncurrent_versions(
+                &self,
+                _prefix: &str,
+            ) -> Result<NoncurrentVersionListing, StoreError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        // A versioned bucket with an actual noncurrent version present: the
+        // anomaly fires (count 1).
+        let present = Fixture(NoncurrentVersionListing {
+            supported: true,
+            versions: vec![NoncurrentVersion {
+                key: "t/ab/m/l0/0000/obj.rseg".to_string(),
+                version_id: "v-prior-1".to_string(),
+            }],
+        });
+        let report = check_noncurrent_versions(&present, "t/ab/")
+            .await
+            .expect("check runs");
+        assert!(report.supported);
+        assert_eq!(
+            report.recoverable_versions, 1,
+            "a present noncurrent version must fire the anomaly"
+        );
+
+        // A versioned bucket with no noncurrent versions: no anomaly.
+        let clean = Fixture(NoncurrentVersionListing {
+            supported: true,
+            versions: vec![],
+        });
+        let report = check_noncurrent_versions(&clean, "t/ab/")
+            .await
+            .expect("check runs");
+        assert!(report.supported);
+        assert_eq!(
+            report.recoverable_versions, 0,
+            "no noncurrent version means no anomaly"
+        );
+
+        // A backend that cannot enumerate versions (production default): an
+        // honest gap, not an anomaly.
+        let store = MemoryStore::new();
+        let report = check_noncurrent_versions(&store as &dyn ObjectStoreBackend, "t/ab/")
+            .await
+            .expect("check runs");
+        assert!(
+            !report.supported,
+            "the trait-contract default cannot enumerate versions"
+        );
+        assert_eq!(report.recoverable_versions, 0);
     }
 }

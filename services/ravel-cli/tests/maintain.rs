@@ -396,7 +396,7 @@ async fn audit_versions_empty_store_finds_no_anomaly() {
 
 #[tokio::test]
 async fn verify_custody_empty_store_is_clean() {
-    verify_custody(store(), "acme", 4)
+    verify_custody(store(), "acme", 4, false)
         .await
         .expect("empty store has no live objects and no anomaly");
 }
@@ -410,7 +410,7 @@ async fn verify_custody_clean_store_verifies_every_object() {
     // that was legitimately swept (no L0 object seeded for it).
     seed_compaction(&store, "acme", &[(Uuid::new_v4(), 1, 1)]).await;
 
-    verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1)
+    verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
         .await
         .expect("a clean store passes custody verification");
 }
@@ -430,7 +430,7 @@ async fn verify_custody_catches_a_corrupted_data_object() {
         .await
         .expect("overwrite the data object");
 
-    let err = verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1)
+    let err = verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
         .await
         .expect_err("a corrupted data object must fail verification");
     assert!(
@@ -447,7 +447,7 @@ async fn verify_custody_treats_a_legitimately_swept_input_as_no_anomaly() {
     // part is present and matches. This must not be an anomaly.
     seed_compaction(&store, "acme", &[(Uuid::new_v4(), 1, 1)]).await;
 
-    verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1)
+    verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
         .await
         .expect("a swept (missing) compaction input is expected, not an anomaly");
 }
@@ -463,7 +463,7 @@ async fn verify_custody_catches_a_compaction_input_with_a_mismatched_hash() {
     put_l0_object_at(&store, "acme", 0, identity, content_hash, b"corrupted").await;
     seed_compaction(&store, "acme", &[identity]).await;
 
-    let err = verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1)
+    let err = verify_custody(store as Arc<dyn ObjectStoreBackend>, "acme", 1, false)
         .await
         .expect_err("an existing-but-mismatched input must fail verification");
     assert!(

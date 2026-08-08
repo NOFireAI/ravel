@@ -40,6 +40,18 @@ fn store_qualify_prints_informational_object_lock_probe() {
         stdout.contains("unknown"),
         "the memory backend reports Object Lock status unknown; got:\n{stdout}"
     );
+    // The required-bucket-configuration report (ADR-0064 §7) also appears,
+    // labeled informational. Through the trait contract every field is unknown,
+    // so it raises no alarm and does not gate the outcome.
+    assert!(
+        stdout.contains("bucket/versioning"),
+        "store qualify output must include the bucket versioning report line; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("lifecycle/noncurrent_version_expiration"),
+        "store qualify output must include the lifecycle-rule report lines; got:\n{stdout}"
+    );
+
     // And the probe never gates the outcome: qualification still passes.
     assert!(
         stdout.contains("qualified"),

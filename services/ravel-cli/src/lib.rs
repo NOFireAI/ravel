@@ -6,6 +6,7 @@
 //! impossible to construct without a persistent S3/MinIO backend).
 
 pub mod catalog;
+pub mod erase;
 pub mod gc_config;
 pub mod hold;
 pub mod idem;
