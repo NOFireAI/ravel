@@ -61,6 +61,7 @@ fn base_header(entries: &[SnapshotEntry], entries_uncompressed_len: u64) -> Snap
         watermark_hour: 10,
         entry_count: entries.len() as u64,
         entries_uncompressed_len,
+        min_hour: 0,
     }
 }
 
@@ -320,6 +321,44 @@ fn watermark_exceeded() {
 }
 
 #[test]
+fn below_min_hour() {
+    // Entries sit at hour 5; a header claiming the part starts at hour 6
+    // makes them fall below the part's declared floor (ADR-0063).
+    let entries = base_entries();
+    let raw = encode_entries_raw(&entries);
+    let mut header = base_header(&entries, raw.len() as u64);
+    header.min_hour = 6;
+    let bytes = assemble(&header, &raw, None, None);
+    let err = decode_part(&bytes, &PartLimits::default()).expect_err("decode must fail");
+    assert_eq!(
+        err,
+        SnapshotFormatError::BelowMinHour {
+            hour: 5,
+            min_hour: 6,
+        }
+    );
+}
+
+#[test]
+fn header_min_hour_exceeds_watermark() {
+    // An inverted range (min_hour 11 > watermark_hour 10) is a malformed
+    // header, rejected before any per-entry bound is checked.
+    let entries = base_entries();
+    let raw = encode_entries_raw(&entries);
+    let mut header = base_header(&entries, raw.len() as u64);
+    header.min_hour = 11;
+    let bytes = assemble(&header, &raw, None, None);
+    let err = decode_part(&bytes, &PartLimits::default()).expect_err("decode must fail");
+    assert_eq!(
+        err,
+        SnapshotFormatError::MinHourExceedsWatermark {
+            min_hour: 11,
+            watermark: 10,
+        }
+    );
+}
+
+#[test]
 fn unsupported_level() {
     // Level 0 (L0 commit) and level 1 (L1 compaction part) are defined;
     // anything higher is reserved and must be rejected, not guessed at.
@@ -400,6 +439,7 @@ fn base_head() -> SnapshotHead {
             size: 100,
             entry_count: 2,
             watermark_hour: 5,
+            min_hour: 0,
         }],
         postings: None,
         folder_id: vec![0x33; 16],

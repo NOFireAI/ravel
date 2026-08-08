@@ -13,6 +13,14 @@ message SnapshotPartHeader {
   uint32 watermark_hour = 5;  // unix hours; all entries <= this
   uint64 entry_count = 6;
   uint64 entries_uncompressed_len = 7;
+  // Additive, ADR-0063 (multi-part parallel fold). Lowest
+  // ingest_hour_bucket any entry in this part may have; the part's hour
+  // range is [min_hour, watermark_hour], both inclusive. Absent (proto3
+  // zero) means 0, the correct floor for every legacy single-part object:
+  // 0 is never itself an error, it is the epoch floor / "not
+  // hour-partitioned" sentinel. decode_part additionally validates
+  // entry.ingest_hour_bucket >= min_hour and min_hour <= watermark_hour.
+  uint32 min_hour = 8;
 }
 
 message SnapshotEntry {
@@ -64,6 +72,12 @@ message SnapshotPartRef {
   uint64 size = 3;
   uint64 entry_count = 4;
   uint32 watermark_hour = 5;
+  // Additive, ADR-0063 (multi-part parallel fold). Mirrors the covering
+  // part header's min_hour onto the HEAD-level reference so validate_head
+  // can check part ordering and range disjointness without fetching part
+  // bytes. Absent (proto3 zero) means 0, matching a legacy single-part
+  // ref. See SnapshotPartHeader.min_hour.
+  uint32 min_hour = 6;
 }
 
 // Reference to a name-postings object (RNP1 envelope), phase P5a

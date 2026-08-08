@@ -39,7 +39,11 @@ pub fn encode_part(
     watermark_hour: u32,
     entries: &[SnapshotEntry],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
-    validate_entries(entries, watermark_hour)?;
+    // Parts written here are v1 single-part parts (min_hour 0, the epoch
+    // floor). Hour-partitioned parts with a non-zero min_hour are produced by
+    // the fold (ADR-0063 T2); the decode/validation layer below already
+    // enforces the full [min_hour, watermark_hour] contract for them.
+    validate_entries(entries, 0, watermark_hour)?;
 
     let mut entries_raw = Vec::new();
     for entry in entries {
@@ -58,6 +62,7 @@ pub fn encode_part(
         watermark_hour,
         entry_count: entries.len() as u64,
         entries_uncompressed_len,
+        min_hour: 0,
     };
     let header_bytes = header.encode_to_vec();
     let header_len =
@@ -166,7 +171,16 @@ pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, Sna
             actual: entries.len() as u64,
         });
     }
-    validate_entries(&entries, header.watermark_hour)?;
+    // A header claiming an empty or inverted hour range is malformed
+    // (ADR-0063). Checked before the per-entry bounds so the range itself is
+    // known sane first.
+    if header.min_hour > header.watermark_hour {
+        return Err(SnapshotFormatError::MinHourExceedsWatermark {
+            min_hour: header.min_hour,
+            watermark: header.watermark_hour,
+        });
+    }
+    validate_entries(&entries, header.min_hour, header.watermark_hour)?;
 
     Ok(DecodedPart { header, entries })
 }
@@ -176,6 +190,7 @@ pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, Sna
 /// docs/metric-index-plan.md 3.1 "Sort order, mandatory and validated".
 fn validate_entries(
     entries: &[SnapshotEntry],
+    min_hour: u32,
     watermark_hour: u32,
 ) -> Result<(), SnapshotFormatError> {
     for (i, entry) in entries.iter().enumerate() {
@@ -209,6 +224,12 @@ fn validate_entries(
             return Err(SnapshotFormatError::WatermarkExceeded {
                 hour: entry.ingest_hour_bucket,
                 watermark: watermark_hour,
+            });
+        }
+        if entry.ingest_hour_bucket < min_hour {
+            return Err(SnapshotFormatError::BelowMinHour {
+                hour: entry.ingest_hour_bucket,
+                min_hour,
             });
         }
         if i > 0 {
