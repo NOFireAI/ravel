@@ -76,6 +76,16 @@ pub const DEFAULT_SNAPSHOT_PART_MAX_ENTRIES: usize = 250_000;
 /// mirroring the resolve path's #278 item 2 bound). 8 matches the resolve
 /// path's fan-out order without saturating a small backend.
 pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
+/// Default `fold_reconcile_window_hours`: how far back of the previous fold's
+/// watermark the post-fold reconcile pass re-lists commit buckets to catch a
+/// compaction record or retention tombstone that landed in an hour already
+/// sealed and folded (ADR-0063 section 4). 26 covers `protection_horizon`
+/// (24 h, the age gate before the sweeper may delete a superseded compaction
+/// input) plus slack, so any late record whose supersession could invalidate
+/// a folded snapshot entry is observed by a reconcile pass before its inputs
+/// can be physically deleted. A late record older than this bound is not
+/// picked up: a stated, bounded staleness tradeoff, not a bug.
+pub const DEFAULT_FOLD_RECONCILE_WINDOW_HOURS: u32 = 26;
 /// Default crossover at which `Catalog::resolve` switches from the
 /// per-(shard, ingest-hour) LIST loop to a single per-shard recursive prefix
 /// LIST (ADR-0056). Expressed in per-bucket request units, i.e. the number of
@@ -209,6 +219,16 @@ pub struct CatalogConfig {
     /// discovery I/O, mirroring the resolve path's #278 item 2 semaphore.
     /// Default [`DEFAULT_FOLD_BUCKET_CONCURRENCY`].
     pub fold_bucket_concurrency: usize,
+    /// How far back of the previous fold's watermark the post-fold reconcile
+    /// pass re-lists commit buckets, in hours (ADR-0063 section 4). Each fold
+    /// re-lists the window `[watermark_hour_old - fold_reconcile_window_hours,
+    /// watermark_hour_old]` to catch a compaction record or retention
+    /// tombstone that landed in an already-sealed, already-folded hour, which
+    /// the incremental path (hours strictly after the old watermark) never
+    /// rediscovers. A late record older than this bound is a stated, bounded
+    /// staleness tradeoff, never applied. Default
+    /// [`DEFAULT_FOLD_RECONCILE_WINDOW_HOURS`].
+    pub fold_reconcile_window_hours: u32,
 }
 
 impl Default for CatalogConfig {
@@ -233,6 +253,7 @@ impl Default for CatalogConfig {
             prefix_list_crossover_requests: DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
             snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,
             fold_bucket_concurrency: DEFAULT_FOLD_BUCKET_CONCURRENCY,
+            fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
         }
     }
 }

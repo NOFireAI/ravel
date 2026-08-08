@@ -400,14 +400,7 @@ fn incremental_buckets(
     watermark_hour_old: u32,
     watermark_hour_new: u32,
 ) -> Vec<(u32, u32)> {
-    let mut buckets = Vec::new();
-    for hour in (watermark_hour_old + 1)..=watermark_hour_new {
-        let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
-        for shard in 0..scan {
-            buckets.push((shard, hour));
-        }
-    }
-    buckets
+    hour_range_buckets(generations, watermark_hour_old + 1, watermark_hour_new)
 }
 
 /// The fan-out ceiling at fold time (ADR-0052 section 5). Delegates to the one
@@ -497,6 +490,91 @@ fn partition_parts(entries: &[SnapshotEntry], max_entries: usize) -> Vec<PartSpa
         watermark_hour: entries[entries.len() - 1].ingest_hour_bucket,
     });
     spans
+}
+
+/// One `(shard, hour)` commit bucket's contribution to the fold: each entry it
+/// should fold in paired with that entry's `is_canonical` flag (whether the
+/// occurrence sits under the hour directory its own embedded
+/// `ingest_hour_bucket` names). Compaction L1 parts first, then unsuperseded L0
+/// commit records; empty when the bucket is tombstoned or holds nothing
+/// foldable. Produced by the shared [`Catalog::classify_bucket`] so both the
+/// incremental fold loop and the reconcile pass (ADR-0063 section 4) derive a
+/// bucket's state one way only, never two subtly different ways.
+type BucketContribution = Vec<(SnapshotEntry, bool)>;
+
+/// The reconcile pass only needs to touch a window bucket whose commit-record
+/// set could differ from what a past fold folded. The seal lemma
+/// (docs/catalog-and-mvcc.md "Sealed hours") makes the L0 set of a sealed
+/// bucket immutable, so a bucket holding only L0 records is guaranteed
+/// unchanged and can be skipped without a GET. Only a compaction record or a
+/// retention tombstone can land after an hour was sealed and folded, so those
+/// two shapes are the sole reconcile triggers.
+fn bucket_has_compaction_or_tombstone(listing: &[ObjectMeta]) -> bool {
+    listing.iter().any(|meta| {
+        matches!(
+            keys::partition_bucket_entry(&meta.key),
+            Ok(BucketEntry::CompactionRecord(_)) | Ok(BucketEntry::Tombstone(_))
+        )
+    })
+}
+
+/// Dedup one bucket's classified contribution by entry identity, preferring
+/// the canonical occurrence, reusing [`fold_in_entry`]'s exact rule so the
+/// reconcile pass and the incremental path resolve a within-bucket duplicate
+/// identically. Within a single bucket a duplicate identity is near-impossible
+/// (it would take two records with the same identity in one directory), so the
+/// throwaway drift counter here is expected to stay zero.
+fn dedup_contribution(items: Vec<(SnapshotEntry, bool)>) -> Vec<SnapshotEntry> {
+    let mut out: Vec<SnapshotEntry> = Vec::new();
+    let mut seen: HashMap<EntryIdentity, (usize, bool)> = HashMap::new();
+    let mut drift = 0u64;
+    for (entry, is_canonical) in items {
+        fold_in_entry(&mut out, &mut seen, &mut drift, entry, is_canonical);
+    }
+    out
+}
+
+/// Whether two entry sets for one bucket are identical ignoring order: same
+/// identities and, for each, byte-identical [`SnapshotEntry`] content. Used by
+/// the reconcile pass to decide whether a re-listed bucket's current
+/// contribution differs from what the in-progress `entries` already reflect.
+/// Sorting by identity is safe: identity is unique within a deduped
+/// contribution, so the sort is total and the elementwise compare is exact.
+fn same_entry_set(a: &mut [SnapshotEntry], b: &mut [SnapshotEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.sort_by(|x, y| entry_identity(x).cmp(&entry_identity(y)));
+    b.sort_by(|x, y| entry_identity(x).cmp(&entry_identity(y)));
+    a == b
+}
+
+/// `(shard, hour)` pairs for every hour in the inclusive range `[lo, hi]`, one
+/// per shard in that hour's own `scan_count(h)` fan-out (ADR-0052 section 4).
+/// `lo > hi` yields no buckets. Shared by the incremental range
+/// ([`incremental_buckets`]) and the reconcile window (ADR-0063 section 4) so
+/// both enumerate exactly the shard set a live resolve would list.
+fn hour_range_buckets(generations: &[ShardGeneration], lo: u32, hi: u32) -> Vec<(u32, u32)> {
+    let mut buckets = Vec::new();
+    for hour in lo..=hi {
+        let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
+        for shard in 0..scan {
+            buckets.push((shard, hour));
+        }
+    }
+    buckets
+}
+
+/// Whether a previous HEAD's part covers any dirty reconcile hour, so it must
+/// NOT be carried forward by reference this fold (ADR-0063 section 4). A dirty
+/// part is always re-encoded and re-PUT through the normal path: fail toward
+/// re-PUTting fresh content, never toward silently keeping a stale part, even
+/// in the (impossible-by-content-addressing) case where the recomputed hash
+/// still coincided with the old ref.
+fn part_covers_dirty_hour(part: &SnapshotPartRef, dirty_hours: &HashSet<u32>) -> bool {
+    dirty_hours
+        .iter()
+        .any(|&h| part.min_hour <= h && h <= part.watermark_hour)
 }
 
 impl Catalog {
@@ -618,6 +696,16 @@ impl Catalog {
                 }
             };
 
+            // The old watermark the reconcile pass anchors its window to,
+            // present ONLY for an incremental fold from a trusted HEAD. Absent
+            // (`None`) on the first fold (no previous watermark) and on any
+            // rebuild (the rebuild already re-derived every hour), which
+            // together skip the reconcile pass entirely (ADR-0063 section 4).
+            let reconcile_watermark: Option<u32> = match &head_state {
+                HeadState::Valid { head, .. } if !rebuilt => Some(head.watermark_hour),
+                _ => None,
+            };
+
             // Identity -> (index in `entries`, whether that occurrence sits
             // under the hour directory its own embedded ingest_hour_bucket
             // names). Entries loaded from a previous part already survived
@@ -644,89 +732,24 @@ impl Catalog {
             counters.list_requests += buckets.len() as u64;
 
             for (shard, hour, listing) in &bucket_listings {
-                // Partition the bucket's keys by shape, mirroring the
-                // resolve-time listing (`Catalog::list_hour_bucket`,
-                // docs/catalog-and-mvcc.md step 2) so a fold and a live
-                // resolve derive identical bucket state
-                // (docs/metric-index-plan.md section 7).
-                let mut l0_keys: Vec<&str> = Vec::new();
-                let mut compaction_keys: Vec<&str> = Vec::new();
-                let mut has_tombstone = false;
-                for meta in listing {
-                    match keys::partition_bucket_entry(&meta.key) {
-                        Ok(BucketEntry::CommitRecord(_)) => l0_keys.push(meta.key.as_str()),
-                        Ok(BucketEntry::CompactionRecord(_)) => {
-                            compaction_keys.push(meta.key.as_str())
-                        }
-                        Ok(BucketEntry::Tombstone(_)) => has_tombstone = true,
-                        Err(err) => {
-                            layout_drift_count += 1;
-                            tracing::warn!(
-                                error = %err,
-                                key = %meta.key,
-                                "unrecognized bucket-key shape, skipping key"
-                            );
-                        }
-                    }
-                }
-
-                // Retention tombstone: the bucket contributes nothing, so
-                // neither its L1 parts nor its L0 records are folded in
-                // (ADR-0019 section 3, docs/metric-index-plan.md section 7
-                // point 2/3).
-                if has_tombstone {
-                    continue;
-                }
-
-                // Compaction records: fold each part as a level-1 entry and
-                // collect the L0 input identities it supersedes
-                // (docs/metric-index-plan.md section 7 point 2). Two records
-                // with different input sets in one bucket both contribute
-                // their parts (a harmless overlap the resolver alarms on but
-                // still serves); the fold matches that inclusion.
-                let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
-                for ckey in &compaction_keys {
-                    let record = self
-                        .load_and_validate_compaction(tenant, signal, *shard, ckey, &accounting)
-                        .await?;
-                    counters.get_requests += 1;
-                    for part in &record.parts {
-                        let entry = build_l1_snapshot_entry(ckey, &record, part)?;
-                        fold_in_entry(
-                            &mut entries,
-                            &mut seen,
-                            &mut layout_drift_count,
-                            entry,
-                            true,
-                        );
-                    }
-                    for input in &record.inputs {
-                        excluded.insert((
-                            input.writer_id.clone(),
-                            input.writer_epoch,
-                            input.writer_seq,
-                        ));
-                    }
-                }
-
-                // L0 commit records: fold every one not named by a compaction
-                // input list above (docs/metric-index-plan.md section 7 point
-                // 2). An unlisted L0 is included exactly as the resolver
-                // includes it.
-                for key in &l0_keys {
-                    let record = self
-                        .load_and_validate(tenant, signal, *shard, key, &accounting)
-                        .await?;
-                    counters.get_requests += 1;
-                    if excluded.contains(&(
-                        record.writer_id.clone(),
-                        record.writer_epoch,
-                        record.writer_seq,
-                    )) {
-                        continue;
-                    }
-                    let entry = build_snapshot_entry(key, &record)?;
-                    let is_canonical = *hour == entry.ingest_hour_bucket;
+                // Classify the bucket into its contribution via the shared
+                // classifier the reconcile pass also uses (ADR-0063 section 4),
+                // then fold each contributed entry into the running set. A
+                // tombstoned bucket classifies to an empty contribution, so it
+                // folds nothing in (ADR-0019 section 3).
+                let contribution = self
+                    .classify_bucket(
+                        tenant,
+                        signal,
+                        *shard,
+                        *hour,
+                        listing,
+                        &accounting,
+                        &mut counters,
+                        &mut layout_drift_count,
+                    )
+                    .await?;
+                for (entry, is_canonical) in contribution {
                     fold_in_entry(
                         &mut entries,
                         &mut seen,
@@ -736,6 +759,87 @@ impl Catalog {
                     );
                 }
             }
+
+            // ---- Reconcile pass (ADR-0063 section 4) ----
+            //
+            // `incremental_buckets` only lists hours STRICTLY AFTER the
+            // previous fold's watermark, so a compaction record or retention
+            // tombstone published into an hour that was already sealed and
+            // folded into a PAST fold's output is never rediscovered by any
+            // later incremental fold. Re-list a bounded window of already-
+            // sealed hours and diff each bucket's current contribution against
+            // what the in-progress `entries` (seeded from the previous fold's
+            // own output for every hour outside the incremental range) already
+            // reflect. A bucket whose contribution changed updates `entries`
+            // and marks its covering part dirty so it is re-encoded and re-PUT
+            // rather than carried forward by reference. The findings fold into
+            // THIS fold attempt's single HEAD CAS below, never a second CAS.
+            //
+            // Skipped on the first fold for a tenant (`Absent`: no previous
+            // watermark exists) and on a rebuilt fold (`rebuilt`: the rebuild
+            // already re-derives every hour from the commit layout, so a
+            // reconcile pass would redo the same work over the same buckets).
+            let mut dirty_hours: HashSet<u32> = HashSet::new();
+            if let Some(watermark_hour_old) = reconcile_watermark {
+                let window = self.config().fold_reconcile_window_hours;
+                let lo = watermark_hour_old.saturating_sub(window);
+                // Inclusive at both ends: `watermark_hour_old` is the boundary
+                // `incremental_buckets` already excludes, so the reconcile
+                // window and the incremental range are adjacent, not
+                // overlapping.
+                let reconcile_buckets = hour_range_buckets(&generations, lo, watermark_hour_old);
+                let reconcile_listings = self
+                    .discover_bucket_listings(tenant, signal, &reconcile_buckets)
+                    .await?;
+                counters.list_requests += reconcile_buckets.len() as u64;
+
+                for (shard, hour, listing) in &reconcile_listings {
+                    // A bucket with only immutable L0 records cannot have
+                    // changed since it was folded (seal lemma). Skip it with no
+                    // GET; only a late compaction record or tombstone triggers
+                    // real reconcile work.
+                    if !bucket_has_compaction_or_tombstone(listing) {
+                        continue;
+                    }
+                    let contribution = self
+                        .classify_bucket(
+                            tenant,
+                            signal,
+                            *shard,
+                            *hour,
+                            listing,
+                            &accounting,
+                            &mut counters,
+                            &mut layout_drift_count,
+                        )
+                        .await?;
+                    let mut desired = dedup_contribution(contribution);
+                    // What `entries` currently reflects for this (shard, hour):
+                    // found by each entry's own shard and ingest_hour_bucket.
+                    let mut current: Vec<SnapshotEntry> = entries
+                        .iter()
+                        .filter(|e| e.shard == *shard && e.ingest_hour_bucket == *hour)
+                        .cloned()
+                        .collect();
+                    if same_entry_set(&mut current, &mut desired) {
+                        continue;
+                    }
+                    // The bucket's contribution changed (a late compaction
+                    // superseded L0 inputs previously folded in directly, or a
+                    // late tombstone means the hour now contributes nothing):
+                    // replace exactly this bucket's entries, leave every other
+                    // entry untouched, and mark the hour dirty.
+                    entries.retain(|e| !(e.shard == *shard && e.ingest_hour_bucket == *hour));
+                    entries.extend(desired);
+                    dirty_hours.insert(*hour);
+                }
+            }
+            // A reconcile that changed any hour invalidates the append-only,
+            // stable-ordinal assumption the forward postings merge relies on
+            // (a superseded or removed entry shifts every later ordinal), so
+            // postings must be rebuilt from scratch this fold, exactly as on
+            // the rebuild path.
+            let reconciled = !dirty_hours.is_empty();
 
             entries.sort_by(|a, b| {
                 (
@@ -788,10 +892,19 @@ impl Catalog {
             // HEAD permanently naming a dead object -- defeating the
             // PUT-and-get-AlreadyExists self-heal ADR-0063 section 5
             // describes, which only works if the object actually exists.
+            //
+            // A part the reconcile pass marked dirty (its covering hours'
+            // contribution changed) is excluded from this reuse map, so it can
+            // never be carried forward even if its recomputed hash somehow
+            // still matched the old ref: a dirty part always takes the normal
+            // re-encode-and-PUT path (ADR-0063 section 4). In practice the
+            // changed content already yields a different hash, so this is a
+            // fail-safe, not the primary mechanism.
             let existing_by_blake3: HashMap<Vec<u8>, SnapshotPartRef> = match &head_state {
                 HeadState::Valid { head, .. } if !rebuilt => head
                     .parts
                     .iter()
+                    .filter(|p| !part_covers_dirty_hour(p, &dirty_hours))
                     .map(|p| (p.blake3.clone(), p.clone()))
                     .collect(),
                 _ => HashMap::new(),
@@ -891,7 +1004,7 @@ impl Catalog {
             // (docs/metric-index-plan.md P5a).
             let postings_names = if entries.iter().all(|entry| entry.level == 0) {
                 let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) =
-                    if rebuilt {
+                    if rebuilt || reconciled {
                         (Vec::new(), 0)
                     } else if let HeadState::Valid { head, .. } = &head_state {
                         match self
@@ -1358,6 +1471,97 @@ impl Catalog {
         }
         buckets.sort_unstable();
         Ok(buckets)
+    }
+
+    /// Classify one `(shard, hour)` commit bucket's listing into the entries
+    /// it should contribute to the snapshot (docs/metric-index-plan.md section
+    /// 7), the single shared classifier for both the incremental fold loop and
+    /// the reconcile pass (ADR-0063 section 4). Partitioning the bucket's keys
+    /// by shape mirrors the resolve-time listing (`Catalog::list_hour_bucket`,
+    /// docs/catalog-and-mvcc.md step 2) so a fold and a live resolve derive
+    /// identical bucket state.
+    ///
+    /// A retention tombstone makes the bucket contribute nothing: neither its
+    /// L1 parts nor its L0 records are folded in (ADR-0019 section 3). Each
+    /// compaction record contributes its parts as level-1 entries and
+    /// supersedes its named L0 inputs; two records with different input sets in
+    /// one bucket both contribute (a harmless overlap the resolver alarms on
+    /// but still serves). Every L0 not named by a compaction input list is
+    /// contributed exactly as the resolver includes it. Unrecognized key
+    /// shapes are counted as layout drift and skipped, never fatal.
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_bucket(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+        listing: &[ObjectMeta],
+        accounting: &QueryAccounting,
+        counters: &mut RequestCounters,
+        layout_drift_count: &mut u64,
+    ) -> Result<BucketContribution, CatalogError> {
+        let mut l0_keys: Vec<&str> = Vec::new();
+        let mut compaction_keys: Vec<&str> = Vec::new();
+        let mut has_tombstone = false;
+        for meta in listing {
+            match keys::partition_bucket_entry(&meta.key) {
+                Ok(BucketEntry::CommitRecord(_)) => l0_keys.push(meta.key.as_str()),
+                Ok(BucketEntry::CompactionRecord(_)) => compaction_keys.push(meta.key.as_str()),
+                Ok(BucketEntry::Tombstone(_)) => has_tombstone = true,
+                Err(err) => {
+                    *layout_drift_count += 1;
+                    tracing::warn!(
+                        error = %err,
+                        key = %meta.key,
+                        "unrecognized bucket-key shape, skipping key"
+                    );
+                }
+            }
+        }
+
+        if has_tombstone {
+            return Ok(Vec::new());
+        }
+
+        let mut contributed: BucketContribution = Vec::new();
+        let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
+        for ckey in &compaction_keys {
+            let record = self
+                .load_and_validate_compaction(tenant, signal, shard, ckey, accounting)
+                .await?;
+            counters.get_requests += 1;
+            for part in &record.parts {
+                let entry = build_l1_snapshot_entry(ckey, &record, part)?;
+                contributed.push((entry, true));
+            }
+            for input in &record.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+        }
+
+        for key in &l0_keys {
+            let record = self
+                .load_and_validate(tenant, signal, shard, key, accounting)
+                .await?;
+            counters.get_requests += 1;
+            if excluded.contains(&(
+                record.writer_id.clone(),
+                record.writer_epoch,
+                record.writer_seq,
+            )) {
+                continue;
+            }
+            let entry = build_snapshot_entry(key, &record)?;
+            let is_canonical = hour == entry.ingest_hour_bucket;
+            contributed.push((entry, is_canonical));
+        }
+
+        Ok(contributed)
     }
 
     /// Discover each `(shard, hour)` bucket's raw keys concurrently, bounded by
