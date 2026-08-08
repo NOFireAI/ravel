@@ -544,8 +544,8 @@ fn same_entry_set(a: &mut [SnapshotEntry], b: &mut [SnapshotEntry]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.sort_by(|x, y| entry_identity(x).cmp(&entry_identity(y)));
-    b.sort_by(|x, y| entry_identity(x).cmp(&entry_identity(y)));
+    a.sort_by_key(entry_identity);
+    b.sort_by_key(entry_identity);
     a == b
 }
 
@@ -1708,6 +1708,7 @@ mod tests {
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_proto::commit::v1::{CompactionInputIdentity, RetentionTombstone};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
 
@@ -2765,6 +2766,500 @@ mod tests {
         assert!(
             store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
             "the intersecting low part is fetched"
+        );
+    }
+
+    // ---- ADR-0063 T3 (#742): fold reconcile pass ----
+
+    /// Publish a compaction record into `(shard, ingest_hour_bucket)` that
+    /// supersedes the given L0 `inputs` and contributes one L1 part. Only the
+    /// record object is written (at its own reconstructed key): the fold's
+    /// reconcile and incremental paths read the record, not the part object, so
+    /// no L1 part object is needed for these tests.
+    async fn publish_compaction(
+        store: &MemoryStore,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        inputs: &[&CommitRecord],
+        created_unix_ns: i64,
+    ) -> CompactionRecord {
+        let input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        let mut hasher = blake3::Hasher::new();
+        for id in &input_ids {
+            hasher.update(id.writer_id.as_bytes());
+            hasher.update(&id.writer_epoch.to_le_bytes());
+            hasher.update(&id.writer_seq.to_le_bytes());
+        }
+        let input_set_hash = *hasher.finalize().as_bytes();
+        let part_payload = format!("l1-{shard}-{ingest_hour_bucket}").into_bytes();
+        let part_content_hash = *blake3::hash(&part_payload).as_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: part_content_hash.to_vec(),
+            object_size: part_payload.len() as u64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            segment_format_version: 3,
+        };
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: input_ids,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            created_unix_ns,
+        };
+        let key = keys::compaction_record_key_for(&record).expect("compaction key");
+        store
+            .put(
+                &key,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        record
+    }
+
+    /// Publish a retention tombstone for `(shard, ingest_hour_bucket)`. The
+    /// fold classifies a bucket as tombstoned from the key shape alone and
+    /// never reads the body, so a minimal valid record suffices.
+    async fn publish_tombstone(store: &MemoryStore, shard: u32, ingest_hour_bucket: u32) {
+        let record = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard,
+            ingest_hour_bucket,
+            retired_at_ns: 0,
+            retention_window_ns: 0,
+            record_count_observed: 0,
+        };
+        let key = keys::retention_tombstone_key_for(&record).expect("tombstone key");
+        store
+            .put(
+                &key,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put tombstone");
+    }
+
+    /// Load and concatenate every entry across all parts a HEAD names, in part
+    /// order (the globally sorted entry set).
+    async fn collect_head_entries(
+        store: &dyn ObjectStoreBackend,
+        head: &SnapshotHead,
+    ) -> Vec<SnapshotEntry> {
+        let mut out = Vec::new();
+        for part in &head.parts {
+            let got = store
+                .get(&part.key, GetRange::Full)
+                .await
+                .expect("part present");
+            let decoded = snapshot_format::decode_part(&got.data, &PartLimits::default())
+                .expect("decode part");
+            out.extend(decoded.entries);
+        }
+        out
+    }
+
+    async fn read_head(store: &dyn ObjectStoreBackend) -> SnapshotHead {
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let got = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head present");
+        snapshot_format::decode_head(&got.data).expect("head decodes")
+    }
+
+    /// #742 acceptance: a compaction record published into an hour that a
+    /// PREVIOUS fold already sealed and folded is discovered and applied by the
+    /// reconcile pass of a later fold, and the sealed part covering that hour is
+    /// actually re-PUT (its content changed) rather than carried forward by
+    /// reference.
+    #[tokio::test]
+    async fn reconcile_applies_late_compaction_before_horizon() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Hour 10 seals into its own part; hour 11 is the tail.
+        let now_1 = now_at_seal(11);
+        let writer_a = Uuid::new_v4();
+        let seg_a = publish_segment(&store, 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert_eq!(first.parts_total, 2);
+        assert_eq!(first.entry_count, 2);
+
+        let head1 = read_head(store.as_ref()).await;
+        let hour10_part = head1
+            .parts
+            .iter()
+            .find(|p| p.min_hour <= 10 && 10 <= p.watermark_hour)
+            .expect("a part covers hour 10")
+            .clone();
+        let old_blake3 = hour10_part.blake3.clone();
+
+        // A compaction lands in the already-sealed, already-folded hour 10,
+        // superseding seg_a's L0 with one L1 part.
+        publish_compaction(&store, 0, 10, &[&seg_a], now_1).await;
+
+        // A later fold: the reconcile window covers hour 10 and applies it.
+        let now_2 = now_at_seal(13);
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("second fold");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let head2 = read_head(store.as_ref()).await;
+        let entries = collect_head_entries(store.as_ref(), &head2).await;
+        let hour10: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 10)
+            .collect();
+        assert_eq!(hour10.len(), 1, "hour 10 now has exactly the L1 part");
+        assert_eq!(hour10[0].level, 1, "hour 10's entry is the compaction L1");
+        assert!(
+            !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
+            "the superseded L0 must be gone from the snapshot"
+        );
+
+        // The sealed part covering hour 10 was re-PUT: no part in the new HEAD
+        // carries the old hour-10 part's blake3, so it was not carried forward.
+        assert!(
+            !head2.parts.iter().any(|p| p.blake3 == old_blake3),
+            "the sealed hour-10 part must be re-PUT with new content, not reused"
+        );
+        assert!(
+            head2
+                .parts
+                .iter()
+                .any(|p| p.min_hour <= 10 && 10 <= p.watermark_hour),
+            "a part still covers hour 10"
+        );
+    }
+
+    /// A late record landing OUTSIDE the reconcile window (older than
+    /// `watermark_hour_old - fold_reconcile_window_hours`) is correctly NOT
+    /// picked up: the stated, bounded staleness this window accepts.
+    #[tokio::test]
+    async fn reconcile_ignores_late_record_outside_window() {
+        let store = Arc::new(MemoryStore::new());
+        // Default window is 26 hours.
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let writer_x = Uuid::new_v4();
+        let seg_x = publish_segment(&store, 0, writer_x, 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 2);
+
+        // A compaction lands in hour 5, far older than watermark 40 minus the
+        // 26-hour window (floor 14).
+        publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.no_op, "the watermark advanced 40 -> 41");
+        assert_eq!(
+            second.entry_count, 2,
+            "the out-of-window compaction is not applied"
+        );
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        let hour5: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 5)
+            .collect();
+        assert_eq!(hour5.len(), 1);
+        assert_eq!(hour5[0].level, 0, "hour 5 still holds the original L0");
+        assert_eq!(hour5[0].content_hash, seg_x.content_hash);
+    }
+
+    /// A late retention tombstone in an already-folded, in-window hour drops
+    /// that hour's entries on the next fold.
+    #[tokio::test]
+    async fn reconcile_applies_late_tombstone() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 2);
+
+        // Retire hour 10 after it was folded.
+        publish_tombstone(&store, 0, 10).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt);
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        assert!(
+            !entries.iter().any(|e| e.ingest_hour_bucket == 10),
+            "the tombstoned hour contributes nothing after reconcile"
+        );
+        assert!(
+            entries.iter().any(|e| e.ingest_hour_bucket == 11),
+            "the untouched hour 11 is preserved"
+        );
+    }
+
+    /// A fold whose reconcile window finds nothing changed carries every
+    /// untouched sealed part forward by reference: no spurious PUT, EH-T2's
+    /// carry-forward optimization is not regressed by the reconcile pass.
+    #[tokio::test]
+    async fn reconcile_no_change_carries_sealed_parts_forward() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+
+        let head1 = read_head(store.as_ref()).await;
+        let sealed = head1
+            .parts
+            .iter()
+            .find(|p| p.min_hour <= 10 && 10 <= p.watermark_hour)
+            .expect("hour-10 part")
+            .clone();
+        let sealed_bytes = store
+            .get(&sealed.key, GetRange::Full)
+            .await
+            .expect("sealed part")
+            .data;
+
+        // No late record: a later fold's reconcile pass finds nothing changed.
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt);
+        assert!(
+            second.parts_reused >= 1,
+            "the unchanged sealed part is carried by reference"
+        );
+
+        let head2 = read_head(store.as_ref()).await;
+        assert!(
+            head2.parts.iter().any(|p| p.key == sealed.key),
+            "sealed part still referenced by its original key"
+        );
+        let sealed_bytes_2 = store
+            .get(&sealed.key, GetRange::Full)
+            .await
+            .expect("sealed part still present")
+            .data;
+        assert_eq!(
+            sealed_bytes, sealed_bytes_2,
+            "the sealed part object was not rewritten"
+        );
+    }
+
+    /// Both the very first fold (`HeadState::Absent`) and a rebuilt fold
+    /// (corrupt HEAD) skip the reconcile pass entirely: no in-window empty
+    /// bucket is ever listed. Proven by a LIST fault on hour 5's bucket prefix
+    /// (an hour that holds no data, so `discover_buckets` never lists it, but
+    /// the reconcile window WOULD): the fault must never fire.
+    #[tokio::test]
+    async fn first_and_rebuilt_folds_skip_reconcile() {
+        let hour5_prefix =
+            keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, 5).expect("prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Permanent("reconcile listed an in-window empty hour".into()),
+            )
+            .with_key_contains(hour5_prefix),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // First fold: HEAD absent -> rebuilt, reconcile skipped.
+        let now_1 = now_at_seal(10);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt);
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Permanent),
+            0,
+            "first fold must not run the reconcile pass"
+        );
+
+        // Corrupt HEAD, then fold again: rebuilt, reconcile skipped.
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        store
+            .inner()
+            .put(
+                &head_key,
+                Bytes::from_static(b"not a head"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("corrupt head");
+        let now_2 = now_at_seal(12);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("second fold");
+        assert!(second.rebuilt);
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Permanent),
+            0,
+            "a rebuilt fold must not run the reconcile pass"
+        );
+    }
+
+    /// The single HEAD CAS invariant holds even when the reconcile pass finds
+    /// and applies a change: exactly one HEAD PUT per fold attempt. Fault the
+    /// THIRD HEAD PUT (fold 1 is the 1st, the reconcile-applying fold 2 is the
+    /// 2nd); a spurious second HEAD PUT inside fold 2 would be the 3rd and fire
+    /// the fault. It must not.
+    #[tokio::test]
+    async fn reconcile_preserves_single_head_cas() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("second HEAD PUT within one fold".into()),
+            )
+            .with_key_contains("HEAD")
+            .with_occurrence(Occurrence::Nth(3)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        let writer_a = Uuid::new_v4();
+        let seg_a =
+            publish_segment(store.inner(), 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+
+        publish_compaction(store.inner(), 0, 10, &[&seg_a], now_1).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+            )
+            .await
+            .expect("second fold applies reconcile under one HEAD CAS");
+        assert!(!second.no_op);
+
+        // The reconcile change actually landed (proving the test exercised the
+        // apply path, not a no-op).
+        let entries = collect_head_entries(store.inner(), &read_head(store.inner()).await).await;
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.ingest_hour_bucket == 10 && e.level == 1),
+            "the late compaction was applied"
+        );
+        assert!(
+            !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
+            "the superseded L0 is gone"
+        );
+
+        // No fold attempt issued a second HEAD PUT.
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Permanent),
+            0,
+            "each fold attempt performs exactly one HEAD CAS write"
         );
     }
 }

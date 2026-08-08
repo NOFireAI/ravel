@@ -323,6 +323,76 @@ always safe for sealing.
 
 (docs/metric-index-plan.md 2, ADR-0020.)
 
+## Fold reconcile pass (ADR-0063 section 4)
+
+The incremental fold lists only the buckets for hours strictly after the
+previous fold's watermark (`incremental_buckets`, hours
+`(watermark_hour_old, watermark_hour_new]`). A compaction record (`l1.*.cmt`)
+or retention tombstone (`retire.tmb`) can be published into an hour long
+after that hour was sealed and folded into a past fold's output; because no
+later fold ever re-lists an already-folded hour, such a late record would
+otherwise never be applied to the snapshot short of a full HEAD-corruption
+rebuild. Under the single ever-rewritten part of the pre-EH design this was
+masked (the one part was recomputed every cycle). Under EH-T2's sealed parts,
+which are deliberately carried forward by reference and never rewritten, it
+must be addressed directly.
+
+Each incremental fold, after the incremental-bucket processing and before the
+part spans are cut, runs a reconcile pass over a bounded window of
+already-sealed hours:
+
+- **Window.** Hours in `[watermark_hour_old - fold_reconcile_window_hours,
+  watermark_hour_old]`, inclusive at both ends. `watermark_hour_old` is the
+  boundary the incremental range excludes, so the reconcile window and the
+  incremental range are adjacent, never overlapping. `fold_reconcile_window_hours`
+  defaults to 26 hours: `protection_horizon` (24 h, the age gate before the
+  sweeper may physically delete a superseded compaction input) plus slack.
+  Because the sweeper only deletes an input after that horizon, any record
+  whose supersession could invalidate a snapshot entry is observed by a
+  reconcile pass before its inputs can disappear.
+- **Skipped when redundant.** The pass does not run on the first fold for a
+  tenant (no previous watermark exists) or on a rebuilt fold (absent, corrupt,
+  or unreadable-part HEAD): a rebuild already re-derives every hour from the
+  commit layout, so reconcile would repeat that work.
+- **Cheap common case.** Each window bucket is re-listed (bounded by the same
+  `fold_bucket_concurrency` semaphore the incremental path uses). A bucket
+  holding only immutable L0 records cannot have changed since it was folded
+  (seal lemma above), so it is skipped with no record GET. Only a bucket whose
+  listing contains a compaction record or a tombstone is classified and
+  diffed. When nothing late has landed, the pass costs only the window LISTs
+  and every unchanged sealed part is still carried forward by reference.
+- **Diff and apply.** A triggered bucket is classified by the same
+  commit/compaction/tombstone logic the incremental path applies
+  (`Catalog::classify_bucket`), yielding what the bucket should currently
+  contribute. That is compared, ignoring order, against what the in-progress
+  entry set already reflects for that `(shard, hour)` (found by each entry's
+  own `ingest_hour_bucket`; those entries were seeded from the previous fold's
+  own output). If they differ — a late compaction supersedes L0 inputs
+  previously folded in directly, or a late tombstone means the hour now
+  contributes nothing — exactly that bucket's entries are replaced and every
+  other entry is left untouched.
+- **Dirty parts rebuild, never carry forward.** A previous HEAD's sealed part
+  whose `[min_hour, watermark_hour]` range covers a changed hour is marked
+  dirty and excluded from the by-content-hash carry-forward reuse: it always
+  goes through the normal re-encode-and-PUT path. The changed content already
+  yields a different blake3, so a dirty part is re-PUT under a new
+  content-addressed key regardless; the explicit exclusion is a fail-safe that
+  refuses to keep stale content even in a hash coincidence.
+- **One CAS.** Reconcile findings fold into the same fold attempt's single
+  HEAD `CasVersion` write. There is never a second CAS: HEAD remains the only
+  mutable object and the only unit of atomic visibility.
+- **Postings.** A reconcile that changed any hour forces a full postings
+  rebuild this fold, since the forward postings merge assumes append-only,
+  stable-ordinal growth that a supersession or removal breaks. (A change that
+  introduces an L1 entry suppresses postings entirely, as elsewhere.)
+
+Invariant this closes: a compaction record or retention tombstone landing in
+an already-folded hour is now eventually applied — within
+`fold_reconcile_window_hours` of its own publish — rather than never. A late
+record older than that window is deliberately not picked up: a stated,
+bounded staleness tradeoff, not a bug. (This closes a latent correctness gap
+that predates the epic; see ADR-0063 Consequences.)
+
 ## Commit sequence (strict mode)
 
 1. Pin the flush identity (above).
