@@ -23,6 +23,10 @@ executors.
   editing files directly in the dispatching session's working tree, or
   two subagents sharing one tree, corrupts both in-flight edits and any
   concurrent `cargo` build cache. One worktree per unit of work, always.
+  This rule has no small-change exception. A doc-only edit and a one-file
+  fixup follow it too: both commits that ever bypassed it were rationalized
+  as "just a doc" and "just one file", and a concurrent session can sit on
+  the primary checkout at any moment.
 - Exception: fleet executors working in a dedicated clone. The clone is
   already the isolated workspace; commit directly on the dispatched
   checkout's HEAD (detached HEAD is fine). Do not create a side worktree
@@ -109,6 +113,31 @@ and test gates on every push. Where cargo-nextest is installed, `cargo
 nextest run` is an accepted equivalent of `cargo test` (CI's check job
 runs it with the `ci` profile); doctests still need `cargo test --doc`.
 
+### Long commands and the Bash tool
+
+The Bash tool stops a foreground command after 2 minutes by default. Its
+`timeout` parameter accepts up to 600000 ms. Workspace clippy and test
+runs, and the `sql`/`flight-sql` lanes, routinely run longer than 2
+minutes: pass a long `timeout` on the call, or use `run_in_background`
+and wait for the notification. Do not emulate waiting with repeated
+`sleep N && tail` calls: a sleep of 120 s or more times out itself, and
+each poll turn resends the full session context (one measured executor
+session spent 39 of 205 turns on pure poll turns).
+
+On an 8 GB host, default cargo parallelism gets ld killed with signal 9;
+`gates.sh` caps build jobs there automatically. If you invoke cargo
+directly on such a host, pass `--jobs 2`.
+
+### CI workflow changes
+
+No local gate compiles `.github/workflows/`. A workflow change is done
+only when the pushed Actions run is green. Two defect classes have
+shipped from here: `taiki-e/install-action@sccache` lacks the Cache
+Service v2 tokens (use `mozilla-actions/sccache-action`), and
+`CARGO_TERM_COLOR: always` puts ANSI codes inside cargo/nextest output,
+which breaks any grep guard over that output (`--color never`, or strip
+the codes first).
+
 ## Scripts
 
 Use these instead of retyping the same shell each time; they exist
@@ -120,6 +149,13 @@ connection, a pushed-but-broken main).
   to specific crates for fast iteration. It also runs the `sql` and
   `flight-sql` feature lanes, always in workspace mode and in scoped mode
   when `ravel-server` or `ravel-sql` is named.
+- `scripts/disk-reap.sh [-y]` — reclaims disk from merged clean worktrees
+  and orphaned cargo target dirs (dry run by default; `-y` applies). Run
+  it when free space drops below ~20 GB, and after a land worktree's PR
+  merges. Multi-session days have filled this volume to zero bytes free,
+  at which point no Bash command can run at all and gates fail with fake
+  errors; each manual cleanup used exactly the heuristics this script
+  encodes.
 - `scripts/fleet-watch.sh <watch-url> [poll-interval-seconds]` — waits on
   a `fleet_dispatch`/`fleet_status` task by polling its watch endpoint in
   a loop. The SSE stream it wraps drops the connection almost immediately
@@ -147,6 +183,44 @@ connection, a pushed-but-broken main).
   the `verify-dispatch` skill, which adds narrow adversarial checks on
   top) before merging any fleet result — a crate-scoped or warm-cache
   gate run has let a broken branch through before.
+
+### Writing gate and poll shell
+
+Three shell bugs have each silently turned a failing gate or watch loop
+into a false green. When you write or edit any such script:
+
+- Capture an exit code as `cmd || code=$?` on the same line. `$?` read
+  after an `if`/`fi` block reports the `if` construct, not the command
+  (this exact bug made a draft of `verify-dispatch-gates.sh` report PASS
+  on everything).
+- Never name a variable `status`, `path`, `argv`, or `PWD`: zsh reserves
+  them, and assignment kills the loop with `read-only variable` (killed
+  the same Monitor poll loop twice).
+- Never pipe a gate through `grep`, `head`, or `tail`, and never append
+  `&& echo MARKER`: the pipeline's exit code masks the gate's.
+
+## Fleet executor environment
+
+Facts about the dispatched clone that executors have re-derived by trial
+and error, one wasted turn (or one lost result) at a time:
+
+- The host has 8 GB RAM and 4 cores. See "Long commands and the Bash
+  tool" above for the `timeout` and `--jobs` consequences.
+- Fresh clones may carry no git identity, and the first `git commit -s`
+  fails with "unable to auto-detect email address". Before your first
+  commit, run: `git config user.email "fleet-executor@nofire.ai" &&
+  git config user.name "Ravel Fleet Executor"`.
+- `CARGO_HOME` varies per clone and is never `~/.cargo`. To locate a
+  dependency's source, ask cargo: `cargo metadata --format-version 1 |
+  jq -r '.packages[] | select(.name=="<crate>") | .manifest_path'`.
+  Never hunt with `find /`.
+- A source-only `git fetch origin <ref>` populates only `FETCH_HEAD`. To
+  diff another task's result branch, fetch with a destination:
+  `git fetch origin '<ref>:refs/remotes/origin/<ref>'`.
+- If the final result push (or a git-start call) fails with a 5xx from
+  the control plane, wait 30 s and retry, up to 5 times, and report the
+  retries. Completed, gate-green work has been lost to a single
+  unretried 502 at exactly this step.
 
 ## Commits
 
