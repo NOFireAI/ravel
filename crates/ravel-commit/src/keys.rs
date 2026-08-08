@@ -1231,16 +1231,19 @@ pub enum BucketEntry {
 // with `l1.`, so today they fall through to the `else if filename.ends_with(".cmt")`
 // commit-record branch and fail to parse (a UUID-shaped writer id is expected,
 // `rw` is not one). This must be fixed before ravel-catalog's snapshot
-// resolution can see rewrite records, at two known call sites:
+// resolution can see rewrite records, at three known call sites:
 //   - crates/ravel-catalog/src/catalog.rs: propagates the parse error via `?`,
 //     so a live rewrite record hard-errors resolution today.
 //   - crates/ravel-catalog/src/fold.rs: catches the error and silently skips
 //     the entry with a warning. This one is the dangerous case: a silently
 //     skipped rewrite record means its supersession of the erased inputs is
 //     ignored by the index fold, so an erased subject's pre-rewrite records
-//     can reappear in a folded snapshot. Fix `partition_bucket_entry` to emit
-//     a `BucketEntry::RewriteRecord` (via `parse_rewrite_record_key`) before
-//     wiring either call site to act on it.
+//     can reappear in a folded snapshot.
+//   - crates/ravel-maintain/src/read.rs (`list_bucket`): also routes through
+//     `partition_bucket_entry` and hard-errors on an `rw.` key today, so
+//     compacting any bucket containing a rewrite record currently fails.
+// Fix `partition_bucket_entry` to emit a `BucketEntry::RewriteRecord` (via
+// `parse_rewrite_record_key`) before wiring any of the three to act on it.
 // Classifying `rw.` keys and teaching ravel-catalog to act on them is out of
 // scope for this task; this comment is the pointer for whoever does it next.
 /// Classify one key from a `c/<shard>/<hour>/` bucket listing by filename

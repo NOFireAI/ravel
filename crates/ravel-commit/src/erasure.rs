@@ -22,6 +22,7 @@ use ravel_proto::commit::v1::{
 };
 use uuid::Uuid;
 
+use crate::keys::{parse_compaction_record_key, parse_rewrite_record_key};
 use crate::signal;
 
 /// The only supported `format_version` for every selective-erasure record.
@@ -54,8 +55,6 @@ pub enum ErasureError {
     UnknownDeferralCause(i32),
     #[error("invalid input_set_hash length: expected 32 bytes, got {0}")]
     InvalidInputSetHashLen(usize),
-    #[error("empty input set: a rewrite record must supersede at least one input")]
-    EmptyInputs,
     #[error(
         "rewrite record sets both `inputs` and `superseded_record_key`: exactly one may be set"
     )]
@@ -68,6 +67,27 @@ pub enum ErasureError {
         "input_set_hash mismatch: the record's input_set_hash is not the hash computed from its own inputs/superseded_record_key and applied request ids"
     )]
     InputSetHashMismatch,
+    #[error("superseded_record_key {0:?} does not parse as a compaction or rewrite record key")]
+    InvalidSupersededRecordKey(String),
+    #[error(
+        "superseded_record_key names a different bucket than this record: key names \
+         (tenant={key_tenant_hex}, signal={key_signal:?}, shard={key_shard}, hour={key_hour}), \
+         record is (tenant={record_tenant_hex}, signal={record_signal:?}, shard={record_shard}, hour={record_hour})"
+    )]
+    SupersededRecordKeyBucketMismatch {
+        key_tenant_hex: String,
+        key_signal: i32,
+        key_shard: u32,
+        key_hour: u32,
+        record_tenant_hex: String,
+        record_signal: i32,
+        record_shard: u32,
+        record_hour: u32,
+    },
+    #[error("duplicate applied request id {0:?} across a rewrite record's drops")]
+    DuplicateAppliedRequestId(String),
+    #[error("rewrite record inputs are not sorted canonically (index {index})")]
+    InputsNotSorted { index: usize },
     #[error(
         "bucket drop signal {bucket_drop} does not match the completion's top-level signal {completion}"
     )]
@@ -230,20 +250,29 @@ pub const REWRITE_INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-rewrite-input-set-v1\0"
 /// The preimage, in order, is:
 ///
 /// 1. the [`REWRITE_INPUT_SET_HASH_DOMAIN`] tag;
-/// 2. exactly one of
-///    - (inputs) if `inputs` is non-empty: a little-endian `u64` count of the
-///      inputs, then for each input its `writer_id` UTF-8 bytes
-///      (length-prefixed by a little-endian `u64`), then its `writer_epoch`
-///      and `writer_seq` as little-endian `u64` — the same shape ravel-maintain's
-///      compaction `input_set_hash` uses; or
-///    - (superseded) if `superseded_record_key` is `Some`: its UTF-8 bytes
-///      prefixed by their length as a little-endian `u64`;
-/// 3. a little-endian `u64` count of `applied_request_ids`, then each
+/// 2. a single case-discriminant byte, `0x00` for the inputs case or `0x01`
+///    for the superseded case;
+/// 3. exactly one of
+///    - (inputs, discriminant `0x00`) if `inputs` is non-empty: a
+///      little-endian `u64` count of the inputs, then for each input its
+///      `writer_id` UTF-8 bytes (length-prefixed by a little-endian `u64`),
+///      then its `writer_epoch` and `writer_seq` as little-endian `u64` —
+///      the same shape ravel-maintain's compaction `input_set_hash` uses; or
+///    - (superseded, discriminant `0x01`) if `superseded_record_key` is
+///      `Some`: its UTF-8 bytes prefixed by their length as a little-endian
+///      `u64`;
+/// 4. a little-endian `u64` count of `applied_request_ids`, then each
 ///    request id's UTF-8 bytes (length-prefixed the same way).
 ///
-/// The length-prefix framing of the one-of case makes the two cases produce
-/// distinct preimages by construction, so no `inputs` set can ever hash the
-/// same as a `superseded_record_key` string.
+/// The discriminant byte makes the two cases produce disjoint preimages by
+/// construction: with only length-prefix framing and no discriminant, a
+/// crafted `inputs` set and a crafted `superseded_record_key` string could
+/// in principle produce byte-identical preimages (the count field of one
+/// case and the length field of the other occupy the same position), even
+/// though this crate's own validation makes that unreachable in practice
+/// today (every `RewriteDrop.request_id` must be UUID-shaped). The
+/// discriminant makes the "distinct by construction" claim actually true,
+/// not merely true for every input this crate currently accepts.
 ///
 /// This function does NOT sort. Inputs must already arrive sorted canonically
 /// by `(writer_id, writer_epoch, writer_seq)` (per the proto comment on
@@ -280,6 +309,7 @@ pub fn compute_rewrite_input_set_hash(
     let mut hasher = blake3::Hasher::new();
     hasher.update(REWRITE_INPUT_SET_HASH_DOMAIN);
     if has_inputs {
+        hasher.update(&[0x00]);
         hasher.update(&(inputs.len() as u64).to_le_bytes());
         for input in inputs {
             let wid = input.writer_id.as_bytes();
@@ -289,6 +319,7 @@ pub fn compute_rewrite_input_set_hash(
             hasher.update(&input.writer_seq.to_le_bytes());
         }
     } else if let Some(key) = superseded {
+        hasher.update(&[0x01]);
         hasher.update(&(key.len() as u64).to_le_bytes());
         hasher.update(key.as_bytes());
     }
@@ -335,11 +366,70 @@ pub fn validate_rewrite(record: &RewriteRecord) -> Result<(), ErasureError> {
         (false, false) => return Err(ErasureError::NeitherInputsNorSuperseded),
         _ => {}
     }
+    if has_inputs {
+        // Inputs must arrive sorted canonically by (writer_id, writer_epoch,
+        // writer_seq), matching CompactionRecord.inputs's own discipline and
+        // `compute_rewrite_input_set_hash`'s no-sort contract (the hash is
+        // only well-defined, and only idempotent under CreateIfAbsent for a
+        // retried batch, if callers never disagree about ordering).
+        fn sort_key(i: &CompactionInputIdentity) -> (&str, u64, u64) {
+            (i.writer_id.as_str(), i.writer_epoch, i.writer_seq)
+        }
+        for (index, pair) in record.inputs.windows(2).enumerate() {
+            if sort_key(&pair[0]) > sort_key(&pair[1]) {
+                return Err(ErasureError::InputsNotSorted { index: index + 1 });
+            }
+        }
+    }
+    // A `superseded_record_key` is a stored key string: never trust it at
+    // face value (ADR-0010 §7 discipline, applied here the same way every
+    // other stored key in this crate is verified). It must parse as either a
+    // live compaction record's key or a prior rewrite record's key, and it
+    // must name the exact same bucket this record itself is in -- a
+    // wrong-bucket value here would let a rewrite silently supersede the
+    // wrong tenant/signal/shard/hour's records, either resurrecting records
+    // that should have stayed erased or excluding records that were never
+    // actually rewritten.
+    if let Some(key) = superseded {
+        let (key_tenant, key_signal, key_shard, key_hour) = parse_compaction_record_key(key)
+            .map(|p| (p.tenant_hash.0, p.signal, p.shard, p.ingest_hour_bucket))
+            .or_else(|_| {
+                parse_rewrite_record_key(key)
+                    .map(|p| (p.tenant_hash.0, p.signal, p.shard, p.ingest_hour_bucket))
+            })
+            .map_err(|_| ErasureError::InvalidSupersededRecordKey(key.to_string()))?;
+        let record_signal = signal::from_proto(record.signal)
+            .map_err(|_| ErasureError::UnknownSignal(record.signal))?;
+        if key_tenant.as_slice() != record.tenant_hash.as_slice()
+            || key_signal != record_signal
+            || key_shard != record.shard
+            || key_hour != record.ingest_hour_bucket
+        {
+            return Err(ErasureError::SupersededRecordKeyBucketMismatch {
+                key_tenant_hex: hex::encode(key_tenant),
+                key_signal: signal::to_proto(key_signal) as i32,
+                key_shard,
+                key_hour,
+                record_tenant_hex: hex::encode(&record.tenant_hash),
+                record_signal: record.signal,
+                record_shard: record.shard,
+                record_hour: record.ingest_hour_bucket,
+            });
+        }
+    }
     if record.drops.is_empty() {
         return Err(ErasureError::EmptyDrops);
     }
-    for drop in &record.drops {
-        check_request_id(&drop.request_id)?;
+    {
+        let mut seen = std::collections::HashSet::new();
+        for drop in &record.drops {
+            check_request_id(&drop.request_id)?;
+            if !seen.insert(drop.request_id.as_str()) {
+                return Err(ErasureError::DuplicateAppliedRequestId(
+                    drop.request_id.clone(),
+                ));
+            }
+        }
     }
     for part in &record.parts {
         if part.content_hash.len() != 32 {
@@ -541,7 +631,14 @@ mod tests {
         ) -> RewriteRecord {
             // A valid rewrite carries the canonical hash of its own inputs and
             // sorted applied request ids, so it survives validate_rewrite's
-            // recomputation check on decode.
+            // recomputation check on decode. `inputs` must also be in
+            // validate_rewrite's required sorted order, same as
+            // CompactionRecord.inputs.
+            let mut inputs = inputs;
+            inputs.sort_by(|a, b| {
+                (a.writer_id.as_str(), a.writer_epoch, a.writer_seq)
+                    .cmp(&(b.writer_id.as_str(), b.writer_epoch, b.writer_seq))
+            });
             let mut request_ids: Vec<String> =
                 drops.iter().map(|d| d.request_id.clone()).collect();
             request_ids.sort();
@@ -663,9 +760,20 @@ mod tests {
 
     /// A valid rewrite that supersedes a whole live record key instead of a
     /// raw input set (the amended second case): `inputs` empty,
-    /// `superseded_record_key` set, hash recomputed from that key.
+    /// `superseded_record_key` set, hash recomputed from that key. The key
+    /// must be a real, correctly-shaped `CompactionRecord`/`RewriteRecord`
+    /// key naming exactly this record's own bucket (validate_rewrite now
+    /// parses and checks it, not just checks it's non-empty).
     fn valid_superseding_rewrite() -> RewriteRecord {
-        let superseded = "t/aabb/m/c/0001/20260726T14/l1.0011223344556677.cmt".to_string();
+        let tenant = ravel_types::TenantHash([0x11; 16]);
+        let superseded = crate::keys::compaction_record_key(
+            &tenant,
+            ravel_types::Signal::Metrics,
+            1,
+            0,
+            "0011223344556677",
+        )
+        .expect("build a well-formed compaction record key for the fixture");
         let drops = vec![RewriteDrop {
             request_id: Uuid::from_u128(1).to_string(),
             dropped_count: 5,
@@ -899,6 +1007,171 @@ mod tests {
         let via_inputs = compute_rewrite_input_set_hash(&inputs, None, &ids);
         let via_superseded = compute_rewrite_input_set_hash(&[], Some(&writer), &ids);
         assert_ne!(via_inputs, via_superseded);
+    }
+
+    /// The end-to-end regression for the collision the checkpoint reproduced:
+    /// two full `RewriteRecord`s over the same inputs but different applied
+    /// request sets must produce two different `rw.<hash16>.cmt` object
+    /// keys via `keys::rewrite_record_key_for`, not just two different
+    /// `compute_rewrite_input_set_hash` outputs in isolation. This is what
+    /// actually proves `CreateIfAbsent` can never collide the two batches --
+    /// the hash-level test above is necessary but not sufficient on its own.
+    #[test]
+    fn two_batches_over_same_bucket_produce_different_object_keys() {
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(9).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let build = |request_ids: &[String]| -> RewriteRecord {
+            let input_set_hash =
+                compute_rewrite_input_set_hash(&inputs, None, request_ids).to_vec();
+            RewriteRecord {
+                format_version: 1,
+                tenant_hash: vec![0x11; 16],
+                signal: 1,
+                shard: 0,
+                ingest_hour_bucket: 0,
+                inputs: inputs.clone(),
+                input_set_hash,
+                parts: vec![],
+                drops: request_ids
+                    .iter()
+                    .map(|id| RewriteDrop {
+                        request_id: id.clone(),
+                        dropped_count: 1,
+                    })
+                    .collect(),
+                created_unix_ns: 0,
+                superseded_record_key: String::new(),
+            }
+        };
+        let first = build(&[Uuid::from_u128(1).to_string()]);
+        let second = build(&[
+            Uuid::from_u128(1).to_string(),
+            Uuid::from_u128(2).to_string(),
+        ]);
+        assert_eq!(validate_rewrite(&first), Ok(()));
+        assert_eq!(validate_rewrite(&second), Ok(()));
+        let key_one = crate::keys::rewrite_record_key_for(&first).expect("reconstruct first key");
+        let key_two = crate::keys::rewrite_record_key_for(&second).expect("reconstruct second key");
+        assert_ne!(
+            key_one, key_two,
+            "a second erasure batch over the same bucket must not collide with the first \
+             batch's rw.<hash16>.cmt key under CreateIfAbsent"
+        );
+        // A retry of the exact same first batch still lands on the same key
+        // (idempotent under CreateIfAbsent), the other half of the fix.
+        let first_retry = build(&[Uuid::from_u128(1).to_string()]);
+        let key_one_retry =
+            crate::keys::rewrite_record_key_for(&first_retry).expect("reconstruct retry key");
+        assert_eq!(key_one, key_one_retry);
+    }
+
+    #[test]
+    fn rewrite_rejects_unsorted_inputs() {
+        let mut rw = valid_rewrite();
+        rw.inputs = vec![
+            CompactionInputIdentity {
+                writer_id: Uuid::from_u128(9).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            CompactionInputIdentity {
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        ];
+        // input_set_hash is intentionally left stale (from valid_rewrite's
+        // single input): sortedness is checked before the hash recompute, so
+        // this must fail with InputsNotSorted, not InputSetHashMismatch.
+        assert_eq!(
+            validate_rewrite(&rw),
+            Err(ErasureError::InputsNotSorted { index: 1 })
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_duplicate_applied_request_id() {
+        let mut rw = valid_rewrite();
+        let id = rw.drops[0].request_id.clone();
+        rw.drops.push(RewriteDrop {
+            request_id: id.clone(),
+            dropped_count: 1,
+        });
+        assert_eq!(
+            validate_rewrite(&rw),
+            Err(ErasureError::DuplicateAppliedRequestId(id))
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_malformed_superseded_record_key() {
+        let mut rw = valid_superseding_rewrite();
+        rw.superseded_record_key = "not-a-real-key".to_string();
+        assert_eq!(
+            validate_rewrite(&rw),
+            Err(ErasureError::InvalidSupersededRecordKey(
+                "not-a-real-key".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_superseded_record_key_naming_a_different_bucket() {
+        // A real, well-formed key -- but for a different tenant than this
+        // record's own. Must be rejected, not silently trusted (ADR-0010 §7).
+        let mut rw = valid_superseding_rewrite();
+        let other_tenant = ravel_types::TenantHash([0x22; 16]);
+        rw.superseded_record_key = crate::keys::compaction_record_key(
+            &other_tenant,
+            ravel_types::Signal::Metrics,
+            1,
+            0,
+            "0011223344556677",
+        )
+        .expect("build a well-formed compaction record key for a different tenant");
+        match validate_rewrite(&rw) {
+            Err(ErasureError::SupersededRecordKeyBucketMismatch { .. }) => {}
+            other => panic!("expected SupersededRecordKeyBucketMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_accepts_superseded_record_key_naming_a_prior_rewrite_record() {
+        // The recursive case: a rewrite superseding a prior RewriteRecord
+        // (not a CompactionRecord) is also a valid, parseable predecessor.
+        let tenant = ravel_types::TenantHash([0x11; 16]);
+        let superseded = crate::keys::rewrite_record_key(
+            &tenant,
+            ravel_types::Signal::Metrics,
+            1,
+            0,
+            "aabbccddeeff0011",
+        )
+        .expect("build a well-formed rewrite record key for the fixture");
+        let drops = vec![RewriteDrop {
+            request_id: Uuid::from_u128(1).to_string(),
+            dropped_count: 5,
+        }];
+        let request_ids: Vec<String> = drops.iter().map(|d| d.request_id.clone()).collect();
+        let input_set_hash =
+            compute_rewrite_input_set_hash(&[], Some(&superseded), &request_ids).to_vec();
+        let rw = RewriteRecord {
+            format_version: 1,
+            tenant_hash: vec![0x11; 16],
+            signal: 1,
+            shard: 1,
+            ingest_hour_bucket: 0,
+            inputs: vec![],
+            input_set_hash,
+            parts: vec![],
+            drops,
+            created_unix_ns: 0,
+            superseded_record_key: superseded,
+        };
+        assert_eq!(validate_rewrite(&rw), Ok(()));
     }
 
     #[test]

@@ -209,11 +209,22 @@ message RewriteRecord {
   Signal signal = 3;
   uint32 shard = 4;
   uint32 ingest_hour_bucket = 5;
-  // The exact input set this rewrite supersedes: L0 commit identities and/or
-  // the inputs of the compaction record it replaces, sorted canonically by
+  // The exact L0/L1 input set this rewrite supersedes, sorted canonically by
   // (writer_id, writer_epoch, writer_seq) exactly as CompactionRecord.inputs.
+  // Set only when the bucket's live record set is raw L0/L1 objects; use
+  // `superseded_record_key` below instead when superseding a whole live
+  // CompactionRecord or RewriteRecord. Exactly one of the two is ever set.
   repeated CompactionInputIdentity inputs = 6;
-  bytes input_set_hash = 7;    // blake3 over the sorted inputs, 32 bytes
+  // blake3 over: a case discriminant byte, then exactly one of the sorted
+  // `inputs` above or `superseded_record_key` below (whichever is set), then
+  // the sorted set of erasure request ids this rewrite applied (drops[].
+  // request_id below). Binding the applied request set is what lets two
+  // erasure batches over the same otherwise-unchanged bucket produce two
+  // different keys, while an identical-batch retry still hashes the same and
+  // stays idempotent under CreateIfAbsent (ADR-0064 decision 3, amended; see
+  // ravel-commit::erasure::compute_rewrite_input_set_hash for the exact
+  // byte-level preimage).
+  bytes input_set_hash = 7;    // 32 bytes
   repeated CompactionPart parts = 8;   // surviving-record output parts (may be empty)
   // Which erasure requests this rewrite applied, each with the count it
   // dropped for that request (0 is valid: a request whose predicate matched
