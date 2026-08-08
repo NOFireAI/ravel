@@ -12,9 +12,11 @@ use parking_lot::Mutex;
 use prost::Message;
 use ravel_cache::{Cache, CacheKey, CacheLimits};
 use ravel_commit::keys::BucketEntry;
-use ravel_commit::{keys, record, signal};
+use ravel_commit::{erasure, keys, record, signal};
 use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
-use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
+use ravel_proto::commit::v1::{
+    CommitRecord, CompactionPart, CompactionRecord, ErasureRequest, RewriteRecord,
+};
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use tracing::Instrument;
@@ -863,6 +865,16 @@ impl Catalog {
                 .await?;
         }
 
+        // One LIST of `t/<th>/<sig>/del/` per resolve (ADR-0064 decision 2):
+        // attach every pending erasure predicate to the snapshot. Runs
+        // unconditionally, independent of the segment fan-out and of whether
+        // any rewrite pass has physically run yet, so the visibility bound
+        // holds -- a `.dreq` durable before this resolve is always seen by it.
+        // Empty (the common case) costs exactly one LIST and nothing more.
+        let pending_erasure = self
+            .list_pending_erasure(tenant, signal, accounting)
+            .await?;
+
         let mut segments: Vec<SegmentRef> = segments.into_values().collect();
         // Deterministic total order: the cross-segment dedup provenance order
         // named in docs/catalog-and-mvcc.md (created_unix_ns, writer_epoch,
@@ -884,6 +896,7 @@ impl Catalog {
         Ok(Snapshot {
             segments,
             segments_pruned,
+            pending_erasure,
         })
     }
 
@@ -1037,11 +1050,13 @@ impl Catalog {
         // skip (plan §3.1: fail-loud on layout drift).
         let mut l0_keys: Vec<String> = Vec::new();
         let mut compaction_keys: Vec<String> = Vec::new();
+        let mut rewrite_keys: Vec<String> = Vec::new();
         let mut has_tombstone = false;
         for meta in objects {
             match keys::partition_bucket_entry(&meta.key)? {
                 BucketEntry::CommitRecord(_) => l0_keys.push(meta.key),
                 BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
+                BucketEntry::RewriteRecord(_) => rewrite_keys.push(meta.key),
                 BucketEntry::Tombstone(_) => has_tombstone = true,
             }
         }
@@ -1066,8 +1081,11 @@ impl Catalog {
         self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys, accounting)
             .await?;
 
-        // No compaction record: Phase 1 behavior, every overlapping L0.
-        if compaction_keys.is_empty() {
+        // No compaction AND no rewrite record: Phase 1 behavior, every
+        // overlapping L0. A rewrite record supersedes inputs exactly as a
+        // compaction record does, so its presence alone (even with no
+        // compaction record) rules out this fast path.
+        if compaction_keys.is_empty() && rewrite_keys.is_empty() {
             for key in &l0_keys {
                 self.include_l0_if_overlaps(
                     tenant, signal, shard, key, &range, &mut out, accounting,
@@ -1077,21 +1095,86 @@ impl Catalog {
             return Ok(out);
         }
 
-        // Compaction record(s) present (docs/catalog-and-mvcc.md step 3):
-        // include each record's parts (event-bound filtered), collect the
-        // input identities to exclude, and remember the newest record's
-        // created_unix_ns for the interlock check on unlisted L0s.
+        // Compaction and/or rewrite record(s) present (docs/catalog-and-mvcc.md
+        // step 3; ADR-0064 decision 3). Load every compaction record: collect
+        // its input identities into the SINGLE `excluded` set, and remember the
+        // newest record's created_unix_ns for the interlock check on unlisted
+        // L0s. Parts are included below, after the rewrite supersession pass,
+        // so a part a rewrite superseded is never included.
         let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
         let mut newest_record_created_ns = i64::MIN;
         let mut input_set_hashes: HashSet<Vec<u8>> = HashSet::new();
+        let mut compaction_records: Vec<(String, Arc<CompactionRecord>)> =
+            Vec::with_capacity(compaction_keys.len());
         for ckey in &compaction_keys {
             let record = self
                 .load_and_validate_compaction(tenant, signal, shard, ckey, accounting)
                 .await?;
             input_set_hashes.insert(record.input_set_hash.clone());
             newest_record_created_ns = newest_record_created_ns.max(record.created_unix_ns);
+            for input in &record.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+            compaction_records.push((ckey.clone(), record));
+        }
+
+        // Load every rewrite record (ADR-0064 decision 3). Same-bucket, key
+        // verified against the record's own identity (ADR-0010 §7) inside
+        // `load_and_validate_rewrite`.
+        let mut rewrite_records: Vec<(String, Arc<RewriteRecord>)> =
+            Vec::with_capacity(rewrite_keys.len());
+        for rkey in &rewrite_keys {
+            let record = self
+                .load_and_validate_rewrite(tenant, signal, shard, rkey, accounting)
+                .await?;
+            newest_record_created_ns = newest_record_created_ns.max(record.created_unix_ns);
+            rewrite_records.push((rkey.clone(), record));
+        }
+
+        // Resolve every rewrite's supersession into two unified exclusion sets:
+        // `excluded` gains the rewrite's effective L0 input identities (its own
+        // `inputs`, or those reached by chasing `superseded_record_key`), and
+        // `superseded_records` gains the keys of any compaction/rewrite record a
+        // rewrite superseded as a whole -- whose output parts must therefore be
+        // excluded (overlap harmlessness does NOT hold across a rewrite,
+        // ADR-0064 decision 3 point 5). The chase is bounded and cycle-checked;
+        // an over-deep or cyclic chain is a typed error, never a hang.
+        let mut superseded_records: HashSet<String> = HashSet::new();
+        if !rewrite_records.is_empty() {
+            let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect();
+            let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect();
+            for (rkey, record) in &rewrite_records {
+                resolve_rewrite_supersession(
+                    rkey,
+                    record,
+                    &prefix,
+                    &compaction_by_key,
+                    &rewrite_by_key,
+                    &mut excluded,
+                    &mut superseded_records,
+                )?;
+            }
+        }
+
+        // Compaction parts: include each non-superseded record's parts
+        // (event-bound filtered). A record whose whole output a live rewrite
+        // superseded is skipped -- its parts would resurrect erased records.
+        for (ckey, record) in &compaction_records {
+            if superseded_records.contains(ckey) {
+                continue;
+            }
             for part in &record.parts {
-                let segment_ref = build_l1_segment_ref(&record, part, ckey)?;
+                let segment_ref = build_l1_segment_ref(record, part, ckey)?;
                 let event_range = TimeRange {
                     start_ns: segment_ref.min_event_ts_ns,
                     end_ns: segment_ref.max_event_ts_ns,
@@ -1101,18 +1184,34 @@ impl Catalog {
                         .or_insert(segment_ref);
                 }
             }
-            for input in &record.inputs {
-                excluded.insert((
-                    input.writer_id.clone(),
-                    input.writer_epoch,
-                    input.writer_seq,
-                ));
+        }
+
+        // Rewrite output parts: folded in as L1-equivalent entries exactly as
+        // compaction parts are (ADR-0064 decision 3 point 5), unless this
+        // rewrite is itself superseded by a newer one (a bucket erased twice,
+        // ADR-0064 amendment). A rewrite's parts may be empty (a bucket whose
+        // every record matched is rewritten to nothing), which contributes
+        // nothing here.
+        for (rkey, record) in &rewrite_records {
+            if superseded_records.contains(rkey) {
+                continue;
+            }
+            for part in &record.parts {
+                let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
+                let event_range = TimeRange {
+                    start_ns: segment_ref.min_event_ts_ns,
+                    end_ns: segment_ref.max_event_ts_ns,
+                };
+                if event_range.overlaps(&range) {
+                    out.entry(segment_ref.data_object_key.clone())
+                        .or_insert(segment_ref);
+                }
             }
         }
 
-        // Two records with different input_set_hash in one bucket: both parts
-        // sets are already included above (harmless overlap); alarm loudly
-        // (docs/catalog-and-mvcc.md step 3, §3.6 row 11).
+        // Two compaction records with different input_set_hash in one bucket:
+        // both parts sets are already included above (harmless overlap); alarm
+        // loudly (docs/catalog-and-mvcc.md step 3, §3.6 row 11).
         if input_set_hashes.len() > 1 {
             self.compaction_input_set_conflicts
                 .fetch_add(1, Ordering::Relaxed);
@@ -1124,9 +1223,10 @@ impl Catalog {
             );
         }
 
-        // L0 records: exclude exactly those named in an input list; include
+        // L0 records: exclude exactly those named in an input list (a
+        // compaction record's inputs, or a rewrite's effective inputs); include
         // any unlisted one normally, raising the interlock metric if it
-        // postdates the newest compaction record (docs/catalog-and-mvcc.md
+        // postdates the newest compaction/rewrite record (docs/catalog-and-mvcc.md
         // step 3).
         for key in &l0_keys {
             let record = self
@@ -1265,6 +1365,7 @@ impl Catalog {
                     let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
                         BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
                         BucketEntry::CompactionRecord(k) => (k.shard, k.ingest_hour_bucket),
+                        BucketEntry::RewriteRecord(k) => (k.shard, k.ingest_hour_bucket),
                         BucketEntry::Tombstone(k) => (k.shard, k.ingest_hour_bucket),
                     };
                     if bhour < listing_start_hour || bhour > window_end_hour {
@@ -1426,6 +1527,88 @@ impl Catalog {
         Ok(record)
     }
 
+    /// Load, decode, and validate a rewrite record (ADR-0064 decision 3). Not
+    /// cached: rewrite records are rare (one per erasure batch over a bucket),
+    /// so a fresh GET+decode per resolve is cheap and avoids a fifth record
+    /// cache. `decode_rewrite` already re-verifies the record's own
+    /// `input_set_hash` and its `superseded_record_key` bucket-match on decode;
+    /// this additionally checks tenant_hash/signal/shard against the (tenant,
+    /// signal, shard) it was listed under and verifies its observed key
+    /// reconstructs from its own identity fields (ADR-0010 §7), exactly the
+    /// discipline every other record type in the bucket loop gets.
+    pub(crate) async fn load_and_validate_rewrite(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        key: &str,
+        accounting: &QueryAccounting,
+    ) -> Result<Arc<RewriteRecord>, CatalogError> {
+        let got = self.guarded_get(key, GetRange::Full, accounting).await?;
+        let record = erasure::decode_rewrite(got.data.as_ref()).map_err(|source| {
+            CatalogError::RewriteRecordDecode {
+                key: key.to_string(),
+                source,
+            }
+        })?;
+        validate_rewrite_expected_fields(self, &record, tenant, signal, shard, key)?;
+        Ok(Arc::new(record))
+    }
+
+    /// List `t/<th>/<sig>/del/` once and decode every pending erasure request
+    /// (`.dreq`) into the resolved snapshot's `pending_erasure` (ADR-0064
+    /// decision 2, EJ-T2). Empty for the common no-erasure case, at the cost of
+    /// exactly one LIST and nothing more. `.done` completion records (PII-free
+    /// audit evidence) are recognized and skipped; any other shape under `del/`
+    /// is layout drift and fails the resolve loudly, never silently dropped.
+    ///
+    /// Each `.dreq` is decoded and structurally validated (`decode_request`),
+    /// and its observed key is verified against the request's own identity
+    /// fields (ADR-0010 §7) -- which, since the listed key is already asserted
+    /// under this tenant's prefix by `guarded_list_all`, also proves the
+    /// request's tenant_hash/signal match this (tenant, signal).
+    async fn list_pending_erasure(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        accounting: &QueryAccounting,
+    ) -> Result<Vec<ErasureRequest>, CatalogError> {
+        let prefix = keys::del_prefix(tenant, signal);
+        let objects = self.guarded_list_all(tenant, &prefix, accounting).await?;
+        let mut pending = Vec::new();
+        for meta in objects {
+            // Classify by shape: `.dreq` carries a predicate; `.done` is a
+            // completion record with no predicate and is skipped; anything else
+            // is layout drift.
+            if keys::parse_erasure_request_key(&meta.key).is_ok() {
+                let got = self
+                    .guarded_get(&meta.key, GetRange::Full, accounting)
+                    .await?;
+                let record = erasure::decode_request(got.data.as_ref()).map_err(|source| {
+                    CatalogError::ErasureRequestDecode {
+                        key: meta.key.clone(),
+                        source,
+                    }
+                })?;
+                keys::verify_erasure_request_key(&record, &meta.key).map_err(|source| {
+                    CatalogError::Reconstruction {
+                        key: meta.key.clone(),
+                        source,
+                    }
+                })?;
+                pending.push(record);
+            } else if keys::parse_erasure_completion_key(&meta.key).is_ok() {
+                // `.done`: permanent, PII-free audit evidence, no predicate to
+                // attach (ADR-0064 decision 1). Skip.
+            } else {
+                return Err(CatalogError::Key(keys::KeyError::UnknownBucketEntryShape(
+                    meta.key,
+                )));
+            }
+        }
+        Ok(pending)
+    }
+
     /// Drop the cached commit and compaction records for one bucket, keyed by
     /// its `c/<shard>/<hour>/` prefix. The single tombstone-observation
     /// invalidation path (ADR-0010 §10): called from both the listing resolve
@@ -1536,6 +1719,7 @@ impl Catalog {
             keys::commit_shard_hour_prefix(tenant, signal, token.shard, token.ingest_hour_bucket)?;
         let objects = self.guarded_list_all(tenant, &prefix, accounting).await?;
         let mut compaction_keys: Vec<String> = Vec::new();
+        let mut rewrite_keys: Vec<String> = Vec::new();
         for meta in objects {
             match keys::partition_bucket_entry(&meta.key)? {
                 BucketEntry::Tombstone(_) => {
@@ -1546,15 +1730,65 @@ impl Catalog {
                     return Ok(());
                 }
                 BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
+                BucketEntry::RewriteRecord(_) => rewrite_keys.push(meta.key),
                 BucketEntry::CommitRecord(_) => {}
             }
         }
 
         let token_identity = (token.writer_id.to_string(), token.epoch, token.seq);
+
+        // Load the bucket's compaction and rewrite records. A rewrite (ADR-0064
+        // decision 3) supersedes inputs exactly as compaction does, so
+        // read-your-write for a swept L0 whose data a rewrite absorbed must be
+        // served from the rewrite's (erased) output, never from a superseded
+        // predecessor's parts (which would resurrect erased records).
+        let mut compaction_records: Vec<(String, Arc<CompactionRecord>)> = Vec::new();
         for ckey in &compaction_keys {
             let record = self
                 .load_and_validate_compaction(tenant, signal, token.shard, ckey, accounting)
                 .await?;
+            compaction_records.push((ckey.clone(), record));
+        }
+        let mut rewrite_records: Vec<(String, Arc<RewriteRecord>)> = Vec::new();
+        for rkey in &rewrite_keys {
+            let record = self
+                .load_and_validate_rewrite(tenant, signal, token.shard, rkey, accounting)
+                .await?;
+            rewrite_records.push((rkey.clone(), record));
+        }
+
+        // Which records a live rewrite superseded as a whole (their parts must
+        // never be served). No rewrites -> empty set -> exactly the pre-ADR-0064
+        // behavior below.
+        let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r.as_ref()))
+            .collect();
+        let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r.as_ref()))
+            .collect();
+        let mut superseded_records: HashSet<String> = HashSet::new();
+        {
+            let mut discard: HashSet<(String, u64, u64)> = HashSet::new();
+            for (rkey, record) in &rewrite_records {
+                resolve_rewrite_supersession(
+                    rkey,
+                    record,
+                    &prefix,
+                    &compaction_by_key,
+                    &rewrite_by_key,
+                    &mut discard,
+                    &mut superseded_records,
+                )?;
+            }
+        }
+
+        // A live compaction record whose inputs cover the token: serve its parts.
+        for (ckey, record) in &compaction_records {
+            if superseded_records.contains(ckey) {
+                continue;
+            }
             let covers = record.inputs.iter().any(|input| {
                 (
                     input.writer_id.clone(),
@@ -1564,7 +1798,36 @@ impl Catalog {
             });
             if covers {
                 for part in &record.parts {
-                    let segment_ref = build_l1_segment_ref(&record, part, ckey)?;
+                    let segment_ref = build_l1_segment_ref(record, part, ckey)?;
+                    out.entry(segment_ref.data_object_key.clone())
+                        .or_insert(segment_ref);
+                }
+                return Ok(());
+            }
+        }
+
+        // A live rewrite record whose effective inputs (its own, or chased
+        // through `superseded_record_key`) cover the token: serve its erased
+        // output parts. This is the read-your-write answer after an erasure
+        // rewrite absorbed the token's flush.
+        for (rkey, record) in &rewrite_records {
+            if superseded_records.contains(rkey) {
+                continue;
+            }
+            let mut effective_inputs: HashSet<(String, u64, u64)> = HashSet::new();
+            let mut discard_superseded: HashSet<String> = HashSet::new();
+            resolve_rewrite_supersession(
+                rkey,
+                record,
+                &prefix,
+                &compaction_by_key,
+                &rewrite_by_key,
+                &mut effective_inputs,
+                &mut discard_superseded,
+            )?;
+            if effective_inputs.contains(&token_identity) {
+                for part in &record.parts {
+                    let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
                     out.entry(segment_ref.data_object_key.clone())
                         .or_insert(segment_ref);
                 }
@@ -1756,6 +2019,54 @@ fn validate_compaction_expected_fields(
     Ok(())
 }
 
+/// Validate a decoded rewrite record's tenant_hash/signal/shard against the
+/// (tenant, signal, shard) it was listed under, and verify its observed key
+/// reconstructs from its own identity fields (ADR-0010 §7). The rewrite-record
+/// analog of [`validate_compaction_expected_fields`]; a `tenant_hash`
+/// disagreement is recorded on `ravel_catalog_isolation_breach_total` before
+/// the hard `FieldMismatch` (ADR-0050 §2).
+fn validate_rewrite_expected_fields(
+    catalog: &Catalog,
+    record: &RewriteRecord,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    key: &str,
+) -> Result<(), CatalogError> {
+    if record.tenant_hash.as_slice() != tenant.0.as_slice() {
+        catalog.record_isolation_breach();
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "tenant_hash",
+            expected: tenant.to_hex(),
+            actual: format!("{:?}", record.tenant_hash),
+        });
+    }
+    if signal::from_proto(record.signal) != Ok(signal) {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "signal",
+            expected: format!("{signal:?}"),
+            actual: format!("{:?}", record.signal),
+        });
+    }
+    if record.shard != shard {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "shard",
+            expected: shard.to_string(),
+            actual: record.shard.to_string(),
+        });
+    }
+    keys::verify_rewrite_record_key(record, key).map_err(|source| {
+        CatalogError::Reconstruction {
+            key: key.to_string(),
+            source,
+        }
+    })?;
+    Ok(())
+}
+
 /// Build an L1 [`SegmentRef`] from a compaction record and one of its parts,
 /// reconstructing the part key from their identity fields (ADR-0010 §7,
 /// never a stored string). `observed_ckey` names the compaction record for
@@ -1809,6 +2120,163 @@ fn build_l1_segment_ref(
             part_index: part.part_index,
         },
     })
+}
+
+/// Maximum length of a `superseded_record_key` chase before the resolver gives
+/// up with a typed error (ADR-0064 decision 3, amended). Real chains are one
+/// link per erasure batch over a bucket and never approach this; a chain this
+/// long is corruption or a pathological write pattern, refused rather than
+/// looped. Cycles are caught independently by a visited set, so this only
+/// bounds acyclic-but-absurd depth.
+const MAX_REWRITE_SUPERSESSION_DEPTH: usize = 64;
+
+/// Build an L1-equivalent [`SegmentRef`] from a [`RewriteRecord`] and one of
+/// its output parts (ADR-0064 decision 3 point 5: rewrite outputs fold into
+/// the snapshot exactly as compaction parts do). The part key is reconstructed
+/// from the rewrite's own identity fields (ADR-0010 §7, never a stored
+/// string), keyed by the rewrite's `input_set_hash` -- which binds the applied
+/// request set (ADR-0064 amendment). The ref carries `SegmentLevel::L1` with
+/// that same hash, so it sorts and dedups in the mixed-level snapshot order
+/// identically to a compaction part.
+fn build_rewrite_l1_segment_ref(
+    record: &RewriteRecord,
+    part: &CompactionPart,
+    observed_rkey: &str,
+) -> Result<SegmentRef, CatalogError> {
+    let data_object_key = keys::reconstruct_rewrite_part_key(record, part)?;
+    let content_hash: [u8; 32] =
+        part.content_hash
+            .clone()
+            .try_into()
+            .map_err(|_| CatalogError::FieldMismatch {
+                key: observed_rkey.to_string(),
+                field: "part content_hash",
+                expected: "32 bytes".to_string(),
+                actual: format!("{} bytes", part.content_hash.len()),
+            })?;
+    let input_set_hash: [u8; 32] =
+        record
+            .input_set_hash
+            .clone()
+            .try_into()
+            .map_err(|_| CatalogError::FieldMismatch {
+                key: observed_rkey.to_string(),
+                field: "input_set_hash",
+                expected: "32 bytes".to_string(),
+                actual: format!("{} bytes", record.input_set_hash.len()),
+            })?;
+    Ok(SegmentRef {
+        data_object_key,
+        object_size: part.object_size,
+        min_event_ts_ns: part.min_event_ts_ns,
+        max_event_ts_ns: part.max_event_ts_ns,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        sample_count: part.sample_count,
+        series_count: part.series_count,
+        shard: record.shard,
+        content_hash,
+        // A part has no writer identity of its own; never used for an L1
+        // ref's identity or dedup (see `build_l1_segment_ref`).
+        writer_id: Uuid::nil(),
+        writer_epoch: 0,
+        writer_seq: 0,
+        created_unix_ns: record.created_unix_ns,
+        level: SegmentLevel::L1 {
+            input_set_hash,
+            part_index: part.part_index,
+        },
+    })
+}
+
+/// Resolve one rewrite record's supersession into the two unified exclusion
+/// sets shared with the compaction path (ADR-0064 decision 3, amended). Used
+/// by both snapshot resolution (`process_bucket`) and the index fold
+/// (`fold.rs`), which must derive identical bucket state.
+///
+/// - `excluded` gains the rewrite's *effective* L0 input identities: its own
+///   `inputs` when set, or -- when `superseded_record_key` is set instead --
+///   the inputs of the compaction/rewrite record it names, chased through any
+///   rewrite-of-a-rewrite chain until a record with `inputs` set directly is
+///   reached.
+/// - `superseded_records` gains the key of every compaction/rewrite record a
+///   rewrite superseded as a whole, so the caller can exclude that record's
+///   output parts (overlap harmlessness does not hold across a rewrite).
+///
+/// The named predecessor is looked up among the bucket's already-loaded
+/// records. A predecessor absent from the live listing (already swept) simply
+/// ends the chase: its parts and inputs are no longer live, so there is
+/// nothing further to exclude. A chain that revisits a key (cycle) or exceeds
+/// [`MAX_REWRITE_SUPERSESSION_DEPTH`] is a typed error, never a hang. Both
+/// `decode_rewrite` and `validate_rewrite` already guarantee each record has
+/// exactly one of `inputs`/`superseded_record_key` set and that the key parses
+/// and names this same bucket, so this walk trusts those invariants.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_rewrite_supersession(
+    start_key: &str,
+    start_record: &RewriteRecord,
+    bucket_prefix: &str,
+    compaction_by_key: &HashMap<&str, &CompactionRecord>,
+    rewrite_by_key: &HashMap<&str, &RewriteRecord>,
+    excluded: &mut HashSet<(String, u64, u64)>,
+    superseded_records: &mut HashSet<String>,
+) -> Result<(), CatalogError> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut current_key = start_key.to_string();
+    let mut current: &RewriteRecord = start_record;
+    let mut depth = 0usize;
+    loop {
+        if !visited.insert(current_key.clone()) {
+            return Err(CatalogError::RewriteSupersessionCycle { key: current_key });
+        }
+        if depth > MAX_REWRITE_SUPERSESSION_DEPTH {
+            return Err(CatalogError::RewriteSupersessionChainTooDeep {
+                bucket: bucket_prefix.to_string(),
+                max: MAX_REWRITE_SUPERSESSION_DEPTH,
+            });
+        }
+        depth += 1;
+
+        // Direct-inputs case: terminal. Exclude the raw L0/L1 identities.
+        if !current.inputs.is_empty() {
+            for input in &current.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+            return Ok(());
+        }
+
+        // Superseded-record case: the whole named record's output is
+        // superseded, so its parts must be excluded.
+        let superseded_key = current.superseded_record_key.as_str();
+        superseded_records.insert(superseded_key.to_string());
+
+        // A compaction record is terminal (it always carries `inputs`): exclude
+        // its L0 inputs; its parts are already excluded via `superseded_records`.
+        if let Some(comp) = compaction_by_key.get(superseded_key) {
+            for input in &comp.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+            return Ok(());
+        }
+
+        // A prior rewrite record: chase it (rewrite-of-a-rewrite).
+        if let Some(next) = rewrite_by_key.get(superseded_key) {
+            current_key = superseded_key.to_string();
+            current = next;
+            continue;
+        }
+
+        // Named predecessor is not live in this bucket (already swept): its
+        // inputs and parts are gone, so nothing more to exclude. Stop cleanly.
+        return Ok(());
+    }
 }
 
 fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, CatalogError> {
@@ -1950,6 +2418,93 @@ mod tests {
         );
         assert_eq!(seg.shard, 0);
         assert_eq!(seg.content_hash.to_vec(), record.content_hash);
+    }
+
+    /// A bare `RewriteRecord` naming a `superseded_record_key`, for exercising
+    /// `resolve_rewrite_supersession`'s chase guards directly. Field values
+    /// other than `superseded_record_key`/`inputs` are irrelevant to the walk,
+    /// which trusts the decode-time invariants rather than re-validating.
+    fn bare_superseding_rewrite(superseded_key: &str) -> RewriteRecord {
+        RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 0,
+            inputs: Vec::new(),
+            input_set_hash: vec![0u8; 32],
+            parts: Vec::new(),
+            drops: Vec::new(),
+            created_unix_ns: 0,
+            superseded_record_key: superseded_key.to_string(),
+        }
+    }
+
+    #[test]
+    fn rewrite_supersession_cycle_is_a_typed_error() {
+        // Two rewrite records naming each other: the chase detects the revisit
+        // and returns a typed error rather than looping forever. (Honest hash
+        // derivation makes a real cycle unconstructable, so this guards the
+        // resolver against tampered/corrupt records directly.)
+        let k1 = "t/aa/m/c/0000/20260101T00/rw.1111111111111111.cmt".to_string();
+        let k2 = "t/aa/m/c/0000/20260101T00/rw.2222222222222222.cmt".to_string();
+        let r1 = bare_superseding_rewrite(&k2);
+        let r2 = bare_superseding_rewrite(&k1);
+        let compaction_by_key: HashMap<&str, &CompactionRecord> = HashMap::new();
+        let rewrite_by_key: HashMap<&str, &RewriteRecord> =
+            [(k1.as_str(), &r1), (k2.as_str(), &r2)]
+                .into_iter()
+                .collect();
+        let mut excluded = HashSet::new();
+        let mut superseded = HashSet::new();
+        let err = resolve_rewrite_supersession(
+            &k1,
+            &r1,
+            "bucket",
+            &compaction_by_key,
+            &rewrite_by_key,
+            &mut excluded,
+            &mut superseded,
+        )
+        .expect_err("a supersession cycle must be a typed error");
+        assert!(matches!(err, CatalogError::RewriteSupersessionCycle { .. }));
+    }
+
+    #[test]
+    fn rewrite_supersession_over_deep_chain_is_a_typed_error() {
+        // A chain of distinct rewrite records longer than the depth bound is
+        // refused rather than walked unboundedly.
+        let count = MAX_REWRITE_SUPERSESSION_DEPTH + 5;
+        let keys: Vec<String> = (0..=count)
+            .map(|i| format!("t/aa/m/c/0000/20260101T00/rw.{i:016x}.cmt"))
+            .collect();
+        // r[i] supersedes r[i+1]; the last points past the end (absent), but the
+        // depth bound trips long before the chase reaches it.
+        let records: Vec<RewriteRecord> = (0..count)
+            .map(|i| bare_superseding_rewrite(&keys[i + 1]))
+            .collect();
+        let compaction_by_key: HashMap<&str, &CompactionRecord> = HashMap::new();
+        let rewrite_by_key: HashMap<&str, &RewriteRecord> = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (keys[i].as_str(), r))
+            .collect();
+        let mut excluded = HashSet::new();
+        let mut superseded = HashSet::new();
+        let err = resolve_rewrite_supersession(
+            &keys[0],
+            &records[0],
+            "bucket",
+            &compaction_by_key,
+            &rewrite_by_key,
+            &mut excluded,
+            &mut superseded,
+        )
+        .expect_err("an over-deep supersession chain must be a typed error");
+        assert!(matches!(
+            err,
+            CatalogError::RewriteSupersessionChainTooDeep { .. }
+        ));
     }
 
     async fn seed_provisioning_record(store: &MemoryStore, shard_count: u32) {

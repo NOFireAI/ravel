@@ -222,6 +222,7 @@ fn provider(store: MemoryStore, segments: Vec<SegmentRef>) -> AlertsTableProvide
     let snapshot = Snapshot {
         segments,
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     };
     AlertsTableProvider::new(
         snapshot,

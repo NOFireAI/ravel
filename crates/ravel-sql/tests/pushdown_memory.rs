@@ -248,6 +248,7 @@ async fn build_snapshot(store: &dyn ObjectStoreBackend, specs: &[SegSpec]) -> Sn
     Snapshot {
         segments,
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     }
 }
 

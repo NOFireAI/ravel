@@ -67,7 +67,7 @@ pub enum KeyError {
     #[error("invalid hash16 {0:?}: expected 16 lowercase hex chars")]
     InvalidHash16(String),
     #[error(
-        "key {0:?} matches no known bucket-entry shape (commit record, compaction record, tombstone)"
+        "key {0:?} matches no known bucket-entry shape (commit record, compaction record, rewrite record, tombstone)"
     )]
     UnknownBucketEntryShape(String),
 }
@@ -1199,6 +1199,35 @@ pub fn reconstruct_l1_part_key(
     )
 }
 
+/// Reconstruct one rewrite output part's key from its parent
+/// [`RewriteRecord`]'s identity fields plus the part's own `part_index` and
+/// `content_hash` (ADR-0064 decision 3 point 2: rewrite outputs are PUT under
+/// the existing L1 part key shape). Same discipline as
+/// [`reconstruct_l1_part_key`], but keyed by the rewrite record's own
+/// `input_set_hash` (which binds the applied request set, ADR-0064 amendment)
+/// rather than a compaction record's. Never trust a stored key string.
+pub fn reconstruct_rewrite_part_key(
+    record: &ravel_proto::commit::v1::RewriteRecord,
+    part: &ravel_proto::commit::v1::CompactionPart,
+) -> Result<String, KeyError> {
+    let tenant_hash = tenant_hash_from_bytes(&record.tenant_hash)?;
+    let signal = signal::from_proto(record.signal)
+        .map_err(|_| KeyError::UnknownSignal(record.signal.to_string()))?;
+    let input_set_hash = content_hash_from_bytes(&record.input_set_hash)?;
+    let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+    let content_hash = content_hash_from_bytes(&part.content_hash)?;
+    let hash16 = hex::encode(&content_hash[..8]);
+    l1_part_key(
+        &tenant_hash,
+        signal,
+        record.shard,
+        record.ingest_hour_bucket,
+        &input_set_hash16,
+        part.part_index,
+        &hash16,
+    )
+}
+
 /// Verify an observed key (the key one part object was found at) against
 /// the key reconstructed from its parent record's and its own identity
 /// fields.
@@ -1223,41 +1252,33 @@ pub fn verify_l1_part_key(
 pub enum BucketEntry {
     CommitRecord(ParsedCommitKey),
     CompactionRecord(ParsedCompactionRecordKey),
+    /// A selective-erasure rewrite record (`rw.<hash16>.cmt`, ADR-0064
+    /// decision 3). Shares the `c/` prefix and `.cmt` suffix with commit and
+    /// compaction records; told apart by the leading `rw.` filename tag.
+    RewriteRecord(ParsedRewriteRecordKey),
     Tombstone(ParsedRetentionTombstoneKey),
 }
 
-// NOTE (ADR-0064, follow-up): `partition_bucket_entry` does NOT yet classify
-// `rw.<hash16>.cmt` rewrite record keys. They end with `.cmt` but do not start
-// with `l1.`, so today they fall through to the `else if filename.ends_with(".cmt")`
-// commit-record branch and fail to parse (a UUID-shaped writer id is expected,
-// `rw` is not one). This must be fixed before ravel-catalog's snapshot
-// resolution can see rewrite records, at three known call sites:
-//   - crates/ravel-catalog/src/catalog.rs: propagates the parse error via `?`,
-//     so a live rewrite record hard-errors resolution today.
-//   - crates/ravel-catalog/src/fold.rs: catches the error and silently skips
-//     the entry with a warning. This one is the dangerous case: a silently
-//     skipped rewrite record means its supersession of the erased inputs is
-//     ignored by the index fold, so an erased subject's pre-rewrite records
-//     can reappear in a folded snapshot.
-//   - crates/ravel-maintain/src/read.rs (`list_bucket`): also routes through
-//     `partition_bucket_entry` and hard-errors on an `rw.` key today, so
-//     compacting any bucket containing a rewrite record currently fails.
-// Fix `partition_bucket_entry` to emit a `BucketEntry::RewriteRecord` (via
-// `parse_rewrite_record_key`) before wiring any of the three to act on it.
-// Classifying `rw.` keys and teaching ravel-catalog to act on them is out of
-// scope for this task; this comment is the pointer for whoever does it next.
 /// Classify one key from a `c/<shard>/<hour>/` bucket listing by filename
-/// shape. Name patterns are disjoint by construction (plan §3.1): a
-/// tombstone is exactly `retire.tmb`, a compaction record's filename starts
-/// with `l1.` where an L0 commit record's filename is always a UUID (never
-/// `l1`). An unrecognized shape is a hard error, never silently skipped, so
-/// layout drift surfaces to metrics instead of vanishing.
+/// shape. Name patterns are disjoint by construction (plan §3.1, ADR-0064
+/// decision 3): a tombstone is exactly `retire.tmb`; a compaction record's
+/// filename starts with `l1.`; a selective-erasure rewrite record's starts
+/// with `rw.`; an L0 commit record's filename is always a UUID (never `l1`
+/// or `rw`). An unrecognized shape is a hard error, never silently skipped,
+/// so layout drift surfaces to metrics instead of vanishing.
+///
+/// A `rw.<hash16>.cmt` rewrite record is classified before the bare `.cmt`
+/// commit-record branch: it ends with `.cmt` but its `rw` filename head is
+/// not a UUID, so without this branch it would fall through and fail to
+/// parse (ADR-0064 EJ-T2 closed this gap).
 pub fn partition_bucket_entry(key: &str) -> Result<BucketEntry, KeyError> {
     let filename = key.rsplit('/').next().unwrap_or(key);
     if filename == TOMBSTONE_FILENAME {
         parse_retention_tombstone_key(key).map(BucketEntry::Tombstone)
     } else if filename.starts_with("l1.") && filename.ends_with(".cmt") {
         parse_compaction_record_key(key).map(BucketEntry::CompactionRecord)
+    } else if filename.starts_with("rw.") && filename.ends_with(".cmt") {
+        parse_rewrite_record_key(key).map(BucketEntry::RewriteRecord)
     } else if filename.ends_with(".cmt") {
         parse_commit_key(key).map(BucketEntry::CommitRecord)
     } else {
@@ -1906,6 +1927,13 @@ mod tests {
         assert!(matches!(
             partition_bucket_entry(&compaction).expect("classify"),
             BucketEntry::CompactionRecord(_)
+        ));
+
+        let rewrite = rewrite_record_key(&th, Signal::Metrics, 1, hour_bucket, &hash16_hex(2))
+            .expect("build rewrite key");
+        assert!(matches!(
+            partition_bucket_entry(&rewrite).expect("classify"),
+            BucketEntry::RewriteRecord(_)
         ));
 
         let tombstone = retention_tombstone_key(&th, Signal::Metrics, 1, hour_bucket)

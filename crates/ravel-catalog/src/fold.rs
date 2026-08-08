@@ -24,7 +24,7 @@ use ravel_object_store::{
     Version, list_all,
 };
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
-use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
+use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
@@ -350,6 +350,53 @@ fn build_l1_snapshot_entry(
     })
 }
 
+/// Build a level-1 [`SnapshotEntry`] for one part of a [`RewriteRecord`]
+/// (ADR-0064 decision 3 point 5: rewrite outputs fold in exactly as compaction
+/// parts do). Identical entry shape to [`build_l1_snapshot_entry`]: the frozen
+/// entry has no dedicated L1-identity field, so `writer_id` carries the
+/// rewrite's 32-byte `input_set_hash` and `writer_epoch` carries the
+/// `part_index`. A resolve reconstructs the part key from these via
+/// `reconstruct_rewrite_part_key`, matching what a live listing builds
+/// (`build_rewrite_l1_segment_ref`).
+fn build_rewrite_l1_snapshot_entry(
+    key: &str,
+    record: &RewriteRecord,
+    part: &CompactionPart,
+) -> Result<SnapshotEntry, CatalogError> {
+    if record.input_set_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "input_set_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", record.input_set_hash.len()),
+        });
+    }
+    if part.content_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "part content_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", part.content_hash.len()),
+        });
+    }
+    Ok(SnapshotEntry {
+        level: 1,
+        shard: record.shard,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        writer_id: record.input_set_hash.clone(),
+        writer_epoch: u64::from(part.part_index),
+        writer_seq: 0,
+        content_hash: part.content_hash.clone(),
+        object_size: part.object_size,
+        min_event_ts_ns: part.min_event_ts_ns,
+        max_event_ts_ns: part.max_event_ts_ns,
+        sample_count: part.sample_count,
+        series_count: part.series_count,
+        segment_format_version: part.segment_format_version,
+        created_unix_ns: record.created_unix_ns,
+    })
+}
+
 /// Fold one entry into the running set, deduping by commit/part identity.
 /// `is_canonical` marks whether this occurrence sits under the hour directory
 /// its own embedded `ingest_hour_bucket` names. On a duplicate identity the
@@ -506,14 +553,31 @@ type BucketContribution = Vec<(SnapshotEntry, bool)>;
 /// set could differ from what a past fold folded. The seal lemma
 /// (docs/catalog-and-mvcc.md "Sealed hours") makes the L0 set of a sealed
 /// bucket immutable, so a bucket holding only L0 records is guaranteed
-/// unchanged and can be skipped without a GET. Only a compaction record or a
-/// retention tombstone can land after an hour was sealed and folded, so those
-/// two shapes are the sole reconcile triggers.
-fn bucket_has_compaction_or_tombstone(listing: &[ObjectMeta]) -> bool {
+/// unchanged and can be skipped without a GET. A compaction record, a
+/// retention tombstone, or a selective-erasure rewrite record (ADR-0064
+/// decision 3) can all land after an hour was sealed and folded, so those
+/// three shapes are the reconcile triggers.
+///
+/// A rewrite record is load-bearing here, not an incidental addition: the
+/// rewrite pass targets already-sealed (already-folded) buckets by
+/// construction (ADR-0064 §3.1 scopes it to sealed buckets), so without this
+/// trigger a rewrite would never be picked up by the incremental fold path at
+/// all -- the folded snapshot would keep serving the rewrite's pre-erasure
+/// inputs indefinitely for any hour outside `incremental_buckets`' range,
+/// since those objects stay physically present (GET-able) until the
+/// horizon-gated sweep runs, so there is no NotFound-driven re-resolve to
+/// force a refresh either. This is the mechanism ADR-0064 §4's "the next
+/// fold rebuilds snapshots over the rewrite outputs" claim depends on; that
+/// claim is honest only within `fold_reconcile_window_hours` of the fold
+/// that observes it -- see the amendment note in
+/// docs/adrs/0064-selective-subject-erasure.md §4.
+fn bucket_needs_reconcile(listing: &[ObjectMeta]) -> bool {
     listing.iter().any(|meta| {
         matches!(
             keys::partition_bucket_entry(&meta.key),
-            Ok(BucketEntry::CompactionRecord(_)) | Ok(BucketEntry::Tombstone(_))
+            Ok(BucketEntry::CompactionRecord(_))
+                | Ok(BucketEntry::Tombstone(_))
+                | Ok(BucketEntry::RewriteRecord(_))
         )
     })
 }
@@ -733,10 +797,10 @@ impl Catalog {
 
             for (shard, hour, listing) in &bucket_listings {
                 // Classify the bucket into its contribution via the shared
-                // classifier the reconcile pass also uses (ADR-0063 section 4),
-                // then fold each contributed entry into the running set. A
-                // tombstoned bucket classifies to an empty contribution, so it
-                // folds nothing in (ADR-0019 section 3).
+                // classifier the reconcile pass also uses (ADR-0063 section 4,
+                // ADR-0064 decision 3), then fold each contributed entry into
+                // the running set. A tombstoned bucket classifies to an empty
+                // contribution, so it folds nothing in (ADR-0019 section 3).
                 let contribution = self
                     .classify_bucket(
                         tenant,
@@ -798,7 +862,7 @@ impl Catalog {
                     // changed since it was folded (seal lemma). Skip it with no
                     // GET; only a late compaction record or tombstone triggers
                     // real reconcile work.
-                    if !bucket_has_compaction_or_tombstone(listing) {
+                    if !bucket_needs_reconcile(listing) {
                         continue;
                     }
                     let contribution = self
@@ -1522,9 +1586,18 @@ impl Catalog {
     /// compaction record contributes its parts as level-1 entries and
     /// supersedes its named L0 inputs; two records with different input sets in
     /// one bucket both contribute (a harmless overlap the resolver alarms on
-    /// but still serves). Every L0 not named by a compaction input list is
-    /// contributed exactly as the resolver includes it. Unrecognized key
-    /// shapes are counted as layout drift and skipped, never fatal.
+    /// but still serves). A selective-erasure rewrite record (ADR-0064
+    /// decision 3, amended) contributes its own output parts as level-1
+    /// entries and supersedes either its named L0 inputs directly, or -- when
+    /// it names a `superseded_record_key` instead -- whatever that
+    /// compaction/rewrite predecessor's own inputs are, chased recursively via
+    /// [`crate::catalog::resolve_rewrite_supersession`] (the same helper
+    /// snapshot resolution uses, so a fold and a live resolve can never
+    /// disagree on which records an erasure has superseded). A rewrite itself
+    /// superseded by a later one (a bucket erased twice) contributes nothing.
+    /// Every L0 not named by a compaction or rewrite input list is contributed
+    /// exactly as the resolver includes it. Unrecognized key shapes are
+    /// counted as layout drift and skipped, never fatal.
     #[allow(clippy::too_many_arguments)]
     async fn classify_bucket(
         &self,
@@ -1539,11 +1612,18 @@ impl Catalog {
     ) -> Result<BucketContribution, CatalogError> {
         let mut l0_keys: Vec<&str> = Vec::new();
         let mut compaction_keys: Vec<&str> = Vec::new();
+        let mut rewrite_keys: Vec<&str> = Vec::new();
         let mut has_tombstone = false;
         for meta in listing {
             match keys::partition_bucket_entry(&meta.key) {
                 Ok(BucketEntry::CommitRecord(_)) => l0_keys.push(meta.key.as_str()),
                 Ok(BucketEntry::CompactionRecord(_)) => compaction_keys.push(meta.key.as_str()),
+                // Selective-erasure rewrite record (ADR-0064 decision 3).
+                // Recognized here rather than warn-skipped: a silently
+                // skipped rewrite record's supersession would be ignored by
+                // the fold and could resurrect an erased subject's
+                // pre-rewrite records into a folded snapshot.
+                Ok(BucketEntry::RewriteRecord(_)) => rewrite_keys.push(meta.key.as_str()),
                 Ok(BucketEntry::Tombstone(_)) => has_tombstone = true,
                 Err(err) => {
                     *layout_drift_count += 1;
@@ -1562,15 +1642,12 @@ impl Catalog {
 
         let mut contributed: BucketContribution = Vec::new();
         let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
+        let mut compaction_records: Vec<(String, Arc<CompactionRecord>)> = Vec::new();
         for ckey in &compaction_keys {
             let record = self
                 .load_and_validate_compaction(tenant, signal, shard, ckey, accounting)
                 .await?;
             counters.get_requests += 1;
-            for part in &record.parts {
-                let entry = build_l1_snapshot_entry(ckey, &record, part)?;
-                contributed.push((entry, true));
-            }
             for input in &record.inputs {
                 excluded.insert((
                     input.writer_id.clone(),
@@ -1578,8 +1655,82 @@ impl Catalog {
                     input.writer_seq,
                 ));
             }
+            compaction_records.push(((*ckey).to_string(), record));
         }
 
+        // Load rewrite records (ADR-0064 decision 3), verified against their
+        // own identity inside `load_and_validate_rewrite`.
+        let mut rewrite_records: Vec<(String, Arc<RewriteRecord>)> = Vec::new();
+        for rkey in &rewrite_keys {
+            let record = self
+                .load_and_validate_rewrite(tenant, signal, shard, rkey, accounting)
+                .await?;
+            counters.get_requests += 1;
+            rewrite_records.push(((*rkey).to_string(), record));
+        }
+
+        // Resolve every rewrite's supersession into the SAME `excluded` set
+        // (its effective L0 inputs) and a `superseded_records` set (keys of
+        // compaction/rewrite records superseded as a whole, whose parts must
+        // therefore be skipped). This is what stops an erased subject's
+        // pre-rewrite records from resurfacing in the fold. Identical
+        // mechanism to snapshot resolution (`process_bucket`), sharing one
+        // chase helper.
+        let mut superseded_records: HashSet<String> = HashSet::new();
+        if !rewrite_records.is_empty() {
+            let bucket_label = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
+            let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect();
+            let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect();
+            for (rkey, record) in &rewrite_records {
+                crate::catalog::resolve_rewrite_supersession(
+                    rkey,
+                    record,
+                    &bucket_label,
+                    &compaction_by_key,
+                    &rewrite_by_key,
+                    &mut excluded,
+                    &mut superseded_records,
+                )?;
+            }
+        }
+
+        // Compaction parts: contribute each non-superseded record's parts as
+        // level-1 entries. Two records with different input sets in one
+        // bucket both contribute (a harmless overlap the resolver alarms on
+        // but still serves).
+        for (ckey, record) in &compaction_records {
+            if superseded_records.contains(ckey.as_str()) {
+                continue;
+            }
+            for part in &record.parts {
+                let entry = build_l1_snapshot_entry(ckey, record, part)?;
+                contributed.push((entry, true));
+            }
+        }
+
+        // Rewrite output parts: contributed as level-1 entries exactly as
+        // compaction parts, unless this rewrite is itself superseded by a
+        // newer one (ADR-0064 amendment).
+        for (rkey, record) in &rewrite_records {
+            if superseded_records.contains(rkey.as_str()) {
+                continue;
+            }
+            for part in &record.parts {
+                let entry = build_rewrite_l1_snapshot_entry(rkey, record, part)?;
+                contributed.push((entry, true));
+            }
+        }
+
+        // L0 commit records: contribute every one not named by a compaction
+        // or rewrite input list above (docs/metric-index-plan.md section 7
+        // point 2). An unlisted L0 is included exactly as the resolver
+        // includes it.
         for key in &l0_keys {
             let record = self
                 .load_and_validate(tenant, signal, shard, key, accounting)

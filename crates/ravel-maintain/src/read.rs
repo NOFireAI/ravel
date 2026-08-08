@@ -49,6 +49,12 @@ pub struct BucketListing {
     pub commit_keys: Vec<String>,
     /// Compaction record keys already present in the bucket.
     pub compaction_record_keys: Vec<String>,
+    /// Selective-erasure rewrite record keys (`rw.<hash16>.cmt`, ADR-0064
+    /// decision 3) present in the bucket. Recognized and surfaced here rather
+    /// than treated as layout drift; the rewrite pass (EJ-T4) is what acts on
+    /// them. Classifying them keeps `list_bucket` from hard-erroring on a
+    /// bucket that has already been erased once.
+    pub rewrite_record_keys: Vec<String>,
     /// The retention tombstone key, if the bucket is tombstoned.
     pub tombstone_key: Option<String>,
 }
@@ -69,6 +75,7 @@ pub async fn list_bucket(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Res
         match keys::partition_bucket_entry(&meta.key) {
             Ok(BucketEntry::CommitRecord(_)) => listing.commit_keys.push(meta.key),
             Ok(BucketEntry::CompactionRecord(_)) => listing.compaction_record_keys.push(meta.key),
+            Ok(BucketEntry::RewriteRecord(_)) => listing.rewrite_record_keys.push(meta.key),
             Ok(BucketEntry::Tombstone(_)) => listing.tombstone_key = Some(meta.key),
             Err(keys::KeyError::UnknownBucketEntryShape(k)) => {
                 return Err(MaintainError::UnknownBucketEntry(k));
@@ -79,6 +86,7 @@ pub async fn list_bucket(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Res
     // Deterministic order regardless of how the store paginated the listing.
     listing.commit_keys.sort();
     listing.compaction_record_keys.sort();
+    listing.rewrite_record_keys.sort();
     Ok(listing)
 }
 

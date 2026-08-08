@@ -262,9 +262,16 @@ async fn load_hold_records(
         match keys::partition_bucket_entry(&meta.key) {
             Ok(BucketEntry::CommitRecord(_)) => {}
             // A tenant's audit hold shard holds only L0 commit records and their
-            // data objects; a compaction record or tombstone here is fine to
-            // ignore for the fold (it names the same folded records).
-            Ok(BucketEntry::CompactionRecord(_) | BucketEntry::Tombstone(_)) => continue,
+            // data objects; a compaction record, rewrite record, or tombstone
+            // here is fine to ignore for the fold (it names the same folded
+            // records). Selective-erasure rewrite records (ADR-0064) never
+            // target the audit keyspace, but classifying one explicitly keeps
+            // this loop from failing loud on a shape it can safely skip.
+            Ok(
+                BucketEntry::CompactionRecord(_)
+                | BucketEntry::RewriteRecord(_)
+                | BucketEntry::Tombstone(_),
+            ) => continue,
             Err(KeyError::UnknownBucketEntryShape(k)) => {
                 return Err(MaintainError::UnknownBucketEntry(k));
             }

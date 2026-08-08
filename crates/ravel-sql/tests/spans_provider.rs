@@ -219,6 +219,7 @@ async fn scan_prunes_by_ts_window_returns_exact_rows() {
     let snapshot = Snapshot {
         segments: vec![ref_a, ref_b, ref_c],
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     };
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
     let fetcher = SpanSegmentFetcher::new(store);
@@ -286,6 +287,7 @@ async fn trace_id_query_takes_the_cheap_trace_lookup() {
     let snapshot = Snapshot {
         segments: vec![seg.clone()],
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     };
     let provider = SpansTableProvider::new(snapshot, fetcher.clone(), EngineConfig::default());
 

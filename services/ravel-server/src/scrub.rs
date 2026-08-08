@@ -544,11 +544,17 @@ async fn run_shard_tick(
         std::collections::HashMap::new();
     for meta in &metas {
         // Only L0 commit records name an object `scrub_one_object` can verify
-        // (its API is commit-record based). Compaction records and tombstones
-        // are skipped here; L1 part verification is not part of this wiring.
+        // (its API is commit-record based). Compaction, rewrite (ADR-0064), and
+        // tombstone records are skipped here; L1 part verification is not part
+        // of this wiring. Listed explicitly so a new bucket-entry shape fails
+        // to compile here rather than being silently swallowed.
         match keys::partition_bucket_entry(&meta.key) {
             Ok(keys::BucketEntry::CommitRecord(_)) => {}
-            Ok(_) => continue,
+            Ok(
+                keys::BucketEntry::CompactionRecord(_)
+                | keys::BucketEntry::RewriteRecord(_)
+                | keys::BucketEntry::Tombstone(_),
+            ) => continue,
             Err(err) => {
                 tracing::warn!(
                     key = %meta.key, error = %err,

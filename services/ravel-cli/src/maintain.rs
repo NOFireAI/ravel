@@ -348,6 +348,21 @@ pub async fn audit_versions(
                             hist.entry(part.segment_format_version).or_default().1 += 1;
                         }
                     }
+                    Ok(keys::BucketEntry::RewriteRecord(_)) => {
+                        // A selective-erasure rewrite record (ADR-0064) names
+                        // L1 output parts exactly as a compaction record does;
+                        // count their segment format versions the same way.
+                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
+                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
+                        })?;
+                        let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref())
+                            .map_err(|err| {
+                                anyhow::anyhow!("rewrite record {} is corrupt: {err}", meta.key)
+                            })?;
+                        for part in &record.parts {
+                            hist.entry(part.segment_format_version).or_default().1 += 1;
+                        }
+                    }
                     Ok(keys::BucketEntry::Tombstone(_)) => {}
                     Err(err) => {
                         return Err(anyhow::anyhow!("unknown key shape {}: {err}", meta.key));
@@ -736,6 +751,58 @@ pub async fn verify_custody(
                                 // anomaly.
                                 ObjectCheck::Missing => inputs_swept += 1,
                             }
+                        }
+                    }
+                    Ok(keys::BucketEntry::RewriteRecord(_)) => {
+                        // A selective-erasure rewrite record (ADR-0064 decision
+                        // 3) names live L1 output parts exactly as a compaction
+                        // record does; verify each exists and still matches its
+                        // content hash. Input-identity resolution and the
+                        // versioning-aware custody surface for erased data are
+                        // EJ-T6's to extend; this only covers the surviving
+                        // rewritten parts so verify-custody does not silently
+                        // ignore a bucket that has been erased once.
+                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
+                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
+                        })?;
+                        let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref())
+                            .map_err(|err| {
+                                anyhow::anyhow!("rewrite record {} is corrupt: {err}", meta.key)
+                            })?;
+                        for part in &record.parts {
+                            let part_key = keys::reconstruct_rewrite_part_key(&record, part)
+                                .map_err(|err| {
+                                    anyhow::anyhow!("failed to reconstruct rewrite part key: {err}")
+                                })?;
+                            match check_object(store.as_ref(), &part_key).await? {
+                                ObjectCheck::Verified => data_objects_verified += 1,
+                                ObjectCheck::Mismatch { expected, actual } => {
+                                    content_mismatches += 1;
+                                    anomalies += 1;
+                                    println!(
+                                        "  CONTENT MISMATCH (l1 rewrite) {part_key}: key \
+                                         hash16={expected} content hash16={actual}  <-- ANOMALY"
+                                    );
+                                }
+                                ObjectCheck::Missing => {
+                                    missing_live_objects += 1;
+                                    anomalies += 1;
+                                    println!(
+                                        "  MISSING LIVE OBJECT (l1 rewrite) {part_key}: referenced \
+                                         by surviving rewrite record {}  <-- ANOMALY",
+                                        meta.key
+                                    );
+                                }
+                            }
+                            check_object_epoch(
+                                key_epochs.as_deref(),
+                                record.created_unix_ns,
+                                "l1",
+                                &part_key,
+                                &mut epoch_objects_located,
+                                &mut epoch_inconsistencies,
+                                &mut anomalies,
+                            );
                         }
                     }
                     Ok(keys::BucketEntry::Tombstone(_)) => {}
