@@ -58,6 +58,7 @@ use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use futures::{Stream, StreamExt};
 use ravel_catalog::Snapshot;
+use ravel_query::QueryPermit;
 use ravel_types::TenantHash;
 use ravel_types::accounting::{
     CostEstimate, QueryAccounting, QueryCostRecorder, QueryWorkloadClass,
@@ -81,7 +82,11 @@ pub(super) type DoGetStream =
 /// `FlightData` stream.
 ///
 /// `tenant` is the authoritative, metadata-resolved tenant; the caller has
-/// already rejected a ticket whose embedded tenant disagrees with it.
+/// already rejected a ticket whose embedded tenant disagrees with it. `permit`
+/// is the fleet-global concurrency slot the caller admitted for this execution;
+/// it moves into the stream's guard so the slot is held for the whole streaming
+/// phase.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn statement_stream(
     executor: &SqlExecutor,
     clock: ClockRef,
@@ -90,6 +95,7 @@ pub(super) async fn statement_stream(
     config: &FlightSqlConfig,
     recorder: Arc<dyn QueryCostRecorder>,
     span: tracing::Span,
+    permit: QueryPermit,
 ) -> Result<DoGetStream, Status> {
     // Re-run the security gate on redemption. The statement is carried in
     // bytes a client holds, and the gate is cheap; running it again means a
@@ -135,11 +141,19 @@ pub(super) async fn statement_stream(
     // estimate was recorded at GetFlightInfo (crate::flight::service), so the
     // two RPCs' folds sum to one estimate beside the summed actual. A DoGet
     // that failed before this point returned above and records nothing.
+    //
+    // `permit` is the fleet-global concurrency slot `do_get_statement` acquired
+    // for this execution (ADR-0061 decision 2). It moves into the guard so the
+    // slot is held for the whole streaming phase and released at exactly the
+    // moment the cost fold happens -- stream end or client abandonment -- by the
+    // same `Drop`. A DoGet that failed before this point dropped the permit on
+    // its early return, so the slot never leaks on the error paths above.
     let record_guard = RecordOnStreamEnd {
         recorder,
         accounting,
         tenant,
         span,
+        _permit: permit,
     };
 
     // Post-emission rule: any vanished segment from here on is terminal.
@@ -189,6 +203,12 @@ pub(super) async fn statement_stream(
 /// keeps incrementing, so the snapshot taken here is the whole RPC's cost. The
 /// estimate is zero: the whole-query estimate was recorded once at
 /// `GetFlightInfo`.
+///
+/// It also carries the fleet-global concurrency [`QueryPermit`] for this
+/// execution (ADR-0061 decision 2): one guard, held for the stream's whole
+/// lifetime, both folds the cost and releases the slot in the same `Drop`, so
+/// the concurrency ceiling binds the actual streaming phase and not merely the
+/// planning RPC.
 struct RecordOnStreamEnd {
     recorder: Arc<dyn QueryCostRecorder>,
     accounting: QueryAccounting,
@@ -197,6 +217,10 @@ struct RecordOnStreamEnd {
     /// The query's final store totals are recorded on it here, from the same
     /// snapshot folded into `/metrics`, so the span and the scrape agree.
     span: tracing::Span,
+    /// The concurrency slot this execution holds. Never read; its only job is to
+    /// release the slot (via [`QueryPermit`]'s own `Drop`) when this guard drops,
+    /// which is the same instant the cost fold above happens.
+    _permit: QueryPermit,
 }
 
 impl Drop for RecordOnStreamEnd {

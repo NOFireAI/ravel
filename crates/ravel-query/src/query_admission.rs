@@ -15,10 +15,21 @@
 //! mid-flight once it has scanned too much), this is an **admission** decision
 //! made *before* a query is allowed to start: before any snapshot resolve, let
 //! alone any object GET. A query that would push this process past its local
-//! threshold is rejected outright; a query that is admitted holds a slot for its
-//! whole lifetime and releases it on completion, error, or client disconnect.
-//! The slot is a [`QueryPermit`] whose [`Drop`] releases it, so no code path can
-//! forget to decrement the stock.
+//! threshold is rejected outright; an admitted query holds a slot for the
+//! lifetime of the work that slot covers and releases it on completion, error,
+//! or client disconnect. The slot is a [`QueryPermit`] whose [`Drop`] releases
+//! it, so no code path can forget to decrement the stock.
+//!
+//! On the single-shot HTTP and PromQL surfaces one permit covers a query end to
+//! end. Flight SQL splits one query across two RPCs, so it admits at two points:
+//! `get_flight_info_statement` holds a permit for resolve + logical plan
+//! (released when that RPC returns), and `do_get_statement` takes a fresh permit
+//! held for the whole streaming execution phase (released when the result stream
+//! ends or the client abandons it). `get_flight_info`'s permit is already gone
+//! by the time the ticket is redeemed, so the `do_get_statement` gate is the one
+//! that actually bounds Flight's scan phase. The two RPCs are separate points in
+//! time, so one Flight query never holds two slots at once. See
+//! `ravel_sql::flight`.
 //!
 //! ## Fleet reconciliation (ADR-0057 pattern)
 //!
@@ -60,15 +71,13 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, Stor
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Default fleet reconciliation interval `R` for the query concurrency ceiling.
-///
-/// Matches ADR-0057's ingest-side cadence (10s) deliberately: the two
-/// reconciliation loops answer the same shape of question (make a per-process
-/// count cap fleet-wide) and an operator sizes the bounded overshoot window the
-/// same way for both. The server drives this loop off the same
-/// `--admission-reconcile-interval` knob it drives the ingest one with, so there
-/// is one cadence to reason about, not two.
-pub const DEFAULT_QUERY_ADMISSION_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+// The query concurrency ceiling has no default-interval constant of its own by
+// design: the server drives this reconciliation loop off the same
+// `--admission-reconcile-interval` knob (defaulting to
+// `ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL`) it drives the ingest one
+// with, so there is one cadence to reason about, not two. A second 10s constant
+// here would be dead weight that could silently drift from the value actually in
+// force.
 
 /// Format floor for the snapshot body. A sibling advertising a higher version is
 /// one this reader does not understand, so it is skipped (treated as absent)
@@ -224,9 +233,13 @@ impl QueryAdmissionController {
     /// admitting one more would exceed this process's effective fleet threshold;
     /// the caller must reject the query before doing any resolve or GET.
     ///
-    /// [`QueryConcurrencyLimit::Unlimited`] always admits (but still tracks the
-    /// stock, so `/metrics` and reconciliation observe a truthful count even
-    /// under an unlimited config).
+    /// [`QueryConcurrencyLimit::Unlimited`] always admits, but still tracks the
+    /// stock: [`Self::in_flight`] reports a truthful live count under any config,
+    /// so an observer that reads it (a test today; a `/metrics` gauge if one is
+    /// later wired) sees the real number, not a zero the unlimited branch skipped.
+    /// Reconciliation, by contrast, is a genuine no-op under `Unlimited`
+    /// ([`reconcile_query_admission_once`] returns early with no cap to enforce),
+    /// so under that config it neither reads nor writes any snapshot.
     pub fn try_admit(self: &Arc<Self>) -> Result<QueryPermit, QueryRejected> {
         let mut state = lock(&self.state);
         let admit = match self.limit {

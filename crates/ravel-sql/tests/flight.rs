@@ -42,11 +42,11 @@ use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, Scri
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::{QueryAdmissionController, QueryConcurrencyLimit};
 use ravel_sql::{FlightClock, FlightSqlConfig, FlightTicket, RavelFlightSqlService};
-use ravel_types::TenantHash;
 use ravel_types::accounting::{
     CostEstimate, NoopQueryCostRecorder, QueryAccountingSnapshot, QueryCostRecorder,
     QueryWorkloadClass,
 };
+use ravel_types::{TenantHash, TenantId};
 use tonic::Request;
 use tonic::metadata::MetadataMap;
 use util::flight_harness::{
@@ -907,22 +907,18 @@ async fn a_flight_statement_folds_its_cost_into_the_recorder() {
 // Fleet-global query concurrency ceiling (ADR-0061 decision 2, issue #725)
 // ---------------------------------------------------------------------------
 
-/// `get_flight_info_statement` is gated by the shared concurrency controller;
-/// `do_get_statement` is deliberately not. With a ceiling of 1, a
-/// `GetFlightInfo` issued while the single slot is already held is rejected with
-/// `RESOURCE_EXHAUSTED` before it resolves or plans, while redeeming a ticket
-/// minted earlier (when there was headroom) still streams -- the redemption path
-/// must not reject work that was already admitted and planned.
-#[tokio::test]
-async fn get_flight_info_is_gated_but_do_get_is_not() {
-    let tenant = tenant_id("acme");
-    let seg_specs = specs();
-    let mut harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
-
-    let controller = QueryAdmissionController::shared(QueryConcurrencyLimit::Bounded(1));
+/// Build a harness whose Flight service shares `controller` as its concurrency
+/// ceiling (ADR-0061 decision 2), so a test can hold or inspect slots directly.
+async fn ceiling_harness(
+    tenant: &TenantId,
+    seg_specs: &[SegSpec],
+    limit: QueryConcurrencyLimit,
+) -> (Harness, Arc<QueryAdmissionController>) {
+    let mut harness = Harness::memory(&[(tenant, seg_specs)]).await;
+    let controller = QueryAdmissionController::shared(limit);
     harness.service = RavelFlightSqlService::new(
         Arc::clone(&harness.executor),
-        TestAuth::new(&[("acme", &tenant)]),
+        TestAuth::new(&[("acme", tenant)]),
         Arc::clone(&harness.clock) as Arc<dyn FlightClock>,
         FlightSqlConfig {
             max_deadline: Duration::from_secs(30),
@@ -932,10 +928,24 @@ async fn get_flight_info_is_gated_but_do_get_is_not() {
         Arc::new(NoopQueryCostRecorder),
         Arc::clone(&controller),
     );
+    (harness, controller)
+}
+
+/// `get_flight_info_statement` is gated by the shared concurrency controller.
+/// With a ceiling of 1, a `GetFlightInfo` issued while the single slot is
+/// already held is rejected with `RESOURCE_EXHAUSTED` before it resolves or
+/// plans; freeing the slot restores admission. Its own permit covers only the
+/// resolve+plan RPC and releases when that RPC returns.
+#[tokio::test]
+async fn get_flight_info_is_gated_at_the_ceiling() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let (harness, controller) =
+        ceiling_harness(&tenant, &seg_specs, QueryConcurrencyLimit::Bounded(1)).await;
 
     // With headroom, GetFlightInfo is admitted and mints a redeemable ticket.
     // Its own permit is released when the RPC returns.
-    let ticket = harness
+    harness
         .get_flight_info("acme", QUERY)
         .await
         .expect("admitted while the ceiling has headroom");
@@ -945,7 +955,7 @@ async fn get_flight_info_is_gated_but_do_get_is_not() {
         "the GetFlightInfo permit released on return"
     );
 
-    // Fill the single slot, simulating another GetFlightInfo in flight. The next
+    // Fill the single slot, simulating another query in flight. The next
     // GetFlightInfo must be rejected before it resolves or plans.
     let held = controller.try_admit().expect("hold the one slot");
     assert_eq!(controller.in_flight(), 1);
@@ -959,22 +969,6 @@ async fn get_flight_info_is_gated_but_do_get_is_not() {
         "the concurrency rejection surfaces as RESOURCE_EXHAUSTED, got {err:?}"
     );
 
-    // do_get is NOT gated: the earlier ticket redeems and streams even though the
-    // ceiling is now full (the held slot is still occupied).
-    let batches = harness
-        .do_get("acme", &ticket)
-        .await
-        .expect("do_get redeems an already-admitted ticket without an admission check");
-    assert!(
-        !batches.is_empty(),
-        "the redeemed ticket streamed the query's rows"
-    );
-    assert_eq!(
-        controller.in_flight(),
-        1,
-        "do_get neither acquired nor released a slot"
-    );
-
     // Releasing the held slot restores admission for the next GetFlightInfo.
     drop(held);
     assert_eq!(controller.in_flight(), 0);
@@ -982,4 +976,154 @@ async fn get_flight_info_is_gated_but_do_get_is_not() {
         .get_flight_info("acme", QUERY)
         .await
         .expect("a freed slot admits the next GetFlightInfo");
+}
+
+/// The load-bearing test for the EF-5 fix: `do_get_statement` -- the RPC that
+/// actually scans segments and streams rows -- is itself gated, so the ceiling
+/// bounds Flight's *execution* phase, not merely its planning phase. A held
+/// `DoGet` stream occupies the one slot; a second `DoGet` redeeming a ticket
+/// minted earlier (while there was headroom) is rejected with
+/// `RESOURCE_EXHAUSTED`, even though its ticket is perfectly valid. Before the
+/// fix `do_get` took no permit, so a client that serialized its `GetFlightInfo`
+/// calls could run unbounded concurrent `DoGet`s.
+#[tokio::test]
+async fn do_get_is_gated_at_the_ceiling() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let (harness, controller) =
+        ceiling_harness(&tenant, &seg_specs, QueryConcurrencyLimit::Bounded(1)).await;
+
+    // Two tickets minted while the ceiling had headroom (each GetFlightInfo took
+    // and released the one slot in turn). Both are valid and redeemable.
+    let ticket_a = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("first ticket minted");
+    let ticket_b = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("second ticket minted");
+    assert_eq!(
+        controller.in_flight(),
+        0,
+        "no GetFlightInfo permit outlives its RPC"
+    );
+
+    // Redeem the first ticket and hold the stream open without draining it: the
+    // execution permit lives inside the stream's guard, so the one slot is now
+    // occupied for as long as this stream is held.
+    let held_stream = harness
+        .do_get_stream("acme", &ticket_a)
+        .await
+        .expect("first DoGet admitted with headroom");
+    assert_eq!(
+        controller.in_flight(),
+        1,
+        "the in-flight DoGet holds the execution slot"
+    );
+
+    // A second DoGet, redeeming an equally valid ticket, is now rejected: the
+    // execution phase is gated, so the ceiling genuinely bounds concurrent Flight
+    // execution and not just concurrent planning.
+    // `.err()` rather than `expect_err`: the Ok variant is a boxed stream that
+    // is not `Debug`, so `expect_err` would not compile.
+    let err = harness
+        .do_get_stream("acme", &ticket_b)
+        .await
+        .err()
+        .expect("at the ceiling, the second DoGet is rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "the redemption-time concurrency rejection surfaces as RESOURCE_EXHAUSTED, got {err:?}"
+    );
+
+    // The rejection is admission back-pressure, not a ticket problem: once the
+    // held stream is dropped and its slot freed, the very same ticket redeems.
+    drop(held_stream);
+    assert_eq!(
+        controller.in_flight(),
+        0,
+        "the dropped stream released its slot"
+    );
+    let batches = harness
+        .do_get("acme", &ticket_b)
+        .await
+        .expect("with the slot freed, the previously rejected ticket redeems");
+    assert!(!batches.is_empty(), "the redeemed ticket streamed rows");
+}
+
+/// A `DoGet`'s execution permit is held for the whole streaming lifetime and
+/// released exactly when the stream ends (the same instant the cost fold fires),
+/// not when `do_get_statement` returns its first batch.
+#[tokio::test]
+async fn a_held_do_get_stream_holds_its_permit_until_it_ends() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let (harness, controller) =
+        ceiling_harness(&tenant, &seg_specs, QueryConcurrencyLimit::Bounded(1)).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("ticket minted");
+
+    let stream = harness
+        .do_get_stream("acme", &ticket)
+        .await
+        .expect("DoGet admitted");
+    assert_eq!(
+        controller.in_flight(),
+        1,
+        "the permit is held while the stream is open and undrained"
+    );
+
+    // Draining the stream to completion drops its guard, which releases the slot.
+    let batches = collect(stream).await.expect("stream drains");
+    assert!(!batches.is_empty(), "the query streamed rows");
+    assert_eq!(
+        controller.in_flight(),
+        0,
+        "the permit released when the stream ended"
+    );
+}
+
+/// A client that abandons a `DoGet` mid-stream (drops it without draining)
+/// releases its execution permit, mirroring how the cost fold fires on drop.
+#[tokio::test]
+async fn abandoning_a_do_get_stream_releases_its_permit() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let (harness, controller) =
+        ceiling_harness(&tenant, &seg_specs, QueryConcurrencyLimit::Bounded(1)).await;
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("ticket minted");
+
+    let stream = harness
+        .do_get_stream("acme", &ticket)
+        .await
+        .expect("DoGet admitted");
+    assert_eq!(
+        controller.in_flight(),
+        1,
+        "the in-flight DoGet holds the slot"
+    );
+
+    // The client walks away without reading the rest: dropping the stream drops
+    // its guard, which releases the slot exactly as a clean end would.
+    drop(stream);
+    assert_eq!(
+        controller.in_flight(),
+        0,
+        "abandoning the stream released the permit"
+    );
+
+    // The freed slot admits the next DoGet.
+    let _resumed = harness
+        .do_get_stream("acme", &ticket)
+        .await
+        .expect("a freed slot admits the next DoGet");
 }
