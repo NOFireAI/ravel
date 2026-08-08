@@ -29,6 +29,7 @@ sys/auth                                                                deployme
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
 sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite; ADR-0065 §1)
+sys/maintain/memo/<process_id>                                          maintain-worker durable memo snapshot for warm start/handoff (root-level, per-process, Overwrite; ADR-0065 §3)
 ```
 
 The compaction/retention key shapes (ADR-0018, ADR-0019;
@@ -77,6 +78,29 @@ above; a stale or missing heartbeat is self-correcting on the next interval and,
 past the `3 * H` window, its owner is treated as gone and its units are taken
 over (idempotent overlap during the transition, never lost or double-counted
 work). Nothing deletes these heartbeats (staleness detection replaces a sweep).
+
+`sys/maintain/memo/<process_id>` (ADR-0065 §3) is the maintain role's durable
+per-worker memo snapshot: the same self-owned, root-level, `Overwrite` pattern
+beside the heartbeat prefix. On its discovery cadence each maintain process
+writes a compact summary of the `(tenant, signal, shard)` buckets it has
+verified terminal -- per unit a `terminal_frontier_hour` frontier run plus a
+sparse RLE exception list, so the retention-window interior is one run and the
+object stays KBs even at large retention -- **debounced**, so a tick that
+verified nothing new writes nothing (the debounce compares the timestamp-free
+body, so it rides the existing tick and needs no separate timer). On startup,
+and whenever a membership change moves ownership of a unit to this process, the
+worker lists this prefix and GETs every sibling's snapshot (its own previous one
+included), seeding its in-memory memo from the freshest non-stale entries for
+the units it now owns, so a restart or ownership handoff warm-starts instead of
+rescanning the retention window cold. A snapshot is trusted only while it is
+within one memo re-verify interval (default 1h) of the reader's clock: past that
+every entry it carries would already be individually stale, so an older snapshot
+holds nothing that could suppress a read and is ignored. Like the heartbeat, the
+payload is a versioned-tag advisory record -- membership/warm-start state,
+deliberately **not** a lease -- and losing, staling, or corrupting it costs at
+most a rescan of the affected units, never correctness (the ADR-0003
+HEAD-pointer precedent). Nothing deletes these snapshots (staleness detection
+replaces a sweep; a bounded cleanup sweep is a future step if it ever matters).
 
 `sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
 additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.

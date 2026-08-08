@@ -156,10 +156,54 @@ async fn list_shard_hours(
 /// only a small bound on promptness (issue #280).
 pub const DEFAULT_MEMO_REVERIFY_INTERVAL_NS: i64 = NS_PER_HOUR;
 
+/// Staleness bound past which a durable memo snapshot (ADR-0065 decision 3,
+/// `sys/maintain/memo/<process_id>`) is not trusted for warm start or handoff
+/// seeding: a snapshot whose `snapshot_unix_ns` is further than this from the
+/// reader's clock (in either direction) is ignored, degrading that unit to the
+/// cold rescan we do unconditionally today.
+///
+/// This is deliberately an **independent** bound, not the worker heartbeat's
+/// `3 * H` liveness window, and it is set to the memo re-verify interval
+/// ([`DEFAULT_MEMO_REVERIFY_INTERVAL_NS`], 1 hour). The justification is exact:
+/// a snapshot is written at tick time and every entry it carries was verified
+/// at or before that write, so `snapshot_unix_ns >= max(entry.verified_at_ns)`.
+/// Past one re-verify interval, `now - snapshot_unix_ns > reverify_interval`
+/// implies `now - entry.verified_at_ns > reverify_interval` for *every* entry,
+/// so no seeded entry could pass [`MaintainMemo::is_fresh_terminal`] and none
+/// could suppress a single read -- loading such a snapshot is pure waste. Tying
+/// the bound to the re-verify interval makes it precisely "trust a snapshot
+/// only while at least its newest possible entry could still be fresh."
+///
+/// Coupling to worker liveness (`3 * H` = 180s) would be wrong here in the
+/// other direction: a live worker whose memo is stable does not rewrite its
+/// snapshot every tick (writes are debounced), so its own last snapshot can be
+/// many minutes old while the worker is perfectly healthy; a 180s bound would
+/// wrongly reject that worker's own snapshot on a warm restart. The re-verify
+/// interval is the only bound that matches what the snapshot is actually for.
+/// A far-future-dated snapshot (clock skew) is excluded symmetrically, exactly
+/// as [`crate::worker_set`] excludes a far-future heartbeat.
+pub const DEFAULT_MEMO_SNAPSHOT_STALENESS_NS: i64 = DEFAULT_MEMO_REVERIFY_INTERVAL_NS;
+
+/// Version tag on the durable memo snapshot payload (ADR-0065 decision 3). Like
+/// the advisory cursor's [`CURSOR_TAG`], the snapshot is not a frozen format:
+/// the tag only lets a future encoding be detected and treated as "no usable
+/// snapshot" (cold rescan), never misread.
+const MEMO_SNAPSHOT_TAG: u8 = 1;
+
 /// Memo key: `(tenant, signal, shard, ingest-hour)`, the full identity of one
 /// bucket. Tenant and signal are included so a single per-worker memo can span
 /// every `(signal, shard)` the worker maintains without cross-bucket aliasing.
 type BucketKey = (TenantHash, Signal, u32, u32);
+
+/// Snapshot grouping key for one `(tenant, signal-code, shard)` unit, with the
+/// signal held as its one-byte snapshot discriminant so the map orders
+/// deterministically (required for the debounce body to be a stable function of
+/// the memo).
+type SnapshotUnitKey = (TenantHash, u8, u32);
+
+/// One unit's terminal buckets as `(hour, state, verified_at_ns)` before they
+/// are run-length encoded into a frontier plus exceptions.
+type SnapshotUnitEntries = Vec<(u32, TerminalState, i64)>;
 
 /// Why a bucket is terminal for the maintain loop: no retention or compaction
 /// action is due now, and none can become due until either a later retention
@@ -180,6 +224,31 @@ pub enum TerminalState {
     /// bucket holds nothing further to do. (It normally also vanishes from the
     /// shard listing, so its entry is pruned on the next pass.)
     SweptEmpty,
+}
+
+impl TerminalState {
+    /// Stable one-byte discriminant for the durable memo snapshot payload
+    /// (ADR-0065 decision 3). Fixed values: a persisted snapshot must decode
+    /// the same across versions, so these never change once shipped.
+    fn to_code(self) -> u8 {
+        match self {
+            TerminalState::Compacted => 0,
+            TerminalState::BelowThreshold => 1,
+            TerminalState::SweptEmpty => 2,
+        }
+    }
+
+    /// Inverse of [`Self::to_code`]. An unrecognized code is a future-version or
+    /// corrupt snapshot; the decoder treats it as undecodable (cold rescan),
+    /// never a panic.
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(TerminalState::Compacted),
+            1 => Some(TerminalState::BelowThreshold),
+            2 => Some(TerminalState::SweptEmpty),
+            _ => None,
+        }
+    }
 }
 
 /// One memo entry: the terminal classification and the injected time the bucket
@@ -336,6 +405,446 @@ impl MaintainMemo {
         self.entries.retain(|(t, s, sh, hour), _| {
             *t != tenant || *s != signal || *sh != shard || present.contains(hour)
         });
+    }
+
+    /// Seed one terminal entry from a durable snapshot (ADR-0065 decision 3),
+    /// keeping the freshest verdict when a bucket is seeded from more than one
+    /// snapshot: an existing entry verified at or after `verified_at_ns` wins,
+    /// so merging siblings' snapshots converges on the most recently verified
+    /// state per bucket regardless of read order.
+    fn seed_entry(&mut self, key: BucketKey, state: TerminalState, verified_at_ns: i64) {
+        match self.entries.get(&key) {
+            Some(existing) if existing.verified_at_ns >= verified_at_ns => {}
+            _ => {
+                self.entries.insert(
+                    key,
+                    MemoEntry {
+                        state,
+                        verified_at_ns,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The RLE-encoded snapshot **body** (ADR-0065 decision 3): every terminal
+    /// bucket the memo holds, grouped per `(tenant, signal, shard)` unit, each
+    /// unit summarized as a dense **frontier** run plus a sparse **exception**
+    /// list, without the [`MEMO_SNAPSHOT_TAG`]/`snapshot_unix_ns` header. The
+    /// body is a pure function of the memoized entries and is emitted in a
+    /// canonical order (units sorted by `(tenant, signal-code, shard)`, hours
+    /// ascending), so a driver can compare two bodies byte-for-byte to **debounce**
+    /// the durable write (skip a tick that changed nothing) without the ever-
+    /// changing timestamp forcing a write every tick.
+    ///
+    /// Encoding, per unit: the terminal hours are partitioned into maximal
+    /// contiguous same-state runs; the single longest run (ties broken toward
+    /// the highest hour) is the frontier -- the compacted interior of the
+    /// retention window, one run covering hundreds of hours -- stored as
+    /// `(frontier_start_hour, terminal_frontier_hour, state, verified_ns)`. Every
+    /// other run is an exception, stored as `(start_hour, run_len, state,
+    /// verified_ns)`. Each run's `verified_ns` is the *minimum* verified time
+    /// across its hours, so a warm-started entry is never treated as fresher
+    /// than its oldest member. See [`Self::encode_snapshot`] for the full framed
+    /// object and [`Self::seed_from_snapshot`] for the inverse.
+    pub fn snapshot_body(&self) -> Vec<u8> {
+        // Group terminal entries per unit, deterministically ordered so the
+        // body is a stable function of the memo (required for debounce).
+        let mut by_unit: std::collections::BTreeMap<SnapshotUnitKey, SnapshotUnitEntries> =
+            std::collections::BTreeMap::new();
+        for (&(t, s, sh, hour), entry) in &self.entries {
+            by_unit
+                .entry((t, signal_to_code(s), sh))
+                .or_default()
+                .push((hour, entry.state, entry.verified_at_ns));
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(by_unit.len() as u32).to_le_bytes());
+        for ((tenant, signal_code, shard), mut hours) in by_unit {
+            hours.sort_unstable_by_key(|(hour, _, _)| *hour);
+            let runs = terminal_runs(&hours);
+            // Frontier = the longest run; ties toward the highest end hour. The
+            // retention-window interior is one run, so this is the compression.
+            let frontier_idx = runs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    a.len()
+                        .cmp(&b.len())
+                        .then_with(|| a.end_hour.cmp(&b.end_hour))
+                })
+                .map(|(i, _)| i);
+
+            buf.extend_from_slice(&tenant.0);
+            buf.push(signal_code);
+            buf.extend_from_slice(&shard.to_le_bytes());
+
+            match frontier_idx {
+                Some(idx) => {
+                    let f = &runs[idx];
+                    buf.push(1); // frontier present
+                    buf.extend_from_slice(&f.start_hour.to_le_bytes());
+                    buf.extend_from_slice(&f.end_hour.to_le_bytes());
+                    buf.push(f.state.to_code());
+                    buf.extend_from_slice(&f.verified_ns.to_le_bytes());
+
+                    let exceptions: Vec<&TerminalRun> = runs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .map(|(_, r)| r)
+                        .collect();
+                    buf.extend_from_slice(&(exceptions.len() as u32).to_le_bytes());
+                    for run in exceptions {
+                        buf.extend_from_slice(&run.start_hour.to_le_bytes());
+                        buf.extend_from_slice(&run.len().to_le_bytes());
+                        buf.push(run.state.to_code());
+                        buf.extend_from_slice(&run.verified_ns.to_le_bytes());
+                    }
+                }
+                None => {
+                    // A unit with an entry always has at least one run, so this
+                    // arm is only reached for an entry-less unit, which the
+                    // grouping above never produces; encode it as empty anyway.
+                    buf.push(0); // no frontier
+                    buf.extend_from_slice(&0u32.to_le_bytes()); // zero exceptions
+                }
+            }
+        }
+        buf
+    }
+
+    /// Frame a snapshot body ([`Self::snapshot_body`]) into the durable object
+    /// bytes: `[MEMO_SNAPSHOT_TAG][snapshot_unix_ns i64 LE][body]`. Taking a
+    /// pre-computed body lets a driver reuse the body it already built for the
+    /// debounce comparison rather than re-encoding it.
+    pub fn snapshot_bytes_from_body(body: &[u8], snapshot_unix_ns: i64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 8 + body.len());
+        buf.push(MEMO_SNAPSHOT_TAG);
+        buf.extend_from_slice(&snapshot_unix_ns.to_le_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    /// The full durable snapshot object (ADR-0065 decision 3), stamped with the
+    /// writer's clock `snapshot_unix_ns` for the reader-side staleness check
+    /// ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]). Convenience over
+    /// [`Self::snapshot_bytes_from_body`] when the caller does not separately
+    /// need the body for debouncing.
+    pub fn encode_snapshot(&self, snapshot_unix_ns: i64) -> Vec<u8> {
+        Self::snapshot_bytes_from_body(&self.snapshot_body(), snapshot_unix_ns)
+    }
+
+    /// Seed this memo from one durable snapshot's bytes for the units `owns`
+    /// accepts (ADR-0065 decision 3's warm start and handoff). Fail-open by
+    /// contract: an undecodable or truncated payload returns an
+    /// [`MemoSnapshotError`] the caller logs and treats as a cold start for
+    /// those units, never a panic and never a blocked loop.
+    ///
+    /// `staleness_ns` gates the whole snapshot on its `snapshot_unix_ns`: a
+    /// snapshot further than `staleness_ns` from `now_ns` in either direction is
+    /// ignored ([`SeedStats::stale`] set, nothing seeded), matching the
+    /// far-future exclusion [`crate::worker_set`] applies to heartbeats. A
+    /// non-positive `staleness_ns` disables the whole-snapshot gate (every
+    /// snapshot is loaded; per-entry freshness still governs skipping). Seeded
+    /// entries only ever *suppress reads* through the same freshness rules as a
+    /// warm in-memory entry ([`Self::is_fresh_terminal`]); the memo stays as
+    /// advisory as ever, so a wrong seed can at worst defer a bucket's
+    /// re-evaluation by one re-verify interval.
+    pub fn seed_from_snapshot(
+        &mut self,
+        bytes: &[u8],
+        now_ns: i64,
+        staleness_ns: i64,
+        owns: impl Fn(TenantHash, Signal, u32) -> bool,
+    ) -> std::result::Result<SeedStats, MemoSnapshotError> {
+        let decoded = decode_snapshot(bytes)?;
+
+        if staleness_ns > 0 {
+            let too_old = now_ns.saturating_sub(decoded.snapshot_unix_ns) > staleness_ns;
+            let too_future = decoded.snapshot_unix_ns.saturating_sub(now_ns) > staleness_ns;
+            if too_old || too_future {
+                return Ok(SeedStats {
+                    stale: true,
+                    seeded_units: 0,
+                    seeded_buckets: 0,
+                });
+            }
+        }
+
+        let mut stats = SeedStats {
+            stale: false,
+            seeded_units: 0,
+            seeded_buckets: 0,
+        };
+        for unit in decoded.units {
+            if !owns(unit.tenant, unit.signal, unit.shard) {
+                continue;
+            }
+            stats.seeded_units += 1;
+            for (hour, state, verified_ns) in unit.entries {
+                self.seed_entry(
+                    (unit.tenant, unit.signal, unit.shard, hour),
+                    state,
+                    verified_ns,
+                );
+                stats.seeded_buckets += 1;
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// What one [`MaintainMemo::seed_from_snapshot`] call did, for logging and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SeedStats {
+    /// The snapshot was excluded by the staleness gate; nothing was seeded.
+    pub stale: bool,
+    /// Owned units the snapshot carried entries for and seeded from.
+    pub seeded_units: usize,
+    /// Terminal bucket entries seeded (may include buckets already warm, which
+    /// keep whichever verdict is fresher).
+    pub seeded_buckets: usize,
+}
+
+/// A durable memo snapshot ([`MaintainMemo::encode_snapshot`]) that failed to
+/// decode. Every variant means the same thing to the caller -- treat the
+/// snapshot as absent and cold-start the affected units -- but they are
+/// distinguished so a log line can say why a snapshot was skipped.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MemoSnapshotError {
+    /// The payload ended before a field the format requires was fully read.
+    #[error("memo snapshot truncated: wanted {wanted} more bytes at offset {offset}")]
+    Truncated { offset: usize, wanted: usize },
+    /// The leading version tag is not one this build writes.
+    #[error("memo snapshot has unknown version tag {0} (a future or corrupt encoding)")]
+    UnknownTag(u8),
+    /// A terminal-state discriminant outside [`TerminalState`]'s range.
+    #[error("memo snapshot carries unknown terminal-state code {0}")]
+    UnknownState(u8),
+    /// A signal discriminant outside [`Signal`]'s range.
+    #[error("memo snapshot carries unknown signal code {0}")]
+    UnknownSignal(u8),
+    /// An exception run with zero length, which the encoder never emits.
+    #[error("memo snapshot carries a zero-length run (a corrupt encoding)")]
+    ZeroLengthRun,
+}
+
+/// One maximal contiguous same-state run of terminal hours within a unit.
+#[derive(Debug, Clone, Copy)]
+struct TerminalRun {
+    start_hour: u32,
+    end_hour: u32,
+    state: TerminalState,
+    /// Minimum `verified_at_ns` across the run (conservative for freshness).
+    verified_ns: i64,
+}
+
+impl TerminalRun {
+    fn len(&self) -> u32 {
+        self.end_hour - self.start_hour + 1
+    }
+}
+
+/// Partition sorted `(hour, state, verified_ns)` entries into maximal runs of
+/// consecutive hours sharing one [`TerminalState`]. A run breaks on a hour gap
+/// or a state change. Input must be sorted ascending by hour with unique hours
+/// (the memo keys one entry per bucket, so hours are unique by construction).
+fn terminal_runs(sorted: &[(u32, TerminalState, i64)]) -> Vec<TerminalRun> {
+    let mut runs: Vec<TerminalRun> = Vec::new();
+    for &(hour, state, verified_ns) in sorted {
+        match runs.last_mut() {
+            Some(run)
+                if run.end_hour + 1 == hour
+                    && std::mem::discriminant(&run.state) == std::mem::discriminant(&state) =>
+            {
+                run.end_hour = hour;
+                run.verified_ns = run.verified_ns.min(verified_ns);
+            }
+            _ => runs.push(TerminalRun {
+                start_hour: hour,
+                end_hour: hour,
+                state,
+                verified_ns,
+            }),
+        }
+    }
+    runs
+}
+
+/// One decoded unit of a snapshot: its identity plus every terminal bucket the
+/// runs expanded to.
+struct DecodedUnit {
+    tenant: TenantHash,
+    signal: Signal,
+    shard: u32,
+    entries: Vec<(u32, TerminalState, i64)>,
+}
+
+/// A fully decoded snapshot.
+struct DecodedSnapshot {
+    snapshot_unix_ns: i64,
+    units: Vec<DecodedUnit>,
+}
+
+/// Stable one-byte discriminant for a [`Signal`] in the memo snapshot. Fixed
+/// values (a persisted snapshot must decode identically across versions); every
+/// signal is mapped, not just the maintained three, so a snapshot is total.
+fn signal_to_code(signal: Signal) -> u8 {
+    match signal {
+        Signal::Metrics => 0,
+        Signal::Logs => 1,
+        Signal::Spans => 2,
+        Signal::Profiles => 3,
+        Signal::Alerts => 4,
+        Signal::Audit => 5,
+    }
+}
+
+/// Inverse of [`signal_to_code`]. An unknown code is a future-version or corrupt
+/// snapshot, surfaced as [`MemoSnapshotError::UnknownSignal`].
+fn signal_from_code(code: u8) -> Option<Signal> {
+    match code {
+        0 => Some(Signal::Metrics),
+        1 => Some(Signal::Logs),
+        2 => Some(Signal::Spans),
+        3 => Some(Signal::Profiles),
+        4 => Some(Signal::Alerts),
+        5 => Some(Signal::Audit),
+        _ => None,
+    }
+}
+
+/// A bounds-checked cursor over the snapshot bytes; every read that would run
+/// off the end is a typed [`MemoSnapshotError::Truncated`], never a panic.
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SnapshotReader<'a> {
+    fn take(&mut self, n: usize) -> std::result::Result<&'a [u8], MemoSnapshotError> {
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or(MemoSnapshotError::Truncated {
+                offset: self.offset,
+                wanted: n,
+            })?;
+        if end > self.bytes.len() {
+            return Err(MemoSnapshotError::Truncated {
+                offset: self.offset,
+                wanted: n,
+            });
+        }
+        let out = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> std::result::Result<u8, MemoSnapshotError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> std::result::Result<u32, MemoSnapshotError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn i64(&mut self) -> std::result::Result<i64, MemoSnapshotError> {
+        let b = self.take(8)?;
+        Ok(i64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+}
+
+/// Decode a full durable snapshot object, expanding every frontier/exception
+/// run back into per-bucket terminal entries. Every malformed input yields a
+/// typed [`MemoSnapshotError`] (fail-open at the caller), never a panic.
+fn decode_snapshot(bytes: &[u8]) -> std::result::Result<DecodedSnapshot, MemoSnapshotError> {
+    let mut reader = SnapshotReader { bytes, offset: 0 };
+    let tag = reader.u8()?;
+    if tag != MEMO_SNAPSHOT_TAG {
+        return Err(MemoSnapshotError::UnknownTag(tag));
+    }
+    let snapshot_unix_ns = reader.i64()?;
+    let unit_count = reader.u32()?;
+
+    let mut units = Vec::with_capacity(unit_count as usize);
+    for _ in 0..unit_count {
+        let tenant_bytes = reader.take(16)?;
+        let mut tenant = [0u8; 16];
+        tenant.copy_from_slice(tenant_bytes);
+        let tenant = TenantHash(tenant);
+        let signal_code = reader.u8()?;
+        let signal =
+            signal_from_code(signal_code).ok_or(MemoSnapshotError::UnknownSignal(signal_code))?;
+        let shard = reader.u32()?;
+
+        let mut entries: Vec<(u32, TerminalState, i64)> = Vec::new();
+
+        let frontier_present = reader.u8()?;
+        if frontier_present == 1 {
+            let start = reader.u32()?;
+            let end = reader.u32()?;
+            let state_code = reader.u8()?;
+            let state = TerminalState::from_code(state_code)
+                .ok_or(MemoSnapshotError::UnknownState(state_code))?;
+            let verified = reader.i64()?;
+            expand_run(
+                &mut entries,
+                start,
+                end.saturating_sub(start) + 1,
+                state,
+                verified,
+            );
+        }
+
+        let exception_count = reader.u32()?;
+        for _ in 0..exception_count {
+            let start = reader.u32()?;
+            let run_len = reader.u32()?;
+            if run_len == 0 {
+                return Err(MemoSnapshotError::ZeroLengthRun);
+            }
+            let state_code = reader.u8()?;
+            let state = TerminalState::from_code(state_code)
+                .ok_or(MemoSnapshotError::UnknownState(state_code))?;
+            let verified = reader.i64()?;
+            expand_run(&mut entries, start, run_len, state, verified);
+        }
+
+        units.push(DecodedUnit {
+            tenant,
+            signal,
+            shard,
+            entries,
+        });
+    }
+
+    Ok(DecodedSnapshot {
+        snapshot_unix_ns,
+        units,
+    })
+}
+
+/// Expand one RLE run of `run_len` consecutive hours from `start` into per-hour
+/// terminal entries. Saturating arithmetic keeps a corrupt oversized run from
+/// overflowing the hour index rather than panicking.
+fn expand_run(
+    out: &mut Vec<(u32, TerminalState, i64)>,
+    start: u32,
+    run_len: u32,
+    state: TerminalState,
+    verified_ns: i64,
+) {
+    for i in 0..run_len {
+        let Some(hour) = start.checked_add(i) else {
+            break;
+        };
+        out.push((hour, state, verified_ns));
     }
 }
 
@@ -543,5 +1052,315 @@ async fn write_cursor(
     match store.put(key, payload.into(), opts).await {
         Ok(_) | Err(StoreError::AlreadyExists) | Err(StoreError::PreconditionFailed) => Ok(()),
         Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod memo_snapshot_tests {
+    use super::*;
+    use ravel_types::TenantId;
+
+    fn tenant() -> TenantHash {
+        TenantId::new("acme").hash()
+    }
+
+    /// A cold snapshot round-trips to nothing: an empty memo encodes a
+    /// well-formed object that seeds nothing and decodes clean.
+    #[test]
+    fn empty_memo_round_trips_to_empty() {
+        let memo = MaintainMemo::with_default_interval();
+        let bytes = memo.encode_snapshot(1_000);
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(
+                &bytes,
+                1_000,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("decode empty");
+        assert!(!stats.stale);
+        assert_eq!(stats.seeded_buckets, 0);
+        assert!(seeded.is_empty());
+    }
+
+    /// The frontier/exception split reconstructs the exact terminal set: a long
+    /// same-state interior run (the frontier) plus divergent stragglers (the
+    /// exceptions), across two units, seed back byte-for-byte identical.
+    #[test]
+    fn frontier_and_exceptions_round_trip_exactly() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        // Unit A: a Compacted interior run 10..=20 (the frontier), an isolated
+        // BelowThreshold at hour 5, and a SweptEmpty at hour 25 (exceptions).
+        for hour in 10..=20 {
+            memo.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                5_000,
+            );
+        }
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 5),
+            TerminalState::BelowThreshold,
+            5_000,
+        );
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 25),
+            TerminalState::SweptEmpty,
+            5_000,
+        );
+        // Unit B (different shard, different signal): a small Compacted run.
+        for hour in 100..=102 {
+            memo.mark_terminal((t, Signal::Logs, 3, hour), TerminalState::Compacted, 6_000);
+        }
+        let want_len = memo.len();
+
+        let bytes = memo.encode_snapshot(9_000);
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(
+                &bytes,
+                9_000,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("decode");
+        assert!(!stats.stale);
+        assert_eq!(stats.seeded_units, 2);
+        assert_eq!(seeded.len(), want_len);
+
+        // Every original entry reconstructs with its exact state.
+        for hour in 10..=20 {
+            assert_eq!(
+                seeded.terminal_state(t, Signal::Metrics, 0, hour),
+                Some(TerminalState::Compacted)
+            );
+        }
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 0, 5),
+            Some(TerminalState::BelowThreshold)
+        );
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 0, 25),
+            Some(TerminalState::SweptEmpty)
+        );
+        for hour in 100..=102 {
+            assert_eq!(
+                seeded.terminal_state(t, Signal::Logs, 3, hour),
+                Some(TerminalState::Compacted)
+            );
+        }
+    }
+
+    /// A contiguous interior collapses to one frontier run and no exceptions,
+    /// so the body stays small (the compression the ADR relies on): the
+    /// exception-count field for the unit is zero regardless of run length.
+    #[test]
+    fn contiguous_interior_encodes_as_one_frontier_run() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        for hour in 0..500 {
+            memo.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                1_000,
+            );
+        }
+        // Body is one unit header + one frontier record + a zero exception
+        // count -- far smaller than 500 per-bucket entries would be.
+        let body = memo.snapshot_body();
+        // 4 (unit count) + [16 tenant +1 sig +4 shard +1 present +4 start +4 end
+        // +1 state +8 verified +4 exc_count(=0)] = 4 + 43 = 47 bytes.
+        assert_eq!(body.len(), 47, "500 hours collapse to one frontier run");
+    }
+
+    /// The whole-snapshot staleness gate excludes an old snapshot: nothing is
+    /// seeded and `stale` is set, exactly one re-verify interval past the write.
+    #[test]
+    fn stale_snapshot_is_ignored() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        let bytes = memo.encode_snapshot(0);
+
+        // Read one nanosecond past the staleness bound: excluded.
+        let now = DEFAULT_MEMO_SNAPSHOT_STALENESS_NS + 1;
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(
+                &bytes,
+                now,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("decode");
+        assert!(stats.stale, "a snapshot past the bound is ignored");
+        assert_eq!(stats.seeded_buckets, 0);
+        assert!(seeded.is_empty());
+
+        // Exactly at the bound: still trusted (inclusive), seeded.
+        let mut seeded2 = MaintainMemo::with_default_interval();
+        let stats2 = seeded2
+            .seed_from_snapshot(
+                &bytes,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("decode");
+        assert!(!stats2.stale);
+        assert_eq!(stats2.seeded_buckets, 1);
+    }
+
+    /// A far-future-dated snapshot is excluded symmetrically, like a
+    /// far-future heartbeat: a skewed clock cannot seed stale facts as fresh.
+    #[test]
+    fn future_dated_snapshot_is_ignored() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::Compacted,
+            10 * NS_PER_HOUR,
+        );
+        let bytes = memo.encode_snapshot(10 * NS_PER_HOUR);
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(&bytes, 0, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, |_, _, _| {
+                true
+            })
+            .expect("decode");
+        assert!(stats.stale, "a future-dated snapshot is excluded");
+    }
+
+    /// Only owned units are seeded: a snapshot spanning several units seeds
+    /// exactly the ones the ownership predicate accepts.
+    #[test]
+    fn only_owned_units_are_seeded() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        memo.mark_terminal((t, Signal::Metrics, 1, 1), TerminalState::Compacted, 0);
+        let bytes = memo.encode_snapshot(0);
+
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(
+                &bytes,
+                0,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, shard| shard == 0,
+            )
+            .expect("decode");
+        assert_eq!(stats.seeded_units, 1);
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 0, 1),
+            Some(TerminalState::Compacted)
+        );
+        assert_eq!(
+            seeded.terminal_state(t, Signal::Metrics, 1, 1),
+            None,
+            "unowned unit not seeded"
+        );
+    }
+
+    /// Merging two snapshots keeps the freshest verdict per bucket regardless of
+    /// which is applied first, so sibling handoff converges deterministically.
+    #[test]
+    fn merging_snapshots_keeps_the_freshest_entry() {
+        let t = tenant();
+        let mut older = MaintainMemo::with_default_interval();
+        older.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::BelowThreshold,
+            1_000,
+        );
+        let older_bytes = older.encode_snapshot(1_000);
+
+        let mut newer = MaintainMemo::with_default_interval();
+        newer.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 5_000);
+        let newer_bytes = newer.encode_snapshot(5_000);
+
+        // Apply older then newer: newer wins.
+        let mut a = MaintainMemo::new(0);
+        a.seed_from_snapshot(&older_bytes, 5_000, 0, |_, _, _| true)
+            .expect("older");
+        a.seed_from_snapshot(&newer_bytes, 5_000, 0, |_, _, _| true)
+            .expect("newer");
+        assert_eq!(
+            a.terminal_state(t, Signal::Metrics, 0, 1),
+            Some(TerminalState::Compacted)
+        );
+
+        // Apply newer then older: newer still wins (order independent).
+        let mut b = MaintainMemo::new(0);
+        b.seed_from_snapshot(&newer_bytes, 5_000, 0, |_, _, _| true)
+            .expect("newer");
+        b.seed_from_snapshot(&older_bytes, 5_000, 0, |_, _, _| true)
+            .expect("older");
+        assert_eq!(
+            b.terminal_state(t, Signal::Metrics, 0, 1),
+            Some(TerminalState::Compacted)
+        );
+    }
+
+    /// A truncated or wrong-tag payload is a typed error, never a panic, so the
+    /// driver can log it and cold-start (fail-open).
+    #[test]
+    fn corrupt_payloads_are_typed_errors_not_panics() {
+        let mut memo = MaintainMemo::with_default_interval();
+        assert!(matches!(
+            memo.seed_from_snapshot(&[], 0, 0, |_, _, _| true),
+            Err(MemoSnapshotError::Truncated { .. })
+        ));
+        assert!(matches!(
+            memo.seed_from_snapshot(&[9, 0, 0, 0, 0, 0, 0, 0, 0], 0, 0, |_, _, _| true),
+            Err(MemoSnapshotError::UnknownTag(9))
+        ));
+        // Valid tag + timestamp but a unit count promising a unit that is not
+        // there: truncated, not a panic.
+        let t = tenant();
+        let mut good = MaintainMemo::with_default_interval();
+        good.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        let mut bytes = good.encode_snapshot(0);
+        bytes.truncate(bytes.len() - 3);
+        assert!(matches!(
+            memo.seed_from_snapshot(&bytes, 0, 0, |_, _, _| true),
+            Err(MemoSnapshotError::Truncated { .. })
+        ));
+    }
+
+    /// The snapshot body is a stable function of the memo (debounce contract):
+    /// two memos with the same terminal set and verify times produce identical
+    /// bodies, and the body ignores the timestamp header.
+    #[test]
+    fn snapshot_body_is_stable_for_debounce() {
+        let t = tenant();
+        let mut a = MaintainMemo::with_default_interval();
+        let mut b = MaintainMemo::with_default_interval();
+        for hour in [3u32, 1, 2, 7, 5] {
+            a.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                1_000,
+            );
+            b.mark_terminal(
+                (t, Signal::Metrics, 0, hour),
+                TerminalState::Compacted,
+                1_000,
+            );
+        }
+        assert_eq!(
+            a.snapshot_body(),
+            b.snapshot_body(),
+            "same content, same body"
+        );
+        // The framed object differs only in the timestamp header, so the body
+        // used for debounce is unchanged across two writes at different times.
+        let body_from_full_1 = &a.encode_snapshot(1)[9..];
+        let body_from_full_2 = &a.encode_snapshot(999)[9..];
+        assert_eq!(body_from_full_1, body_from_full_2);
     }
 }
