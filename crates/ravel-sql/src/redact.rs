@@ -204,12 +204,12 @@ impl VisitorMut for LiteralRedactor<'_> {
 /// structure, so a capture pass and a restore pass visit the same positions in
 /// the same order.
 fn for_each_structural_value<F: FnMut(&mut ValueWithSpan)>(query: &mut Query, mut f: F) {
-    if let Some(order_by) = &mut query.order_by {
-        if let OrderByKind::Expressions(exprs) = &mut order_by.kind {
-            for item in exprs {
-                if let Expr::Value(vws) = &mut item.expr {
-                    f(vws);
-                }
+    if let Some(order_by) = &mut query.order_by
+        && let OrderByKind::Expressions(exprs) = &mut order_by.kind
+    {
+        for item in exprs {
+            if let Expr::Value(vws) = &mut item.expr {
+                f(vws);
             }
         }
     }
@@ -218,10 +218,10 @@ fn for_each_structural_value<F: FnMut(&mut ValueWithSpan)>(query: &mut Query, mu
             if let Some(Expr::Value(vws)) = limit.as_mut() {
                 f(vws);
             }
-            if let Some(offset) = offset.as_mut() {
-                if let Expr::Value(vws) = &mut offset.value {
-                    f(vws);
-                }
+            if let Some(offset) = offset.as_mut()
+                && let Expr::Value(vws) = &mut offset.value
+            {
+                f(vws);
             }
         }
         Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
@@ -234,10 +234,10 @@ fn for_each_structural_value<F: FnMut(&mut ValueWithSpan)>(query: &mut Query, mu
         }
         None => {}
     }
-    if let Some(fetch) = &mut query.fetch {
-        if let Some(Expr::Value(vws)) = fetch.quantity.as_mut() {
-            f(vws);
-        }
+    if let Some(fetch) = &mut query.fetch
+        && let Some(Expr::Value(vws)) = fetch.quantity.as_mut()
+    {
+        f(vws);
     }
 }
 
