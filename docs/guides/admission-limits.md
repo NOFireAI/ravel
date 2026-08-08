@@ -48,9 +48,9 @@ is visible in config review rather than being the silent default.
 
 ## The limits
 
-All limits are per tenant except `max_bytes_scanned` (see the note below
-the table). Rates are token buckets (a sustained `per_sec` plus an
-instantaneous `burst`).
+All limits are per tenant except `max_bytes_scanned` and the
+concurrent-query ceiling (see the notes below the table). Rates are token
+buckets (a sustained `per_sec` plus an instantaneous `burst`).
 
 | Knob | Shipped default | Config key |
 |---|---|---|
@@ -60,6 +60,7 @@ instantaneous `burst`).
 | Active-stream cap (logs) | 200,000 | `max_active_streams` |
 | Series-creation rate / burst | 10,000/s / 100,000 | `series_creation_rate_per_sec` / `series_creation_burst` |
 | Query bytes-scanned budget | unlimited | `max_bytes_scanned` |
+| Fleet-wide concurrent-query ceiling | unlimited | `--max-concurrent-queries` (CLI flag, not a `--limits-file` key) |
 | Event-time future skew | 10 m | not configurable (`ravel-otlp` default) |
 | Event-time ingest lag | 2 h | not configurable (`ravel-otlp` default) |
 | Idle flush delay | 10 s | not configurable (shard default) |
@@ -73,6 +74,20 @@ A `[tenants.<id>]` override for this key is parsed and validated, but has
 no effect beyond a startup warning naming the ineffective tenant. True
 per-tenant query enforcement needs a tenant-aware engine config lookup,
 tracked separately from this ingest-side admission mechanism.
+
+`--max-concurrent-queries` (ADR-0061 decision 2) is a fleet-wide, not
+per-tenant, ceiling on how many queries may execute concurrently across the
+whole process, guarding against total query fan-out overwhelming the fleet
+rather than any one tenant's own concurrency. It is a CLI flag, not a
+`--limits-file` key, and only runs in the query-serving modes (`all`,
+`query`). It covers every query surface: the PromQL HTTP handlers, the SQL
+HTTP endpoint, and both Flight SQL phases (`GetFlightInfo` for planning,
+`DoGet` for execution, each holding its own slot for its own phase's
+duration). Omitted means unlimited, the same safe-default convention as
+`max_bytes_scanned`; a `0` value is rejected at startup rather than
+rejecting every query. A rejected query gets HTTP 503 (PromQL/SQL HTTP) or
+Flight's `RESOURCE_EXHAUSTED` status (Flight SQL), the same shape as any
+other admission rejection.
 
 The active-series/stream default is 200,000, not the 1,000,000 ADR-0051
 section 3 names: issue #491 measured the real per-entry cost of the exact
