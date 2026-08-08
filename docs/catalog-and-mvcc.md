@@ -105,10 +105,17 @@ history via `ravel_catalog::scan_count` rather than a single static count.
   this prefix matching none of these shapes is a fail-loud error (surfaced to
   metrics), never silently skipped: layout drift must be visible, not
   swallowed. (Implementation note: `keys::partition_bucket_entry` does not yet
-  classify the `rw.` shape; until it does, a live rewrite record parses as
-  neither compaction nor commit and trips the fail-loud path. Wiring it into
-  ravel-catalog snapshot resolution is tracked as EJ follow-up work, not part
-  of the ADR-0064 T1 record/codec surface.)
+  classify the `rw.` shape, so a live rewrite record today parses as neither
+  compaction nor commit and every caller's actual behavior differs by call
+  site, not uniformly fail-loud:
+  `crates/ravel-catalog/src/catalog.rs` and `crates/ravel-maintain/src/read.rs`
+  (`list_bucket`) both hard-error via `?`, but `crates/ravel-catalog/src/fold.rs`
+  catches the error and silently skips the entry with a warning instead --
+  the dangerous case, since a silently-skipped rewrite record's supersession
+  of the erased inputs is ignored by the index fold, letting erased records
+  reappear in a folded snapshot. Wiring `partition_bucket_entry` and all
+  three call sites is tracked as EJ follow-up work, not part of the
+  ADR-0064 T1 record/codec surface.)
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
