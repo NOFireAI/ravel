@@ -23,13 +23,18 @@
 //!
 //! # Failure posture
 //!
-//! A flush failure is one event: the batch's single object+commit write either
-//! lands or it does not, atomic from every submitter's view. In
-//! [`AuditMode::Required`] (the default) that failure is returned to every
-//! submitter whose event was in the batch, so their responses fail closed
-//! (HTTP 503 / Flight `Unavailable`). In [`AuditMode::BestEffort`] - the
-//! explicit, documented opt-out - the failure is logged and every submitter
-//! instead gets `Ok(())`, trading complete audit coverage for availability.
+//! [`AuditMode`] governs every way a submission can fail to observe a real,
+//! durable flush of its own batch, not only a live flush call that itself
+//! returned an error: a flush failure, the flush task having already exited
+//! (panicked, or drained and stopped), or `submit` being called after
+//! [`AuditPipeline::shutdown`]/`Drop` have signaled the pipeline closed. In
+//! [`AuditMode::Required`] (the default) every one of those is returned to
+//! the submitter, so its response fails closed (HTTP 503 / Flight
+//! `Unavailable`). In [`AuditMode::BestEffort`] - the explicit, documented
+//! opt-out - every one of them instead resolves `Ok(())`, trading complete
+//! audit coverage for availability: a dead or draining pipeline is exactly
+//! the kind of audit-plane failure `BestEffort` exists to survive, not a
+//! separate class of error exempt from the mode.
 //!
 //! # Shape and shutdown
 //!
@@ -37,11 +42,17 @@
 //! `mpsc` to a single background flush task ([`tokio::spawn`]ed at
 //! construction) that owns the batch-accumulate-then-flush loop; the flush task
 //! signals each submitter's `oneshot` with the batch's outcome. Shutdown is
-//! explicit: [`AuditPipeline::shutdown`] drains and flushes whatever is buffered
-//! and awaits the flush task, so a clean stop never discards buffered records.
-//! `Drop` also signals the task to drain and flush, but cannot await it, so a
-//! caller that needs the final flush observed must call
-//! [`AuditPipeline::shutdown`].
+//! explicit: [`AuditPipeline::shutdown`] signals the flush task to drain and
+//! flush whatever is buffered, then awaits it. This does not guarantee every
+//! submission enqueued before the signal lands in that final flush: a
+//! submission racing the drain, or one still mid-accumulate when the inner
+//! loop's own stop path returns without a further drain, instead has its
+//! `oneshot` dropped and resolves to an error (or, in [`AuditMode::BestEffort`],
+//! `Ok(())`) rather than silently vanishing -- the non-lossy guarantee is that
+//! a submitter is never left uninformed, not that every submission is always
+//! swept into the last batch. `Drop` also signals the task to drain and flush,
+//! but cannot await it, so a caller that needs the final flush observed must
+//! call [`AuditPipeline::shutdown`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -129,6 +140,11 @@ pub struct AuditPipeline {
     /// observability and tests: a best-effort failure is otherwise invisible to
     /// the released query.
     flush_failures: Arc<AtomicU64>,
+    /// A copy of `config.audit_mode`, kept alongside the config the flush task
+    /// owns so `submit` can honor the configured failure posture on its own
+    /// error paths (pipeline stopped, flush task gone), not only on a flush
+    /// call that itself returned an error inside the flush task.
+    audit_mode: AuditMode,
 }
 
 impl AuditPipeline {
@@ -140,6 +156,7 @@ impl AuditPipeline {
         tenant: TenantHash,
         config: AuditPipelineConfig,
     ) -> Self {
+        let audit_mode = config.audit_mode;
         let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
         let shutdown = Arc::new(Notify::new());
         let stopped = Arc::new(AtomicBool::new(false));
@@ -158,44 +175,80 @@ impl AuditPipeline {
             join: Mutex::new(Some(handle)),
             stopped,
             flush_failures,
+            audit_mode,
         }
     }
 
     /// Submit one event and await the durability of the batch it lands in. See
     /// [`QueryAuditSink::submit`].
+    ///
+    /// Every error path here -- the pipeline already stopped, the flush task
+    /// gone, or the flush task exiting before flushing this event -- is
+    /// resolved through [`Self::resolve`], so [`AuditMode::BestEffort`]
+    /// releases the submitter with `Ok(())` on all of them, exactly as it does
+    /// for a flush call that itself failed. A dead or draining pipeline is an
+    /// audit-plane failure like any other, not a separate class exempt from
+    /// the configured mode.
     pub async fn submit(&self, event: AuditEvent) -> Result<()> {
         if self.stopped.load(Ordering::SeqCst) {
-            return Err(MaintainError::AuditFlush(
+            return self.resolve(Err(MaintainError::AuditFlush(
                 "audit pipeline is stopped".to_string(),
-            ));
+            )));
         }
         let (done_tx, done_rx) = oneshot::channel();
-        self.tx
+        if self
+            .tx
             .send(Submission {
                 record: event,
                 done: done_tx,
             })
             .await
-            .map_err(|_| {
-                MaintainError::AuditFlush("audit pipeline flush task is gone".to_string())
-            })?;
+            .is_err()
+        {
+            return self.resolve(Err(MaintainError::AuditFlush(
+                "audit pipeline flush task is gone".to_string(),
+            )));
+        }
         match done_rx.await {
+            // The flush task's own result is already mode-resolved (see
+            // `flush_batch`): `Ok` in Required-flush-failed became `Err`
+            // there, and `Ok` in BestEffort-flush-failed became `Ok` there.
+            // Nothing further to do here.
             Ok(result) => result,
             // The flush task dropped our `oneshot` without sending: it exited
             // (shutdown/close) before flushing this event. The event was never
-            // acknowledged, so failing this submit keeps the trail non-lossy.
-            Err(_) => Err(MaintainError::AuditFlush(
+            // acknowledged.
+            Err(_) => self.resolve(Err(MaintainError::AuditFlush(
                 "audit pipeline stopped before this event flushed".to_string(),
-            )),
+            ))),
+        }
+    }
+
+    /// Apply [`AuditMode`] to an error this pipeline itself produced (as
+    /// opposed to one already resolved by the flush task): `Required` returns
+    /// it unchanged, `BestEffort` counts it in [`Self::flush_failures`], logs
+    /// it, and releases the caller with `Ok(())`.
+    fn resolve(&self, result: Result<()>) -> Result<()> {
+        match (self.audit_mode, result) {
+            (AuditMode::Required, result) => result,
+            (AuditMode::BestEffort, Ok(())) => Ok(()),
+            (AuditMode::BestEffort, Err(e)) => {
+                self.flush_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(error = %e, "audit pipeline: releasing submitter in best-effort mode after a pipeline-level failure");
+                Ok(())
+            }
         }
     }
 
     /// Stop the pipeline cleanly: signal the flush task to drain and flush
-    /// whatever is buffered, then await its exit. Idempotent - a second call is
-    /// a no-op. After this returns the flush task has finished; any submission
-    /// still in flight has had its `oneshot` resolved (with its real batch
-    /// outcome if it was drained and flushed, or an error if it raced the
-    /// stop).
+    /// whatever is buffered, then await its exit. Idempotent, but only the
+    /// first caller actually awaits the flush task's exit -- it takes the
+    /// task's `JoinHandle` out of `self.join`, so a concurrent second call
+    /// finds it already taken and returns `Ok(())` immediately without
+    /// waiting. Callers that must know the flush task has actually finished
+    /// (not just that some `shutdown` call returned) should not rely on a
+    /// concurrent second call for that; only the call that actually awaited
+    /// the handle observed it.
     pub async fn shutdown(&self) -> Result<()> {
         self.stopped.store(true, Ordering::SeqCst);
         self.shutdown.notify_one();
@@ -636,6 +689,38 @@ mod tests {
         assert!(
             matches!(result, Err(MaintainError::AuditFlush(_))),
             "a submit after shutdown must error, got {result:?}"
+        );
+    }
+
+    /// The Stage 4 checkpoint's blocking finding: `submit`'s own error paths
+    /// (pipeline already stopped, flush task gone) must honor `audit_mode`
+    /// exactly as a flush-call failure does, not fail closed unconditionally.
+    /// A dead or draining pipeline is an audit-plane failure `BestEffort`
+    /// exists to survive, same as a failed flush.
+    #[tokio::test]
+    async fn best_effort_survives_submit_after_shutdown() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = TenantHash([7u8; 16]);
+        let config = AuditPipelineConfig {
+            max_batch: 1000,
+            max_age: Duration::from_secs(3600),
+            shard: QUERY_AUDIT_SHARD,
+            audit_mode: AuditMode::BestEffort,
+            channel_capacity: 1024,
+        };
+        let pipeline = AuditPipeline::spawn(store.clone(), tenant, config);
+        pipeline.shutdown().await.expect("shutdown");
+
+        let result = pipeline.submit(test_event(1, 7)).await;
+        assert!(
+            result.is_ok(),
+            "best-effort must release a submit after shutdown with Ok, not fail closed \
+             like required mode; got {result:?}"
+        );
+        assert_eq!(
+            pipeline.flush_failures(),
+            1,
+            "the post-shutdown release must still be counted, not silently vanished"
         );
     }
 
