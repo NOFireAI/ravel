@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use ravel_types::{TenantHash, TenantId};
 use uuid::Uuid;
@@ -180,6 +181,70 @@ pub const DEFAULT_ORPHAN_BREAKER_MAX_RATIO: f64 = 0.10;
 /// `ravel_ingest::IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`, subtracted from
 /// the sweep's own `min_hour` calculation (`crate::sweep`).
 pub const DEFAULT_IDEM_DEDUP_WINDOW_HOURS: u32 = 24;
+
+/// Default `max_batch` for the group-commit [`crate::audit_pipeline::AuditPipeline`]:
+/// the buffered-record count that forces a flush before `max_age` elapses.
+pub const DEFAULT_AUDIT_MAX_BATCH: usize = 256;
+/// Default `max_age` for the group-commit audit pipeline (ADR-0062 §2b): a
+/// batch is flushed once this long has elapsed since its first buffered event,
+/// even below `max_batch`.
+pub const DEFAULT_AUDIT_MAX_AGE: Duration = Duration::from_millis(25);
+/// Default submission-channel capacity for the audit pipeline: the number of
+/// in-flight submissions the bounded `mpsc` from submitters to the flush task
+/// holds before `submit` awaits backpressure.
+pub const DEFAULT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Whether a failed audit flush fails the awaiting queries or releases them
+/// anyway (ADR-0062 §2b). [`AuditMode::Required`] (the default) fails closed:
+/// every query whose event was in a failed batch gets an error, so no response
+/// is released without a durable audit record. [`AuditMode::BestEffort`] is the
+/// explicit, named opt-out that logs the failure and releases the queries with
+/// `Ok`, trading complete audit coverage for availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditMode {
+    /// Fail closed: a flush failure is returned to every awaiting submitter.
+    #[default]
+    Required,
+    /// Fail open: a flush failure is logged and every awaiting submitter gets
+    /// `Ok(())`. Opt-in only, for deployments preferring availability over
+    /// complete audit coverage.
+    BestEffort,
+}
+
+/// Configuration for the group-commit [`crate::audit_pipeline::AuditPipeline`]
+/// (ADR-0062 §2b). A batch flushes on whichever of `max_batch` or `max_age`
+/// comes first; `audit_mode` picks the flush-failure posture.
+#[derive(Debug, Clone)]
+pub struct AuditPipelineConfig {
+    /// Flush once the current batch reaches this many buffered records, before
+    /// `max_age` elapses. Default [`DEFAULT_AUDIT_MAX_BATCH`].
+    pub max_batch: usize,
+    /// Flush once this long has elapsed since the current batch's first
+    /// buffered event, before `max_batch` is reached. Default
+    /// [`DEFAULT_AUDIT_MAX_AGE`] (25 ms).
+    pub max_age: Duration,
+    /// The [`ravel_types::Signal::Audit`] shard every batch is written to.
+    /// Default [`crate::query_audit::QUERY_AUDIT_SHARD`].
+    pub shard: u32,
+    /// Whether a flush failure fails or releases the awaiting queries. Default
+    /// [`AuditMode::Required`].
+    pub audit_mode: AuditMode,
+    /// Capacity of the bounded submission channel from `submit` to the flush
+    /// task. Default [`DEFAULT_AUDIT_CHANNEL_CAPACITY`].
+    pub channel_capacity: usize,
+}
+
+impl Default for AuditPipelineConfig {
+    fn default() -> Self {
+        AuditPipelineConfig {
+            max_batch: DEFAULT_AUDIT_MAX_BATCH,
+            max_age: DEFAULT_AUDIT_MAX_AGE,
+            shard: crate::query_audit::QUERY_AUDIT_SHARD,
+            audit_mode: AuditMode::Required,
+            channel_capacity: DEFAULT_AUDIT_CHANNEL_CAPACITY,
+        }
+    }
+}
 
 /// Everything the compactor needs beyond the store and the clock.
 #[derive(Debug, Clone)]

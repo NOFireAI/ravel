@@ -35,6 +35,7 @@
 //!
 //! [`CompactionRecord`]: ravel_proto::commit::v1::CompactionRecord
 
+pub mod audit_pipeline;
 mod audit_write;
 pub mod bucket;
 pub mod build;
@@ -57,12 +58,14 @@ pub mod scan;
 pub mod scrub;
 pub mod sweep;
 
+pub use audit_pipeline::{AuditEvent, AuditPipeline, NoopQueryAuditSink, QueryAuditSink};
 pub use bucket::Bucket;
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{CompactionOutcome, compact_bucket};
 pub use config::{
-    CompactorConfig, MergeMemoryTracker, RetentionConfig, RetentionConfigError, RetentionPolicy,
+    AuditMode, AuditPipelineConfig, CompactorConfig, MergeMemoryTracker, RetentionConfig,
+    RetentionConfigError, RetentionPolicy,
 };
 pub use discover::discover_tenants;
 pub use error::{MaintainError, Result};
