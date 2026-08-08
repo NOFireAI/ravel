@@ -370,6 +370,25 @@ isolation), or must force a reconcile of every bucket in a request's scope
 (regardless of window) before writing `.done`. Either approach is
 acceptable; writing `.done` from a fresh-LIST check alone is not.
 
+**The sibling case makes the same requirement sharper.** Decision 3 point 5
+already says overlap harmlessness does not hold for rewrites. Two live
+rewrites over one bucket, neither superseding the other, therefore defeat
+each other: request A's subject is dropped from rewrite A's output but
+still present in rewrite B's, and vice versa. A completion check phrased
+as "this bucket's live record set is rewrite-output-only" reads TRUE in
+exactly that state, so T4 would write `.done` for request A, §5 would
+then delete A's `.dreq` after the horizon, the §2 query-time filter would
+stop applying, and A's subject would be served permanently out of rewrite
+B's output. T4's per-bucket completion condition for request R is
+therefore not "rewrite-output-only" but "**every live (non-superseded)
+rewrite record in this bucket names R in its `drops`**"; anything weaker
+turns the sibling state into permanent, silent erasure failure. EJ-T2
+makes the state observable: `Catalog::rewrite_sibling_conflicts` is
+raised by every site that resolves rewrite supersession (snapshot
+resolution, the index fold, and the read-your-write token fallback), so a
+deployment that ever reaches it alarms rather than serving it as ordinary
+overlap.
+
 Also folded into this correction: `resolve_rewrite_supersession`'s
 absent-predecessor case (a named `superseded_record_key` no longer present
 in the bucket's live listing) currently stops the chase cleanly and

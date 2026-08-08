@@ -443,6 +443,46 @@ impl Catalog {
         self.rewrite_sibling_conflicts.load(Ordering::Relaxed)
     }
 
+    /// Raise [`Self::rewrite_sibling_conflicts`] when one bucket holds two or
+    /// more live (non-superseded) rewrite records, neither superseding the
+    /// other. Unlike two compaction records, this is NOT harmless overlap: a
+    /// rewrite's output deliberately lacks the records its own erasure
+    /// dropped, so a sibling rewrite's un-rewritten copy of those same records
+    /// silently defeats it (ADR-0064 decision 3 point 5). Normal operation
+    /// never produces this (one rewrite batches every pending request for a
+    /// bucket); alarm loudly rather than serve it as ordinary overlap.
+    ///
+    /// Called from every site that resolves rewrite supersession: snapshot
+    /// resolution's `process_bucket`, the index fold's `classify_bucket`, and
+    /// the read-your-write `resolve_min_token_fallback`. Wiring it into only
+    /// `process_bucket` would leave it silent for the ordinary case: ADR-0064
+    /// §3.1 scopes the rewrite pass to already-sealed buckets, and a folded
+    /// snapshot serves those hours without ever calling `process_bucket`.
+    pub(crate) fn check_rewrite_siblings(
+        &self,
+        shard: u32,
+        hour: u32,
+        rewrite_records: &[(String, Arc<RewriteRecord>)],
+        superseded_records: &HashSet<String>,
+    ) {
+        let live = rewrite_records
+            .iter()
+            .filter(|(rkey, _)| !superseded_records.contains(rkey))
+            .count();
+        if live > 1 {
+            self.rewrite_sibling_conflicts
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                shard,
+                hour,
+                records = live,
+                "rewrite interlock breach: sealed bucket holds multiple live, non-superseding \
+                 rewrite records -- each sibling's erasure may be defeated by the other's \
+                 un-rewritten copy"
+            );
+        }
+    }
+
     /// Count of hard isolation-breach failures observed across this
     /// catalog's lifetime (ADR-0050 §2): a HEAD/postings tenant_hash
     /// mismatch or an out-of-prefix listing result. See
@@ -1264,30 +1304,7 @@ impl Catalog {
             );
         }
 
-        // Two or more live (non-superseded) rewrite records in one bucket,
-        // neither superseding the other: unlike the compaction case above,
-        // this is NOT harmless. A rewrite's output deliberately lacks records
-        // its own erasure dropped, so if a sibling rewrite's un-rewritten
-        // copy of those same records is also included, the erasure is
-        // silently defeated (ADR-0064 decision 3 point 5). Normal operation
-        // never produces this (one rewrite batches every pending request per
-        // bucket); alarm loudly rather than serve it as ordinary overlap.
-        let live_rewrite_count = rewrite_records
-            .iter()
-            .filter(|(rkey, _)| !superseded_records.contains(rkey))
-            .count();
-        if live_rewrite_count > 1 {
-            self.rewrite_sibling_conflicts
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                shard,
-                hour,
-                records = live_rewrite_count,
-                "rewrite interlock breach: sealed bucket holds multiple live, non-superseding \
-                 rewrite records -- each sibling's erasure may be defeated by the other's \
-                 un-rewritten copy"
-            );
-        }
+        self.check_rewrite_siblings(shard, hour, &rewrite_records, &superseded_records);
 
         // L0 records: exclude exactly those named in an input list (a
         // compaction record's inputs, or a rewrite's effective inputs); include
@@ -1849,6 +1866,15 @@ impl Catalog {
                 )?;
             }
         }
+
+        // Third and last classifier that resolves rewrite supersession; it
+        // raises the sibling alarm for the same reason the other two do.
+        self.check_rewrite_siblings(
+            token.shard,
+            token.ingest_hour_bucket,
+            &rewrite_records,
+            &superseded_records,
+        );
 
         // A live compaction record whose inputs cover the token: serve its parts.
         for (ckey, record) in &compaction_records {
@@ -2572,6 +2598,51 @@ mod tests {
             &mut superseded,
         )
         .expect_err("an over-deep supersession chain must be a typed error");
+        assert!(matches!(
+            err,
+            CatalogError::RewriteSupersessionChainTooDeep { .. }
+        ));
+    }
+
+    /// Pin the depth boundary exactly, not just "deep enough fails": a chain of
+    /// `MAX_REWRITE_SUPERSESSION_DEPTH` records is walked to its end, and one
+    /// more record is refused. Off by one in either direction would either
+    /// reject a legal chain or walk one hop past the documented maximum.
+    #[test]
+    fn rewrite_supersession_depth_bound_is_exact_at_the_maximum() {
+        // A chain of `n` records where r[i] supersedes r[i+1] and the last
+        // names an absent predecessor (so the walk terminates cleanly if the
+        // depth bound lets it).
+        fn chase(n: usize) -> Result<(), CatalogError> {
+            let keys: Vec<String> = (0..=n)
+                .map(|i| format!("t/aa/m/c/0000/20260101T00/rw.{i:016x}.cmt"))
+                .collect();
+            let records: Vec<RewriteRecord> = (0..n)
+                .map(|i| bare_superseding_rewrite(&keys[i + 1]))
+                .collect();
+            let compaction_by_key: HashMap<&str, &CompactionRecord> = HashMap::new();
+            let rewrite_by_key: HashMap<&str, &RewriteRecord> = records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (keys[i].as_str(), r))
+                .collect();
+            let mut excluded = HashSet::new();
+            let mut superseded = HashSet::new();
+            resolve_rewrite_supersession(
+                &keys[0],
+                &records[0],
+                "bucket",
+                &compaction_by_key,
+                &rewrite_by_key,
+                &mut excluded,
+                &mut superseded,
+            )
+        }
+
+        chase(MAX_REWRITE_SUPERSESSION_DEPTH)
+            .expect("a chain of exactly the maximum length must be walked, not refused");
+        let err = chase(MAX_REWRITE_SUPERSESSION_DEPTH + 1)
+            .expect_err("one record past the maximum must be refused");
         assert!(matches!(
             err,
             CatalogError::RewriteSupersessionChainTooDeep { .. }

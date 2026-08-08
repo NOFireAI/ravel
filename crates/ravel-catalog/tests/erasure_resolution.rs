@@ -883,3 +883,291 @@ async fn sibling_rewrites_raise_the_conflict_counter() {
         "two live sibling rewrites over one bucket must raise the alarm, not pass silently"
     );
 }
+
+// --- Stage 4 re-review additions: sibling-alarm precision and part-key
+// --- correctness on the reconcile path.
+
+/// A rewrite chain (rw2 supersedes rw1) is exactly ONE live rewrite, not two
+/// siblings. The conflict alarm must not false-positive on it, or the alarm
+/// becomes noise the moment any bucket is erased twice -- the case ADR-0064's
+/// amendment explicitly designs for.
+#[tokio::test]
+async fn a_rewrite_chain_is_not_a_sibling_conflict() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+    let start = range.start_ns;
+
+    let a = l0_record(Uuid::new_v4(), 0, 1, HOUR, now, start, start + 100);
+    put_l0(store.as_ref(), &a).await;
+    let rw1 = build_rewrite(
+        0,
+        HOUR,
+        &[&a],
+        None,
+        vec![part(0, start, start + 100, 0x31)],
+        &[Uuid::new_v4()],
+        now,
+    );
+    let rw1_key = put_rewrite(store.as_ref(), &rw1).await;
+    let rw2 = build_rewrite(
+        0,
+        HOUR,
+        &[],
+        Some(&rw1_key),
+        vec![part(0, start, start + 100, 0x32)],
+        &[Uuid::new_v4()],
+        now + 1,
+    );
+    put_rewrite(store.as_ref(), &rw2).await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect("resolve");
+    assert_eq!(snapshot.segments.len(), 1);
+    assert_eq!(
+        catalog.rewrite_sibling_conflicts(),
+        0,
+        "a superseded predecessor is not a live sibling; the alarm must not fire"
+    );
+}
+
+/// Three rewrites: rw2 supersedes rw1, and rw3 is independent. Exactly TWO
+/// live, non-superseding rewrites remain, so the bucket is a genuine sibling
+/// conflict and must alarm once -- proving the counter reads live records
+/// rather than raw record count.
+#[tokio::test]
+async fn a_chain_plus_an_independent_rewrite_is_one_sibling_conflict() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+    let start = range.start_ns;
+
+    let a = l0_record(Uuid::new_v4(), 0, 1, HOUR, now, start, start + 100);
+    let b = l0_record(Uuid::new_v4(), 0, 2, HOUR, now, start, start + 100);
+    put_l0(store.as_ref(), &a).await;
+    put_l0(store.as_ref(), &b).await;
+
+    let rw1 = build_rewrite(
+        0,
+        HOUR,
+        &[&a],
+        None,
+        vec![part(0, start, start + 100, 0x41)],
+        &[Uuid::new_v4()],
+        now,
+    );
+    let rw1_key = put_rewrite(store.as_ref(), &rw1).await;
+    let rw2 = build_rewrite(
+        0,
+        HOUR,
+        &[],
+        Some(&rw1_key),
+        vec![part(0, start, start + 100, 0x42)],
+        &[Uuid::new_v4()],
+        now + 1,
+    );
+    put_rewrite(store.as_ref(), &rw2).await;
+    let rw3 = build_rewrite(
+        0,
+        HOUR,
+        &[&b],
+        None,
+        vec![part(0, start, start + 100, 0x43)],
+        &[Uuid::new_v4()],
+        now + 2,
+    );
+    put_rewrite(store.as_ref(), &rw3).await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect("resolve");
+    let mut got = l1_keys(&snapshot);
+    got.sort();
+    let mut want = vec![
+        keys::reconstruct_rewrite_part_key(&rw2, &rw2.parts[0]).unwrap(),
+        keys::reconstruct_rewrite_part_key(&rw3, &rw3.parts[0]).unwrap(),
+    ];
+    want.sort();
+    assert_eq!(got, want, "only the two live rewrites' parts are served");
+    assert_eq!(
+        snapshot.segments.len(),
+        2,
+        "both L0 inputs are excluded; only the two live rewrite parts remain"
+    );
+    assert_eq!(
+        catalog.rewrite_sibling_conflicts(),
+        1,
+        "two live non-superseding rewrites is exactly one bucket conflict"
+    );
+}
+
+/// The reconcile path must reconstruct the rewrite output part's REAL object
+/// key, not merely some entry that happens to carry the right content hash.
+/// A folded `SnapshotEntry` carries only (level, shard, hour, writer_id =
+/// input_set_hash, writer_epoch = part_index, content_hash), so a fold that
+/// built a structurally plausible entry with the wrong identity fields would
+/// resolve to a key no object lives at, and every assertion in
+/// `reconcile_picks_up_a_rewrite_published_into_an_already_folded_bucket`
+/// would still pass.
+#[tokio::test]
+async fn reconciled_rewrite_part_resolves_to_the_real_part_key() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let start = i64::from(HOUR) * NS_PER_HOUR;
+
+    let a = l0_record(Uuid::new_v4(), 0, 1, HOUR, start + 1, start, start + 100);
+    put_l0(store.as_ref(), &a).await;
+    let tail = l0_record(
+        Uuid::new_v4(),
+        0,
+        1,
+        HOUR + 1,
+        start + NS_PER_HOUR + 1,
+        start + NS_PER_HOUR,
+        start + NS_PER_HOUR + 100,
+    );
+    put_l0(store.as_ref(), &tail).await;
+
+    let now_1 = now_at_seal(HOUR + 1);
+    catalog
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .await
+        .expect("first fold");
+
+    let rw = build_rewrite(
+        0,
+        HOUR,
+        &[&a],
+        None,
+        vec![part(0, start, start + 100, 0x78)],
+        &[Uuid::new_v4()],
+        start + 2,
+    );
+    put_rewrite(store.as_ref(), &rw).await;
+
+    let now_2 = now_at_seal(HOUR + 3);
+    let second = catalog
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+        .await
+        .expect("second fold");
+    assert!(!second.rebuilt);
+
+    let snapshot = catalog
+        .resolve(
+            &tenant(),
+            Signal::Metrics,
+            TimeRange {
+                start_ns: start,
+                end_ns: start + 100,
+            },
+            &[],
+            now_2,
+        )
+        .await
+        .expect("resolve");
+    let expected = keys::reconstruct_rewrite_part_key(&rw, &rw.parts[0]).unwrap();
+    assert_eq!(
+        l1_keys(&snapshot),
+        vec![expected],
+        "the folded entry must reconstruct the rewrite's own part key"
+    );
+    let l0_key = keys::verify_object_key(&a).unwrap();
+    assert!(
+        !snapshot
+            .segments
+            .iter()
+            .any(|s| s.data_object_key == l0_key),
+        "the pre-erasure L0 object key must not be reachable from the folded snapshot"
+    );
+}
+
+/// The sibling-rewrite alarm must fire on the FOLD path, not only on the live
+/// per-bucket listing path. A query for an hour the folded snapshot covers
+/// never calls `Catalog::process_bucket` at all, and per ADR-0064 section 3.1
+/// that is the ORDINARY case for a rewrite (it always targets an
+/// already-sealed, already-folded bucket). An alarm wired only into
+/// `process_bucket` would therefore be silent for exactly the case it exists
+/// to catch -- the same "correct logic on the path that does not run" shape as
+/// the reconcile-trigger bug above.
+#[tokio::test]
+async fn sibling_rewrites_alarm_on_the_folded_snapshot_path_too() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let start = i64::from(HOUR) * NS_PER_HOUR;
+
+    let a = l0_record(Uuid::new_v4(), 0, 1, HOUR, start + 1, start, start + 100);
+    let b = l0_record(Uuid::new_v4(), 0, 2, HOUR, start + 1, start, start + 100);
+    put_l0(store.as_ref(), &a).await;
+    put_l0(store.as_ref(), &b).await;
+    let tail = l0_record(
+        Uuid::new_v4(),
+        0,
+        1,
+        HOUR + 1,
+        start + NS_PER_HOUR + 1,
+        start + NS_PER_HOUR,
+        start + NS_PER_HOUR + 100,
+    );
+    put_l0(store.as_ref(), &tail).await;
+
+    let now_1 = now_at_seal(HOUR + 1);
+    catalog
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .await
+        .expect("first fold");
+
+    // Two live, non-superseding rewrites land in the sealed bucket.
+    let rw_a = build_rewrite(
+        0,
+        HOUR,
+        &[&a],
+        None,
+        vec![part(0, start, start + 100, 0x51)],
+        &[Uuid::new_v4()],
+        start + 2,
+    );
+    let rw_b = build_rewrite(
+        0,
+        HOUR,
+        &[&b],
+        None,
+        vec![part(0, start, start + 100, 0x52)],
+        &[Uuid::new_v4()],
+        start + 3,
+    );
+    put_rewrite(store.as_ref(), &rw_a).await;
+    put_rewrite(store.as_ref(), &rw_b).await;
+
+    let now_2 = now_at_seal(HOUR + 3);
+    catalog
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+        .await
+        .expect("second fold");
+
+    let snapshot = catalog
+        .resolve(
+            &tenant(),
+            Signal::Metrics,
+            TimeRange {
+                start_ns: start,
+                end_ns: start + 100,
+            },
+            &[],
+            now_2,
+        )
+        .await
+        .expect("resolve");
+
+    // Both siblings' parts are served (the ADR-sanctioned posture: correctness
+    // still rests on the section 2 query-time filter), but the conflict must
+    // not be silent -- the fold is the only observer in this scenario.
+    assert_eq!(snapshot.segments.len(), 2);
+    assert!(
+        catalog.rewrite_sibling_conflicts() >= 1,
+        "the fold must raise the sibling-rewrite alarm; a resolve served from the folded \
+         snapshot never reaches process_bucket, so nothing else would"
+    );
+}
