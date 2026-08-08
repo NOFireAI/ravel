@@ -42,10 +42,41 @@ pub enum PublishOutcome {
     Abandoned,
 }
 
+/// A record-count conservation predicate. Given the summed input record count
+/// and the summed built-part record count, it returns `true` when the rewrite
+/// conserved records as this variant requires. Compaction (and EM's
+/// format-migration rewrite, which drops nothing) supplies [`conserve_exact`];
+/// EJ's later erasure rewrite supplies "input equals output plus the erased
+/// count" by capturing the erased count in the closure (ADR-0064 decision 3
+/// point 4, ADR-0066 decision 5). The primitive never hardcodes exact match:
+/// the check is always taken from here, so a non-exact caller cannot silently
+/// fall back to it.
+pub trait ConservationPredicate {
+    /// Whether `part_sample_count` conserves `input_sample_count` per this
+    /// variant's arithmetic.
+    fn conserved(&self, input_sample_count: u64, part_sample_count: u64) -> bool;
+}
+
+impl<F: Fn(u64, u64) -> bool> ConservationPredicate for F {
+    fn conserved(&self, input_sample_count: u64, part_sample_count: u64) -> bool {
+        self(input_sample_count, part_sample_count)
+    }
+}
+
+/// The exact-conservation predicate (ADR-0048 decision 6): the built parts
+/// carry exactly the records the inputs carry. Used by compaction and by EM's
+/// format-migration rewrite, neither of which drops a record.
+pub fn conserve_exact() -> impl ConservationPredicate {
+    |input: u64, output: u64| input == output
+}
+
 /// Assemble the compaction record from the sorted inputs and built parts, then
-/// publish it per §3.4. `start_ns` is when this run began (for the
-/// abandonment deadline); `created_unix_ns` on the record is stamped from the
-/// clock at publish time (the supersession-horizon anchor, plan §5).
+/// publish it per §3.4 with the exact-conservation gate. `start_ns` is when
+/// this run began (for the abandonment deadline); `created_unix_ns` on the
+/// record is stamped from the clock at publish time (the supersession-horizon
+/// anchor, plan §5). This is the compaction entry point; the shared rewrite
+/// primitive ([`crate::rewrite`]) calls [`publish_record_with_conservation`]
+/// with its own predicate.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_record(
     store: &dyn ObjectStoreBackend,
@@ -56,6 +87,41 @@ pub async fn publish_record(
     input_set_hash: &[u8; 32],
     parts: &[BuiltPart],
     start_ns: i64,
+) -> Result<PublishOutcome> {
+    publish_record_with_conservation(
+        store,
+        config,
+        clock,
+        bucket,
+        inputs,
+        input_set_hash,
+        parts,
+        start_ns,
+        conserve_exact(),
+    )
+    .await
+}
+
+/// Assemble and publish the record exactly as [`publish_record`] does, but
+/// with the record-count conservation gate taken as a parameter rather than
+/// hardcoded to exact match. Every durability property of the publish path is
+/// unchanged: the abandonment deadline, the `CreateIfAbsent` single-winner
+/// serialization, and the racing-loser convergence/repair all behave
+/// identically; only the predicate that decides whether the built parts
+/// conserve the inputs' record count is pluggable, so EM's compaction variant
+/// (exact) and EJ's later erasure variant (exact minus the erased set) share
+/// this one publish path (ADR-0066 decision 5).
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_record_with_conservation(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    clock: &dyn Clock,
+    bucket: &Bucket,
+    inputs: &[InputRecord],
+    input_set_hash: &[u8; 32],
+    parts: &[BuiltPart],
+    start_ns: i64,
+    conservation: impl ConservationPredicate,
 ) -> Result<PublishOutcome> {
     // Abandonment mirror of the writer interlock: past the deadline, a run
     // must never publish, so the sweeper's unreferenced-part rule stays safe
@@ -72,15 +138,18 @@ pub async fn publish_record(
     // Record-count conservation gate (ADR-0048 decision 6, review finding
     // S2-03): compaction is a verbatim page copy for every signal and never
     // dedups, so the built parts must carry exactly the records the inputs
-    // carry. Publishing a lossy merge would be a permanent silent loss (the
-    // resolver excludes the inputs the moment the record lands, and the
-    // sweep removes them after the horizon), so a mismatch aborts before
-    // anything is PUT: the L0 inputs stay live and queryable, and the
-    // abandoned parts age out under sweep rule 3 like any abandoned run's.
-    // This runs under dry_run too, so a dry run reports the violation.
+    // carry. A rewrite that deliberately drops records (EJ) supplies a
+    // predicate that accounts for the drop; the exact-match compaction and
+    // format-migration paths supply [`conserve_exact`]. Publishing a merge the
+    // predicate rejects would be a permanent silent loss or gain (the resolver
+    // excludes the inputs the moment the record lands, and the sweep removes
+    // them after the horizon), so a rejected count aborts before the record is
+    // PUT: the L0 inputs stay live and queryable, and any parts already PUT
+    // age out under sweep rule 3 like any abandoned run's. This runs under
+    // dry_run too, so a dry run reports the violation.
     let input_sample_count = checked_sample_sum(inputs.iter().map(|i| i.record.sample_count))?;
     let part_sample_count = checked_sample_sum(parts.iter().map(|p| p.part.sample_count))?;
-    if input_sample_count != part_sample_count {
+    if !conservation.conserved(input_sample_count, part_sample_count) {
         return Err(MaintainError::ConservationViolation {
             tenant_hash: hex::encode(bucket.tenant_hash.0),
             signal: bucket.signal.key_prefix().to_string(),

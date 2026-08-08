@@ -12,9 +12,10 @@ use crate::clock::Clock;
 use crate::codec::{RsegCodec, SegmentCodec};
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
-use crate::publish::{PublishOutcome, publish_record};
+use crate::publish::{PublishOutcome, conserve_exact};
 use crate::read;
-use crate::read::{input_set_hash, list_bucket, load_inputs};
+use crate::read::list_bucket;
+use crate::rewrite::rewrite_and_publish;
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
@@ -94,11 +95,13 @@ pub async fn compact_bucket(
 }
 
 /// The signal-generic plan-build-publish pipeline, parameterized over the
-/// per-signal [`SegmentCodec`]. Loads and canonically orders the inputs,
-/// derives the `input_set_hash`, decodes each input's catalog metadata through
-/// the codec, streams the merge into size-capped parts through the codec, and
-/// publishes the record. Only the two `C::` calls know the on-object format;
-/// everything else is identical for every signal.
+/// per-signal [`SegmentCodec`]. Compaction is the exact-conservation case of
+/// the shared rewrite primitive ([`crate::rewrite::rewrite_and_publish`],
+/// ADR-0066 decision 5): it loads and canonically orders the inputs, derives
+/// the `input_set_hash`, decodes each input's catalog metadata through the
+/// codec, streams the merge into size-capped parts through the codec, and
+/// publishes the record with [`conserve_exact`]. Only the two `C::` calls know
+/// the on-object format; everything else is identical for every signal.
 async fn run_pipeline<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -107,26 +110,20 @@ async fn run_pipeline<C: SegmentCodec>(
     commit_keys: &[String],
     start_ns: i64,
 ) -> Result<CompactionOutcome> {
-    let inputs = load_inputs(store, bucket, commit_keys).await?;
-    let hash = input_set_hash(&inputs);
-
-    // Catalogs aligned one-to-one with `inputs` (canonical order): the merge
-    // relies on that alignment for deterministic tie-breaking.
-    let mut catalogs = Vec::with_capacity(inputs.len());
-    for input in &inputs {
-        catalogs.push(C::load_input_catalog(store, config, input).await?);
-    }
-
-    let parts = C::build_parts(store, config, bucket, &inputs, catalogs, &hash).await?;
-
-    let publish = publish_record(
-        store, config, clock, bucket, &inputs, &hash, &parts, start_ns,
+    let outcome = rewrite_and_publish::<C>(
+        store,
+        clock,
+        config,
+        bucket,
+        commit_keys,
+        conserve_exact(),
+        start_ns,
     )
     .await?;
 
     Ok(CompactionOutcome::Compacted {
-        parts: parts.len(),
-        publish,
+        parts: outcome.parts,
+        publish: outcome.publish,
     })
 }
 
