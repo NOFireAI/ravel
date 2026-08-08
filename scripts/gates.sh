@@ -28,6 +28,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Linker OOM guard. On low-memory hosts (fleet executors run with 8 GB)
+# the default parallelism links several multi-GB test binaries at once and
+# the kernel kills ld ("signal 9"). That is a resource failure, not a code
+# failure, and it wastes a full gate cycle. Cap build jobs before it
+# happens. An explicit CARGO_BUILD_JOBS in the environment wins.
+if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
+  mem_gb=""
+  if [[ "$(uname)" == "Darwin" ]]; then
+    mem_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  elif [[ -r /proc/meminfo ]]; then
+    mem_gb=$(( $(awk '/^MemTotal/{print $2}' /proc/meminfo) / 1048576 ))
+  fi
+  if [[ -n "${mem_gb}" && "${mem_gb}" -le 11 ]]; then
+    export CARGO_BUILD_JOBS=2
+    echo "gates.sh: ${mem_gb} GB RAM; capping cargo build jobs at 2"
+  fi
+fi
+
 # --locked everywhere so a local green gate warms the exact artifacts CI's
 # `check` job reuses (and vice versa): CI runs against a committed
 # Cargo.lock, so a divergent local resolve would recompile from scratch on
