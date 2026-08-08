@@ -968,7 +968,15 @@ mod tests {
         let safety = MaintenanceSafetyMetrics::default();
         let worker = solo_worker();
         let report = run_tick(
-            &store, &tenant, &compactor, &retention, 4, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            4,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
         // Nothing to maintain, nothing memoized: a subsequent tick would still
@@ -1033,7 +1041,15 @@ mod tests {
         let safety = MaintenanceSafetyMetrics::default();
         let worker = solo_worker();
         run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
 
@@ -1255,7 +1271,15 @@ mod tests {
         // Static shard_count is 2, matching generation 0's count; the scan
         // range must nonetheless cover shard 3 via the generation history.
         let report = run_tick(
-            &store, &tenant, &compactor, &retention, 2, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            2,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
 
@@ -1298,7 +1322,15 @@ mod tests {
         // gets memoized as terminal.
         let before_first = store.metrics().snapshot();
         let first = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
         let first_reads =
@@ -1311,7 +1343,15 @@ mod tests {
         // Tick 2 (warm memo): the bucket is skipped straight from the memo.
         let before_second = store.metrics().snapshot();
         let second = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
         let second_reads =
@@ -1382,7 +1422,15 @@ mod tests {
         // clock. Not memoized terminal (Tombstoned isn't a terminal state),
         // so tick 2 re-evaluates it for real rather than skipping it.
         let first = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
         assert_eq!(first.retired, 1, "the expired bucket is tombstoned");
@@ -1391,7 +1439,15 @@ mod tests {
         // horizon), so this tick attempts the physical sweep. The hold must
         // block it entirely.
         let second = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
         assert_eq!(
@@ -1467,7 +1523,15 @@ mod tests {
         let worker = solo_worker();
 
         let report = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
 
@@ -1519,7 +1583,16 @@ mod tests {
         let worker = solo_worker();
 
         let report = run_discovery_cycle(
-            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
 
@@ -1613,7 +1686,16 @@ mod tests {
         let worker = solo_worker();
 
         let report = run_discovery_cycle(
-            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety, &worker, &worker.solo_live_set(),
+            &store,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
 

@@ -317,7 +317,11 @@ impl WorkerSet {
         signal: Signal,
         shard: u32,
     ) -> bool {
-        owns(&unit_key(tenant_hash, signal, shard), self.process_id, live_set)
+        owns(
+            &unit_key(tenant_hash, signal, shard),
+            self.process_id,
+            live_set,
+        )
     }
 
     /// The single-replica live set (`{self}`): every unit owned by self, so
@@ -450,7 +454,10 @@ mod tests {
         let live_b = b.live_set(&store, now).await.expect("b live set");
 
         assert!(live_a.contains(&a.process_id()) && live_a.contains(&b.process_id()));
-        assert_eq!(live_a, live_b, "both processes see the same sorted live set");
+        assert_eq!(
+            live_a, live_b,
+            "both processes see the same sorted live set"
+        );
         assert_eq!(live_a.len(), 2);
     }
 
@@ -464,7 +471,9 @@ mod tests {
 
         // `b` last beat at t=0; `a` reads at various later times.
         b.write_heartbeat(&store, 0).await.expect("b heartbeat");
-        a.write_heartbeat(&store, 3 * H_NS).await.expect("a heartbeat");
+        a.write_heartbeat(&store, 3 * H_NS)
+            .await
+            .expect("a heartbeat");
 
         // Exactly 3*H old: still live (inclusive on the fresh side).
         let live = a.live_set(&store, 3 * H_NS).await.expect("live set");
