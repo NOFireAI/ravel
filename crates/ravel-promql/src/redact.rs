@@ -66,10 +66,16 @@ const METRIC_NAME_LABEL: &str = "__name__";
 /// parser rejecting malformed input; the walk and re-render are infallible.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RedactError {
-    /// `query` did not parse as PromQL. The message is the parser's own,
-    /// which quotes only the caller's input.
-    #[error("PromQL parse error: {0}")]
-    Parse(String),
+    /// `query` did not parse as PromQL.
+    ///
+    /// Carries no parser detail on purpose: `promql_parser`'s own error
+    /// message echoes fragments of the offending input verbatim (an illegal
+    /// regex message quotes the literal pattern; a duplicate-label message
+    /// quotes the label value), which can be exactly the PII this module
+    /// exists to redact. Storing or logging that message would leak it, so
+    /// the error is a fixed, input-independent label.
+    #[error("PromQL parse error")]
+    Parse,
 }
 
 /// The deterministic audit token for `value` under `token_key`:
@@ -95,7 +101,7 @@ pub fn audit_token(token_key: &[u8; 32], value: &[u8]) -> String {
 /// operands change, and only into other valid values. See the module docs for
 /// the exact redaction rules (and why numeric literals stay readable).
 pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> {
-    let mut expr = parser::parse(query).map_err(RedactError::Parse)?;
+    let mut expr = parser::parse(query).map_err(|_| RedactError::Parse)?;
     redact_expr(&mut expr, token_key);
     Ok(expr.to_string())
 }
@@ -278,6 +284,30 @@ mod tests {
     #[test]
     fn malformed_input_returns_typed_error_without_panic() {
         let err = redact("up{job=", &KEY_A).expect_err("must reject malformed input");
-        assert!(matches!(err, RedactError::Parse(_)));
+        assert!(matches!(err, RedactError::Parse));
+    }
+
+    #[test]
+    fn error_display_never_leaks_input_literals() {
+        // The raw parser message DOES quote the offending literal verbatim:
+        // this documents the leak the fixed-label Parse error closes. An
+        // illegal regex in a `=~` matcher makes promql_parser echo the
+        // pattern text in its own error message.
+        let probe = r#"up{user=~"[alice@example.com"}"#;
+        let raw = parser::parse(probe)
+            .expect_err("malformed input")
+            .to_string();
+        assert!(
+            raw.contains("alice@example.com"),
+            "raw parser message unexpectedly safe, rationale stale: {raw}"
+        );
+
+        // Our Parse error carries none of it.
+        let err = redact(probe, &KEY_A).expect_err("rejected");
+        assert!(matches!(err, RedactError::Parse));
+        assert!(
+            !err.to_string().contains("alice@example.com"),
+            "Parse Display leaked a literal: {err}"
+        );
     }
 }
