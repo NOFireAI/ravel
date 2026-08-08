@@ -69,6 +69,7 @@ mod minmax;
 mod output;
 mod provider;
 mod pushdown;
+pub mod redact;
 mod rlog_attrs;
 mod scan;
 mod schema;
@@ -118,6 +119,7 @@ pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
+pub use redact::{RedactError, redact};
 pub use schema::{internal_schema, public_schema};
 pub use session::{
     EmptyObjectStoreRegistry, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session,
