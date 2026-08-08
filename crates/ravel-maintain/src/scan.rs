@@ -293,6 +293,36 @@ impl MaintainMemo {
         self.entries.remove(key);
     }
 
+    /// Split off the memo entries for one `(tenant, signal, shard)` unit into a
+    /// standalone memo carrying the same re-verify interval, removing them from
+    /// `self`. For the bounded-concurrent per-unit walk (ADR-0065 decision 2):
+    /// each owned unit maintains its own slice of the memo independently on its
+    /// own future, and [`Self::merge_unit`] folds the slice back once the unit's
+    /// concurrent tick completes. Distinct units never share a [`BucketKey`], so
+    /// split-then-merge is lossless.
+    pub fn split_unit(&mut self, tenant: TenantHash, signal: Signal, shard: u32) -> MaintainMemo {
+        let mut moved = HashMap::new();
+        self.entries.retain(|(t, s, sh, hour), entry| {
+            if *t == tenant && *s == signal && *sh == shard {
+                moved.insert((*t, *s, *sh, *hour), *entry);
+                false
+            } else {
+                true
+            }
+        });
+        MaintainMemo {
+            entries: moved,
+            reverify_interval_ns: self.reverify_interval_ns,
+        }
+    }
+
+    /// Merge a unit memo produced by [`Self::split_unit`] back into `self` after
+    /// its concurrent tick. The unit owns a disjoint [`BucketKey`] space, so
+    /// this never overwrites another unit's entry.
+    pub fn merge_unit(&mut self, unit: MaintainMemo) {
+        self.entries.extend(unit.entries);
+    }
+
     /// Drop entries for `(tenant, signal, shard)` whose hour is absent from
     /// `present`, bounding memory to buckets that still exist. Entries for other
     /// shards, signals, or tenants are untouched.
