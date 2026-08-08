@@ -51,8 +51,30 @@ pub enum SubmitOutcome {
     /// A fresh `.dreq` was written.
     Created,
     /// A `.dreq` for this request id already existed and was left untouched
-    /// (the idempotent-retry path, `CreateIfAbsent` semantics).
+    /// (the idempotent-retry path, `CreateIfAbsent` semantics). Reached only
+    /// when the existing record defines the same erasure as this submission.
     AlreadyPresent,
+}
+
+/// A reason [`submit`] refused to record a request without surfacing a plain
+/// store error. Currently one case.
+#[derive(Debug, thiserror::Error)]
+pub enum SubmitError {
+    /// A `.dreq` already exists under this `request_id`, but it defines a
+    /// *different* erasure (different predicate matchers or window bounds) than
+    /// the request just submitted. `request_id` is operator-chosen (often a
+    /// DSAR ticket id) and the payload is PII-bearing, so this must fail loudly
+    /// rather than report a false [`SubmitOutcome::AlreadyPresent`]: a silent
+    /// success would signal that the new subject was erased and start a
+    /// compliance (GDPR) clock on data never touched for the corrected
+    /// predicate. Erasure requests are immutable, so the fix is a new
+    /// `request_id`, not an overwrite.
+    #[error(
+        "a conflicting erasure request already exists under request_id {request_id} \
+         with different predicate matchers or window bounds; it was NOT overwritten. \
+         Erasure requests are immutable -- submit the corrected request under a new request_id"
+    )]
+    ConflictingRequest { request_id: Uuid },
 }
 
 /// `erase submit`: build an [`ErasureRequest`] from a predicate (a conjunction
@@ -62,9 +84,16 @@ pub enum SubmitOutcome {
 ///
 /// `request_id` and `now_ns` are caller-supplied (the CLI generates a fresh
 /// UUID and reads the wall clock; tests inject fixed values), matching this
-/// repo's injected-clock discipline. A retry with the same `request_id` and the
-/// same predicate re-sends byte-identical content, so `CreateIfAbsent` leaves
-/// the original intact and reports [`SubmitOutcome::AlreadyPresent`].
+/// repo's injected-clock discipline. Because `now_ns` is stamped into
+/// `created_unix_ns` on every call, two submissions of the same `request_id`
+/// are never byte-identical, even when they define exactly the same erasure.
+/// Idempotency is therefore defined over the erasure-defining fields -- the
+/// predicate matchers and the event-time window bounds -- not the encoded
+/// bytes. On a `CreateIfAbsent` rejection this reads the stored record back and
+/// compares those fields: a genuine retry (same fields) reports
+/// [`SubmitOutcome::AlreadyPresent`] and leaves the original intact, while a
+/// request that reuses the `request_id` to define a *different* erasure is a
+/// [`SubmitError::ConflictingRequest`], never a silent success.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit(
     store: Arc<dyn ObjectStoreBackend>,
@@ -111,16 +140,61 @@ pub async fn submit(
             Ok(SubmitOutcome::Created)
         }
         Err(StoreError::AlreadyExists) => {
-            println!(
-                "erasure request {request_id} already present (idempotent retry); left untouched"
-            );
-            println!("  key: {key}");
-            Ok(SubmitOutcome::AlreadyPresent)
+            // CreateIfAbsent rejected the write: a `.dreq` already exists at
+            // this key. That is a genuine idempotent retry only if the stored
+            // record defines the *same* erasure. Read it back and compare the
+            // erasure-defining fields; do NOT compare encoded bytes, because
+            // `created_unix_ns` carries a fresh `now_ns` per call and a true
+            // retry is therefore never byte-identical to the original.
+            let existing = store.get(&key, GetRange::Full).await.map_err(|err| {
+                anyhow::anyhow!("failed to read existing erasure request {key}: {err}")
+            })?;
+            let existing = erasure::decode_request(&existing.data).map_err(|err| {
+                anyhow::anyhow!("existing erasure request {key} is corrupt: {err}")
+            })?;
+            if same_erasure(&existing, &record) {
+                println!(
+                    "erasure request {request_id} already present (idempotent retry); left untouched"
+                );
+                println!("  key: {key}");
+                Ok(SubmitOutcome::AlreadyPresent)
+            } else {
+                Err(SubmitError::ConflictingRequest { request_id }.into())
+            }
         }
         Err(err) => Err(anyhow::anyhow!(
             "failed to write erasure request {key}: {err}"
         )),
     }
+}
+
+/// Whether two erasure requests define the *same* erasure: they agree on every
+/// field that determines which records get dropped. That is the predicate
+/// matchers (compared as an unordered multiset, since matcher order is not
+/// significant to the conjunction) and the event-time window bounds. Fields
+/// that do not change what is erased are ignored -- notably `created_unix_ns`
+/// (a fresh wall-clock read on every submit) and the free-text `reason` -- so a
+/// genuine idempotent retry compares equal despite never being byte-identical.
+/// The `request_id`, `signal`, and `tenant_hash` are not compared here because
+/// they are encoded in the object key: two records reaching this comparison
+/// already share a key and therefore all three.
+fn same_erasure(a: &ErasureRequest, b: &ErasureRequest) -> bool {
+    if a.window_start_ns != b.window_start_ns || a.window_end_ns != b.window_end_ns {
+        return false;
+    }
+    let mut am: Vec<(&str, &str)> = a
+        .predicate
+        .iter()
+        .map(|m| (m.key.as_str(), m.value.as_str()))
+        .collect();
+    let mut bm: Vec<(&str, &str)> = b
+        .predicate
+        .iter()
+        .map(|m| (m.key.as_str(), m.value.as_str()))
+        .collect();
+    am.sort_unstable();
+    bm.sort_unstable();
+    am == bm
 }
 
 /// The resolved state of one erasure request (ADR-0064 decision 4). `.done`
@@ -347,8 +421,13 @@ mod tests {
         keys::verify_erasure_request_key(&decoded, &key)
             .expect("stored key matches the record's own identity");
 
-        // Idempotent retry: same id, same predicate -> byte-identical content,
-        // so CreateIfAbsent rejects the loser and keeps the winner's bytes.
+        // Idempotent retry with the *real* production shape: same id, same
+        // predicate and window, but a later `now_ns` (main.rs passes a fresh
+        // now_ns() per invocation). The two encodings therefore differ in
+        // `created_unix_ns` and are NOT byte-identical, yet the retry must
+        // still be recognized as idempotent by comparing erasure-defining
+        // fields, report AlreadyPresent, and leave the first writer's bytes
+        // (with the original timestamp) intact.
         let first_bytes = got.data.clone();
         let out2 = submit(
             store.clone(),
@@ -359,7 +438,7 @@ mod tests {
             0,
             "dsar-4711".to_string(),
             id,
-            1_700_000_000_000_000_000,
+            1_700_000_000_000_000_042,
         )
         .await
         .expect("retry succeeds");
@@ -371,6 +450,101 @@ mod tests {
         assert_eq!(
             first_bytes, got2.data,
             "CreateIfAbsent must leave the first writer's bytes intact on retry"
+        );
+    }
+
+    /// A retry that reuses a `request_id` but changes the erasure-defining
+    /// predicate must be rejected, not silently reported as an idempotent
+    /// AlreadyPresent. request_id is operator-chosen (a DSAR ticket id), the
+    /// payload is PII-bearing, and a false "already erased" signal starts a
+    /// GDPR clock on data never erased for the corrected matcher, so the second
+    /// submit returns [`SubmitError::ConflictingRequest`] and the original
+    /// record is left untouched.
+    #[tokio::test]
+    async fn submit_rejects_conflicting_request_id_with_different_predicate() {
+        let store = store();
+        let tenant = "acme";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let id = Uuid::from_u128(4711);
+
+        submit(
+            store.clone(),
+            tenant,
+            SignalArg::Metrics,
+            vec![("user_id".to_string(), "u123".to_string())],
+            0,
+            0,
+            "dsar-4711".to_string(),
+            id,
+            1_700_000_000_000_000_000,
+        )
+        .await
+        .expect("first submit succeeds");
+
+        let key = keys::erasure_request_key(&tenant_hash, Signal::Metrics, id).expect("key");
+        let first_bytes = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("first .dreq present")
+            .data;
+
+        // Same request_id, DIFFERENT subject: this is a distinct erasure that
+        // happens to reuse the id, not a retry.
+        let err = submit(
+            store.clone(),
+            tenant,
+            SignalArg::Metrics,
+            vec![("user_id".to_string(), "u999".to_string())],
+            0,
+            0,
+            "dsar-4711".to_string(),
+            id,
+            1_700_000_000_000_000_099,
+        )
+        .await
+        .expect_err("a conflicting request under the same id must be rejected");
+        assert!(
+            matches!(
+                err.downcast_ref::<SubmitError>(),
+                Some(SubmitError::ConflictingRequest { request_id }) if *request_id == id
+            ),
+            "expected SubmitError::ConflictingRequest, got: {err}"
+        );
+
+        // The original record is untouched: the second (conflicting) subject
+        // was never recorded.
+        let after = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("original .dreq still present")
+            .data;
+        assert_eq!(
+            first_bytes, after,
+            "a rejected conflicting submit must not overwrite the original request"
+        );
+        let decoded = erasure::decode_request(&after).expect("well-formed .dreq");
+        assert_eq!(decoded.predicate[0].value, "u123");
+
+        // A window-only difference (same matchers) is equally a conflict.
+        let err = submit(
+            store.clone(),
+            tenant,
+            SignalArg::Metrics,
+            vec![("user_id".to_string(), "u123".to_string())],
+            1,
+            1_000,
+            "dsar-4711".to_string(),
+            id,
+            1_700_000_000_000_000_100,
+        )
+        .await
+        .expect_err("a differing window under the same id must be rejected");
+        assert!(
+            matches!(
+                err.downcast_ref::<SubmitError>(),
+                Some(SubmitError::ConflictingRequest { .. })
+            ),
+            "expected SubmitError::ConflictingRequest for a window change, got: {err}"
         );
     }
 
