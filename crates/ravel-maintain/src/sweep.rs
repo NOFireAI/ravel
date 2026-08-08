@@ -1,4 +1,4 @@
-//! The sweeper: one component, four eligibility rules
+//! The sweeper: one component, five eligibility rules
 //! (docs/compaction-retention-plan.md §5, docs/consistency-model.md "Deletion
 //! and GC"). This is the first implementation of any deletion in Ravel.
 //!
@@ -46,18 +46,37 @@
 //!    `<keyhash32>.<ingest_hour>.idm` is logged and skipped, never deleted and
 //!    never fatal: the prefix is additive, so the `c/`-prefix fail-loud
 //!    unknown-shape rule (rules 1-3) does not apply to it.
+//! 5. **Unreferenced catalog-object sweep** (EH-T4, issue #741,
+//!    docs/metric-index-plan.md 3-4): a snapshot part under
+//!    `t/<tenant_hash>/catalog/<signal>/snap/` or a name-postings object under
+//!    the sibling `.../idx/` prefix that the current
+//!    `.../catalog/<signal>/HEAD` does not name (neither a `parts[].key` nor
+//!    the optional `postings.key`), once the object's `last_modified` age
+//!    exceeds the protection horizon. Every fold that rewrites a part or
+//!    postings object supersedes the old one by writing a new
+//!    content-addressed key and swapping HEAD; the superseded object is left
+//!    in place (plan 4 step 8, the "orphan part" crash-matrix row) and leaks
+//!    until this rule collects it. Per (tenant, signal), not per shard:
+//!    catalog objects and HEAD carry no shard dimension, so the rule LISTs the
+//!    two coarse prefixes and reads one HEAD, exactly the coarse-prefix shape
+//!    rule 4 uses for `idem/`. An absent HEAD means nothing is referenced (a
+//!    fold that crashed before its HEAD CAS, or a since-rebuilt index), so old
+//!    orphans are collected; a HEAD that is present but fails to decode aborts
+//!    the pass without deleting, so a corrupt HEAD can never cause the live
+//!    snapshot to be read as unreferenced and swept.
 //!
-//! All four are **signal-generic**: rules 1-3 operate only on commit-record,
-//! compaction-record, and object *keys* plus store `last_modified`, and rule 4
-//! only on marker keys, never on a segment byte, so nothing here needs to know
-//! RSEG from RLOG. All four are stateless per pass, restartable from zero, and
-//! every delete is idempotent (the object-store contract makes deleting a
-//! missing key a success). The clock is always injected; rules 1-3 read object
-//! age from `last_modified` (which the object-store contract restricts to
-//! exactly GC age checks), while rule 4 reads it from the ingest hour encoded
-//! in the marker's own key.
+//! All five are **signal-generic**: rules 1-3 operate only on commit-record,
+//! compaction-record, and object *keys* plus store `last_modified`, rule 4
+//! only on marker keys, and rule 5 only on catalog object keys plus the HEAD
+//! it decodes to a referenced-key set, never on a segment byte, so nothing
+//! here needs to know RSEG from RLOG. All five are stateless per pass,
+//! restartable from zero, and every delete is idempotent (the object-store
+//! contract makes deleting a missing key a success). The clock is always
+//! injected; rules 1-3 and rule 5 read object age from `last_modified` (which
+//! the object-store contract restricts to exactly GC age checks), while rule 4
+//! reads it from the ingest hour encoded in the marker's own key.
 //!
-//! The [`LeaseCheck`] hook is consulted before every delete in all four
+//! The [`LeaseCheck`] hook is consulted before every delete in all five
 //! rules. It ships as the no-op [`NoLeases`] ("nothing is ever protected"):
 //! the consistency-model's "not lease-protected" precondition is then
 //! vacuously satisfied everywhere. It is a seam for future slow-consumer work
@@ -675,6 +694,157 @@ fn is_keyhash32(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+// --- Rule 5: unreferenced catalog-object sweep (EH-T4, issue #741) ----------
+
+/// What one unreferenced-catalog-object sweep pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogSweepOutcome {
+    /// Superseded snapshot parts / postings objects deleted (or, under
+    /// `dry_run`, that would have been).
+    pub deleted: usize,
+    /// Objects left in place: named by the current HEAD, younger than the
+    /// protection horizon, or lease-protected.
+    pub kept: usize,
+}
+
+/// Delete every snapshot part (`t/<tenant_hash>/catalog/<signal>/snap/`) and
+/// name-postings object (sibling `.../idx/`) that the current
+/// `.../catalog/<signal>/HEAD` does not name, once the object's `last_modified`
+/// age exceeds `config.protection_horizon_ns` (EH-T4, issue #741,
+/// docs/metric-index-plan.md 3-4).
+///
+/// A fold supersedes a part or postings object by writing a fresh
+/// content-addressed key and swapping HEAD; the old object is deliberately left
+/// in place (plan 4 step 8) and would otherwise leak on every content-changing
+/// fold. This rule is the GC track's side of that contract.
+///
+/// Safety, mirroring the other physical-delete rules:
+/// - **Reference set from HEAD.** The referenced set is exactly the current
+///   HEAD's `parts[].key` plus its optional `postings.key`. An object under the
+///   two prefixes but not in that set is superseded or orphaned.
+/// - **Protection-horizon age gate.** An object younger than the horizon is
+///   spared: it may be a part a fold's HEAD CAS is about to name, or one a
+///   query resolved just before the fold still has pinned (the same horizon the
+///   superseded-input sweep uses, plan §5).
+/// - **Lease/legal-hold gate.** Every delete consults the [`LeaseCheck`] hook,
+///   like every other physical delete here.
+/// - **Fail-closed on a corrupt HEAD.** A HEAD that is present but does not
+///   decode aborts the pass with an error and deletes nothing, so a corrupt
+///   HEAD can never make the live snapshot look unreferenced. An absent HEAD
+///   legitimately means nothing is referenced (a fold that crashed before its
+///   HEAD CAS, or a since-rebuilt index), so old orphans are collected; a later
+///   fold re-PUTs any part it still needs, since parts are content-addressed
+///   derived data (ADR-0020).
+///
+/// Per (tenant, signal), not per shard: catalog objects carry no shard
+/// dimension. Like [`sweep_idempotency_markers`], the dispatcher calls this
+/// once per (tenant, signal) per tick, not inside the per-shard
+/// [`sweep_shard`] loop.
+pub async fn sweep_unreferenced_catalog_objects(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<CatalogSweepOutcome> {
+    let now = clock.now_ns();
+    let horizon = config.protection_horizon_ns;
+
+    let referenced = referenced_catalog_keys(store, tenant, signal).await?;
+
+    let mut deleted = 0usize;
+    let mut kept = 0usize;
+    for prefix in [
+        catalog_snap_prefix(tenant, signal),
+        catalog_idx_prefix(tenant, signal),
+    ] {
+        let objects = list_all(store, &prefix).await?;
+        for meta in objects {
+            // Named by the current HEAD: a live part or the live postings
+            // object. Never delete; this is the whole safety property.
+            if referenced.contains(&meta.key) {
+                kept += 1;
+                continue;
+            }
+            // Younger than the protection horizon: spare it (a part a fold is
+            // about to reference, or one a still-running query pinned).
+            if object_age_ns(now, &meta) <= horizon {
+                kept += 1;
+                continue;
+            }
+            if lease.is_protected(&meta.key) {
+                kept += 1;
+                continue;
+            }
+            if !config.dry_run {
+                store.delete(&meta.key).await?;
+            }
+            deleted += 1;
+        }
+    }
+
+    Ok(CatalogSweepOutcome { deleted, kept })
+}
+
+/// The set of catalog object keys the current HEAD names for one
+/// `(tenant, signal)`: every `parts[].key` plus the optional `postings.key`.
+/// An absent HEAD yields the empty set (nothing referenced); a present but
+/// undecodable HEAD is a fail-closed error so the pass deletes nothing rather
+/// than treat the live snapshot as unreferenced.
+async fn referenced_catalog_keys(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<HashSet<String>> {
+    let head_key = catalog_head_key(tenant, signal);
+    match store.get(&head_key, GetRange::Full).await {
+        Ok(got) => {
+            let head = ravel_catalog::decode_head(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!(
+                    "catalog sweep: HEAD at {head_key} failed to decode ({e}); deleting \
+                     nothing this pass rather than treating a live snapshot as unreferenced"
+                ))
+            })?;
+            let mut referenced =
+                HashSet::with_capacity(head.parts.len() + usize::from(head.postings.is_some()));
+            for part in &head.parts {
+                referenced.insert(part.key.clone());
+            }
+            if let Some(postings) = &head.postings {
+                referenced.insert(postings.key.clone());
+            }
+            Ok(referenced)
+        }
+        Err(StoreError::NotFound) => Ok(HashSet::new()),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+/// `t/<tenant_hash_hex>/catalog/<signal>/HEAD` -- the mutable head pointer for
+/// one `(tenant, signal)` (docs/catalog-and-mvcc.md key layout). No public
+/// builder is exported from ravel-catalog, so it is constructed here from the
+/// same pieces, matching `idem_prefix`'s local-reconstruction precedent.
+fn catalog_head_key(tenant: &TenantHash, signal: Signal) -> String {
+    format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
+}
+
+/// `t/<tenant_hash_hex>/catalog/<signal>/snap/` -- the prefix covering every
+/// snapshot part for one `(tenant, signal)`, across every watermark.
+fn catalog_snap_prefix(tenant: &TenantHash, signal: Signal) -> String {
+    format!(
+        "t/{}/catalog/{}/snap/",
+        tenant.to_hex(),
+        signal.key_prefix()
+    )
+}
+
+/// `t/<tenant_hash_hex>/catalog/<signal>/idx/` -- the prefix covering every
+/// name-postings object for one `(tenant, signal)`, across every watermark.
+fn catalog_idx_prefix(tenant: &TenantHash, signal: Signal) -> String {
+    format!("t/{}/catalog/{}/idx/", tenant.to_hex(), signal.key_prefix())
+}
+
 // --- shared helpers --------------------------------------------------------
 
 /// List a shard's commit prefix and classify every key by shape, failing loud
@@ -778,6 +948,7 @@ mod tests {
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
     use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
     use ravel_types::TenantId;
 
     use super::*;
@@ -1347,5 +1518,407 @@ mod tests {
         let key = marker_key(&tenant_id, signal, b"key", old_hour);
         let still_there = store.get(&key, GetRange::Full).await;
         assert!(still_there.is_ok(), "dry_run must not actually delete");
+    }
+
+    // --- Rule 5: unreferenced catalog-object sweep (EH-T4, #741) -----------
+
+    /// A [`LeaseCheck`] that protects any key under one prefix. Stands in for a
+    /// real [`crate::legal_hold::LegalHoldCheck`] snapshot holding that prefix,
+    /// exercising the sweep's per-delete lease gate without seeding audit
+    /// records.
+    struct HoldPrefix(String);
+
+    impl LeaseCheck for HoldPrefix {
+        fn is_protected(&self, key: &str) -> bool {
+            key.starts_with(self.0.as_str())
+        }
+    }
+
+    /// A part ref under the snap prefix. The sweep matches on `key` alone;
+    /// `blake3` only has to be 32 bytes for `encode_head`'s own validation.
+    fn part_ref(key: &str, blake3: [u8; 32]) -> SnapshotPartRef {
+        SnapshotPartRef {
+            key: key.to_string(),
+            blake3: blake3.to_vec(),
+            size: 1,
+            entry_count: 1,
+            watermark_hour: 100,
+            min_hour: 0,
+        }
+    }
+
+    /// Encode a valid single-or-multi-part HEAD and PUT it at the catalog HEAD
+    /// key, so the sweep's `referenced_catalog_keys` GET returns it.
+    async fn put_head(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        parts: Vec<SnapshotPartRef>,
+        postings: Option<SnapshotPostingsRef>,
+    ) {
+        let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour,
+            parts,
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings,
+            shard_generation_count: 1,
+        };
+        let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
+        store
+            .put(
+                &catalog_head_key(tenant, signal),
+                Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+    }
+
+    /// Seed a catalog object (snapshot part or postings) at `key` with whatever
+    /// the store's current fake clock stamps as `last_modified`.
+    async fn put_catalog_object(store: &dyn ObjectStoreBackend, key: &str) {
+        store
+            .put(
+                key,
+                Bytes::from_static(b"catalog-object"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed catalog object");
+    }
+
+    /// Assert an object is present / absent in the store.
+    async fn present(store: &dyn ObjectStoreBackend, key: &str) -> bool {
+        store.get(key, GetRange::Full).await.is_ok()
+    }
+
+    /// The acceptance test (EH-T4): a snapshot part named by the current HEAD is
+    /// spared even when it is far older than the protection horizon, and an
+    /// unreferenced part younger than the horizon is spared by the age gate.
+    /// Neither delete fires; both objects survive.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_and_young() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let horizon = config.protection_horizon_ns;
+        let now_ns = horizon.saturating_mul(2);
+
+        // Old (store clock 0) referenced part, named by HEAD.
+        let referenced_old = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced_old).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced_old, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // Young (store clock at now) unreferenced part.
+        store.set_clock_ms((now_ns / 1_000_000) as u64);
+        let unreferenced_young = format!(
+            "{}20260201T00.bbbb.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &unreferenced_young).await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 0, "nothing eligible: referenced or young");
+        assert_eq!(outcome.kept, 2);
+        assert!(
+            present(&store, &referenced_old).await,
+            "an old part the HEAD still names must never be swept"
+        );
+        assert!(
+            present(&store, &unreferenced_young).await,
+            "an unreferenced part younger than the horizon is spared by the age gate"
+        );
+    }
+
+    /// An old, unreferenced snapshot part is swept; the referenced part the
+    /// HEAD names is spared in the same pass.
+    #[tokio::test]
+    async fn catalog_sweep_deletes_old_unreferenced() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        // Both seeded at store clock 0, so both are old.
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let superseded = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced).await;
+        put_catalog_object(&store, &superseded).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.kept, 1);
+        assert!(
+            !present(&store, &superseded).await,
+            "the old unreferenced part must be swept"
+        );
+        assert!(
+            present(&store, &referenced).await,
+            "the HEAD-named part must be spared"
+        );
+    }
+
+    /// A postings object named by `HEAD.postings.key` is spared like a part ref;
+    /// an unreferenced old postings object under `idx/` is swept.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_postings() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part_blake3 = [7u8; 32];
+        let part = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let referenced_postings = format!(
+            "{}20260101T00.pppp.npost",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let stale_postings = format!(
+            "{}20251231T00.qqqq.npost",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &part).await;
+        put_catalog_object(&store, &referenced_postings).await;
+        put_catalog_object(&store, &stale_postings).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&part, part_blake3)],
+            Some(SnapshotPostingsRef {
+                key: referenced_postings.clone(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                name_count: 1,
+                part_blake3: vec![part_blake3.to_vec()],
+            }),
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 1, "only the stale postings object");
+        assert!(
+            present(&store, &referenced_postings).await,
+            "a postings object the HEAD names must be spared"
+        );
+        assert!(
+            !present(&store, &stale_postings).await,
+            "an old unreferenced postings object must be swept"
+        );
+        assert!(
+            present(&store, &part).await,
+            "the HEAD-named part is spared"
+        );
+    }
+
+    /// A legal hold over the object's prefix spares an otherwise-eligible old
+    /// unreferenced part, exactly as it does in every other sweep rule.
+    #[tokio::test]
+    async fn catalog_sweep_spares_legal_hold() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let held = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced).await;
+        put_catalog_object(&store, &held).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // Control: without the hold, `held` would be swept (proven by
+        // `catalog_sweep_deletes_old_unreferenced`). With a hold over the whole
+        // catalog prefix, it survives.
+        let hold = HoldPrefix(format!("t/{}/catalog/", tenant.to_hex()));
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &hold, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 0, "the hold blocks the delete");
+        assert!(
+            present(&store, &held).await,
+            "a held object must never be swept"
+        );
+    }
+
+    /// Under `dry_run`, the sweep counts what it would delete but calls
+    /// `delete` on nothing.
+    #[tokio::test]
+    async fn catalog_sweep_dry_run_reports_without_deleting() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig {
+            dry_run: true,
+            ..CompactorConfig::default()
+        };
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let superseded = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced).await;
+        put_catalog_object(&store, &superseded).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("dry run must not error");
+
+        assert_eq!(
+            outcome.deleted, 1,
+            "dry run still counts what it would delete"
+        );
+        assert!(
+            present(&store, &superseded).await,
+            "dry_run must not actually delete"
+        );
+    }
+
+    /// With no HEAD present, an old catalog object is an orphan (a fold that
+    /// crashed before its HEAD CAS, or a since-rebuilt index) and is collected.
+    #[tokio::test]
+    async fn catalog_sweep_absent_head_collects_old_orphans() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let orphan = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &orphan).await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("an absent HEAD is not an error");
+
+        assert_eq!(
+            outcome.deleted, 1,
+            "an old orphan with no HEAD is collected"
+        );
+        assert!(!present(&store, &orphan).await);
+    }
+
+    /// A HEAD that is present but does not decode aborts the pass with an error
+    /// and deletes nothing: a corrupt HEAD must never make the live snapshot
+    /// look unreferenced.
+    #[tokio::test]
+    async fn catalog_sweep_corrupt_head_deletes_nothing() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &part).await;
+        store
+            .put(
+                &catalog_head_key(&tenant, signal),
+                Bytes::from_static(b"not a valid HEAD"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt HEAD");
+
+        let clock = FixedClock::new(now_ns);
+        let err =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect_err("a corrupt HEAD must fail the pass, not sweep the snapshot");
+        assert!(matches!(err, MaintainError::Invariant(_)), "got: {err:?}");
+        assert!(
+            present(&store, &part).await,
+            "no object is deleted when the HEAD cannot be decoded"
+        );
     }
 }

@@ -94,8 +94,8 @@ pub use scrub::{
     advance_cursor, per_tick_byte_budget, scrub_one_object,
 };
 pub use sweep::{
-    IdemSweepOutcome, LeaseCheck, NoLeases, OrphanSweepOutcome, SweepReport,
+    CatalogSweepOutcome, IdemSweepOutcome, LeaseCheck, NoLeases, OrphanSweepOutcome, SweepReport,
     sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_superseded,
-    sweep_unreferenced_parts,
+    sweep_unreferenced_catalog_objects, sweep_unreferenced_parts,
 };
 pub use worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};

@@ -257,6 +257,29 @@ so a slightly stale reader cannot misroute a write.
   fold the same input independently write the same key and
   `PutMode::CreateIfAbsent` `AlreadyExists` is idempotent success, exactly
   like data objects (ADR-0010 §7).
+- Superseded snapshot parts (`catalog/<signal>/snap/`) and name-postings
+  objects (`catalog/<signal>/idx/`) are swept by
+  `ravel_maintain::sweep::sweep_unreferenced_catalog_objects` (EH-T4,
+  issue #741), the fifth GC sweep rule alongside orphan GC, the
+  superseded-input and unreferenced-part sweeps, and the idempotency-marker
+  sweep. Every fold that rewrites a part or postings object writes a new
+  content-addressed key and swaps HEAD, leaving the old object in place
+  (docs/metric-index-plan.md 4 step 8, the "orphan part" crash-matrix row);
+  without this rule each such fold leaks one object. The rule GETs the current
+  `catalog/<signal>/HEAD`, treats every `parts[].key` and the optional
+  `postings.key` as referenced, and deletes any object under the two prefixes
+  that HEAD does not name once its `last_modified` age exceeds
+  `CompactorConfig::protection_horizon_ns` (the same horizon the
+  superseded-input sweep uses). Like the idempotency-marker sweep, it is per
+  (tenant, signal) rather than per shard (catalog objects carry no shard
+  dimension) and consults the `LeaseCheck`/legal-hold gate before every
+  delete; under `CompactorConfig::dry_run` it counts what it would delete
+  without calling `delete`. An absent HEAD means nothing is referenced (a fold
+  that crashed before its HEAD CAS, or a since-rebuilt index), so old orphans
+  are collected and a later fold re-PUTs any part it still needs (parts are
+  content-addressed derived data); a HEAD present but undecodable fails the
+  pass without deleting, so a corrupt HEAD can never make the live snapshot
+  look unreferenced.
 
 ### Idempotency marker body layout
 
