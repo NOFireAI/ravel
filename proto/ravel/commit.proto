@@ -92,3 +92,132 @@ message RetentionTombstone {
   uint64 retention_window_ns = 7;    // the R applied
   uint64 record_count_observed = 8;
 }
+
+// --- Selective subject erasure (ADR-0064). All additive: new messages and a
+// new enum only; no existing message or field number is touched. Three
+// durable record types plus their helper messages. The `.dreq` request
+// necessarily names the subject and is therefore deletable after completion
+// (ADR-0064 decision 5); the `.done` completion record is permanent audit
+// evidence and, by construction, carries no subject identifier. ---
+
+// One exact-match label/attribute equality matcher in an ErasureRequest
+// predicate (ADR-0064 decision 1). A request's predicate is the conjunction
+// (logical AND) of all its matchers: a record matches only when, for every
+// matcher, the record's label/attribute named `key` equals `value` exactly.
+// v1 is equality-only (no regex): erasure is irreversible, so over-matching
+// is unrecoverable (ADR-0064 rejected alternatives).
+message ErasurePredicateMatcher {
+  string key = 1;
+  string value = 2;
+}
+
+// A durable, immutable selective-erasure request (ADR-0064 decision 1).
+// Additive; written once, CreateIfAbsent, to the object key
+// `t/<tenant_hash>/<signal>/del/<request_id>.dreq`. Immutable once acked.
+// It necessarily contains the subject identifier (the predicate values),
+// which is itself personal data, so it is NOT retained forever: a sweep rule
+// deletes it once its `.done` exists and the protection horizon has passed
+// (ADR-0064 decision 5). The permanent, PII-free audit record is
+// ErasureCompletion.
+message ErasureRequest {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  // UUID-shaped opaque request id (string, matching CommitRecord.writer_id's
+  // precedent). It names this request's `.dreq` and `.done` object keys.
+  string request_id = 4;
+  sfixed64 created_unix_ns = 5;   // injected clock; ack time starts every bound
+  // Conjunction (AND) of exact-match matchers. Never empty: an empty
+  // conjunction would match every record, so decoders reject it.
+  repeated ErasurePredicateMatcher predicate = 6;
+  // Optional event-time restriction, a half-open [window_start_ns,
+  // window_end_ns) interval. proto3 scalars have no presence, so both fields
+  // zero is the documented "no range restriction" sentinel (the whole
+  // retained history is in scope), matching this file's zero-as-unset
+  // convention for CommitRecord's timestamp fields.
+  sfixed64 window_start_ns = 7;
+  sfixed64 window_end_ns = 8;
+  // Optional free-text operator reason (may be empty).
+  string reason = 9;
+}
+
+// Why a request's physical erasure was deferred (ADR-0064 decision 6).
+// Deliberately a closed enum, not free text, so ErasureCompletion cannot
+// carry an operator-supplied string that might leak a subject identifier.
+enum ErasureDeferralCause {
+  ERASURE_DEFERRAL_CAUSE_UNSPECIFIED = 0;   // not deferred; completed cleanly
+  ERASURE_DEFERRAL_CAUSE_LEGAL_HOLD = 1;    // paused under an overlapping legal hold
+}
+
+// Per-bucket dropped-record accounting inside an ErasureCompletion. Names a
+// sealed bucket by (signal, shard, ingest_hour_bucket) under the completion's
+// implied tenant, and how many records the rewrite pass dropped from it for
+// this request. Carries no subject identifier.
+message ErasureBucketDrop {
+  Signal signal = 1;
+  uint32 shard = 2;
+  uint32 ingest_hour_bucket = 3;
+  uint64 dropped_count = 4;
+}
+
+// Permanent, immutable completion record for a selective-erasure request
+// (ADR-0064 decision 1 and 4). Additive; written once, CreateIfAbsent, to
+// `t/<tenant_hash>/<signal>/del/<request_id>.done`. Unlike the `.dreq`, this
+// record is permanent audit evidence and MUST NOT carry any plaintext subject
+// identifier. Its PII-exclusion is structural, not conventional: there is
+// deliberately no field here that can hold a predicate key or value. The
+// predicate is represented only by `predicate_hash` (a blake3 digest, not
+// reversible), the deferral cause is a closed enum, and the only string field
+// is the UUID-shaped `request_id`.
+message ErasureCompletion {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  string request_id = 4;       // UUID-shaped; names this `.done`'s own key
+  // blake3 over the canonical predicate encoding of the originating request
+  // (ADR-0064 decision 1). 32 bytes. NOT the plaintext predicate.
+  bytes predicate_hash = 5;
+  repeated ErasureBucketDrop bucket_drops = 6;
+  sfixed64 requested_unix_ns = 7;   // copied from the `.dreq`'s created_unix_ns
+  sfixed64 completed_unix_ns = 8;   // when the pass verified completion
+  ErasureDeferralCause deferral_cause = 9;
+}
+
+// One (request_id, dropped_count) pair inside a RewriteRecord: how many
+// records the rewrite dropped for one applied erasure request. A nested pair,
+// not two parallel arrays, so a request id can never fall out of step with
+// its count.
+message RewriteDrop {
+  string request_id = 1;    // UUID-shaped; a `.dreq` this rewrite applied
+  uint64 dropped_count = 2;
+}
+
+// L0/L1 to L1 selective-erasure rewrite record (ADR-0064 decision 3). The
+// rewrite pass reads a sealed bucket's live segments, drops records matching
+// one or more erasure predicates, and re-encodes the survivors into new parts
+// of the same frozen segment format. Additive; lives in the same `c/` prefix
+// as CommitRecord and CompactionRecord (key
+// `t/<tenant_hash>/<signal>/c/<shard>/<hour>/rw.<input_set_hash16>.cmt`) so the
+// existing single LIST per bucket discovers it. Immutable once published. It
+// excludes its inputs from new snapshots exactly as a CompactionRecord does,
+// but overlap is NOT harmless (the outputs deliberately lack records the
+// inputs contain), so the resolver keeps the query-time predicate filter
+// active until the `.dreq` is removed (ADR-0064 decision 3.5).
+message RewriteRecord {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  uint32 ingest_hour_bucket = 5;
+  // The exact input set this rewrite supersedes: L0 commit identities and/or
+  // the inputs of the compaction record it replaces, sorted canonically by
+  // (writer_id, writer_epoch, writer_seq) exactly as CompactionRecord.inputs.
+  repeated CompactionInputIdentity inputs = 6;
+  bytes input_set_hash = 7;    // blake3 over the sorted inputs, 32 bytes
+  repeated CompactionPart parts = 8;   // surviving-record output parts (may be empty)
+  // Which erasure requests this rewrite applied, each with the count it
+  // dropped for that request (0 is valid: a request whose predicate matched
+  // nothing in this bucket is still recorded as applied).
+  repeated RewriteDrop drops = 9;
+  sfixed64 created_unix_ns = 10;
+}

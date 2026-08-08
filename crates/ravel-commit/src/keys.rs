@@ -32,6 +32,17 @@ pub const TOMBSTONE_FILENAME: &str = "retire.tmb";
 pub const MAINT_DIR: &str = "maint";
 /// Advisory maintenance-cursor filename, fixed per (tenant, signal, shard).
 pub const CURSOR_FILENAME: &str = "cursor";
+/// Selective-erasure directory segment (ADR-0064): holds `.dreq` requests
+/// and `.done` completion records for one (tenant, signal).
+pub const DEL_DIR: &str = "del";
+/// Erasure request object suffix: `<request_id>.dreq`.
+pub const DREQ_SUFFIX: &str = "dreq";
+/// Erasure completion object suffix: `<request_id>.done`.
+pub const DONE_SUFFIX: &str = "done";
+/// Rewrite record filename tag: `rw.<input_set_hash16>.cmt`. Shares the `c/`
+/// prefix and `.cmt` suffix with compaction records (ADR-0064 decision 3);
+/// told apart by this tag, exactly as compaction records use [`COMPACTION_RECORD_TAG`].
+pub const REWRITE_RECORD_TAG: &str = "rw";
 
 /// Errors building or parsing a key. All are caller-input problems (bad
 /// shard, malformed key text); none indicate a system fault.
@@ -586,6 +597,304 @@ pub fn maint_cursor_key(
     ))
 }
 
+// --- Selective-erasure key shapes (ADR-0064 decision 1 and 3). All additive:
+// new `del/` prefix plus a new `rw.` tag in the existing `c/` prefix; every
+// key shape above is untouched. ---
+
+/// Prefix covering every selective-erasure record (`.dreq` and `.done`) for
+/// one (tenant, signal). The resolver LISTs this per resolve to attach
+/// pending predicates (ADR-0064 decision 2); it is empty for any tenant with
+/// no erasure requests.
+///
+/// `t/<tenant_hash_hex>/<signal>/del/`
+pub fn del_prefix(tenant_hash: &TenantHash, signal: Signal) -> String {
+    format!(
+        "t/{}/{}/{}/",
+        tenant_hash.to_hex(),
+        signal.key_prefix(),
+        DEL_DIR
+    )
+}
+
+/// Build the erasure request key for one request id (ADR-0064 decision 1).
+/// CreateIfAbsent, immutable; deleted after completion plus horizon (§5).
+///
+/// `t/<tenant_hash_hex>/<signal>/del/<request_id>.dreq`
+pub fn erasure_request_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    request_id: Uuid,
+) -> Result<String, KeyError> {
+    Ok(format!(
+        "{}{}.{}",
+        del_prefix(tenant_hash, signal),
+        request_id,
+        DREQ_SUFFIX
+    ))
+}
+
+/// Build the erasure completion key for one request id (ADR-0064 decision 1).
+/// CreateIfAbsent, immutable, permanent (PII-free audit evidence).
+///
+/// `t/<tenant_hash_hex>/<signal>/del/<request_id>.done`
+pub fn erasure_completion_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    request_id: Uuid,
+) -> Result<String, KeyError> {
+    Ok(format!(
+        "{}{}.{}",
+        del_prefix(tenant_hash, signal),
+        request_id,
+        DONE_SUFFIX
+    ))
+}
+
+/// Build the rewrite record key for a sealed bucket (ADR-0064 decision 3).
+/// Same `c/` prefix and `.cmt` suffix as a compaction record, told apart by
+/// the `rw.` tag, so the existing single per-bucket LIST discovers it.
+///
+/// `t/<tenant_hash_hex>/<signal>/c/<shard>/<ingest_hour>/rw.<input_set_hash16>.cmt`
+pub fn rewrite_record_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    ingest_hour_bucket: u32,
+    input_set_hash16: &str,
+) -> Result<String, KeyError> {
+    validate_hash16_arg(input_set_hash16)?;
+    let prefix = commit_shard_hour_prefix(tenant_hash, signal, shard, ingest_hour_bucket)?;
+    Ok(format!(
+        "{prefix}{REWRITE_RECORD_TAG}.{input_set_hash16}.{COMMIT_SUFFIX}"
+    ))
+}
+
+/// Parsed form of an erasure request (`.dreq`) key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedErasureRequestKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub request_id: Uuid,
+}
+
+/// Parsed form of an erasure completion (`.done`) key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedErasureCompletionKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub request_id: Uuid,
+}
+
+/// Parsed form of a rewrite record (`rw.<hash16>.cmt`) key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRewriteRecordKey {
+    pub tenant_hash: TenantHash,
+    pub signal: Signal,
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+    pub input_set_hash16: String,
+}
+
+/// Parse the `t/<hex>/<sig>/del/<request_id>.<suffix>` shape shared by
+/// `.dreq` and `.done` keys, validating every component and the suffix.
+fn parse_del_key(key: &str, expected_suffix: &str) -> Result<(TenantHash, Signal, Uuid), KeyError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [root, tenant_hex, signal_s, del, filename] = parts.as_slice() else {
+        return Err(malformed(key, "expected 5 path segments"));
+    };
+    if *root != "t" {
+        return Err(malformed(key, "expected key to start with \"t/\""));
+    }
+    if *del != DEL_DIR {
+        return Err(malformed(key, format!("expected {DEL_DIR:?} segment")));
+    }
+    let tenant_hash = TenantHash::from_hex(tenant_hex)
+        .map_err(|_| KeyError::InvalidTenantHash(tenant_hex.to_string()))?;
+    let signal =
+        signal::from_prefix(signal_s).map_err(|_| KeyError::UnknownSignal(signal_s.to_string()))?;
+
+    let file_parts: Vec<&str> = filename.split('.').collect();
+    let [request_id_s, suffix] = file_parts.as_slice() else {
+        return Err(malformed(
+            key,
+            format!("expected \"<request_id>.{expected_suffix}\" filename"),
+        ));
+    };
+    if *suffix != expected_suffix {
+        return Err(malformed(
+            key,
+            format!("expected suffix {expected_suffix:?}"),
+        ));
+    }
+    let request_id = Uuid::parse_str(request_id_s)
+        .map_err(|_| KeyError::InvalidWriterId(request_id_s.to_string()))?;
+    Ok((tenant_hash, signal, request_id))
+}
+
+/// Parse an erasure request key produced by [`erasure_request_key`].
+pub fn parse_erasure_request_key(key: &str) -> Result<ParsedErasureRequestKey, KeyError> {
+    let (tenant_hash, signal, request_id) = parse_del_key(key, DREQ_SUFFIX)?;
+    Ok(ParsedErasureRequestKey {
+        tenant_hash,
+        signal,
+        request_id,
+    })
+}
+
+/// Parse an erasure completion key produced by [`erasure_completion_key`].
+pub fn parse_erasure_completion_key(key: &str) -> Result<ParsedErasureCompletionKey, KeyError> {
+    let (tenant_hash, signal, request_id) = parse_del_key(key, DONE_SUFFIX)?;
+    Ok(ParsedErasureCompletionKey {
+        tenant_hash,
+        signal,
+        request_id,
+    })
+}
+
+/// Parse a rewrite record key produced by [`rewrite_record_key`], validating
+/// every component. Structurally identical to a compaction record key except
+/// for the leading filename tag ([`REWRITE_RECORD_TAG`] vs
+/// [`COMPACTION_RECORD_TAG`]).
+pub fn parse_rewrite_record_key(key: &str) -> Result<ParsedRewriteRecordKey, KeyError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [root, tenant_hex, signal_s, c, shard_s, hour_s, filename] = parts.as_slice() else {
+        return Err(malformed(key, "expected 7 path segments"));
+    };
+    if *root != "t" {
+        return Err(malformed(key, "expected key to start with \"t/\""));
+    }
+    if *c != "c" {
+        return Err(malformed(key, "expected \"c\" segment"));
+    }
+    let tenant_hash = TenantHash::from_hex(tenant_hex)
+        .map_err(|_| KeyError::InvalidTenantHash(tenant_hex.to_string()))?;
+    let signal =
+        signal::from_prefix(signal_s).map_err(|_| KeyError::UnknownSignal(signal_s.to_string()))?;
+    let shard = parse_shard_component(key, shard_s)?;
+    let ingest_hour_bucket = parse_ingest_hour_string(hour_s)?;
+
+    let file_parts: Vec<&str> = filename.split('.').collect();
+    let [tag, hash16, suffix] = file_parts.as_slice() else {
+        return Err(malformed(key, "expected \"rw.hash16.cmt\" filename"));
+    };
+    if *tag != REWRITE_RECORD_TAG {
+        return Err(malformed(
+            key,
+            format!("expected tag {REWRITE_RECORD_TAG:?}"),
+        ));
+    }
+    if *suffix != COMMIT_SUFFIX {
+        return Err(malformed(key, format!("expected suffix {COMMIT_SUFFIX:?}")));
+    }
+    let input_set_hash16 = parse_hash16_component(key, hash16)?;
+
+    Ok(ParsedRewriteRecordKey {
+        tenant_hash,
+        signal,
+        shard,
+        ingest_hour_bucket,
+        input_set_hash16,
+    })
+}
+
+/// The erasure request's own key, reconstructed from its identity fields.
+/// Never trust a stored key string (ADR-0010 §7 discipline); callers verify
+/// an observed key with [`verify_erasure_request_key`].
+pub fn erasure_request_key_for(
+    record: &ravel_proto::commit::v1::ErasureRequest,
+) -> Result<String, KeyError> {
+    let tenant_hash = tenant_hash_from_bytes(&record.tenant_hash)?;
+    let signal = signal::from_proto(record.signal)
+        .map_err(|_| KeyError::UnknownSignal(record.signal.to_string()))?;
+    let request_id = Uuid::parse_str(&record.request_id)
+        .map_err(|_| KeyError::InvalidWriterId(record.request_id.clone()))?;
+    erasure_request_key(&tenant_hash, signal, request_id)
+}
+
+/// Verify an observed key against the key reconstructed from an
+/// `ErasureRequest`'s own identity fields. Any mismatch is a fatal invariant
+/// breach (ADR-0010 §7).
+pub fn verify_erasure_request_key(
+    record: &ravel_proto::commit::v1::ErasureRequest,
+    observed_key: &str,
+) -> Result<String, ReconstructionError> {
+    let expected = erasure_request_key_for(record)?;
+    if expected == observed_key {
+        Ok(expected)
+    } else {
+        Err(ReconstructionError::ObjectKeyMismatch {
+            expected,
+            actual: observed_key.to_string(),
+        })
+    }
+}
+
+/// The erasure completion's own key, reconstructed from its identity fields.
+pub fn erasure_completion_key_for(
+    record: &ravel_proto::commit::v1::ErasureCompletion,
+) -> Result<String, KeyError> {
+    let tenant_hash = tenant_hash_from_bytes(&record.tenant_hash)?;
+    let signal = signal::from_proto(record.signal)
+        .map_err(|_| KeyError::UnknownSignal(record.signal.to_string()))?;
+    let request_id = Uuid::parse_str(&record.request_id)
+        .map_err(|_| KeyError::InvalidWriterId(record.request_id.clone()))?;
+    erasure_completion_key(&tenant_hash, signal, request_id)
+}
+
+/// Verify an observed key against the key reconstructed from an
+/// `ErasureCompletion`'s own identity fields.
+pub fn verify_erasure_completion_key(
+    record: &ravel_proto::commit::v1::ErasureCompletion,
+    observed_key: &str,
+) -> Result<String, ReconstructionError> {
+    let expected = erasure_completion_key_for(record)?;
+    if expected == observed_key {
+        Ok(expected)
+    } else {
+        Err(ReconstructionError::ObjectKeyMismatch {
+            expected,
+            actual: observed_key.to_string(),
+        })
+    }
+}
+
+/// The rewrite record's own key, reconstructed from its identity fields (the
+/// same first-8-bytes-of-`input_set_hash` convention as
+/// [`compaction_record_key_for`]).
+pub fn rewrite_record_key_for(
+    record: &ravel_proto::commit::v1::RewriteRecord,
+) -> Result<String, KeyError> {
+    let tenant_hash = tenant_hash_from_bytes(&record.tenant_hash)?;
+    let signal = signal::from_proto(record.signal)
+        .map_err(|_| KeyError::UnknownSignal(record.signal.to_string()))?;
+    let input_set_hash = content_hash_from_bytes(&record.input_set_hash)?;
+    let hash16 = hex::encode(&input_set_hash[..8]);
+    rewrite_record_key(
+        &tenant_hash,
+        signal,
+        record.shard,
+        record.ingest_hour_bucket,
+        &hash16,
+    )
+}
+
+/// Verify an observed key against the key reconstructed from a
+/// `RewriteRecord`'s own identity fields.
+pub fn verify_rewrite_record_key(
+    record: &ravel_proto::commit::v1::RewriteRecord,
+    observed_key: &str,
+) -> Result<String, ReconstructionError> {
+    let expected = rewrite_record_key_for(record)?;
+    if expected == observed_key {
+        Ok(expected)
+    } else {
+        Err(ReconstructionError::ObjectKeyMismatch {
+            expected,
+            actual: observed_key.to_string(),
+        })
+    }
+}
+
 /// Parsed form of an L1 part key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedL1PartKey {
@@ -940,6 +1249,9 @@ pub fn partition_bucket_entry(key: &str) -> Result<BucketEntry, KeyError> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_proto::commit::v1::{
+        ErasureCompletion, ErasurePredicateMatcher, ErasureRequest, RewriteRecord,
+    };
 
     fn tenant_hash() -> TenantHash {
         TenantHash([0xab; 16])
@@ -1593,5 +1905,227 @@ mod tests {
         let err = partition_bucket_entry(&format!("{prefix}unexpected.file"))
             .expect_err("unknown shape must be an error, never silently skipped");
         assert!(matches!(err, KeyError::UnknownBucketEntryShape(_)));
+    }
+
+    // --- Selective-erasure key shapes (ADR-0064). ---
+
+    fn request_id() -> Uuid {
+        Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0)
+    }
+
+    #[test]
+    fn erasure_request_key_round_trips() {
+        let th = tenant_hash();
+        let rid = request_id();
+        let key = erasure_request_key(&th, Signal::Metrics, rid).expect("build");
+        assert_eq!(key, format!("t/{}/m/del/{}.dreq", th.to_hex(), rid));
+        let parsed = parse_erasure_request_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Metrics);
+        assert_eq!(parsed.request_id, rid);
+    }
+
+    #[test]
+    fn erasure_completion_key_round_trips() {
+        let th = tenant_hash();
+        let rid = request_id();
+        let key = erasure_completion_key(&th, Signal::Logs, rid).expect("build");
+        assert_eq!(key, format!("t/{}/l/del/{}.done", th.to_hex(), rid));
+        let parsed = parse_erasure_completion_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Logs);
+        assert_eq!(parsed.request_id, rid);
+    }
+
+    #[test]
+    fn dreq_and_done_keys_are_distinct_for_one_request() {
+        let th = tenant_hash();
+        let rid = request_id();
+        let dreq = erasure_request_key(&th, Signal::Spans, rid).expect("build");
+        let done = erasure_completion_key(&th, Signal::Spans, rid).expect("build");
+        assert_ne!(dreq, done);
+        // Only the suffix differs; the del/ prefix is shared, so one LIST of
+        // del_prefix returns both.
+        assert!(dreq.starts_with(&del_prefix(&th, Signal::Spans)));
+        assert!(done.starts_with(&del_prefix(&th, Signal::Spans)));
+    }
+
+    #[test]
+    fn parse_del_keys_reject_malformed_input() {
+        let th = tenant_hash();
+        let rid = request_id();
+        let dreq = erasure_request_key(&th, Signal::Metrics, rid).expect("build");
+        let done = erasure_completion_key(&th, Signal::Metrics, rid).expect("build");
+
+        // Wrong number of path segments.
+        assert!(parse_erasure_request_key("t/only/three").is_err());
+        assert!(parse_erasure_request_key(&format!("{dreq}/extra")).is_err());
+        // A .done is not a .dreq and vice versa: suffix is checked.
+        assert!(parse_erasure_request_key(&done).is_err());
+        assert!(parse_erasure_completion_key(&dreq).is_err());
+        // Wrong directory segment.
+        assert!(parse_erasure_request_key(&dreq.replacen("/del/", "/c/", 1)).is_err());
+        // Non-UUID request id.
+        assert!(
+            parse_erasure_request_key(&dreq.replacen(&rid.to_string(), "not-a-uuid", 1)).is_err()
+        );
+        // Unknown signal prefix.
+        assert!(parse_erasure_request_key(&dreq.replacen("/m/", "/q/", 1)).is_err());
+    }
+
+    #[test]
+    fn rewrite_record_key_round_trips() {
+        let th = tenant_hash();
+        let hour_bucket = 495_734u32;
+        let input_set_hash16 = hash16_hex(0x33);
+        let key = rewrite_record_key(&th, Signal::Logs, 3, hour_bucket, &input_set_hash16)
+            .expect("build");
+        assert_eq!(
+            key,
+            format!(
+                "t/{}/l/c/0003/{}/rw.{}.cmt",
+                th.to_hex(),
+                ingest_hour_string(hour_bucket),
+                input_set_hash16
+            )
+        );
+        let parsed = parse_rewrite_record_key(&key).expect("parse");
+        assert_eq!(parsed.tenant_hash, th);
+        assert_eq!(parsed.signal, Signal::Logs);
+        assert_eq!(parsed.shard, 3);
+        assert_eq!(parsed.ingest_hour_bucket, hour_bucket);
+        assert_eq!(parsed.input_set_hash16, input_set_hash16);
+    }
+
+    #[test]
+    fn rewrite_record_key_shares_bucket_prefix_with_compaction() {
+        // Both records live in the same c/<shard>/<hour>/ prefix so one LIST
+        // discovers both (ADR-0064 decision 3).
+        let th = tenant_hash();
+        let hour_bucket = 495_734u32;
+        let hash16 = hash16_hex(0x44);
+        let prefix =
+            commit_shard_hour_prefix(&th, Signal::Metrics, 2, hour_bucket).expect("prefix");
+        let rw = rewrite_record_key(&th, Signal::Metrics, 2, hour_bucket, &hash16).expect("build");
+        let cp =
+            compaction_record_key(&th, Signal::Metrics, 2, hour_bucket, &hash16).expect("build");
+        assert!(rw.starts_with(&prefix));
+        assert!(cp.starts_with(&prefix));
+        assert_ne!(rw, cp);
+    }
+
+    #[test]
+    fn parse_rewrite_record_key_rejects_malformed_input() {
+        let th = tenant_hash();
+        let good = rewrite_record_key(&th, Signal::Logs, 3, 0, &hash16_hex(4)).expect("build");
+        assert!(parse_rewrite_record_key("t/only/three").is_err());
+        // A compaction record's tag is not a rewrite's tag.
+        assert!(parse_rewrite_record_key(&good.replacen("rw.", "l1.", 1)).is_err());
+        let bad_suffix = good.replacen(".cmt", ".rseg", 1);
+        assert!(parse_rewrite_record_key(&bad_suffix).is_err());
+        // Looks like an L0 commit key instead (four dot components).
+        assert!(parse_rewrite_record_key(&good.replacen("rw.", "", 1)).is_err());
+    }
+
+    fn sample_erasure_request(th: &TenantHash, signal: Signal, rid: Uuid) -> ErasureRequest {
+        ErasureRequest {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: signal::to_proto(signal) as i32,
+            request_id: rid.to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: "user_id".to_string(),
+                value: "u123".to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn erasure_request_key_for_matches_and_verifies() {
+        let th = tenant_hash();
+        let rid = request_id();
+        let record = sample_erasure_request(&th, Signal::Metrics, rid);
+        let expected = erasure_request_key(&th, Signal::Metrics, rid).expect("build");
+        assert_eq!(
+            erasure_request_key_for(&record).expect("reconstruct"),
+            expected
+        );
+        assert_eq!(
+            verify_erasure_request_key(&record, &expected).expect("verified"),
+            expected
+        );
+        let err =
+            verify_erasure_request_key(&record, "t/wrong/key").expect_err("must be fatal mismatch");
+        assert!(matches!(err, ReconstructionError::ObjectKeyMismatch { .. }));
+    }
+
+    #[test]
+    fn erasure_completion_key_for_matches_and_verifies() {
+        let th = tenant_hash();
+        let rid = request_id();
+        let record = ErasureCompletion {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: signal::to_proto(Signal::Logs) as i32,
+            request_id: rid.to_string(),
+            predicate_hash: hash32(0x11).to_vec(),
+            bucket_drops: vec![],
+            requested_unix_ns: 0,
+            completed_unix_ns: 0,
+            deferral_cause: 0,
+        };
+        let expected = erasure_completion_key(&th, Signal::Logs, rid).expect("build");
+        assert_eq!(
+            erasure_completion_key_for(&record).expect("reconstruct"),
+            expected
+        );
+        assert_eq!(
+            verify_erasure_completion_key(&record, &expected).expect("verified"),
+            expected
+        );
+        let err = verify_erasure_completion_key(&record, "t/wrong/key")
+            .expect_err("must be fatal mismatch");
+        assert!(matches!(err, ReconstructionError::ObjectKeyMismatch { .. }));
+    }
+
+    #[test]
+    fn rewrite_record_key_for_matches_and_verifies() {
+        let th = tenant_hash();
+        let input_set_hash = hash32(0x55);
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard: 1,
+            ingest_hour_bucket: 495_734,
+            inputs: vec![],
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![],
+            drops: vec![],
+            created_unix_ns: 0,
+        };
+        let expected = rewrite_record_key(
+            &th,
+            Signal::Metrics,
+            1,
+            495_734,
+            &hex::encode(&input_set_hash[..8]),
+        )
+        .expect("build");
+        assert_eq!(
+            rewrite_record_key_for(&record).expect("reconstruct"),
+            expected
+        );
+        assert_eq!(
+            verify_rewrite_record_key(&record, &expected).expect("verified"),
+            expected
+        );
+        let err =
+            verify_rewrite_record_key(&record, "t/wrong/key").expect_err("must be fatal mismatch");
+        assert!(matches!(err, ReconstructionError::ObjectKeyMismatch { .. }));
     }
 }
