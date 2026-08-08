@@ -779,8 +779,17 @@ impl Catalog {
             // already in the store under the same content-addressed key. Only
             // a part whose covering hours actually changed produces a new hash
             // and is PUT.
+            //
+            // `!rebuilt` is load-bearing: when `load_previous_entries` failed
+            // above and this fold rebuilt from the commit layout instead
+            // (missing or corrupt sealed part object), reusing the old HEAD's
+            // refs here would recompute a byte-identical hash for a part that
+            // does NOT exist in the store, skip its PUT, and leave the new
+            // HEAD permanently naming a dead object -- defeating the
+            // PUT-and-get-AlreadyExists self-heal ADR-0063 section 5
+            // describes, which only works if the object actually exists.
             let existing_by_blake3: HashMap<Vec<u8>, SnapshotPartRef> = match &head_state {
-                HeadState::Valid { head, .. } => head
+                HeadState::Valid { head, .. } if !rebuilt => head
                     .parts
                     .iter()
                     .map(|p| (p.blake3.clone(), p.clone()))
@@ -1318,16 +1327,15 @@ impl Catalog {
         // Fan out the per-shard delimited LISTs concurrently under
         // `fold_bucket_concurrency` (ADR-0063 section 3); parse and filter
         // serially afterwards so the result stays deterministic.
-        let per_shard: Vec<Result<ShardListing, CatalogError>> =
-            stream::iter(0..scan_shards)
-                .map(|shard| async move {
-                    let prefix = keys::commit_shard_prefix(&tenant_c, signal, shard)?;
-                    let listing = self.store().list_delimited(&prefix).await?;
-                    Ok::<_, CatalogError>((shard, prefix, listing.common_prefixes))
-                })
-                .buffered(concurrency)
-                .collect()
-                .await;
+        let per_shard: Vec<Result<ShardListing, CatalogError>> = stream::iter(0..scan_shards)
+            .map(|shard| async move {
+                let prefix = keys::commit_shard_prefix(&tenant_c, signal, shard)?;
+                let listing = self.store().list_delimited(&prefix).await?;
+                Ok::<_, CatalogError>((shard, prefix, listing.common_prefixes))
+            })
+            .buffered(concurrency)
+            .collect()
+            .await;
         counters.list_requests += u64::from(scan_shards);
         let mut buckets = Vec::new();
         for res in per_shard {
@@ -2316,6 +2324,90 @@ mod tests {
             sealed_bytes, sealed_bytes_2,
             "the sealed part object was not rewritten"
         );
+    }
+
+    /// Stage 4 checkpoint regression: when a sealed part object is missing
+    /// and the fold falls back to a full rebuild from the commit layout
+    /// (`rebuilt = true`), the rebuild recomputes byte-identical content for
+    /// that span, so its blake3 matches the stale ref in the (still `Valid`)
+    /// previous HEAD. Carrying that ref forward by reference -- as if the
+    /// object still existed -- would skip the PUT and leave the new HEAD
+    /// permanently naming a dead object. The rebuild path must always
+    /// restore the sealed part, never reuse a reference across a rebuild.
+    #[tokio::test]
+    async fn rebuild_restores_a_deleted_sealed_part_instead_of_reusing_its_ref() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert_eq!(
+            first.parts_total, 2,
+            "crossing the cap splits into two parts"
+        );
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let head = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head")
+                .data,
+        )
+        .expect("head decodes");
+        let sealed_key = head.parts[0].key.clone();
+
+        // Delete the sealed part object out from under the HEAD, simulating
+        // an unreadable/missing part (e.g. a GC race). Any live tenant read
+        // of it now fails with `NotFound`.
+        store.delete(&sealed_key).await.expect("delete sealed part");
+
+        let now_2 = now_at_seal(13);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("fold falls back to rebuild and restores the missing part");
+        assert!(
+            second.rebuilt,
+            "the missing sealed part must trigger a rebuild, not an incremental fold"
+        );
+
+        // The sealed part object must have been restored: a live GET must
+        // succeed now, not still return NotFound.
+        let restored = store.get(&sealed_key, GetRange::Full).await;
+        assert!(
+            restored.is_ok(),
+            "the rebuild must have re-PUT the deleted sealed part, got {restored:?}"
+        );
+
+        let head2 = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head 2")
+                .data,
+        )
+        .expect("head2 decodes");
+        for part in &head2.parts {
+            let got = store.get(&part.key, GetRange::Full).await;
+            assert!(
+                got.is_ok(),
+                "every part the rebuilt HEAD references must actually exist: {} -> {got:?}",
+                part.key
+            );
+        }
     }
 
     /// Issue #739 acceptance: failing the crashing fold's HEAD CAS (after some
