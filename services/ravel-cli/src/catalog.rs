@@ -63,35 +63,42 @@ pub async fn fold(
 }
 
 pub async fn inspect(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
-    let report = render_inspect(store, tenant).await?;
-    print!("{report}");
-    Ok(())
+    let mut out = String::new();
+    let result = render_inspect(store, tenant, &mut out).await;
+    // Print whatever was rendered even on error: a part fetch/decode failure
+    // partway through must not discard the HEAD fields and every earlier
+    // part's ref this call already rendered -- an operator inspecting a
+    // damaged catalog needs exactly that partial output, not just the error
+    // string for the one part that failed.
+    print!("{out}");
+    result
 }
 
 /// Decodes the tenant's metrics HEAD and every referenced snapshot part into
-/// the human-readable report `inspect` prints. Returns the report as a string
-/// (rather than writing to stdout directly) so tests can assert the exact
-/// output; `inspect` is a thin `print!` wrapper over it.
+/// the human-readable report `inspect` prints, appending into `out` as it
+/// goes so a failure partway through still leaves everything rendered so far
+/// in `out` for the caller to print. Returns `Err` (with `out` still holding
+/// everything rendered before the failure) on a fetch/decode error; `inspect`
+/// is a thin wrapper that always prints `out`, then propagates the result.
 ///
 /// A multi-part HEAD (epic EH multi-part fold) carries more than one snapshot
 /// part, each covering a disjoint `[min_hour, watermark_hour]` hour range
 /// (docs/catalog-and-mvcc.md, ADR-0063). The report lists every part with its
 /// range and the total part count; a single-part HEAD is the special case of
 /// one part whose range starts at hour 0.
-async fn render_inspect(
+pub async fn render_inspect(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
-) -> anyhow::Result<String> {
+    out: &mut String,
+) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let key = head_key(&tenant_hash, Signal::Metrics);
-
-    let mut out = String::new();
 
     let head_bytes = match store.get(&key, GetRange::Full).await {
         Ok(outcome) => outcome.data,
         Err(err) => {
             out.push_str(&format!("HEAD at {key} is absent or unreadable: {err}\n"));
-            return Ok(out);
+            return Ok(());
         }
     };
     let head = ravel_catalog::decode_head(&head_bytes)
@@ -146,7 +153,7 @@ async fn render_inspect(
             decoded.entries.len()
         ));
     }
-    Ok(out)
+    Ok(())
 }
 
 fn format_identity(id: &ravel_catalog::EntryIdentity) -> String {
@@ -301,7 +308,8 @@ mod tests {
             .await
             .expect("put head");
 
-        let report = render_inspect(store.clone(), tenant)
+        let mut report = String::new();
+        render_inspect(store.clone(), tenant, &mut report)
             .await
             .expect("inspect renders");
 

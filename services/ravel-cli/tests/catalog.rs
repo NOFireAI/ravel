@@ -17,6 +17,7 @@ use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
@@ -155,5 +156,95 @@ async fn inspect_rejects_a_corrupt_head() {
     assert!(
         err.to_string().contains("corrupt"),
         "unexpected error: {err}"
+    );
+}
+
+/// A part fetch failure partway through the parts loop must not discard the
+/// report already rendered: an operator inspecting a damaged catalog needs
+/// the HEAD fields and every earlier part's line, not just the one error for
+/// the part that failed.
+#[tokio::test]
+async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant_hash = TenantId::new("acme").hash();
+    let head_key = format!(
+        "t/{}/catalog/{}/HEAD",
+        tenant_hash.to_hex(),
+        Signal::Metrics.key_prefix()
+    );
+
+    let present_key = format!(
+        "t/{}/catalog/{}/part/present",
+        tenant_hash.to_hex(),
+        Signal::Metrics.key_prefix()
+    );
+    let present_bytes =
+        ravel_catalog::encode_part(tenant_hash.0, Signal::Metrics as u32, 1, 0, &[])
+            .expect("encode a valid empty part");
+    store
+        .put(
+            &present_key,
+            Bytes::from(present_bytes.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed the present part");
+
+    let missing_key = format!(
+        "t/{}/catalog/{}/part/missing",
+        tenant_hash.to_hex(),
+        Signal::Metrics.key_prefix()
+    );
+
+    let head = SnapshotHead {
+        format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+        tenant_hash: tenant_hash.0.to_vec(),
+        signal: Signal::Metrics as u32,
+        shard_count: 1,
+        watermark_hour: 1,
+        parts: vec![
+            SnapshotPartRef {
+                key: present_key.clone(),
+                blake3: blake3::hash(&present_bytes).as_bytes().to_vec(),
+                size: present_bytes.len() as u64,
+                entry_count: 0,
+                watermark_hour: 0,
+                min_hour: 0,
+            },
+            SnapshotPartRef {
+                key: missing_key.clone(),
+                blake3: vec![0u8; 32],
+                size: 0,
+                entry_count: 0,
+                watermark_hour: 1,
+                min_hour: 1,
+            },
+        ],
+        folder_id: Uuid::new_v4().into_bytes().to_vec(),
+        created_unix_ns: now_ns(),
+        ..Default::default()
+    };
+    let head_bytes = ravel_catalog::encode_head(&head).expect("encode a valid multi-part head");
+    store
+        .put(&head_key, Bytes::from(head_bytes), PutOptions::default())
+        .await
+        .expect("seed the head");
+
+    let mut out = String::new();
+    let err = catalog::render_inspect(store as Arc<dyn ObjectStoreBackend>, "acme", &mut out)
+        .await
+        .expect_err("a missing part must surface as a typed error");
+    assert!(
+        err.to_string().contains("missing"),
+        "unexpected error: {err}"
+    );
+
+    assert!(
+        out.contains("format_version"),
+        "partial report lost the HEAD fields: {out}"
+    );
+    assert!(
+        out.contains(&present_key),
+        "partial report lost the successfully-fetched part that preceded the failure: {out}"
     );
 }
