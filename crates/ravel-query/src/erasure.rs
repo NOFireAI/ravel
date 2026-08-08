@@ -667,6 +667,16 @@ mod tests {
             len in 1i64..500,
         ) {
             let end = start + len;
+            // Both bounds must be genuinely set for the strict `[start, end)`
+            // oracle below to describe the predicate: `0` on a bound is the
+            // zero-as-unset sentinel (see the module docs), which opens that
+            // side of the window and legitimately erases samples the strict
+            // reading would keep -- `start == 0` erases every negative
+            // timestamp, `end == 0` erases every timestamp at or above
+            // `start`. The sentinel's own semantics are covered exactly by
+            // `window_is_half_open_with_zero_as_unset`; this property covers
+            // fully-specified windows.
+            prop_assume!(start != 0 && end != 0);
             let samples: Vec<(i64, f64)> = tss.iter().map(|t| (*t, *t as f64)).collect();
             let mut series = vec![soa(labels(&[("user_id", "u1")]), &samples)];
             retain_series_soa(&mut series, &[pred(&[("user_id", "u1")], start, end)]);
