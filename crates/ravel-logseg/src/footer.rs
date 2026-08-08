@@ -248,9 +248,7 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
         return Err(LogSegError::Corrupted("bad magic".into()));
     }
     if version != VERSION {
-        return Err(LogSegError::Corrupted(format!(
-            "unsupported version {version}"
-        )));
+        return Err(LogSegError::UnsupportedVersion(version));
     }
     if signal != SIGNAL_LOGS {
         return Err(LogSegError::Corrupted(format!(
@@ -463,11 +461,37 @@ mod tests {
         assert_eq!(got, footer);
     }
 
-    /// There is no v1 writer left (ADR-0032: no dual-reader path), so hand-build
-    /// a structurally valid v1 trailer and assert the reader rejects it with a
-    /// typed `Corrupted` error rather than panicking. Only the trailer `version`
-    /// field differs from a valid v2 object; the crc is recomputed for v1 so the
+    /// Hand-build a structurally valid trailer whose version is one higher than
+    /// the supported constant and assert the reader rejects it with the typed
+    /// `UnsupportedVersion(N)` variant, not `Corrupted` (ADR-0066 decision 2:
+    /// fail-closed-on-newer, typed). Only the trailer `version` field differs
+    /// from a valid object; the crc is recomputed for that version so the
     /// rejection is the version check, not an incidental crc mismatch.
+    #[test]
+    fn rejects_newer_trailer_as_unsupported_version() {
+        let newer = VERSION + 1;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, newer, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&newer.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        match open(&obj) {
+            Err(LogSegError::UnsupportedVersion(v)) => assert_eq!(v, newer),
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    /// The version/corruption split is real: an older version (v1) is also the
+    /// typed `UnsupportedVersion` variant, never `Corrupted`.
     #[test]
     fn rejects_v1_trailer_as_unsupported_version() {
         const V1: u16 = 1;
@@ -485,10 +509,10 @@ mod tests {
         obj.push(RESERVED);
         obj.extend_from_slice(&MAGIC);
 
-        match open(&obj) {
-            Err(LogSegError::Corrupted(msg)) => assert!(msg.contains("unsupported version 1")),
-            other => panic!("expected Corrupted unsupported-version, got {other:?}"),
-        }
+        assert!(matches!(
+            open(&obj),
+            Err(LogSegError::UnsupportedVersion(1))
+        ));
     }
 
     /// An L0 object built through the normal writer path stamps the compaction

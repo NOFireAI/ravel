@@ -18,6 +18,14 @@
 pub enum SpanSegError {
     #[error("corrupted segment: {0}")]
     Corrupted(String),
+    /// The trailer's format version is not the one this build supports
+    /// (ADR-0066 decision 2: fail-closed-on-newer, everywhere, typed). This is
+    /// distinct from `Corrupted`: the bytes are well-formed, they just carry a
+    /// version this reader does not implement. Kept separate so a caller can
+    /// tell a genuine corruption from a stray older/newer object. Mirrors
+    /// `ravel_segment::SegmentError::UnsupportedVersion`.
+    #[error("unsupported format version {0}")]
+    UnsupportedVersion(u16),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
     #[error("io: {0}")]
