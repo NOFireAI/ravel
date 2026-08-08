@@ -10,8 +10,11 @@ t/<tenant_hash>/m/l0/<shard>/<writer_id>.<epoch>.<seq>.<hash16>.rseg      data
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt   commit
 t/<tenant_hash>/m/l1/<shard>/<ingest_hour>/<input_set_hash16>.<part:04>.<hash16>.rseg   L1 part
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt       compaction record
+t/<tenant_hash>/m/c/<shard>/<ingest_hour>/rw.<input_set_hash16>.cmt       rewrite record (selective erasure; ADR-0064)
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/retire.tmb                      retention tombstone
 t/<tenant_hash>/m/maint/<shard>/cursor                                    advisory scan cursor
+t/<tenant_hash>/<signal>/del/<request_id>.dreq                          erasure request (CreateIfAbsent, immutable; ADR-0064)
+t/<tenant_hash>/<signal>/del/<request_id>.done                          erasure completion (CreateIfAbsent, immutable, PII-free; ADR-0064)
 t/<tenant_hash>/<signal>/prov                                           shard_count provisioning record (write-once, additive; ADR-0050 §5)
 t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
@@ -23,9 +26,10 @@ sys/tenancy                                                             tenant-h
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 ```
 
-The four compaction/retention key shapes (ADR-0018, ADR-0019;
-docs/compaction-retention-plan.md §3.1) are additive: existing keys and
-their meaning are untouched.
+The compaction/retention key shapes (ADR-0018, ADR-0019;
+docs/compaction-retention-plan.md §3.1) and the selective-erasure key shapes
+(`rw.` rewrite records and the `del/` request/completion prefix, ADR-0064) are
+additive: existing keys and their meaning are untouched.
 
 `sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
 additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.
@@ -91,15 +95,34 @@ history via `ravel_catalog::scan_count` rather than a single static count.
   `(writer_id, writer_epoch, writer_seq)`). `hash16` on an L1 part is the
   part object's own blake3, same convention as an L0 data key. `part` is
   zero-padded 4 digits.
-- Compaction records and the retention tombstone live in the same
-  `c/<shard>/<ingest_hour>/` prefix as L0 commit records, so the existing
-  one-LIST-per-bucket resolution path discovers all three shapes without
+- Compaction records, rewrite records, and the retention tombstone live in
+  the same `c/<shard>/<ingest_hour>/` prefix as L0 commit records, so the
+  existing one-LIST-per-bucket resolution path discovers every shape without
   a second LIST. Filenames are disjoint by construction:
   `<writer_id>.<epoch>.<seq>.cmt` (L0 commit), `l1.<input_set_hash16>.cmt`
-  (compaction record), `retire.tmb` (tombstone, fixed name). A key in
-  this prefix matching none of the three shapes is a fail-loud error
-  (surfaced to metrics), never silently skipped: layout drift must be
-  visible, not swallowed.
+  (compaction record), `rw.<input_set_hash16>.cmt` (selective-erasure rewrite
+  record, ADR-0064 decision 3), `retire.tmb` (tombstone, fixed name). A key in
+  this prefix matching none of these shapes is a fail-loud error (surfaced to
+  metrics), never silently skipped: layout drift must be visible, not
+  swallowed. (Implementation note: `keys::partition_bucket_entry` does not yet
+  classify the `rw.` shape; until it does, a live rewrite record parses as
+  neither compaction nor commit and trips the fail-loud path. Wiring it into
+  ravel-catalog snapshot resolution is tracked as EJ follow-up work, not part
+  of the ADR-0064 T1 record/codec surface.)
+- Selective-erasure request and completion records (ADR-0064 decision 1) live
+  under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
+  bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
+  resolve to attach pending predicates (decision 2). A `.dreq` is written
+  `CreateIfAbsent`, is immutable, necessarily names the subject, and is deleted
+  after its `.done` exists plus the protection horizon (decision 5). A `.done`
+  is written `CreateIfAbsent`, is immutable, carries no plaintext subject
+  identifier (only a blake3 predicate hash and per-bucket dropped counts), and
+  is permanent audit evidence. The `rw.<input_set_hash16>.cmt` rewrite record's
+  `input_set_hash16` is the first 16 hex chars of the blake3 digest defined by
+  `ravel_commit::erasure::compute_rewrite_input_set_hash` (domain-separated,
+  over the record's superseded input set or superseded record key plus its
+  sorted applied request ids), a distinct domain from the compaction
+  `input_set_hash` so the two can never collide.
 - The maint cursor (`m/maint/<shard>/cursor`) is advisory mutable state,
   updated by CAS, the same exemption from the immutability rule that the
   ADR-0003 HEAD pointer has. Losing or corrupting it costs a rescan, never

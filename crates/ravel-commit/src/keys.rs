@@ -1226,6 +1226,23 @@ pub enum BucketEntry {
     Tombstone(ParsedRetentionTombstoneKey),
 }
 
+// NOTE (ADR-0064, follow-up): `partition_bucket_entry` does NOT yet classify
+// `rw.<hash16>.cmt` rewrite record keys. They end with `.cmt` but do not start
+// with `l1.`, so today they fall through to the `else if filename.ends_with(".cmt")`
+// commit-record branch and fail to parse (a UUID-shaped writer id is expected,
+// `rw` is not one). This must be fixed before ravel-catalog's snapshot
+// resolution can see rewrite records, at two known call sites:
+//   - crates/ravel-catalog/src/catalog.rs: propagates the parse error via `?`,
+//     so a live rewrite record hard-errors resolution today.
+//   - crates/ravel-catalog/src/fold.rs: catches the error and silently skips
+//     the entry with a warning. This one is the dangerous case: a silently
+//     skipped rewrite record means its supersession of the erased inputs is
+//     ignored by the index fold, so an erased subject's pre-rewrite records
+//     can reappear in a folded snapshot. Fix `partition_bucket_entry` to emit
+//     a `BucketEntry::RewriteRecord` (via `parse_rewrite_record_key`) before
+//     wiring either call site to act on it.
+// Classifying `rw.` keys and teaching ravel-catalog to act on them is out of
+// scope for this task; this comment is the pointer for whoever does it next.
 /// Classify one key from a `c/<shard>/<hour>/` bucket listing by filename
 /// shape. Name patterns are disjoint by construction (plan §3.1): a
 /// tombstone is exactly `retire.tmb`, a compaction record's filename starts
@@ -2107,6 +2124,7 @@ mod tests {
             parts: vec![],
             drops: vec![],
             created_unix_ns: 0,
+            superseded_record_key: String::new(),
         };
         let expected = rewrite_record_key(
             &th,

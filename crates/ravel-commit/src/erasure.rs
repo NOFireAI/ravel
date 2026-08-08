@@ -18,7 +18,7 @@
 
 use prost::Message;
 use ravel_proto::commit::v1::{
-    ErasureCompletion, ErasureDeferralCause, ErasureRequest, RewriteRecord,
+    CompactionInputIdentity, ErasureCompletion, ErasureDeferralCause, ErasureRequest, RewriteRecord,
 };
 use uuid::Uuid;
 
@@ -56,6 +56,22 @@ pub enum ErasureError {
     InvalidInputSetHashLen(usize),
     #[error("empty input set: a rewrite record must supersede at least one input")]
     EmptyInputs,
+    #[error(
+        "rewrite record sets both `inputs` and `superseded_record_key`: exactly one may be set"
+    )]
+    BothInputsAndSuperseded,
+    #[error(
+        "rewrite record sets neither `inputs` nor `superseded_record_key`: exactly one must be set"
+    )]
+    NeitherInputsNorSuperseded,
+    #[error(
+        "input_set_hash mismatch: the record's input_set_hash is not the hash computed from its own inputs/superseded_record_key and applied request ids"
+    )]
+    InputSetHashMismatch,
+    #[error(
+        "bucket drop signal {bucket_drop} does not match the completion's top-level signal {completion}"
+    )]
+    BucketDropSignalMismatch { completion: i32, bucket_drop: i32 },
     #[error("empty drops: a rewrite record must apply at least one erasure request")]
     EmptyDrops,
     #[error("invalid output part content_hash length: expected 32 bytes, got {0}")]
@@ -162,6 +178,18 @@ pub fn validate_completion(record: &ErasureCompletion) -> Result<(), ErasureErro
     // rather than a silently-misread integer.
     ErasureDeferralCause::try_from(record.deferral_cause)
         .map_err(|_| ErasureError::UnknownDeferralCause(record.deferral_cause))?;
+    // Every per-bucket drop belongs to this completion's own request, so its
+    // signal must equal the completion's top-level signal. A mismatch means a
+    // bucket drop for the wrong signal was folded in and is rejected, never
+    // silently accepted (ADR-0064 decision 4, amended).
+    for drop in &record.bucket_drops {
+        if drop.signal != record.signal {
+            return Err(ErasureError::BucketDropSignalMismatch {
+                completion: record.signal,
+                bucket_drop: drop.signal,
+            });
+        }
+    }
     if record.requested_unix_ns != 0
         && record.completed_unix_ns != 0
         && record.requested_unix_ns > record.completed_unix_ns
@@ -188,6 +216,99 @@ pub fn decode_completion(bytes: &[u8]) -> Result<ErasureCompletion, ErasureError
 
 // --- RewriteRecord ---
 
+/// Domain-separation prefix for [`compute_rewrite_input_set_hash`]. Distinct
+/// from ravel-maintain's compaction `input_set_hash` domain
+/// (`ravel-compaction-input-set-v1\0`) so the two hashes can never collide
+/// even if the same input byte sequence were fed to both.
+pub const REWRITE_INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-rewrite-input-set-v1\0";
+
+/// Compute the canonical `input_set_hash` for a [`RewriteRecord`]
+/// (ADR-0064 decision 3, amended). This hash names the rewrite by exactly
+/// what it supersedes and which erasure requests it applied, and is what the
+/// rewrite record is keyed by (`rw.<hash16>.cmt`) under `CreateIfAbsent`.
+///
+/// The preimage, in order, is:
+///
+/// 1. the [`REWRITE_INPUT_SET_HASH_DOMAIN`] tag;
+/// 2. exactly one of
+///    - (inputs) if `inputs` is non-empty: a little-endian `u64` count of the
+///      inputs, then for each input its `writer_id` UTF-8 bytes
+///      (length-prefixed by a little-endian `u64`), then its `writer_epoch`
+///      and `writer_seq` as little-endian `u64` — the same shape ravel-maintain's
+///      compaction `input_set_hash` uses; or
+///    - (superseded) if `superseded_record_key` is `Some`: its UTF-8 bytes
+///      prefixed by their length as a little-endian `u64`;
+/// 3. a little-endian `u64` count of `applied_request_ids`, then each
+///    request id's UTF-8 bytes (length-prefixed the same way).
+///
+/// The length-prefix framing of the one-of case makes the two cases produce
+/// distinct preimages by construction, so no `inputs` set can ever hash the
+/// same as a `superseded_record_key` string.
+///
+/// This function does NOT sort. Inputs must already arrive sorted canonically
+/// by `(writer_id, writer_epoch, writer_seq)` (per the proto comment on
+/// `RewriteRecord.inputs`), matching how the sibling compaction hash works.
+/// Callers MUST likewise sort `applied_request_ids` lexicographically before
+/// calling. That sorting is exactly what makes an identical-batch retry
+/// idempotent: the same sorted set yields the same hash, hence the same
+/// `CreateIfAbsent` key, so a retry addresses the same object; two batches
+/// that applied a different set of requests hash differently and diverge into
+/// distinct records.
+///
+/// # Panics
+///
+/// Panics unless exactly one of `inputs` (non-empty) or
+/// `superseded_record_key` (`Some` and non-empty) holds. Both-set or
+/// neither-set is a caller contract violation the type system cannot express;
+/// this is a library invariant check on malformed caller input, not a
+/// data-path unwrap on untrusted external bytes.
+pub fn compute_rewrite_input_set_hash(
+    inputs: &[CompactionInputIdentity],
+    superseded_record_key: Option<&str>,
+    applied_request_ids: &[String],
+) -> [u8; 32] {
+    let has_inputs = !inputs.is_empty();
+    let superseded = superseded_record_key.filter(|k| !k.is_empty());
+    assert!(
+        has_inputs != superseded.is_some(),
+        "compute_rewrite_input_set_hash: exactly one of `inputs` (non-empty) or \
+         `superseded_record_key` (non-empty) must be set \
+         (inputs_present={has_inputs}, superseded_present={})",
+        superseded.is_some()
+    );
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(REWRITE_INPUT_SET_HASH_DOMAIN);
+    if has_inputs {
+        hasher.update(&(inputs.len() as u64).to_le_bytes());
+        for input in inputs {
+            let wid = input.writer_id.as_bytes();
+            hasher.update(&(wid.len() as u64).to_le_bytes());
+            hasher.update(wid);
+            hasher.update(&input.writer_epoch.to_le_bytes());
+            hasher.update(&input.writer_seq.to_le_bytes());
+        }
+    } else if let Some(key) = superseded {
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    hasher.update(&(applied_request_ids.len() as u64).to_le_bytes());
+    for id in applied_request_ids {
+        hasher.update(&(id.len() as u64).to_le_bytes());
+        hasher.update(id.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Extract and lexicographically sort the applied request ids from a rewrite
+/// record's drops, the canonical order [`compute_rewrite_input_set_hash`]
+/// expects.
+fn sorted_applied_request_ids(record: &RewriteRecord) -> Vec<String> {
+    let mut ids: Vec<String> = record.drops.iter().map(|d| d.request_id.clone()).collect();
+    ids.sort();
+    ids
+}
+
 /// Structural invariants every [`RewriteRecord`] must satisfy. A rewrite
 /// supersedes at least one input and applies at least one erasure request;
 /// its output parts may be empty (a bucket whose every record matched is
@@ -202,8 +323,17 @@ pub fn validate_rewrite(record: &RewriteRecord) -> Result<(), ErasureError> {
             record.input_set_hash.len(),
         ));
     }
-    if record.inputs.is_empty() {
-        return Err(ErasureError::EmptyInputs);
+    // Exactly one of `inputs` (raw L0/L1 identities) or `superseded_record_key`
+    // (a whole live compaction/rewrite record superseded as a unit) names what
+    // this rewrite replaces (ADR-0064 decision 3, amended). Both-set or
+    // neither-set is malformed.
+    let has_inputs = !record.inputs.is_empty();
+    let superseded =
+        (!record.superseded_record_key.is_empty()).then_some(record.superseded_record_key.as_str());
+    match (has_inputs, superseded.is_some()) {
+        (true, true) => return Err(ErasureError::BothInputsAndSuperseded),
+        (false, false) => return Err(ErasureError::NeitherInputsNorSuperseded),
+        _ => {}
     }
     if record.drops.is_empty() {
         return Err(ErasureError::EmptyDrops);
@@ -217,6 +347,20 @@ pub fn validate_rewrite(record: &RewriteRecord) -> Result<(), ErasureError> {
                 part.content_hash.len(),
             ));
         }
+    }
+    // Verify the stored input_set_hash actually is the canonical hash of this
+    // record's own inputs/superseded key and its sorted applied request ids,
+    // not merely a well-formed 32-byte value (ADR-0064 decision 3, amended).
+    // This is what makes an identical-batch retry idempotent under
+    // CreateIfAbsent and what prevents two logically different rewrites from
+    // colliding on one key.
+    let expected = compute_rewrite_input_set_hash(
+        &record.inputs,
+        superseded,
+        &sorted_applied_request_ids(record),
+    );
+    if record.input_set_hash.as_slice() != expected.as_slice() {
+        return Err(ErasureError::InputSetHashMismatch);
     }
     Ok(())
 }
@@ -319,6 +463,16 @@ mod tests {
             } else {
                 (0, 0)
             };
+            // Every bucket drop belongs to this completion's request, so its
+            // signal must equal the top-level signal (validate_completion now
+            // enforces this); align the generated drops accordingly.
+            let bucket_drops = bucket_drops
+                .into_iter()
+                .map(|mut d| {
+                    d.signal = signal;
+                    d
+                })
+                .collect();
             ErasureCompletion {
                 format_version: 1,
                 tenant_hash,
@@ -381,11 +535,18 @@ mod tests {
             shard in any::<u32>(),
             ingest_hour_bucket in any::<u32>(),
             inputs in prop::collection::vec(input_strategy(), 1..5),
-            input_set_hash in prop::collection::vec(any::<u8>(), 32),
             parts in prop::collection::vec(part_strategy(), 0..4),
             drops in prop::collection::vec(drop_strategy(), 1..4),
             created_unix_ns in any::<i64>(),
         ) -> RewriteRecord {
+            // A valid rewrite carries the canonical hash of its own inputs and
+            // sorted applied request ids, so it survives validate_rewrite's
+            // recomputation check on decode.
+            let mut request_ids: Vec<String> =
+                drops.iter().map(|d| d.request_id.clone()).collect();
+            request_ids.sort();
+            let input_set_hash =
+                compute_rewrite_input_set_hash(&inputs, None, &request_ids).to_vec();
             RewriteRecord {
                 format_version: 1,
                 tenant_hash,
@@ -397,6 +558,7 @@ mod tests {
                 parts,
                 drops,
                 created_unix_ns,
+                superseded_record_key: String::new(),
             }
         }
     }
@@ -472,24 +634,58 @@ mod tests {
     }
 
     fn valid_rewrite() -> RewriteRecord {
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(9).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let drops = vec![RewriteDrop {
+            request_id: Uuid::from_u128(1).to_string(),
+            dropped_count: 5,
+        }];
+        let mut request_ids: Vec<String> = drops.iter().map(|d| d.request_id.clone()).collect();
+        request_ids.sort();
+        let input_set_hash = compute_rewrite_input_set_hash(&inputs, None, &request_ids).to_vec();
         RewriteRecord {
             format_version: 1,
             tenant_hash: vec![0x11; 16],
             signal: 1,
             shard: 0,
             ingest_hour_bucket: 0,
-            inputs: vec![CompactionInputIdentity {
-                writer_id: Uuid::from_u128(9).to_string(),
-                writer_epoch: 1,
-                writer_seq: 1,
-            }],
-            input_set_hash: vec![0x33; 32],
+            inputs,
+            input_set_hash,
             parts: vec![],
-            drops: vec![RewriteDrop {
-                request_id: Uuid::from_u128(1).to_string(),
-                dropped_count: 5,
-            }],
+            drops,
             created_unix_ns: 0,
+            superseded_record_key: String::new(),
+        }
+    }
+
+    /// A valid rewrite that supersedes a whole live record key instead of a
+    /// raw input set (the amended second case): `inputs` empty,
+    /// `superseded_record_key` set, hash recomputed from that key.
+    fn valid_superseding_rewrite() -> RewriteRecord {
+        let superseded = "t/aabb/m/c/0001/20260726T14/l1.0011223344556677.cmt".to_string();
+        let drops = vec![RewriteDrop {
+            request_id: Uuid::from_u128(1).to_string(),
+            dropped_count: 5,
+        }];
+        let mut request_ids: Vec<String> = drops.iter().map(|d| d.request_id.clone()).collect();
+        request_ids.sort();
+        let input_set_hash =
+            compute_rewrite_input_set_hash(&[], Some(&superseded), &request_ids).to_vec();
+        RewriteRecord {
+            format_version: 1,
+            tenant_hash: vec![0x11; 16],
+            signal: 1,
+            shard: 1,
+            ingest_hour_bucket: 0,
+            inputs: vec![],
+            input_set_hash,
+            parts: vec![],
+            drops,
+            created_unix_ns: 0,
+            superseded_record_key: superseded,
         }
     }
 
@@ -599,10 +795,53 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_rejects_empty_inputs() {
+    fn rewrite_rejects_neither_inputs_nor_superseded() {
+        // inputs empty and superseded_record_key empty: the amended one-of
+        // invariant is violated in the neither direction.
         let mut rw = valid_rewrite();
         rw.inputs.clear();
-        assert_eq!(validate_rewrite(&rw), Err(ErasureError::EmptyInputs));
+        assert!(rw.superseded_record_key.is_empty());
+        assert_eq!(
+            validate_rewrite(&rw),
+            Err(ErasureError::NeitherInputsNorSuperseded)
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_both_inputs_and_superseded() {
+        // inputs non-empty AND superseded_record_key non-empty: violated in
+        // the both direction.
+        let mut rw = valid_rewrite();
+        rw.superseded_record_key = "t/aa/m/c/0001/20260726T14/l1.0011223344556677.cmt".to_string();
+        assert!(!rw.inputs.is_empty());
+        assert_eq!(
+            validate_rewrite(&rw),
+            Err(ErasureError::BothInputsAndSuperseded)
+        );
+    }
+
+    #[test]
+    fn rewrite_accepts_superseded_record_key() {
+        let rw = valid_superseding_rewrite();
+        assert!(rw.inputs.is_empty());
+        assert!(!rw.superseded_record_key.is_empty());
+        assert_eq!(validate_rewrite(&rw), Ok(()));
+        // And it round-trips through encode/decode under the new validation.
+        let bytes = encode_rewrite(&rw);
+        assert_eq!(decode_rewrite(&bytes).expect("decode"), rw);
+    }
+
+    #[test]
+    fn rewrite_rejects_input_set_hash_mismatch() {
+        // A well-formed 32-byte hash that is not the canonical hash of this
+        // record's own inputs/drops is rejected (regression: validation used
+        // to accept any 32-byte value).
+        let mut rw = valid_rewrite();
+        rw.input_set_hash = vec![0x33; 32];
+        assert_eq!(
+            validate_rewrite(&rw),
+            Err(ErasureError::InputSetHashMismatch)
+        );
     }
 
     #[test]
@@ -610,6 +849,92 @@ mod tests {
         let mut rw = valid_rewrite();
         rw.drops.clear();
         assert_eq!(validate_rewrite(&rw), Err(ErasureError::EmptyDrops));
+    }
+
+    #[test]
+    fn compute_rewrite_input_set_hash_is_deterministic() {
+        // Same inputs, same (already sorted) request ids: identical hash. This
+        // is what makes an identical-batch retry idempotent under
+        // CreateIfAbsent.
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(9).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let ids = vec!["req-a".to_string(), "req-b".to_string()];
+        let h1 = compute_rewrite_input_set_hash(&inputs, None, &ids);
+        let h2 = compute_rewrite_input_set_hash(&inputs, None, &ids);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn compute_rewrite_input_set_hash_differs_on_request_ids() {
+        // The collision the checkpoint reproduced: two batches over the same
+        // inputs that applied a different set of requests must diverge.
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(9).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let one = vec!["req-a".to_string()];
+        let two = vec!["req-a".to_string(), "req-b".to_string()];
+        assert_ne!(
+            compute_rewrite_input_set_hash(&inputs, None, &one),
+            compute_rewrite_input_set_hash(&inputs, None, &two)
+        );
+    }
+
+    #[test]
+    fn compute_rewrite_input_set_hash_no_cross_case_collision() {
+        // The same logical value fed through the `inputs` case versus the
+        // `superseded_record_key` case must not collide: the length-prefix
+        // framing separates the two cases by construction, not by luck.
+        let writer = Uuid::from_u128(9).to_string();
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: writer.clone(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        }];
+        let ids = vec!["req-a".to_string()];
+        let via_inputs = compute_rewrite_input_set_hash(&inputs, None, &ids);
+        let via_superseded = compute_rewrite_input_set_hash(&[], Some(&writer), &ids);
+        assert_ne!(via_inputs, via_superseded);
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one")]
+    fn compute_rewrite_input_set_hash_panics_on_neither() {
+        let _ = compute_rewrite_input_set_hash(&[], None, &["req-a".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one")]
+    fn compute_rewrite_input_set_hash_panics_on_both() {
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(9).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let _ = compute_rewrite_input_set_hash(&inputs, Some("some-key"), &["req-a".to_string()]);
+    }
+
+    #[test]
+    fn completion_rejects_bucket_drop_signal_mismatch() {
+        let mut c = valid_completion();
+        c.signal = 1; // METRICS
+        c.bucket_drops = vec![ErasureBucketDrop {
+            signal: 2, // LOGS: differs from the completion's top-level signal
+            shard: 0,
+            ingest_hour_bucket: 0,
+            dropped_count: 3,
+        }];
+        assert_eq!(
+            validate_completion(&c),
+            Err(ErasureError::BucketDropSignalMismatch {
+                completion: 1,
+                bucket_drop: 2,
+            })
+        );
     }
 
     #[test]
