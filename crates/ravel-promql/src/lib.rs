@@ -25,6 +25,7 @@ mod functions;
 pub mod histogram;
 mod matchers;
 mod plan;
+pub mod redact;
 mod source;
 pub mod testsource;
 
@@ -36,6 +37,7 @@ pub use eval::{
 pub use histogram::{FloatHistogram, ResetHint, Span};
 pub use matchers::{from_ast_matcher, from_ast_matchers, has_or_group, matches_series};
 pub use plan::{PlanAnchor, SelectorPlan, plan_selectors};
+pub use redact::{RedactError, audit_token, redact};
 pub use source::{
     HistogramSample, HistogramSeriesData, LabelMatcher, MatchOp, MatcherError, SeriesData,
     SeriesSource, SourceError,
