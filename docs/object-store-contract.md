@@ -391,6 +391,39 @@ creates the bucket, sets that variable, and asserts the gated test executed
 rather than skipping. This job is required: S3 is the only durable backend,
 so an adapter regression must fail CI.
 
+### Per-tenant KMS routing decorator
+
+`KmsRoutingStore` wraps a default backend and routes writes (`put`,
+`put_multipart`) for a tenant with a configured KMS key to a lazily-built,
+cached per-tenant `S3Store` built from the default `S3Config` with only
+`kms_key_id` overridden (ADR-0062 decision 1a). Routing is decided per call
+from the object key alone: every tenant-scoped key begins with
+`t/<tenant_hash_hex>/`, so no trait change and no per-tenant handle threaded
+through call sites. Every read (`get`, `head`, `list`, `list_delimited`),
+`delete`, and any non-`t/`-prefixed or malformed-tenant-segment key delegates
+unconditionally to the default store: SSE-KMS decryption on GET is
+server-side and transparent given `kms:Decrypt`, so a reader never selects a
+key. `capabilities()` passes straight through the default store's
+declaration, same as the instrumentation decorator.
+
+Per-tenant stores are cached for the process lifetime (`Box::leak`'d to
+`&'static`, bounded by the number of distinct configured tenants) so a
+`put_multipart` handle can satisfy the trait's lifetime without a
+self-referential owner. The cache is keyed by tenant hash together with the
+ARN it was built under: registering a new key for a tenant that already has
+a cached store (`set_tenant_key`) does not retroactively re-encrypt anything
+already written (objects are immutable), but the next write for that tenant
+rebuilds the cache entry under the new key rather than silently continuing
+to route through the store built under the superseded one.
+
+The contract suite runs `KmsRoutingStore` (wrapping `MemoryStore`, no tenant
+key configured) through the full assertion set the same way it does
+`InstrumentedStore`, proving the decorator is transparent when no tenant has
+opted into per-tenant routing. It does not exercise the routing branch
+itself (a live per-tenant `S3Store` has no endpoint under test); routing is
+covered by `kms_routing`'s own unit tests instead, including key rotation
+and `put_multipart` routing.
+
 ## Rules for callers
 
 - Never infer visibility from a successful data PUT; only commit records

@@ -69,9 +69,20 @@ type TenantStoreBuilder =
 /// (via [`Box::leak`], see [`KmsRoutingStore::tenant_store`]) so a multipart
 /// handle returned from it can satisfy the [`ObjectStoreBackend::put_multipart`]
 /// lifetime without a self-referential wrapper. The leak is bounded by the
-/// number of distinct tenants with a configured key --- built once per tenant,
-/// never rebuilt --- each of which would live for the process lifetime anyway.
+/// number of distinct tenants with a configured key, plus one extra leaked
+/// store per ARN rotation for an already-cached tenant (see
+/// [`KmsRoutingStore::tenant_store`]) --- still bounded by operator-driven
+/// configuration, never by observed traffic, and each superseded store would
+/// live for the process lifetime under the old design anyway.
 type CachedStore = &'static dyn ObjectStoreBackend;
+
+/// A cached per-tenant store together with the key ARN it was built with, so
+/// a cache hit can be checked against the tenant's *current* configured ARN
+/// before being reused.
+struct TenantCacheEntry {
+    arn: String,
+    store: CachedStore,
+}
 
 /// Routes tenant writes to per-tenant SSE-KMS stores; everything else goes to
 /// the default store. Composes wherever the default `S3Store` sits today
@@ -89,8 +100,9 @@ pub struct KmsRoutingStore {
     /// consulted on every write to decide routing.
     tenant_keys: Mutex<HashMap<String, String>>,
     /// Lazily-built per-tenant store cache, keyed by `tenant_hash_hex`. Built
-    /// on the first routed write for a tenant and reused thereafter.
-    tenant_stores: Mutex<HashMap<String, CachedStore>>,
+    /// on the first routed write for a tenant and reused thereafter, unless
+    /// the tenant's configured ARN changes (see [`Self::tenant_store`]).
+    tenant_stores: Mutex<HashMap<String, TenantCacheEntry>>,
     /// How a per-tenant store is constructed from its config.
     builder: TenantStoreBuilder,
 }
@@ -140,9 +152,13 @@ impl KmsRoutingStore {
 
     /// Register (or overwrite) a tenant's KMS key. Designed so a later task
     /// (EL-7) can wire `--tenant-kms-key` into it without changing this crate's
-    /// shape. Registering a key that a store was already built under does not
-    /// rebuild that store: the first build wins for the process lifetime (key
-    /// rotation and epochs are EL-2's concern, not this decorator's).
+    /// shape. Overwriting a tenant's key does not retroactively re-encrypt
+    /// anything already written (objects are immutable), but it does take
+    /// effect for the *next* write: [`Self::tenant_store`] rebuilds the cached
+    /// store the first time it observes the new ARN, rather than silently
+    /// keeping writes on a store built under the superseded key (full epoch
+    /// tracking and rotation bookkeeping are EL-2's concern, not this
+    /// decorator's).
     pub fn set_tenant_key(&self, tenant_hash_hex: String, key_arn: String) {
         self.tenant_keys.lock().insert(tenant_hash_hex, key_arn);
     }
@@ -163,27 +179,44 @@ impl KmsRoutingStore {
     }
 
     /// Get or lazily build the per-tenant store for `tenant_hash_hex`,
-    /// configured with `key_arn`. Built at most once per tenant: the cache is
-    /// checked and populated under one lock, and the builder is synchronous so
-    /// nothing is awaited while the lock is held.
+    /// configured with `key_arn`. A cache hit is only reused when its ARN
+    /// still matches `key_arn`; if the tenant's configured key changed since
+    /// the cached store was built, the stale entry is replaced rather than
+    /// silently kept (see [`Self::set_tenant_key`]). The cache is checked and
+    /// populated under one lock, and the builder is synchronous, so nothing
+    /// is awaited while the lock is held.
     fn tenant_store(
         &self,
         tenant_hash_hex: &str,
         key_arn: &str,
     ) -> Result<CachedStore, StoreError> {
         let mut cache = self.tenant_stores.lock();
-        if let Some(store) = cache.get(tenant_hash_hex) {
-            return Ok(*store);
+        if let Some(entry) = cache.get(tenant_hash_hex)
+            && entry.arn == key_arn
+        {
+            return Ok(entry.store);
         }
+        // Either there was no cache entry, or the configured ARN changed
+        // since this store was built. Fall through and rebuild under the
+        // (possibly new) key; a superseded store is simply dropped from the
+        // map (it was `&'static` via `Box::leak` and stays leaked, same as
+        // any other cache entry -- bounded by the number of ARN rotations an
+        // operator performs, not by traffic).
         let mut config = self.default_config.clone();
         config.kms_key_id = Some(key_arn.to_string());
         let built = (self.builder)(&config)?;
         // Leak to `&'static`: the store lives for the process (a per-tenant
-        // singleton, built once), and a `&'static` backend lets a multipart
-        // handle returned below satisfy `put_multipart`'s lifetime without a
-        // self-referential owner. See `CachedStore`.
+        // singleton, built once per distinct ARN), and a `&'static` backend
+        // lets a multipart handle returned below satisfy `put_multipart`'s
+        // lifetime without a self-referential owner. See `CachedStore`.
         let leaked: CachedStore = Box::leak(built);
-        cache.insert(tenant_hash_hex.to_string(), leaked);
+        cache.insert(
+            tenant_hash_hex.to_string(),
+            TenantCacheEntry {
+                arn: key_arn.to_string(),
+                store: leaked,
+            },
+        );
         Ok(leaked)
     }
 }
@@ -251,6 +284,7 @@ impl ObjectStoreBackend for KmsRoutingStore {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::UploadChecksum;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// One recorded operation: which store handled it and the key it saw.
@@ -337,8 +371,43 @@ mod tests {
             Ok(())
         }
 
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.record("put_multipart", key);
+            Ok(Box::new(FakeMultipart))
+        }
+
         fn capabilities(&self) -> Capabilities {
             Capabilities::mandatory()
+        }
+    }
+
+    /// A trivial [`MultipartUpload`] handle: the routing tests only need to
+    /// prove which store's `put_multipart` was reached, not exercise real
+    /// part-sequencing.
+    struct FakeMultipart;
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for FakeMultipart {
+        async fn put_part(
+            &mut self,
+            _data: Bytes,
+            _checksum: Option<UploadChecksum>,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn complete(&mut self) -> Result<PutOutcome, StoreError> {
+            Ok(PutOutcome {
+                etag: crate::Etag("fake".into()),
+                version: crate::Version("fake".into()),
+            })
+        }
+
+        async fn abort(&mut self) -> Result<(), StoreError> {
+            Ok(())
         }
     }
 
@@ -594,6 +663,94 @@ mod tests {
         );
         assert_eq!(events_for(&rig, "default").len(), 3);
         assert_eq!(rig.builds.load(Ordering::SeqCst), 0);
+    }
+
+    /// `put_multipart` is claimed to route exactly like `put` (the initiation
+    /// carries the SSE-KMS config), but `RecordingStore` did not override it
+    /// until this test existed, so nothing ever exercised that claim: a
+    /// broken route here (a tenant's multipart upload starting on the default
+    /// store, i.e. under the wrong key) would have passed every other test in
+    /// this module.
+    #[tokio::test]
+    async fn put_multipart_routes_to_per_tenant_kms_store() {
+        let rig = rig();
+        rig.store
+            .set_tenant_key(TENANT_A.to_string(), KEY_A.to_string());
+
+        let key_a = format!("t/{TENANT_A}/seg/0001");
+        let key_b = format!("t/{TENANT_B}/seg/0001");
+
+        let _ = rig
+            .store
+            .put_multipart(&key_a)
+            .await
+            .expect("tenant A multipart init");
+        let _ = rig
+            .store
+            .put_multipart(&key_b)
+            .await
+            .expect("tenant B multipart init");
+
+        assert_eq!(
+            events_for(&rig, KEY_A),
+            vec![Event {
+                store: KEY_A.to_string(),
+                op: "put_multipart",
+                key: key_a,
+            }],
+            "a configured tenant's multipart init must route to its per-tenant store"
+        );
+        assert_eq!(
+            events_for(&rig, "default"),
+            vec![Event {
+                store: "default".to_string(),
+                op: "put_multipart",
+                key: key_b,
+            }],
+            "an unconfigured tenant's multipart init goes to the default store"
+        );
+    }
+
+    /// If a tenant's configured ARN changes after its store was already
+    /// built, the next write must go through a store built with the *new*
+    /// key, not silently keep using the one built under the superseded key.
+    #[tokio::test]
+    async fn write_after_key_rotation_uses_the_new_key() {
+        const KEY_A2: &str = "arn:aws:kms:us-east-1:111122223333:key/tenant-a-v2";
+        let rig = rig();
+        rig.store
+            .set_tenant_key(TENANT_A.to_string(), KEY_A.to_string());
+        let key_a = format!("t/{TENANT_A}/seg/0001");
+
+        rig.store
+            .put(&key_a, Bytes::from_static(b"a"), PutOptions::default())
+            .await
+            .expect("first write, under the original key");
+
+        // Rotate the tenant's key.
+        rig.store
+            .set_tenant_key(TENANT_A.to_string(), KEY_A2.to_string());
+
+        rig.store
+            .put(&key_a, Bytes::from_static(b"b"), PutOptions::default())
+            .await
+            .expect("second write, must route under the rotated key");
+
+        assert_eq!(
+            events_for(&rig, KEY_A).len(),
+            1,
+            "only the pre-rotation write reached the store built under the old key"
+        );
+        assert_eq!(
+            events_for(&rig, KEY_A2).len(),
+            1,
+            "the post-rotation write must reach a store built under the new key, not the cached old one"
+        );
+        assert_eq!(
+            rig.builds.load(Ordering::SeqCst),
+            2,
+            "a key rotation must rebuild the per-tenant store, not reuse the stale cache entry"
+        );
     }
 
     #[test]
