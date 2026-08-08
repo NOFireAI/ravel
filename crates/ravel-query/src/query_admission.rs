@@ -178,9 +178,10 @@ struct State {
 ///
 /// Tracks this process's concurrently-open query count as a stock and answers
 /// ADMIT/REJECT before a query starts. Shared (via `Arc`) across every query
-/// surface in the process — the PromQL HTTP handlers, the SQL HTTP endpoint, and
-/// the Flight SQL `GetFlightInfo` path — so the process holds one honest count
-/// across all transports, not one per transport.
+/// surface in the process — the PromQL HTTP handlers, the SQL HTTP endpoint,
+/// and Flight SQL's `GetFlightInfo` (planning) and `DoGet` (execution) paths,
+/// each held for its own phase's duration — so the process holds one honest
+/// count across all transports, not one per transport.
 ///
 /// A single [`Mutex`] guards the small counter state; every operation is O(1)
 /// arithmetic with no `.await` under the lock, so there is no contention concern
