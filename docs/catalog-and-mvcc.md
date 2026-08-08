@@ -265,21 +265,36 @@ so a slightly stale reader cannot misroute a write.
   sweep. Every fold that rewrites a part or postings object writes a new
   content-addressed key and swaps HEAD, leaving the old object in place
   (docs/metric-index-plan.md 4 step 8, the "orphan part" crash-matrix row);
-  without this rule each such fold leaks one object. The rule GETs the current
-  `catalog/<signal>/HEAD`, treats every `parts[].key` and the optional
-  `postings.key` as referenced, and deletes any object under the two prefixes
-  that HEAD does not name once its `last_modified` age exceeds
-  `CompactorConfig::protection_horizon_ns` (the same horizon the
-  superseded-input sweep uses). Like the idempotency-marker sweep, it is per
-  (tenant, signal) rather than per shard (catalog objects carry no shard
-  dimension) and consults the `LeaseCheck`/legal-hold gate before every
-  delete; under `CompactorConfig::dry_run` it counts what it would delete
-  without calling `delete`. An absent HEAD means nothing is referenced (a fold
-  that crashed before its HEAD CAS, or a since-rebuilt index), so old orphans
-  are collected and a later fold re-PUTs any part it still needs (parts are
-  content-addressed derived data); a HEAD present but undecodable fails the
-  pass without deleting, so a corrupt HEAD can never make the live snapshot
-  look unreferenced.
+  without this rule each such fold leaks one object. The rule LISTs the two
+  prefixes first, then GETs the current `catalog/<signal>/HEAD`, treats every
+  `parts[].key` and the optional `postings.key` as referenced, and deletes any
+  object under the two prefixes that HEAD does not name once its
+  `last_modified` age exceeds `CompactorConfig::protection_horizon_ns`. A fresh
+  re-verify GET of HEAD is taken immediately before the delete loop (the same
+  batched-re-verify shape orphan GC uses for its commit-prefix LIST), so an
+  object a fold's HEAD CAS named between the two reads is spared. Like the
+  idempotency-marker sweep, it is per (tenant, signal) rather than per shard
+  (catalog objects carry no shard dimension) and consults the
+  `LeaseCheck`/legal-hold gate before every delete; under
+  `CompactorConfig::dry_run` it counts what it would delete without calling
+  `delete`. A present, decodable HEAD is the rule's only anchor: an absent HEAD
+  sweeps nothing for the (tenant, signal), exactly like a bucket with neither a
+  compaction record nor a tombstone in the unreferenced-part sweep. This is
+  because a recovery fold rebuilding from no HEAD (`HeadState::Absent`/`Corrupt`)
+  recomputes and re-PUTs every part, and a non-tail span keys on its stable
+  `watermark_hour`, so the recomputed key is byte-identical to any surviving old
+  object: the PUT returns `AlreadyExists` and the fold adopts the old object
+  *without rewriting it* (its `last_modified` stays old) before naming it in the
+  HEAD it is about to CAS. With no HEAD to compare against, such an object is
+  indistinguishable from a part a fold is mid-flight on, so it must be left
+  alone. The `protection_horizon_ns` gate is therefore a reader-pinning buffer
+  here (`max_query_duration + grace`), not a writer interlock: unlike the orphan
+  and unreferenced-part gates, whose lifetime terms mirror a real writer
+  abandonment deadline, adoption-via-`AlreadyExists` never refreshes
+  `last_modified`, so an object's age does not bound the fold that may adopt it;
+  what bounds the writer race is the no-anchor rule plus the pre-delete HEAD
+  re-verify. A HEAD present but undecodable fails the pass without deleting, so
+  a corrupt HEAD can never make the live snapshot look unreferenced.
 
 ### Idempotency marker body layout
 
