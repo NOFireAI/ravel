@@ -13,6 +13,7 @@
 //! object (an isolation breach, never silently absorbed into a fallback
 //! that could serve or reference foreign bytes).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,6 +31,37 @@ use crate::fold::head_object_key;
 use crate::provisioning::{ShardGeneration, shard_ceiling};
 use crate::snapshot::{SegmentLevel, SegmentRef};
 use crate::snapshot_format::{self, DecodedPart, DecodedPostings, PartLimits, PostingsLimits};
+
+/// Leading sentinel that marks a `name_filter` string as a literal-prefix
+/// range key rather than an exact `__name__` value (ADR-0061 decision 3,
+/// EF-4/#724).
+///
+/// The postings-pruning pipeline threads a single `Option<&str>` filter from
+/// each query language down through `Catalog::resolve_pruned` (which is out of
+/// this change's scope and keeps its signature) into
+/// [`SnapshotWindow::extract_into`]. To carry the new "literal-prefix-anchored
+/// regex" case alongside the pre-existing exact-equality case without changing
+/// that signature, the two producers (`ravel_query::engine` and
+/// `ravel_sql::executor`) encode a prefix filter as this sentinel followed by
+/// the literal prefix; an exact filter is passed verbatim, unchanged, so the
+/// public `resolve_pruned` contract and every existing caller are untouched.
+///
+/// `U+0001` (Start Of Heading) is used because it is a control character that
+/// no supported ingest path admits into a stored `__name__`. That property is
+/// only a defence-in-depth convenience, not the correctness argument: the
+/// prefix path in [`SnapshotWindow::postings_ordinals_for_filter`] additionally
+/// unions the ordinals of any stored name equal to the *entire* encoded string,
+/// so even a (nonexistent in practice) exact `__name__` value that literally
+/// began with this byte could never have its segments pruned away. Pruning
+/// therefore can never drop a segment a query could match, regardless of what
+/// names a snapshot happens to hold -- the false-negative class this ticket
+/// exists to prevent.
+///
+/// The two producers duplicate this constant's value inline (matching this
+/// codebase's language-specific-enforcement precedent, #278 and ADR-0061
+/// decision 1); [`PREFIX_FILTER_SENTINEL`]'s own value is pinned by a test so a
+/// silent drift is caught.
+pub(crate) const PREFIX_FILTER_SENTINEL: char = '\u{1}';
 
 /// A usable snapshot: its watermark and every part HEAD named, already
 /// verified and decoded.
@@ -53,10 +85,14 @@ impl SnapshotWindow {
     /// matching hour range is one contiguous slice found by
     /// `partition_point`.
     ///
-    /// `name_filter`, when `Some`, is the query's equality `__name__` value
-    /// (P5b): entries this snapshot's postings provably do not carry that
-    /// name are skipped before the event-overlap check, and `*pruned` is
-    /// incremented once per skipped entry. Pruning only ever activates when
+    /// `name_filter`, when `Some`, is the query's `__name__` pruning key (P5b,
+    /// ADR-0061 decision 3): either an exact equality value, or -- when it
+    /// begins with [`PREFIX_FILTER_SENTINEL`] -- a literal prefix from a
+    /// prefix-anchored `__name__` regex (`^foo.*$`). Either way, entries this
+    /// snapshot's postings provably do not carry a matching name are skipped
+    /// before the event-overlap check, and `*pruned` is incremented once per
+    /// skipped entry (see [`Self::postings_ordinals_for_filter`]). Pruning only
+    /// ever activates when
     /// postings are present, decoded, and bound to exactly the parts this
     /// window holds; any other case (`name_filter` is `None`, postings
     /// absent/corrupt, or more than one covered part, which today's
@@ -76,12 +112,12 @@ impl SnapshotWindow {
         pruned: &mut u64,
         out: &mut HashMap<String, SegmentRef>,
     ) -> Result<(), CatalogError> {
-        let ordinals = self.postings_ordinals_for(name_filter);
+        let ordinals = self.postings_ordinals_for_filter(name_filter);
         for part in &self.parts {
             let entries = &part.entries;
             let start = entries.partition_point(|e| e.ingest_hour_bucket < lower_hour);
             let end = entries.partition_point(|e| e.ingest_hour_bucket <= upper_hour);
-            match ordinals {
+            match ordinals.as_deref() {
                 None => {
                     for entry in &entries[start..end] {
                         self.maybe_insert(tenant, signal, entry, query_range, out)?;
@@ -145,6 +181,101 @@ impl SnapshotWindow {
             Ok(idx) => Some(postings.names[idx].ordinals.as_slice()),
             Err(_) => Some(&[]),
         }
+    }
+
+    /// Resolves `name_filter` (as threaded through `Catalog::resolve_pruned`)
+    /// to the sorted ordinal list of every entry a matching name carries,
+    /// dispatching on the [`PREFIX_FILTER_SENTINEL`] encoding (ADR-0061
+    /// decision 3):
+    ///
+    /// - `None` / an unencoded string -> the pre-existing exact-equality
+    ///   lookup ([`Self::postings_ordinals_for`]), returned borrowed.
+    /// - a string led by [`PREFIX_FILTER_SENTINEL`] -> the literal-prefix
+    ///   range scan ([`Self::postings_prefix_ordinals_for`]) over the sentinel-
+    ///   stripped prefix, returned owned.
+    ///
+    /// The `None` vs `Some(&[])` contract is identical to
+    /// [`Self::postings_ordinals_for`]: `None` means pruning cannot safely
+    /// apply at all (no filter, no usable postings, or more than one covered
+    /// part), and `Some(empty)` means the filter genuinely matches zero names
+    /// in this snapshot (so every candidate entry is pruned).
+    ///
+    /// The prefix arm additionally unions the ordinals of any stored name
+    /// exactly equal to the *whole* encoded string. In normal operation that
+    /// name cannot exist (a stored `__name__` never begins with the control
+    /// sentinel), so the union is empty and pruning is exactly the prefix
+    /// range. It exists solely so that if a caller's *exact* filter value ever
+    /// coincidentally began with the sentinel byte and were misread here as a
+    /// prefix, that value's own segments are still retained -- making a
+    /// dropped-match (false-negative) impossible independent of any ingest
+    /// name-charset guarantee.
+    fn postings_ordinals_for_filter(&self, name_filter: Option<&str>) -> Option<Cow<'_, [u64]>> {
+        let filter = name_filter?;
+        match filter.strip_prefix(PREFIX_FILTER_SENTINEL) {
+            None => self.postings_ordinals_for(Some(filter)).map(Cow::Borrowed),
+            Some(prefix) => {
+                let mut ords = self.postings_prefix_ordinals_for(prefix)?;
+                // Defence-in-depth union; see the doc comment above. When the
+                // prefix arm applies (single part, usable postings), the exact
+                // lookup is `Some` too, so this never turns a prunable filter
+                // into `None`.
+                if let Some(exact) = self.postings_ordinals_for(Some(filter))
+                    && !exact.is_empty()
+                {
+                    ords.extend_from_slice(exact);
+                    ords.sort_unstable();
+                    ords.dedup();
+                }
+                Some(Cow::Owned(ords))
+            }
+        }
+    }
+
+    /// Resolves a literal `prefix` to the sorted union of the ordinal lists of
+    /// every name that starts with it, or `None` if pruning cannot safely
+    /// apply (empty prefix, more than one covered part, or no usable
+    /// postings). `Some(empty)` is a legitimate result: no name in this
+    /// snapshot starts with `prefix`, so every candidate entry is pruned. The
+    /// sibling of [`Self::postings_ordinals_for`] for ADR-0061 decision 3.
+    ///
+    /// `postings.names` is sorted ascending (the frozen postings invariant,
+    /// `snapshot_format::postings`), so the names starting with `prefix` form
+    /// one contiguous slice, located by two `partition_point`s -- never an
+    /// over- or under-approximation. Because every entry carries exactly one
+    /// `__name__`, the matched names' ordinal sets are disjoint; the union is
+    /// their concatenation, sorted so [`Self::extract_into`]'s `partition_point`
+    /// bounds hold (the `dedup` is belt-and-suspenders).
+    ///
+    /// An empty `prefix` is rejected (`None`, i.e. bypass) rather than treated
+    /// as "match every name": a `.*`-only regex prunes nothing, so declining to
+    /// prune is both correct and cheaper.
+    fn postings_prefix_ordinals_for(&self, prefix: &str) -> Option<Vec<u64>> {
+        if prefix.is_empty() {
+            return None;
+        }
+        if self.parts.len() != 1 {
+            return None;
+        }
+        let postings = self.postings.as_ref()?;
+        let names = &postings.names;
+        // Lower bound: first name that is not strictly less than `prefix`.
+        let lo = names.partition_point(|np| np.name.as_str() < prefix);
+        // Upper bound: first name that is >= `prefix` yet does NOT start with
+        // it. For ascending-sorted names this predicate is monotone (every
+        // name `< prefix` or `starts_with(prefix)` precedes every name that is
+        // `> prefix` without the prefix), so `[lo, hi)` is exactly the
+        // contiguous run of prefix matches.
+        let hi = names.partition_point(|np| {
+            let n = np.name.as_str();
+            n < prefix || n.starts_with(prefix)
+        });
+        let mut ords: Vec<u64> = Vec::new();
+        for np in &names[lo..hi] {
+            ords.extend_from_slice(&np.ordinals);
+        }
+        ords.sort_unstable();
+        ords.dedup();
+        Some(ords)
     }
 }
 
@@ -1317,5 +1448,199 @@ mod tests {
             "a pre-reshard head whose watermark reaches into gen1's active hours \
              is rejected, same as a modern older head"
         );
+    }
+
+    // ---- ADR-0061 decision 3 (EF-4/#724): literal-prefix range scan ----
+
+    use crate::snapshot_format::NamePostings;
+    use ravel_proto::catalog::v1::{SnapshotPartHeader, SnapshotPostingsHeader};
+
+    /// A `SnapshotWindow` with `part_count` empty parts and hand-built,
+    /// ascending-sorted postings. The parts' contents are irrelevant to the
+    /// ordinal-lookup methods under test (they only gate on `parts.len()`), so
+    /// their entries are empty.
+    fn window_with_names(names: &[(&str, &[u64])], part_count: usize) -> SnapshotWindow {
+        let names = names
+            .iter()
+            .map(|(n, ords)| NamePostings {
+                name: (*n).to_string(),
+                ordinals: ords.to_vec(),
+            })
+            .collect();
+        let postings = DecodedPostings {
+            header: SnapshotPostingsHeader::default(),
+            names,
+        };
+        let parts = (0..part_count)
+            .map(|_| {
+                Arc::new(DecodedPart {
+                    header: SnapshotPartHeader::default(),
+                    entries: Vec::new(),
+                })
+            })
+            .collect();
+        SnapshotWindow {
+            watermark_hour: 0,
+            parts,
+            postings: Some(Arc::new(postings)),
+        }
+    }
+
+    /// Names deliberately include an aliasing pair ("app" is itself a prefix of
+    /// "apple") and interleaved ordinals across distinct names, so the union's
+    /// sort is genuinely exercised. Ascending sort order:
+    /// alpha, apex, app, apple, banana, zebra.
+    fn sample_window(part_count: usize) -> SnapshotWindow {
+        window_with_names(
+            &[
+                ("alpha", &[0]),
+                ("apex", &[1, 4]),
+                ("app", &[2]),
+                ("apple", &[3, 5]),
+                ("banana", &[6]),
+                ("zebra", &[7]),
+            ],
+            part_count,
+        )
+    }
+
+    #[test]
+    fn prefix_sentinel_value_is_pinned() {
+        // The two query-language producers (ravel_query::engine,
+        // ravel_sql::executor) duplicate this literal inline; pin it here so a
+        // silent drift on either side is caught by the end-to-end oracles and
+        // this assertion together.
+        assert_eq!(PREFIX_FILTER_SENTINEL, '\u{1}');
+    }
+
+    #[test]
+    fn prefix_range_scan_covers_every_boundary_case() {
+        let w = sample_window(1);
+
+        // Zero matches: a real "prune everything" result, not a bypass.
+        assert_eq!(
+            w.postings_prefix_ordinals_for("qux"),
+            Some(Vec::new()),
+            "a prefix matching no name yields Some(empty), pruning every entry"
+        );
+
+        // Matches exactly the first name in sort order.
+        assert_eq!(
+            w.postings_prefix_ordinals_for("alph"),
+            Some(vec![0]),
+            "prefix isolating the first name"
+        );
+
+        // Matches exactly the last name in sort order.
+        assert_eq!(
+            w.postings_prefix_ordinals_for("zeb"),
+            Some(vec![7]),
+            "prefix isolating the last name"
+        );
+
+        // Matches multiple distinct names; the union is sorted across them.
+        assert_eq!(
+            w.postings_prefix_ordinals_for("ap"),
+            Some(vec![1, 2, 3, 4, 5]),
+            "apex|app|apple ordinals, unioned and sorted"
+        );
+
+        // Matches one name that is itself a prefix of another matching name.
+        assert_eq!(
+            w.postings_prefix_ordinals_for("app"),
+            Some(vec![2, 3, 5]),
+            "app and apple both match; app is a prefix of apple"
+        );
+
+        // An exact whole-name prefix still range-scans (it can alias a longer
+        // name): "apple" matches only itself here.
+        assert_eq!(w.postings_prefix_ordinals_for("apple"), Some(vec![3, 5]));
+    }
+
+    #[test]
+    fn prefix_range_scan_bypasses_when_unsafe() {
+        // Empty prefix (a `.*`-only regex) prunes nothing: bypass, not "match
+        // all".
+        assert_eq!(sample_window(1).postings_prefix_ordinals_for(""), None);
+
+        // More than one covered part: pruning is confined to the single-part
+        // case, exactly like the exact lookup.
+        assert_eq!(sample_window(2).postings_prefix_ordinals_for("ap"), None);
+
+        // No usable postings at all.
+        let mut w = sample_window(1);
+        w.postings = None;
+        assert_eq!(w.postings_prefix_ordinals_for("ap"), None);
+    }
+
+    #[test]
+    fn filter_dispatch_routes_prefix_and_exact() {
+        let w = sample_window(1);
+
+        // No filter: no pruning.
+        assert!(w.postings_ordinals_for_filter(None).is_none());
+
+        // Unencoded string: exact-equality lookup, borrowed, unchanged
+        // behaviour. "apex" matches exactly one name.
+        assert_eq!(
+            w.postings_ordinals_for_filter(Some("apex")).as_deref(),
+            Some([1u64, 4].as_slice())
+        );
+        // Exact lookup of a name that is a prefix of others must NOT range
+        // scan: "app" exact is only app's ordinals, not apple's.
+        assert_eq!(
+            w.postings_ordinals_for_filter(Some("app")).as_deref(),
+            Some([2u64].as_slice())
+        );
+        // A prefix (sentinel-encoded) of the very same text DOES range scan.
+        let encoded = format!("{PREFIX_FILTER_SENTINEL}app");
+        assert_eq!(
+            w.postings_ordinals_for_filter(Some(&encoded)).as_deref(),
+            Some([2u64, 3, 5].as_slice())
+        );
+
+        // Exact miss is Some(empty) (prune all); prefix miss likewise.
+        assert_eq!(
+            w.postings_ordinals_for_filter(Some("nope")).as_deref(),
+            Some([].as_slice())
+        );
+        let encoded_miss = format!("{PREFIX_FILTER_SENTINEL}qux");
+        assert_eq!(
+            w.postings_ordinals_for_filter(Some(&encoded_miss))
+                .as_deref(),
+            Some([].as_slice())
+        );
+    }
+
+    /// The defence-in-depth union: even if a stored name literally equalled the
+    /// encoded (sentinel-led) string -- which no real ingest path produces --
+    /// an exact filter misread as a prefix must never prune that name's
+    /// segments away. Here a name equal to the encoded bytes exists AND does
+    /// not start with the decoded prefix, so only the union keeps it.
+    #[test]
+    fn misread_exact_filter_never_drops_its_own_segments() {
+        let sentinel = PREFIX_FILTER_SENTINEL;
+        let encoded = format!("{sentinel}zzz");
+        // Sorted ascending: the control byte (U+0001) sorts before ASCII
+        // letters, so the encoded name is first.
+        let w = window_with_names(
+            &[
+                (encoded.as_str(), &[9]),
+                ("aaa", &[0]),
+                ("zzzsomething", &[1]),
+            ],
+            1,
+        );
+        // Decoded prefix is "zzz": range-scans zzzsomething (ordinal 1), and
+        // the union additionally retains the exact encoded name (ordinal 9).
+        let got = w
+            .postings_ordinals_for_filter(Some(&encoded))
+            .expect("prunable")
+            .into_owned();
+        assert!(
+            got.contains(&9),
+            "the exact encoded name's segments must be retained (no false negative)"
+        );
+        assert!(got.contains(&1), "the genuine prefix match is present too");
     }
 }

@@ -891,23 +891,179 @@ fn collect_filter_predicates(plan: &LogicalPlan, out: &mut Vec<Expr>) {
     }
 }
 
-/// The lone equality `__name__` value in `matchers`, or `None` if none can be
-/// soundly used to prune (#278 item 4). Mirrors the PromQL engine's
-/// `equality_name_filter`: a single `__name__ = value` matcher yields that
-/// value; a second `__name__` matcher of any kind, or a non-equality one,
-/// takes the conservative bypass so pruning never drops a segment the query
-/// could still match.
+/// Leading sentinel marking a `name_filter` as a literal-prefix range key
+/// rather than an exact `__name__` value (ADR-0061 decision 3, EF-4/#724).
+///
+/// This MUST equal `ravel_catalog`'s
+/// `snapshot_resolve::PREFIX_FILTER_SENTINEL`, the byte the catalog strips to
+/// decide the prefix-vs-exact postings lookup. The value is duplicated inline
+/// here (matching this codebase's language-specific-enforcement precedent for
+/// name filters, #278, which already duplicates `equality_name_filter` across
+/// ravel-query and ravel-sql) rather than shared across the crate boundary; the
+/// catalog pins the value with a test and the postings-pruning oracles round-
+/// trip it end to end, so a silent drift cannot pass.
+const PREFIX_FILTER_SENTINEL: char = '\u{1}';
+
+/// The literal prefix of a fully-anchored `__name__` regex of the exact shape
+/// `^literal.*$`, or `None` for every other shape (ADR-0061 decision 3).
+///
+/// SQL's `label_match(labels, '__name__', 'pattern')` UDF lowers to the same
+/// fully-anchored `ravel_promql` regex matcher PromQL selectors use (the raw
+/// pattern in `LabelMatcher.value`, evaluated as `^(?:value)$`), so this is the
+/// byte-for-byte twin of the PromQL engine's own detector. It accepts ONLY the
+/// prefix shape and rejects everything else so a misclassification can never
+/// prune a segment the query could match:
+///
+/// - one optional explicit leading `^` and trailing `$` are tolerated;
+/// - the remainder MUST end with an unanchored `.*` wildcard tail;
+/// - the literal before that tail MUST be non-empty and consist solely of
+///   plain metric-name bytes (`[A-Za-z0-9_:]`).
+///
+/// Infix wildcards, alternations, character classes, non-`.*` tails, and ANY
+/// backslash escape are rejected; the caller falls back to the pre-existing
+/// unpruned resolve.
+fn literal_prefix_from_anchored_regex(pattern: &str) -> Option<String> {
+    let mut p = pattern;
+    p = p.strip_prefix('^').unwrap_or(p);
+    p = p.strip_suffix('$').unwrap_or(p);
+    let literal = p.strip_suffix(".*")?;
+    if literal.is_empty() {
+        return None;
+    }
+    if literal.bytes().all(is_literal_prefix_byte) {
+        Some(literal.to_string())
+    } else {
+        None
+    }
+}
+
+/// A byte that is unambiguously a literal in a Prometheus-anchored regex and a
+/// valid metric-name character. Conservative on purpose: any byte outside this
+/// set (including every regex metacharacter and every escape) forces a bypass.
+fn is_literal_prefix_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b':'
+}
+
+/// The postings pruning key a single `__name__` matcher yields, or `None` if
+/// it cannot be soundly used to prune: an exact value verbatim, a prefix-
+/// anchored regex (`^foo.*$`) as its sentinel-encoded literal prefix, and a
+/// negation / non-prefix regex as `None`.
+fn name_pruning_key(m: &LabelMatcher) -> Option<String> {
+    match &m.op {
+        MatchOp::Eq => Some(m.value.clone()),
+        MatchOp::Re(_) => literal_prefix_from_anchored_regex(&m.value)
+            .map(|prefix| format!("{PREFIX_FILTER_SENTINEL}{prefix}")),
+        MatchOp::Ne | MatchOp::Nre(_) => None,
+    }
+}
+
+/// The lone `__name__` pruning key in `matchers`, or `None` if none can be
+/// soundly used to prune (#278 item 4, extended by ADR-0061 decision 3).
+/// Mirrors the PromQL engine's `equality_name_filter`: a single `__name__`
+/// matcher that is either an exact `=` or a literal-prefix-anchored regex
+/// yields its (possibly sentinel-encoded) key; a second `__name__` matcher of
+/// any kind, a negation, or a non-prefix regex takes the conservative bypass
+/// so pruning never drops a segment the query could still match.
 fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<String> {
-    let mut found: Option<&str> = None;
+    let mut found: Option<String> = None;
     for m in matchers {
-        if m.name == METRIC_NAME_LABEL {
-            match &m.op {
-                MatchOp::Eq if found.is_none() => found = Some(m.value.as_str()),
-                _ => return None,
-            }
+        if m.name != METRIC_NAME_LABEL {
+            continue;
+        }
+        // A second `__name__` matcher of any kind: the pruning key is no longer
+        // well defined, so bypass (unchanged from the equality-only behaviour).
+        if found.is_some() {
+            return None;
+        }
+        found = Some(name_pruning_key(m)?);
+    }
+    found
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod name_filter_tests {
+    use super::*;
+
+    fn re(pattern: &str) -> LabelMatcher {
+        LabelMatcher::regex(METRIC_NAME_LABEL, pattern).expect("compilable regex")
+    }
+
+    fn encoded(prefix: &str) -> String {
+        format!("{PREFIX_FILTER_SENTINEL}{prefix}")
+    }
+
+    /// The SQL detector is the byte-for-byte twin of the PromQL engine's, so it
+    /// accepts exactly the same literal-prefix shapes and rejects everything
+    /// else (including escapes, which it declines rather than mis-parses).
+    #[test]
+    fn detector_accepts_and_rejects_the_same_shapes_as_promql() {
+        for (pattern, prefix) in [
+            ("foo.*", "foo"),
+            ("^foo.*$", "foo"),
+            ("^foo.*", "foo"),
+            ("foo.*$", "foo"),
+            ("a1_b:c.*", "a1_b:c"),
+        ] {
+            assert_eq!(
+                literal_prefix_from_anchored_regex(pattern).as_deref(),
+                Some(prefix),
+                "{pattern:?} must yield {prefix:?}"
+            );
+        }
+        for pattern in [
+            "foo",
+            "^foo$",
+            ".*",
+            "^.*$",
+            ".*foo.*",
+            "foo.*bar.*",
+            "foo.*bar",
+            "fo.o.*",
+            "foo*",
+            "foo.+",
+            "foo|bar",
+            "(foo).*",
+            "[a-z].*",
+            r"a\.b.*",
+            r"^a\.b.*$",
+            "^^foo.*$",
+        ] {
+            assert_eq!(
+                literal_prefix_from_anchored_regex(pattern),
+                None,
+                "{pattern:?} must be rejected (unpruned bypass)"
+            );
         }
     }
-    found.map(str::to_string)
+
+    #[test]
+    fn equality_name_filter_routes_prefix_and_preserves_bypass() {
+        // Exact case unchanged.
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::equal(METRIC_NAME_LABEL, "foo")]),
+            Some("foo".to_string())
+        );
+        // Prefix regex now prunes, via the sentinel encoding.
+        assert_eq!(equality_name_filter(&[re("^foo.*$")]), Some(encoded("foo")));
+        // Non-prefix regex and negations bypass.
+        assert_eq!(equality_name_filter(&[re(".*foo.*")]), None);
+        assert_eq!(equality_name_filter(&[re("foo|bar")]), None);
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::not_equal(METRIC_NAME_LABEL, "foo")]),
+            None
+        );
+        // Two `__name__` matchers bypass, even when each alone would prune.
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::equal(METRIC_NAME_LABEL, "foo"), re("^foo.*$"),]),
+            None
+        );
+        // No `__name__` matcher bypasses.
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::equal("job", "api")]),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
