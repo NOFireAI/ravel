@@ -242,6 +242,68 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
    other delete.
 
+## Amendment (2026-08-08): the rewrite key must bind to the applied request set, and a rewrite must be able to name a non-L0 predecessor
+
+EJ-T1 (#750) implemented decision 1 and this decision's `RewriteRecord`
+shape and found two problems the Stage 4 checkpoint proved rather than
+merely argued.
+
+**The collision.** `input_set_hash` was specified as "blake3 over the
+sorted inputs" and the key as `rw.<input_set_hash16>.cmt`. A second
+erasure batch over a bucket whose live record set has not otherwise
+changed since a prior rewrite -- the ordinary case, since sealed buckets
+are largely static -- names the identical L0 input set and therefore
+hashes to the identical key. Published `CreateIfAbsent`, the second
+batch can never land: it collides with the first rewrite's own record
+and is silently rejected as already-existing. This defeats "once per
+request batch" (decision 3 point 3) for every batch after the first over
+a given bucket, which is a compliance dead end for a subject named in a
+second, later DSAR against data a first DSAR already caused to be
+rewritten.
+
+**The predecessor gap.** Decision 3 point 3 already says a rewrite names
+"L0 commit identities *and/or* the compaction record it supersedes" --
+but the checkpoint found no field able to carry the second case, and
+none able to name a *prior rewrite* as a predecessor at all, which
+decision 3 point 3's "recursively" implication (a rewrite superseding an
+earlier rewrite, for a bucket erased twice) requires. Reusing
+`CompactionInputIdentity` (`RewriteRecord.inputs`, field 6) only names L0
+identities; it cannot name a `CompactionRecord` or `RewriteRecord` key.
+
+**Fix, both additive, no field renumbered:**
+
+- `RewriteRecord` gains `string superseded_record_key = 11` (the next
+  free field number): the exact key of the live `CompactionRecord` or
+  `RewriteRecord` this rewrite supersedes as a whole, populated instead
+  of `inputs` when the bucket's live record set is already a compaction
+  or rewrite output rather than raw L0 objects. `inputs` (field 6) is
+  used exactly as before when the live record set is raw L0. Exactly one
+  of `inputs` (non-empty) or `superseded_record_key` (non-empty) is set;
+  a decoder must reject a record with both empty or both non-empty as
+  invalid. This directly satisfies decision 3 point 3's "and/or" clause,
+  which was previously aspirational text with no schema behind it, and
+  makes recursive supersession (rewrite-of-a-rewrite) nameable: the
+  predecessor's key is just a string, regardless of whether it is a
+  `l1.<hash16>.cmt` or an `rw.<hash16>.cmt` key.
+- `input_set_hash`'s preimage is corrected to bind the applied request
+  set, not only the input set: `blake3(canonical_input_bytes ++
+  sorted(applied request_ids))`, where `canonical_input_bytes` is the
+  sorted-inputs encoding the field already used (or, when
+  `superseded_record_key` is set instead, that key's own bytes) and
+  `sorted(applied request_ids)` is the lexicographically sorted list of
+  `RewriteDrop.request_id` values this record applies (field 9). Two
+  batches with different request_ids now hash differently and never
+  collide, closing the bug. A retry of the *same* batch (same inputs,
+  same applied request_ids -- the crash-and-retry case decision 3's
+  `CreateIfAbsent` idempotency depends on) still hashes identically and
+  still lands for free, so idempotent retry is preserved exactly as
+  designed.
+
+This is a key-derivation and schema-additivity correction to decision 3,
+not a new decision; it must land before any task that encodes
+supersession matching on top of `RewriteRecord` (EJ-T2) or that
+publishes rewrite records (EJ-T4).
+
 ### 4. Completion, verification, and the stated worst-case bound
 
 When every bucket in a request's scope has a live record set consisting
@@ -516,7 +578,7 @@ and PII-free) get permanent audit evidence without permanent PII.
 
 | ID | Title | Crates | Deps | Risk |
 |---|---|---|---|---|
-| T1 | `ErasureRequest`/`RewriteRecord` protos, codecs, key-layout doc, property tests | ravel-types, proto/ | — | high (frozen-contract additive; format-change skill) |
+| T1 | `ErasureRequest`/`RewriteRecord` protos, codecs, key-layout doc, property tests | ravel-commit, proto/ | — | high (frozen-contract additive; format-change skill) |
 | T2 | Resolver: `del/` listing, `RewriteRecord` supersession in snapshot resolution, predicate attach | ravel-catalog | T1 | high (visibility correctness) |
 | T3 | Scan-time predicate filters, all three signals, post-cache | ravel-query, ravel-server fetchers | T1 | medium |
 | T4 | Rewrite pass: decode-filter-reencode (RSEG/RLOG/RSPAN), conservation gate, publish, completion verify, legal-hold gate | ravel-maintain, ravel-segment/logseg codec use | T1, T2 | high (rides solo in its wave) |
