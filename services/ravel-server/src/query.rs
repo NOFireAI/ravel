@@ -7,7 +7,7 @@ use ravel_cache::Cache;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::http::{AppState, TenantResolver};
-use ravel_query::{CacheFetchError, EngineConfig, QueryEngine};
+use ravel_query::{CacheFetchError, EngineConfig, QueryAdmissionController, QueryEngine};
 use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
 
 /// The per-query `stats` object attached beside a query response's data
@@ -107,6 +107,7 @@ pub fn build_app_state(
     cache: Option<Arc<Cache<CacheFetchError>>>,
     engine_config: EngineConfig,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
+    query_admission: Arc<QueryAdmissionController>,
 ) -> AppState {
     let mut engine = QueryEngine::new(catalog, store, engine_config);
     if let Some(cache) = cache {
@@ -114,8 +115,12 @@ pub fn build_app_state(
     }
     // Fold every completed Prometheus-shaped query into the same process
     // aggregator the SQL and analytics paths use (ADR-0044 section 4, issue
-    // #425), so `/metrics` covers PromQL read traffic too.
-    AppState::new(Arc::new(engine), tenant_resolver).with_cost_recorder(query_accounting)
+    // #425), so `/metrics` covers PromQL read traffic too. The shared query
+    // concurrency controller (ADR-0061 decision 2) gates every handler before
+    // it resolves or fetches.
+    AppState::new(Arc::new(engine), tenant_resolver)
+        .with_cost_recorder(query_accounting)
+        .with_query_admission(query_admission)
 }
 
 /// Default per-tenant SQL memory ceiling: 1 GiB across a tenant's concurrent
@@ -147,6 +152,7 @@ pub fn build_sql_state(
     cache: Option<Arc<Cache<CacheFetchError>>>,
     engine_config: EngineConfig,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
+    query_admission: Arc<QueryAdmissionController>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SqlConfig, SqlExecutor};
@@ -181,6 +187,7 @@ pub fn build_sql_state(
         clock: Arc::new(ravel_ingest::SystemClock),
         max_deadline,
         query_accounting,
+        query_admission,
     })
 }
 
@@ -221,6 +228,7 @@ mod catalog_cache_tests {
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
         );
         assert_eq!(
             state.engine.config().max_bytes_scanned,
@@ -314,6 +322,7 @@ mod tests {
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
         )
         .expect("sql state builds");
 
@@ -354,6 +363,7 @@ mod tests {
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
         )
         .expect("sql state builds");
         assert_eq!(

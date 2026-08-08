@@ -40,6 +40,7 @@ use prost::Message;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
+use ravel_query::{QueryAdmissionController, QueryConcurrencyLimit};
 use ravel_sql::{FlightClock, FlightSqlConfig, FlightTicket, RavelFlightSqlService};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{
@@ -213,6 +214,9 @@ async fn the_ticket_deadline_is_bounded_by_the_gc_protection_horizon() {
         },
         Arc::clone(&harness.store),
         Arc::new(NoopQueryCostRecorder),
+        ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
     );
 
     let ticket = harness
@@ -308,6 +312,9 @@ async fn do_get_bounds_a_stalled_read_to_the_gc_horizon_not_the_tickets_own_dead
         },
         Arc::clone(&harness.store),
         Arc::new(NoopQueryCostRecorder),
+        ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
     );
 
     let ticket = harness
@@ -894,4 +901,85 @@ async fn a_flight_statement_folds_its_cost_into_the_recorder() {
         total_requests > 0,
         "the flight query read the catalog and a segment, so the summed folds must record > 0 s3 requests"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Fleet-global query concurrency ceiling (ADR-0061 decision 2, issue #725)
+// ---------------------------------------------------------------------------
+
+/// `get_flight_info_statement` is gated by the shared concurrency controller;
+/// `do_get_statement` is deliberately not. With a ceiling of 1, a
+/// `GetFlightInfo` issued while the single slot is already held is rejected with
+/// `RESOURCE_EXHAUSTED` before it resolves or plans, while redeeming a ticket
+/// minted earlier (when there was headroom) still streams -- the redemption path
+/// must not reject work that was already admitted and planned.
+#[tokio::test]
+async fn get_flight_info_is_gated_but_do_get_is_not() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let mut harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+
+    let controller = QueryAdmissionController::shared(QueryConcurrencyLimit::Bounded(1));
+    harness.service = RavelFlightSqlService::new(
+        Arc::clone(&harness.executor),
+        TestAuth::new(&[("acme", &tenant)]),
+        Arc::clone(&harness.clock) as Arc<dyn FlightClock>,
+        FlightSqlConfig {
+            max_deadline: Duration::from_secs(30),
+            ..FlightSqlConfig::default()
+        },
+        Arc::clone(&harness.store),
+        Arc::new(NoopQueryCostRecorder),
+        Arc::clone(&controller),
+    );
+
+    // With headroom, GetFlightInfo is admitted and mints a redeemable ticket.
+    // Its own permit is released when the RPC returns.
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("admitted while the ceiling has headroom");
+    assert_eq!(
+        controller.in_flight(),
+        0,
+        "the GetFlightInfo permit released on return"
+    );
+
+    // Fill the single slot, simulating another GetFlightInfo in flight. The next
+    // GetFlightInfo must be rejected before it resolves or plans.
+    let held = controller.try_admit().expect("hold the one slot");
+    assert_eq!(controller.in_flight(), 1);
+    let err = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect_err("at the ceiling, GetFlightInfo is rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "the concurrency rejection surfaces as RESOURCE_EXHAUSTED, got {err:?}"
+    );
+
+    // do_get is NOT gated: the earlier ticket redeems and streams even though the
+    // ceiling is now full (the held slot is still occupied).
+    let batches = harness
+        .do_get("acme", &ticket)
+        .await
+        .expect("do_get redeems an already-admitted ticket without an admission check");
+    assert!(
+        !batches.is_empty(),
+        "the redeemed ticket streamed the query's rows"
+    );
+    assert_eq!(
+        controller.in_flight(),
+        1,
+        "do_get neither acquired nor released a slot"
+    );
+
+    // Releasing the held slot restores admission for the next GetFlightInfo.
+    drop(held);
+    assert_eq!(controller.in_flight(), 0);
+    harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("a freed slot admits the next GetFlightInfo");
 }

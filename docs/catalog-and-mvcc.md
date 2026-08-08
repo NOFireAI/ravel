@@ -25,12 +25,36 @@ sys/qualification                                                       store qu
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
+admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
 ```
 
 The compaction/retention key shapes (ADR-0018, ADR-0019;
 docs/compaction-retention-plan.md §3.1) and the selective-erasure key shapes
 (`rw.` rewrite records and the `del/` request/completion prefix, ADR-0064) are
 additive: existing keys and their meaning are untouched.
+
+`admission/query/<process_id>.snapshot` (ADR-0061 §2) is the fleet-global
+query concurrency ceiling's keyspace. Each query-serving process writes its
+current in-flight query count to the single key named by its own stable
+process id and reads every sibling's key under the `admission/query/` prefix,
+computing a fleet-wide reconciled total the local admission check enforces
+against (the ADR-0057 count-cap reconciliation pattern, reused for a query
+resource). It is deliberately a **root-level** key, outside any tenant's
+`t/<tenant_hash>/` space and carrying no tenant dimension at all, because the
+ceiling is fleet-global rather than per-tenant: the resource it bounds is
+aggregate query fan-out across all tenants, which has no single tenant to scope
+under — unlike ADR-0057's ingest admission snapshot, which is per-(tenant,
+signal) and lives under `t/<tenant_hash>/<signal>/admission/`. The key is
+owned exclusively by the one process that names it, so it is written with a
+plain `Overwrite` (no CAS, no concurrent writer to race); a stale or missing
+snapshot is self-correcting on the next reconciliation interval and, past the
+`2R` staleness window, is treated as contributing zero rather than trusted. The
+body is a small JSON object (`format_version`, `in_flight`, `snapshot_unix_ns`)
+rather than a protobuf message, because the keyspace is owned entirely by
+`ravel-query`'s query-admission module, single-writer per key and ephemeral, so
+its body is an internal contract of that module rather than a cross-crate frozen
+format. Nothing deletes these snapshots (staleness detection replaces a sweep),
+so no role holds a delete grant for the prefix.
 
 `sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
 additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.

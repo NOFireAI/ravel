@@ -686,7 +686,7 @@ role holds a delete grant for it to need denying.
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["t/*/*/c/*", "t/*/catalog/*/*"]
+          "s3:prefix": ["t/*/*/c/*", "t/*/catalog/*/*", "admission/query/*"]
         }
       }
     },
@@ -700,6 +700,7 @@ role holds a delete grant for it to need denying.
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/admission/query/*",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/gc"
@@ -714,6 +715,7 @@ role holds a delete grant for it to need denying.
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
+        "arn:aws:s3:::my-ravel-bucket/admission/query/*",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy"
       ]
     },
@@ -738,6 +740,27 @@ role holds a delete grant for it to need denying.
 segment data directly (footer-first ranged reads) once Phase 1 resolve has
 found the relevant commit records under `c/*` — `c/*` alone names the
 records, it is not the data those records point at.
+
+`QueryList`/`QueryRead`/`QueryWrite` also carry `admission/query/*` — a
+bucket-**root** prefix, not under any `t/<hash>/` tenant prefix. This is the
+fleet-global query concurrency ceiling's keyspace (ADR-0061 decision 2,
+`admission/query/<process_id>.snapshot`): each query-serving process writes its
+own in-flight query count to its own key (PutObject) and lists/reads its
+siblings' keys (ListBucket/GetObject) to compute the fleet-wide share the local
+admission check enforces against, on the same ADR-0057 reconciliation pattern
+the ingest admission uses. It is deliberately root-scoped rather than
+tenant-scoped because the ceiling is fleet-global, not per-tenant: the resource
+being bounded is aggregate query fan-out across all tenants, which has no single
+tenant to scope under. This is distinct from the per-tenant ingest admission
+grant `t/<hash>/<sig>/admission/*` above, which only Gateway holds: that one
+reconciles ingest active-series/rate caps and is never touched by the query
+path. Query (and the query half of `--mode all`) holds the `admission/query/*`
+grant because reconciliation for the query ceiling is wired only in the
+query-serving modes. Like the ingest admission keyspace, `admission/query/*` is
+not one of ADR-0055's six protected prefixes and is absent from
+`DenyDeleteProtected`: nothing deletes it (a stale snapshot is handled by the
+`2R` staleness window, not a sweep), so no role holds a delete grant for it to
+need denying.
 
 **Maintain:**
 

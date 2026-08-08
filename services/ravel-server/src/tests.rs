@@ -158,6 +158,9 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
         query_accounting: Arc::clone(&query_accounting),
+        query_admission: ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
     });
 
     let catalog_cache_metrics = catalog.byte_cache_metrics();

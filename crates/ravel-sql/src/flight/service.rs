@@ -39,6 +39,7 @@ use futures::StreamExt;
 use prost::Message;
 use ravel_maintain::{QueryStatus, write_query_audit};
 use ravel_object_store::ObjectStoreBackend;
+use ravel_query::QueryAdmissionController;
 use ravel_types::TenantHash;
 use ravel_types::accounting::{QueryAccounting, QueryCostRecorder, QueryWorkloadClass};
 use tonic::metadata::MetadataMap;
@@ -95,6 +96,13 @@ pub struct RavelFlightSqlService {
     /// read surfaces sum into one `ravel_query_*` family. Defaults to the no-op
     /// so an embedding with no aggregator needs no branch.
     recorder: Arc<dyn QueryCostRecorder>,
+    /// The fleet-global query concurrency ceiling (ADR-0061 decision 2), shared
+    /// with the PromQL and HTTP SQL surfaces so the process holds one honest
+    /// in-flight count across every transport. `get_flight_info_statement`
+    /// acquires a permit before it resolves or plans; `do_get_statement` does
+    /// not (it redeems an already-admitted, already-planned ticket -- see that
+    /// method).
+    query_admission: Arc<QueryAdmissionController>,
 }
 
 impl RavelFlightSqlService {
@@ -115,6 +123,7 @@ impl RavelFlightSqlService {
         config: FlightSqlConfig,
         store: Arc<dyn ObjectStoreBackend>,
         recorder: Arc<dyn QueryCostRecorder>,
+        query_admission: Arc<QueryAdmissionController>,
     ) -> Self {
         let mut ticket_key = TicketKey::default();
         rand::rng().fill_bytes(&mut ticket_key);
@@ -126,6 +135,7 @@ impl RavelFlightSqlService {
             ticket_key,
             store,
             recorder,
+            query_admission,
         }
     }
 
@@ -251,6 +261,16 @@ impl FlightSqlService for RavelFlightSqlService {
 
         // Step 1: the security gate, before any catalog or plan work.
         validate(&query.query).map_err(|err| status_from_sql(&err.into(), tenant))?;
+
+        // Fleet-global concurrency admission (ADR-0061 decision 2): decide before
+        // the resolve below (and so before any GET). The permit is held for this
+        // RPC only -- through resolve and plan -- and released when it returns.
+        // `do_get_statement` is deliberately NOT gated: it redeems a ticket this
+        // RPC already admitted and planned, so gating it would double-count or
+        // wrongly reject work already in flight.
+        let _permit = self.query_admission.try_admit().map_err(|_| {
+            Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
+        })?;
 
         let now_ns = self.clock.now_ns();
         let req = sql_request(

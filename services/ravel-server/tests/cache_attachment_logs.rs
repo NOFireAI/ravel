@@ -208,6 +208,9 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
+        ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
     )
     .expect("sql state");
     // Freeze the clock so the epoch-start window resolves to an ordinary

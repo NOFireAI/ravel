@@ -366,6 +366,9 @@ async fn main() -> anyhow::Result<()> {
         admission_reconcile_interval: cli
             .parse_admission_reconcile_interval()
             .context("failed to parse --admission-reconcile-interval")?,
+        query_concurrency_limit: cli
+            .parse_query_concurrency_limit()
+            .context("failed to parse --max-concurrent-queries")?,
         scrub_period: cli
             .parse_scrub_period()
             .context("failed to parse --scrub-period")?,

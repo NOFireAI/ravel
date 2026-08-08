@@ -83,6 +83,7 @@ async fn start_with_mtls(
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
         admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
         scrub_period: std::time::Duration::from_secs(7 * 86_400),
         indexed_fields: Default::default(),
         disable_cache: false,

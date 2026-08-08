@@ -252,6 +252,9 @@ fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, Tena
         query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
+        query_admission: ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
     })
 }
 
