@@ -203,6 +203,15 @@ pub enum ProvisioningError {
     /// named format family; an empty name governs nothing.
     #[error("cannot raise a format floor for an empty family (ADR-0066 decision 3)")]
     FloorFamilyEmpty,
+    /// `raise_format_floor` was called with a `family` containing an uppercase
+    /// character. `family` is a lowercase format-family id and lookup is an
+    /// exact string match, so an uppercase raise would silently create a
+    /// second, independent family rather than extending the intended one.
+    #[error(
+        "cannot raise a format floor for family {0:?}: family must be lowercase \
+         (ADR-0066 decision 3)"
+    )]
+    FloorFamilyNotLowercase(String),
     /// `raise_format_floor` was asked to raise a family's floor to a value at or
     /// below its current recorded floor. Floors are raised only, never lowered,
     /// and a re-raise to the same value records nothing new; both are refused so
@@ -299,6 +308,15 @@ pub enum FloorDefect {
     /// entry for a family has a `floor_version` at or below an earlier entry's
     /// for the same family. Floors are raised only, never lowered or repeated.
     NotIncreasing,
+    /// An entry's `family` contains an uppercase ASCII character. `family`
+    /// lookup is an exact string match ([`current_floor`]), so `"RSEG"` and
+    /// `"rseg"` would silently be two independent families rather than one
+    /// mistyped raise -- enforced here rather than left as a documented-only
+    /// convention, since a case mismatch is easy to introduce by hand and hard
+    /// to notice (it fails safe, as a missing floor, not as a wrong one, but
+    /// it still means the wrong record answers "has this family's floor been
+    /// raised").
+    NotLowercase,
 }
 
 impl std::fmt::Display for FloorDefect {
@@ -309,6 +327,10 @@ impl std::fmt::Display for FloorDefect {
             FloorDefect::NotIncreasing => {
                 "a family's floor_version is not strictly increasing across the history \
                  (floors are raised only)"
+            }
+            FloorDefect::NotLowercase => {
+                "a format-floor entry's family contains an uppercase character (family is a \
+                 lowercase format-family id)"
             }
         };
         f.write_str(s)
@@ -1206,6 +1228,9 @@ pub fn read_floors(
         if f.family.is_empty() {
             return Err(corrupt(FloorDefect::EmptyFamily));
         }
+        if f.family.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(corrupt(FloorDefect::NotLowercase));
+        }
         if f.floor_version == 0 {
             return Err(corrupt(FloorDefect::ZeroFloor));
         }
@@ -1319,7 +1344,8 @@ pub async fn current_floor_from_store(
 /// existing byte of history.
 ///
 /// Enforced fail-closed before any write:
-/// - `family` must be non-empty ([`ProvisioningError::FloorFamilyEmpty`]);
+/// - `family` must be non-empty ([`ProvisioningError::FloorFamilyEmpty`]) and
+///   lowercase ([`ProvisioningError::FloorFamilyNotLowercase`]);
 /// - the record must already exist ([`ProvisioningError::NoRecordForFloor`]);
 /// - the record's version, (tenant, signal), and existing floor history must
 ///   decode and validate ([`read_floors_checked`]) — a record misfiled under
@@ -1344,6 +1370,11 @@ pub async fn raise_format_floor(
 ) -> Result<FloorRaiseOutcome, ProvisioningError> {
     if family.is_empty() {
         return Err(ProvisioningError::FloorFamilyEmpty);
+    }
+    if family.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(ProvisioningError::FloorFamilyNotLowercase(
+            family.to_string(),
+        ));
     }
     let key = provisioning_key(tenant_hash, signal);
 
@@ -2747,6 +2778,9 @@ mod tests {
         expect_defect(&base(vec![ff("", 5)]), FloorDefect::EmptyFamily);
         // Zero floor_version.
         expect_defect(&base(vec![ff(RSEG, 0)]), FloorDefect::ZeroFloor);
+        // Uppercase family: family lookup is an exact string match, so this
+        // would silently be a second family rather than RSEG.
+        expect_defect(&base(vec![ff("RSEG", 5)]), FloorDefect::NotLowercase);
 
         // A valid interleaved history of two families decodes cleanly.
         let ok = base(vec![ff(RSEG, 5), ff(RLOG, 2), ff(RSEG, 6), ff(RLOG, 3)]);
@@ -2815,6 +2849,31 @@ mod tests {
         .expect_err("an empty family must be refused");
         assert!(
             matches!(err, ProvisioningError::FloorFamilyEmpty),
+            "got: {err}"
+        );
+    }
+
+    /// An uppercase family is refused up front, before any store touch: family
+    /// lookup is an exact string match, so an uppercase raise would silently
+    /// create a second, independent family rather than extending the intended
+    /// one.
+    #[tokio::test]
+    async fn raise_floor_rejects_uppercase_family() {
+        let store = mem();
+        seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            "RSEG",
+            5,
+            "job",
+            100,
+        )
+        .await
+        .expect_err("an uppercase family must be refused");
+        assert!(
+            matches!(err, ProvisioningError::FloorFamilyNotLowercase(ref f) if f == "RSEG"),
             "got: {err}"
         );
     }

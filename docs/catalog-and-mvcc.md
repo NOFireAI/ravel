@@ -72,7 +72,10 @@ guarantee beyond the run that created them.
 `t/<tenant_hash>/<signal>/prov` (ADR-0050 §5, EC5) is the durable
 `shard_count` provisioning record: a per-(tenant, signal) object holding
 `tenant_hash`, `signal`, `shard_count`, a `format_version` floor,
-`created_unix_ns`, and an append-only `generations` history (ADR-0052)
+`created_unix_ns`, an append-only `generations` history (ADR-0052), and an
+append-only `format_floors` history (ADR-0066 §3): per-format-family floors
+below which no live object exists for this (tenant, signal), raised only,
+never lowered, CAS-appended by `ravel_catalog::raise_format_floor`
 (proto/ravel/sys.proto `ProvisioningRecord`). It is
 written with `CreateIfAbsent` at the tenant's first write for that signal
 (`ravel_catalog::validate_or_adopt`), so a racing loser re-reads and

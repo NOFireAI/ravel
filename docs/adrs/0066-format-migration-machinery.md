@@ -175,3 +175,17 @@ High-risk tasks ride solo waves. T1/T2 first (T2 gates EH); T3 before T5; T4 bef
 2. **Spec/code contradiction**: `.claude/skills/format-change/SKILL.md` asserts "data written today must be readable by every future version" and "keep both paths", but ADR-0027/0032/0045/0054 delete old read paths pre-release; the carve-out lives only in ADR-0027 decision 7. The skill was never amended.
 3. **Stale doc pointers**: issue #450 says the review lives at `docs/reviews/adversarial/RAVEL-ADVERSARIAL-REVIEW.md` "with the five slice reports beside it" — the actual files are `RAVEL-ADVERSARIAL-REVIEW.md` and `-V2.md` at the repo root, and no slice reports exist (only `plans/`). Also `docs/adrs/README.md:52` still lists ADR-0045 as "RSPAN v2 and v3" (amended to v2/v4 by ADR-0054), and `crates/ravel-segment/src/reader.rs:3,:135` and `lib.rs:4` doc comments still say "v5 only" while the gate is v6.
 4. Minor: `CommitRecord.segment_format_version` is copied through unvalidated (`record.rs:97`); many tests hardcode `1` and nothing rejects it.
+
+## Amendment (2026-08-08): `family` is a lowercase string, not an enum
+
+T3 shipped `FormatFloor.family` as `string family = 1` (lowercase format-family
+id: `"rseg"`, `"rlog"`, `"rspan"`, mirroring each format's trailer magic),
+not the `uint32 family` enum sketched in Decision 3. Reason: by the time T3
+landed, T1/T2 had already established no typed family-naming convention —
+their `UnsupportedVersion(u16)` variants carry only a numeric version, no
+family tag — so there was no enum to be consistent with, and a free-form
+string keeps a new format family (a future signal, or a sub-format within an
+existing one) addable without a proto change, matching the additive-evolution
+discipline the rest of this record follows. Decoding enforces `family` is
+non-empty and lowercase, fail-closed on either violation, so the field is not
+an unconstrained string in practice — see `ravel_catalog::provisioning::FloorDefect`.
