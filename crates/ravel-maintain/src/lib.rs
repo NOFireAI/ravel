@@ -48,6 +48,7 @@ pub mod discover;
 pub mod error;
 pub mod gc_config;
 pub mod legal_hold;
+pub mod memo_snapshot;
 pub mod provision_audit;
 pub mod publish;
 pub mod query_audit;
@@ -80,6 +81,7 @@ pub use gc_config::{
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };
+pub use memo_snapshot::{MEMO_PREFIX, memo_key, read_all_memo_snapshots, write_memo_snapshot};
 pub use provision_audit::write_reshard_audit;
 pub use publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record,
@@ -90,7 +92,10 @@ pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite_and_publish};
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
-pub use scan::{MaintainReport, ScanReport, scan_and_compact, scan_and_maintain};
+pub use scan::{
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainReport, MemoSnapshotError, ScanReport, SeedStats,
+    scan_and_compact, scan_and_maintain,
+};
 pub use scrub::{
     CoveringPostings, ScrubBudget, ScrubCursor, ScrubResult, ScrubSlice, ScrubTarget,
     advance_cursor, per_tick_byte_budget, scrub_one_object,

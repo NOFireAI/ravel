@@ -51,6 +51,20 @@
 //! re-verify interval. The memo key is `(tenant, signal, shard, hour)`, so one
 //! process-wide memo safely spans every tenant this supervisor discovers,
 //! across ticks.
+//!
+//! That memo is also persisted durably (ADR-0065 decision 3, issue #747). On
+//! its discovery cadence [`run_loop`] writes a compact per-unit summary of the
+//! memo to `sys/maintain/memo/<process_id>`, debounced so an unchanged tick
+//! writes nothing (the debounce compares the timestamp-free snapshot body, so
+//! it piggybacks on the discovery tick and needs no dedicated timer). On
+//! startup, and whenever a membership change moves ownership of a unit to this
+//! process, the loop seeds the in-memory memo from every non-stale durable
+//! snapshot (its own previous one and siblings') for the units it now owns, so a
+//! restart or handoff warm-starts instead of rescanning the retention window
+//! cold. Every read or write here is fail-open: a fault logs and degrades to a
+//! cold start for the affected units, never blocking or crashing the loop
+//! ([`crate::maintain::seed_memo_from_snapshots`],
+//! [`crate::maintain::persist_memo_snapshot`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,8 +75,9 @@ use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
 use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
-    Clock, CompactorConfig, LegalHoldCheck, MaintainError, QUERY_AUDIT_SHARD, RetentionConfig,
-    WorkerSet, scan_and_compact, sweep_audit_retention, sweep_idempotency_markers, sweep_shard,
+    Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, LegalHoldCheck, MaintainError,
+    QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, read_all_memo_snapshots, scan_and_compact,
+    sweep_audit_retention, sweep_idempotency_markers, sweep_shard, write_memo_snapshot,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
@@ -345,8 +360,27 @@ async fn run_loop(
     // discovered tenant until shutdown (issue #280, #330). Its key includes
     // the tenant and signal, so this single instance safely spans every
     // tenant this supervisor discovers. Cold on the first tick, so that tick
-    // is a full rescan identical to the pre-memo behavior.
+    // is a full rescan identical to the pre-memo behavior -- unless warm start
+    // (below) seeds it from durable snapshots first.
     let mut memo = MaintainMemo::with_default_interval();
+
+    // Durable memo snapshot state (ADR-0065 decision 3, issue #747).
+    //
+    // `reseed` requests a warm start: seed `memo` from every non-stale durable
+    // snapshot (this process's own previous one and siblings') for the units
+    // this process now owns, before the next discovery cycle runs cold. It is
+    // set once at startup and again whenever a membership change moves ownership
+    // (the live set below changes), which is exactly when a unit may have just
+    // arrived from another worker and its terminal facts live only in that
+    // worker's snapshot.
+    //
+    // `last_memo_body` debounces the durable write: it holds the last snapshot
+    // *body* (the RLE unit/exception content, without the ever-changing
+    // timestamp header) we successfully wrote, so a tick that changed nothing
+    // writes nothing. The debounce piggybacks on the existing discovery cadence;
+    // it needs no dedicated timer.
+    let mut reseed = true;
+    let mut last_memo_body: Option<Vec<u8>> = None;
 
     // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
     // `H`, independent of the (coarser) discovery interval: the heartbeat must
@@ -382,7 +416,16 @@ async fn run_loop(
                     );
                 }
                 match worker.live_set(store.as_ref(), now).await {
-                    Ok(computed) => live_set = computed,
+                    Ok(computed) => {
+                        // A membership change may have moved ownership of a unit
+                        // to this process; request a warm start so its terminal
+                        // facts are seeded from the departing worker's snapshot
+                        // rather than rescanned cold (ADR-0065 decision 3).
+                        if computed != live_set {
+                            reseed = true;
+                        }
+                        live_set = computed;
+                    }
                     Err(err) => tracing::warn!(
                         error = %err,
                         "maintenance: worker live-set read failed; keeping the last-known live set \
@@ -391,6 +434,34 @@ async fn run_loop(
                 }
             }
             () = &mut discovery_sleep => {
+                // Warm start / handoff seeding (ADR-0065 decision 3): before a
+                // cycle runs cold, seed the memo from durable snapshots for the
+                // units this process now owns. Fail-open: a read fault logs and
+                // degrades to a cold start, never blocks the loop.
+                if reseed {
+                    match read_all_memo_snapshots(store.as_ref()).await {
+                        Ok(snapshots) => {
+                            let now = clock.now_ns();
+                            let (units, buckets) = seed_memo_from_snapshots(
+                                &mut memo, &snapshots, now, &worker, &live_set,
+                            );
+                            if buckets > 0 {
+                                tracing::info!(
+                                    seeded_units = units,
+                                    seeded_buckets = buckets,
+                                    "maintenance: warm-started memo from durable snapshots"
+                                );
+                            }
+                        }
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "maintenance: memo snapshot read failed; cold start for all units \
+                             this cycle (fail-open, ADR-0065 decision 3)"
+                        ),
+                    }
+                    reseed = false;
+                }
+
                 run_discovery_cycle(
                     store.as_ref(),
                     restrict.as_deref(),
@@ -404,6 +475,19 @@ async fn run_loop(
                     &live_set,
                 )
                 .await;
+
+                // Persist the updated memo, debounced (ADR-0065 decision 3): a
+                // tick whose terminal set and verify times are unchanged writes
+                // nothing. Fail-open: a write fault logs and retries next cycle.
+                persist_memo_snapshot(
+                    store.as_ref(),
+                    &worker,
+                    &memo,
+                    &mut last_memo_body,
+                    clock.now_ns(),
+                )
+                .await;
+
                 discovery_sleep.as_mut().reset(tokio::time::Instant::now() + jittered(interval));
             }
             _ = &mut shutdown => return,
@@ -877,6 +961,79 @@ pub async fn run_tick(
     }
 
     total
+}
+
+/// Seed `memo` from durable memo snapshots (ADR-0065 decision 3's warm start
+/// and handoff). Each snapshot is gated on ownership -- only units this process
+/// owns under `live_set` are seeded, so a departing worker's units are picked up
+/// by whichever survivor the rendezvous hash now assigns them to -- and on
+/// staleness ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]). Merging several snapshots
+/// keeps the freshest verdict per bucket. An undecodable snapshot is skipped
+/// with a debug line (fail-open: cold start for whatever it would have seeded),
+/// never a panic. Returns `(seeded_units, seeded_buckets)` summed across the
+/// snapshots, for the caller's log line.
+fn seed_memo_from_snapshots(
+    memo: &mut MaintainMemo,
+    snapshots: &[Vec<u8>],
+    now_ns: i64,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+) -> (usize, usize) {
+    let mut units = 0usize;
+    let mut buckets = 0usize;
+    for bytes in snapshots {
+        match memo.seed_from_snapshot(
+            bytes,
+            now_ns,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |tenant, signal, shard| worker.owns_unit(live_set, &tenant, signal, shard),
+        ) {
+            Ok(stats) => {
+                units += stats.seeded_units;
+                buckets += stats.seeded_buckets;
+            }
+            Err(err) => tracing::debug!(
+                error = %err,
+                "maintenance: skipping an undecodable memo snapshot (cold start for its units)"
+            ),
+        }
+    }
+    (units, buckets)
+}
+
+/// Write the memo snapshot only when its content changed since the last write
+/// (ADR-0065 decision 3's debounce). Compares the timestamp-free snapshot body
+/// against `last_body`: identical bodies mean this tick verified nothing new, so
+/// the write is skipped and the durable object left as-is. On a real change the
+/// body is framed with `now_ns` and written `Overwrite`; a write fault is logged
+/// and `last_body` left unchanged so the next cycle retries (fail-open). Returns
+/// whether a write happened (for tests and callers that count writes).
+async fn persist_memo_snapshot(
+    store: &dyn ObjectStoreBackend,
+    worker: &WorkerSet,
+    memo: &MaintainMemo,
+    last_body: &mut Option<Vec<u8>>,
+    now_ns: i64,
+) -> bool {
+    let body = memo.snapshot_body();
+    if last_body.as_deref() == Some(body.as_slice()) {
+        return false;
+    }
+    let bytes = MaintainMemo::snapshot_bytes_from_body(&body, now_ns);
+    match write_memo_snapshot(store, &worker.process_id(), bytes).await {
+        Ok(()) => {
+            *last_body = Some(body);
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "maintenance: memo snapshot write failed; retried next cycle (fail-open, \
+                 ADR-0065 decision 3)"
+            );
+            false
+        }
+    }
 }
 
 /// Up to 10% jitter over `base`, so co-started replicas' maintenance ticks do
@@ -1886,6 +2043,158 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// ADR-0065 decision 3 (issue #747): the durable memo write is debounced.
+    /// A first persist writes the snapshot object; a second persist over an
+    /// unchanged memo writes nothing (no PUT); and a persist after the memo
+    /// gained a bucket writes again. Counts PUTs through an `InstrumentedStore`
+    /// around each `persist_memo_snapshot` call so the assertion isolates the
+    /// persist's own write from the publishing/tick writes.
+    #[tokio::test]
+    async fn memo_snapshot_write_is_debounced_on_unchanged_tick() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // A tick populates the memo with the one terminal bucket.
+        run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(memo.len(), 1, "the tick memoized the terminal bucket");
+
+        let now = SystemClock.now_ns();
+        let mut last_body: Option<Vec<u8>> = None;
+
+        // First persist: writes the snapshot object (one PUT).
+        let before = store.metrics().snapshot();
+        assert!(
+            persist_memo_snapshot(&store, &worker, &memo, &mut last_body, now).await,
+            "first persist writes"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(after.put.calls - before.put.calls, 1, "one snapshot PUT");
+
+        // Second persist over the unchanged memo: writes nothing, even though
+        // the timestamp advanced (debounce compares the timestamp-free body).
+        let before = store.metrics().snapshot();
+        assert!(
+            !persist_memo_snapshot(&store, &worker, &memo, &mut last_body, now + 1_000_000).await,
+            "an unchanged memo persists nothing"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(
+            after.put.calls - before.put.calls,
+            0,
+            "the debounced tick issues no PUT"
+        );
+
+        // A memo change writes again: here the terminal set emptied (as it
+        // would after the bucket was swept), so the body differs from the last
+        // written one and the debounce lets the write through.
+        let emptied = MaintainMemo::with_default_interval();
+        let before = store.metrics().snapshot();
+        assert!(
+            persist_memo_snapshot(&store, &worker, &emptied, &mut last_body, now + 2_000_000).await,
+            "a changed memo persists again"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(
+            after.put.calls - before.put.calls,
+            1,
+            "the changed memo re-writes"
+        );
+    }
+
+    /// ADR-0065 decision 3 (issue #747): warm start and ownership handoff
+    /// through real store objects. Worker A maintains a unit, memoizes its
+    /// terminal bucket, and persists a durable snapshot. Worker B -- a distinct
+    /// process that now owns the unit -- reads the snapshots back from the store
+    /// and seeds its cold memo from A's, then skips the bucket A already proved
+    /// terminal rather than cold-rescanning it.
+    #[tokio::test]
+    async fn warm_start_seeds_successor_from_predecessor_snapshot_through_store() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // Worker A warms and persists its snapshot.
+        let worker_a = solo_worker();
+        let mut memo_a = MaintainMemo::with_default_interval();
+        run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo_a,
+            &safety,
+            &worker_a,
+            &worker_a.solo_live_set(),
+        )
+        .await;
+        assert_eq!(memo_a.len(), 1);
+        let now = SystemClock.now_ns();
+        let mut last_body = None;
+        assert!(
+            persist_memo_snapshot(&store, &worker_a, &memo_a, &mut last_body, now).await,
+            "A persists its snapshot"
+        );
+
+        // Worker B (a different process id) reads the snapshots and warm-starts.
+        let worker_b = WorkerSet::with_defaults(0);
+        let live_b = worker_b.solo_live_set();
+        let snapshots = read_all_memo_snapshots(&store)
+            .await
+            .expect("read snapshots");
+        assert_eq!(snapshots.len(), 1, "A's one snapshot is on the store");
+
+        let mut memo_b = MaintainMemo::with_default_interval();
+        let (b_units, b_buckets) =
+            seed_memo_from_snapshots(&mut memo_b, &snapshots, now, &worker_b, &live_b);
+        assert_eq!(b_units, 1, "B seeds the one unit it owns from A's snapshot");
+        assert_eq!(b_buckets, 1);
+        assert_eq!(memo_b.len(), 1, "B's memo warm-started from the store");
+
+        // B's tick skips the seeded terminal bucket (no cold rescan).
+        let report = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo_b,
+            &safety,
+            &worker_b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            report.skipped_terminal, 1,
+            "B skips A's terminal bucket after a store-backed warm start"
+        );
+        assert_eq!(report.already_done, 0, "no per-bucket work redone by B");
     }
 
     /// The un-trip an operator must not read as "resolved" (ADR-0048 decision
