@@ -347,15 +347,29 @@ always safe for sealing.
 
 The incremental fold lists only the buckets for hours strictly after the
 previous fold's watermark (`incremental_buckets`, hours
-`(watermark_hour_old, watermark_hour_new]`). A compaction record (`l1.*.cmt`)
-or retention tombstone (`retire.tmb`) can be published into an hour long
-after that hour was sealed and folded into a past fold's output; because no
-later fold ever re-lists an already-folded hour, such a late record would
-otherwise never be applied to the snapshot short of a full HEAD-corruption
-rebuild. Under the single ever-rewritten part of the pre-EH design this was
-masked (the one part was recomputed every cycle). Under EH-T2's sealed parts,
-which are deliberately carried forward by reference and never rewritten, it
-must be addressed directly.
+`(watermark_hour_old, watermark_hour_new]`). A compaction record (`l1.*.cmt`),
+a retention tombstone (`retire.tmb`), or a selective-erasure rewrite record
+(`rw.*.cmt`, ADR-0064) can be published into an hour long after that hour
+was sealed and folded into a past fold's output; because no later fold ever
+re-lists an already-folded hour, such a late record would otherwise never be
+applied to the snapshot short of a full HEAD-corruption rebuild. Under the
+single ever-rewritten part of the pre-EH design this was masked (the one
+part was recomputed every cycle). Under EH-T2's sealed parts, which are
+deliberately carried forward by reference and never rewritten, it must be
+addressed directly.
+
+The rewrite-record trigger is load-bearing, not incidental: ADR-0064 §3.1
+scopes the rewrite pass to already-sealed buckets by construction, so a
+rewrite ALWAYS lands in an already-folded hour. Without this trigger, a
+folded snapshot would keep serving a rewrite's pre-erasure inputs
+indefinitely for any hour outside the reconcile window -- the input objects
+stay physically present (GET-able) until the horizon-gated sweep runs, so
+there is no NotFound-driven re-resolve to force a refresh the way a deleted
+object would provide. See the amendment note in
+docs/adrs/0064-selective-subject-erasure.md §4 for the window-width
+consequence this has for erasure specifically (the 26h default reconcile
+window is far narrower than the rewrite pass's own scope, which can target
+any sealed bucket regardless of age).
 
 Each incremental fold, after the incremental-bucket processing and before the
 part spans are cut, runs a reconcile pass over a bounded window of
@@ -378,9 +392,10 @@ already-sealed hours:
   `fold_bucket_concurrency` semaphore the incremental path uses). A bucket
   holding only immutable L0 records cannot have changed since it was folded
   (seal lemma above), so it is skipped with no record GET. Only a bucket whose
-  listing contains a compaction record or a tombstone is classified and
-  diffed. When nothing late has landed, the pass costs only the window LISTs
-  and every unchanged sealed part is still carried forward by reference.
+  listing contains a compaction record, a tombstone, or a rewrite record is
+  classified and diffed. When nothing late has landed, the pass costs only
+  the window LISTs and every unchanged sealed part is still carried forward
+  by reference.
 - **Diff and apply.** A triggered bucket is classified by the same
   commit/compaction/tombstone logic the incremental path applies
   (`Catalog::classify_bucket`), yielding what the bucket should currently
