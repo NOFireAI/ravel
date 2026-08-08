@@ -51,7 +51,9 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{
+    LogSegmentFetcher, QueryAdmissionController, QueryConcurrencyLimit, SegmentFetcher,
+};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{
     FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SqlConfig, SqlExecutor,
@@ -199,6 +201,13 @@ async fn run(args: &Args) -> Report {
         // the benchmark's own synthetic queries into the same counters a real
         // deployment reports.
         Arc::new(NoopQueryCostRecorder),
+        // This benchmark measures egress bytes with a single warm run plus
+        // timed iterations run sequentially (see below), not fleet
+        // concurrency, so it opts out of the ceiling the same way it opts
+        // out of cost recording above.
+        Arc::new(QueryAdmissionController::new(
+            QueryConcurrencyLimit::Unlimited,
+        )),
     );
 
     // One warm run per path establishes the deterministic byte counts and
