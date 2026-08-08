@@ -16,6 +16,7 @@ t/<tenant_hash>/m/maint/<shard>/cursor                                    adviso
 t/<tenant_hash>/<signal>/del/<request_id>.dreq                          erasure request (CreateIfAbsent, immutable; ADR-0064)
 t/<tenant_hash>/<signal>/del/<request_id>.done                          erasure completion (CreateIfAbsent, immutable, PII-free; ADR-0064)
 t/<tenant_hash>/<signal>/prov                                           shard_count provisioning record (write-once, additive; ADR-0050 §5)
+t/<tenant_hash>/enc                                                     per-tenant KMS key-epoch record (CAS append-only, additive; ADR-0062 §1b)
 t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
@@ -69,6 +70,31 @@ append-only; the shard-index domain of hour `h` is `0..scan_count(h)`
 history is immutable, and the scalar `shard_count` field stays equal to
 generation 0's count. Readers derive the per-hour shard fan-out from the
 history via `ravel_catalog::scan_count` rather than a single static count.
+
+`t/<tenant_hash>/enc` (ADR-0062 §1b, epic EL) is the durable per-tenant
+KMS key-epoch record: a tenant-scoped object (not per-signal, since a
+tenant's KMS key applies across every signal) holding `tenant_hash`, a
+`format_version` floor, `created_unix_ns`, and an append-only `epochs`
+history, each epoch `{epoch, key_arn (empty = deployment default),
+activated_ns}` (proto/ravel/sys.proto `KeyEpochRecord`/`KeyEpoch`). It is a
+wholly new additive object type; ADR-0062 authorizes it, no existing layout
+changes and no version bump is required. The first time a tenant's key is
+configured or changed, one epoch is appended
+(`ravel_catalog::record_key_epoch`): epoch 0 is bootstrapped with
+`CreateIfAbsent` (a racing loser surfaces a typed CAS conflict and re-reads,
+the `ProvisioningRecord` first-write precedent), and every later rotation is
+appended under `CasVersion` with an `activated_ns` strictly past the last and
+a `key_arn` different from the last (the `append_generation` reshard pattern).
+Every existing byte of history is immutable. Because data objects are
+immutable, every object's write time locates it in exactly one epoch, so
+"which key encrypts what" is answerable from the bucket alone;
+`ravel-cli maintain verify-custody` uses `ravel_catalog::epoch_for_write` to
+flag any live object whose write time predates the tenant's first recorded
+epoch as a custody anomaly. A tenant with no `enc` record has only ever used
+the deployment default key, which is not an error (`read_epochs_from_store`
+returns `Ok(None)`). This record is durable audit metadata only; it is not
+read on the live write path (the routing decorator carries the active key),
+so a slightly stale reader cannot misroute a write.
 
 - `keyhash32` (idempotency marker keys only, ADR-0051 §5): 32 lowercase hex
   chars, the first 16 bytes of `blake3("ravel-idem-v1" || tenant_id ||
