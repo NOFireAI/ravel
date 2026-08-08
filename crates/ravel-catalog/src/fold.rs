@@ -830,7 +830,43 @@ impl Catalog {
                     // replace exactly this bucket's entries, leave every other
                     // entry untouched, and mark the hour dirty.
                     entries.retain(|e| !(e.shard == *shard && e.ingest_hour_bucket == *hour));
-                    entries.extend(desired);
+                    // `seen`'s cached indices go stale the instant `entries`
+                    // is mutated by anything other than `fold_in_entry` (the
+                    // `retain` above shifts every later index); rebuild it
+                    // from the post-retain entries, seeded as trivially
+                    // canonical exactly like the initial seeding above, so
+                    // the fold-in below can detect a `desired` identity that
+                    // already exists elsewhere in `entries` instead of a
+                    // blind `extend`. That case is real: a commit record
+                    // physically stored under this bucket's directory but
+                    // whose own embedded `ingest_hour_bucket` names a
+                    // different hour (`classify_bucket`'s drift tolerance)
+                    // can already be present in `entries` under its true
+                    // home bucket; re-adding it unconditionally here would
+                    // insert a second occurrence of the same identity and
+                    // permanently break every later fold with
+                    // `SnapshotFormat(DuplicateEntry)`, since the reconcile
+                    // pass runs again every fold and would keep reproducing
+                    // it. `fold_in_entry` resolves the collision the same
+                    // way the incremental loop above already does: the
+                    // already-resident occurrence wins, the duplicate is
+                    // dropped and counted as layout drift, and reconciling
+                    // this bucket still proceeds rather than failing.
+                    seen = entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| (entry_identity(entry), (index, true)))
+                        .collect();
+                    for entry in desired {
+                        let is_canonical = entry.ingest_hour_bucket == *hour;
+                        fold_in_entry(
+                            &mut entries,
+                            &mut seen,
+                            &mut layout_drift_count,
+                            entry,
+                            is_canonical,
+                        );
+                    }
                     dirty_hours.insert(*hour);
                 }
             }
@@ -2965,6 +3001,131 @@ mod tests {
                 .any(|p| p.min_hour <= 10 && 10 <= p.watermark_hour),
             "a part still covers hour 10"
         );
+    }
+
+    /// The reconcile pass must never reintroduce a duplicate entry identity.
+    /// A record physically stored under one hour's directory but whose own
+    /// embedded `ingest_hour_bucket` names a different hour
+    /// (`classify_bucket`'s drift tolerance, exercised for the incremental
+    /// path by `duplicate_commit_identity_across_buckets_skips_and_advances`)
+    /// is already resident in `entries` from a past fold with no colliding
+    /// copy anywhere. When a LATER compaction lands in that drifted record's
+    /// own physical (not embedded) bucket, the reconcile pass re-classifies
+    /// that bucket and must not blindly re-append the drifted record's
+    /// identity a second time -- doing so used to permanently break every
+    /// later fold with `SnapshotFormat(DuplicateEntry)`.
+    #[tokio::test]
+    async fn reconcile_never_reintroduces_a_drifted_duplicate() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+
+        // S: a genuine record properly placed in hour 9's directory.
+        let seg_s = publish_segment(&store, 0, Uuid::new_v4(), 1, 9, now_1 - 2 * NS_PER_HOUR).await;
+
+        // R: physically stored under hour 9's directory, but its own
+        // embedded ingest_hour_bucket names hour 10 -- a drifted record with
+        // no other physical copy anywhere. classify_bucket tolerates this
+        // shape (validate_expected_fields never checks the embedded hour
+        // against the physical directory).
+        let writer_r = Uuid::new_v4();
+        let record_r = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id: writer_r,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: 5,
+            content_hash: *blake3::hash(b"r").as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1,
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 1,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+            ingest_hour_bucket: 10,
+        })
+        .expect("valid record r");
+        let key_r =
+            keys::commit_key(&tenant(), Signal::Metrics, 0, 9, writer_r, 1, 1).expect("key r");
+        store
+            .put(
+                &key_r,
+                record::encode(&record_r),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put r");
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert_eq!(
+            first.entry_count, 3,
+            "S, the drifted R, and hour 11's segment all fold in with no collision"
+        );
+        assert_eq!(first.layout_drift_count, 0, "R has no colliding copy yet");
+
+        // A late compaction lands in hour 9's directory, covering S but not
+        // the drifted R (a different writer identity entirely).
+        publish_compaction(&store, 0, 9, &[&seg_s], now_1).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+            )
+            .await
+            .expect("reconcile must not fail with DuplicateEntry");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        let r_bytes = writer_r.into_bytes().to_vec();
+        assert_eq!(
+            entries.iter().filter(|e| e.writer_id == r_bytes).count(),
+            1,
+            "the drifted record R must appear exactly once, never duplicated"
+        );
+        let hour9: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 9)
+            .collect();
+        assert_eq!(
+            hour9.len(),
+            1,
+            "hour 9 now holds exactly the compacted L1 part"
+        );
+        assert_eq!(hour9[0].level, 1);
+
+        // A third fold must also succeed cleanly: the bug reproduced
+        // deterministically on every subsequent fold, not just the first.
+        let third = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(14),
+                &[],
+            )
+            .await
+            .expect("a third fold must also succeed, not fail forever");
+        assert!(!third.no_op);
     }
 
     /// A late record landing OUTSIDE the reconcile window (older than

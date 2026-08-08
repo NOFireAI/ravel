@@ -387,11 +387,19 @@ already-sealed hours:
   introduces an L1 entry suppresses postings entirely, as elsewhere.)
 
 Invariant this closes: a compaction record or retention tombstone landing in
-an already-folded hour is now eventually applied — within
-`fold_reconcile_window_hours` of its own publish — rather than never. A late
-record older than that window is deliberately not picked up: a stated,
-bounded staleness tradeoff, not a bug. (This closes a latent correctness gap
-that predates the epic; see ADR-0063 Consequences.)
+an already-folded hour is now eventually applied — once that hour's own
+bucket falls within `[watermark_hour_old - fold_reconcile_window_hours,
+watermark_hour_old]` on some later fold — rather than never. The window is
+on the *target hour bucket*, not on how recently the late record was
+published: a compaction landing hours after its bucket sealed is caught on
+the very next fold (this is the common case the window is sized for), while
+a retention tombstone's bucket is typically far outside the window by the
+time retention runs (tombstones normally have a retention period of days,
+so this path is legal but uncommon in practice; see
+`reconcile_applies_late_tombstone`). A late record whose bucket falls
+outside the window is deliberately not picked up: a stated, bounded
+staleness tradeoff, not a bug. (This closes a latent correctness gap that
+predates the epic; see ADR-0063 Consequences.)
 
 ## Commit sequence (strict mode)
 
