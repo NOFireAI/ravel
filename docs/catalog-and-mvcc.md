@@ -177,18 +177,13 @@ so a slightly stale reader cannot misroute a write.
   record, ADR-0064 decision 3), `retire.tmb` (tombstone, fixed name). A key in
   this prefix matching none of these shapes is a fail-loud error (surfaced to
   metrics), never silently skipped: layout drift must be visible, not
-  swallowed. (Implementation note: `keys::partition_bucket_entry` does not yet
-  classify the `rw.` shape, so a live rewrite record today parses as neither
-  compaction nor commit and every caller's actual behavior differs by call
-  site, not uniformly fail-loud:
-  `crates/ravel-catalog/src/catalog.rs` and `crates/ravel-maintain/src/read.rs`
-  (`list_bucket`) both hard-error via `?`, but `crates/ravel-catalog/src/fold.rs`
-  catches the error and silently skips the entry with a warning instead --
-  the dangerous case, since a silently-skipped rewrite record's supersession
-  of the erased inputs is ignored by the index fold, letting erased records
-  reappear in a folded snapshot. Wiring `partition_bucket_entry` and all
-  three call sites is tracked as EJ follow-up work, not part of the
-  ADR-0064 T1 record/codec surface.)
+  swallowed. `keys::partition_bucket_entry` classifies all four shapes, so
+  every caller handles a rewrite record explicitly rather than by wildcard.
+  This matters most in `crates/ravel-catalog/src/fold.rs`: the fold treats an
+  unrecognized shape as layout drift and skips it with a warning, so an
+  unclassified `rw.` key would have had its supersession of the erased inputs
+  ignored by the index fold, letting erased records reappear in a folded
+  snapshot.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per

@@ -1700,6 +1700,14 @@ impl Catalog {
             }
         }
 
+        // Sibling-rewrite alarm, raised through the same helper snapshot
+        // resolution uses. The fold is the path that matters most here: a
+        // rewrite always lands in an already-sealed bucket (ADR-0064 §3.1),
+        // and once that hour is folded, a query is served from the snapshot
+        // without ever calling `process_bucket`, so this is the only place the
+        // conflict would ever be observed for the ordinary case.
+        self.check_rewrite_siblings(shard, hour, &rewrite_records, &superseded_records);
+
         // Compaction parts: contribute each non-superseded record's parts as
         // level-1 entries. Two records with different input sets in one
         // bucket both contribute (a harmless overlap the resolver alarms on
