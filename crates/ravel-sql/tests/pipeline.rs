@@ -158,6 +158,7 @@ async fn build_snapshot(
         Snapshot {
             segments,
             segments_pruned: 0,
+            pending_erasure: Vec::new(),
         },
     )
 }
@@ -579,6 +580,7 @@ async fn mid_scan_get_failure_is_typed_error_and_fault_fires() {
     let snapshot = Snapshot {
         segments: vec![seg],
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     };
 
     let backend: Arc<dyn ObjectStoreBackend> = store.clone();

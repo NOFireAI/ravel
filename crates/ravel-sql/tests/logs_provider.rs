@@ -240,6 +240,7 @@ async fn scan_prunes_by_ts_and_word_returns_exact_rows() {
     let snapshot = Snapshot {
         segments: vec![ref_a, ref_b, ref_c],
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     };
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
     let fetcher = LogSegmentFetcher::new(store);
@@ -343,6 +344,7 @@ async fn stream_attr_equality_is_resolved_by_the_residual() {
     let snapshot = Snapshot {
         segments: vec![seg],
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     };
     let provider = LogsTableProvider::new(
         snapshot,
@@ -529,6 +531,7 @@ async fn residual_recheck_keeps_resource_only_stream_attr_match() {
     let snapshot = Snapshot {
         segments: vec![seg],
         segments_pruned: 0,
+        pending_erasure: Vec::new(),
     };
     let provider = LogsTableProvider::new(
         snapshot,

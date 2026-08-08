@@ -418,6 +418,7 @@ async fn build_corpus(objects: &[ObjSpec]) -> (Arc<MemoryStore>, Snapshot) {
         Snapshot {
             segments,
             segments_pruned: 0,
+            pending_erasure: Vec::new(),
         },
     )
 }

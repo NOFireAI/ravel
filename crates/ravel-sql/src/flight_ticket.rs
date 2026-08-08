@@ -485,6 +485,7 @@ impl FlightTicket {
                 .map(SegmentPin::to_segment_ref)
                 .collect(),
             segments_pruned: 0,
+            pending_erasure: Vec::new(),
         }
     }
 }

@@ -309,17 +309,19 @@ async fn epoch_window_issues_object_bounded_requests() {
 
     // Per-bucket = one LIST per (shard, hour) bucket = 5000 for a 5000-hour
     // window. Prefix = one page per page_size(1000) objects + terminal =
-    // floor(50/1000)+1 = 1. Independent of the 4950 empty buckets.
+    // floor(50/1000)+1 = 1. Independent of the 4950 empty buckets. Each resolve
+    // also issues exactly one `del/` LIST for pending erasure (ADR-0064
+    // decision 2), so both paths carry a +1.
     assert_eq!(
         log_pb.count(),
-        5000,
-        "per-bucket loop issues one LIST per bucket (window width in hours)"
+        5001,
+        "per-bucket loop issues one LIST per bucket (window width in hours) plus the del/ LIST"
     );
     assert_eq!(
         log_px.count(),
-        1,
-        "prefix scan issues O(objects/page_size) LISTs; here 50 objects at \
-         page_size 1000 = 1 page, versus the per-bucket loop's {}",
+        2,
+        "prefix scan issues O(objects/page_size) LISTs plus the del/ LIST; here 50 objects at \
+         page_size 1000 = 1 page + 1 del/ LIST, versus the per-bucket loop's {}",
         log_pb.count()
     );
 }
@@ -409,11 +411,12 @@ async fn prefix_scan_paginates_across_page_boundaries() {
     assert_eq!(snap_pb, snap_px, "pagination must not change the result");
     assert_eq!(snap_px.segments.len(), 5, "all five records returned");
     // 5 commit objects at page_size 2: floor(5/2)+1 = 3 pages for the one
-    // shard subtree.
+    // shard subtree, plus one `del/` LIST per resolve for pending erasure
+    // (ADR-0064 decision 2) = 4.
     assert_eq!(
         log.count(),
-        3,
-        "prefix scan drained the shard subtree across page boundaries"
+        4,
+        "prefix scan drained the shard subtree across page boundaries, plus the del/ LIST"
     );
 }
 

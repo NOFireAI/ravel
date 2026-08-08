@@ -1,5 +1,6 @@
 //! Catalog errors (docs/catalog-and-mvcc.md).
 
+use ravel_commit::erasure::ErasureError;
 use ravel_commit::keys::{KeyError, ReconstructionError};
 use ravel_commit::record::RecordError;
 use ravel_object_store::StoreError;
@@ -109,4 +110,41 @@ pub enum CatalogError {
         "HEAD format_version {format_version} is newer than this process understands; upgrade this process (it must not rebuild and overwrite a newer HEAD)"
     )]
     UnsupportedHeadVersion { format_version: u32 },
+    /// A selective-erasure request (`.dreq`) failed protobuf decode or
+    /// structural validation while resolving pending predicates (ADR-0064
+    /// decision 2). Fatal: a corrupt request object is layout drift, never
+    /// silently skipped, so it surfaces the resolve as an error rather than
+    /// silently dropping an erasure predicate a query must honor.
+    #[error("erasure request at {key:?} failed to decode/validate: {source}")]
+    ErasureRequestDecode {
+        key: String,
+        #[source]
+        source: ErasureError,
+    },
+    /// A rewrite record (`rw.<hash16>.cmt`) failed protobuf decode or
+    /// structural validation (ADR-0064 decision 3). Fatal: a live rewrite
+    /// record whose supersession a resolve cannot read could resurrect erased
+    /// records, so this is never silently skipped.
+    #[error("rewrite record at {key:?} failed to decode/validate: {source}")]
+    RewriteRecordDecode {
+        key: String,
+        #[source]
+        source: ErasureError,
+    },
+    /// A rewrite record's `superseded_record_key` chain exceeded the resolver's
+    /// depth bound (ADR-0064 decision 3, amended: a rewrite may supersede a
+    /// prior rewrite recursively). A chain this long is either corruption or a
+    /// pathological write pattern; the resolver refuses it as a typed error
+    /// rather than looping unboundedly. `bucket` names where it was observed.
+    #[error(
+        "rewrite record supersession chain in bucket {bucket:?} exceeded the max depth of {max}"
+    )]
+    RewriteSupersessionChainTooDeep { bucket: String, max: usize },
+    /// A rewrite record's `superseded_record_key` chain forms a cycle
+    /// (ADR-0064 decision 3). Two rewrite records naming each other, or a
+    /// longer loop, would otherwise spin forever; the resolver detects the
+    /// revisit and fails with this typed error. `key` is the record key first
+    /// revisited.
+    #[error("rewrite record supersession cycle detected at key {key:?}")]
+    RewriteSupersessionCycle { key: String },
 }

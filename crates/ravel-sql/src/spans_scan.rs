@@ -562,6 +562,7 @@ mod tests {
         let snapshot = Snapshot {
             segments: vec![seg.clone()],
             segments_pruned: 0,
+            pending_erasure: Vec::new(),
         };
         let provider = SpansTableProvider::new(snapshot, fetcher.clone(), EngineConfig::default());
 

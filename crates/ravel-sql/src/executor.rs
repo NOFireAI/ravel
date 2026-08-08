@@ -495,6 +495,7 @@ impl SqlExecutor {
             Snapshot {
                 segments: Vec::new(),
                 segments_pruned: 0,
+                pending_erasure: Vec::new(),
             },
             tenant_hash,
             self.fetcher.clone(),

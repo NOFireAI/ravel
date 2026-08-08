@@ -412,7 +412,13 @@ async fn referenced_identities(
             Ok(BucketEntry::CommitRecord(pk)) => {
                 out.insert((pk.writer_id, pk.epoch, pk.seq));
             }
-            Ok(BucketEntry::CompactionRecord(_) | BucketEntry::Tombstone(_)) => {}
+            // Only L0 commit identities are collected; a compaction, rewrite
+            // (ADR-0064), or tombstone record names none.
+            Ok(
+                BucketEntry::CompactionRecord(_)
+                | BucketEntry::RewriteRecord(_)
+                | BucketEntry::Tombstone(_),
+            ) => {}
             Err(err) => {
                 return Err(anyhow::anyhow!(
                     "unknown commit-prefix key shape {}: {err}",

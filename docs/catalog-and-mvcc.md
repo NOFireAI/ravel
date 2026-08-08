@@ -488,21 +488,41 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      those are dropped client-side.
    Both traversals then partition the keys identically (step 2 onward).
 2. Partition the listed keys by shape (L0 commit record, compaction
-   record, tombstone; ADR-0018, ADR-0019, docs/compaction-retention-plan.md
-   §3.5). A key matching none of the three shapes is a fail-loud error, not
-   a skip. Decode all records. Cache decoded records keyed by FULL object
-   key; validate tenant_hash/signal/shard fields against the expected
-   values on every hit; bound the cache per tenant. Records are immutable
-   and never invalidated, except: observing a tombstone for a bucket
-   invalidates that bucket's cached commit and compaction records (the
-   trigger ADR-0010 §10 promises).
+   record, selective-erasure rewrite record, tombstone; ADR-0018, ADR-0019,
+   ADR-0064, docs/compaction-retention-plan.md §3.5). A key matching none of
+   the four shapes is a fail-loud error, not a skip. Decode all records.
+   Cache decoded records keyed by FULL object key; validate
+   tenant_hash/signal/shard fields against the expected values on every hit;
+   bound the cache per tenant. Records are immutable and never invalidated,
+   except: observing a tombstone for a bucket invalidates that bucket's
+   cached commit and compaction records (the trigger ADR-0010 §10 promises).
 3. Tombstone present: the bucket contributes nothing to the snapshot.
-   Otherwise, for each compaction record present: include its parts as
-   segment refs, filtered by per-part event bounds against the query
-   range; exclude exactly the L0 records named in its input list; include
-   any L0 record not named in an input list normally, and raise an
-   interlock-violation metric if its created_unix_ns postdates the
-   compaction record (it should have been sealed before compaction ran).
+   Otherwise, build ONE unified exclusion mechanism over the bucket
+   (ADR-0064 unifies rewrite supersession with compaction's, rather than
+   running two parallel mechanisms):
+   - An `excluded` set of L0 identities `(writer_id, writer_epoch,
+     writer_seq)`, and a `superseded_records` set of whole compaction/rewrite
+     record keys whose output parts are superseded.
+   - Each **compaction record** contributes its input list to `excluded`.
+   - Each **rewrite record** contributes its *effective* inputs to `excluded`
+     exactly as a compaction record does: its own `inputs` when set, or --
+     when it names a `superseded_record_key` instead -- the inputs of the
+     compaction/rewrite record that key names, chased through any
+     rewrite-of-a-rewrite chain until a record with `inputs` set directly is
+     reached (a bounded, cycle-checked walk; an over-deep or cyclic chain is
+     a typed error, never a hang). Every record a rewrite supersedes as a
+     whole is added to `superseded_records`.
+   - Include each compaction record's parts and each rewrite record's output
+     parts as segment refs, filtered by per-part event bounds, UNLESS that
+     record's key is in `superseded_records`. A superseded record's parts are
+     never included: overlap harmlessness does NOT hold across a rewrite
+     (the rewrite's output deliberately lacks records its predecessor's parts
+     contain, so including both would resurrect erased records; ADR-0064
+     decision 3 point 5). Rewrite output parts fold in as L1-equivalent
+     entries, keyed by the rewrite's own `input_set_hash`.
+   - Include any L0 record not in `excluded` normally, and raise an
+     interlock-violation metric if its created_unix_ns postdates the newest
+     compaction/rewrite record (it should have been sealed before that ran).
    Two compaction records in one bucket with different input_set_hash:
    include both parts sets and all L0s not covered by either (correct
    under overlap harmlessness; ADR-0018), and alarm loudly (§3.6 row 11).
@@ -514,13 +534,33 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    holds). Absent: fall back to GETting the bucket's compaction record(s)
    (cacheable, same as step 2) and check the token's writer identity
    against each record's input list. Found in an input list: satisfied via
-   that record's parts. A tombstone present for the bucket: satisfied with
-   zero segments (the data was retired, not lost). Neither found after one
-   retry: error `unsatisfiable token`, surfaced as 5xx.
-6. Snapshot = the resulting segment set, pinned for the query lifetime;
-   later commits, compactions, or deletions do not affect a running query.
-   A store NotFound on a pinned segment surfaces as SnapshotInvalidated;
-   the frontend re-resolves and retries the query once (ADR-0010 §11).
+   that record's parts. A rewrite record (ADR-0064) is treated the same:
+   if the token's identity is among a live (non-superseded) rewrite's
+   effective inputs, it is satisfied via that rewrite's erased output parts,
+   and a rewrite-superseded compaction record's parts are never served. A
+   tombstone present for the bucket: satisfied with zero segments (the data
+   was retired, not lost). Neither found after one retry: error
+   `unsatisfiable token`, surfaced as 5xx.
+6. Attach pending selective-erasure predicates (ADR-0064 decision 2). Once
+   per resolve -- independent of the per-bucket fan-out and of whether any
+   physical rewrite has run -- LIST `t/<th>/<sig>/del/` exactly once. For
+   every `.dreq` erasure request found, decode and structurally validate it
+   and verify its observed key against its own identity fields (ADR-0010 §7),
+   then attach it to the snapshot's `pending_erasure`. `.done` completion
+   records (PII-free audit evidence, no predicate) are recognized and
+   skipped; any other shape under `del/` is fail-loud layout drift. The
+   directory is empty for the common no-erasure case, costing exactly one
+   LIST and nothing more. This delivers the visibility bound: a `.dreq`
+   durable before a resolve is always seen by that resolve, so a query whose
+   snapshot resolves after the request ack can never return matching records
+   -- attachment depends on nothing a later rewrite pass does. The scan /
+   materialization layer (EJ-T3) is what filters query results against these
+   predicates; resolution only discovers and attaches them.
+7. Snapshot = the resulting segment set plus `pending_erasure`, pinned for
+   the query lifetime; later commits, compactions, rewrites, erasure
+   requests, or deletions do not affect a running query. A store NotFound on
+   a pinned segment surfaces as SnapshotInvalidated; the frontend re-resolves
+   and retries the query once (ADR-0010 §11).
 
 `SegmentRef` carries a level discriminator. L0 refs keep the existing
 commit-record provenance fields. L1 part refs carry (ingest_hour,

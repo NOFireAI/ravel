@@ -319,6 +319,7 @@ mod tests {
         let snapshot = Snapshot {
             segments: Vec::new(),
             segments_pruned: 0,
+            pending_erasure: Vec::new(),
         };
         let provider =
             crate::spans_provider::SpansTableProvider::new(snapshot, fetcher, SqlConfig::default());

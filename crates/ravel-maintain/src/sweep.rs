@@ -69,7 +69,7 @@ use prost::Message;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::CompactionRecord;
+use ravel_proto::commit::v1::{CompactionRecord, RewriteRecord};
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
@@ -298,7 +298,13 @@ async fn referenced_l0_identities(
             Ok(BucketEntry::CommitRecord(pk)) => {
                 out.insert((pk.writer_id, pk.epoch, pk.seq));
             }
-            Ok(BucketEntry::CompactionRecord(_) | BucketEntry::Tombstone(_)) => {}
+            // Only L0 commit identities are collected here; a compaction,
+            // rewrite (ADR-0064), or tombstone record contributes none.
+            Ok(
+                BucketEntry::CompactionRecord(_)
+                | BucketEntry::RewriteRecord(_)
+                | BucketEntry::Tombstone(_),
+            ) => {}
             Err(KeyError::UnknownBucketEntryShape(k)) => {
                 return Err(MaintainError::UnknownBucketEntry(k));
             }
@@ -523,6 +529,17 @@ async fn bucket_reference_map(
                     set.insert(keys::reconstruct_l1_part_key(&record, part)?);
                 }
             }
+            // A selective-erasure rewrite record (ADR-0064 decision 3) names
+            // live L1 output parts exactly as a compaction record does. They
+            // must be marked referenced, or the unreferenced-part GC would
+            // delete an erased subject's surviving rewritten data.
+            BucketEntry::RewriteRecord(_) => {
+                let record = get_rewrite_record(store, key).await?;
+                let set = referenced.entry(record.ingest_hour_bucket).or_default();
+                for part in &record.parts {
+                    set.insert(keys::reconstruct_rewrite_part_key(&record, part)?);
+                }
+            }
             BucketEntry::Tombstone(pk) => {
                 tombstoned.insert(pk.ingest_hour_bucket);
             }
@@ -693,6 +710,17 @@ async fn get_compaction_record(
     let record = CompactionRecord::decode(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
     keys::verify_compaction_record_key(&record, key)?;
+    Ok(record)
+}
+
+/// GET, decode, validate, and key-verify a rewrite record (ADR-0064 decision
+/// 3, ADR-0010 §7). `decode_rewrite` also re-verifies the record's own
+/// `input_set_hash` and `superseded_record_key` bucket-match on decode.
+async fn get_rewrite_record(store: &dyn ObjectStoreBackend, key: &str) -> Result<RewriteRecord> {
+    let got = store.get(key, GetRange::Full).await?;
+    let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref())
+        .map_err(|e| MaintainError::Invariant(format!("rewrite record decode failed: {e}")))?;
+    keys::verify_rewrite_record_key(&record, key)?;
     Ok(record)
 }
 

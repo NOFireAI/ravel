@@ -1,6 +1,7 @@
 //! Resolved snapshot types (docs/catalog-and-mvcc.md "Snapshot resolution",
 //! "MVCC rules").
 
+use ravel_proto::commit::v1::ErasureRequest;
 use uuid::Uuid;
 
 /// Which storage level a [`SegmentRef`] names
@@ -82,7 +83,12 @@ pub struct SegmentRef {
 /// compaction record's `created_unix_ns` in the provenance position and,
 /// since it has no writer identity, `input_set_hash` then `part_index` as
 /// its final tiebreaks in place of `writer_id`/`writer_epoch`/`writer_seq`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `Eq` is deliberately not derived: [`Snapshot::pending_erasure`] holds
+/// `ErasureRequest` protobuf messages, which prost derives `PartialEq` but
+/// not `Eq` for. `PartialEq` is all any caller needs (assertions, dedup
+/// checks); nothing keys a `HashSet`/`BTreeMap` on a whole `Snapshot`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Snapshot {
     pub segments: Vec<SegmentRef>,
     /// Snapshot-sourced segments excluded by postings-based pruning
@@ -93,4 +99,19 @@ pub struct Snapshot {
     /// whole window; never counts listing- or `min_token`-sourced segments,
     /// which are never pruned.
     pub segments_pruned: u64,
+    /// Pending selective-erasure predicates for this (tenant, signal),
+    /// discovered by one LIST of `t/<th>/<sig>/del/` per resolve (ADR-0064
+    /// decision 2, EJ-T2). Every durable `.dreq` observed at resolve time is
+    /// decoded, its observed key verified against its own identity fields
+    /// (ADR-0010 §7), and attached here. Empty for the common case of a
+    /// (tenant, signal) with no pending erasure.
+    ///
+    /// This task only *discovers and attaches* the predicates. The scan /
+    /// materialization layer (EJ-T3) is what filters matching series, rows,
+    /// and spans out of query results against these predicates; nothing here
+    /// filters. The visibility bound (ADR-0064 decision 2) is delivered by
+    /// this attachment being unconditional: a `.dreq` durable before a
+    /// resolve is always seen by that resolve, before any physical rewrite
+    /// has run.
+    pub pending_erasure: Vec<ErasureRequest>,
 }
