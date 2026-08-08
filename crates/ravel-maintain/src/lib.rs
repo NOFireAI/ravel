@@ -58,6 +58,7 @@ pub mod rspan_codec;
 pub mod scan;
 pub mod scrub;
 pub mod sweep;
+pub mod worker_set;
 
 pub use audit_pipeline::{AuditEvent, AuditPipeline, NoopQueryAuditSink, QueryAuditSink};
 pub use bucket::Bucket;
@@ -97,3 +98,4 @@ pub use sweep::{
     sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_superseded,
     sweep_unreferenced_parts,
 };
+pub use worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};

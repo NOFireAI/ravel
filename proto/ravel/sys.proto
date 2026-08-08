@@ -252,6 +252,39 @@ message AdmissionUsageSnapshot {
   sfixed64 snapshot_unix_ns = 6;
 }
 
+// One maintain-role process's periodic self-owned liveness heartbeat for
+// worker membership (ADR-0065 decision 1, epic EI). Written to
+// `sys/maintain/workers/<process_id>` with PutMode::Overwrite: the key has
+// exactly one writer (the owning process), so there is no concurrent writer to
+// race and no CAS. Every heartbeat interval H (default 60s) each maintain
+// process writes its own snapshot here and lists the prefix to compute the live
+// worker set; a sibling whose heartbeat_unix_ns is older than 3*H at read time
+// is treated as gone and its owned work is taken over (ADR-0065 decision 1).
+// Advisory and reconstructible: losing it costs at most one membership-
+// staleness window of duplicated (idempotent) work, never correctness. This is
+// membership/ownership, deliberately not a lease (the existing LeaseCheck trait
+// is the unrelated GC reader-protection gate; ADR-0065 decision 1).
+//
+// Its own top-level message, sharing no field number with the markers above.
+message WorkerHeartbeat {
+  // Format floor: the minimum reader version that understands this record,
+  // matching the guard every other sys/ message uses. A sibling advertising a
+  // higher version is skipped (treated as absent) rather than misread. = 1.
+  uint32 format_version = 1;
+  // The writing process's UUID (16 bytes). Redundant with the <process_id> in
+  // the object key, carried here too so a snapshot is self-describing; the
+  // reader takes identity from the key.
+  bytes process_id = 2;
+  // This process's clock when it first started. Informational (fleet age and
+  // debugging); never used for the liveness decision, which reads
+  // heartbeat_unix_ns below.
+  sfixed64 started_unix_ns = 3;
+  // This process's clock at write time, for the 3*H staleness check on the
+  // reading side (a sibling older than 3*H is treated as gone, ADR-0065
+  // decision 1).
+  sfixed64 heartbeat_unix_ns = 4;
+}
+
 // The per-tenant key-epoch record at `t/<tenant_hash>/enc` (ADR-0062
 // decision 1b, epic EL). Tenant-scoped, not per-signal: a tenant's KMS key
 // applies across every signal, so this object sits directly under the tenant
