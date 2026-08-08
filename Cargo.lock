@@ -4400,6 +4400,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "hex",
+ "proptest",
  "prost",
  "rand 0.10.2",
  "ravel-object-store",
