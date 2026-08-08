@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use ravel_object_store::fault::{FaultPlan, FaultStore};
 use ravel_object_store::instrument::{StoreErrorClass, StoreOp};
+use ravel_object_store::kms_routing::KmsRoutingStore;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{MULTIPART_THRESHOLD, S3Config, S3Store};
 use ravel_object_store::{
@@ -25,6 +26,7 @@ use ravel_object_store::{
     MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions,
     PutOutcome, StoreError, UploadChecksum, list_all,
 };
+use std::sync::Arc;
 
 /// Runs every contract assertion against `store`. Each assertion gets its
 /// own key sub-prefix under `root` so they can share one backend instance
@@ -997,6 +999,37 @@ async fn memory_store_paged_contract() {
 async fn fault_store_empty_plan_contract() {
     let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
     run_contract_suite(&store, "fault-empty").await;
+}
+
+/// `KmsRoutingStore` must be as transparent as `InstrumentedStore` above when
+/// no tenant key is configured: every operation the suite drives is unrouted
+/// (no `t/`-scoped key in the suite names a configured tenant), so it all
+/// falls through to the default store and every contract assertion --
+/// capability check included -- must hold identically with the decorator in
+/// the path. This does not exercise the per-tenant routing branch itself
+/// (see `kms_routing`'s own unit tests for that); it proves the boundary the
+/// decorator sits on is not silently altered for the common case where no
+/// tenant has opted into per-tenant SSE-KMS.
+#[tokio::test]
+async fn kms_routing_store_contract_with_no_configured_tenants() {
+    let store = KmsRoutingStore::new(Arc::new(MemoryStore::new()), test_s3_config());
+    run_contract_suite(&store, "kms-routing-unconfigured").await;
+}
+
+/// An `S3Config` shape sufficient to construct a [`KmsRoutingStore`] in tests
+/// that never build a per-tenant store (no tenant key is ever configured, so
+/// the fields here are never dereferenced against a live endpoint).
+fn test_s3_config() -> S3Config {
+    S3Config {
+        bucket: "ravel-test".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://localhost:0".to_string()),
+        access_key_id: "test".to_string(),
+        secret_access_key: "test".to_string(),
+        allow_http: true,
+        force_path_style: true,
+        kms_key_id: None,
+    }
 }
 
 /// The instrumentation decorator must be transparent (issue #272): every
