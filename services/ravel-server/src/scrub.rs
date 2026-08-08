@@ -33,10 +33,18 @@
 //! retention, and the GC sweep already are (`crate::maintain`, gated on
 //! [`Mode::Maintain`](crate::config::Mode::Maintain)). Running it in an
 //! ingest- or query-serving process would burn `O(corpus bytes / P)` sustained
-//! read bandwidth on a process whose job is the hot path, and the persisted
-//! per-shard cursor assumes a single writer, which the Maintain-only gating
-//! guarantees (one maintain process per deployment). So this task is spawned in
-//! exactly the same mode the maintenance loop is, and nowhere else.
+//! read bandwidth on a process whose job is the hot path. So this task is
+//! spawned in exactly the same mode the maintenance loop is, and nowhere
+//! else.
+//!
+//! ADR-0065 makes the Maintain role N-replica, so the persisted per-shard
+//! cursor no longer has a true single writer: two processes can both own a
+//! shard briefly during a membership transition, or both fall back to
+//! `{self}` during a live-set read outage (worker_set.rs), and both
+//! `Overwrite` the same cursor. This is not a correctness hazard -- a missing
+//! or corrupt cursor is treated as "start over," and a racing overwrite costs
+//! at most a re-scrubbed slice, never wrong or missing coverage -- but it is
+//! no longer a true single-writer invariant, just a benign racing overwrite.
 //!
 //! # Detection only, never repair
 //!
@@ -351,6 +359,13 @@ pub async fn run_cycle(
             // (tenant, signal), skip the covering-postings load and the
             // seal-divergence tier too rather than pay their reads for work it
             // will not do.
+            // A degenerate `scan_shards == 0` (no valid shard_count/generation
+            // configured for this tenant, which should not happen in a valid
+            // deployment) also skips the seal-divergence tier below, since it
+            // is checked for shard 0 ownership specifically after this loop
+            // and this `continue` never lets that check run. Narrow and
+            // harmless (there is nothing to verify with zero shards), but
+            // worth naming: this early exit did not exist pre-ADR-0065.
             let owns_any =
                 (0..scan_shards).any(|shard| worker.owns_unit(live_set, tenant, signal, shard));
             if !owns_any {
@@ -668,7 +683,8 @@ async fn run_shard_tick(
 /// `maint/` control prefix (`t/<hash>/<sig>/maint/scrub/<shard>.cursor`) so it
 /// falls under the Maintain role's existing `t/*/*/maint/*` IAM grant
 /// (ADR-0055) with no new prefix, alongside the compactor's own advisory scan
-/// cursor. Single writer per shard, guaranteed by the Maintain-mode gating.
+/// cursor. Not a true single writer under ADR-0065's N-replica Maintain role
+/// (see the module docs); a racing overwrite is benign.
 fn cursor_key(tenant: &TenantHash, signal: Signal, shard: u32) -> String {
     format!(
         "t/{}/{}/maint/scrub/{:04}.cursor",
@@ -726,9 +742,10 @@ async fn load_cursor(
     }
 }
 
-/// Persist the advanced cursor (overwrite; single writer per shard). A write
-/// failure is logged and left for the next tick to retry: the worst case is one
-/// shard re-scrubbing the same slice, never a correctness problem.
+/// Persist the advanced cursor (overwrite; a racing overwrite from another
+/// owner is benign, see the module docs). A write failure is logged and left
+/// for the next tick to retry: the worst case is one shard re-scrubbing the
+/// same slice, never a correctness problem.
 async fn persist_cursor(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,

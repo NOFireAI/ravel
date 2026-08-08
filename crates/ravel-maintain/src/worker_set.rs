@@ -135,12 +135,26 @@ pub fn owns(unit_key: &[u8], process_id: Uuid, live_set: &[Uuid]) -> bool {
     owner(unit_key, live_set) == Some(process_id)
 }
 
-/// Whether a sibling heartbeat is stale at read time: older than the liveness
-/// window. Exactly the window old is still live (inclusive on the fresh side);
-/// a future-dated heartbeat (negative age from clock skew) is treated as live,
-/// the same fail-open direction ADR-0057 uses.
+/// Whether a sibling heartbeat is stale at read time: further than the
+/// liveness window from `now_ns` in EITHER direction. Exactly the window old
+/// (or young) is still live (inclusive on the fresh side).
+///
+/// A far-future-dated heartbeat is excluded, not treated as live. This is the
+/// opposite of ADR-0057's admission-control fail-open direction, and
+/// deliberately so: there, a future-dated phantom sibling only *adds* to a
+/// conservative sum, so treating it as live costs nothing but a slightly
+/// wider self-throttle. Here, a live-forever phantom process_id can *win* the
+/// rendezvous argmax for a unit and never relinquish it, permanently starving
+/// every real worker of that unit's maintenance -- the opposite of ADR-0065's
+/// stated direction ("a stale worker is treated as gone... the overlap is
+/// idempotent"), which wants MORE claimants on doubt, not fewer. Excluding an
+/// implausible heartbeat (whether corrupt, future-version, or impossibly
+/// future-dated) is the one direction that is safe under every other
+/// exclusion this module already makes.
 fn is_stale(now_ns: i64, heartbeat_unix_ns: i64, liveness_window_ns: i64) -> bool {
-    now_ns.saturating_sub(heartbeat_unix_ns) > liveness_window_ns
+    let too_old = now_ns.saturating_sub(heartbeat_unix_ns) > liveness_window_ns;
+    let too_future = heartbeat_unix_ns.saturating_sub(now_ns) > liveness_window_ns;
+    too_old || too_future
 }
 
 /// Run `f` over `items` with at most `concurrency` futures in flight,
@@ -482,6 +496,53 @@ mod tests {
         // One nanosecond past 3*H: excluded.
         let live = a.live_set(&store, 3 * H_NS + 1).await.expect("live set");
         assert!(!live.contains(&b.process_id()), "past 3*H is stale");
+        assert_eq!(live, vec![a.process_id()], "only self survives");
+    }
+
+    /// A far-future-dated heartbeat (clock skew, or a stuck writer that wrote
+    /// its own future timestamp) must be excluded exactly like a far-past one,
+    /// not treated as live forever. A live-forever phantom can win the
+    /// rendezvous argmax for a unit and never relinquish it, permanently
+    /// starving every real worker of that unit -- the opposite of a fail-open
+    /// direction, since fail-open here means MORE claimants on doubt, not a
+    /// single unkillable one.
+    #[test]
+    fn future_dated_sibling_is_excluded_at_three_h() {
+        // Symmetric to `stale_sibling_is_excluded_at_three_h`: exactly 3*H in
+        // the future is still live (inclusive), one nanosecond past that is
+        // excluded.
+        assert!(
+            !is_stale(0, 3 * H_NS, 3 * H_NS),
+            "exactly 3*H in the future is still live"
+        );
+        assert!(
+            is_stale(0, 3 * H_NS + 1, 3 * H_NS),
+            "past 3*H in the future must be excluded, not treated as live forever"
+        );
+    }
+
+    /// The same exclusion, exercised through `live_set` end to end: a sibling
+    /// whose stored heartbeat is impossibly far in the future never appears
+    /// in the reader's live set, so it can never win ownership of any unit.
+    #[tokio::test]
+    async fn future_dated_sibling_never_wins_ownership() {
+        let store = MemoryStore::new();
+        let a = worker(0);
+        let phantom = worker(0);
+
+        // The phantom's heartbeat claims a timestamp far past the liveness
+        // window into the future relative to every real reader's clock.
+        phantom
+            .write_heartbeat(&store, 100 * H_NS)
+            .await
+            .expect("phantom heartbeat");
+        a.write_heartbeat(&store, 0).await.expect("a heartbeat");
+
+        let live = a.live_set(&store, 0).await.expect("live set");
+        assert!(
+            !live.contains(&phantom.process_id()),
+            "a far-future-dated heartbeat must not read as live"
+        );
         assert_eq!(live, vec![a.process_id()], "only self survives");
     }
 
