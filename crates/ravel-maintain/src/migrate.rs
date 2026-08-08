@@ -494,8 +494,17 @@ pub async fn migrate_family(
     // walk finishing and now -- including a still-unsealed one the walk could
     // not migrate -- is counted here and refuses the raise, so a floor is never
     // asserted over a stale audit (EM-T10).
+    // Re-resolve the shard range too, for the same reason the audit itself is
+    // re-run: `scan_shards` was resolved before a walk that can run for a long
+    // time, and resharding is online (ADR-0052 section 3 has no quiescence
+    // requirement), so a generation appended during the walk is invisible to
+    // that stale value. Auditing the old, narrower range would come back clean
+    // while stragglers sit in a shard it never listed, and the floor would be
+    // raised over an under-scanned audit. The range is a max over an
+    // append-only generation list, so re-resolving can only widen it.
+    let verify_shards = scan_shard_count(store, &tenant_hash, signal, configured_shards).await?;
     let (l0_below, l1_below) =
-        count_below_target(store, &tenant_hash, signal, scan_shards, target_version).await?;
+        count_below_target(store, &tenant_hash, signal, verify_shards, target_version).await?;
     if l0_below + l1_below > 0 {
         report.verification = Some(Verification::Stragglers {
             l0: l0_below,
@@ -547,10 +556,17 @@ mod tests {
     //! (a drained walk with no stragglers raises the floor and a subsequent
     //! audit finds nothing below it).
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use bytes::Bytes;
     use ravel_commit::keys;
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, ListPage, ObjectMeta, ObjectStoreBackend,
+        PageToken, PutOptions, PutOutcome,
+    };
     use ravel_segment::{
         IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V6,
     };
@@ -892,6 +908,256 @@ mod tests {
                 .await
                 .expect("re-audit");
         assert_eq!((l0_below, l1_below), (0, 0));
+    }
+
+    /// What an [`InjectingStore`] writes when it fires, i.e. what "lands"
+    /// during the window between the walk finishing and the re-audit reading.
+    #[derive(Debug, Clone, Copy)]
+    enum Injection {
+        /// A below-target commit record in the already-walked shard 0.
+        Straggler,
+        /// An online reshard (ADR-0052) widening the tenant to two shards, plus
+        /// a below-target commit record in the newly added shard 1.
+        ReshardWithStragglerInNewShard,
+    }
+
+    /// When an [`InjectingStore`] fires, expressed as a listing call the driver
+    /// makes at a known point. The two listing methods separate the two phases
+    /// cleanly: the walk reaches for `list_delimited` (its per-shard hour
+    /// listing) and for `list` on the strictly longer per-hour bucket prefix,
+    /// while `count_below_target` is the only caller that `list`s exactly the
+    /// commit *shard* prefix.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Trigger {
+        /// The first `list_delimited` of the shard prefix: the walk's own hour
+        /// listing, so the write lands while the walk is still running.
+        DuringWalk,
+        /// The first `list` of exactly the shard prefix: the opening read of
+        /// the verification re-audit, so the write lands strictly after the
+        /// walk finished and before the re-audit has read anything.
+        AfterWalk,
+    }
+
+    /// A store decorator that performs `injection` exactly once, immediately
+    /// before the listing call named by `trigger` is served. This gives a
+    /// genuine interleaving rather than a pre-seeded stand-in: the injected
+    /// state does not exist while the earlier phase runs.
+    struct InjectingStore {
+        inner: Arc<MemoryStore>,
+        trigger_prefix: String,
+        trigger: Trigger,
+        injection: Injection,
+        fired: AtomicBool,
+    }
+
+    impl InjectingStore {
+        fn new(
+            inner: Arc<MemoryStore>,
+            trigger_prefix: String,
+            trigger: Trigger,
+            injection: Injection,
+        ) -> Self {
+            InjectingStore {
+                inner,
+                trigger_prefix,
+                trigger,
+                injection,
+                fired: AtomicBool::new(false),
+            }
+        }
+
+        /// Run the injection if `op` is the configured trigger, `prefix`
+        /// matches, and it has not already fired.
+        async fn maybe_fire(&self, op: Trigger, prefix: &str) {
+            if op != self.trigger
+                || prefix != self.trigger_prefix
+                || self.fired.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            let inner = self.inner.as_ref();
+            match self.injection {
+                Injection::Straggler => {
+                    seed_at(inner, 0, 105, 42, "straggler", VERSION_V6 as u32 - 1).await;
+                }
+                Injection::ReshardWithStragglerInNewShard => {
+                    ravel_catalog::append_generation(
+                        inner,
+                        &tenant_hash(),
+                        Signal::Metrics,
+                        2,
+                        1,
+                        0,
+                    )
+                    .await
+                    .expect("append shard generation mid-flight");
+                    seed_at(inner, 1, 105, 43, "straggler", VERSION_V6 as u32 - 1).await;
+                }
+            }
+        }
+
+        /// Whether the injection actually ran. Asserted by every test using
+        /// this decorator, so a trigger prefix that stopped matching (a key
+        /// layout change, a different list shape) fails loudly instead of
+        /// turning the test vacuous.
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The object-store trait's own result type. Spelled out because the
+    /// crate's `Result` alias is in scope here via `use super::*`.
+    type StoreResult<T> = std::result::Result<T, StoreError>;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for InjectingStore {
+        async fn put(&self, key: &str, data: Bytes, opts: PutOptions) -> StoreResult<PutOutcome> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> StoreResult<GetOutcome> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> StoreResult<ObjectMeta> {
+            self.inner.head(key).await
+        }
+
+        async fn list(&self, prefix: &str, page: Option<PageToken>) -> StoreResult<ListPage> {
+            self.maybe_fire(Trigger::AfterWalk, prefix).await;
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> StoreResult<DelimitedList> {
+            self.maybe_fire(Trigger::DuringWalk, prefix).await;
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> StoreResult<()> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            // multipart: false to match the refusing default `put_multipart`
+            // this double inherits (issue #298); the corpora here are tiny.
+            Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    /// Race safety, the real interleaving (EM-T10's named acceptance pattern).
+    /// Unlike the pre-seeded variant above, the straggler here does not exist
+    /// while the walk runs: it is written by the store decorator at the instant
+    /// the verification re-audit issues its first list, so it lands strictly
+    /// between "the walk finished" and "the re-audit read anything". The floor
+    /// must not be raised. This is the case where a cached or walk-derived
+    /// enumeration would come back clean and CAS-append a false floor.
+    #[tokio::test]
+    async fn a_straggler_landing_after_the_walk_refuses_the_floor_raise() {
+        let inner = Arc::new(MemoryStore::new());
+        provision(inner.as_ref(), 1).await;
+        let target = VERSION_V6 as u32;
+        seed_at(inner.as_ref(), 0, 100, 1, "alpha", target).await;
+
+        let trigger =
+            keys::commit_shard_prefix(&tenant_hash(), Signal::Metrics, 0).expect("shard prefix");
+        let store = InjectingStore::new(
+            Arc::clone(&inner),
+            trigger,
+            Trigger::AfterWalk,
+            Injection::Straggler,
+        );
+
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+        let report = migrate_family(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("migrate");
+
+        assert!(
+            store.fired(),
+            "the injection never ran; the test is vacuous"
+        );
+        assert!(report.walk_complete, "the walk drained within budget");
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers { l0: 1, l1: 0 }),
+            "a record that landed after the walk must refuse the raise"
+        );
+        let floor =
+            current_floor_from_store(inner.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor");
+        assert_eq!(floor, None, "a refused verify raises no floor");
+    }
+
+    /// The verification re-audit must resolve its own shard range, not reuse
+    /// the one resolved before the walk. Resharding is online (ADR-0052), so a
+    /// generation can be appended while a walk is in flight; auditing the stale
+    /// narrower range would come back clean while stragglers sit in a shard it
+    /// never listed, and the floor would be raised over an under-scanned audit.
+    #[tokio::test]
+    async fn a_reshard_during_the_walk_widens_the_verification_audit() {
+        let inner = Arc::new(MemoryStore::new());
+        provision(inner.as_ref(), 1).await;
+        let target = VERSION_V6 as u32;
+        seed_at(inner.as_ref(), 0, 100, 1, "alpha", target).await;
+
+        let trigger =
+            keys::commit_shard_prefix(&tenant_hash(), Signal::Metrics, 0).expect("shard prefix");
+        let store = InjectingStore::new(
+            Arc::clone(&inner),
+            trigger,
+            Trigger::DuringWalk,
+            Injection::ReshardWithStragglerInNewShard,
+        );
+
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+        let report = migrate_family(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("migrate");
+
+        assert!(
+            store.fired(),
+            "the injection never ran; the test is vacuous"
+        );
+        assert!(report.walk_complete, "the walk drained within budget");
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers { l0: 1, l1: 0 }),
+            "the straggler in the shard added mid-walk must refuse the raise"
+        );
+        let floor =
+            current_floor_from_store(inner.as_ref(), &tenant_hash(), Signal::Metrics, FAMILY)
+                .await
+                .expect("read floor");
+        assert_eq!(
+            floor, None,
+            "no floor may be raised over an audit that never listed the new shard"
+        );
     }
 
     /// A completed walk must not strand later work. The skip predicate is
