@@ -118,10 +118,14 @@ impl SeriesValues {
         }
     }
 
-    fn ts_values(&self) -> Vec<i64> {
+    /// Appends this series' timestamps to `out` without allocating: `out` is
+    /// caller-owned scratch, cleared and reused across series within one
+    /// flush (issue #813).
+    fn extend_ts_values_into(&self, out: &mut Vec<i64>) {
+        out.clear();
         match self {
-            SeriesValues::Scalar(v) => v.iter().map(|s| s.ts_ns).collect(),
-            SeriesValues::Histogram(v) => v.iter().map(|s| s.ts_ns).collect(),
+            SeriesValues::Scalar(v) => out.extend(v.iter().map(|s| s.ts_ns)),
+            SeriesValues::Histogram(v) => out.extend(v.iter().map(|s| s.ts_ns)),
         }
     }
 }
@@ -274,21 +278,31 @@ impl SegmentWriter {
             u32::try_from(created_unix_ns.div_euclid(NS_PER_HOUR)).unwrap_or(0);
 
         let mut v4_series = Vec::with_capacity(series.len());
+        let mut scratch = WriteScratch::default();
         for s in series {
             let sample_count =
                 u32::try_from(s.values.len()).map_err(|_| WriteError::TooManySamples)?;
             let min_ts_ns = s.values.first_ts().unwrap_or(0);
             let max_ts_ns = s.values.last_ts().unwrap_or(0);
-            let ts_page = frame_ts_page(&s.series_id, &s.values.ts_values())?;
+            s.values.extend_ts_values_into(&mut scratch.ts_values);
+            let ts_page = frame_ts_page(&s.series_id, &scratch.ts_values, &mut scratch.payload)?;
             let value_page = match &s.values {
                 SeriesValues::Scalar(samples) => {
-                    let vals: Vec<f64> = samples.iter().map(|sm| sm.value).collect();
-                    RunValuePageV4::Scalar(frame_val_page(&s.series_id, &vals))
+                    scratch.scalar_values.clear();
+                    scratch
+                        .scalar_values
+                        .extend(samples.iter().map(|sm| sm.value));
+                    RunValuePageV4::Scalar(frame_val_page(
+                        &s.series_id,
+                        &scratch.scalar_values,
+                        &mut scratch.payload,
+                    ))
                 }
-                SeriesValues::Histogram(hist) => {
-                    let vals: Vec<HistogramValue> = hist.iter().map(|h| h.value.clone()).collect();
-                    RunValuePageV4::Histogram(frame_hist_page(&s.series_id, &vals)?)
-                }
+                SeriesValues::Histogram(hist) => RunValuePageV4::Histogram(frame_hist_page(
+                    &s.series_id,
+                    hist,
+                    &mut scratch.payload,
+                )?),
             };
             v4_series.push(SeriesInputV4 {
                 series_id: s.series_id,
@@ -316,315 +330,376 @@ impl SegmentWriter {
     }
 
     /// Builds the v4-grammar object (multi-run, run-major SERIES_META, the
-    /// compaction-provenance Footer fields), private since ADR-0027: it is
-    /// the encode core [`SegmentWriter::write_v5`] wraps, no longer a public
-    /// version of its own. Every run's TS/VAL/HIST page bytes are pre-framed
-    /// by the caller and copied verbatim, including histogram pages, which
-    /// stay an opaque per-run blob to this writer.
+    /// compaction-provenance Footer fields) and finalizes it with a v4
+    /// trailer, private since ADR-0027: it is the encode core
+    /// [`SegmentWriter::write_v5`] wraps, no longer a public version of its
+    /// own. Every run's TS/VAL/HIST page bytes are pre-framed by the caller
+    /// and copied verbatim, including histogram pages, which stay an opaque
+    /// per-run blob to this writer.
     ///
     /// Runs with `sample_count == 0` are dropped; a series left with no
     /// runs afterward is dropped in turn (mirrors the empty-series rule of
     /// the raw-sample adapters, generalized to run granularity).
+    ///
+    /// Test-only (issue #813): production now reaches the v4 grammar through
+    /// `assemble_v4_body` directly (see
+    /// [`SegmentWriter::write_v5_with_exemplars`]), which finalizes as v4 for
+    /// the sparse path's `base` input and as v6 directly otherwise. This
+    /// wrapper survives only so the v4-grammar unit tests below keep
+    /// exercising the assemble+finalize pair through one call, unchanged
+    /// from before the split.
+    #[cfg(test)]
     fn write_v4(
-        mut series: Vec<SeriesInputV4>,
+        series: Vec<SeriesInputV4>,
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
         meta: CompactionMetaV4,
         exemplars: Vec<ExemplarInput>,
     ) -> Result<WrittenSegment, WriteError> {
-        for s in &mut series {
-            s.runs.retain(|r| r.sample_count != 0);
-        }
-        series.retain(|s| !s.runs.is_empty());
+        let body = assemble_v4_body(series, identity, ingest_bounds, meta, exemplars)?;
+        Ok(finalize_v4_trailer(body, VERSION_V4))
+    }
+}
 
-        series.sort_unstable_by_key(|s| s.series_id.0);
-        if series
-            .windows(2)
-            .any(|w| w[0].series_id.0 == w[1].series_id.0)
-        {
-            return Err(WriteError::DuplicateSeriesId);
-        }
+/// The v4-grammar object body -- every section byte plus the encoded Footer
+/// -- built but not yet trailer-finalized. Splitting assembly from
+/// finalization lets [`SegmentWriter::write_v5_with_exemplars`] pick the
+/// output trailer version (6 below the sparse threshold, 4 as the sparse
+/// path's rebuild input) without assembling the body twice or computing
+/// blake3 more than once for the version it actually emits (issue #813).
+struct AssembledV4Body {
+    object: Vec<u8>,
+    footer_bytes: Vec<u8>,
+    footer_len: u32,
+    min_event_ts_ns: i64,
+    max_event_ts_ns: i64,
+    sample_count: u64,
+    series_count: u64,
+}
 
-        for s in &series {
-            u16::try_from(s.labels.len()).map_err(|_| WriteError::TooManyLabels)?;
+/// Builds every section byte and the encoded Footer for the v4 grammar,
+/// stopping short of the trailer so the caller can finalize with whichever
+/// version applies. See [`SegmentWriter::write_v4`] for the grammar this
+/// assembles (moved out of that method, unchanged, so `write_v4` and
+/// [`SegmentWriter::write_v5_with_exemplars`] share one assembly path).
+fn assemble_v4_body(
+    mut series: Vec<SeriesInputV4>,
+    identity: SegmentIdentity,
+    ingest_bounds: IngestBounds,
+    meta: CompactionMetaV4,
+    exemplars: Vec<ExemplarInput>,
+) -> Result<AssembledV4Body, WriteError> {
+    for s in &mut series {
+        s.runs.retain(|r| r.sample_count != 0);
+    }
+    series.retain(|s| !s.runs.is_empty());
 
-            let mut has_scalar = false;
-            let mut has_histogram = false;
-            for r in &s.runs {
-                match &r.value_page {
-                    RunValuePageV4::Scalar(_) => has_scalar = true,
-                    RunValuePageV4::Histogram(_) => has_histogram = true,
-                }
-            }
-            if has_scalar && has_histogram {
-                return Err(WriteError::MixedValueKindInSeries);
-            }
-        }
-
-        for s in &mut series {
-            s.runs
-                .sort_by_key(|r| (r.created_unix_ns, r.writer_epoch, r.writer_seq));
-        }
-
-        let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
-
-        let mut run_total: u32 = 0;
-        let mut sample_count: u64 = 0;
-        let mut min_event_ts_ns = i64::MAX;
-        let mut max_event_ts_ns = i64::MIN;
-        let mut base_created_unix_ns = i64::MAX;
-        for s in &series {
-            let series_run_count =
-                u32::try_from(s.runs.len()).map_err(|_| WriteError::TooManyRuns)?;
-            run_total = run_total
-                .checked_add(series_run_count)
-                .ok_or(WriteError::TooManyRuns)?;
-            for r in &s.runs {
-                sample_count = sample_count
-                    .checked_add(u64::from(r.sample_count))
-                    .ok_or(WriteError::TooManySamples)?;
-                min_event_ts_ns = min_event_ts_ns.min(r.min_ts_ns);
-                max_event_ts_ns = max_event_ts_ns.max(r.max_ts_ns);
-                base_created_unix_ns = base_created_unix_ns.min(r.created_unix_ns);
-            }
-        }
-        if series.is_empty() {
-            min_event_ts_ns = 0;
-            max_event_ts_ns = 0;
-            base_created_unix_ns = 0;
-        }
-
-        let dict = build_dictionary_v4(&series, &exemplars)?;
-
-        let mut series_index_by_id: HashMap<[u8; 16], u32> = HashMap::with_capacity(series.len());
-        for (i, s) in series.iter().enumerate() {
-            series_index_by_id.insert(s.series_id.0, i as u32);
-        }
-        let mut resolved_exemplars = Vec::with_capacity(exemplars.len());
-        let mut exemplar_attr_cursor = 0usize;
-        for e in &exemplars {
-            let series_index = *series_index_by_id
-                .get(&e.series_id.0)
-                .ok_or(WriteError::ExemplarUnknownSeries)?;
-            let mut attr_ords = Vec::with_capacity(e.attrs.len());
-            for _ in &e.attrs {
-                let name_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor];
-                let value_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor + 1];
-                exemplar_attr_cursor += 2;
-                attr_ords.push((name_ord, value_ord));
-            }
-            resolved_exemplars.push(ResolvedExemplar {
-                series_index,
-                ts_ns: e.ts_ns,
-                value: e.value,
-                trace_id: e.trace_id,
-                span_id: e.span_id,
-                attr_ords,
-            });
-        }
-        // Sort by (series_index, ts_ns) per the EXEMPLARS grammar. Equal keys
-        // are kept, not collapsed: compaction is a verbatim copy that never
-        // drops a record (crates/ravel-maintain/src/publish.rs), so two inputs
-        // each carrying an exemplar for the same series at the same timestamp
-        // must both reach the output. The reader accepts equal keys for this
-        // reason (ADR-0047 amendment 2026-08-03). `sort_by_key` is stable, so
-        // equal keys keep the caller's original order, which makes the encoded
-        // bytes a function of the input order alone. Admission-time capping is
-        // ADR-0047 decision 2 and happens earlier, on a different layer.
-        resolved_exemplars.sort_by_key(|r| (r.series_index, r.ts_ns));
-
-        let total_samples =
-            usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
-        let run_total_usize = run_total as usize;
-        let mut ts_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 4);
-        let mut val_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 9);
-        let mut hist_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 32);
-
-        let series_meta_raw = build_series_meta_v4(
-            &series,
-            &dict.occurrence_ordinals,
-            min_event_ts_ns,
-            base_created_unix_ns,
-            run_total,
-            &mut ts_pages,
-            &mut val_pages,
-            &mut hist_pages,
-        )?;
-        let series_ids_raw = encode_series_ids_v4(&series)?;
-        let label_dict_raw = encode_label_dict_v4(&dict)?;
-
-        let label_dict_compressed = zstd_compress_v4(&label_dict_raw)?;
-        let series_meta_compressed = zstd_compress_v4(&series_meta_raw)?;
-
-        let mut object = Vec::with_capacity(
-            label_dict_compressed.len()
-                + series_ids_raw.len()
-                + series_meta_compressed.len()
-                + ts_pages.len()
-                + val_pages.len()
-                + hist_pages.len()
-                + 512,
-        );
-
-        // Physical section order 1, 5, 6, 3, 4, 7 (LABEL_DICT, SERIES_IDS,
-        // SERIES_META, TS_PAGES, VAL_PAGES, HIST_PAGES), unchanged from v3
-        // (section 4: "no new section kind").
-        let label_dict_offset = object.len() as u64;
-        object.extend_from_slice(&label_dict_compressed);
-
-        let series_ids_offset = object.len() as u64;
-        object.extend_from_slice(&series_ids_raw);
-
-        let series_meta_offset = object.len() as u64;
-        object.extend_from_slice(&series_meta_compressed);
-
-        let ts_pages_offset = object.len() as u64;
-        object.extend_from_slice(&ts_pages);
-
-        let mut sections = vec![
-            Section {
-                kind: section_kind::LABEL_DICT,
-                offset: label_dict_offset,
-                len: label_dict_compressed.len() as u64,
-                crc32c: crc32c::crc32c(&label_dict_compressed),
-                comp: compression::ZSTD,
-                uncompressed_len: label_dict_raw.len() as u64,
-            },
-            Section {
-                kind: section_kind::SERIES_IDS,
-                offset: series_ids_offset,
-                len: series_ids_raw.len() as u64,
-                crc32c: crc32c::crc32c(&series_ids_raw),
-                comp: compression::NONE,
-                uncompressed_len: series_ids_raw.len() as u64,
-            },
-            Section {
-                kind: section_kind::SERIES_META,
-                offset: series_meta_offset,
-                len: series_meta_compressed.len() as u64,
-                crc32c: crc32c::crc32c(&series_meta_compressed),
-                comp: compression::ZSTD,
-                uncompressed_len: series_meta_raw.len() as u64,
-            },
-            Section {
-                kind: section_kind::TS_PAGES,
-                offset: ts_pages_offset,
-                len: ts_pages.len() as u64,
-                crc32c: crc32c::crc32c(&ts_pages),
-                comp: compression::NONE,
-                uncompressed_len: ts_pages.len() as u64,
-            },
-        ];
-
-        // VAL_PAGES: present only when at least one series is scalar-kind.
-        if !val_pages.is_empty() {
-            // 8-byte-align the VAL_PAGES section offset, unchanged from
-            // v2/v3.
-            let val_pad = (8 - (object.len() % 8)) % 8;
-            object.extend(std::iter::repeat_n(0u8, val_pad));
-            let val_pages_offset = object.len() as u64;
-            debug_assert_eq!(
-                val_pages_offset % 8,
-                0,
-                "VAL_PAGES section must be 8-byte aligned"
-            );
-            object.extend_from_slice(&val_pages);
-            sections.push(Section {
-                kind: section_kind::VAL_PAGES,
-                offset: val_pages_offset,
-                len: val_pages.len() as u64,
-                crc32c: crc32c::crc32c(&val_pages),
-                comp: compression::NONE,
-                uncompressed_len: val_pages.len() as u64,
-            });
-        }
-
-        // HIST_PAGES: present only when at least one series is
-        // histogram-kind. No alignment requirement, unchanged from v3.
-        if !hist_pages.is_empty() {
-            let hist_pages_offset = object.len() as u64;
-            object.extend_from_slice(&hist_pages);
-            sections.push(Section {
-                kind: section_kind::HIST_PAGES,
-                offset: hist_pages_offset,
-                len: hist_pages.len() as u64,
-                crc32c: crc32c::crc32c(&hist_pages),
-                comp: compression::NONE,
-                uncompressed_len: hist_pages.len() as u64,
-            });
-        }
-
-        // EXEMPLARS (kind 10, ADR-0047), RSEG v6 only: present only when at
-        // least one sample carried an exemplar (docs/segment-format.md).
-        // Physical section order 1, 5, 6, 3, 4, 7, 10.
-        if !resolved_exemplars.is_empty() {
-            let exemplars_raw = encode_exemplars_section(&resolved_exemplars, min_event_ts_ns)?;
-            let exemplars_offset = object.len() as u64;
-            object.extend_from_slice(&exemplars_raw);
-            sections.push(Section {
-                kind: section_kind::EXEMPLARS,
-                offset: exemplars_offset,
-                len: exemplars_raw.len() as u64,
-                crc32c: crc32c::crc32c(&exemplars_raw),
-                comp: compression::NONE,
-                uncompressed_len: exemplars_raw.len() as u64,
-            });
-        }
-
-        let footer = Footer {
-            tenant_hash: identity.tenant_hash.to_vec(),
-            shard: identity.shard,
-            writer_id: identity.writer_id,
-            writer_epoch: identity.writer_epoch,
-            writer_seq: identity.writer_seq,
-            min_event_ts_ns,
-            max_event_ts_ns,
-            min_ingest_ts_ns: ingest_bounds.min_ingest_ts_ns,
-            max_ingest_ts_ns: ingest_bounds.max_ingest_ts_ns,
-            sample_count,
-            series_count,
-            sections,
-            base_created_unix_ns,
-            ingest_hour_bucket: meta.ingest_hour_bucket,
-            input_set_hash: meta.input_set_hash.to_vec(),
-            part_index: meta.part_index,
-            level: meta.level,
-        };
-
-        let footer_bytes = footer.encode_to_vec();
-        let footer_len =
-            u32::try_from(footer_bytes.len()).map_err(|_| WriteError::FooterTooLarge)?;
-        object.extend_from_slice(&footer_bytes);
-
-        let crc = footer_crc(
-            &footer_bytes,
-            footer_len,
-            VERSION_V4,
-            SIGNAL_METRICS,
-            RESERVED,
-        );
-
-        object.extend_from_slice(&footer_len.to_le_bytes());
-        object.extend_from_slice(&crc.to_le_bytes());
-        object.extend_from_slice(&VERSION_V4.to_le_bytes());
-        object.push(SIGNAL_METRICS);
-        object.push(RESERVED);
-        object.extend_from_slice(&MAGIC);
-
-        let blake3 = *blake3::hash(&object).as_bytes();
-
-        Ok(WrittenSegment {
-            bytes: Bytes::from(object),
-            summary: SegmentSummary {
-                min_event_ts_ns,
-                max_event_ts_ns,
-                sample_count,
-                series_count,
-                blake3,
-            },
-        })
+    series.sort_unstable_by_key(|s| s.series_id.0);
+    if series
+        .windows(2)
+        .any(|w| w[0].series_id.0 == w[1].series_id.0)
+    {
+        return Err(WriteError::DuplicateSeriesId);
     }
 
+    for s in &series {
+        u16::try_from(s.labels.len()).map_err(|_| WriteError::TooManyLabels)?;
+
+        let mut has_scalar = false;
+        let mut has_histogram = false;
+        for r in &s.runs {
+            match &r.value_page {
+                RunValuePageV4::Scalar(_) => has_scalar = true,
+                RunValuePageV4::Histogram(_) => has_histogram = true,
+            }
+        }
+        if has_scalar && has_histogram {
+            return Err(WriteError::MixedValueKindInSeries);
+        }
+    }
+
+    for s in &mut series {
+        s.runs
+            .sort_by_key(|r| (r.created_unix_ns, r.writer_epoch, r.writer_seq));
+    }
+
+    let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+
+    let mut run_total: u32 = 0;
+    let mut sample_count: u64 = 0;
+    let mut min_event_ts_ns = i64::MAX;
+    let mut max_event_ts_ns = i64::MIN;
+    let mut base_created_unix_ns = i64::MAX;
+    for s in &series {
+        let series_run_count = u32::try_from(s.runs.len()).map_err(|_| WriteError::TooManyRuns)?;
+        run_total = run_total
+            .checked_add(series_run_count)
+            .ok_or(WriteError::TooManyRuns)?;
+        for r in &s.runs {
+            sample_count = sample_count
+                .checked_add(u64::from(r.sample_count))
+                .ok_or(WriteError::TooManySamples)?;
+            min_event_ts_ns = min_event_ts_ns.min(r.min_ts_ns);
+            max_event_ts_ns = max_event_ts_ns.max(r.max_ts_ns);
+            base_created_unix_ns = base_created_unix_ns.min(r.created_unix_ns);
+        }
+    }
+    if series.is_empty() {
+        min_event_ts_ns = 0;
+        max_event_ts_ns = 0;
+        base_created_unix_ns = 0;
+    }
+
+    let dict = build_dictionary_v4(&series, &exemplars)?;
+
+    let mut series_index_by_id: HashMap<[u8; 16], u32> = HashMap::with_capacity(series.len());
+    for (i, s) in series.iter().enumerate() {
+        series_index_by_id.insert(s.series_id.0, i as u32);
+    }
+    let mut resolved_exemplars = Vec::with_capacity(exemplars.len());
+    let mut exemplar_attr_cursor = 0usize;
+    for e in &exemplars {
+        let series_index = *series_index_by_id
+            .get(&e.series_id.0)
+            .ok_or(WriteError::ExemplarUnknownSeries)?;
+        let mut attr_ords = Vec::with_capacity(e.attrs.len());
+        for _ in &e.attrs {
+            let name_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor];
+            let value_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor + 1];
+            exemplar_attr_cursor += 2;
+            attr_ords.push((name_ord, value_ord));
+        }
+        resolved_exemplars.push(ResolvedExemplar {
+            series_index,
+            ts_ns: e.ts_ns,
+            value: e.value,
+            trace_id: e.trace_id,
+            span_id: e.span_id,
+            attr_ords,
+        });
+    }
+    // Sort by (series_index, ts_ns) per the EXEMPLARS grammar. Equal keys
+    // are kept, not collapsed: compaction is a verbatim copy that never
+    // drops a record (crates/ravel-maintain/src/publish.rs), so two inputs
+    // each carrying an exemplar for the same series at the same timestamp
+    // must both reach the output. The reader accepts equal keys for this
+    // reason (ADR-0047 amendment 2026-08-03). `sort_by_key` is stable, so
+    // equal keys keep the caller's original order, which makes the encoded
+    // bytes a function of the input order alone. Admission-time capping is
+    // ADR-0047 decision 2 and happens earlier, on a different layer.
+    resolved_exemplars.sort_by_key(|r| (r.series_index, r.ts_ns));
+
+    let total_samples = usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
+    let run_total_usize = run_total as usize;
+    let mut ts_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 4);
+    let mut val_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 9);
+    let mut hist_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 32);
+
+    let series_meta_raw = build_series_meta_v4(
+        &series,
+        &dict.occurrence_ordinals,
+        min_event_ts_ns,
+        base_created_unix_ns,
+        run_total,
+        &mut ts_pages,
+        &mut val_pages,
+        &mut hist_pages,
+    )?;
+    let series_ids_raw = encode_series_ids_v4(&series)?;
+    let label_dict_raw = encode_label_dict_v4(&dict)?;
+
+    let label_dict_compressed = zstd_compress_v4(&label_dict_raw)?;
+    let series_meta_compressed = zstd_compress_v4(&series_meta_raw)?;
+
+    let mut object = Vec::with_capacity(
+        label_dict_compressed.len()
+            + series_ids_raw.len()
+            + series_meta_compressed.len()
+            + ts_pages.len()
+            + val_pages.len()
+            + hist_pages.len()
+            + 512,
+    );
+
+    // Physical section order 1, 5, 6, 3, 4, 7 (LABEL_DICT, SERIES_IDS,
+    // SERIES_META, TS_PAGES, VAL_PAGES, HIST_PAGES), unchanged from v3
+    // (section 4: "no new section kind").
+    let label_dict_offset = object.len() as u64;
+    object.extend_from_slice(&label_dict_compressed);
+
+    let series_ids_offset = object.len() as u64;
+    object.extend_from_slice(&series_ids_raw);
+
+    let series_meta_offset = object.len() as u64;
+    object.extend_from_slice(&series_meta_compressed);
+
+    let ts_pages_offset = object.len() as u64;
+    object.extend_from_slice(&ts_pages);
+
+    let mut sections = vec![
+        Section {
+            kind: section_kind::LABEL_DICT,
+            offset: label_dict_offset,
+            len: label_dict_compressed.len() as u64,
+            crc32c: crc32c::crc32c(&label_dict_compressed),
+            comp: compression::ZSTD,
+            uncompressed_len: label_dict_raw.len() as u64,
+        },
+        Section {
+            kind: section_kind::SERIES_IDS,
+            offset: series_ids_offset,
+            len: series_ids_raw.len() as u64,
+            crc32c: crc32c::crc32c(&series_ids_raw),
+            comp: compression::NONE,
+            uncompressed_len: series_ids_raw.len() as u64,
+        },
+        Section {
+            kind: section_kind::SERIES_META,
+            offset: series_meta_offset,
+            len: series_meta_compressed.len() as u64,
+            crc32c: crc32c::crc32c(&series_meta_compressed),
+            comp: compression::ZSTD,
+            uncompressed_len: series_meta_raw.len() as u64,
+        },
+        Section {
+            kind: section_kind::TS_PAGES,
+            offset: ts_pages_offset,
+            len: ts_pages.len() as u64,
+            crc32c: crc32c::crc32c(&ts_pages),
+            comp: compression::NONE,
+            uncompressed_len: ts_pages.len() as u64,
+        },
+    ];
+
+    // VAL_PAGES: present only when at least one series is scalar-kind.
+    if !val_pages.is_empty() {
+        // 8-byte-align the VAL_PAGES section offset, unchanged from
+        // v2/v3.
+        let val_pad = (8 - (object.len() % 8)) % 8;
+        object.extend(std::iter::repeat_n(0u8, val_pad));
+        let val_pages_offset = object.len() as u64;
+        debug_assert_eq!(
+            val_pages_offset % 8,
+            0,
+            "VAL_PAGES section must be 8-byte aligned"
+        );
+        object.extend_from_slice(&val_pages);
+        sections.push(Section {
+            kind: section_kind::VAL_PAGES,
+            offset: val_pages_offset,
+            len: val_pages.len() as u64,
+            crc32c: crc32c::crc32c(&val_pages),
+            comp: compression::NONE,
+            uncompressed_len: val_pages.len() as u64,
+        });
+    }
+
+    // HIST_PAGES: present only when at least one series is
+    // histogram-kind. No alignment requirement, unchanged from v3.
+    if !hist_pages.is_empty() {
+        let hist_pages_offset = object.len() as u64;
+        object.extend_from_slice(&hist_pages);
+        sections.push(Section {
+            kind: section_kind::HIST_PAGES,
+            offset: hist_pages_offset,
+            len: hist_pages.len() as u64,
+            crc32c: crc32c::crc32c(&hist_pages),
+            comp: compression::NONE,
+            uncompressed_len: hist_pages.len() as u64,
+        });
+    }
+
+    // EXEMPLARS (kind 10, ADR-0047), RSEG v6 only: present only when at
+    // least one sample carried an exemplar (docs/segment-format.md).
+    // Physical section order 1, 5, 6, 3, 4, 7, 10.
+    if !resolved_exemplars.is_empty() {
+        let exemplars_raw = encode_exemplars_section(&resolved_exemplars, min_event_ts_ns)?;
+        let exemplars_offset = object.len() as u64;
+        object.extend_from_slice(&exemplars_raw);
+        sections.push(Section {
+            kind: section_kind::EXEMPLARS,
+            offset: exemplars_offset,
+            len: exemplars_raw.len() as u64,
+            crc32c: crc32c::crc32c(&exemplars_raw),
+            comp: compression::NONE,
+            uncompressed_len: exemplars_raw.len() as u64,
+        });
+    }
+
+    let footer = Footer {
+        tenant_hash: identity.tenant_hash.to_vec(),
+        shard: identity.shard,
+        writer_id: identity.writer_id,
+        writer_epoch: identity.writer_epoch,
+        writer_seq: identity.writer_seq,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: ingest_bounds.min_ingest_ts_ns,
+        max_ingest_ts_ns: ingest_bounds.max_ingest_ts_ns,
+        sample_count,
+        series_count,
+        sections,
+        base_created_unix_ns,
+        ingest_hour_bucket: meta.ingest_hour_bucket,
+        input_set_hash: meta.input_set_hash.to_vec(),
+        part_index: meta.part_index,
+        level: meta.level,
+    };
+
+    let footer_bytes = footer.encode_to_vec();
+    let footer_len = u32::try_from(footer_bytes.len()).map_err(|_| WriteError::FooterTooLarge)?;
+    object.extend_from_slice(&footer_bytes);
+
+    Ok(AssembledV4Body {
+        object,
+        footer_bytes,
+        footer_len,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        sample_count,
+        series_count,
+    })
+}
+
+/// Appends the trailer for `version` to an assembled body and computes the
+/// whole-object blake3 exactly once: the single finalization step for both
+/// `write_v4` (always version 4) and the direct-emit non-sparse path in
+/// [`SegmentWriter::write_v5_with_exemplars`] (version 6, no retrailer).
+fn finalize_v4_trailer(body: AssembledV4Body, version: u16) -> WrittenSegment {
+    let AssembledV4Body {
+        mut object,
+        footer_bytes,
+        footer_len,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        sample_count,
+        series_count,
+    } = body;
+
+    let crc = footer_crc(&footer_bytes, footer_len, version, SIGNAL_METRICS, RESERVED);
+
+    object.extend_from_slice(&footer_len.to_le_bytes());
+    object.extend_from_slice(&crc.to_le_bytes());
+    object.extend_from_slice(&version.to_le_bytes());
+    object.push(SIGNAL_METRICS);
+    object.push(RESERVED);
+    object.extend_from_slice(&MAGIC);
+
+    let blake3 = *blake3::hash(&object).as_bytes();
+
+    WrittenSegment {
+        bytes: Bytes::from(object),
+        summary: SegmentSummary {
+            min_event_ts_ns,
+            max_event_ts_ns,
+            sample_count,
+            series_count,
+            blake3,
+        },
+    }
+}
+
+impl SegmentWriter {
     /// Encodes RSEG v5 (docs/segment-format.md): the v4 grammar plus, when the
     /// output object carries at least [`V5_SPARSE_THRESHOLD`] series, the
     /// sparse SERIES_IDX (kind 8) and chunked SERIES_META (kind 9) sections.
@@ -635,14 +710,16 @@ impl SegmentWriter {
     /// ADR-0026's "L0 never emits v5" clause: the sparse-emission threshold,
     /// not the writer tier, protects small objects).
     ///
-    /// Implemented as a post-process over the private v4 encode core rather
-    /// than a bespoke encode path, so the v4 grammar stays a single source of
-    /// truth and the below-threshold case is provably that object with only
-    /// the trailer version bumped. Below the threshold the object is
-    /// byte-for-byte the v4-grammar object save the trailer's version field
-    /// (and the footer_crc it feeds, plus the whole-object blake3); at or
-    /// above it the sparse sections are layered on and the whole-section
-    /// SERIES_META (kind 6) is replaced by the chunked form (kind 9).
+    /// Shares the private v4 assembly core (`assemble_v4_body`) rather than a
+    /// bespoke encode path, so the v4 grammar stays a single source of truth.
+    /// Below the threshold, the core is finalized with the version-6 trailer
+    /// directly -- no intermediate v4 object, no retrailer copy, exactly one
+    /// whole-object blake3 pass (issue #813; previously a `write_v4` call
+    /// finalized as version 4 and a second pass, `retrailer_v4_to_v6`, copied
+    /// the whole object again to rewrite the trailer as version 6). At or
+    /// above the threshold, the core is finalized as version 4 (the shape
+    /// [`crate::sparse::build_sparse_object`] expects as input) and the
+    /// sparse sections are layered on from there, unchanged from before.
     pub fn write_v5(
         series: Vec<SeriesInputV4>,
         identity: SegmentIdentity,
@@ -664,80 +741,49 @@ impl SegmentWriter {
         meta: CompactionMetaV4,
         exemplars: Vec<ExemplarInput>,
     ) -> Result<WrittenSegment, WriteError> {
-        let base = Self::write_v4(series, identity, ingest_bounds, meta, exemplars)?;
-        if base.summary.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(retrailer_v4_to_v6(base));
+        let body = assemble_v4_body(series, identity, ingest_bounds, meta, exemplars)?;
+        if body.series_count < V5_SPARSE_THRESHOLD {
+            return Ok(finalize_v4_trailer(body, VERSION_V6));
         }
+        let base = finalize_v4_trailer(body, VERSION_V4);
         crate::sparse::build_sparse_object(&base)
     }
 }
 
-/// Rewrites a freshly built v4 object's trailer to declare version 6,
-/// recomputing the footer_crc (which covers the version) and the whole-object
-/// blake3. Everything before the trailer -- every section byte (including an
-/// EXEMPLARS section, when present) and the footer protobuf -- is copied
-/// verbatim, so a below-threshold v6 object differs from the v4 object only
-/// in the trailer's version field and the two derived values. This is the
-/// byte-level proof of ADR-0026's "below the threshold, a v5-grammar object
-/// is the v4 object plus a version bump", carried forward unchanged by
-/// ADR-0047's v6 bump.
-fn retrailer_v4_to_v6(base: WrittenSegment) -> WrittenSegment {
-    let obj = base.bytes.as_ref();
-    let total = obj.len();
-    // A `write_v4` result always carries the full 16-byte trailer.
-    let trailer_start = total - crate::format::TRAILER_LEN as usize;
-    let footer_len = u32::from_le_bytes([
-        obj[total - 16],
-        obj[total - 15],
-        obj[total - 14],
-        obj[total - 13],
-    ]);
-    let footer_end = trailer_start;
-    let footer_start = footer_end - footer_len as usize;
-    let footer_bytes = &obj[footer_start..footer_end];
-    let crc = footer_crc(
-        footer_bytes,
-        footer_len,
-        VERSION_V6,
-        SIGNAL_METRICS,
-        RESERVED,
-    );
-
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&obj[..footer_end]);
-    out.extend_from_slice(&footer_len.to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&VERSION_V6.to_le_bytes());
-    out.push(SIGNAL_METRICS);
-    out.push(RESERVED);
-    out.extend_from_slice(&MAGIC);
-
-    let blake3 = *blake3::hash(&out).as_bytes();
-    let mut summary = base.summary;
-    summary.blake3 = blake3;
-    WrittenSegment {
-        bytes: Bytes::from(out),
-        summary,
-    }
+/// Per-writer encode scratch reused across series within one flush (issue
+/// #813): each buffer is cleared, not reallocated, between series, so a
+/// flush of N series pays for growth once (amortized) instead of N fresh
+/// heap allocations for values extracted from samples and for page payload
+/// bytes.
+#[derive(Default)]
+struct WriteScratch {
+    ts_values: Vec<i64>,
+    scalar_values: Vec<f64>,
+    payload: Vec<u8>,
 }
 
 /// Frames one series' TS page (6-byte header + payload) into a fresh buffer
 /// for the raw-sample v5 adapters. TS_DELTA_VARINT payload, lz4-compressed
 /// only when it clears the size floor and shrinks. The returned page is
 /// copied verbatim (any alignment gap re-applied) by `append_ts_run_page_v4`.
-fn frame_ts_page(series_id: &SeriesId, ts_values: &[i64]) -> Result<Vec<u8>, WriteError> {
-    let mut payload = Vec::new();
-    encode_ts_deltas_into(&mut payload, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
+/// `payload` is caller-owned scratch (cleared here, reused across series).
+fn frame_ts_page(
+    series_id: &SeriesId,
+    ts_values: &[i64],
+    payload: &mut Vec<u8>,
+) -> Result<Vec<u8>, WriteError> {
+    payload.clear();
+    encode_ts_deltas_into(payload, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
     let enc = page_enc::TS_DELTA_VARINT;
     let compressed = if payload.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
-        let candidate = lz4_flex::compress_prepend_size(&payload);
+        let candidate = lz4_flex::compress_prepend_size(payload);
         (candidate.len() < payload.len()).then_some(candidate)
     } else {
         None
     };
     let (comp, body): (u8, &[u8]) = match &compressed {
         Some(candidate) => (page_comp::LZ4, candidate),
-        None => (page_comp::NONE, &payload),
+        None => (page_comp::NONE, payload.as_slice()),
     };
     Ok(frame_page(&series_id.0, enc, comp, body))
 }
@@ -745,10 +791,11 @@ fn frame_ts_page(series_id: &SeriesId, ts_values: &[i64]) -> Result<Vec<u8>, Wri
 /// Frames one scalar series' VAL page into a fresh buffer: Gorilla unless it
 /// fails to beat raw f64 (the raw-fallback rule). No alignment gap is applied
 /// here; `append_val_run_page_v4` inserts the VAL_RAW_F64 pad when it copies
-/// the page into the section.
-fn frame_val_page(series_id: &SeriesId, values: &[f64]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    encode_gorilla_into(values, &mut payload);
+/// the page into the section. `payload` is caller-owned scratch (cleared
+/// here, reused across series).
+fn frame_val_page(series_id: &SeriesId, values: &[f64], payload: &mut Vec<u8>) -> Vec<u8> {
+    payload.clear();
+    encode_gorilla_into(values, payload);
     let count = values.len() as u64;
     let enc = if (payload.len() as u64) >= 8 * count {
         payload.clear();
@@ -759,21 +806,27 @@ fn frame_val_page(series_id: &SeriesId, values: &[f64]) -> Vec<u8> {
     } else {
         page_enc::VAL_GORILLA
     };
-    frame_page(&series_id.0, enc, page_comp::NONE, &payload)
+    frame_page(&series_id.0, enc, page_comp::NONE, payload)
 }
 
 /// Frames one histogram series' HIST page into a fresh buffer: back-to-back
-/// HIST_SPANS records, never per-page compressed (writer policy).
-fn frame_hist_page(series_id: &SeriesId, values: &[HistogramValue]) -> Result<Vec<u8>, WriteError> {
-    let mut payload = Vec::new();
-    for value in values {
-        encode_histogram_record_into(&mut payload, value)?;
+/// HIST_SPANS records, never per-page compressed (writer policy). Borrows
+/// each sample's [`HistogramValue`] rather than cloning it (issue #813).
+/// `payload` is caller-owned scratch (cleared here, reused across series).
+fn frame_hist_page(
+    series_id: &SeriesId,
+    samples: &[HistogramSample],
+    payload: &mut Vec<u8>,
+) -> Result<Vec<u8>, WriteError> {
+    payload.clear();
+    for sample in samples {
+        encode_histogram_record_into(payload, &sample.value)?;
     }
     Ok(frame_page(
         &series_id.0,
         page_enc::HIST_SPANS,
         page_comp::NONE,
-        &payload,
+        payload,
     ))
 }
 
@@ -2543,5 +2596,827 @@ mod v4_tests {
             got, want,
             "both runs' values must survive, in on-disk order"
         );
+    }
+}
+
+/// Bit-parity acceptance test for issue #813. The direct-emit writer
+/// (`assemble_v4_body` finalized as version 6 for the non-sparse path, no
+/// retrailer, one blake3 pass; scratch-reused `frame_ts_page`/
+/// `frame_val_page`/`frame_hist_page`; a borrowed rather than cloned
+/// `HistogramValue` per sample) must produce byte-for-byte identical output,
+/// and an identical `SegmentSummary`, to the writer it replaced.
+///
+/// The reference implementation below (`old_*`) is not a re-derivation: every
+/// function is copied verbatim from the pre-#813 commit (`git show
+/// HEAD:crates/ravel-segment/src/writer.rs`, taken before this issue's
+/// changes were made), including the deleted `retrailer_v4_to_v6` and the
+/// original per-series-fresh-`Vec` `frame_*_page`/`ts_values`. A divergence
+/// here means the new assembly actually changed a byte, not that the
+/// reference drifted alongside it.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod direct_v6_emit_bit_parity {
+    use proptest::prelude::*;
+    use ravel_types::{Label, Sample};
+
+    use super::*;
+
+    fn labels(metric: &str) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    fn series_id_for(idx: u16) -> SeriesId {
+        let mut id = [0u8; 16];
+        id[0] = (idx >> 8) as u8;
+        id[1] = idx as u8;
+        SeriesId(id)
+    }
+
+    fn sample_histogram_value(seed: i32) -> HistogramValue {
+        let zero_count = 1;
+        let positive = vec![2, (seed.unsigned_abs()) as u64 + 1];
+        let count = zero_count + positive.iter().sum::<u64>();
+        HistogramValue {
+            scale: 3,
+            zero_threshold: 0.001,
+            sum: Some(f64::from(seed) + 0.5),
+            custom_values: None,
+            positive_spans: vec![crate::histogram::HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            negative_spans: vec![],
+            counts: crate::histogram::HistogramCounts::Int {
+                zero_count,
+                count,
+                positive,
+                negative: vec![],
+            },
+            reset_hint: crate::histogram::ResetHint::Unknown,
+        }
+    }
+
+    // ---- pre-#813 reference algorithm, copied verbatim ----
+
+    fn old_ts_values(values: &SeriesValues) -> Vec<i64> {
+        match values {
+            SeriesValues::Scalar(v) => v.iter().map(|s| s.ts_ns).collect(),
+            SeriesValues::Histogram(v) => v.iter().map(|s| s.ts_ns).collect(),
+        }
+    }
+
+    fn old_frame_ts_page(series_id: &SeriesId, ts_values: &[i64]) -> Result<Vec<u8>, WriteError> {
+        let mut payload = Vec::new();
+        encode_ts_deltas_into(&mut payload, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
+        let enc = page_enc::TS_DELTA_VARINT;
+        let compressed = if payload.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
+            let candidate = lz4_flex::compress_prepend_size(&payload);
+            (candidate.len() < payload.len()).then_some(candidate)
+        } else {
+            None
+        };
+        let (comp, body): (u8, &[u8]) = match &compressed {
+            Some(candidate) => (page_comp::LZ4, candidate),
+            None => (page_comp::NONE, &payload),
+        };
+        Ok(frame_page(&series_id.0, enc, comp, body))
+    }
+
+    fn old_frame_val_page(series_id: &SeriesId, values: &[f64]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        encode_gorilla_into(values, &mut payload);
+        let count = values.len() as u64;
+        let enc = if (payload.len() as u64) >= 8 * count {
+            payload.clear();
+            for v in values {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+            page_enc::VAL_RAW_F64
+        } else {
+            page_enc::VAL_GORILLA
+        };
+        frame_page(&series_id.0, enc, page_comp::NONE, &payload)
+    }
+
+    fn old_frame_hist_page(
+        series_id: &SeriesId,
+        values: &[HistogramValue],
+    ) -> Result<Vec<u8>, WriteError> {
+        let mut payload = Vec::new();
+        for value in values {
+            encode_histogram_record_into(&mut payload, value)?;
+        }
+        Ok(frame_page(
+            &series_id.0,
+            page_enc::HIST_SPANS,
+            page_comp::NONE,
+            &payload,
+        ))
+    }
+
+    /// Verbatim pre-#813 `write_v4`: the full assemble-and-finalize-as-v4
+    /// body, not a call into today's split `assemble_v4_body` +
+    /// `finalize_v4_trailer`. This is what makes the sparse-path parity case
+    /// below a real check rather than a tautology.
+    fn old_write_v4(
+        mut series: Vec<SeriesInputV4>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
+        for s in &mut series {
+            s.runs.retain(|r| r.sample_count != 0);
+        }
+        series.retain(|s| !s.runs.is_empty());
+
+        series.sort_unstable_by_key(|s| s.series_id.0);
+        if series
+            .windows(2)
+            .any(|w| w[0].series_id.0 == w[1].series_id.0)
+        {
+            return Err(WriteError::DuplicateSeriesId);
+        }
+
+        for s in &series {
+            u16::try_from(s.labels.len()).map_err(|_| WriteError::TooManyLabels)?;
+
+            let mut has_scalar = false;
+            let mut has_histogram = false;
+            for r in &s.runs {
+                match &r.value_page {
+                    RunValuePageV4::Scalar(_) => has_scalar = true,
+                    RunValuePageV4::Histogram(_) => has_histogram = true,
+                }
+            }
+            if has_scalar && has_histogram {
+                return Err(WriteError::MixedValueKindInSeries);
+            }
+        }
+
+        for s in &mut series {
+            s.runs
+                .sort_by_key(|r| (r.created_unix_ns, r.writer_epoch, r.writer_seq));
+        }
+
+        let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
+
+        let mut run_total: u32 = 0;
+        let mut sample_count: u64 = 0;
+        let mut min_event_ts_ns = i64::MAX;
+        let mut max_event_ts_ns = i64::MIN;
+        let mut base_created_unix_ns = i64::MAX;
+        for s in &series {
+            let series_run_count =
+                u32::try_from(s.runs.len()).map_err(|_| WriteError::TooManyRuns)?;
+            run_total = run_total
+                .checked_add(series_run_count)
+                .ok_or(WriteError::TooManyRuns)?;
+            for r in &s.runs {
+                sample_count = sample_count
+                    .checked_add(u64::from(r.sample_count))
+                    .ok_or(WriteError::TooManySamples)?;
+                min_event_ts_ns = min_event_ts_ns.min(r.min_ts_ns);
+                max_event_ts_ns = max_event_ts_ns.max(r.max_ts_ns);
+                base_created_unix_ns = base_created_unix_ns.min(r.created_unix_ns);
+            }
+        }
+        if series.is_empty() {
+            min_event_ts_ns = 0;
+            max_event_ts_ns = 0;
+            base_created_unix_ns = 0;
+        }
+
+        let dict = build_dictionary_v4(&series, &exemplars)?;
+
+        let mut series_index_by_id: HashMap<[u8; 16], u32> = HashMap::with_capacity(series.len());
+        for (i, s) in series.iter().enumerate() {
+            series_index_by_id.insert(s.series_id.0, i as u32);
+        }
+        let mut resolved_exemplars = Vec::with_capacity(exemplars.len());
+        let mut exemplar_attr_cursor = 0usize;
+        for e in &exemplars {
+            let series_index = *series_index_by_id
+                .get(&e.series_id.0)
+                .ok_or(WriteError::ExemplarUnknownSeries)?;
+            let mut attr_ords = Vec::with_capacity(e.attrs.len());
+            for _ in &e.attrs {
+                let name_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor];
+                let value_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor + 1];
+                exemplar_attr_cursor += 2;
+                attr_ords.push((name_ord, value_ord));
+            }
+            resolved_exemplars.push(ResolvedExemplar {
+                series_index,
+                ts_ns: e.ts_ns,
+                value: e.value,
+                trace_id: e.trace_id,
+                span_id: e.span_id,
+                attr_ords,
+            });
+        }
+        resolved_exemplars.sort_by_key(|r| (r.series_index, r.ts_ns));
+
+        let total_samples =
+            usize::try_from(sample_count).map_err(|_| WriteError::TooManySamples)?;
+        let run_total_usize = run_total as usize;
+        let mut ts_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 4);
+        let mut val_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 9);
+        let mut hist_pages = Vec::with_capacity(run_total_usize * 16 + total_samples * 32);
+
+        let series_meta_raw = build_series_meta_v4(
+            &series,
+            &dict.occurrence_ordinals,
+            min_event_ts_ns,
+            base_created_unix_ns,
+            run_total,
+            &mut ts_pages,
+            &mut val_pages,
+            &mut hist_pages,
+        )?;
+        let series_ids_raw = encode_series_ids_v4(&series)?;
+        let label_dict_raw = encode_label_dict_v4(&dict)?;
+
+        let label_dict_compressed = zstd_compress_v4(&label_dict_raw)?;
+        let series_meta_compressed = zstd_compress_v4(&series_meta_raw)?;
+
+        let mut object = Vec::with_capacity(
+            label_dict_compressed.len()
+                + series_ids_raw.len()
+                + series_meta_compressed.len()
+                + ts_pages.len()
+                + val_pages.len()
+                + hist_pages.len()
+                + 512,
+        );
+
+        let label_dict_offset = object.len() as u64;
+        object.extend_from_slice(&label_dict_compressed);
+
+        let series_ids_offset = object.len() as u64;
+        object.extend_from_slice(&series_ids_raw);
+
+        let series_meta_offset = object.len() as u64;
+        object.extend_from_slice(&series_meta_compressed);
+
+        let ts_pages_offset = object.len() as u64;
+        object.extend_from_slice(&ts_pages);
+
+        let mut sections = vec![
+            Section {
+                kind: section_kind::LABEL_DICT,
+                offset: label_dict_offset,
+                len: label_dict_compressed.len() as u64,
+                crc32c: crc32c::crc32c(&label_dict_compressed),
+                comp: compression::ZSTD,
+                uncompressed_len: label_dict_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::SERIES_IDS,
+                offset: series_ids_offset,
+                len: series_ids_raw.len() as u64,
+                crc32c: crc32c::crc32c(&series_ids_raw),
+                comp: compression::NONE,
+                uncompressed_len: series_ids_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::SERIES_META,
+                offset: series_meta_offset,
+                len: series_meta_compressed.len() as u64,
+                crc32c: crc32c::crc32c(&series_meta_compressed),
+                comp: compression::ZSTD,
+                uncompressed_len: series_meta_raw.len() as u64,
+            },
+            Section {
+                kind: section_kind::TS_PAGES,
+                offset: ts_pages_offset,
+                len: ts_pages.len() as u64,
+                crc32c: crc32c::crc32c(&ts_pages),
+                comp: compression::NONE,
+                uncompressed_len: ts_pages.len() as u64,
+            },
+        ];
+
+        if !val_pages.is_empty() {
+            let val_pad = (8 - (object.len() % 8)) % 8;
+            object.extend(std::iter::repeat_n(0u8, val_pad));
+            let val_pages_offset = object.len() as u64;
+            object.extend_from_slice(&val_pages);
+            sections.push(Section {
+                kind: section_kind::VAL_PAGES,
+                offset: val_pages_offset,
+                len: val_pages.len() as u64,
+                crc32c: crc32c::crc32c(&val_pages),
+                comp: compression::NONE,
+                uncompressed_len: val_pages.len() as u64,
+            });
+        }
+
+        if !hist_pages.is_empty() {
+            let hist_pages_offset = object.len() as u64;
+            object.extend_from_slice(&hist_pages);
+            sections.push(Section {
+                kind: section_kind::HIST_PAGES,
+                offset: hist_pages_offset,
+                len: hist_pages.len() as u64,
+                crc32c: crc32c::crc32c(&hist_pages),
+                comp: compression::NONE,
+                uncompressed_len: hist_pages.len() as u64,
+            });
+        }
+
+        if !resolved_exemplars.is_empty() {
+            let exemplars_raw = encode_exemplars_section(&resolved_exemplars, min_event_ts_ns)?;
+            let exemplars_offset = object.len() as u64;
+            object.extend_from_slice(&exemplars_raw);
+            sections.push(Section {
+                kind: section_kind::EXEMPLARS,
+                offset: exemplars_offset,
+                len: exemplars_raw.len() as u64,
+                crc32c: crc32c::crc32c(&exemplars_raw),
+                comp: compression::NONE,
+                uncompressed_len: exemplars_raw.len() as u64,
+            });
+        }
+
+        let footer = Footer {
+            tenant_hash: identity.tenant_hash.to_vec(),
+            shard: identity.shard,
+            writer_id: identity.writer_id,
+            writer_epoch: identity.writer_epoch,
+            writer_seq: identity.writer_seq,
+            min_event_ts_ns,
+            max_event_ts_ns,
+            min_ingest_ts_ns: ingest_bounds.min_ingest_ts_ns,
+            max_ingest_ts_ns: ingest_bounds.max_ingest_ts_ns,
+            sample_count,
+            series_count,
+            sections,
+            base_created_unix_ns,
+            ingest_hour_bucket: meta.ingest_hour_bucket,
+            input_set_hash: meta.input_set_hash.to_vec(),
+            part_index: meta.part_index,
+            level: meta.level,
+        };
+
+        let footer_bytes = footer.encode_to_vec();
+        let footer_len =
+            u32::try_from(footer_bytes.len()).map_err(|_| WriteError::FooterTooLarge)?;
+        object.extend_from_slice(&footer_bytes);
+
+        let crc = footer_crc(
+            &footer_bytes,
+            footer_len,
+            VERSION_V4,
+            SIGNAL_METRICS,
+            RESERVED,
+        );
+
+        object.extend_from_slice(&footer_len.to_le_bytes());
+        object.extend_from_slice(&crc.to_le_bytes());
+        object.extend_from_slice(&VERSION_V4.to_le_bytes());
+        object.push(SIGNAL_METRICS);
+        object.push(RESERVED);
+        object.extend_from_slice(&MAGIC);
+
+        let blake3 = *blake3::hash(&object).as_bytes();
+
+        Ok(WrittenSegment {
+            bytes: Bytes::from(object),
+            summary: SegmentSummary {
+                min_event_ts_ns,
+                max_event_ts_ns,
+                sample_count,
+                series_count,
+                blake3,
+            },
+        })
+    }
+
+    /// Verbatim pre-#813 `retrailer_v4_to_v6`, the function this issue
+    /// deleted: a full-object copy plus a second `footer_crc` and a second
+    /// whole-object blake3.
+    fn old_retrailer_v4_to_v6(base: WrittenSegment) -> WrittenSegment {
+        let obj = base.bytes.as_ref();
+        let total = obj.len();
+        let trailer_start = total - crate::format::TRAILER_LEN as usize;
+        let footer_len = u32::from_le_bytes([
+            obj[total - 16],
+            obj[total - 15],
+            obj[total - 14],
+            obj[total - 13],
+        ]);
+        let footer_end = trailer_start;
+        let footer_start = footer_end - footer_len as usize;
+        let footer_bytes = &obj[footer_start..footer_end];
+        let crc = footer_crc(
+            footer_bytes,
+            footer_len,
+            VERSION_V6,
+            SIGNAL_METRICS,
+            RESERVED,
+        );
+
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&obj[..footer_end]);
+        out.extend_from_slice(&footer_len.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&VERSION_V6.to_le_bytes());
+        out.push(SIGNAL_METRICS);
+        out.push(RESERVED);
+        out.extend_from_slice(&MAGIC);
+
+        let blake3 = *blake3::hash(&out).as_bytes();
+        let mut summary = base.summary;
+        summary.blake3 = blake3;
+        WrittenSegment {
+            bytes: Bytes::from(out),
+            summary,
+        }
+    }
+
+    fn old_write_v5_with_exemplars(
+        series: Vec<SeriesInputV4>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
+        let base = old_write_v4(series, identity, ingest_bounds, meta, exemplars)?;
+        if base.summary.series_count < V5_SPARSE_THRESHOLD {
+            return Ok(old_retrailer_v4_to_v6(base));
+        }
+        crate::sparse::build_sparse_object(&base)
+    }
+
+    fn old_write_histograms_with_exemplars(
+        mut series: Vec<SeriesInputV3>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
+        for s in &mut series {
+            s.values.sort_by_ts();
+        }
+        series.retain(|s| !s.values.is_empty());
+
+        let created_unix_ns = ingest_bounds.max_ingest_ts_ns;
+        let ingest_hour_bucket =
+            u32::try_from(created_unix_ns.div_euclid(NS_PER_HOUR)).unwrap_or(0);
+
+        let mut v4_series = Vec::with_capacity(series.len());
+        for s in series {
+            let sample_count =
+                u32::try_from(s.values.len()).map_err(|_| WriteError::TooManySamples)?;
+            let min_ts_ns = s.values.first_ts().unwrap_or(0);
+            let max_ts_ns = s.values.last_ts().unwrap_or(0);
+            let ts_page = old_frame_ts_page(&s.series_id, &old_ts_values(&s.values))?;
+            let value_page = match &s.values {
+                SeriesValues::Scalar(samples) => {
+                    let vals: Vec<f64> = samples.iter().map(|sm| sm.value).collect();
+                    RunValuePageV4::Scalar(old_frame_val_page(&s.series_id, &vals))
+                }
+                SeriesValues::Histogram(hist) => {
+                    let vals: Vec<HistogramValue> = hist.iter().map(|h| h.value.clone()).collect();
+                    RunValuePageV4::Histogram(old_frame_hist_page(&s.series_id, &vals)?)
+                }
+            };
+            v4_series.push(SeriesInputV4 {
+                series_id: s.series_id,
+                labels: s.labels,
+                runs: vec![RunInputV4 {
+                    created_unix_ns,
+                    writer_epoch: identity.writer_epoch,
+                    writer_seq: identity.writer_seq,
+                    min_ts_ns,
+                    max_ts_ns,
+                    sample_count,
+                    ts_page,
+                    value_page,
+                }],
+            });
+        }
+
+        let meta = CompactionMetaV4 {
+            ingest_hour_bucket,
+            input_set_hash: [0u8; 32],
+            part_index: 0,
+            level: 0,
+        };
+        old_write_v5_with_exemplars(v4_series, identity, ingest_bounds, meta, exemplars)
+    }
+
+    // ---- input generation: plain-data specs, instantiated twice (once for
+    // the production writer, once for the old reference) so no `Clone` bound
+    // is needed on the writer's own input types ----
+
+    #[derive(Debug, Clone)]
+    enum ValueSpec {
+        Scalar(Vec<(i64, f64)>),
+        Histogram(Vec<(i64, i32)>),
+    }
+
+    #[derive(Debug, Clone)]
+    struct SeriesSpec {
+        idx: u16,
+        values: ValueSpec,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ExemplarSpec {
+        target_idx: u16,
+        ts_ns: i64,
+        value: f64,
+        trace_byte: u8,
+        span_byte: u8,
+        attr: Option<(String, String)>,
+    }
+
+    fn instantiate(specs: &[SeriesSpec]) -> Vec<SeriesInputV3> {
+        specs
+            .iter()
+            .map(|spec| {
+                let values = match &spec.values {
+                    ValueSpec::Scalar(v) => SeriesValues::Scalar(
+                        v.iter()
+                            .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                            .collect(),
+                    ),
+                    ValueSpec::Histogram(v) => SeriesValues::Histogram(
+                        v.iter()
+                            .map(|&(ts_ns, seed)| HistogramSample {
+                                ts_ns,
+                                value: sample_histogram_value(seed),
+                            })
+                            .collect(),
+                    ),
+                };
+                SeriesInputV3 {
+                    series_id: series_id_for(spec.idx),
+                    labels: labels(&format!("m{}", spec.idx)),
+                    values,
+                }
+            })
+            .collect()
+    }
+
+    fn instantiate_exemplars(specs: &[ExemplarSpec]) -> Vec<ExemplarInput> {
+        specs
+            .iter()
+            .map(|e| ExemplarInput {
+                series_id: series_id_for(e.target_idx),
+                ts_ns: e.ts_ns,
+                value: e.value,
+                trace_id: [e.trace_byte; 16],
+                span_id: [e.span_byte; 8],
+                attrs: e.attr.clone().into_iter().collect(),
+            })
+            .collect()
+    }
+
+    fn fixed_identity() -> SegmentIdentity {
+        SegmentIdentity {
+            tenant_hash: [0x99; 16],
+            shard: 7,
+            writer_id: "parity-test-writer".to_string(),
+            writer_epoch: 3,
+            writer_seq: 11,
+        }
+    }
+
+    fn fixed_bounds() -> IngestBounds {
+        IngestBounds {
+            min_ingest_ts_ns: -5_000,
+            max_ingest_ts_ns: 50_000,
+        }
+    }
+
+    /// Normalizes a write result into something comparable with `assert_eq!`
+    /// (`WrittenSegment` itself carries `Bytes`, which is `PartialEq`, but
+    /// bundled with a summary that is also `PartialEq`; unpacking both here
+    /// makes a mismatch's assertion failure point at bytes vs. summary
+    /// instead of just "not equal").
+    fn normalize(
+        result: Result<WrittenSegment, WriteError>,
+    ) -> Result<(Vec<u8>, SegmentSummary), WriteError> {
+        result.map(|w| (w.bytes.to_vec(), w.summary))
+    }
+
+    fn assert_parity(specs: Vec<SeriesSpec>, exemplar_specs: Vec<ExemplarSpec>) {
+        let new_result = SegmentWriter::write_histograms_with_exemplars(
+            instantiate(&specs),
+            fixed_identity(),
+            fixed_bounds(),
+            instantiate_exemplars(&exemplar_specs),
+        );
+        let old_result = old_write_histograms_with_exemplars(
+            instantiate(&specs),
+            fixed_identity(),
+            fixed_bounds(),
+            instantiate_exemplars(&exemplar_specs),
+        );
+        assert_eq!(
+            normalize(new_result),
+            normalize(old_result),
+            "direct-emit writer diverged from the pre-#813 reference"
+        );
+    }
+
+    #[test]
+    fn scalar_only() {
+        let specs = vec![
+            SeriesSpec {
+                idx: 0,
+                values: ValueSpec::Scalar(vec![(100, 1.0), (200, 2.0), (300, 3.0)]),
+            },
+            SeriesSpec {
+                idx: 1,
+                values: ValueSpec::Scalar(vec![(150, -1.5), (250, 0.0), (350, f64::MIN)]),
+            },
+        ];
+        assert_parity(specs, Vec::new());
+    }
+
+    #[test]
+    fn histogram_only() {
+        let specs = vec![
+            SeriesSpec {
+                idx: 0,
+                values: ValueSpec::Histogram(vec![(100, 5), (200, -3)]),
+            },
+            SeriesSpec {
+                idx: 1,
+                values: ValueSpec::Histogram(vec![(120, 0), (220, 42), (320, -17)]),
+            },
+        ];
+        assert_parity(specs, Vec::new());
+    }
+
+    #[test]
+    fn exemplar_carrying() {
+        let specs = vec![
+            SeriesSpec {
+                idx: 0,
+                values: ValueSpec::Scalar(vec![(100, 1.0), (200, 2.0)]),
+            },
+            SeriesSpec {
+                idx: 1,
+                values: ValueSpec::Histogram(vec![(150, 9)]),
+            },
+        ];
+        let exemplars = vec![
+            ExemplarSpec {
+                target_idx: 0,
+                ts_ns: 200,
+                value: 42.5,
+                trace_byte: 0xAB,
+                span_byte: 0xCD,
+                attr: Some(("trace_state".to_string(), "sampled=1".to_string())),
+            },
+            ExemplarSpec {
+                target_idx: 1,
+                ts_ns: 150,
+                value: f64::NAN,
+                trace_byte: 0,
+                span_byte: 0,
+                attr: None,
+            },
+        ];
+        assert_parity(specs, exemplars);
+    }
+
+    /// A single sample makes Gorilla's own framing overhead exceed 8 bytes,
+    /// so both the old and new `frame_val_page` fall back to VAL_RAW_F64
+    /// (docs/segment-format.md "raw-fallback rule"); this exercises that
+    /// branch under both algorithms.
+    #[test]
+    fn single_sample_series_raw_f64_fallback() {
+        let specs = vec![SeriesSpec {
+            idx: 0,
+            values: ValueSpec::Scalar(vec![(42, 9.87654)]),
+        }];
+        assert_parity(specs, Vec::new());
+    }
+
+    /// Series A's TS page payload is comfortably over `LZ4_MIN_TS_PAYLOAD_BYTES`
+    /// (64), forcing an lz4 compression attempt and growing the shared
+    /// scratch buffer; series B's is comfortably under it, so no lz4 attempt.
+    /// Both old (fresh `Vec` per series) and new (scratch `Vec`, cleared and
+    /// reused across series) must produce the same page bytes for B: a
+    /// `payload.clear()` that failed to actually truncate the buffer's
+    /// logical length would leak A's leftover bytes into B's page.
+    #[test]
+    fn lz4_floor_edge_ts_pages_across_scratch_reuse() {
+        let big: Vec<(i64, f64)> = (0..96i64).map(|i| (1_000 + i * 37, i as f64)).collect();
+        let small = vec![(5i64, 1.0), (9i64, 2.0)];
+        let specs = vec![
+            SeriesSpec {
+                idx: 0,
+                values: ValueSpec::Scalar(big),
+            },
+            SeriesSpec {
+                idx: 1,
+                values: ValueSpec::Scalar(small),
+            },
+        ];
+        assert_parity(specs, Vec::new());
+    }
+
+    /// At/above `V5_SPARSE_THRESHOLD` (4096), `write_v5_with_exemplars`
+    /// finalizes the assembled body as version 4 (unchanged by issue #813)
+    /// and feeds it to `crate::sparse::build_sparse_object`. Comparing
+    /// against `old_write_v4` (the verbatim pre-#813 body, not today's
+    /// `assemble_v4_body`) proves that intermediate v4 object is still
+    /// byte-identical, not just that the sparse builder is unchanged.
+    #[test]
+    fn sparse_shape_at_threshold() {
+        let n = V5_SPARSE_THRESHOLD as usize;
+        let specs: Vec<SeriesSpec> = (0..n)
+            .map(|i| {
+                let idx = i as u16;
+                let values = if i % 7 == 0 {
+                    ValueSpec::Histogram(vec![(1_000 + i as i64, (i % 23) as i32 - 11)])
+                } else {
+                    ValueSpec::Scalar(vec![
+                        (1_000 + i as i64, i as f64 * 0.5),
+                        (2_000 + i as i64, i as f64 * 0.5 + 1.0),
+                    ])
+                };
+                SeriesSpec { idx, values }
+            })
+            .collect();
+        assert_parity(specs, Vec::new());
+    }
+
+    fn value_spec_strategy() -> impl Strategy<Value = ValueSpec> {
+        prop_oneof![
+            prop::collection::vec((-1_000_000i64..1_000_000, -1_000.0f64..1_000.0), 0..8)
+                .prop_map(ValueSpec::Scalar),
+            prop::collection::vec((-1_000_000i64..1_000_000, -64i32..64), 0..6)
+                .prop_map(ValueSpec::Histogram),
+        ]
+    }
+
+    fn series_specs_strategy() -> impl Strategy<Value = Vec<SeriesSpec>> {
+        prop::collection::vec(value_spec_strategy(), 0..24).prop_map(|values| {
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(i, values)| SeriesSpec {
+                    idx: i as u16,
+                    values,
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// General-shape parity: randomized scalar/histogram batches of
+        /// varying series count, sample count, and value content, optionally
+        /// carrying exemplars, must write identically under both algorithms.
+        #[test]
+        fn direct_v6_emit_bit_parity(
+            specs in series_specs_strategy(),
+            exemplar_raw in prop::collection::vec(
+                (any::<u16>(), any::<i64>(), -1_000.0f64..1_000.0, any::<u8>(), any::<u8>(), any::<bool>()),
+                0..4,
+            ),
+        ) {
+            let exemplar_specs: Vec<ExemplarSpec> = if specs.is_empty() {
+                Vec::new()
+            } else {
+                exemplar_raw
+                    .into_iter()
+                    .map(|(idx, ts_ns, value, trace_byte, span_byte, has_attr)| ExemplarSpec {
+                        target_idx: idx % specs.len() as u16,
+                        ts_ns,
+                        value,
+                        trace_byte,
+                        span_byte,
+                        attr: has_attr.then(|| ("k".to_string(), "v".to_string())),
+                    })
+                    .collect()
+            };
+
+            let new_result = SegmentWriter::write_histograms_with_exemplars(
+                instantiate(&specs),
+                fixed_identity(),
+                fixed_bounds(),
+                instantiate_exemplars(&exemplar_specs),
+            );
+            let old_result = old_write_histograms_with_exemplars(
+                instantiate(&specs),
+                fixed_identity(),
+                fixed_bounds(),
+                instantiate_exemplars(&exemplar_specs),
+            );
+            prop_assert_eq!(normalize(new_result), normalize(old_result));
+        }
     }
 }
