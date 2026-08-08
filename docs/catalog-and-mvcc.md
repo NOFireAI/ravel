@@ -26,6 +26,7 @@ sys/qualify/<run-id>/...                                                store qu
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
+sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite; ADR-0065 §1)
 ```
 
 The compaction/retention key shapes (ADR-0018, ADR-0019;
@@ -55,6 +56,25 @@ rather than a protobuf message, because the keyspace is owned entirely by
 its body is an internal contract of that module rather than a cross-crate frozen
 format. Nothing deletes these snapshots (staleness detection replaces a sweep),
 so no role holds a delete grant for the prefix.
+
+`sys/maintain/workers/<process_id>` (ADR-0065 §1) is the maintain role's
+worker-membership keyspace. Every maintain-role process writes, on a heartbeat
+interval `H` (default 60s), a small versioned-tag protobuf `WorkerHeartbeat`
+(`format_version`, `process_id`, `started_unix_ns`, `heartbeat_unix_ns`) to the
+single key named by its own stable process id, with a plain `Overwrite` (one
+writer per key, no CAS). On the same cadence each process lists the
+`sys/maintain/workers/` prefix and GETs siblings to compute the **live set** --
+itself plus every sibling whose heartbeat is within `3 * H` of the reader's
+clock -- and every process partitions the `(tenant_hash, signal, shard)` unit
+space over that live set by rendezvous (highest-random-weight) hashing, so N
+replicas divide the maintenance work rather than each paying for all of it.
+This is membership/ownership, deliberately **not** a lease (the existing
+`LeaseCheck` trait is the unrelated GC reader-protection gate). It is a
+root-level key with no tenant dimension, like the query-admission snapshot
+above; a stale or missing heartbeat is self-correcting on the next interval and,
+past the `3 * H` window, its owner is treated as gone and its units are taken
+over (idempotent overlap during the transition, never lost or double-counted
+work). Nothing deletes these heartbeats (staleness detection replaces a sweep).
 
 `sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
 additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.
