@@ -30,6 +30,9 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
           selector (each selector gets the full budget, not a shared
           split; max_segments stays a per-query cap on the shared
           snapshot)
+       -> selective-erasure exclusion: every series or sample matching a
+          predicate the snapshot carries in `pending_erasure` is dropped
+          from the decoded per-segment results (ADR-0064 decision 2)
   -> every selector's already-merged series combined into one flat
      SeriesSource (later selectors sharing a series id keep the first
      merge seen; a later per-selector SeriesSource::query call still clips
@@ -57,6 +60,22 @@ that selector's own fetch window (its lookback or matrix range, plus its
 own offset, anchored per `PlanAnchor::Window`/`Pinned`), so lookback never
 misses samples stored in an earlier-only segment for any selector, however
 widely the selectors' own windows differ.
+
+Selective erasure (ADR-0064 decision 2): `Catalog::resolve` lists the
+tenant's `del/` prefix once per resolve and attaches every pending erasure
+request to the snapshot. The engine maps each request into one scan-time
+predicate (a conjunction of exact `key = value` matchers plus an optional
+half-open `[window_start_ns, window_end_ns)` event-time window, zero on a
+bound meaning unset) and applies them in `fetch_all_samples_and_histograms`
+and `fetch_all_series`, on decoded results, after the fetch and after any
+cache tier. Filtering there rather than at fetch time is what makes stale
+cached bytes of a since-erased subject unreachable: a cache hit is filtered
+exactly like a fresh GET. A series matching a windowless predicate is
+dropped whole, including from `/labels`, `/label/{name}/values`, and
+`/series`; a windowed predicate drops only that series' in-window samples
+and leaves it enumerable. The equivalent hop for the SQL logs, spans, and
+metrics surfaces in `ravel-sql` is not wired yet: those scans build their
+own queries and do not read `Snapshot::pending_erasure`.
 
 Staleness: the evaluator recognizes the Prometheus staleness marker (the
 exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via

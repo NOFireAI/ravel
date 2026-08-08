@@ -129,10 +129,14 @@ pub struct LogQuery {
     /// which reads and returns exactly what it did before this field existed.
     ///
     /// The caller populates this from the resolved snapshot's attached
-    /// predicates. That attachment is the resolver's job (EJ-T2); until the
-    /// resolver surfaces them (and the `ravel-sql` logs provider that builds
-    /// this query threads them through), this stays empty and log erasure
-    /// exclusion is inert.
+    /// predicates. The resolver already surfaces them: EJ-T2 (#752) attaches
+    /// every pending request to `Snapshot::pending_erasure` on each resolve.
+    /// What is still missing is the last hop -- the `ravel-sql` scans that
+    /// build this query (`logs_scan`, `alerts_scan`, `audit_scan`) do not yet
+    /// map that field into this one, so on the SQL log surface this stays
+    /// empty and log erasure exclusion is inert. The metric surface needs no
+    /// such hop: `QueryEngine` reads `Snapshot::pending_erasure` directly at
+    /// its own fetch funnels.
     pub erasure: Vec<ErasurePredicate>,
 }
 
