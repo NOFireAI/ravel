@@ -67,6 +67,51 @@ impl StreamBlockSpan {
     }
 }
 
+/// The absolute byte range of exactly one candidate block for a stream, for the
+/// block-at-a-time streaming decode a memory-bounded merge needs (issue #745).
+///
+/// [`StreamBlockSpan`] names the whole run of blocks a stream occupies in one
+/// GET; a caller that decodes that whole run at once holds decoded records
+/// proportional to the stream's size in that input. A k-way streaming merge
+/// instead fetches one block at a time via [`RlogRangeReader::stream_blocks`]
+/// (ascending, ts-order for the stream), decodes it with
+/// [`RlogRangeReader::decode_block`], drains it, and only then fetches the next,
+/// so at most one block's raw bytes and one decoded block are resident per
+/// input regardless of how many blocks the stream spans.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamBlockLoc {
+    /// The stream's dense ref in this object (the decode filter for the block).
+    stream_ref: u32,
+    /// The level-0 block index this loc names.
+    block_index: usize,
+    /// Absolute start offset of the block.
+    start: u64,
+    /// Absolute end offset (exclusive) of the block.
+    end: u64,
+}
+
+impl StreamBlockLoc {
+    /// Absolute start offset of the block to fetch.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// Absolute end offset (exclusive) of the block to fetch.
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// Number of bytes to fetch (`end - start`).
+    pub fn byte_len(&self) -> u64 {
+        self.end - self.start
+    }
+
+    /// The level-0 block index this loc names.
+    pub fn block_index(&self) -> usize {
+        self.block_index
+    }
+}
+
 /// A ranged RLOG reader over one object's directories. Built from the three
 /// whole-read sections (fetched by range and decoded via
 /// [`crate::decode_section`]); serves per-stream block spans and decode without
@@ -207,6 +252,100 @@ impl RlogRangeReader {
                         row,
                     )?);
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The candidate blocks covering `stream_id`, each as its own absolute byte
+    /// range, in ascending block order, or `None` if the object does not carry
+    /// the stream.
+    ///
+    /// This is the block-granular counterpart to [`Self::stream_block_span`]:
+    /// where that returns one fused range for a whole-run fetch, this returns
+    /// each block separately so a memory-bounded merge can fetch and decode one
+    /// block at a time (issue #745), holding at most one block per input.
+    /// Because a stream's records are stored in `(stream_ref, ts)` order, the
+    /// ascending block order is ts-ascending for the stream, so decoding the
+    /// blocks in this order yields the stream's records already sorted.
+    pub fn stream_blocks(
+        &self,
+        stream_id: &LogStreamId,
+    ) -> Result<Option<Vec<StreamBlockLoc>>, LogSegError> {
+        let Some(stream_ref) = self.stream_dir.stream_ref(stream_id) else {
+            return Ok(None);
+        };
+        let blocks = self
+            .skip
+            .candidate_blocks(i64::MIN, i64::MAX, Some(&[stream_ref]));
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        let mut locs = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let entry =
+                self.skip.l0.get(b).ok_or_else(|| {
+                    LogSegError::Corrupted("skip block index out of range".into())
+                })?;
+            let start = self
+                .blocks_offset
+                .checked_add(entry.block_offset)
+                .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
+            let end = start
+                .checked_add(entry.block_len)
+                .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
+            locs.push(StreamBlockLoc {
+                stream_ref,
+                block_index: b,
+                start,
+                end,
+            });
+        }
+        Ok(Some(locs))
+    }
+
+    /// Decode exactly one block's records for its stream, given that one block's
+    /// bytes (the object's `[loc.start, loc.end)` range). Only rows whose
+    /// `stream_ref` matches `loc`'s stream are rebuilt (a boundary block can
+    /// hold rows of a neighbouring stream too), returned in stored (ts) order.
+    ///
+    /// This is the per-block seam [`Self::decode_stream`] is built on, exposed
+    /// so a streaming merge holds one decoded block per input rather than a
+    /// whole stream's worth (issue #745). It reuses the same
+    /// [`crate::reader::rebuild_record`] path, so a record decoded one block at
+    /// a time is byte-for-byte the record a whole-span or whole-object decode
+    /// would produce.
+    pub fn decode_block(
+        &self,
+        loc: &StreamBlockLoc,
+        block_bytes: &[u8],
+    ) -> Result<Vec<LogRecord>, LogSegError> {
+        if block_bytes.len() as u64 != loc.byte_len() {
+            return Err(LogSegError::Corrupted(
+                "block bytes length != block range".into(),
+            ));
+        }
+        let entry = self
+            .skip
+            .l0
+            .get(loc.block_index)
+            .ok_or_else(|| LogSegError::Corrupted("skip block index out of range".into()))?;
+        if entry.block_len != loc.byte_len() {
+            return Err(LogSegError::Corrupted("block len != skip entry len".into()));
+        }
+        let plans = column_plans(&self.field_dir);
+        let decoded = read_block(block_bytes, entry.block_crc32c, &plans, DEFAULT_MAX_UNCOMP)?;
+        let mut out = Vec::new();
+        for row in 0..decoded.record_count() {
+            let sref = u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            if sref == loc.stream_ref {
+                out.push(rebuild_record(
+                    &self.stream_dir,
+                    &self.field_dir,
+                    &decoded,
+                    row,
+                )?);
             }
         }
         Ok(out)

@@ -56,19 +56,50 @@
 //! one writer implementation, so an L0 write and an L1 merge cannot drift. The
 //! only ravel-logseg addition this required is `finish_compacted` itself.
 //!
-//! # Memory
+//! # Memory (issue #745, ADR-0065 decision 4)
 //!
 //! The read side ([`RlogCodec::load_input_catalog`]) retains only per-input
 //! catalog metadata: a [`RlogRangeReader`] holding the decoded STREAM_DIR,
-//! FIELD_DIR, and SKIP_IDX plus the object key, never block or bloom bytes. The
-//! merge fetches one stream's blocks at a time by range (issue #275) via
-//! [`RlogRangeReader::stream_block_span`] and decodes them, accumulating at
-//! most one in-flight part's records before flushing. So both *decoded* data
-//! and resident *raw* bytes are bounded by one part plus one stream, never the
-//! whole bucket -- the same footprint RSEG's ranged reader gives. The first
-//! RLOG merge held every input object whole (RLOG then had no ranged section
-//! reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue of
-//! `ravel_segment::open_from_suffix` and closes that raw-bytes gap.
+//! FIELD_DIR, and SKIP_IDX plus the object key, never block or bloom bytes.
+//!
+//! The merge itself is a **k-way block-streaming merge**, so its peak resident
+//! memory is bounded independently of any one stream's size -- the defect
+//! issue #745 fixed. Issue #275 already fetched one stream's blocks by range
+//! rather than whole objects, but it then fully materialized *all* of that
+//! stream's decoded records from every input into one `Vec` before returning,
+//! and the part builder held a second fully decoded copy in its accumulator.
+//! One hot, high-volume stream (a single busy service, the common case for
+//! logs) can carry most of a sealed hour, so that made peak memory scale with
+//! stream size.
+//!
+//! Instead, [`build_parts`] merges each stream through one
+//! [`StreamCursor`] per input that decodes exactly one block at a time
+//! ([`RlogRangeReader::stream_blocks`] +
+//! [`RlogRangeReader::decode_block`]), fetching the next block's bytes by range
+//! only once the previous block is drained. A record's `(stream_ref, ts)`
+//! stored order makes each input's stream one ts-ascending sequence spread
+//! across ascending blocks, so N inputs carrying the same stream are a standard
+//! k-way merge ordered by `ts_ns`, ties broken by canonical input order. That
+//! is byte-for-byte the ordering the old "gather everything then stable-sort by
+//! `ts_ns`" produced, which matters because parts are content-addressed and any
+//! reordering would change every downstream hash. Merged records feed straight
+//! into the in-progress part's [`RlogWriter`]; there is no intermediate
+//! `Vec<LogRecord>` batch.
+//!
+//! Peak resident memory is then: per-input catalog metadata (KBs per input,
+//! unchanged from #275), plus at most one decoded block per input carrying the
+//! current stream (`O(input_count * block_size)`, independent of stream size),
+//! plus the in-progress part's writer buffer. The writer buffer is bounded by
+//! `max_l1_part_bytes` -- a part is flushed on a stream boundary once its
+//! record-byte estimate reaches the cap -- and holding a whole part before its
+//! content-addressed key exists is unavoidable, not a regression. The
+//! [`MergeMemoryTracker`] seam accounts these terms at their real
+//! allocation/decode points and records a high-water mark; the acceptance test
+//! asserts that mark stays under a fixed bound while a hot stream grows.
+//!
+//! The first RLOG merge held every input object whole (RLOG then had no ranged
+//! section reader); [`ravel_logseg::open_from_suffix`] is now the RLOG analogue
+//! of `ravel_segment::open_from_suffix` and closed that raw-bytes gap.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -77,8 +108,8 @@ use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SuffixOutcome, kind};
 use ravel_logseg::postings::PostingsSection;
 use ravel_logseg::{
-    AttrValue, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter, decode_section,
-    writer::ObjectIdentity,
+    AttrValue, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter, StreamBlockLoc,
+    decode_section, writer::ObjectIdentity,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
@@ -86,7 +117,7 @@ use ravel_proto::commit::v1::CompactionPart;
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, put_part};
 use crate::codec::SegmentCodec;
-use crate::config::CompactorConfig;
+use crate::config::{CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
 
@@ -236,132 +267,324 @@ impl SegmentCodec for RlogCodec {
         }
 
         // No whole-object fetch: the per-input ranged readers are already in the
-        // catalogs. Each stream's blocks are fetched by range one stream at a
-        // time in gather_stream below, so raw resident bytes stay bounded to one
-        // stream, never the whole bucket (issue #275).
+        // catalogs. Each stream's blocks are fetched by range one block at a
+        // time in the k-way merge below, so raw resident bytes stay bounded to
+        // one block per input, never a whole stream or the whole bucket
+        // (issue #745, building on issue #275).
         let identity = compactor_identity(bucket, config);
         // The output's indexed-field list: the union of the inputs' (issue #509,
         // and see `input_indexed_fields`). Every part of this compaction gets
         // the same list, so a field is indexed uniformly across the output.
         let indexed_fields = merged_indexed_fields(&catalogs);
+        let tracker = config.merge_memory_tracker.as_ref();
         let mut parts = Vec::new();
         let mut part_index: u32 = 0;
-        let mut batch: Vec<LogRecord> = Vec::new();
-        let mut batch_bytes: u64 = 0;
+        let mut current: Option<PartBuilder> = None;
 
-        // Merge stream by stream in sorted stream_id order. Each stream's
-        // records are gathered from every input carrying it, ts-merged, and
-        // pushed into the current part; a part flushes on a stream boundary once
-        // it reaches the size cap (so a stream never straddles two parts, the
-        // log analogue of RSEG's series-boundary split).
+        // Merge stream by stream in sorted stream_id order. Each stream is
+        // k-way merged from every input carrying it (ts-ascending, canonical
+        // input-order tie-break) straight into the current part's writer; a
+        // part flushes on a stream boundary once its accumulated record-byte
+        // estimate reaches the size cap (so a stream never straddles two parts,
+        // the log analogue of RSEG's series-boundary split). No intermediate
+        // `Vec<LogRecord>` and no per-stream dedup: distinct submissions of
+        // identical content are distinct records (ADR-0032).
         for stream_id in merged.keys() {
-            let mut recs = gather_stream(store, &catalogs, stream_id).await?;
-            // Stable sort by ts: within one stream this is the format's
-            // (stream_ref, ts) order, and ts ties keep canonical input order
-            // (readers are iterated in the inputs' canonical order). No dedup:
-            // distinct submissions of identical content are distinct records
-            // (ADR-0032).
-            recs.sort_by_key(|r| r.ts_ns);
-            for r in recs {
-                batch_bytes = batch_bytes.saturating_add(estimate_record(&r));
-                batch.push(r);
-            }
-            if batch_bytes >= config.max_l1_part_bytes && !batch.is_empty() {
-                let part = flush_part(
-                    store,
-                    bucket,
-                    &identity,
-                    input_set_hash,
-                    part_index,
-                    std::mem::take(&mut batch),
-                    &indexed_fields,
-                    config.dry_run,
-                )
-                .await?;
-                parts.push(part);
+            let part = current.get_or_insert_with(|| PartBuilder::new(&identity, &indexed_fields));
+            merge_stream_into_part(store, &catalogs, stream_id, part, tracker).await?;
+            // Flush on this stream boundary once the part reaches the cap. The
+            // `take` is `Some` here (just inserted above); the `if let` avoids
+            // an `unwrap`/`expect` on the critical path rather than asserting.
+            let over_cap = part.estimate >= config.max_l1_part_bytes && !part.is_empty();
+            if over_cap && let Some(builder) = current.take() {
+                let built = builder
+                    .finish(store, bucket, input_set_hash, part_index, config.dry_run)
+                    .await?;
+                parts.push(built);
                 part_index += 1;
-                batch_bytes = 0;
+                if let Some(t) = tracker {
+                    t.set_writer_bytes(0);
+                }
             }
         }
-        if !batch.is_empty() {
-            let part = flush_part(
-                store,
-                bucket,
-                &identity,
-                input_set_hash,
-                part_index,
-                batch,
-                &indexed_fields,
-                config.dry_run,
-            )
-            .await?;
-            parts.push(part);
+        if let Some(part) = current
+            && !part.is_empty()
+        {
+            let built = part
+                .finish(store, bucket, input_set_hash, part_index, config.dry_run)
+                .await?;
+            parts.push(built);
+            if let Some(t) = tracker {
+                t.set_writer_bytes(0);
+            }
         }
 
         Ok(parts)
     }
 }
 
-/// Gather one stream's records from every input carrying it. Each input's
-/// ranged reader gives the absolute byte range of exactly the blocks that
-/// stream occupies; that one range is fetched and decoded, and an input that
-/// does not carry the stream is fetched not at all. This reuses the reader's
-/// full block-decode path (fixed columns, dynamic columns, and `attrs_raw`
-/// overflow), so a merged record is a faithful round-trip of the input record.
-/// Only one stream's blocks from one input are resident at a time (issue #275).
-async fn gather_stream(
+/// One in-progress L1 part: the shared [`RlogWriter`] the merged records push
+/// into directly, plus the running record-byte estimate that decides where the
+/// part splits (a stream boundary once the estimate reaches `max_l1_part_bytes`)
+/// and feeds the [`MergeMemoryTracker`]'s writer term. Holding a whole part's
+/// records before [`PartBuilder::finish`] stamps its content-addressed key is
+/// unavoidable (the key is a hash of the whole object); the k-way merge is what
+/// keeps everything *else* bounded (issue #745).
+struct PartBuilder {
+    writer: RlogWriter,
+    /// Sum of [`estimate_record`] over every pushed record: the split trigger
+    /// (matching the old accumulator's `batch_bytes`) and the writer-buffer
+    /// term the tracker records.
+    estimate: u64,
+    min_stream: Option<LogStreamId>,
+    max_stream: Option<LogStreamId>,
+    count: usize,
+}
+
+impl PartBuilder {
+    fn new(identity: &ObjectIdentity, indexed_fields: &[String]) -> Self {
+        let writer = RlogWriter::new(RlogConfig::default(), *identity)
+            .with_indexed_fields(indexed_fields.to_vec());
+        PartBuilder {
+            writer,
+            estimate: 0,
+            min_stream: None,
+            max_stream: None,
+            count: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Push one merged record into the part's writer, updating the running
+    /// estimate and the part's inclusive stream-id bounds.
+    fn push(&mut self, r: LogRecord, tracker: Option<&MergeMemoryTracker>) -> Result<()> {
+        self.min_stream = Some(self.min_stream.map_or(r.stream_id, |m| m.min(r.stream_id)));
+        self.max_stream = Some(self.max_stream.map_or(r.stream_id, |m| m.max(r.stream_id)));
+        self.estimate = self.estimate.saturating_add(estimate_record(&r));
+        self.count += 1;
+        self.writer.push(r)?;
+        if let Some(t) = tracker {
+            t.set_writer_bytes(self.estimate);
+        }
+        Ok(())
+    }
+
+    /// Encode and PUT the part through the shared writer pipeline. See
+    /// [`finalize_part`] for the encode/summary/PUT detail this reuses.
+    async fn finish(
+        self,
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+        input_set_hash: &[u8; 32],
+        part_index: u32,
+        dry_run: bool,
+    ) -> Result<BuiltPart> {
+        finalize_part(
+            store,
+            bucket,
+            self.writer,
+            self.min_stream,
+            self.max_stream,
+            input_set_hash,
+            part_index,
+            dry_run,
+        )
+        .await
+    }
+}
+
+/// One input's cursor over a single stream's records, yielding them in stored
+/// (ts-ascending) order one block at a time. At most one decoded block is
+/// resident: `head` is the next record to merge, `block` holds the rest of the
+/// current block, and the next block's bytes are fetched by range only once the
+/// current block is drained (issue #745). `input_index` is the cursor's
+/// canonical position in `catalogs`, the k-way merge's tie-break on equal
+/// `ts_ns`.
+struct StreamCursor<'a> {
+    input_index: usize,
+    object_key: &'a str,
+    reader: &'a RlogRangeReader,
+    /// Candidate blocks for the stream, ascending (ts-ascending for the
+    /// stream), consumed front to back via `next_loc`.
+    locs: Vec<StreamBlockLoc>,
+    next_loc: usize,
+    /// Remaining records of the current decoded block.
+    block: std::vec::IntoIter<LogRecord>,
+    /// The current block's decoded-byte estimate, held live in the tracker
+    /// until the block is released.
+    block_bytes: u64,
+    /// The next record to merge, or `None` once the cursor is exhausted.
+    head: Option<LogRecord>,
+}
+
+impl<'a> StreamCursor<'a> {
+    /// Open a cursor over `stream_id` in `catalog`, or `None` if the input does
+    /// not carry the stream. Does not fetch yet; call [`Self::refill`] once to
+    /// load the first record.
+    fn open(
+        catalog: &'a RlogInputCatalog,
+        input_index: usize,
+        stream_id: &LogStreamId,
+    ) -> Result<Option<Self>> {
+        let Some(locs) = catalog.reader.stream_blocks(stream_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(StreamCursor {
+            input_index,
+            object_key: &catalog.object_key,
+            reader: &catalog.reader,
+            locs,
+            next_loc: 0,
+            block: Vec::new().into_iter(),
+            block_bytes: 0,
+            head: None,
+        }))
+    }
+
+    /// Take the current head record; the caller must [`Self::refill`] before
+    /// the next merge step.
+    fn take_head(&mut self) -> Option<LogRecord> {
+        self.head.take()
+    }
+
+    /// Release the current decoded block's residency from the tracker.
+    fn release_block(&mut self, tracker: Option<&MergeMemoryTracker>) {
+        if self.block_bytes > 0 {
+            if let Some(t) = tracker {
+                t.block_released(self.block_bytes);
+            }
+            self.block_bytes = 0;
+        }
+    }
+
+    /// Load the next record into `head`: the next record of the current block,
+    /// or the first record of the next non-empty block (fetched by range and
+    /// decoded here), or `None` when the stream is exhausted in this input. At
+    /// most one block's raw bytes and one decoded block are resident at a time.
+    async fn refill(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tracker: Option<&MergeMemoryTracker>,
+    ) -> Result<()> {
+        if let Some(rec) = self.block.next() {
+            self.head = Some(rec);
+            return Ok(());
+        }
+        // Current block drained: release it and pull the next non-empty block.
+        self.release_block(tracker);
+        while self.next_loc < self.locs.len() {
+            let loc = self.locs[self.next_loc].clone();
+            self.next_loc += 1;
+            let got = store
+                .get(self.object_key, GetRange::Range(loc.start(), loc.end()))
+                .await?;
+            let raw_len = got.data.len() as u64;
+            if let Some(t) = tracker {
+                t.block_fetched(raw_len);
+            }
+            let recs = self.reader.decode_block(&loc, got.data.as_ref())?;
+            let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
+            if let Some(t) = tracker {
+                // Records both raw and decoded resident at the high-water
+                // instant, then drops the raw buffer.
+                t.block_decoded(raw_len, decoded_bytes);
+            }
+            drop(got);
+            self.block_bytes = decoded_bytes;
+            self.block = recs.into_iter();
+            if let Some(rec) = self.block.next() {
+                self.head = Some(rec);
+                return Ok(());
+            }
+            // A candidate block with no row for this stream (a neighbour's
+            // boundary block): release and try the next.
+            self.release_block(tracker);
+        }
+        self.head = None;
+        Ok(())
+    }
+}
+
+/// K-way merge one stream from every input carrying it into `part`, in
+/// ts-ascending order with ties broken by canonical input order. This is
+/// byte-for-byte the ordering the old "concatenate every input's decoded
+/// records, then stable-sort by `ts_ns`" produced -- each input's stream is
+/// already ts-ascending (the format's `(stream_ref, ts)` order), so a stable
+/// sort of the concatenation orders equal-`ts_ns` records by (input, position),
+/// exactly what selecting the minimum `(ts_ns, input_index)` head does here.
+async fn merge_stream_into_part(
     store: &dyn ObjectStoreBackend,
     catalogs: &[RlogInputCatalog],
     stream_id: &LogStreamId,
-) -> Result<Vec<LogRecord>> {
-    let mut out = Vec::new();
-    for catalog in catalogs {
-        let Some(span) = catalog.reader.stream_block_span(stream_id)? else {
-            continue;
-        };
-        let got = store
-            .get(
-                &catalog.object_key,
-                GetRange::Range(span.start(), span.end()),
-            )
-            .await?;
-        out.extend(catalog.reader.decode_stream(&span, got.data.as_ref())?);
+    part: &mut PartBuilder,
+    tracker: Option<&MergeMemoryTracker>,
+) -> Result<()> {
+    let mut cursors: Vec<StreamCursor> = Vec::new();
+    for (idx, catalog) in catalogs.iter().enumerate() {
+        if let Some(mut cursor) = StreamCursor::open(catalog, idx, stream_id)? {
+            cursor.refill(store, tracker).await?;
+            if cursor.head.is_some() {
+                cursors.push(cursor);
+            }
+        }
     }
-    Ok(out)
+    loop {
+        // Pick the cursor whose head has the minimum (ts_ns, input_index).
+        // input_index is unique per cursor, so the key is a total order and the
+        // tie-break is deterministic.
+        let mut best: Option<(usize, i64, usize)> = None;
+        for (i, cursor) in cursors.iter().enumerate() {
+            if let Some(head) = &cursor.head {
+                let key = (head.ts_ns, cursor.input_index);
+                match best {
+                    Some((_, bts, bidx)) if (bts, bidx) <= key => {}
+                    _ => best = Some((i, head.ts_ns, cursor.input_index)),
+                }
+            }
+        }
+        let Some((bi, _, _)) = best else {
+            break;
+        };
+        if let Some(rec) = cursors[bi].take_head() {
+            part.push(rec, tracker)?;
+        }
+        cursors[bi].refill(store, tracker).await?;
+    }
+    Ok(())
 }
 
-/// Build one L1 part from an accumulated record batch: encode it through the
+/// Encode one in-progress part's writer into an L1 object and PUT it: run the
 /// shared writer pipeline via [`RlogWriter::finish_compacted_with_stats`]
 /// (stamping `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
 /// `CreateIfAbsent`. The part's summary stats are read back from the produced
 /// object's own footer, so they describe exactly what was written.
 ///
-/// `indexed_fields` is handed to the same [`RlogWriter::with_indexed_fields`]
-/// the L0 write path uses, so this part's POSTINGS is built by the one writer
-/// implementation from this part's own blocks (ADR-0049 decision 6, issue #509).
-/// The per-field distinct-value cap therefore applies to the merged part; when
-/// it fires the writer drops that field's postings and reports it in
+/// The writer was built with the same [`RlogWriter::with_indexed_fields`] the
+/// L0 write path uses, so this part's POSTINGS is built by the one writer
+/// implementation from this part's own blocks (ADR-0049 decision 6, issue
+/// #509). The per-field distinct-value cap therefore applies to the merged
+/// part; when it fires the writer drops that field's postings and reports it in
 /// `WriteStats`, which is logged here because a silently unindexed field is
 /// invisible in the object bytes (they are simply absent, which is always
 /// legal).
+///
+/// `first_stream_id`/`last_stream_id` are the part's inclusive stream-id bounds
+/// accumulated as records were pushed (streams are merged in sorted id order,
+/// so `first` is the smallest and `last` the largest id in the part).
 #[allow(clippy::too_many_arguments)]
-async fn flush_part(
+async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
-    identity: &ObjectIdentity,
+    writer: RlogWriter,
+    first_stream_id: Option<LogStreamId>,
+    last_stream_id: Option<LogStreamId>,
     input_set_hash: &[u8; 32],
     part_index: u32,
-    batch: Vec<LogRecord>,
-    indexed_fields: &[String],
     dry_run: bool,
 ) -> Result<BuiltPart> {
-    let (first_stream_id, last_stream_id) = stream_id_bounds(&batch);
-
-    let mut writer = RlogWriter::new(RlogConfig::default(), *identity)
-        .with_indexed_fields(indexed_fields.to_vec());
-    for r in batch {
-        writer.push(r)?;
-    }
     let (object, stats) =
         writer.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?;
     if stats.postings_capped_fields > 0 {
@@ -413,20 +636,6 @@ async fn flush_part(
         put_part(store, &built).await?;
     }
     Ok(built)
-}
-
-/// The min and max `stream_id` over a batch's records: the part's inclusive
-/// id range (`first_series_id`/`last_series_id` in the record). Because streams
-/// are merged in sorted order and a stream never straddles a part, adjacent
-/// parts' ranges are disjoint and ascending.
-fn stream_id_bounds(batch: &[LogRecord]) -> (Option<LogStreamId>, Option<LogStreamId>) {
-    let mut min: Option<LogStreamId> = None;
-    let mut max: Option<LogStreamId> = None;
-    for r in batch {
-        min = Some(min.map_or(r.stream_id, |m| m.min(r.stream_id)));
-        max = Some(max.map_or(r.stream_id, |m| m.max(r.stream_id)));
-    }
-    (min, max)
 }
 
 /// The compactor's object identity for an L1 part. `writer_epoch`/`writer_seq`
@@ -605,7 +814,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{Bucket, CompactionOutcome, CompactorConfig, FixedClock, compact_bucket};
+    use crate::{
+        Bucket, CompactionOutcome, CompactorConfig, FixedClock, MergeMemoryTracker, compact_bucket,
+    };
 
     /// FIELD_DIR entry-count cap for the test-only `field_dir_len` decode (a
     /// real object never approaches it; the reader carries its own copy).
@@ -1670,6 +1881,243 @@ mod tests {
         let mut expected = a.clone();
         expected.extend(b.clone());
         assert_eq!(canon_multiset(&l1), canon_multiset(&expected));
+    }
+
+    // --- issue #745: bounded-memory k-way merge ------------------------------
+
+    /// Acceptance test for issue #745 (ADR-0065 decision 4): the RLOG
+    /// compaction merge's peak resident decode memory is bounded by block size
+    /// times input count, independent of how large one hot stream grows.
+    ///
+    /// A single hot stream (the common log shape: one busy service carrying
+    /// most of a sealed hour) is grown 10x across two runs. The
+    /// [`MergeMemoryTracker`]'s recorded *transient* high-water -- the merge's
+    /// own decode-side buffers, at most one fetched raw block plus one decoded
+    /// block per input -- must stay under a fixed bound and must NOT grow with
+    /// the stream. The defect was that the old merge decoded a whole stream's
+    /// records from every input into one `Vec`, plus a second copy in the part
+    /// accumulator, so peak scaled with stream size; a regression to that shape
+    /// would push the `decoded` term to `O(stream)` and break the bound below.
+    ///
+    /// Deterministic: it asserts on the tracker's accounting, never on process
+    /// RSS or allocator hooks, and runs against [`MemoryStore`].
+    #[tokio::test]
+    async fn merge_peak_memory_is_bounded_independently_of_stream_size() {
+        const INPUTS: u32 = 3;
+        // l0_blocked_cfg's block target: each input is re-blocked at 1000
+        // records, so a grown stream spans many blocks per input.
+        const L0_BLOCK: u64 = 1000;
+        // A generous per-record upper bound (estimate_record for these tiny
+        // records is ~53 bytes); the bound is intentionally loose so it tracks
+        // block size and input count, not the exact estimate.
+        const PER_RECORD_BOUND: u64 = 256;
+        // At most one raw block plus one decoded block resident per input.
+        const TRANSIENT_BOUND: u64 = INPUTS as u64 * 2 * L0_BLOCK * PER_RECORD_BOUND;
+        // Rough bytes-per-record for the "stream size" the peak is compared
+        // against (only used for reporting and the not-scaling assertion).
+        const PER_RECORD_APPROX: i64 = 53;
+
+        // records-per-input at the base scale and 10x.
+        let scales = [3_000i64, 30_000i64];
+        let mut peaks = Vec::new();
+        for &records_per_input in &scales {
+            let store = MemoryStore::new();
+            for j in 0..INPUTS {
+                // One hot stream (stream 0); ts interleaves across inputs so
+                // the k-way merge genuinely interleaves them.
+                let recs: Vec<LogRecord> = (0..records_per_input)
+                    .map(|i| record(0, i * i64::from(INPUTS) + i64::from(j), "x", Vec::new()))
+                    .collect();
+                seed_l0(
+                    &store,
+                    Uuid::from_u128(u128::from(j) + 1),
+                    u64::from(j) + 1,
+                    &recs,
+                    l0_blocked_cfg(),
+                    &[],
+                )
+                .await;
+            }
+
+            let tracker = MergeMemoryTracker::new();
+            let config = CompactorConfig {
+                merge_memory_tracker: Some(tracker.clone()),
+                ..CompactorConfig::default()
+            };
+            let clock = FixedClock::new(sealed_now_ns());
+            compact_bucket(&store, &clock, &config, &bucket())
+                .await
+                .expect("compact");
+
+            // One hot stream => exactly one part (a stream never straddles).
+            let (_rec, parts) = read_output(&store).await;
+            assert_eq!(parts.len(), 1, "one stream is one part");
+            assert_eq!(
+                decode_all(&parts[0]).len() as i64,
+                records_per_input * i64::from(INPUTS),
+                "every record survived the merge"
+            );
+
+            let transient = tracker.peak_transient_bytes();
+            let total = tracker.peak_total_bytes();
+            let stream_bytes =
+                (records_per_input * i64::from(INPUTS)) as u64 * PER_RECORD_APPROX as u64;
+            println!(
+                "[mem:rlog #745] records/input={records_per_input} stream~={stream_bytes}B \
+                 peak_transient={transient}B peak_total={total}B transient_bound={TRANSIENT_BOUND}B \
+                 part_cap={}B",
+                config.max_l1_part_bytes
+            );
+
+            // The decode-side peak is under the fixed bound.
+            assert!(
+                transient > 0,
+                "the tracker must record real decode residency"
+            );
+            assert!(
+                transient < TRANSIENT_BOUND,
+                "transient peak {transient} exceeded the fixed bound {TRANSIENT_BOUND} \
+                 (block size x input count)"
+            );
+            // The only stream-dependent residency is the writer's in-progress
+            // part, bounded by the part cap (content-addressing needs the whole
+            // part before its key exists).
+            assert!(
+                total < TRANSIENT_BOUND + config.max_l1_part_bytes,
+                "total peak {total} exceeded transient bound + part cap"
+            );
+            peaks.push(transient);
+        }
+
+        // The stream grew 10x; the decode-side peak did not (the same handful
+        // of blocks stay resident regardless of stream size).
+        let (base, ten_x) = (peaks[0], peaks[1]);
+        assert!(
+            ten_x <= base * 2,
+            "decode-side peak scaled with the stream: base={base} 10x={ten_x}"
+        );
+        // And concretely, at 10x the peak is a small fraction of the stream.
+        let stream_bytes_10x = (scales[1] * i64::from(INPUTS)) as u64 * PER_RECORD_APPROX as u64;
+        assert!(
+            ten_x < stream_bytes_10x / 5,
+            "10x peak {ten_x} is not far below the stream size {stream_bytes_10x}"
+        );
+    }
+
+    /// Byte-identical-output test for issue #745: the new k-way streaming merge
+    /// produces the exact same part bytes as the old "concatenate every input's
+    /// decoded records for the stream in canonical input order, then stable
+    /// sort by `ts_ns`" path. Parts are content-addressed, so a reordering bug
+    /// would silently change every downstream hash.
+    ///
+    /// The corpus carries the same `(stream, ts)` in two different inputs with
+    /// *different bodies*, so a wrong tie-break would reorder those records and
+    /// change the bytes -- the exact failure this guards against.
+    #[tokio::test]
+    async fn streaming_merge_output_is_byte_identical_to_stable_sort_order() {
+        let store = MemoryStore::new();
+        // Three inputs over three streams. `a` and `b` share an even ts grid
+        // (cross-input ties on every stream); `c` uses an odd grid (it
+        // interleaves). Bodies are tagged by input so order is observable.
+        let mk = |tag: &str, odd: i64| -> Vec<LogRecord> {
+            let mut v = Vec::new();
+            for s in 0..3u32 {
+                for k in 0..40i64 {
+                    v.push(record(
+                        s,
+                        k * 2 + odd,
+                        &format!("{tag}-{s}-{k}"),
+                        vec![("svc".into(), AttrValue::Str(format!("v{}", k % 4)))],
+                    ));
+                }
+            }
+            v
+        };
+        let a = mk("a", 0);
+        let b = mk("b", 0); // same ts grid as `a` => cross-input ts ties
+        let c = mk("c", 1); // odd grid => interleaves
+        // writer_ids 1,2,3 with seqs 1,2,3 sort to canonical order [a, b, c],
+        // the order the merge breaks ts ties in.
+        let a_bytes = seed_l0(
+            &store,
+            Uuid::from_u128(1),
+            1,
+            &a,
+            l0_blocked_cfg(),
+            &["svc"],
+        )
+        .await;
+        let b_bytes = seed_l0(
+            &store,
+            Uuid::from_u128(2),
+            2,
+            &b,
+            l0_blocked_cfg(),
+            &["svc"],
+        )
+        .await;
+        let c_bytes = seed_l0(
+            &store,
+            Uuid::from_u128(3),
+            3,
+            &c,
+            l0_blocked_cfg(),
+            &["svc"],
+        )
+        .await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1, "small corpus fits one part");
+        let actual = &parts[0];
+
+        // Reference: the OLD logical order. For each stream in sorted id order,
+        // concatenate each input's records for that stream in canonical (seed)
+        // order, then stable-sort by ts_ns; concatenate across streams.
+        let per_input: Vec<Vec<LogRecord>> = [&a_bytes, &b_bytes, &c_bytes]
+            .iter()
+            .map(|b| decode_all(b))
+            .collect();
+        let mut all_ids: BTreeSet<LogStreamId> = BTreeSet::new();
+        for recs in &per_input {
+            for r in recs {
+                all_ids.insert(r.stream_id);
+            }
+        }
+        let mut old_order: Vec<LogRecord> = Vec::new();
+        for id in &all_ids {
+            let mut recs: Vec<LogRecord> = Vec::new();
+            for recs_in in &per_input {
+                recs.extend(recs_in.iter().filter(|r| &r.stream_id == id).cloned());
+            }
+            recs.sort_by_key(|r| r.ts_ns); // stable: exactly the old path
+            old_order.extend(recs);
+        }
+
+        // Build the reference part through the same writer, identity, indexed
+        // fields, input_set_hash, and part_index the compaction used.
+        let ftr = footer::open(actual).expect("open actual part");
+        assert_eq!(ftr.input_set_hash.len(), 32, "input_set_hash is 32 bytes");
+        let mut ish = [0u8; 32];
+        ish.copy_from_slice(&ftr.input_set_hash);
+        let identity = compactor_identity(&bucket(), &CompactorConfig::default());
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity)
+            .with_indexed_fields(vec!["svc".to_string()]);
+        for r in old_order {
+            writer.push(r).expect("push");
+        }
+        let reference = writer
+            .finish_compacted(1, ish.to_vec(), 0)
+            .expect("finish reference part");
+
+        assert_eq!(
+            reference.as_slice(),
+            actual.as_ref(),
+            "streaming merge output must be byte-identical to the stable-sort ordering"
+        );
     }
 
     // --- keystone differential property test ---------------------------------

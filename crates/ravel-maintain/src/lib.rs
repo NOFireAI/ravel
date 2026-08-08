@@ -61,7 +61,9 @@ pub use bucket::Bucket;
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{CompactionOutcome, compact_bucket};
-pub use config::{CompactorConfig, RetentionConfig, RetentionConfigError, RetentionPolicy};
+pub use config::{
+    CompactorConfig, MergeMemoryTracker, RetentionConfig, RetentionConfigError, RetentionPolicy,
+};
 pub use discover::discover_tenants;
 pub use error::{MaintainError, Result};
 pub use gc_config::{

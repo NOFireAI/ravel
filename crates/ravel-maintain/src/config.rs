@@ -5,9 +5,120 @@
 //! nanoseconds to match the injected [`crate::clock::Clock`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ravel_types::{TenantHash, TenantId};
 use uuid::Uuid;
+
+/// A test-injectable accounting hook for the RLOG compaction merge's peak
+/// resident memory (issue #745, ADR-0065 decision 4).
+///
+/// The RLOG k-way merge ([`crate::rlog`]) drives this at its real
+/// allocation/decode points so a test can assert the merge's residency is
+/// bounded independently of a stream's size. It is deliberately *load-bearing*,
+/// not decorative: the merge calls [`Self::block_fetched`] when it fetches one
+/// input block's raw bytes, [`Self::block_decoded`]/[`Self::block_released`] as
+/// each decoded block enters and leaves a cursor, and [`Self::set_writer_bytes`]
+/// as records accumulate in the in-progress part's writer. If the merge ever
+/// regressed to decoding a whole stream at once, the `decoded` term would grow
+/// with the stream and the recorded high-water would break the test's bound.
+///
+/// Two high-water marks are kept:
+///
+/// - [`Self::peak_transient_bytes`]: `fetched + decoded`, the merge's *own*
+///   decode-side buffers. This is the quantity issue #745 bounds: at most one
+///   raw block plus one decoded block per input carrying the current stream, so
+///   it is `O(input_count * block_size)` and does NOT scale with stream size.
+/// - [`Self::peak_total_bytes`]: `fetched + decoded + writer`, adding the
+///   in-progress part's writer buffer. The writer term is bounded by
+///   `max_l1_part_bytes` (a part is flushed once its record-byte estimate
+///   reaches the cap on a stream boundary) and is the unavoidable
+///   content-addressing cost the ADR calls out: a part's key does not exist
+///   until the whole part is buffered.
+///
+/// Production never installs one (`CompactorConfig::merge_memory_tracker` is
+/// `None`), so the hooks compile to a single `Option` check and add nothing.
+#[derive(Clone, Debug, Default)]
+pub struct MergeMemoryTracker {
+    inner: Arc<MergeMemoryInner>,
+}
+
+#[derive(Debug, Default)]
+struct MergeMemoryInner {
+    /// Raw block bytes fetched but not yet decoded-and-dropped.
+    fetched: AtomicU64,
+    /// Decoded-record bytes currently resident across all merge cursors.
+    decoded: AtomicU64,
+    /// The in-progress part's accumulated record-byte estimate in the writer.
+    writer: AtomicU64,
+    /// High-water of `fetched + decoded`.
+    peak_transient: AtomicU64,
+    /// High-water of `fetched + decoded + writer`.
+    peak_total: AtomicU64,
+}
+
+impl MergeMemoryTracker {
+    /// A fresh tracker with every counter at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Account `bytes` of raw block bytes just fetched (before decode).
+    pub fn block_fetched(&self, bytes: u64) {
+        self.inner.fetched.fetch_add(bytes, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// Account a block decode: the `raw` bytes are about to be dropped and
+    /// `decoded` bytes of records take their place. Called after the decoded
+    /// records exist but before the raw buffer is released, so the high-water
+    /// captures the instant both are resident.
+    pub fn block_decoded(&self, raw: u64, decoded: u64) {
+        self.inner.decoded.fetch_add(decoded, Ordering::Relaxed);
+        self.note();
+        self.inner.fetched.fetch_sub(raw, Ordering::Relaxed);
+    }
+
+    /// Account a decoded block leaving a cursor (its records were drained into
+    /// the writer and the block's buffer is dropped).
+    pub fn block_released(&self, decoded: u64) {
+        self.inner.decoded.fetch_sub(decoded, Ordering::Relaxed);
+    }
+
+    /// Set the in-progress part's writer buffer estimate to `bytes`. Passing 0
+    /// on flush records that the part's buffer was handed off and released.
+    pub fn set_writer_bytes(&self, bytes: u64) {
+        self.inner.writer.store(bytes, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// Recompute both high-water marks from the live counters.
+    fn note(&self) {
+        let fetched = self.inner.fetched.load(Ordering::Relaxed);
+        let decoded = self.inner.decoded.load(Ordering::Relaxed);
+        let writer = self.inner.writer.load(Ordering::Relaxed);
+        let transient = fetched.saturating_add(decoded);
+        let total = transient.saturating_add(writer);
+        self.inner
+            .peak_transient
+            .fetch_max(transient, Ordering::Relaxed);
+        self.inner.peak_total.fetch_max(total, Ordering::Relaxed);
+    }
+
+    /// High-water of the merge's decode-side buffers (`fetched + decoded`).
+    /// Bounded by `O(input_count * block_size)`, independent of stream size.
+    pub fn peak_transient_bytes(&self) -> u64 {
+        self.inner.peak_transient.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the merge's total residency
+    /// (`fetched + decoded + writer`), the decode-side buffers plus the
+    /// in-progress part's writer buffer.
+    pub fn peak_total_bytes(&self) -> u64 {
+        self.inner.peak_total.load(Ordering::Relaxed)
+    }
+}
 
 /// Nanoseconds in one hour; an ingest-hour bucket spans exactly this.
 pub const NS_PER_HOUR: i64 = 3_600_000_000_000;
@@ -151,6 +262,14 @@ pub struct CompactorConfig {
     /// config via `..CompactorConfig::default()`, stay byte-for-byte unchanged
     /// with `dry_run == false`. Default `false`.
     pub dry_run: bool,
+    /// Optional test-injectable accounting hook for the RLOG compaction merge's
+    /// peak resident memory (issue #745). `None` in production (the merge's
+    /// accounting hooks are skipped); a test installs one and reads its
+    /// high-water marks after `compact_bucket` to assert the k-way merge stayed
+    /// bounded independently of stream size. Carried in the config, like every
+    /// other merge knob, so `..CompactorConfig::default()` call sites are
+    /// unaffected. Default `None`.
+    pub merge_memory_tracker: Option<MergeMemoryTracker>,
 }
 
 impl Default for CompactorConfig {
@@ -170,6 +289,7 @@ impl Default for CompactorConfig {
             force_orphan_gc: false,
             idem_dedup_window_hours: DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
             dry_run: false,
+            merge_memory_tracker: None,
         }
     }
 }

@@ -33,7 +33,7 @@ pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
 
 pub use error::LogSegError;
 pub use footer::{SuffixOutcome, open_from_suffix};
-pub use ranged::{RlogRangeReader, StreamBlockSpan};
+pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockSpan};
 pub use reader::{RlogReader, ScanStats, decode_section, read_section};
 pub use record::{FieldSel, LogRecord, Predicate, stream_attrs_bytes};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
