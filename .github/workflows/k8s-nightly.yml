@@ -1,0 +1,166 @@
+name: k8s-nightly
+
+# The kind lane (k8s-build + k8s-integration) is expensive real CI minutes
+# (k8s-build alone budgets 55m) for a class of regression most PRs don't
+# touch, so ci.yml no longer runs it by default -- only on a PR carrying the
+# `run-k8s` label (see ci.yml's k8s-build/k8s-integration `if:` comments).
+# This workflow is the backstop: it runs the identical two-job pipeline
+# nightly against main, so a k8s-affecting regression that lands via an
+# unlabeled PR is still caught within a day, not only when someone happens to
+# add the label.
+#
+# The job bodies here are a deliberate copy of ci.yml's k8s-build and
+# k8s-integration, not a shared/reusable-workflow indirection: a reusable
+# workflow call changes the check name GitHub reports for the job (from
+# `k8s-build` to `<caller-job>/k8s-build`), which risks silently breaking
+# branch-protection required-status-check names configured against the
+# existing bare names. Copying avoids that risk at the cost of needing the
+# two files kept in sync by hand. If you change the steps in one, mirror the
+# change in the other; a diff between this file's two jobs and ci.yml's is
+# the way to check they haven't drifted.
+on:
+  schedule:
+    # 03:00 UTC daily -- outside the working hours these jobs' authors keep,
+    # so a nightly failure is triaged fresh rather than mid-review-cycle.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: k8s-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Mirrors ci.yml's k8s-build. See that job's own comments for the full
+  # rationale (ADR-0034 decision 7, ADR-0053 D5, issue #250); this copy omits
+  # only the `needs: changes` / `if:` gating, since this workflow always runs
+  # the full pipeline against main rather than diffing a PR's changed paths.
+  k8s-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release binaries on the host
+        run: |
+          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-cli
+          cargo build --release --locked -p ravel-operator
+      - name: Assemble both images from the prebuilt binaries
+        run: |
+          ctx=$(mktemp -d)
+          cp target/release/ravel-server target/release/ravel-cli target/release/ravel-operator "$ctx/"
+          docker build --file Dockerfile.prebuilt --target server \
+            --tag "$RAVEL_SERVER_IMAGE" "$ctx"
+          docker build --file Dockerfile.prebuilt --target operator \
+            --tag "$RAVEL_OPERATOR_IMAGE" "$ctx"
+          rm -rf "$ctx"
+      - name: Smoke-run both assembled images
+        run: |
+          docker run --rm "$RAVEL_SERVER_IMAGE" --help >/dev/null
+          docker run --rm "$RAVEL_OPERATOR_IMAGE" --help >/dev/null
+      - name: Save the assembled images
+        run: docker save -o k8s-images.tar "$RAVEL_SERVER_IMAGE" "$RAVEL_OPERATOR_IMAGE"
+      - name: Upload the assembled images
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-images-nightly
+          path: k8s-images.tar
+          retention-days: 1
+
+  # Mirrors ci.yml's k8s-integration. See that job's own comments for the full
+  # rationale; this copy needs only k8s-build (no `lint` fail-fast gate --
+  # this workflow runs no lint job of its own -- and no `changes` gate, since
+  # there is no PR diff to narrow against).
+  k8s-integration:
+    needs: k8s-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAVEL_SERVER_IMAGE: ravel-server:kind-ci
+      RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
+      RAVEL_KIND_CLUSTER: ravel-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-disk-space
+      - name: Download the assembled images
+        uses: actions/download-artifact@v4
+        with:
+          name: k8s-images-nightly
+      - name: Load the assembled images into the docker daemon
+        run: docker load -i k8s-images.tar
+      - name: Install kubectl (pinned, retried)
+        run: |
+          version=v1.32.2
+          bin_dir="${RUNNER_TEMP}/kubectl-bin"
+          mkdir -p "$bin_dir"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 -o /tmp/kubectl \
+                "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"; then
+              break
+            fi
+            echo "kubectl download attempt ${attempt} failed; retrying" >&2
+            sleep $((attempt * 5))
+            [ "$attempt" = 5 ] && { echo "::error::kubectl download failed after 5 attempts"; exit 1; }
+          done
+          chmod +x /tmp/kubectl
+          mv /tmp/kubectl "$bin_dir/kubectl"
+          "$bin_dir/kubectl" version --client
+      - name: Resolve the pinned kind node image
+        id: node-image
+        run: |
+          # shellcheck disable=SC2016  # the ${...} below is sed's pattern, not
+          # a shell expansion: it matches the script's default-value syntax.
+          image=$(sed -n 's/^NODE_IMAGE="\${RAVEL_KIND_NODE_IMAGE:-\(.*\)}"$/\1/p' \
+            scripts/kind-up.sh)
+          if [ -z "$image" ]; then
+            echo "::error::could not read the pinned node image from scripts/kind-up.sh"
+            exit 1
+          fi
+          echo "node image: $image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - name: Create the kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          version: v0.32.0
+          node_image: ${{ steps.node-image.outputs.image }}
+          cluster_name: ravel-ci
+          kubectl_version: v1.32.2
+          wait: 300s
+      - name: Prefer the retried kubectl over the action's own install
+        run: echo "${RUNNER_TEMP}/kubectl-bin" >> "$GITHUB_PATH"
+      - name: Bring up the kind environment
+        env:
+          RAVEL_SKIP_IMAGE_BUILD: "1"
+        run: |
+          if ! kind get clusters | grep -qx "$RAVEL_KIND_CLUSTER"; then
+            echo "::error::helm/kind-action did not create cluster $RAVEL_KIND_CLUSTER"
+            kind get clusters
+            exit 1
+          fi
+          scripts/kind-up.sh
+      - name: OTLP round trip through the gateway and query Services
+        run: scripts/kind-demo.sh
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl describe pods -n ravel-system || true
+          kubectl get events -A --sort-by=.lastTimestamp || true
+          kubectl logs -n ravel-system -l app.kubernetes.io/name=ravel-operator \
+            --all-containers --tail=500 || true
+      - name: Delete the kind cluster
+        if: always()
+        run: scripts/kind-down.sh

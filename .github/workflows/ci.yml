@@ -20,12 +20,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # Lets a docs-only change (README, PROGRESS, ADRs, guides) skip the whole
-  # cargo-loop straight to green instead of waiting on six compiling jobs
-  # that touch none of the changed files. Diffs against the merge-base
-  # rather than the base branch tip, so commits landing on main during an
-  # open PR don't get pulled into the changed-file list. Any file outside
-  # `*.md` flips this back to the normal full run.
+  # Lets a docs-only change (README, PROGRESS, ADRs, guides, diagrams) skip
+  # the whole cargo-loop straight to green instead of waiting on six
+  # compiling jobs that touch none of the changed files. Diffs against the
+  # merge-base rather than the base branch tip, so commits landing on main
+  # during an open PR don't get pulled into the changed-file list. Any file
+  # outside `*.md` / `*.svg` flips this back to the normal full run.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -93,9 +93,10 @@ jobs:
             emit false true true true true
             exit 0
           fi
-          # docs-only: every changed path ends in .md. Areas are irrelevant
-          # then -- no compiling job runs at all -- so report them false.
-          if ! echo "$changed" | grep -qvE '\.md$'; then
+          # docs-only: every changed path ends in .md or .svg (prose plus the
+          # diagrams that illustrate it). Areas are irrelevant then -- no
+          # compiling job runs at all -- so report them false.
+          if ! echo "$changed" | grep -qvE '\.(md|svg)$'; then
             echo "::notice::docs-only change, skipping compiling jobs"
             emit true false false false false
             exit 0
@@ -793,9 +794,17 @@ jobs:
   k8s-build:
     needs: changes
     # Same gate k8s-integration carries (docs_only plus server_or_operator,
-    # ADR-0053 D4). k8s-integration additionally needs this job, so when this
-    # one skips, k8s-integration skips with it.
-    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.server_or_operator == 'true'
+    # ADR-0053 D4), plus the `run-k8s` label: the kind lane is real CI minutes
+    # (k8s-build alone budgets 55m) for a class of regression most PRs don't
+    # touch, so it no longer runs by default on every PR. Add the `run-k8s`
+    # label to a PR to opt it in explicitly; every PR still gets full coverage
+    # from k8s-nightly.yml's schedule run regardless. k8s-integration
+    # additionally needs this job, so when this one skips, it skips with it.
+    if: >-
+      needs.changes.outputs.docs_only != 'true' &&
+      needs.changes.outputs.server_or_operator == 'true' &&
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-k8s')
     runs-on: ubuntu-latest
     # 55m: the original single job's 60m covered the release build plus the
     # kind half; this half is build + docker save + artifact upload only, but
@@ -875,7 +884,12 @@ jobs:
     # (D5: it consumes the images k8s-build assembled), plus changes for the
     # gate outputs.
     needs: [changes, lint, k8s-build]
-    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.server_or_operator == 'true'
+    # Same run-k8s label gate as k8s-build; see its comment above.
+    if: >-
+      needs.changes.outputs.docs_only != 'true' &&
+      needs.changes.outputs.server_or_operator == 'true' &&
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-k8s')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
