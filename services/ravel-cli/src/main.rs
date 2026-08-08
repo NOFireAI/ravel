@@ -85,6 +85,7 @@ fn command_hashes_tenant(command: &Command) -> bool {
         Command::Catalog { .. }
         | Command::Maintain { .. }
         | Command::Hold { .. }
+        | Command::Erase { .. }
         | Command::Provision { .. } => true,
         // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
         // `--tenant`, so it needs the bucket's scheme resolved first; the
@@ -145,6 +146,13 @@ enum Command {
     Hold {
         #[command(subcommand)]
         command: HoldCommand,
+    },
+    /// Submit and inspect selective (GDPR/CCPA subject) erasure requests
+    /// (ADR-0064 decision 1, issue #751). Runs under the Admin credential, the
+    /// same operator-only posture as `hold`.
+    Erase {
+        #[command(subcommand)]
+        command: EraseCommand,
     },
     /// Inspect an idempotency marker object (ADR-0051 section 5, issue #532).
     Idem {
@@ -269,6 +277,52 @@ enum HoldCommand {
     List {
         #[arg(long)]
         tenant: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EraseCommand {
+    /// Submit an immutable erasure request: a conjunction of exact-match
+    /// label/attribute matchers plus an optional event-time window, and an
+    /// optional free-text reason. Written `.dreq` with CreateIfAbsent; prints
+    /// the assigned request_id. A request id is generated unless `--request-id`
+    /// is given (supply it to retry a prior submit idempotently).
+    Submit {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        /// Exact-match predicate matcher `key=value`, repeatable; the request
+        /// matches a record only when every matcher holds (logical AND). At
+        /// least one is required.
+        #[arg(long = "matcher", value_name = "KEY=VALUE", required = true)]
+        matchers: Vec<String>,
+        /// Optional inclusive event-time window start (unix ns). Both bounds
+        /// zero (the default) means no event-time restriction.
+        #[arg(long, default_value_t = 0)]
+        window_start_ns: i64,
+        /// Optional exclusive event-time window end (unix ns).
+        #[arg(long, default_value_t = 0)]
+        window_end_ns: i64,
+        /// Optional free-text operator reason.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Reuse an explicit request id (UUID) instead of generating one, to
+        /// retry a prior submit idempotently under CreateIfAbsent.
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Report an erasure request's state: pending (a `.dreq`, no `.done`),
+    /// completed (a `.done`, with per-bucket dropped counts and any deferral
+    /// cause), or unknown. Omit `--request-id` to list every request for the
+    /// (tenant, signal).
+    Status {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        #[arg(long)]
+        request_id: Option<String>,
     },
 }
 
@@ -419,6 +473,13 @@ enum MaintainCommand {
         tenant: String,
         #[arg(long, default_value_t = 4)]
         shards: u32,
+        /// Also list noncurrent (prior) versions under the tenant's keys and
+        /// report "deleted but recoverable as prior version" as a distinct
+        /// anomaly class (ADR-0064 §7, S4-12). The ObjectStoreBackend contract
+        /// exposes no versioned listing, so against a real backend this reports
+        /// an honest gap rather than an anomaly.
+        #[arg(long)]
+        versioning_aware: bool,
     },
 }
 
@@ -607,8 +668,21 @@ async fn main() -> anyhow::Result<()> {
             command: MaintainCommand::AuditVersions { tenant, shards },
         } => maintain::audit_versions(store::build_store(&cli.store)?, &tenant, shards).await,
         Command::Maintain {
-            command: MaintainCommand::VerifyCustody { tenant, shards },
-        } => maintain::verify_custody(store::build_store(&cli.store)?, &tenant, shards).await,
+            command:
+                MaintainCommand::VerifyCustody {
+                    tenant,
+                    shards,
+                    versioning_aware,
+                },
+        } => {
+            maintain::verify_custody(
+                store::build_store(&cli.store)?,
+                &tenant,
+                shards,
+                versioning_aware,
+            )
+            .await
+        }
         Command::Store {
             command: StoreCommand::Qualify {},
         } => {
@@ -661,6 +735,59 @@ async fn main() -> anyhow::Result<()> {
         Command::Hold {
             command: HoldCommand::List { tenant },
         } => hold::list(store::build_store(&cli.store)?, &tenant).await,
+        Command::Erase {
+            command:
+                EraseCommand::Submit {
+                    tenant,
+                    signal,
+                    matchers,
+                    window_start_ns,
+                    window_end_ns,
+                    reason,
+                    request_id,
+                },
+        } => {
+            let matchers = matchers
+                .iter()
+                .map(|m| ravel_cli::erase::parse_matcher(m))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let request_id = match request_id {
+                Some(s) => uuid::Uuid::parse_str(&s)
+                    .map_err(|_| anyhow::anyhow!("--request-id {s:?} is not a valid UUID"))?,
+                None => uuid::Uuid::new_v4(),
+            };
+            ravel_cli::erase::submit(
+                store::build_store(&cli.store)?,
+                &tenant,
+                signal,
+                matchers,
+                window_start_ns,
+                window_end_ns,
+                reason,
+                request_id,
+                now_ns()?,
+            )
+            .await
+            .map(|_| ())
+        }
+        Command::Erase {
+            command:
+                EraseCommand::Status {
+                    tenant,
+                    signal,
+                    request_id,
+                },
+        } => {
+            let request_id = match request_id {
+                Some(s) => Some(
+                    uuid::Uuid::parse_str(&s)
+                        .map_err(|_| anyhow::anyhow!("--request-id {s:?} is not a valid UUID"))?,
+                ),
+                None => None,
+            };
+            ravel_cli::erase::status(store::build_store(&cli.store)?, &tenant, signal, request_id)
+                .await
+        }
         Command::Idem {
             command: IdemCommand::Inspect { key },
         } => {

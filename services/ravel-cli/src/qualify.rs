@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ravel_object_store::conformance::{
-    CONFORMANCE_SUITE_VERSION, probe_object_lock, run_conformance_suite,
+    BucketConfigProbe, CONFORMANCE_SUITE_VERSION, bucket_config_alarms, probe_bucket_config,
+    probe_object_lock, run_conformance_suite,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
 
@@ -54,6 +55,19 @@ pub async fn qualify(
         object_lock.status.name(),
         object_lock.detail
     );
+
+    // Informational required-bucket-configuration report (ADR-0064 §7, S2-16,
+    // S4-12): bucket versioning state and the presence/absence of the two
+    // sanctioned lifecycle rules, plus any contract-violation alarms. Like the
+    // Object Lock probe above, it is informational-plus-alarming and never
+    // affects whether qualification passes, what `sys/qualification` records, or
+    // whether the server starts; `object_store` cannot enforce bucket policy, so
+    // Ravel reports what it can observe (unknown through the trait contract) and
+    // documents what it requires.
+    let bucket_config = probe_bucket_config(store.as_ref()).await;
+    for line in bucket_config_report_lines(&bucket_config) {
+        println!("{line}");
+    }
 
     if !report.passed() {
         let failed_names: Vec<&str> = report.failures().map(|r| r.property.name()).collect();
@@ -113,5 +127,85 @@ pub async fn qualify(
         Err(err) => Err(anyhow::anyhow!(
             "qualification passed but writing {QUALIFICATION_KEY} failed: {err}"
         )),
+    }
+}
+
+/// Render the informational required-bucket-configuration report for a
+/// [`BucketConfigProbe`] (ADR-0064 §7): one line per observed setting (all
+/// clearly labeled informational and non-blocking), followed by one line per
+/// contract-violation alarm from [`bucket_config_alarms`]. Factored out of
+/// [`qualify`] so the compliant/non-compliant reporting can be tested without a
+/// live versioned bucket (the trait contract only ever reports `unknown`).
+pub fn bucket_config_report_lines(probe: &BucketConfigProbe) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "{:<40} {} (informational, non-blocking) {}",
+            "bucket/versioning",
+            probe.versioning.name(),
+            probe.detail
+        ),
+        format!(
+            "{:<40} {} (informational, non-blocking)",
+            "lifecycle/abort_incomplete_multipart",
+            probe.abort_incomplete_multipart_upload.name(),
+        ),
+        format!(
+            "{:<40} {} (informational, non-blocking)",
+            "lifecycle/noncurrent_version_expiration",
+            probe.noncurrent_version_expiration.name(),
+        ),
+    ];
+    for alarm in bucket_config_alarms(probe) {
+        lines.push(format!("{:<40} {alarm}", "bucket/config"));
+    }
+    lines
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_object_store::conformance::{LifecycleRuleStatus, VersioningStatus};
+
+    /// A compliant bucket configuration (ADR-0064 §7) produces the three
+    /// informational lines and no alarm; a non-compliant one (versioning on
+    /// with no noncurrent-version expiration rule) adds the named alarm line.
+    /// This is the qualify-level report the operator sees, exercised for both
+    /// configurations without a live versioned bucket.
+    #[test]
+    fn bucket_config_report_marks_compliant_vs_non_compliant() {
+        let compliant = BucketConfigProbe {
+            versioning: VersioningStatus::On,
+            abort_incomplete_multipart_upload: LifecycleRuleStatus::Present,
+            noncurrent_version_expiration: LifecycleRuleStatus::Present,
+            detail: "fixture: compliant".to_string(),
+        };
+        let lines = bucket_config_report_lines(&compliant);
+        assert_eq!(
+            lines.len(),
+            3,
+            "a compliant bucket reports three informational lines and no alarm: {lines:?}"
+        );
+        assert!(lines.iter().all(|l| l.contains("informational")));
+        assert!(
+            !lines.iter().any(|l| l.contains("ALARM")),
+            "a compliant bucket must not alarm: {lines:?}"
+        );
+        assert!(lines[0].contains("bucket/versioning"));
+        assert!(lines[0].contains(" on "));
+
+        let non_compliant = BucketConfigProbe {
+            versioning: VersioningStatus::On,
+            abort_incomplete_multipart_upload: LifecycleRuleStatus::Present,
+            noncurrent_version_expiration: LifecycleRuleStatus::Absent,
+            detail: "fixture: non-compliant".to_string(),
+        };
+        let lines = bucket_config_report_lines(&non_compliant);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("ALARM") && l.contains("unsupported configuration")),
+            "a versioned bucket without a noncurrent-version rule must alarm: {lines:?}"
+        );
     }
 }

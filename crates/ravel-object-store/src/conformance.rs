@@ -263,6 +263,241 @@ pub async fn probe_object_lock<S: ObjectLockProbeSource + ?Sized>(source: &S) ->
     source.object_lock_status().await
 }
 
+// --- Required bucket configuration probe (ADR-0064 section 7, S2-16, S4-12) ---
+//
+// ADR-0064 makes bucket versioning and lifecycle rules a normative contract:
+// versioning OFF unless paired with a noncurrent-version expiration rule, the
+// `AbortIncompleteMultipartUpload` rule recommended, and no other expiration
+// rule on any Ravel prefix. Like the Object Lock probe above, this is
+// informational-plus-alarming, never startup-blocking: `object_store` 0.14 has
+// no bucket-policy query, so a real backend reports every field `Unknown`
+// through the trait contract, and this crate never opens a second, direct-SDK
+// side channel (an ADR-0042 rejected alternative). Test fixtures implement the
+// source to represent compliant and non-compliant buckets so the reporting and
+// alarm paths are exercised for every state.
+
+/// Whether a bucket appears to have object versioning enabled (ADR-0064 §7
+/// point 1). A separate, three-valued signal rather than folding into
+/// [`ObjectLockStatus`]: erasure guarantees depend specifically on versioning,
+/// and the required lifecycle rule below is only meaningful when it is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersioningStatus {
+    /// The backend affirmatively reports object versioning enabled.
+    On,
+    /// The backend affirmatively reports object versioning disabled.
+    Off,
+    /// The backend cannot answer (the trait contract exposes no query; the
+    /// honest default, exactly as [`ObjectLockStatus::Unknown`]).
+    Unknown,
+}
+
+impl VersioningStatus {
+    /// Stable, greppable identifier for CLI output.
+    pub fn name(&self) -> &'static str {
+        match self {
+            VersioningStatus::On => "on",
+            VersioningStatus::Off => "off",
+            VersioningStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether one of ADR-0064 §7's sanctioned lifecycle rules appears configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleRuleStatus {
+    /// The backend affirmatively reports the rule present.
+    Present,
+    /// The backend affirmatively reports the rule absent.
+    Absent,
+    /// The backend cannot answer (the honest default through the trait
+    /// contract).
+    Unknown,
+}
+
+impl LifecycleRuleStatus {
+    /// Stable, greppable identifier for CLI output.
+    pub fn name(&self) -> &'static str {
+        match self {
+            LifecycleRuleStatus::Present => "present",
+            LifecycleRuleStatus::Absent => "absent",
+            LifecycleRuleStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// Observed (or unknown) required-bucket-configuration state (ADR-0064 §7).
+/// Reports the three settings the ADR names: object versioning, the
+/// `AbortIncompleteMultipartUpload` lifecycle rule (recommended), and the
+/// noncurrent-version expiration rule (required only when versioning is on).
+#[derive(Debug, Clone)]
+pub struct BucketConfigProbe {
+    pub versioning: VersioningStatus,
+    pub abort_incomplete_multipart_upload: LifecycleRuleStatus,
+    pub noncurrent_version_expiration: LifecycleRuleStatus,
+    /// Human-readable explanation of how the state was determined (or why it
+    /// is unknown).
+    pub detail: String,
+}
+
+impl BucketConfigProbe {
+    /// The honest default: the backend could not answer any field. Not an
+    /// error, and never a qualification failure.
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        BucketConfigProbe {
+            versioning: VersioningStatus::Unknown,
+            abort_incomplete_multipart_upload: LifecycleRuleStatus::Unknown,
+            noncurrent_version_expiration: LifecycleRuleStatus::Unknown,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Assess a [`BucketConfigProbe`] against ADR-0064 §7 and return one alarm
+/// string per observed contract violation, most-severe first. Informational
+/// only: the caller prints these for the operator and never blocks on them.
+///
+/// An `Unknown` field raises no alarm: the platform cannot see the setting, so
+/// it can neither confirm nor deny a violation (ADR-0055 §3's honest-gap
+/// framing). Only an affirmative observation of a non-compliant state alarms.
+pub fn bucket_config_alarms(probe: &BucketConfigProbe) -> Vec<String> {
+    let mut alarms = Vec::new();
+    // The load-bearing one (S4-12): versioning on without a noncurrent-version
+    // expiration rule silently converts every Ravel delete into a soft delete,
+    // inverting every deletion guarantee in the system. ADR-0064 §7 point 1
+    // calls this an unsupported configuration.
+    if probe.versioning == VersioningStatus::On
+        && probe.noncurrent_version_expiration == LifecycleRuleStatus::Absent
+    {
+        alarms.push(
+            "ALARM: object versioning is enabled but no noncurrent-version expiration rule is \
+             configured. This silently converts every Ravel delete (retention, sweep, and \
+             ADR-0064 erasure) into a soft delete, inverting every deletion guarantee, and is an \
+             unsupported configuration (ADR-0064 §7 point 1). Configure noncurrent-version \
+             expiration plus expired-delete-marker cleanup on all t/ prefixes, or disable \
+             versioning."
+                .to_string(),
+        );
+    }
+    // Recommended, not required: the abort-incomplete-multipart rule
+    // (ADR-0064 §7 point 3; also converts S5-19's undocumented dependency into
+    // a documented one).
+    if probe.abort_incomplete_multipart_upload == LifecycleRuleStatus::Absent {
+        alarms.push(
+            "NOTE: the recommended AbortIncompleteMultipartUpload lifecycle rule (7 days) is not \
+             configured (ADR-0064 §7 point 3). Incomplete multipart uploads will accumulate."
+                .to_string(),
+        );
+    }
+    alarms
+}
+
+/// Source of the informational required-bucket-configuration signal, kept
+/// **separate from [`ObjectStoreBackend`]** for the same reason
+/// [`ObjectLockProbeSource`] is: a real bucket-policy capability belongs to its
+/// own trait-extending ADR (ADR-0042 decision 3), and `object_store` 0.14 has
+/// no query for it. Every production backend reports `Unknown` through the dyn
+/// impl below; test fixtures implement it to represent compliant and
+/// non-compliant buckets.
+#[async_trait::async_trait]
+pub trait BucketConfigProbeSource {
+    async fn bucket_config(&self) -> BucketConfigProbe;
+}
+
+/// The production path: a store reached only through the [`ObjectStoreBackend`]
+/// contract cannot answer, so every field is `Unknown`. Implemented on the
+/// trait object itself so `ravel-cli store qualify`, holding an
+/// `Arc<dyn ObjectStoreBackend>`, can probe without threading a concrete type.
+#[async_trait::async_trait]
+impl BucketConfigProbeSource for dyn ObjectStoreBackend {
+    async fn bucket_config(&self) -> BucketConfigProbe {
+        BucketConfigProbe::unknown(
+            "the ObjectStoreBackend contract exposes no bucket versioning / lifecycle-rule query, \
+             and object_store 0.14 has no API for one; a real probe needs its own trait-extending \
+             ADR (ADR-0042 decision 3). Reporting unknown is the honest, non-blocking default \
+             (ADR-0055 section 3, ADR-0064 §7): the operator must confirm the required \
+             configuration out of band",
+        )
+    }
+}
+
+/// Run the informational required-bucket-configuration probe against `source`.
+/// Never fails, never panics, never affects qualification (ADR-0064 §7).
+pub async fn probe_bucket_config<S: BucketConfigProbeSource + ?Sized>(
+    source: &S,
+) -> BucketConfigProbe {
+    source.bucket_config().await
+}
+
+// --- Noncurrent-version listing for verify-custody (ADR-0064 §7, S4-12) ---
+//
+// On a versioned bucket, a Ravel delete leaves a recoverable prior version
+// invisible to `verify-custody`'s content-addressed walk (S4-12). ADR-0064 §7
+// closes that clause by having `verify-custody` list noncurrent versions under
+// swept keys and report "deleted but recoverable as prior version" as its own
+// anomaly class. The `ObjectStoreBackend` contract has no versioned listing, so
+// this is a separate seam, same as the probes above: the production dyn impl
+// reports `supported: false` (an honest gap, not an anomaly), and a versioning-
+// aware test fixture reports the noncurrent versions it holds.
+
+/// One noncurrent (prior) object version observed under a Ravel key on a
+/// versioned bucket. `version_id` is the backend's opaque version handle
+/// (S3 `VersionId`); its exact form is backend-specific and used only for
+/// display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoncurrentVersion {
+    pub key: String,
+    pub version_id: String,
+}
+
+/// Result of listing noncurrent versions under a prefix. `supported` is false
+/// when the source cannot observe versioned listings at all (every production
+/// backend through the trait contract today), distinguishing "no noncurrent
+/// versions exist" (`supported: true`, empty `versions`) from "cannot tell"
+/// (`supported: false`). The former lets `verify-custody` affirm the bucket is
+/// clean; the latter is an honest gap it reports without alarming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoncurrentVersionListing {
+    pub supported: bool,
+    pub versions: Vec<NoncurrentVersion>,
+}
+
+impl NoncurrentVersionListing {
+    /// The honest default: this source cannot observe noncurrent versions.
+    pub fn unsupported() -> Self {
+        NoncurrentVersionListing {
+            supported: false,
+            versions: Vec::new(),
+        }
+    }
+}
+
+/// Source of noncurrent-version listings, kept **separate from
+/// [`ObjectStoreBackend`]** for the same reason as the probes above. The
+/// production dyn impl reports [`NoncurrentVersionListing::unsupported`]; a
+/// versioning-aware fixture reports the prior versions it holds under a prefix.
+#[async_trait::async_trait]
+pub trait NoncurrentVersionSource {
+    async fn list_noncurrent_versions(
+        &self,
+        prefix: &str,
+    ) -> Result<NoncurrentVersionListing, StoreError>;
+}
+
+/// The production path: a store reached only through the [`ObjectStoreBackend`]
+/// contract cannot enumerate prior versions, so it always reports
+/// `supported: false`. Implemented on the trait object itself so
+/// `ravel-cli verify-custody`, holding an `Arc<dyn ObjectStoreBackend>`, can
+/// probe without threading a concrete type.
+#[async_trait::async_trait]
+impl NoncurrentVersionSource for dyn ObjectStoreBackend {
+    async fn list_noncurrent_versions(
+        &self,
+        _prefix: &str,
+    ) -> Result<NoncurrentVersionListing, StoreError> {
+        Ok(NoncurrentVersionListing::unsupported())
+    }
+}
+
 /// Run every conformance probe against `store`, scoping all writes under
 /// `scratch_prefix` (ADR-0050 section 6: `sys/qualify/<run-id>/`). Never
 /// panics on a misbehaving backend: every probe treats an unexpected
@@ -844,5 +1079,160 @@ mod tests {
         assert!(!failure.passed);
         assert!(failure.detail.contains("timeout"));
         assert_eq!(store.fault_count(Op::Put, FaultKind::Timeout), 1);
+    }
+
+    /// A fixture standing in for a bucket whose versioning / lifecycle-rule
+    /// state a real backend could observe but the `ObjectStoreBackend` contract
+    /// cannot. Lets the required-bucket-configuration probe and its alarm
+    /// assessment be exercised for compliant and non-compliant buckets without
+    /// a live S3 bucket.
+    struct FixedBucketConfig(BucketConfigProbe);
+
+    #[async_trait::async_trait]
+    impl BucketConfigProbeSource for FixedBucketConfig {
+        async fn bucket_config(&self) -> BucketConfigProbe {
+            self.0.clone()
+        }
+    }
+
+    /// A compliant versioned bucket (ADR-0064 §7): versioning on, and both the
+    /// noncurrent-version expiration and the recommended abort-incomplete rule
+    /// present, raises no alarm.
+    #[tokio::test]
+    async fn bucket_config_compliant_versioned_bucket_has_no_alarms() {
+        let source = FixedBucketConfig(BucketConfigProbe {
+            versioning: VersioningStatus::On,
+            abort_incomplete_multipart_upload: LifecycleRuleStatus::Present,
+            noncurrent_version_expiration: LifecycleRuleStatus::Present,
+            detail: "fixture: compliant versioned bucket".to_string(),
+        });
+        let probe = probe_bucket_config(&source).await;
+        assert_eq!(probe.versioning, VersioningStatus::On);
+        assert!(
+            bucket_config_alarms(&probe).is_empty(),
+            "a versioned bucket with both sanctioned rules must not alarm"
+        );
+
+        // A compliant unversioned bucket is equally clean: with versioning off,
+        // the noncurrent-version rule is not required, so its absence does not
+        // alarm.
+        let source = FixedBucketConfig(BucketConfigProbe {
+            versioning: VersioningStatus::Off,
+            abort_incomplete_multipart_upload: LifecycleRuleStatus::Present,
+            noncurrent_version_expiration: LifecycleRuleStatus::Absent,
+            detail: "fixture: compliant unversioned bucket".to_string(),
+        });
+        let probe = probe_bucket_config(&source).await;
+        assert!(
+            bucket_config_alarms(&probe).is_empty(),
+            "an unversioned bucket needs no noncurrent-version rule"
+        );
+    }
+
+    /// The load-bearing non-compliant case (S4-12): versioning on with no
+    /// noncurrent-version expiration rule alarms as an unsupported
+    /// configuration; a missing abort-incomplete rule adds an advisory note.
+    #[tokio::test]
+    async fn bucket_config_versioned_without_noncurrent_rule_alarms() {
+        let source = FixedBucketConfig(BucketConfigProbe {
+            versioning: VersioningStatus::On,
+            abort_incomplete_multipart_upload: LifecycleRuleStatus::Absent,
+            noncurrent_version_expiration: LifecycleRuleStatus::Absent,
+            detail: "fixture: non-compliant versioned bucket".to_string(),
+        });
+        let probe = probe_bucket_config(&source).await;
+        let alarms = bucket_config_alarms(&probe);
+        assert_eq!(
+            alarms.len(),
+            2,
+            "expected the unsupported-config alarm plus the abort-incomplete note, got: {alarms:?}"
+        );
+        assert!(
+            alarms[0].starts_with("ALARM:") && alarms[0].contains("unsupported configuration"),
+            "the versioning-without-expiration alarm must be first and named: {alarms:?}"
+        );
+        assert!(
+            alarms[1].contains("AbortIncompleteMultipartUpload"),
+            "the abort-incomplete note must appear: {alarms:?}"
+        );
+    }
+
+    /// An `Unknown` field never alarms: the platform cannot see the setting, so
+    /// it neither confirms nor denies a violation (ADR-0055 §3 honest gap). A
+    /// real backend reached only through the trait contract reports every field
+    /// unknown and therefore raises no alarm.
+    #[tokio::test]
+    async fn bucket_config_unknown_never_alarms_and_is_the_production_default() {
+        let store = MemoryStore::new();
+        let probe = probe_bucket_config(&store as &dyn ObjectStoreBackend).await;
+        assert_eq!(probe.versioning, VersioningStatus::Unknown);
+        assert_eq!(
+            probe.abort_incomplete_multipart_upload,
+            LifecycleRuleStatus::Unknown
+        );
+        assert_eq!(
+            probe.noncurrent_version_expiration,
+            LifecycleRuleStatus::Unknown
+        );
+        assert!(
+            bucket_config_alarms(&probe).is_empty(),
+            "an all-unknown probe must not alarm"
+        );
+
+        // And it never touches qualification pass/fail.
+        let report = run_conformance_suite(&store, "sys/qualify/bucket-config/").await;
+        assert!(report.passed());
+        assert_eq!(report.results.len(), 4);
+    }
+
+    /// A versioning-aware fixture that holds noncurrent versions, standing in
+    /// for a versioned bucket whose prior versions the trait contract cannot
+    /// enumerate.
+    struct FixedNoncurrentVersions(NoncurrentVersionListing);
+
+    #[async_trait::async_trait]
+    impl NoncurrentVersionSource for FixedNoncurrentVersions {
+        async fn list_noncurrent_versions(
+            &self,
+            _prefix: &str,
+        ) -> Result<NoncurrentVersionListing, StoreError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A real backend cannot enumerate prior versions through the trait
+    /// contract, so it reports `supported: false` -- an honest gap, not an
+    /// empty-and-clean result.
+    #[tokio::test]
+    async fn noncurrent_version_source_production_default_is_unsupported() {
+        let store = MemoryStore::new();
+        let listing = NoncurrentVersionSource::list_noncurrent_versions(
+            &store as &dyn ObjectStoreBackend,
+            "t/",
+        )
+        .await
+        .expect("the dyn impl never errors");
+        assert!(!listing.supported);
+        assert!(listing.versions.is_empty());
+    }
+
+    /// A versioning-aware fixture surfaces the noncurrent versions it holds,
+    /// distinct from the unsupported production default.
+    #[tokio::test]
+    async fn noncurrent_version_fixture_reports_prior_versions() {
+        let source = FixedNoncurrentVersions(NoncurrentVersionListing {
+            supported: true,
+            versions: vec![NoncurrentVersion {
+                key: "t/ab/m/l0/0000/obj.rseg".to_string(),
+                version_id: "v-prior-1".to_string(),
+            }],
+        });
+        let listing = source
+            .list_noncurrent_versions("t/")
+            .await
+            .expect("fixture never errors");
+        assert!(listing.supported);
+        assert_eq!(listing.versions.len(), 1);
+        assert_eq!(listing.versions[0].version_id, "v-prior-1");
     }
 }
