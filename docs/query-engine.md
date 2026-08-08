@@ -783,7 +783,7 @@ oversights.
 ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,
 S3-FIFO eviction, single-flighted) consulted at three funnels:
 `SegmentFetcher::guarded_get`, `Catalog::guarded_get`, and
-`RlogFetcher::fetch`. Cache keys are `(tenant_hash, content_hash, offset,
+`LogSegmentFetcher::fetch`. Cache keys are `(tenant_hash, content_hash, offset,
 len)`, so entries survive object-key churn and two writers producing
 identical bytes share one entry. Each funnel credits its own hit/miss and
 byte counters to `QueryAccounting` (ADR-0044), so a query's `EXPLAIN
