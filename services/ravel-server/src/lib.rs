@@ -830,11 +830,12 @@ pub async fn start(
     // One `WorkerSet` for the whole maintain-role process (ADR-0065 decision
     // 1): a single membership identity shared by the maintenance supervisor
     // (which writes the heartbeat on its `H` cadence) and the scrub loop (which
-    // only reads the resulting live set to gate ownership). Constructed only in
-    // Maintain mode, where both loops run. Its `process_id` is what the
-    // rendezvous hash resolves ownership against, so the two loops must share
-    // one, never mint separate ones (that would make one process look like two
-    // workers to the fleet).
+    // only reads the resulting live set to gate ownership). Constructed
+    // unconditionally (it's cheap: a UUID and config, no I/O), but only ever
+    // wired into a running loop below when Mode::Maintain. Its `process_id` is
+    // what the rendezvous hash resolves ownership against, so the two loops
+    // must share one, never mint separate ones (that would make one process
+    // look like two workers to the fleet).
     let maintain_worker = Arc::new(ravel_maintain::WorkerSet::new(
         <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock),
         ravel_maintain::worker_set::DEFAULT_HEARTBEAT_INTERVAL,
@@ -1088,11 +1089,12 @@ pub async fn start(
     // At-rest integrity scrubber (ADR-0059, issue #694): one task per process,
     // only in Mode::Maintain. Scrubbing is background housekeeping over durable
     // objects, the same class as compaction/retention/sweep (which lib gates on
-    // Mode::Maintain just above), and independent of ingest/query traffic; its
-    // persisted per-shard cursor also assumes a single writer, which the
-    // Maintain-only gating guarantees. It shares the same store handle and
-    // storage-derived tenant restriction the maintenance loop uses, and the
-    // scrub metrics instance the `/metrics` state above holds.
+    // Mode::Maintain just above), and independent of ingest/query traffic. It
+    // shares the same store handle and storage-derived tenant restriction the
+    // maintenance loop uses, and the scrub metrics instance the `/metrics`
+    // state above holds. See scrub.rs's module docs for why its persisted
+    // per-shard cursor no longer has a true single writer under ADR-0065's
+    // N-replica Maintain role (a benign racing overwrite, not a hazard).
     let scrub_task = match (matches!(config.mode, Mode::Maintain), &scrub_metrics) {
         (true, Some(metrics)) => scrub::spawn(
             store.clone(),

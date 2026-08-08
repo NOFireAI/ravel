@@ -352,6 +352,16 @@ async fn run_loop(
     let mut live_set = worker.solo_live_set();
     let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A `tokio::time::sleep(...)` written directly as a `select!` branch is a
+    // fresh expression re-evaluated every time the macro re-polls at the top
+    // of the loop, so any OTHER arm firing (the heartbeat, on its own much
+    // shorter cadence) silently restarts this countdown from zero before it
+    // can ever elapse -- discovery then never runs. Pin one `Sleep` outside
+    // the loop so `select!` only ever polls the same underlying timer across
+    // iterations, and reset it (with a fresh jittered duration) only when it
+    // actually fires.
+    let discovery_sleep = tokio::time::sleep(jittered(interval));
+    tokio::pin!(discovery_sleep);
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -371,7 +381,7 @@ async fn run_loop(
                     ),
                 }
             }
-            _ = tokio::time::sleep(jittered(interval)) => {
+            () = &mut discovery_sleep => {
                 run_discovery_cycle(
                     store.as_ref(),
                     restrict.as_deref(),
@@ -385,6 +395,7 @@ async fn run_loop(
                     &live_set,
                 )
                 .await;
+                discovery_sleep.as_mut().reset(tokio::time::Instant::now() + jittered(interval));
             }
             _ = &mut shutdown => return,
         }
@@ -1716,6 +1727,69 @@ mod tests {
             "gauges stay at their last known-good value, never reporting this failed cycle"
         );
         assert!(memo.is_empty(), "a skipped cycle memoizes nothing");
+    }
+
+    /// `run_loop`'s discovery arm must survive across `select!` iterations:
+    /// with the default heartbeat cadence (60s) shorter than the discovery
+    /// interval (300s), a discovery sleep written as a bare `select!` branch
+    /// expression is silently rebuilt (and its countdown restarted) every
+    /// time the heartbeat arm fires first, so discovery never elapses.
+    /// Drives the real `run_loop` under a paused clock, injecting a
+    /// persistent discovery-LIST fault so each actual discovery attempt is
+    /// observable via `discovery_failures()` -- proving the discovery arm
+    /// fired repeatedly over simulated time, not just that the loop didn't
+    /// panic.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_arm_fires_repeatedly_despite_a_shorter_heartbeat() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("discovery unavailable (test)".into()),
+            )
+            .with_key_contains("t/"),
+        );
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(inner, plan));
+
+        let compactor = Arc::new(CompactorConfig::default());
+        let retention = Arc::new(RetentionConfig::default());
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let safety = Arc::new(MaintenanceSafetyMetrics::default());
+        let worker = Arc::new(WorkerSet::with_defaults(0));
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let discovery_interval = Duration::from_secs(300);
+        let handle = tokio::spawn(run_loop(
+            store,
+            None,
+            compactor,
+            retention,
+            1,
+            discovery_interval,
+            metrics.clone(),
+            safety,
+            worker,
+            shutdown_rx,
+        ));
+
+        // 30 simulated minutes: 30 heartbeats at the default 60s cadence
+        // (which used to starve discovery outright), against roughly 6
+        // discovery cycles at 300s (plus up to 10% jitter). Advance in small
+        // steps so the paused-time runtime actually polls and wakes the
+        // spawned task between each, rather than one giant jump.
+        for _ in 0..180 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            metrics.discovery_failures() >= 4,
+            "discovery must have fired repeatedly over 30 simulated minutes at a 300s interval, \
+             got {} -- the discovery arm is starved again",
+            metrics.discovery_failures()
+        );
+
+        handle.abort();
     }
 
     /// The un-trip an operator must not read as "resolved" (ADR-0048 decision
