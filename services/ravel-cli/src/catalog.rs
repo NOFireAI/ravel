@@ -63,54 +63,90 @@ pub async fn fold(
 }
 
 pub async fn inspect(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
+    let report = render_inspect(store, tenant).await?;
+    print!("{report}");
+    Ok(())
+}
+
+/// Decodes the tenant's metrics HEAD and every referenced snapshot part into
+/// the human-readable report `inspect` prints. Returns the report as a string
+/// (rather than writing to stdout directly) so tests can assert the exact
+/// output; `inspect` is a thin `print!` wrapper over it.
+///
+/// A multi-part HEAD (epic EH multi-part fold) carries more than one snapshot
+/// part, each covering a disjoint `[min_hour, watermark_hour]` hour range
+/// (docs/catalog-and-mvcc.md, ADR-0063). The report lists every part with its
+/// range and the total part count; a single-part HEAD is the special case of
+/// one part whose range starts at hour 0.
+async fn render_inspect(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+) -> anyhow::Result<String> {
     let tenant_hash = TenantId::new(tenant).hash();
     let key = head_key(&tenant_hash, Signal::Metrics);
+
+    let mut out = String::new();
 
     let head_bytes = match store.get(&key, GetRange::Full).await {
         Ok(outcome) => outcome.data,
         Err(err) => {
-            println!("HEAD at {key} is absent or unreadable: {err}");
-            return Ok(());
+            out.push_str(&format!("HEAD at {key} is absent or unreadable: {err}\n"));
+            return Ok(out);
         }
     };
     let head = ravel_catalog::decode_head(&head_bytes)
         .map_err(|err| anyhow::anyhow!("HEAD at {key} is corrupt: {err}"))?;
 
-    println!("format_version: {}", head.format_version);
-    println!("tenant_hash: {}", hex::encode(&head.tenant_hash));
-    println!("signal: {}", head.signal);
-    println!("shard_count: {}", head.shard_count);
-    println!("watermark_hour: {}", head.watermark_hour);
-    println!("folder_id: {}", format_uuid_bytes(&head.folder_id));
-    println!("created_unix_ns: {}", head.created_unix_ns);
-    println!("parts: {}", head.parts.len());
+    out.push_str(&format!("format_version: {}\n", head.format_version));
+    out.push_str(&format!(
+        "tenant_hash: {}\n",
+        hex::encode(&head.tenant_hash)
+    ));
+    out.push_str(&format!("signal: {}\n", head.signal));
+    out.push_str(&format!("shard_count: {}\n", head.shard_count));
+    out.push_str(&format!("watermark_hour: {}\n", head.watermark_hour));
+    out.push_str(&format!(
+        "folder_id: {}\n",
+        format_uuid_bytes(&head.folder_id)
+    ));
+    out.push_str(&format!("created_unix_ns: {}\n", head.created_unix_ns));
+    out.push_str(&format!("parts: {}\n", head.parts.len()));
 
     let limits = PartLimits::default();
-    for part_ref in &head.parts {
-        println!(
-            "  key={} blake3={} size={} entry_count={}",
+    for (index, part_ref) in head.parts.iter().enumerate() {
+        // The hour range is read from the HEAD-level ref (its `min_hour` is
+        // mirrored from the covering part header, ADR-0063), so the range is
+        // reported even before the part object is fetched and decoded.
+        out.push_str(&format!(
+            "  part[{index}] range={}..={} key={} blake3={} size={} entry_count={}\n",
+            part_ref.min_hour,
+            part_ref.watermark_hour,
             part_ref.key,
             hex::encode(&part_ref.blake3),
             part_ref.size,
             part_ref.entry_count
-        );
+        ));
         let got = store
             .get(&part_ref.key, GetRange::Full)
             .await
             .map_err(|err| anyhow::anyhow!("failed to fetch part {}: {err}", part_ref.key))?;
         let decoded = ravel_catalog::decode_part(&got.data, &limits)
             .map_err(|err| anyhow::anyhow!("part {} is corrupt: {err}", part_ref.key))?;
-        println!(
-            "    header: format_version={} watermark_hour={} shard_count={} entry_count={} entries_uncompressed_len={}",
+        out.push_str(&format!(
+            "    header: format_version={} min_hour={} watermark_hour={} shard_count={} entry_count={} entries_uncompressed_len={}\n",
             decoded.header.format_version,
+            decoded.header.min_hour,
             decoded.header.watermark_hour,
             decoded.header.shard_count,
             decoded.header.entry_count,
             decoded.header.entries_uncompressed_len
-        );
-        println!("    entries (decoded): {}", decoded.entries.len());
+        ));
+        out.push_str(&format!(
+            "    entries (decoded): {}\n",
+            decoded.entries.len()
+        ));
     }
-    Ok(())
+    Ok(out)
 }
 
 fn format_identity(id: &ravel_catalog::EntryIdentity) -> String {
@@ -197,9 +233,97 @@ pub async fn verify(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow:
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_object_store::PutOptions;
     use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// Multi-part fold (epic EH): a tenant's HEAD can carry more than one
+    /// snapshot part, each covering a disjoint `[min_hour, watermark_hour]`
+    /// hour range. `catalog inspect` must list every part with its range and
+    /// the correct total count, not assume a single part.
+    #[tokio::test]
+    async fn inspect_lists_every_part_range_of_a_multi_part_head() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-inspect-multipart";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        // Three disjoint, ascending hour ranges. The head-level ref carries the
+        // range (mirrored from each covering part header, ADR-0063); the part
+        // object need only decode, so an empty entry set at the matching
+        // watermark is enough.
+        let ranges = [(0u32, 5u32), (6, 11), (12, 20)];
+        let mut parts = Vec::new();
+        for (index, (min_hour, watermark_hour)) in ranges.iter().enumerate() {
+            let part_bytes = ravel_catalog::encode_part(tenant_hash.0, 0, 1, *watermark_hour, &[])
+                .expect("encode part");
+            let key = format!("t/{}/catalog/m/snap/part{index}.rcs", tenant_hash.to_hex());
+            store
+                .put(
+                    &key,
+                    part_bytes.clone().into(),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put part");
+            parts.push(SnapshotPartRef {
+                key,
+                // inspect never verifies the ref blake3 against the fetched
+                // bytes; any 32-byte value satisfies `decode_head`.
+                blake3: vec![index as u8; 32],
+                size: part_bytes.len() as u64,
+                entry_count: 0,
+                watermark_hour: *watermark_hour,
+                min_hour: *min_hour,
+            });
+        }
+
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 20,
+            parts,
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = ravel_catalog::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &head_key(&tenant_hash, Signal::Metrics),
+                head_bytes.into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let report = render_inspect(store.clone(), tenant)
+            .await
+            .expect("inspect renders");
+
+        // Total part count.
+        assert!(
+            report.contains("parts: 3"),
+            "report must state the total part count, got:\n{report}"
+        );
+        // Every part's range, in order.
+        assert!(
+            report.contains("part[0] range=0..=5"),
+            "missing part[0] range, got:\n{report}"
+        );
+        assert!(
+            report.contains("part[1] range=6..=11"),
+            "missing part[1] range, got:\n{report}"
+        );
+        assert!(
+            report.contains("part[2] range=12..=20"),
+            "missing part[2] range, got:\n{report}"
+        );
+    }
 
     /// Finding 3: the CLI `catalog fold` path must be enforcing, so it reads the
     /// tenant's real shard-generation history and stamps a correct
