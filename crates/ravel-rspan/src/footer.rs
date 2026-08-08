@@ -247,9 +247,7 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
         return Err(SpanSegError::Corrupted("bad magic".into()));
     }
     if version != VERSION {
-        return Err(SpanSegError::Corrupted(format!(
-            "unsupported version {version}"
-        )));
+        return Err(SpanSegError::UnsupportedVersion(version));
     }
     if signal != SIGNAL_SPANS {
         return Err(SpanSegError::Corrupted(format!(
@@ -513,21 +511,45 @@ mod tests {
 
     #[test]
     fn rejects_v1_object() {
-        // A v1 object (trailer version 1) is rejected with the same typed
-        // error as any other unsupported version (ADR-0045 decision 4: no
-        // dual reader).
+        // A v1 object (trailer version 1) is rejected with the typed
+        // `UnsupportedVersion` variant, not `Corrupted` (ADR-0045 decision 4:
+        // no dual reader; ADR-0066 decision 2: typed). The version gate runs
+        // before the crc check, so flipping only the version byte fires the
+        // version rejection, not an incidental crc mismatch.
         let obj = build_object(SAMPLE_BODY_LEN);
         let n = obj.len();
         let mut v1 = obj.clone();
         v1[n - TRAILER_LEN + 8..n - TRAILER_LEN + 10].copy_from_slice(&1u16.to_le_bytes());
-        match open(&v1) {
-            Err(SpanSegError::Corrupted(msg)) => {
-                assert!(
-                    msg.contains("unsupported version"),
-                    "unexpected message: {msg}"
-                );
-            }
-            other => panic!("expected Corrupted, got {other:?}"),
+        assert!(matches!(
+            open(&v1),
+            Err(SpanSegError::UnsupportedVersion(1))
+        ));
+    }
+
+    /// A trailer one version higher than the supported constant is the typed
+    /// `UnsupportedVersion(N)` variant, not `Corrupted` (ADR-0066 decision 2:
+    /// fail-closed-on-newer, typed). The crc is recomputed for the newer
+    /// version so the rejection is the version gate, not a crc mismatch.
+    #[test]
+    fn rejects_newer_trailer_as_unsupported_version() {
+        let newer = VERSION + 1;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, newer, SIGNAL_SPANS, RESERVED);
+
+        let mut obj = vec![0u8; SAMPLE_BODY_LEN];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&newer.to_le_bytes());
+        obj.push(SIGNAL_SPANS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        match open(&obj) {
+            Err(SpanSegError::UnsupportedVersion(v)) => assert_eq!(v, newer),
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
     }
 
