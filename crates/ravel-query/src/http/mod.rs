@@ -21,7 +21,7 @@ pub use tenant::{
     StaticBearerTokenResolver, TenantResolver,
 };
 
-use crate::QueryEngine;
+use crate::{QueryAdmissionController, QueryConcurrencyLimit, QueryEngine};
 
 const ONE_HOUR_NS: i64 = 60 * 60 * 1_000_000_000;
 
@@ -44,15 +44,26 @@ pub struct AppState {
     /// Prometheus-shaped read paths fold into `/metrics` like the SQL path
     /// does.
     pub cost_recorder: Arc<dyn QueryCostRecorder>,
+    /// The fleet-global query concurrency ceiling (ADR-0061 decision 2). Every
+    /// Prometheus-shaped handler acquires a [`crate::QueryPermit`] from this
+    /// before doing any resolve or GET, and is rejected if admitting one more
+    /// query would exceed this process's reconciled fleet threshold. Defaults to
+    /// an [`QueryConcurrencyLimit::Unlimited`] controller in [`AppState::new`],
+    /// so a caller that mounts the router without a ceiling (and every test)
+    /// behaves exactly as before this mechanism existed; a deployment attaches
+    /// the one shared controller with [`AppState::with_query_admission`].
+    pub query_admission: Arc<QueryAdmissionController>,
 }
 
 impl AppState {
-    /// State with the given engine and resolver and a no-op cost recorder.
+    /// State with the given engine and resolver, a no-op cost recorder, and an
+    /// unlimited (never-rejecting) query concurrency controller.
     pub fn new(engine: Arc<QueryEngine>, tenant_resolver: Arc<dyn TenantResolver>) -> Self {
         AppState {
             engine,
             tenant_resolver,
             cost_recorder: Arc::new(NoopQueryCostRecorder),
+            query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
         }
     }
 
@@ -60,6 +71,16 @@ impl AppState {
     /// `self` so it chains off [`AppState::new`].
     pub fn with_cost_recorder(mut self, cost_recorder: Arc<dyn QueryCostRecorder>) -> Self {
         self.cost_recorder = cost_recorder;
+        self
+    }
+
+    /// Set the shared fleet-global query concurrency controller (ADR-0061
+    /// decision 2). Returns `self` so it chains off [`AppState::new`]. A
+    /// deployment passes the one controller instance shared with the SQL and
+    /// Flight SQL surfaces, so the process holds a single honest in-flight count
+    /// across every query transport.
+    pub fn with_query_admission(mut self, query_admission: Arc<QueryAdmissionController>) -> Self {
+        self.query_admission = query_admission;
         self
     }
 }

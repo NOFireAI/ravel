@@ -167,6 +167,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         None,
         ravel_query::EngineConfig::default(),
         Arc::clone(&query_accounting),
+        ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
     );
     let promql = promql_router(app_state);
 
@@ -434,6 +437,9 @@ mod flight {
             clock: Arc::new(FixedClock),
             max_deadline: Duration::from_secs(30),
             query_accounting,
+            query_admission: ravel_query::QueryAdmissionController::shared(
+                ravel_query::QueryConcurrencyLimit::Unlimited,
+            ),
         }
     }
 

@@ -264,6 +264,21 @@ pub struct Cli {
     #[arg(long = "admission-reconcile-interval", value_name = "DURATION")]
     pub admission_reconcile_interval: Option<String>,
 
+    /// The fleet-global query concurrency ceiling (ADR-0061 decision 2): the
+    /// maximum number of queries in flight across the whole fleet at once. A
+    /// single fleet-wide number, not per-tenant: the finding is aggregate query
+    /// fan-out across tenants overwhelming the fleet, not any one tenant's own
+    /// concurrency. Each query-serving process reconciles this to a local
+    /// threshold on the `--admission-reconcile-interval` cadence (ADR-0057
+    /// pattern), rejecting a query before it resolves or fetches when admitting
+    /// it would exceed the process's share. Runs only in the query-serving modes
+    /// (`all`, `query`). Omitted means unlimited (no ceiling), the safe default
+    /// so an upgrade does not silently start rejecting an existing deployment's
+    /// legitimate fan-out; a zero value is rejected rather than rejecting every
+    /// query.
+    #[arg(long = "max-concurrent-queries", value_name = "COUNT")]
+    pub max_concurrent_queries: Option<u64>,
+
     /// The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime
     /// duration (e.g. `7d`). The content-tier scrubber rotates through the
     /// whole object corpus once per `P`, so sustained scrub read bandwidth is
@@ -699,6 +714,25 @@ impl Cli {
                 }
                 Ok(dur)
             }
+        }
+    }
+
+    /// Parse `--max-concurrent-queries` into a [`ravel_query::QueryConcurrencyLimit`]
+    /// (ADR-0061 decision 2), defaulting to
+    /// [`ravel_query::QueryConcurrencyLimit::Unlimited`] when unset. A zero
+    /// ceiling is rejected: it would reject every query, which is never a
+    /// deliberate configuration and is better surfaced as a startup error than
+    /// as a silently unqueryable process.
+    pub fn parse_query_concurrency_limit(
+        &self,
+    ) -> anyhow::Result<ravel_query::QueryConcurrencyLimit> {
+        match self.max_concurrent_queries {
+            None => Ok(ravel_query::QueryConcurrencyLimit::Unlimited),
+            Some(0) => anyhow::bail!(
+                "--max-concurrent-queries '0' would reject every query; omit the flag for no \
+                 ceiling, or set a positive count"
+            ),
+            Some(n) => Ok(ravel_query::QueryConcurrencyLimit::Bounded(n)),
         }
     }
 

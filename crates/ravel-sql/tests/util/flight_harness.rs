@@ -171,6 +171,9 @@ impl Harness {
             },
             Arc::clone(&store),
             recorder,
+            ravel_query::QueryAdmissionController::shared(
+                ravel_query::QueryConcurrencyLimit::Unlimited,
+            ),
         );
         Harness {
             service,

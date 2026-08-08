@@ -107,5 +107,10 @@ pub fn service(
         // reaches the one process `ravel_query_*` family (ADR-0044 section 4,
         // issue #425).
         Arc::clone(&state.query_accounting) as Arc<dyn ravel_types::accounting::QueryCostRecorder>,
+        // The one shared fleet-global query concurrency controller (ADR-0061
+        // decision 2), cloned out of `SqlState` the way `store` and the cost
+        // recorder are, so Flight SQL `GetFlightInfo` admits against the same
+        // process-wide in-flight count the PromQL and HTTP SQL surfaces do.
+        Arc::clone(&state.query_admission),
     ))
 }

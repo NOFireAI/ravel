@@ -27,6 +27,12 @@ tracing = { workspace = true }
 # fetch behind OidcResolver/OidcJwksCache (crates/ravel-query/src/http/tenant.rs).
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
+# Process-id generation for the fleet-global query concurrency ceiling
+# (ADR-0061 decision 2, query_admission.rs): a v4 UUID names the one snapshot
+# key this process owns, mirroring how ravel-ingest's admission reconciliation
+# generates its process id. Already a workspace dependency (previously a
+# dev-dependency here); promoted to a normal dependency, not a new external one.
+uuid = { workspace = true }
 
 [dev-dependencies]
 ravel-commit = { workspace = true }

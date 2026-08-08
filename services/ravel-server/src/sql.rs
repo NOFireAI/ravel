@@ -61,6 +61,7 @@ use axum::routing::post;
 use ravel_ingest::Clock;
 use ravel_maintain::{QueryStatus, write_query_audit};
 use ravel_object_store::ObjectStoreBackend;
+use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
 use ravel_sql::{ErrorClass, SqlError, SqlExecutor, SqlRequest};
 use ravel_types::{CommitToken, TenantHash, TimeRange};
@@ -105,6 +106,12 @@ pub struct SqlState {
     /// only, so `/metrics` covers SQL and analytics traffic, not all query
     /// traffic. Wiring them is the rest of #425.
     pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
+    /// The fleet-global query concurrency ceiling (ADR-0061 decision 2), the one
+    /// shared controller every query surface in the process gates against.
+    /// `handle` acquires a permit before running the statement and is rejected,
+    /// before any resolve or GET, if admitting one more query would exceed this
+    /// process's reconciled fleet threshold.
+    pub query_admission: Arc<QueryAdmissionController>,
 }
 
 /// The `/api/v1/sql` router.
@@ -132,6 +139,21 @@ struct SqlBody {
 }
 
 async fn handle(State(state): State<SqlState>, req: Request<Body>) -> Response {
+    // Fleet-global concurrency admission (ADR-0061 decision 2): decide before
+    // `run` does any resolve or GET. The permit is held for the whole request and
+    // released on return (success or error) or on a dropped request future, by
+    // its `Drop`.
+    let _permit = match state.query_admission.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error_type: "unavailable",
+                message: "fleet query concurrency ceiling reached; retry".to_string(),
+            }
+            .into_response();
+        }
+    };
     match run(&state, req).await {
         Ok(response) => response,
         Err(err) => err.into_response(),

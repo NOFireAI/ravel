@@ -28,6 +28,7 @@ pub mod postings_config;
 pub mod provisioning;
 pub mod qualification;
 pub mod query;
+pub mod query_admission_reconcile;
 pub mod query_postings_metrics;
 pub mod remote_write;
 pub mod scrub;
@@ -213,6 +214,17 @@ pub struct ServerConfig {
     /// configured caps fleet-wide. Not spawned in query/maintain modes, which
     /// serve no ingest admission.
     pub admission_reconcile_interval: Duration,
+    /// The fleet-global query concurrency ceiling (ADR-0061 decision 2), from
+    /// `--max-concurrent-queries` (default
+    /// [`ravel_query::QueryConcurrencyLimit::Unlimited`]). One shared controller
+    /// per process gates every query surface (PromQL/HTTP, SQL/HTTP, Flight SQL
+    /// `GetFlightInfo`) against it. [`start`] spawns a reconciliation task in the
+    /// query-serving modes ([`Mode::All`]/[`Mode::Query`]) that makes the cap
+    /// fleet-wide on the same cadence as the ingest one
+    /// (`admission_reconcile_interval`, ADR-0057). Not spawned in
+    /// gateway/maintain modes, which serve no queries; `Unlimited` (the default)
+    /// never rejects and skips all reconciliation I/O.
+    pub query_concurrency_limit: ravel_query::QueryConcurrencyLimit,
     /// The at-rest scrub period `P` (ADR-0059 decision 1), from `--scrub-period`
     /// (default 7 days). [`start`] spawns one scrub task per process at a
     /// cadence derived from this, only in [`Mode::Maintain`] (the one mode that
@@ -267,6 +279,7 @@ pub struct Running {
     jwks_refresh_task: tenant::JwksRefreshTask,
     store_probe_task: store_probe::StoreProbeTask,
     admission_reconcile_task: admission_reconcile::AdmissionReconcileTask,
+    query_admission_reconcile_task: query_admission_reconcile::QueryAdmissionReconcileTask,
     scrub_task: scrub::ScrubTask,
 }
 
@@ -333,6 +346,7 @@ impl Running {
         self.jwks_refresh_task.shutdown().await;
         self.store_probe_task.shutdown().await;
         self.admission_reconcile_task.shutdown().await;
+        self.query_admission_reconcile_task.shutdown().await;
         self.scrub_task.shutdown().await;
 
         Ok(())
@@ -501,6 +515,14 @@ pub async fn start(
     for (tenant, limits) in &config.limits.tenants {
         admission.set_tenant_limits(tenant.clone(), *limits);
     }
+
+    // Fleet-global query concurrency ceiling (ADR-0061 decision 2): one shared
+    // controller per process, gating every query surface below. Constructed
+    // unconditionally (cheap) but only threaded into the query states and
+    // reconciled in the query-serving modes; an `Unlimited` ceiling never
+    // rejects and does no reconciliation I/O.
+    let query_admission =
+        ravel_query::QueryAdmissionController::shared(config.query_concurrency_limit);
 
     // Per-query cost aggregator (ADR-0044 section 4, issue #425): one per
     // process, shared with every query handler below and read at scrape time by
@@ -676,6 +698,7 @@ pub async fn start(
             cache.clone(),
             engine_config,
             query_accounting.clone(),
+            query_admission.clone(),
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
@@ -696,6 +719,7 @@ pub async fn start(
                 cache.clone(),
                 engine_config,
                 query_accounting.clone(),
+                query_admission.clone(),
             )?;
             alert_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));
@@ -777,7 +801,8 @@ pub async fn start(
         if let Some(mtls) = &config.mtls_listener {
             let mtls_app_state =
                 ravel_query::http::AppState::new(app_state.engine.clone(), mtls.resolver.clone())
-                    .with_cost_recorder(query_accounting.clone());
+                    .with_cost_recorder(query_accounting.clone())
+                    .with_query_admission(query_admission.clone());
             mtls_router = mtls_router.merge(ravel_query::http::router(mtls_app_state));
         }
         http_router = http_router.merge(ravel_query::http::router(app_state));
@@ -1027,6 +1052,23 @@ pub async fn start(
         admission_reconcile::AdmissionReconcileTask::none()
     };
 
+    // Fleet-global query concurrency reconciliation (ADR-0061 decision 2): one
+    // task per process, only in the query-serving modes (a gateway/maintain
+    // process serves no queries, so it holds no concurrency stock to reconcile).
+    // Shares the same `QueryAdmissionController` every query surface gates
+    // against and the same store handle, on the same cadence as the ingest
+    // reconciliation. Off the request path entirely, like the tasks above; a
+    // no-op under an `Unlimited` ceiling.
+    let query_admission_reconcile_task = if matches!(config.mode, Mode::All | Mode::Query) {
+        query_admission_reconcile::spawn(
+            query_admission.clone(),
+            store.clone(),
+            config.admission_reconcile_interval,
+        )
+    } else {
+        query_admission_reconcile::QueryAdmissionReconcileTask::none()
+    };
+
     // At-rest integrity scrubber (ADR-0059, issue #694): one task per process,
     // only in Mode::Maintain. Scrubbing is background housekeeping over durable
     // objects, the same class as compaction/retention/sweep (which lib gates on
@@ -1065,6 +1107,7 @@ pub async fn start(
         jwks_refresh_task,
         store_probe_task,
         admission_reconcile_task,
+        query_admission_reconcile_task,
         scrub_task,
     })
 }

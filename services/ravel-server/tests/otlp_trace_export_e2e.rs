@@ -243,6 +243,7 @@ fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
         scrub_period: std::time::Duration::from_secs(7 * 86_400),
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
         admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
         indexed_fields: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,

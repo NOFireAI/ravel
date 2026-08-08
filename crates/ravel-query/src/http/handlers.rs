@@ -44,6 +44,18 @@ async fn read_params(req: Request<Body>) -> Result<Params, ApiError> {
     ))
 }
 
+/// The response for a query refused by the fleet-global concurrency ceiling
+/// (ADR-0061 decision 2): a retryable HTTP 503 in the same Prometheus error
+/// envelope every other rejection here uses. The refusal happens before any
+/// snapshot resolve or object GET, so no work was done on the query's behalf.
+fn concurrency_rejected_response() -> Response {
+    let body: ApiResponse<()> = ApiResponse::Error {
+        error_type: "unavailable",
+        error: "fleet query concurrency ceiling reached; retry".to_string(),
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
 fn now_ns() -> i64 {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -78,6 +90,13 @@ async fn authenticate(
 }
 
 pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Response {
+    // Fleet-global concurrency admission (ADR-0061 decision 2): decide before any
+    // resolve or GET. The permit is held for the whole handler and released on
+    // return (success or error) or on a dropped request future, by its `Drop`.
+    let _permit = match state.query_admission.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return concurrency_rejected_response(),
+    };
     match handle_query(&state, req).await {
         Ok((data, warnings, infos)) => success_annotated(data, warnings, infos),
         Err(e) => e.into_response(),
@@ -124,6 +143,10 @@ async fn handle_query(
 }
 
 pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let _permit = match state.query_admission.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return concurrency_rejected_response(),
+    };
     match handle_query_range(&state, req).await {
         Ok((data, warnings, infos)) => success_annotated(data, warnings, infos),
         Err(e) => e.into_response(),
@@ -183,6 +206,10 @@ fn parse_duration_ms_field(params: &Params) -> Result<i64, ApiError> {
 }
 
 pub async fn labels(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let _permit = match state.query_admission.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return concurrency_rejected_response(),
+    };
     match handle_labels(&state, req).await {
         Ok(data) => success(data),
         Err(e) => e.into_response(),
@@ -209,6 +236,10 @@ pub async fn label_values(
     Path(name): Path<String>,
     req: Request<Body>,
 ) -> Response {
+    let _permit = match state.query_admission.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return concurrency_rejected_response(),
+    };
     match handle_label_values(&state, name, req).await {
         Ok(data) => success(data),
         Err(e) => e.into_response(),
@@ -235,6 +266,10 @@ async fn handle_label_values(
 }
 
 pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let _permit = match state.query_admission.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return concurrency_rejected_response(),
+    };
     match handle_series(&state, req).await {
         Ok(data) => success(data),
         Err(e) => e.into_response(),
