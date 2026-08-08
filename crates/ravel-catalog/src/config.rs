@@ -63,6 +63,19 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
 /// single shard) that motivated the guard. Sized to catch runaways, not to
 /// cap a tuned deployment; a wider worst case raises the field.
 pub const DEFAULT_MAX_CATALOG_LIST_REQUESTS: u64 = 100_000;
+/// Default `snapshot_part_max_entries`: the tail part seals once its
+/// accumulated entry count reaches this bound and the next fold starts a
+/// fresh tail (ADR-0063 section 1, "Sealing policy"). 250,000 entries is
+/// about 27 MB raw / 8 MB compressed at the measured 100-115 B/entry, well
+/// under [`snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES`]'s decode cap.
+/// Splits are always at hour boundaries, so a single hour larger than this
+/// still produces one oversized (but decode-cap-bounded) part.
+pub const DEFAULT_SNAPSHOT_PART_MAX_ENTRIES: usize = 250_000;
+/// Default `fold_bucket_concurrency`: the number of per-(shard, hour) bucket
+/// discovery LISTs a single fold keeps in flight at once (ADR-0063 section 3,
+/// mirroring the resolve path's #278 item 2 bound). 8 matches the resolve
+/// path's fan-out order without saturating a small backend.
+pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
 /// Default crossover at which `Catalog::resolve` switches from the
 /// per-(shard, ingest-hour) LIST loop to a single per-shard recursive prefix
 /// LIST (ADR-0056). Expressed in per-bucket request units, i.e. the number of
@@ -185,6 +198,17 @@ pub struct CatalogConfig {
     /// [`max_catalog_list_requests`](Self::max_catalog_list_requests). Default
     /// [`DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS`].
     pub prefix_list_crossover_requests: u64,
+    /// Entry-count ceiling at which the fold seals the current tail part and
+    /// starts a fresh one (ADR-0063 section 1). Once a tail's accumulated
+    /// entries reach this, the next hour boundary seals it into an immutable
+    /// sealed part carried by reference on later folds, and a new tail
+    /// accumulates past it. Default [`DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`].
+    pub snapshot_part_max_entries: usize,
+    /// Number of per-(shard, hour) bucket discovery LISTs the fold keeps in
+    /// flight at once (ADR-0063 section 3). Bounds the fold's concurrent
+    /// discovery I/O, mirroring the resolve path's #278 item 2 semaphore.
+    /// Default [`DEFAULT_FOLD_BUCKET_CONCURRENCY`].
+    pub fold_bucket_concurrency: usize,
 }
 
 impl Default for CatalogConfig {
@@ -207,6 +231,8 @@ impl Default for CatalogConfig {
             byte_cache_max_entry_bytes: DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES,
             max_catalog_list_requests: DEFAULT_MAX_CATALOG_LIST_REQUESTS,
             prefix_list_crossover_requests: DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
+            snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,
+            fold_bucket_concurrency: DEFAULT_FOLD_BUCKET_CONCURRENCY,
         }
     }
 }

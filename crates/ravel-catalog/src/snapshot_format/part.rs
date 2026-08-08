@@ -39,11 +39,30 @@ pub fn encode_part(
     watermark_hour: u32,
     entries: &[SnapshotEntry],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
-    // Parts written here are v1 single-part parts (min_hour 0, the epoch
-    // floor). Hour-partitioned parts with a non-zero min_hour are produced by
-    // the fold (ADR-0063 T2); the decode/validation layer below already
-    // enforces the full [min_hour, watermark_hour] contract for them.
-    validate_entries(entries, 0, watermark_hour)?;
+    // A single-part v1 part is the special case of an hour-partitioned part
+    // whose min_hour is the epoch floor 0. Byte-for-byte identical to what
+    // this function has always written, so every existing single-part object
+    // and its content address are unchanged.
+    encode_part_ranged(tenant_hash, signal, shard_count, 0, watermark_hour, entries)
+}
+
+/// Encodes an hour-partitioned snapshot part covering `[min_hour,
+/// watermark_hour]` (ADR-0063 section 1, T2). Identical envelope to
+/// [`encode_part`] but stamps a real `min_hour` into the header and validates
+/// every entry against the full `[min_hour, watermark_hour]` range, so a part
+/// this function writes can never fail its own `decode_part`
+/// (`entry.ingest_hour_bucket >= min_hour` and `<= watermark_hour`). The fold
+/// uses `min_hour = 0` for the single-part case (via [`encode_part`]) and the
+/// covering part's own first hour for each part of a multi-part head.
+pub fn encode_part_ranged(
+    tenant_hash: [u8; 16],
+    signal: u32,
+    shard_count: u32,
+    min_hour: u32,
+    watermark_hour: u32,
+    entries: &[SnapshotEntry],
+) -> Result<Vec<u8>, SnapshotFormatError> {
+    validate_entries(entries, min_hour, watermark_hour)?;
 
     let mut entries_raw = Vec::new();
     for entry in entries {
@@ -62,7 +81,7 @@ pub fn encode_part(
         watermark_hour,
         entry_count: entries.len() as u64,
         entries_uncompressed_len,
-        min_hour: 0,
+        min_hour,
     };
     let header_bytes = header.encode_to_vec();
     let header_len =
