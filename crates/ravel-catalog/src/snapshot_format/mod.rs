@@ -161,6 +161,24 @@ mod tests {
             }
         );
 
+        // Boundary case that discriminates the disjointness operator itself:
+        // part[0]'s watermark_hour (4) equals part[1]'s min_hour (4), so hour
+        // 4 would live in both parts under a too-loose `>` comparison and
+        // only a strict `>=` correctly rejects it. The [0,10]/[5,15] case
+        // above is rejected under either operator and the exact-adjacency
+        // valid case above (4/5, 9/10) is accepted under either operator, so
+        // neither pins this direction on its own -- this one does.
+        let touching = head_with_parts(vec![part_ref("a", 0, 4), part_ref("b", 4, 9)]);
+        let err = decode_head(&touching.encode_to_vec()).expect_err("touching ranges rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::PartRangesOverlap {
+                index: 1,
+                prev_watermark: 4,
+                next_min_hour: 4,
+            }
+        );
+
         // Inverted range: part[1] claims min_hour 10 > watermark_hour 5.
         let mut inverted = head_with_parts(vec![
             part_ref("a", 0, 4),
