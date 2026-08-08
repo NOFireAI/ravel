@@ -58,12 +58,17 @@
 //!    in place (plan 4 step 8, the "orphan part" crash-matrix row) and leaks
 //!    until this rule collects it. Per (tenant, signal), not per shard:
 //!    catalog objects and HEAD carry no shard dimension, so the rule LISTs the
-//!    two coarse prefixes and reads one HEAD, exactly the coarse-prefix shape
-//!    rule 4 uses for `idem/`. An absent HEAD means nothing is referenced (a
-//!    fold that crashed before its HEAD CAS, or a since-rebuilt index), so old
-//!    orphans are collected; a HEAD that is present but fails to decode aborts
-//!    the pass without deleting, so a corrupt HEAD can never cause the live
-//!    snapshot to be read as unreferenced and swept.
+//!    two coarse prefixes first and only then reads one HEAD, exactly the
+//!    coarse-prefix shape rule 4 uses for `idem/`. A present, decodable HEAD is
+//!    the rule's only anchor: an absent HEAD sweeps nothing for that
+//!    (tenant, signal), mirroring rule 3's neither-record-nor-tombstone bucket
+//!    (a recovery fold with no HEAD recomputes and re-PUTs every part under
+//!    keys byte-identical to any surviving old object, adopting it via
+//!    `AlreadyExists` without rewriting it, then names it in the HEAD it is
+//!    about to CAS -- so record-less catalog objects with no HEAD to compare
+//!    against may belong to a fold in flight). A HEAD that is present but fails
+//!    to decode aborts the pass without deleting, so a corrupt HEAD can never
+//!    cause the live snapshot to be read as unreferenced and swept.
 //!
 //! All five are **signal-generic**: rules 1-3 operate only on commit-record,
 //! compaction-record, and object *keys* plus store `last_modified`, rule 4
@@ -99,7 +104,7 @@ use crate::read::verify_commit_key;
 
 use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
 
-/// A hook the sweeper consults before every delete, in all three rules. The
+/// A hook the sweeper consults before every delete, in all five rules. The
 /// only implementation today is [`NoLeases`] (nothing is ever protected); this
 /// is a seam for future reader-lease / slow-consumer work (plan §5, Q3), never
 /// a correctness dependency of the current design (the protection horizon and
@@ -703,7 +708,9 @@ pub struct CatalogSweepOutcome {
     /// `dry_run`, that would have been).
     pub deleted: usize,
     /// Objects left in place: named by the current HEAD, younger than the
-    /// protection horizon, or lease-protected.
+    /// protection horizon, lease-protected, or spared because there was no
+    /// present HEAD to anchor the sweep (the no-anchor case, in which every
+    /// listed object is kept).
     pub kept: usize,
 }
 
@@ -718,23 +725,52 @@ pub struct CatalogSweepOutcome {
 /// in place (plan 4 step 8) and would otherwise leak on every content-changing
 /// fold. This rule is the GC track's side of that contract.
 ///
-/// Safety, mirroring the other physical-delete rules:
-/// - **Reference set from HEAD.** The referenced set is exactly the current
-///   HEAD's `parts[].key` plus its optional `postings.key`. An object under the
-///   two prefixes but not in that set is superseded or orphaned.
-/// - **Protection-horizon age gate.** An object younger than the horizon is
-///   spared: it may be a part a fold's HEAD CAS is about to name, or one a
-///   query resolved just before the fold still has pinned (the same horizon the
-///   superseded-input sweep uses, plan §5).
+/// Ordering and safety, mirroring the other physical-delete rules:
+/// - **LIST before HEAD, then re-verify HEAD before deleting.** The two coarse
+///   prefixes are listed first; HEAD is read *after* the LIST, and a fresh
+///   batched re-verify GET of HEAD is taken immediately before the delete loop
+///   (the same batched shape rule 1 uses for its commit-prefix re-verify LIST).
+///   A candidate the fresh HEAD now names -- a fold's HEAD CAS that landed
+///   between the two reads -- is dropped, so a part a completed fold just
+///   published is never swept.
+/// - **Reference set from a present, decodable HEAD only.** The referenced set
+///   is exactly HEAD's `parts[].key` plus its optional `postings.key`. An
+///   object under the two prefixes but not in that set is superseded or
+///   orphaned.
+/// - **No anchor, no sweep.** An absent HEAD sweeps nothing for the
+///   (tenant, signal), matching rule 3's neither-record-nor-tombstone bucket
+///   exactly. This is not an over-abundance of caution: a recovery fold with no
+///   HEAD (`HeadState::Absent`/`Corrupt`) recomputes and re-PUTs every part,
+///   and because a non-tail span keys on its stable `watermark_hour` the
+///   recomputed key is byte-identical to any surviving old object, so the PUT
+///   returns `AlreadyExists` and the fold *adopts the old object without
+///   rewriting it* (crates/ravel-catalog/src/fold.rs) before naming it in the
+///   HEAD it is about to CAS. With no HEAD to compare against, a record-less
+///   catalog object is indistinguishable from a part such a fold is mid-flight
+///   on, so it must be left alone.
+/// - **Age gate is a reader-pinning buffer, NOT a writer interlock.** The
+///   `protection_horizon_ns` term is `max_query_duration + grace` (plan §5): it
+///   spares an object a query resolved just before the fold still has pinned.
+///   Unlike [`CompactorConfig::orphan_age_gate_ns`] (`grace +
+///   max_flush_lifetime`) and [`CompactorConfig::unreferenced_part_age_gate_ns`]
+///   (`grace + max_compaction_lifetime`), whose lifetime terms mirror a real
+///   writer *abandonment deadline* and so on their own guarantee no future
+///   writer can re-reference an object past the gate, the horizon carries no
+///   fold-lifetime term and does NOT establish such an interlock here: a fold
+///   has no abandonment deadline, and adoption-via-`AlreadyExists` never
+///   refreshes `last_modified`, so an object's age says nothing about whether a
+///   fold is about to adopt and name it. What bounds the writer race instead is
+///   the two points above -- the no-anchor rule (a fold rebuilding from no HEAD
+///   adopts old keys, so we never sweep without a HEAD) and the pre-delete HEAD
+///   re-verify (a fold that has completed its CAS is seen). The remaining
+///   window between the re-verify GET and the delete is the seam the
+///   [`LeaseCheck`] hook / future reader-lease work closes (plan §5, Q3); it is
+///   not closed by an age gate, and this comment does not claim otherwise.
 /// - **Lease/legal-hold gate.** Every delete consults the [`LeaseCheck`] hook,
 ///   like every other physical delete here.
-/// - **Fail-closed on a corrupt HEAD.** A HEAD that is present but does not
-///   decode aborts the pass with an error and deletes nothing, so a corrupt
-///   HEAD can never make the live snapshot look unreferenced. An absent HEAD
-///   legitimately means nothing is referenced (a fold that crashed before its
-///   HEAD CAS, or a since-rebuilt index), so old orphans are collected; a later
-///   fold re-PUTs any part it still needs, since parts are content-addressed
-///   derived data (ADR-0020).
+/// - **Fail-closed on a corrupt HEAD.** A HEAD present but undecodable aborts
+///   the pass with an error and deletes nothing, so a corrupt HEAD can never
+///   make the live snapshot look unreferenced.
 ///
 /// Per (tenant, signal), not per shard: catalog objects carry no shard
 /// dimension. Like [`sweep_idempotency_markers`], the dispatcher calls this
@@ -751,52 +787,114 @@ pub async fn sweep_unreferenced_catalog_objects(
     let now = clock.now_ns();
     let horizon = config.protection_horizon_ns;
 
-    let referenced = referenced_catalog_keys(store, tenant, signal).await?;
-
-    let mut deleted = 0usize;
-    let mut kept = 0usize;
+    // LIST the two coarse prefixes first, before reading HEAD (finding 3: the
+    // reference set must be read *after* the listing, matching rules 1 and 3;
+    // reading HEAD first is the widest possible race window).
+    let mut listed: Vec<ObjectMeta> = Vec::new();
     for prefix in [
         catalog_snap_prefix(tenant, signal),
         catalog_idx_prefix(tenant, signal),
     ] {
-        let objects = list_all(store, &prefix).await?;
-        for meta in objects {
-            // Named by the current HEAD: a live part or the live postings
-            // object. Never delete; this is the whole safety property.
-            if referenced.contains(&meta.key) {
-                kept += 1;
-                continue;
-            }
-            // Younger than the protection horizon: spare it (a part a fold is
-            // about to reference, or one a still-running query pinned).
-            if object_age_ns(now, &meta) <= horizon {
-                kept += 1;
-                continue;
-            }
-            if lease.is_protected(&meta.key) {
-                kept += 1;
-                continue;
-            }
-            if !config.dry_run {
-                store.delete(&meta.key).await?;
-            }
-            deleted += 1;
+        listed.extend(list_all(store, &prefix).await?);
+    }
+
+    // Reference set from HEAD, read after the LIST. An absent HEAD is the
+    // no-anchor case: sweep nothing (finding 2), never the old "collect every
+    // orphan" behavior, because a recovery fold rebuilding from no HEAD adopts
+    // surviving old keys via `AlreadyExists` and is about to name them.
+    let referenced = match read_head_reference(store, tenant, signal).await? {
+        HeadReference::Present(set) => set,
+        HeadReference::Absent => {
+            return Ok(CatalogSweepOutcome {
+                deleted: 0,
+                kept: listed.len(),
+            });
         }
+    };
+
+    let mut kept = 0usize;
+    let mut candidates: Vec<ObjectMeta> = Vec::new();
+    for meta in listed {
+        // Named by the current HEAD: a live part or the live postings object.
+        // Never delete; this is the whole safety property.
+        if referenced.contains(&meta.key) {
+            kept += 1;
+            continue;
+        }
+        // Younger than the protection horizon: spare it (a part a still-running
+        // query pinned; see the age-gate caveat above -- this is a
+        // reader-pinning buffer, not a writer interlock).
+        if object_age_ns(now, &meta) <= horizon {
+            kept += 1;
+            continue;
+        }
+        if lease.is_protected(&meta.key) {
+            kept += 1;
+            continue;
+        }
+        candidates.push(meta);
+    }
+
+    // Fresh batched re-verify GET of HEAD immediately before the delete loop
+    // (finding 3), the same batched shape rule 1 uses for its re-verify LIST: a
+    // fold's HEAD CAS may have landed since the first read and now name one of
+    // these candidates. A HEAD that vanished between the two reads is again the
+    // no-anchor case -- spare everything rather than delete without a HEAD.
+    if !candidates.is_empty() {
+        let fresh = match read_head_reference(store, tenant, signal).await? {
+            HeadReference::Present(set) => set,
+            HeadReference::Absent => {
+                return Ok(CatalogSweepOutcome {
+                    deleted: 0,
+                    kept: kept + candidates.len(),
+                });
+            }
+        };
+        let mut survivors = Vec::with_capacity(candidates.len());
+        for meta in candidates {
+            if fresh.contains(&meta.key) {
+                kept += 1;
+            } else {
+                survivors.push(meta);
+            }
+        }
+        candidates = survivors;
+    }
+
+    let mut deleted = 0usize;
+    for meta in &candidates {
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+        deleted += 1;
     }
 
     Ok(CatalogSweepOutcome { deleted, kept })
 }
 
-/// The set of catalog object keys the current HEAD names for one
-/// `(tenant, signal)`: every `parts[].key` plus the optional `postings.key`.
-/// An absent HEAD yields the empty set (nothing referenced); a present but
-/// undecodable HEAD is a fail-closed error so the pass deletes nothing rather
-/// than treat the live snapshot as unreferenced.
-async fn referenced_catalog_keys(
+/// The outcome of reading the catalog HEAD for one `(tenant, signal)`.
+/// [`Self::Absent`] is the no-anchor case rule 5 must not sweep against; a
+/// present but undecodable HEAD is not represented here at all, because
+/// [`read_head_reference`] fails the whole pass on it (fail-closed).
+enum HeadReference {
+    /// HEAD is present and decoded: the set of keys it names (every
+    /// `parts[].key` plus the optional `postings.key`).
+    Present(HashSet<String>),
+    /// HEAD is absent. There is no anchor to compare against, so rule 5 sweeps
+    /// nothing for this (tenant, signal) (a fold rebuilding from no HEAD adopts
+    /// surviving old keys and is about to name them).
+    Absent,
+}
+
+/// Read the catalog HEAD for one `(tenant, signal)` into a [`HeadReference`].
+/// An absent HEAD is [`HeadReference::Absent`] (the no-anchor case, swept
+/// nothing); a present but undecodable HEAD is a fail-closed error so the pass
+/// deletes nothing rather than treat a live snapshot as unreferenced.
+async fn read_head_reference(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<HashSet<String>> {
+) -> Result<HeadReference> {
     let head_key = catalog_head_key(tenant, signal);
     match store.get(&head_key, GetRange::Full).await {
         Ok(got) => {
@@ -814,9 +912,9 @@ async fn referenced_catalog_keys(
             if let Some(postings) = &head.postings {
                 referenced.insert(postings.key.clone());
             }
-            Ok(referenced)
+            Ok(HeadReference::Present(referenced))
         }
-        Err(StoreError::NotFound) => Ok(HashSet::new()),
+        Err(StoreError::NotFound) => Ok(HeadReference::Absent),
         Err(e) => Err(MaintainError::Store(e)),
     }
 }
@@ -1856,16 +1954,24 @@ mod tests {
         );
     }
 
-    /// With no HEAD present, an old catalog object is an orphan (a fold that
-    /// crashed before its HEAD CAS, or a since-rebuilt index) and is collected.
+    /// Finding 2: with no HEAD present, rule 5 sweeps NOTHING, even for an
+    /// object far older than the horizon. An absent HEAD is the no-anchor case
+    /// (mirroring rule 3's neither-record-nor-tombstone bucket): a recovery
+    /// fold rebuilding from no HEAD recomputes and re-PUTs every part, adopting
+    /// any surviving old object via `AlreadyExists` (which never rewrites it,
+    /// so its `last_modified` stays old) and is about to name it in the HEAD it
+    /// CASes. With no HEAD to compare against, an old record-less catalog
+    /// object is indistinguishable from a part such a fold is mid-flight on, so
+    /// deleting it could race that fold's CAS and orphan the new HEAD.
     #[tokio::test]
-    async fn catalog_sweep_absent_head_collects_old_orphans() {
+    async fn catalog_sweep_absent_head_sweeps_nothing() {
         let tenant = tenant();
         let signal = Signal::Metrics;
         let store = MemoryStore::new();
         let config = CompactorConfig::default();
         let now_ns = config.protection_horizon_ns.saturating_mul(2);
 
+        // Old (store clock 0) object under snap/, with NO HEAD anywhere.
         let orphan = format!(
             "{}20251231T00.cccc.csnap",
             catalog_snap_prefix(&tenant, signal)
@@ -1879,10 +1985,252 @@ mod tests {
                 .expect("an absent HEAD is not an error");
 
         assert_eq!(
-            outcome.deleted, 1,
-            "an old orphan with no HEAD is collected"
+            outcome.deleted, 0,
+            "no HEAD is the no-anchor case: sweep nothing"
         );
-        assert!(!present(&store, &orphan).await);
+        assert_eq!(outcome.kept, 1, "the old object is kept, not collected");
+        assert!(
+            present(&store, &orphan).await,
+            "an old object with no HEAD to anchor the sweep must survive (a \
+             recovery fold may be about to adopt and name it)"
+        );
+    }
+
+    /// A minimal store wrapper that installs a replacement HEAD just before the
+    /// Nth GET of the HEAD key, simulating a concurrent fold's HEAD CAS landing
+    /// between the sweep's first HEAD read and its pre-delete re-verify read.
+    /// Every other operation delegates straight to the inner [`MemoryStore`].
+    struct HeadSwapStore {
+        inner: MemoryStore,
+        head_key: String,
+        new_head: Bytes,
+        swap_on_get: usize,
+        head_gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HeadSwapStore {
+        fn new(inner: MemoryStore, head_key: String, new_head: Bytes, swap_on_get: usize) -> Self {
+            HeadSwapStore {
+                inner,
+                head_key,
+                new_head,
+                swap_on_get,
+                head_gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn head_get_count(&self) -> usize {
+            self.head_gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for HeadSwapStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<ravel_object_store::GetOutcome, StoreError> {
+            if key == self.head_key {
+                let n = self
+                    .head_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if n == self.swap_on_get {
+                    // The fold's CAS lands: install the new HEAD that names the
+                    // adopted-old object, immediately before the sweep's
+                    // re-verify GET reads it.
+                    self.inner
+                        .put(&self.head_key, self.new_head.clone(), PutOptions::default())
+                        .await
+                        .expect("install swapped HEAD");
+                }
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> std::result::Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Finding 1 + 3: an old, unreferenced object that a concurrent fold adopts
+    /// via `AlreadyExists` (so its `last_modified` stays old) and names in a
+    /// HEAD it CASes *after* the sweep's first HEAD read must NOT be deleted.
+    /// The pre-delete re-verify GET of HEAD sees the fold's just-published HEAD
+    /// and spares the object. Without the re-verify (the pre-fix single stale
+    /// HEAD read), the object clears the horizon age gate and would be swept --
+    /// its age says nothing about the in-flight fold, because adoption never
+    /// rewrote it. The control is `catalog_sweep_deletes_old_unreferenced`: the
+    /// same-shaped old unreferenced object IS deleted when no later HEAD names
+    /// it.
+    #[tokio::test]
+    async fn catalog_sweep_reverify_spares_object_a_racing_fold_adopts() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let inner = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        // Both objects seeded at store clock 0, so both are far older than the
+        // horizon. `referenced` is named by the first HEAD; `adopted` is not.
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let adopted = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&inner, &referenced).await;
+        put_catalog_object(&inner, &adopted).await;
+        // First HEAD: names only `referenced`, so `adopted` is an old
+        // unreferenced candidate on the first read.
+        put_head(
+            &inner,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // The fold's post-CAS HEAD, installed at the re-verify GET: it names
+        // the adopted old object (a single-part HEAD is enough -- the
+        // re-verify only re-checks the surviving candidate, which is
+        // `adopted`; `referenced` was already counted kept on the first read).
+        let swapped_head = {
+            let head = SnapshotHead {
+                format_version: 1,
+                tenant_hash: tenant.0.to_vec(),
+                signal: 0,
+                shard_count: 1,
+                watermark_hour: 100,
+                parts: vec![part_ref(&adopted, [2u8; 32])],
+                folder_id: vec![0u8; 16],
+                created_unix_ns: 0,
+                postings: None,
+                shard_generation_count: 1,
+            };
+            Bytes::from(ravel_catalog::encode_head(&head).expect("valid swapped HEAD"))
+        };
+
+        // swap_on_get == 2: the new HEAD is installed just before the sweep's
+        // second HEAD GET, which is the pre-delete re-verify.
+        let store = HeadSwapStore::new(inner, catalog_head_key(&tenant, signal), swapped_head, 2);
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(
+            store.head_get_count(),
+            2,
+            "HEAD is read twice: once for the reference set, once to re-verify \
+             immediately before deleting"
+        );
+        assert_eq!(
+            outcome.deleted, 0,
+            "the object the fold's re-verify-time HEAD names is spared"
+        );
+        assert!(
+            present(&store, &adopted).await,
+            "an old object a racing fold adopted and named must not be swept"
+        );
+        assert!(present(&store, &referenced).await);
+    }
+
+    /// Finding 3: the pre-delete re-verify GET of HEAD actually happens. Fault
+    /// the second HEAD GET (the re-verify) and the pass aborts before any
+    /// delete, exactly as rule 1's and rule 3's re-verify-fault tests prove for
+    /// their re-verify LIST. Mirrors
+    /// `batched_reverify_lists_commit_prefix_once_per_pass`.
+    #[tokio::test]
+    async fn catalog_sweep_reverify_head_get_faults_before_delete() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let mem = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let superseded = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&mem, &referenced).await;
+        put_catalog_object(&mem, &superseded).await;
+        put_head(
+            &mem,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // The second GET of the HEAD key is the batched re-verify: faulting it
+        // aborts the pass before any delete, proving it happens exactly once
+        // (not zero times) between candidate selection and the delete loop.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Timeout)
+                .with_key_contains("/HEAD")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = FaultStore::new(mem, plan);
+
+        let clock = FixedClock::new(now_ns);
+        let err =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect_err("the re-verify HEAD GET faults the pass");
+        assert!(matches!(err, MaintainError::Store(_)), "got: {err:?}");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Timeout),
+            1,
+            "exactly the re-verify HEAD GET faulted"
+        );
+        assert!(
+            present(&store, &superseded).await,
+            "nothing deleted when the re-verify HEAD GET faults"
+        );
     }
 
     /// A HEAD that is present but does not decode aborts the pass with an error
