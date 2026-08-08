@@ -827,6 +827,21 @@ pub async fn start(
     // and run the maintenance loop instead. The two are independent background
     // loops over the same tenant list, and no non-maintain mode runs
     // maintenance.
+    // One `WorkerSet` for the whole maintain-role process (ADR-0065 decision
+    // 1): a single membership identity shared by the maintenance supervisor
+    // (which writes the heartbeat on its `H` cadence) and the scrub loop (which
+    // only reads the resulting live set to gate ownership). Constructed only in
+    // Maintain mode, where both loops run. Its `process_id` is what the
+    // rendezvous hash resolves ownership against, so the two loops must share
+    // one, never mint separate ones (that would make one process look like two
+    // workers to the fleet).
+    let maintain_worker = Arc::new(ravel_maintain::WorkerSet::new(
+        <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock),
+        ravel_maintain::worker_set::DEFAULT_HEARTBEAT_INTERVAL,
+        ravel_maintain::worker_set::DEFAULT_LIVENESS_FACTOR,
+        config.maintain.unit_concurrency,
+    ));
+
     let (fold_tasks, maintenance_tasks) = if matches!(config.mode, Mode::Maintain) {
         let discovery_metrics = tenant_discovery_metrics
             .clone()
@@ -840,6 +855,7 @@ pub async fn start(
             config.maintain.clone(),
             discovery_metrics,
             safety_metrics,
+            maintain_worker.clone(),
         );
         (fold::FoldTasks::none(), maintenance_tasks)
     } else {
@@ -1084,6 +1100,7 @@ pub async fn start(
             config.scrub_period,
             config.shard_count,
             metrics.clone(),
+            maintain_worker.clone(),
         ),
         _ => scrub::ScrubTask::none(),
     };

@@ -53,13 +53,15 @@ use std::time::Duration;
 use ravel_commit::keys;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::{
-    Clock, ScrubResult, ScrubTarget, advance_cursor, per_tick_byte_budget, scrub_one_object,
+    Clock, ScrubResult, ScrubTarget, WorkerSet, advance_cursor, per_tick_byte_budget,
+    scrub_one_object,
 };
 use ravel_maintain::{ScrubBudget, ScrubCursor};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, list_all};
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::fold::jittered;
 use crate::maintain::MAINTAINED_SIGNALS;
@@ -240,6 +242,7 @@ pub fn spawn(
     period: Duration,
     shard_count: u32,
     metrics: Arc<ScrubMetrics>,
+    worker: Arc<WorkerSet>,
 ) -> ScrubTask {
     let restrict = if restrict.is_empty() {
         None
@@ -260,6 +263,25 @@ pub fn spawn(
                 _ = tokio::time::sleep(jittered(tick)) => {}
                 _ = &mut rx => return,
             }
+            // Ownership gating (ADR-0065 decision 2): scrub shares the maintain
+            // role's single `WorkerSet` (one process_id per process, so the
+            // fleet sees one worker, not one per background loop). The maintain
+            // supervisor writes the heartbeat on its `H` cadence; scrub only
+            // reads the resulting live set each cycle to gate which shards it
+            // rotates over. A live-set read failure falls back to `{self}`
+            // (owns everything: the fail-open direction, never scrubbing less
+            // than a lone process would), ADR-0065 decision 1.
+            let now = SystemClock.now_ns();
+            let live_set = worker
+                .live_set(store.as_ref(), now)
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        error = %err,
+                        "scrub: worker live-set read failed; treating self as sole owner this cycle"
+                    );
+                    worker.solo_live_set()
+                });
             run_cycle(
                 store.as_ref(),
                 restrict.as_deref(),
@@ -267,6 +289,8 @@ pub fn spawn(
                 period_secs,
                 tick_secs,
                 metrics.as_ref(),
+                worker.as_ref(),
+                &live_set,
             )
             .await;
         }
@@ -283,6 +307,7 @@ pub fn spawn(
 /// is logged, never falling back to an empty set (the same silent-failure trap
 /// [`crate::maintain::run_discovery_cycle`] avoids). Split out from the loop so
 /// a test can drive one deterministic cycle without the timer.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cycle(
     store: &dyn ObjectStoreBackend,
     restrict: Option<&[TenantHash]>,
@@ -290,6 +315,8 @@ pub async fn run_cycle(
     period_secs: u64,
     tick_secs: u64,
     metrics: &ScrubMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
 ) {
     let outcome = match discover_and_restrict(store, restrict).await {
         Ok(outcome) => outcome,
@@ -316,6 +343,20 @@ pub async fn run_cycle(
             // ADR-0059). A `tenant_hash`-binding breach (ADR-0050 §2) is logged
             // and likewise degrades to `None` for this tick, never wedging the
             // content and structural tiers that do not depend on postings.
+            let scan_shards = scan_shards(store, tenant, signal, shard_count).await;
+
+            // Ownership gate (ADR-0065 decision 2): scrub's per-shard rotation
+            // double-pays across replicas today; gate each shard on ownership
+            // under the current live set. If this process owns no shard of this
+            // (tenant, signal), skip the covering-postings load and the
+            // seal-divergence tier too rather than pay their reads for work it
+            // will not do.
+            let owns_any =
+                (0..scan_shards).any(|shard| worker.owns_unit(live_set, tenant, signal, shard));
+            if !owns_any {
+                continue;
+            }
+
             let covering = match ravel_catalog::load_covering_postings(store, tenant, signal).await
             {
                 Ok(loaded) => loaded,
@@ -327,8 +368,10 @@ pub async fn run_cycle(
                     None
                 }
             };
-            let scan_shards = scan_shards(store, tenant, signal, shard_count).await;
             for shard in 0..scan_shards {
+                if !worker.owns_unit(live_set, tenant, signal, shard) {
+                    continue;
+                }
                 run_shard_tick(
                     store,
                     &clock,
@@ -347,7 +390,12 @@ pub async fn run_cycle(
             // content-tier cursor. It is metadata-cost, matching the structural
             // tier's cost class rather than the content tier's corpus-scan
             // budget, and `verify_seal_divergence` re-lists every shard itself.
-            run_seal_divergence_tick(store, tenant, signal, metrics).await;
+            // Gated on ownership of shard 0 (ADR-0065 decision 2), like the
+            // maintain idempotency-marker sweep: the single owner of shard 0
+            // runs the whole-signal check so replicas do not double-pay it.
+            if worker.owns_unit(live_set, tenant, signal, 0) {
+                run_seal_divergence_tick(store, tenant, signal, metrics).await;
+            }
         }
     }
 }
@@ -725,6 +773,13 @@ mod tests {
 
     use super::*;
 
+    /// A single-replica worker for the scrub tests: its solo live set
+    /// (`{self}`) owns every unit, so `run_cycle` gates nothing away and
+    /// behaves exactly as the pre-ADR-0065 unconditional per-shard rotation.
+    fn solo_worker() -> WorkerSet {
+        WorkerSet::with_defaults(0)
+    }
+
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
     fn tenant() -> TenantId {
@@ -820,9 +875,10 @@ mod tests {
         publish_segment(&store, 2, &["disk"]).await;
 
         let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
         // period == tick so the whole corpus is one slice: a full rotation in
         // one tick.
-        run_cycle(&store, None, 1, 1, 1, &metrics).await;
+        run_cycle(&store, None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
 
         assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
         assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
@@ -864,7 +920,8 @@ mod tests {
             .expect("overwrite corrupted object");
 
         let metrics = ScrubMetrics::default();
-        run_cycle(&store, None, 1, 1, 1, &metrics).await;
+        let worker = solo_worker();
+        run_cycle(&store, None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
 
         assert_eq!(
             metrics.checksum_mismatch(Signal::Metrics),
@@ -883,9 +940,10 @@ mod tests {
         publish_segment(&store, 2, &["mem"]).await;
 
         let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
         // period (100s) >> tick (1s): the per-tick byte budget covers only a
         // fraction of the corpus, so a rotation takes multiple ticks.
-        run_cycle(&store, None, 1, 100, 1, &metrics).await;
+        run_cycle(&store, None, 1, 100, 1, &metrics, &worker, &worker.solo_live_set()).await;
         let after_first = metrics.cursor_position(Signal::Metrics);
         assert!(
             after_first > 0.0 && after_first < 1.0,
@@ -894,7 +952,7 @@ mod tests {
 
         // Keep ticking until the rotation completes and wraps.
         for _ in 0..10 {
-            run_cycle(&store, None, 1, 100, 1, &metrics).await;
+            run_cycle(&store, None, 1, 100, 1, &metrics, &worker, &worker.solo_live_set()).await;
             let tenant_hash = tenant().hash();
             let key = cursor_key(&tenant_hash, Signal::Metrics, 0);
             let got = store.get(&key, GetRange::Full).await.expect("cursor");
@@ -913,7 +971,8 @@ mod tests {
     async fn empty_store_tick_is_clean() {
         let store = MemoryStore::new();
         let metrics = ScrubMetrics::default();
-        run_cycle(&store, None, 4, 1, 1, &metrics).await;
+        let worker = solo_worker();
+        run_cycle(&store, None, 4, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
         assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
         assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
     }
@@ -968,7 +1027,8 @@ mod tests {
         fold(store.clone(), now).await;
 
         let metrics = ScrubMetrics::default();
-        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics).await;
+        let worker = solo_worker();
+        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
 
         assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
         assert_eq!(
@@ -1045,7 +1105,8 @@ mod tests {
             .expect("overwrite head");
 
         let metrics = ScrubMetrics::default();
-        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics).await;
+        let worker = solo_worker();
+        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
 
         assert_eq!(
             metrics.postings_disagreement(Signal::Metrics),
