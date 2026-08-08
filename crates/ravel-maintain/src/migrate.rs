@@ -20,7 +20,11 @@
 //!    stopped, never reprocessing an already-migrated bucket (the pre-migration
 //!    per-bucket compaction-record check makes reprocessing a no-op even if the
 //!    cursor is lost) and never skipping one (the walk order is total and the
-//!    cursor only ever moves forward).
+//!    cursor only ever moves forward). The cursor exists only to carry an
+//!    unfinished walk across invocations, so a walk that drains clears it: it
+//!    is a position in one walk, not a permanent high-water mark, and a
+//!    surviving one would make every bucket of every lower shard unreachable
+//!    to the next invocation.
 //!
 //! 2. **A budget.** One invocation migrates at most [`MigrateBudget::max_records`]
 //!    L0 records before persisting the cursor and returning control, so a very
@@ -138,7 +142,9 @@ pub struct FamilyMigrateReport {
     pub buckets_migrated: usize,
     /// L0 records migrated this invocation (the budget spend).
     pub records_migrated: u64,
-    /// The `(shard, ingest_hour)` the cursor was advanced to, if it moved.
+    /// The `(shard, ingest_hour)` the cursor was persisted at, when this
+    /// invocation stopped on its budget. `None` once the walk completes: a
+    /// drained walk clears the cursor rather than leaving a position behind.
     pub cursor_advanced_to: Option<(u32, u32)>,
     /// The walk reached its end within budget this invocation. When `true` the
     /// driver ran the verify-and-raise step and set [`Self::verification`]; when
@@ -462,16 +468,26 @@ pub async fn migrate_family(
 
     report.walk_complete = !report.budget_exhausted;
 
-    // Persist the advisory cursor at the last examined bucket (best-effort CAS).
-    if let Some((shard, hour)) = position {
-        write_cursor(store, &cursor_key, shard, hour, cursor_version).await?;
-    }
-
     if !report.walk_complete {
-        // Budget exhausted mid-walk: return control; the caller re-invokes and
-        // resumes from the just-persisted cursor.
+        // Budget exhausted mid-walk: persist the advisory cursor at the last
+        // examined bucket (best-effort CAS) and return control; the caller
+        // re-invokes and resumes from here.
+        if let Some((shard, hour)) = position {
+            write_cursor(store, &cursor_key, shard, hour, cursor_version).await?;
+        }
         return Ok(report);
     }
+
+    // The walk drained, so there is nothing left to resume: clear the cursor.
+    // Leaving it at the final position would strand work, because the skip
+    // predicate is lexicographic over `(shard, hour)` -- a cursor at
+    // `(last_shard, last_hour)` skips every bucket of every lower shard at any
+    // hour. A later invocation could then never migrate a bucket that landed
+    // below that position, which is precisely the re-run the straggler path
+    // tells the operator to perform. Deleting is idempotent and the cursor is
+    // advisory, so losing it only ever costs a rescan.
+    report.cursor_advanced_to = None;
+    store.delete(&cursor_key).await?;
 
     // The walk drained within budget. Re-audit FRESH before raising the floor:
     // this is the race close. A record that landed below the target between the
@@ -876,6 +892,71 @@ mod tests {
                 .await
                 .expect("re-audit");
         assert_eq!((l0_below, l1_below), (0, 0));
+    }
+
+    /// A completed walk must not strand later work. The skip predicate is
+    /// lexicographic over `(shard, hour)`, so a cursor left at the last bucket
+    /// of the last shard would skip every bucket of every lower shard at any
+    /// hour, forever. That is exactly the re-run the straggler path instructs
+    /// the operator to perform, so a surviving cursor makes the documented
+    /// remediation unable to converge.
+    #[tokio::test]
+    async fn a_completed_walk_does_not_strand_later_buckets_in_lower_shards() {
+        let store = MemoryStore::new();
+        provision(&store, 2).await;
+        seed_at(&store, 0, 100, 1, "alpha", VERSION_V6 as u32).await;
+        seed_at(&store, 1, 100, 2, "beta", VERSION_V6 as u32).await;
+
+        let config = CompactorConfig::default();
+        let first = migrate_family(
+            &store,
+            &FixedClock::new(sealed_now_ns_for(101)),
+            &config,
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            FUTURE_VERSION,
+            2,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("first migrate");
+        assert!(first.walk_complete, "the first walk drained");
+        assert_eq!(first.buckets_migrated, 2, "both seeded buckets migrated");
+
+        // A new sealed bucket lands in shard 0, lexicographically *below* the
+        // position the completed walk ended at (shard 1, hour 100).
+        seed_at(&store, 0, 200, 3, "gamma", VERSION_V6 as u32).await;
+
+        let second = migrate_family(
+            &store,
+            &FixedClock::new(sealed_now_ns_for(201)),
+            &config,
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            FUTURE_VERSION,
+            2,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("second migrate");
+
+        assert_eq!(
+            second.buckets_migrated, 1,
+            "a later run must still reach a bucket in a lower shard than where the last walk ended"
+        );
+        assert_eq!(
+            compaction_record_count(&store, 0, 200).await,
+            1,
+            "the newly landed bucket was migrated exactly once"
+        );
+        // The already-migrated buckets are not touched again: each still
+        // carries exactly one compaction record.
+        assert_eq!(compaction_record_count(&store, 0, 100).await, 1);
+        assert_eq!(compaction_record_count(&store, 1, 100).await, 1);
     }
 
     /// A redundant run after the floor already sits at the target reports
