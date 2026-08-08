@@ -11,7 +11,7 @@ mod postings;
 
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
-pub use part::{DecodedPart, decode_part, encode_part};
+pub use part::{DecodedPart, decode_part, encode_part, encode_part_ranged};
 pub use postings::{
     DecodedPostings, NamePostings, decode_postings, encode_postings, postings_declared_tenant_hash,
 };

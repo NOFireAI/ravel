@@ -16,11 +16,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use ravel_commit::keys::{self, BucketEntry, KeyError};
 use ravel_commit::signal;
 use ravel_object_store::{
-    GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum, Version,
-    list_all,
+    GetRange, ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum,
+    Version, list_all,
 };
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef};
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
@@ -103,11 +104,22 @@ pub struct FoldReport {
     pub rebuilt: bool,
     /// Number of (shard, hour) commit buckets listed by this fold.
     pub buckets_folded: u64,
-    /// Total entries in the new part (previous entries plus newly folded
-    /// ones).
+    /// Total entries across every part of the new HEAD (previous entries
+    /// plus newly folded ones).
     pub entry_count: u64,
-    /// Encoded size of the new part, in bytes.
+    /// Total encoded size across every part named by the new HEAD, in bytes
+    /// (sealed, carried-by-reference, and the fresh tail).
     pub part_bytes: u64,
+    /// Number of parts named by the new HEAD (ADR-0063: sealed + carried +
+    /// tail). `1` for a single-part fold that never crossed
+    /// `snapshot_part_max_entries`.
+    pub parts_total: u64,
+    /// Of `parts_total`, how many were carried forward from the previous
+    /// HEAD by reference (same key, same blake3) rather than re-encoded and
+    /// re-PUT (ADR-0063 section 3, "Only changed parts are encoded and PUT").
+    /// A fold that touches only recent hours reuses every unchanged sealed
+    /// part, so no PUT is issued for it.
+    pub parts_reused: u64,
     pub list_requests: u64,
     pub get_requests: u64,
     pub put_requests: u64,
@@ -243,6 +255,14 @@ fn writer_id_display(bytes: &[u8]) -> String {
 /// (ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq): the
 /// identity a commit record must be unique under (docs/catalog-and-mvcc.md).
 type EntryIdentity = (u32, u32, Vec<u8>, u64, u64);
+
+/// One shard's delimited-listing result during a rebuild's parallel bucket
+/// discovery: `(shard, shard_prefix, common_prefixes)` (ADR-0063 section 3).
+type ShardListing = (u32, String, Vec<String>);
+
+/// One `(shard, hour)` bucket's discovered keys during the parallel bucket
+/// discovery: `(shard, hour, keys)` (ADR-0063 section 3).
+type BucketListing = (u32, u32, Vec<ObjectMeta>);
 
 fn entry_identity(entry: &SnapshotEntry) -> EntryIdentity {
     (
@@ -401,6 +421,84 @@ fn fold_shard_ceiling(generations: &[ShardGeneration], watermark_hour: u32) -> u
     crate::provisioning::shard_ceiling(generations, watermark_hour)
 }
 
+/// One part's span in the fully-sorted entry set: the `[start, end)` index
+/// range into `entries` and the `[min_hour, watermark_hour]` ingest-hour range
+/// those entries occupy (ADR-0063 section 1). Ranges are disjoint and
+/// ascending across the returned spans because every whole hour lands in
+/// exactly one part and parts are cut only at hour boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartSpan {
+    start: usize,
+    end: usize,
+    min_hour: u32,
+    watermark_hour: u32,
+}
+
+/// Partition the fully hour-major-sorted `entries` into hour-range parts under
+/// the sealing policy (ADR-0063 section 1): whole hours accumulate into the
+/// current part until adding the next hour's run would push the part's entry
+/// count past `max_entries`, at which point the part seals at that hour
+/// boundary and a fresh part starts. Splits are always at hour boundaries, so
+/// a single hour larger than `max_entries` produces one oversized part (the
+/// decode cap still bounds it) rather than being split across parts -- which
+/// would break the free per-part duplicate-freedom proof, since the dedup
+/// identity leads with the hour.
+///
+/// Always returns at least one span. An empty entry set yields a single empty
+/// `[0, 0)` span with `min_hour`/`watermark_hour` 0, so an empty fold still
+/// writes one (empty) part exactly as the single-part path always has. Each
+/// span's `watermark_hour` here is the last ingest hour it actually contains;
+/// the caller overrides the tail span's watermark with the fold watermark.
+fn partition_parts(entries: &[SnapshotEntry], max_entries: usize) -> Vec<PartSpan> {
+    if entries.is_empty() {
+        return vec![PartSpan {
+            start: 0,
+            end: 0,
+            min_hour: 0,
+            watermark_hour: 0,
+        }];
+    }
+    // `max_entries == 0` would seal after every hour and never make progress;
+    // clamp to 1 so a part always holds at least one whole hour.
+    let cap = max_entries.max(1);
+    let mut spans = Vec::new();
+    let mut cur_start = 0usize;
+    let mut cur_count = 0usize;
+    let mut cur_min_hour = entries[0].ingest_hour_bucket;
+    let mut i = 0usize;
+    while i < entries.len() {
+        // The contiguous run of entries sharing this ingest hour (entries are
+        // hour-major sorted, so equal hours are adjacent).
+        let hour = entries[i].ingest_hour_bucket;
+        let run_start = i;
+        while i < entries.len() && entries[i].ingest_hour_bucket == hour {
+            i += 1;
+        }
+        let run_len = i - run_start;
+        // Seal the current part at this hour boundary if it already holds
+        // entries and admitting this whole hour would exceed the cap.
+        if cur_count > 0 && cur_count + run_len > cap {
+            spans.push(PartSpan {
+                start: cur_start,
+                end: run_start,
+                min_hour: cur_min_hour,
+                watermark_hour: entries[run_start - 1].ingest_hour_bucket,
+            });
+            cur_start = run_start;
+            cur_count = 0;
+            cur_min_hour = hour;
+        }
+        cur_count += run_len;
+    }
+    spans.push(PartSpan {
+        start: cur_start,
+        end: entries.len(),
+        min_hour: cur_min_hour,
+        watermark_hour: entries[entries.len() - 1].ingest_hour_bucket,
+    });
+    spans
+}
+
 impl Catalog {
     /// Fold previous snapshot parts plus newly sealed commit buckets into a
     /// new snapshot part and CAS-swap HEAD to name it
@@ -532,11 +630,20 @@ impl Catalog {
                 .collect();
             let mut layout_drift_count: u64 = 0;
 
-            for (shard, hour) in &buckets {
-                let prefix = keys::commit_shard_hour_prefix(tenant, signal, *shard, *hour)?;
-                let listing = list_all(self.store(), &prefix).await?;
-                counters.list_requests += 1;
+            // Discover each (shard, hour) bucket's keys concurrently, bounded
+            // by `fold_bucket_concurrency` (ADR-0063 section 3), mirroring the
+            // resolve path's #278 item 2 `buffered` fan-out. `buffered`
+            // preserves input order, so the discovered buckets are merged in
+            // the same deterministic bucket order the serial loop used, keeping
+            // the fold byte-for-byte reproducible (content addressing depends
+            // on it). Only the LIST discovery is parallel; per-record GETs and
+            // the dedup merge below stay serial in bucket order.
+            let bucket_listings = self
+                .discover_bucket_listings(tenant, signal, &buckets)
+                .await?;
+            counters.list_requests += buckets.len() as u64;
 
+            for (shard, hour, listing) in &bucket_listings {
                 // Partition the bucket's keys by shape, mirroring the
                 // resolve-time listing (`Catalog::list_hour_bucket`,
                 // docs/catalog-and-mvcc.md step 2) so a fold and a live
@@ -545,7 +652,7 @@ impl Catalog {
                 let mut l0_keys: Vec<&str> = Vec::new();
                 let mut compaction_keys: Vec<&str> = Vec::new();
                 let mut has_tombstone = false;
-                for meta in &listing {
+                for meta in listing {
                     match keys::partition_bucket_entry(&meta.key) {
                         Ok(BucketEntry::CommitRecord(_)) => l0_keys.push(meta.key.as_str()),
                         Ok(BucketEntry::CompactionRecord(_)) => {
@@ -651,36 +758,112 @@ impl Catalog {
             // The part/HEAD `shard_count` is the fan-out ceiling at fold time
             // (ADR-0052 section 5), not this process's static config value.
             let shard_ceiling = fold_shard_ceiling(&generations, watermark_hour);
-            let part_bytes = snapshot_format::encode_part(
-                tenant.0,
-                signal_num,
-                shard_ceiling,
-                watermark_hour,
-                &entries,
-            )?;
-            let part_bytes_len = part_bytes.len() as u64;
-            let part_crc = crc32c::crc32c(&part_bytes);
-            let part_hash = blake3::hash(&part_bytes);
-            let hash16 = &part_hash.to_hex()[..16];
-            let part_key = part_object_key(tenant, signal, watermark_hour, hash16);
 
-            match self
-                .store()
-                .put(
-                    &part_key,
-                    Bytes::from(part_bytes),
-                    PutOptions::create_if_absent().with_checksum(UploadChecksum::Crc32c(part_crc)),
-                )
-                .await
-            {
-                Ok(_) => {}
-                // Content-addressed key: bytes are identical by
-                // construction, so a losing folder's part is as good as its
-                // own (mirrors `publish::put_data_object`).
-                Err(StoreError::AlreadyExists) => {}
-                Err(e) => return Err(CatalogError::Store(e)),
+            // Partition the fully-sorted entry set into hour-range parts under
+            // the sealing policy (ADR-0063 section 1): whole hours accumulate
+            // into the current part until adding the next hour would cross
+            // `snapshot_part_max_entries`, then the part seals at that hour
+            // boundary and a fresh tail starts. The concatenation of
+            // range-ordered parts is exactly the globally sorted entry set, so
+            // postings ordinals still index that concatenation and global
+            // duplicate-freedom follows from per-part validation plus range
+            // disjointness (no cross-part entry pass is needed).
+            let spans = partition_parts(&entries, self.config().snapshot_part_max_entries);
+
+            // Sealed parts unchanged since the previous HEAD are carried by
+            // reference, never re-encoded or re-PUT (ADR-0063 section 3). The
+            // "unchanged" signal is content addressing: a part recomputed from
+            // the same entries over the same [min_hour, watermark] range
+            // encodes to byte-identical output and therefore the same blake3,
+            // so a hash already present in the previous HEAD names an object
+            // already in the store under the same content-addressed key. Only
+            // a part whose covering hours actually changed produces a new hash
+            // and is PUT.
+            let existing_by_blake3: HashMap<Vec<u8>, SnapshotPartRef> = match &head_state {
+                HeadState::Valid { head, .. } => head
+                    .parts
+                    .iter()
+                    .map(|p| (p.blake3.clone(), p.clone()))
+                    .collect(),
+                _ => HashMap::new(),
+            };
+
+            let single_part = spans.len() == 1;
+            let mut part_refs: Vec<SnapshotPartRef> = Vec::with_capacity(spans.len());
+            let mut part_hashes: Vec<[u8; 32]> = Vec::with_capacity(spans.len());
+            let mut total_part_bytes: u64 = 0;
+            let mut parts_reused: u64 = 0;
+            for (span_index, span) in spans.iter().enumerate() {
+                let is_tail = span_index + 1 == spans.len();
+                // Single-part fold keeps exact v1 semantics: min_hour 0 (the
+                // epoch floor) and the fold watermark, byte-identical to the
+                // legacy encode so existing single-part objects and their
+                // content addresses never change. Multi-part: each part carries
+                // its real first hour as min_hour; sealed parts end at their
+                // last contained hour, and only the tail carries the fold
+                // watermark, so HEAD.watermark == max part watermark == fold
+                // watermark (the `validate_head` contract).
+                let (part_min_hour, part_watermark) = if single_part {
+                    (0, watermark_hour)
+                } else if is_tail {
+                    (span.min_hour, watermark_hour)
+                } else {
+                    (span.min_hour, span.watermark_hour)
+                };
+                let part_entries = &entries[span.start..span.end];
+                let part_bytes = snapshot_format::encode_part_ranged(
+                    tenant.0,
+                    signal_num,
+                    shard_ceiling,
+                    part_min_hour,
+                    part_watermark,
+                    part_entries,
+                )?;
+                let part_hash = blake3::hash(&part_bytes);
+                if let Some(existing) = existing_by_blake3.get(part_hash.as_bytes().as_slice()) {
+                    // Carried by reference: the previous HEAD already names an
+                    // object with these exact bytes, so no PUT is issued and
+                    // the existing ref (same key/size/entry_count/range) is
+                    // forwarded unchanged.
+                    total_part_bytes += existing.size;
+                    part_hashes.push(*part_hash.as_bytes());
+                    part_refs.push(existing.clone());
+                    parts_reused += 1;
+                    continue;
+                }
+                let part_bytes_len = part_bytes.len() as u64;
+                let part_crc = crc32c::crc32c(&part_bytes);
+                let hash16 = &part_hash.to_hex()[..16];
+                let part_key = part_object_key(tenant, signal, part_watermark, hash16);
+                match self
+                    .store()
+                    .put(
+                        &part_key,
+                        Bytes::from(part_bytes),
+                        PutOptions::create_if_absent()
+                            .with_checksum(UploadChecksum::Crc32c(part_crc)),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    // Content-addressed key: bytes are identical by
+                    // construction, so a losing folder's part is as good as
+                    // its own (mirrors `publish::put_data_object`).
+                    Err(StoreError::AlreadyExists) => {}
+                    Err(e) => return Err(CatalogError::Store(e)),
+                }
+                counters.put_requests += 1;
+                total_part_bytes += part_bytes_len;
+                part_hashes.push(*part_hash.as_bytes());
+                part_refs.push(SnapshotPartRef {
+                    key: part_key,
+                    blake3: part_hash.as_bytes().to_vec(),
+                    size: part_bytes_len,
+                    entry_count: part_entries.len() as u64,
+                    watermark_hour: part_watermark,
+                    min_hour: part_min_hour,
+                });
             }
-            counters.put_requests += 1;
 
             // Postings are merged forward from the previous fold's postings
             // object rather than re-decoded from every historical segment:
@@ -743,7 +926,7 @@ impl Catalog {
                 Some(names) => match snapshot_format::encode_postings(
                     tenant.0,
                     signal_num,
-                    &[*part_hash.as_bytes()],
+                    &part_hashes,
                     entries.len() as u64,
                     &names,
                 ) {
@@ -774,7 +957,7 @@ impl Catalog {
                                     blake3: postings_hash.as_bytes().to_vec(),
                                     size,
                                     name_count,
-                                    part_blake3: vec![part_hash.as_bytes().to_vec()],
+                                    part_blake3: part_hashes.iter().map(|h| h.to_vec()).collect(),
                                 })
                             }
                             Err(err) => {
@@ -805,16 +988,12 @@ impl Catalog {
                 signal: signal_num,
                 shard_count: shard_ceiling,
                 watermark_hour,
-                parts: vec![SnapshotPartRef {
-                    key: part_key,
-                    blake3: part_hash.as_bytes().to_vec(),
-                    size: part_bytes_len,
-                    entry_count: entries.len() as u64,
-                    watermark_hour,
-                    // Single-part v1 fold: epoch floor. Hour-partitioned
-                    // parts (ADR-0063 T2) set a real min_hour.
-                    min_hour: 0,
-                }],
+                // Sealed parts (ascending, disjoint by construction), any
+                // carried-by-reference sealed parts, and the fresh tail, in
+                // range order (ADR-0063 section 1). `partition_parts` builds
+                // them min_hour-ascending with disjoint ranges, exactly what
+                // `validate_head` enforces for a multi-part head.
+                parts: part_refs.clone(),
                 postings: postings_ref,
                 folder_id: folder_id.into_bytes().to_vec(),
                 created_unix_ns: now_ns,
@@ -860,7 +1039,9 @@ impl Catalog {
                         rebuilt,
                         buckets_folded: buckets.len() as u64,
                         entry_count: entries.len() as u64,
-                        part_bytes: part_bytes_len,
+                        part_bytes: total_part_bytes,
+                        parts_total: part_refs.len() as u64,
+                        parts_reused,
                         list_requests: counters.list_requests,
                         get_requests: counters.get_requests,
                         put_requests: counters.put_requests,
@@ -1132,12 +1313,26 @@ impl Catalog {
         counters: &mut RequestCounters,
     ) -> Result<Vec<(u32, u32)>, CatalogError> {
         let scan_shards = fold_shard_ceiling(generations, watermark_hour);
+        let tenant_c = *tenant;
+        let concurrency = self.config().fold_bucket_concurrency.max(1);
+        // Fan out the per-shard delimited LISTs concurrently under
+        // `fold_bucket_concurrency` (ADR-0063 section 3); parse and filter
+        // serially afterwards so the result stays deterministic.
+        let per_shard: Vec<Result<ShardListing, CatalogError>> =
+            stream::iter(0..scan_shards)
+                .map(|shard| async move {
+                    let prefix = keys::commit_shard_prefix(&tenant_c, signal, shard)?;
+                    let listing = self.store().list_delimited(&prefix).await?;
+                    Ok::<_, CatalogError>((shard, prefix, listing.common_prefixes))
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
+        counters.list_requests += u64::from(scan_shards);
         let mut buckets = Vec::new();
-        for shard in 0..scan_shards {
-            let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
-            let listing = self.store().list_delimited(&prefix).await?;
-            counters.list_requests += 1;
-            for common_prefix in &listing.common_prefixes {
+        for res in per_shard {
+            let (shard, prefix, common_prefixes) = res?;
+            for common_prefix in &common_prefixes {
                 let hour_text = common_prefix
                     .strip_prefix(prefix.as_str())
                     .and_then(|s| s.strip_suffix('/'))
@@ -1155,6 +1350,34 @@ impl Catalog {
         }
         buckets.sort_unstable();
         Ok(buckets)
+    }
+
+    /// Discover each `(shard, hour)` bucket's raw keys concurrently, bounded by
+    /// `fold_bucket_concurrency` (ADR-0063 section 3). Returns one
+    /// `(shard, hour, keys)` per input bucket in the SAME order as `buckets`
+    /// (`buffered` preserves input order), so the caller's serial merge stays
+    /// deterministic and the fold's output stays byte-for-byte reproducible.
+    /// Only the LIST discovery is parallel here; the caller loads per-record
+    /// GETs and merges entries serially in this order.
+    async fn discover_bucket_listings(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        buckets: &[(u32, u32)],
+    ) -> Result<Vec<BucketListing>, CatalogError> {
+        let tenant = *tenant;
+        let concurrency = self.config().fold_bucket_concurrency.max(1);
+        let results: Vec<Result<BucketListing, CatalogError>> =
+            stream::iter(buckets.iter().copied())
+                .map(|(shard, hour)| async move {
+                    let prefix = keys::commit_shard_hour_prefix(&tenant, signal, shard, hour)?;
+                    let listing = list_all(self.store(), &prefix).await?;
+                    Ok((shard, hour, listing))
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
+        results.into_iter().collect()
     }
 }
 
@@ -1248,6 +1471,8 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         buckets_folded: 0,
         entry_count: 0,
         part_bytes: 0,
+        parts_total: 0,
+        parts_reused: 0,
         list_requests: counters.list_requests,
         get_requests: counters.get_requests,
         put_requests: counters.put_requests,
@@ -1266,7 +1491,9 @@ mod tests {
     use prost::Message;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
-    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
@@ -1944,5 +2171,304 @@ mod tests {
         // "cpu" entry is neither re-loaded from the part nor re-decoded
         // from its segment.
         assert_eq!(second.get_requests, 5);
+    }
+
+    // ---- ADR-0063 T2: hour-partitioned sealed/tail parts ----
+
+    /// `partition_parts` seals only at hour boundaries: whole hours accumulate
+    /// until admitting the next hour would cross the cap, and a single hour
+    /// larger than the cap becomes one oversized part rather than being split.
+    #[test]
+    fn partition_parts_seals_at_hour_boundaries() {
+        let entry = |hour: u32| SnapshotEntry {
+            ingest_hour_bucket: hour,
+            ..SnapshotEntry::default()
+        };
+        // Empty input still yields one (empty) span.
+        let empty = partition_parts(&[], 100);
+        assert_eq!(empty.len(), 1);
+        assert_eq!((empty[0].start, empty[0].end), (0, 0));
+
+        // One entry per hour, cap 1: every hour becomes its own part.
+        let one_per_hour = vec![entry(10), entry(11), entry(12)];
+        let spans = partition_parts(&one_per_hour, 1);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.min_hour, s.watermark_hour))
+                .collect::<Vec<_>>(),
+            vec![(10, 10), (11, 11), (12, 12)],
+        );
+
+        // A single hour of 3 entries with cap 2 is NOT split: one oversized
+        // part, because splits are only at hour boundaries.
+        let dense = vec![entry(5), entry(5), entry(5)];
+        let spans = partition_parts(&dense, 2);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (0, 3));
+
+        // Two entries in hour 7 then one in hour 8, cap 2: hour 7 fills the
+        // first part, hour 8 seals it and starts the tail.
+        let mixed = vec![entry(7), entry(7), entry(8)];
+        let spans = partition_parts(&mixed, 2);
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].min_hour, spans[0].watermark_hour), (7, 7));
+        assert_eq!((spans[1].min_hour, spans[1].watermark_hour), (8, 8));
+    }
+
+    /// Issue #739 acceptance: a fold whose entry count crosses
+    /// `snapshot_part_max_entries` mid-run produces a multi-part HEAD that is
+    /// sorted, disjoint, and self-consistent (`validate_head`); a later fold
+    /// that adds no new data carries the sealed part forward by reference, so
+    /// no PUT is issued for it.
+    #[tokio::test]
+    async fn ceiling_crossing_produces_multiple_parts() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Two segments in two distinct sealed hours: with a cap of 1 entry the
+        // fold seals hour 10 into its own part and starts a fresh tail at 11.
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert!(!first.no_op);
+        assert_eq!(first.entry_count, 2);
+        assert_eq!(
+            first.parts_total, 2,
+            "crossing the cap splits into two parts"
+        );
+        assert_eq!(first.parts_reused, 0, "first fold writes every part fresh");
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let head = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head")
+                .data,
+        )
+        .expect("head decodes");
+        assert_eq!(head.parts.len(), 2);
+        // Re-encoding re-runs validate_head: sorted, disjoint, self-consistent.
+        snapshot_format::encode_head(&head).expect("multi-part head is self-consistent");
+        assert!(head.parts[0].min_hour <= head.parts[0].watermark_hour);
+        assert!(
+            head.parts[0].watermark_hour < head.parts[1].min_hour,
+            "ranges ascending and disjoint"
+        );
+        assert_eq!(
+            head.parts[1].watermark_hour, head.watermark_hour,
+            "the tail carries the fold watermark"
+        );
+        assert_eq!(head.watermark_hour, 11);
+
+        let sealed_key = head.parts[0].key.clone();
+        let sealed_bytes = store
+            .get(&sealed_key, GetRange::Full)
+            .await
+            .expect("sealed part present")
+            .data;
+
+        // A second fold advances the watermark but adds no new data: the sealed
+        // part is carried by reference, no PUT for it.
+        let now_2 = now_at_seal(13);
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("second fold");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt, "a valid HEAD folds incrementally");
+        assert_eq!(second.parts_total, 2);
+        assert!(
+            second.parts_reused >= 1,
+            "the unchanged sealed part is carried by reference (no PUT)"
+        );
+
+        let head2 = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head 2")
+                .data,
+        )
+        .expect("head2 decodes");
+        assert!(
+            head2.parts.iter().any(|p| p.key == sealed_key),
+            "sealed part still referenced by its original key"
+        );
+        let sealed_bytes_2 = store
+            .get(&sealed_key, GetRange::Full)
+            .await
+            .expect("sealed part still present")
+            .data;
+        assert_eq!(
+            sealed_bytes, sealed_bytes_2,
+            "the sealed part object was not rewritten"
+        );
+    }
+
+    /// Issue #739 acceptance: failing the crashing fold's HEAD CAS (after some
+    /// new part objects have already been PUT) must leave the previous HEAD
+    /// exactly intact -- never half-updated. The orphaned new part objects are
+    /// allowed garbage.
+    #[tokio::test]
+    async fn crash_after_partial_part_puts_leaves_old_head_intact() {
+        // Fail only the SECOND HEAD PUT (the crashing fold's CAS). The first
+        // fold's HEAD PUT (the 1st matching call) passes, establishing a valid
+        // old head; no other PUT key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas crash".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - 2 * NS_PER_HOUR,
+        )
+        .await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert_eq!(first.parts_total, 2);
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let old_head_bytes = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("old head")
+            .data;
+
+        // A second fold adds new data (so new parts get PUT), then its HEAD CAS
+        // is failed by the fault.
+        let now_2 = now_at_seal(13);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 13, now_2 - NS_PER_HOUR).await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect_err("HEAD CAS crash must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        // The fault fired exactly once: the crashing fold's single HEAD PUT
+        // attempt (a Permanent error is not retried).
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+
+        // HEAD is byte-for-byte the old head: never half-updated.
+        let head_now = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head still present")
+            .data;
+        assert_eq!(
+            head_now.as_ref(),
+            old_head_bytes.as_ref(),
+            "HEAD unchanged after the crashing fold"
+        );
+        // And it still decodes to the pre-crash multi-part snapshot.
+        let head = snapshot_format::decode_head(&head_now).expect("old head still valid");
+        assert_eq!(head.watermark_hour, 11);
+        assert_eq!(head.parts.len(), 2);
+    }
+
+    /// Issue #739 acceptance: a resolve over a narrow hour window fetches only
+    /// the parts whose range intersects it, not every part in HEAD. Proven by a
+    /// GET fault on the low part's object (its `/snap/` key embeds hour 10's
+    /// watermark string): a narrow window must not fire it, a wide window must.
+    #[tokio::test]
+    async fn range_scoped_resolve_fetches_only_intersecting_parts() {
+        let low_marker = format!("snap/{}", keys::ingest_hour_string(10));
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("low part fetched".into()))
+                .with_key_contains(low_marker),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Two far-apart hours: hour 10 seals into its own part, hour 20 is the
+        // tail.
+        let now = now_at_seal(20);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now - 11 * NS_PER_HOUR,
+        )
+        .await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 20, now - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .await
+            .expect("fold");
+        assert_eq!(report.parts_total, 2);
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "the rebuild fold GETs no /snap/ object"
+        );
+
+        // Narrow window near hour 20: the low part (hours 10..10) does not
+        // intersect, so it is not fetched.
+        let narrow = ravel_types::TimeRange {
+            start_ns: 20 * NS_PER_HOUR,
+            end_ns: 21 * NS_PER_HOUR,
+        };
+        catalog
+            .resolve(&tenant(), Signal::Metrics, narrow, &[], now)
+            .await
+            .expect("narrow resolve");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "range filter must skip the non-intersecting low part"
+        );
+
+        // A window reaching hour 10 intersects the low part, so a fetch is
+        // attempted (fault fires); the resolve still succeeds via listing.
+        let wide = ravel_types::TimeRange {
+            start_ns: 0,
+            end_ns: 21 * NS_PER_HOUR,
+        };
+        catalog
+            .resolve(&tenant(), Signal::Metrics, wide, &[], now)
+            .await
+            .expect("wide resolve");
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the intersecting low part is fetched"
+        );
     }
 }

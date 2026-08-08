@@ -729,6 +729,10 @@ impl Catalog {
                     signal,
                     now_ns,
                     name_filter.is_some(),
+                    // Range-scoped part fetch (ADR-0063): only parts whose hour
+                    // range intersects this query window are fetched.
+                    window_start_hour,
+                    window_end_hour,
                     &generations,
                     accounting,
                 )

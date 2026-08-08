@@ -68,6 +68,14 @@ pub(crate) const PREFIX_FILTER_SENTINEL: char = '\u{1}';
 pub(crate) struct SnapshotWindow {
     pub(crate) watermark_hour: u32,
     parts: Vec<Arc<DecodedPart>>,
+    /// The blake3 of each part in `parts`, same order (from the HEAD part
+    /// refs). Kept so the postings-binding check (ADR-0063 section 7) can
+    /// confirm a postings object covers exactly the parts actually loaded,
+    /// in order -- the multi-part generalization of the old single-part
+    /// pruning guard. A range-scoped fetch that dropped a part shortens this
+    /// list, so a postings object covering the full HEAD no longer binds and
+    /// pruning safely declines.
+    part_blake3: Vec<Vec<u8>>,
     /// Decoded, part-bound name postings (P5b, docs/metric-index-plan.md
     /// 5.4), or `None` when postings are absent, unreadable, corrupt, or
     /// don't cleanly bind to `parts`. Always safe to treat as absent:
@@ -92,14 +100,15 @@ impl SnapshotWindow {
     /// snapshot's postings provably do not carry a matching name are skipped
     /// before the event-overlap check, and `*pruned` is incremented once per
     /// skipped entry (see [`Self::postings_ordinals_for_filter`]). Pruning only
-    /// ever activates when
-    /// postings are present, decoded, and bound to exactly the parts this
-    /// window holds; any other case (`name_filter` is `None`, postings
-    /// absent/corrupt, or more than one covered part, which today's
-    /// single-part fold never produces but a future compaction phase might)
-    /// falls back to considering every entry, exactly as `Catalog::resolve`
-    /// always has. This can only ever narrow the result set matched by
-    /// `query_range`, never widen it: exact semantics by default.
+    /// ever activates when postings are present, decoded, and bound to exactly
+    /// the parts this window holds, in order (ADR-0063 section 7: the multi-part
+    /// binding check, replacing the old single-part restriction). Any other
+    /// case (`name_filter` is `None`, postings absent/corrupt, or a postings
+    /// object that does not cover exactly the loaded parts -- e.g. a
+    /// range-scoped fetch dropped one) falls back to considering every entry,
+    /// exactly as `Catalog::resolve` always has. This can only ever narrow the
+    /// result set matched by `query_range`, never widen it: exact semantics by
+    /// default.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn extract_into(
         &self,
@@ -113,6 +122,13 @@ impl SnapshotWindow {
         out: &mut HashMap<String, SegmentRef>,
     ) -> Result<(), CatalogError> {
         let ordinals = self.postings_ordinals_for_filter(name_filter);
+        // Postings ordinals index the concatenation of every loaded part's
+        // entries in HEAD order (ADR-0063 section 7). `part_base` is the
+        // running count of entries in earlier parts, so each part's local
+        // `[start, end)` slice maps into that global ordinal space and matched
+        // global ordinals map back to local indices. For a single part
+        // `part_base` stays 0, exactly the pre-multi-part behavior.
+        let mut part_base = 0usize;
         for part in &self.parts {
             let entries = &part.entries;
             let start = entries.partition_point(|e| e.ingest_hour_bucket < lower_hour);
@@ -124,20 +140,18 @@ impl SnapshotWindow {
                     }
                 }
                 Some(ords) => {
-                    let lo = ords.partition_point(|&o| (o as usize) < start);
-                    let hi = ords.partition_point(|&o| (o as usize) < end);
+                    let global_start = part_base + start;
+                    let global_end = part_base + end;
+                    let lo = ords.partition_point(|&o| (o as usize) < global_start);
+                    let hi = ords.partition_point(|&o| (o as usize) < global_end);
                     *pruned += ((end - start) - (hi - lo)) as u64;
                     for &ordinal in &ords[lo..hi] {
-                        self.maybe_insert(
-                            tenant,
-                            signal,
-                            &entries[ordinal as usize],
-                            query_range,
-                            out,
-                        )?;
+                        let local = ordinal as usize - part_base;
+                        self.maybe_insert(tenant, signal, &entries[local], query_range, out)?;
                     }
                 }
             }
+            part_base += entries.len();
         }
         Ok(())
     }
@@ -163,14 +177,39 @@ impl SnapshotWindow {
         Ok(())
     }
 
+    /// Whether this window's postings bind to exactly the parts it holds, in
+    /// order (ADR-0063 section 7): postings present, and their `part_blake3`
+    /// list matches -- in length, content, and order -- the blake3 of every
+    /// loaded part. This is the multi-part generalization of the old
+    /// `parts.len() == 1` restriction. The proto contract
+    /// (`SnapshotPostingsRef.part_blake3` names the covered parts "in the same
+    /// order as SnapshotHead.parts") makes an in-order equality the exact
+    /// safety condition: when it holds, the ordinals index precisely the
+    /// concatenation `extract_into` walks. It fails safe -- when a range-scoped
+    /// fetch dropped a part, or the postings cover a stale/different set, the
+    /// lengths or hashes differ and pruning declines to an unpruned scan
+    /// (never a wrong answer).
+    fn postings_bind_all_parts(&self) -> bool {
+        let Some(postings) = self.postings.as_ref() else {
+            return false;
+        };
+        let bound = &postings.header.part_blake3;
+        bound.len() == self.part_blake3.len()
+            && bound
+                .iter()
+                .zip(self.part_blake3.iter())
+                .all(|(a, b)| a.as_slice() == b.as_slice())
+    }
+
     /// Resolves `name_filter` to the sorted ordinal list of entries carrying
-    /// that name, or `None` if pruning cannot safely apply (no filter, no
-    /// usable postings, or more than one covered part). `Some(&[])` is a
-    /// legitimate result: the name simply does not appear in this snapshot
-    /// at all, so every candidate entry is pruned.
+    /// that name, or `None` if pruning cannot safely apply (no filter, or the
+    /// postings do not bind to exactly the loaded parts -- see
+    /// [`Self::postings_bind_all_parts`]). `Some(&[])` is a legitimate result:
+    /// the name simply does not appear in this snapshot at all, so every
+    /// candidate entry is pruned.
     fn postings_ordinals_for(&self, name_filter: Option<&str>) -> Option<&[u64]> {
         let name = name_filter?;
-        if self.parts.len() != 1 {
+        if !self.postings_bind_all_parts() {
             return None;
         }
         let postings = self.postings.as_ref()?;
@@ -196,9 +235,10 @@ impl SnapshotWindow {
     ///
     /// The `None` vs `Some(&[])` contract is identical to
     /// [`Self::postings_ordinals_for`]: `None` means pruning cannot safely
-    /// apply at all (no filter, no usable postings, or more than one covered
-    /// part), and `Some(empty)` means the filter genuinely matches zero names
-    /// in this snapshot (so every candidate entry is pruned).
+    /// apply at all (no filter, or the postings do not bind to exactly the
+    /// loaded parts, per [`Self::postings_bind_all_parts`]), and `Some(empty)`
+    /// means the filter genuinely matches zero names in this snapshot (so every
+    /// candidate entry is pruned).
     ///
     /// The prefix arm additionally unions the ordinals of any stored name
     /// exactly equal to the *whole* encoded string. In normal operation that
@@ -233,8 +273,9 @@ impl SnapshotWindow {
 
     /// Resolves a literal `prefix` to the sorted union of the ordinal lists of
     /// every name that starts with it, or `None` if pruning cannot safely
-    /// apply (empty prefix, more than one covered part, or no usable
-    /// postings). `Some(empty)` is a legitimate result: no name in this
+    /// apply (empty prefix, or postings that do not bind to exactly the loaded
+    /// parts per [`Self::postings_bind_all_parts`]). `Some(empty)` is a
+    /// legitimate result: no name in this
     /// snapshot starts with `prefix`, so every candidate entry is pruned. The
     /// sibling of [`Self::postings_ordinals_for`] for ADR-0061 decision 3.
     ///
@@ -253,7 +294,7 @@ impl SnapshotWindow {
         if prefix.is_empty() {
             return None;
         }
-        if self.parts.len() != 1 {
+        if !self.postings_bind_all_parts() {
             return None;
         }
         let postings = self.postings.as_ref()?;
@@ -324,6 +365,8 @@ impl Catalog {
         signal: Signal,
         now_ns: i64,
         want_postings: bool,
+        window_start_hour: u32,
+        window_end_hour: u32,
         generations: &[ShardGeneration],
         accounting: &QueryAccounting,
     ) -> Result<(Option<SnapshotWindow>, Option<Vec<ShardGeneration>>), CatalogError> {
@@ -342,7 +385,16 @@ impl Catalog {
         else {
             return Ok((None, None));
         };
-        match self.load_snapshot_parts(tenant, &head, accounting).await {
+        // Range-scoped part fetch (ADR-0063 consequences, "Queries"): fetch
+        // only the parts whose [min_hour, watermark_hour] range intersects the
+        // query's hour window, not every part named by HEAD. A narrow window
+        // over a many-part tenant then reads a handful of parts instead of all
+        // of them. When a part is dropped this way the postings object no
+        // longer covers exactly the loaded parts, so `postings_bind_all_parts`
+        // declines pruning (safe: unpruned scan) -- and `load_snapshot_postings`
+        // already returns `None` on the resulting entry-count mismatch.
+        let refs = parts_intersecting(&head, window_start_hour, window_end_hour);
+        match self.load_snapshot_parts(tenant, &refs, accounting).await {
             PartLoadOutcome::Loaded(parts) => {
                 let postings = if want_postings {
                     self.load_snapshot_postings(tenant, &head, &parts, accounting)
@@ -354,6 +406,7 @@ impl Catalog {
                     Some(SnapshotWindow {
                         watermark_hour: head.watermark_hour,
                         parts,
+                        part_blake3: ref_blake3s(&refs),
                         postings,
                     }),
                     revalidated,
@@ -383,10 +436,8 @@ impl Catalog {
                 // back to the first read's if the re-read validated under the
                 // passed-in view.
                 let revalidated = fresh_revalidated.or(revalidated);
-                match self
-                    .load_snapshot_parts(tenant, &fresh_head, accounting)
-                    .await
-                {
+                let refs = parts_intersecting(&fresh_head, window_start_hour, window_end_hour);
+                match self.load_snapshot_parts(tenant, &refs, accounting).await {
                     PartLoadOutcome::Loaded(parts) => {
                         let postings = if want_postings {
                             self.load_snapshot_postings(tenant, &fresh_head, &parts, accounting)
@@ -398,6 +449,7 @@ impl Catalog {
                             Some(SnapshotWindow {
                                 watermark_hour: fresh_head.watermark_hour,
                                 parts,
+                                part_blake3: ref_blake3s(&refs),
                                 postings,
                             }),
                             revalidated,
@@ -679,14 +731,14 @@ impl Catalog {
     async fn load_snapshot_parts(
         &self,
         tenant: &TenantHash,
-        head: &SnapshotHead,
+        part_refs: &[ravel_proto::catalog::v1::SnapshotPartRef],
         accounting: &QueryAccounting,
     ) -> PartLoadOutcome {
         // Owned part-ref clones, not borrowed `&SnapshotPartRef`s: a stream
         // closure that borrows each item infers a non-higher-ranked lifetime
         // for the future and fails to unify with axum's `Handler` blanket
         // impl at the HTTP router (the "FnOnce is not general enough" wall).
-        let loaded: Vec<OnePartOutcome> = stream::iter(head.parts.iter().cloned())
+        let loaded: Vec<OnePartOutcome> = stream::iter(part_refs.iter().cloned())
             .map(|part_ref| async move { self.load_one_part(tenant, &part_ref, accounting).await })
             .buffered(crate::catalog::MAX_CONCURRENT_REQUESTS)
             .collect()
@@ -990,6 +1042,32 @@ fn hex16(hash: &[u8; 32]) -> String {
     hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The HEAD part refs whose `[min_hour, watermark_hour]` range intersects the
+/// query's `[window_start_hour, window_end_hour]` hour window (ADR-0063
+/// consequences, "Queries"), preserving HEAD order. A part is kept iff
+/// `min_hour <= window_end_hour && watermark_hour >= window_start_hour`. Parts
+/// entirely above or below the window carry no entry a resolve over that window
+/// could return, so skipping their GETs is free of correctness cost; a legacy
+/// single-part head (one part, min_hour 0) always intersects any window at or
+/// below its watermark, so it is unaffected.
+fn parts_intersecting(
+    head: &SnapshotHead,
+    window_start_hour: u32,
+    window_end_hour: u32,
+) -> Vec<ravel_proto::catalog::v1::SnapshotPartRef> {
+    head.parts
+        .iter()
+        .filter(|p| p.min_hour <= window_end_hour && p.watermark_hour >= window_start_hour)
+        .cloned()
+        .collect()
+}
+
+/// The blake3 of each part ref, in order: the loaded parts' identity for the
+/// postings-binding check ([`SnapshotWindow::postings_bind_all_parts`]).
+fn ref_blake3s(refs: &[ravel_proto::catalog::v1::SnapshotPartRef]) -> Vec<Vec<u8>> {
+    refs.iter().map(|r| r.blake3.clone()).collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -1191,9 +1269,12 @@ mod tests {
             .await
             .expect("put head");
 
-        let now_ns = 20 * NS_PER_HOUR;
+        // The query window must intersect the part's hour range so the
+        // range-scoped fetch (ADR-0063) actually loads it: the part covers
+        // hours [0, 10], so query around hour 10.
+        let now_ns = 10 * NS_PER_HOUR;
         let range = TimeRange {
-            start_ns: now_ns - 1_000,
+            start_ns: 9 * NS_PER_HOUR,
             end_ns: now_ns,
         };
         let err = catalog
@@ -1469,8 +1550,17 @@ mod tests {
                 ordinals: ords.to_vec(),
             })
             .collect();
+        // Give each part a distinct blake3 and bind the postings to exactly
+        // that set, in order, so `postings_bind_all_parts` holds for any
+        // `part_count` (ADR-0063 section 7). A single- or multi-part window
+        // built this way prunes; the mismatch cases below break the binding
+        // deliberately.
+        let part_blake3: Vec<Vec<u8>> = (0..part_count).map(|i| vec![i as u8; 32]).collect();
         let postings = DecodedPostings {
-            header: SnapshotPostingsHeader::default(),
+            header: SnapshotPostingsHeader {
+                part_blake3: part_blake3.clone(),
+                ..SnapshotPostingsHeader::default()
+            },
             names,
         };
         let parts = (0..part_count)
@@ -1484,6 +1574,7 @@ mod tests {
         SnapshotWindow {
             watermark_hour: 0,
             parts,
+            part_blake3,
             postings: Some(Arc::new(postings)),
         }
     }
@@ -1565,9 +1656,25 @@ mod tests {
         // all".
         assert_eq!(sample_window(1).postings_prefix_ordinals_for(""), None);
 
-        // More than one covered part: pruning is confined to the single-part
-        // case, exactly like the exact lookup.
-        assert_eq!(sample_window(2).postings_prefix_ordinals_for("ap"), None);
+        // A multi-part window whose postings DO bind to every loaded part
+        // prunes (ADR-0063 section 7): the old `parts.len() == 1` restriction
+        // is gone.
+        assert!(
+            sample_window(2)
+                .postings_prefix_ordinals_for("ap")
+                .is_some()
+        );
+
+        // Postings that do NOT bind to the loaded parts (wrong count) bypass:
+        // drop one loaded part's blake3 so the lengths differ.
+        let mut w = sample_window(2);
+        w.part_blake3.truncate(1);
+        assert_eq!(w.postings_prefix_ordinals_for("ap"), None);
+
+        // Binding mismatch by content (same count, different hash) bypasses too.
+        let mut w = sample_window(1);
+        w.part_blake3 = vec![vec![0xEE; 32]];
+        assert_eq!(w.postings_prefix_ordinals_for("ap"), None);
 
         // No usable postings at all.
         let mut w = sample_window(1);
@@ -1644,5 +1751,113 @@ mod tests {
             "the exact encoded name's segments must be retained (no false negative)"
         );
         assert!(got.contains(&1), "the genuine prefix match is present too");
+    }
+
+    // ---- ADR-0063 section 7: multi-part postings binding ----
+
+    /// Multi-part pruning applies when the postings cover exactly the loaded
+    /// parts in order, and safely declines (`None`) on any binding failure:
+    /// wrong count (a part dropped by range-scoping), wrong order, or a part
+    /// added since the postings object was built.
+    #[test]
+    fn multi_part_postings_binding_applies_and_falls_back() {
+        // Postings bind to both loaded parts, in order: pruning applies.
+        let w = sample_window(2);
+        assert_eq!(
+            w.postings_ordinals_for(Some("app")),
+            Some([2u64].as_slice()),
+            "multi-part pruning applies when postings cover every loaded part"
+        );
+
+        // Wrong count: a part dropped from the loaded set (range-scoped fetch)
+        // no longer matches the postings coverage -> bypass.
+        let mut w = sample_window(2);
+        w.part_blake3.truncate(1);
+        assert_eq!(w.postings_ordinals_for(Some("app")), None);
+
+        // Wrong order: same parts, different order than the binding.
+        let mut w = sample_window(2);
+        w.part_blake3.swap(0, 1);
+        assert_eq!(w.postings_ordinals_for(Some("app")), None);
+
+        // A part added since the postings were built: more loaded parts than
+        // the postings cover -> bypass.
+        let mut w = sample_window(2);
+        w.part_blake3.push(vec![9u8; 32]);
+        assert_eq!(w.postings_ordinals_for(Some("app")), None);
+    }
+
+    /// `extract_into` maps global postings ordinals (indexing the concatenation
+    /// of every loaded part, ADR-0063 section 7) back to each part's local
+    /// entry via a running base offset. A name whose only ordinal lands in the
+    /// SECOND part must resolve to that part's correct local entry, and the
+    /// other in-range entries must be counted as pruned.
+    #[test]
+    fn extract_into_prunes_across_multiple_parts() {
+        let mk = |hour: u32, tag: u8| SnapshotEntry {
+            level: 0,
+            shard: 0,
+            ingest_hour_bucket: hour,
+            writer_id: vec![tag; 16],
+            writer_epoch: 1,
+            writer_seq: u64::from(tag),
+            content_hash: vec![tag; 32],
+            object_size: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: i64::MAX,
+            sample_count: 1,
+            series_count: 1,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+        };
+        let part0 = Arc::new(DecodedPart {
+            header: SnapshotPartHeader::default(),
+            entries: vec![mk(1, 1), mk(2, 2)],
+        });
+        let part1 = Arc::new(DecodedPart {
+            header: SnapshotPartHeader::default(),
+            entries: vec![mk(3, 3), mk(4, 4)],
+        });
+        let part_blake3 = vec![vec![0u8; 32], vec![1u8; 32]];
+        let postings = DecodedPostings {
+            header: SnapshotPostingsHeader {
+                part_blake3: part_blake3.clone(),
+                ..SnapshotPostingsHeader::default()
+            },
+            // Global ordinal 3 == second part, local index 1 (hour 4).
+            names: vec![NamePostings {
+                name: "keep".to_string(),
+                ordinals: vec![3],
+            }],
+        };
+        let window = SnapshotWindow {
+            watermark_hour: 4,
+            parts: vec![part0, part1],
+            part_blake3,
+            postings: Some(Arc::new(postings)),
+        };
+
+        let mut out = HashMap::new();
+        let mut pruned = 0u64;
+        let range = TimeRange {
+            start_ns: 0,
+            end_ns: i64::MAX,
+        };
+        window
+            .extract_into(
+                &tenant(),
+                Signal::Metrics,
+                1,
+                4,
+                &range,
+                Some("keep"),
+                &mut pruned,
+                &mut out,
+            )
+            .expect("extract");
+        // Only the hour-4 entry (global ordinal 3, part1 local index 1) survives.
+        assert_eq!(out.len(), 1);
+        // The other three in-range entries were pruned.
+        assert_eq!(pruned, 3);
     }
 }
