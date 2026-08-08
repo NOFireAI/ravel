@@ -645,6 +645,44 @@ impl QueryEngine {
                 .collect()
                 .await;
 
+            // Reachability analysis (issue #801): two plans in one query CAN
+            // target the same `LabelSet` -- `plan_selectors`
+            // (crates/ravel-promql/src/plan.rs) walks `Expr::Binary`,
+            // `Expr::Aggregate`, and `Expr::Call` and reports one
+            // `SelectorPlan` per operand/arg/param, so e.g. `up + up offset
+            // 5m` yields two plans with identical matchers and different
+            // `offset_ns`/`range_ns` (proven by
+            // `binary_expression_reports_both_operands_selectors` in
+            // ravel-promql). `or_insert` below lets whichever plan's fetch
+            // future completes first, per `buffer_unordered`'s arrival
+            // order, become the resident entry for a shared `LabelSet`.
+            //
+            // That resident choice can never differ in *content*, though,
+            // given how this fetch is built: every plan in this call shares
+            // one `Snapshot` resolved once against the padded union of all
+            // plans' windows (`padded` above), and
+            // `fetch_all_samples_and_histograms` scans that same
+            // `snapshot.segments` list for every plan with no per-plan
+            // sample-level window trim (`SegmentFetcher::
+            // fetch_soa_and_histograms_accounted` takes matchers only, no
+            // start/end bound). Decoding a given series from a given segment
+            // is a pure function of segment bytes + series id, independent
+            // of which plan's matchers selected it, so two plans that both
+            // match the same series decode byte-identical raw runs; feeding
+            // identical runs through the deterministic `merge_soa_runs`
+            // total order (`is_greater`) yields byte-identical `SeriesData`.
+            // Per-selector window clipping happens downstream, once, in
+            // `MergedSource::query`/`query_histograms` against this same
+            // flat pool -- documented in docs/query-engine.md ("later
+            // selectors sharing a series id keep the first merge seen ...
+            // does not affect any single selector's result").
+            //
+            // So `or_insert` is reachable but not data-lossy today: it can
+            // only ever resolve a tie between two identical values. What it
+            // does leak is iteration order -- `HashMap`'s `RandomState`
+            // makes `into_values()` order vary run to run for the same
+            // input, which this stage fixes below with an explicit sort
+            // instead of a merge (there is nothing to merge).
             let mut combined: HashMap<LabelSet, SeriesData> = HashMap::new();
             let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
             let mut page_stats = FetchStats::default();
@@ -661,10 +699,15 @@ impl QueryEngine {
                 page_stats.raw_f64_pages += per_plan_stats.raw_f64_pages;
                 page_stats.raw_f64_bytes += per_plan_stats.raw_f64_bytes;
             }
+            let mut series: Vec<SeriesData> = combined.into_values().collect();
+            series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
+            let mut histogram_series: Vec<HistogramSeriesData> =
+                combined_histograms.into_values().collect();
+            histogram_series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
             Ok((
                 MergedSource {
-                    series: combined.into_values().collect(),
-                    histogram_series: combined_histograms.into_values().collect(),
+                    series,
+                    histogram_series,
                 },
                 page_stats,
             ))
@@ -3258,6 +3301,70 @@ mod prefetch_tests {
             .expect("query metric_a");
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].labels, labels("metric_a"));
+    }
+
+    /// Issue #801: the combine stage's output order must not depend on
+    /// `HashMap` `RandomState` iteration order or on which selector's fetch
+    /// future happened to finish first (`buffer_unordered`). 40 distinct
+    /// series makes an accidental match between two independently-seeded
+    /// `HashMap`s astronomically unlikely, so two `prefetch` calls landing on
+    /// the same order, run after run, is real evidence the stage sorts its
+    /// output rather than leaving it at arbitrary hash order.
+    #[tokio::test]
+    async fn multi_selector_prefetch_output_order_is_deterministic_across_runs() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let ts = BASE_NS - NS_PER_MIN;
+
+        let metrics: Vec<String> = (0..40).map(|i| format!("metric_{i:02}")).collect();
+        for (i, metric) in metrics.iter().enumerate() {
+            publish_metric(&store, tenant_hash, i as u64 + 1, metric, ts, i as f64).await;
+        }
+
+        let eng = engine(Arc::clone(&store));
+        let plans: Vec<SelectorPlan> = metrics.iter().map(|m| window_plan(m)).collect();
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let window = TimeRange {
+            start_ns: BASE_NS - NS_PER_MIN * 10,
+            end_ns: BASE_NS,
+        };
+
+        let (source_a, _) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch 1");
+        let (source_b, _) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch 2");
+
+        let order_a: Vec<LabelSet> = source_a
+            .query(&[], window)
+            .expect("query all")
+            .into_iter()
+            .map(|s| s.labels)
+            .collect();
+        let order_b: Vec<LabelSet> = source_b
+            .query(&[], window)
+            .expect("query all")
+            .into_iter()
+            .map(|s| s.labels)
+            .collect();
+        assert_eq!(order_a.len(), metrics.len());
+
+        assert_eq!(
+            order_a, order_b,
+            "combine stage output order must not depend on HashMap iteration order \
+             or fetch completion order"
+        );
+
+        let mut sorted = order_a.clone();
+        sorted.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(
+            order_a, sorted,
+            "combine stage output must be sorted by label set, not left at \
+             arbitrary HashMap order"
+        );
     }
 
     /// An empty plan list (a query with no selectors, e.g. a bare scalar
