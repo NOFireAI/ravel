@@ -35,7 +35,13 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      merge seen; a later per-selector SeriesSource::query call still clips
      to that selector's own window, so which selector "wins" a shared
      series id in the combine step does not affect any single selector's
-     result)
+     result -- and since every selector in one query fetches against the
+     same shared snapshot with no per-selector sample-level window trim,
+     two selectors sharing a series id always resolve identical merged
+     data, so "wins" only ever breaks a tie between equal values, never
+     drops one. The combined series/histogram-series lists are then sorted
+     by label set, so their order is deterministic across runs regardless
+     of `HashMap` iteration order or fetch completion order, issue #801)
   -> ravel-promql Evaluator -> Value (scalar / string / instant vector /
      range matrix)
   -> Prometheus JSON envelope {status, data:{resultType, result},
