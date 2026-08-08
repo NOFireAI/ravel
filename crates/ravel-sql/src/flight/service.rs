@@ -98,10 +98,12 @@ pub struct RavelFlightSqlService {
     recorder: Arc<dyn QueryCostRecorder>,
     /// The fleet-global query concurrency ceiling (ADR-0061 decision 2), shared
     /// with the PromQL and HTTP SQL surfaces so the process holds one honest
-    /// in-flight count across every transport. `get_flight_info_statement`
-    /// acquires a permit before it resolves or plans; `do_get_statement` does
-    /// not (it redeems an already-admitted, already-planned ticket -- see that
-    /// method).
+    /// in-flight count across every transport. Flight admits at both RPCs:
+    /// `get_flight_info_statement` acquires a permit for resolve + logical plan
+    /// (released when that RPC returns), and `do_get_statement` acquires its own
+    /// for the streaming execution phase (held for the result stream's whole
+    /// lifetime). The `do_get_statement` gate is the one that bounds the actual
+    /// scan work -- see that method.
     query_admission: Arc<QueryAdmissionController>,
 }
 
@@ -263,11 +265,15 @@ impl FlightSqlService for RavelFlightSqlService {
         validate(&query.query).map_err(|err| status_from_sql(&err.into(), tenant))?;
 
         // Fleet-global concurrency admission (ADR-0061 decision 2): decide before
-        // the resolve below (and so before any GET). The permit is held for this
-        // RPC only -- through resolve and plan -- and released when it returns.
-        // `do_get_statement` is deliberately NOT gated: it redeems a ticket this
-        // RPC already admitted and planned, so gating it would double-count or
-        // wrongly reject work already in flight.
+        // the resolve below (and so before any GET). This permit covers only this
+        // RPC -- resolve and logical plan -- and releases when the RPC returns.
+        //
+        // `do_get_statement` takes its OWN permit, held for the whole streaming
+        // execution phase (the segment scans and object GETs that actually run
+        // there), because this RPC's permit is already released by the time the
+        // ticket is redeemed. The two RPCs are separate points in time, so one
+        // logical Flight query never holds two slots at once. See
+        // `do_get_statement`.
         let _permit = self.query_admission.try_admit().map_err(|_| {
             Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
         })?;
@@ -394,6 +400,24 @@ impl FlightSqlService for RavelFlightSqlService {
             ));
         }
 
+        // Fleet-global concurrency admission for the execution phase (ADR-0061
+        // decision 2). `get_flight_info_statement`'s permit released when that RPC
+        // returned, so without this gate the actual scan-and-stream work below --
+        // every segment GET this query performs -- would run unbounded regardless
+        // of the configured ceiling. The permit moves into `statement_stream`,
+        // where it lives inside the same `RecordOnStreamEnd` guard that folds the
+        // query's cost, so it releases at exactly the moment the stream ends or
+        // the client abandons it.
+        //
+        // A client can therefore be rejected HERE even after a successful
+        // `GetFlightInfo`. That is admission back-pressure, not a ticket problem:
+        // the minted ticket stays valid and redeemable later within its deadline,
+        // so the client should simply retry the DoGet. This rejection is emitted
+        // before any store work, mirroring `get_flight_info_statement`.
+        let permit = self.query_admission.try_admit().map_err(|_| {
+            Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
+        })?;
+
         // The statement now reaches execution against its pinned snapshot for a
         // resolved tenant, so it is auditable (ADR-0042 decision 4), exactly as
         // `POST /api/v1/sql` audits after `SqlExecutor::execute` returns. Run
@@ -455,6 +479,7 @@ impl FlightSqlService for RavelFlightSqlService {
             &self.config,
             Arc::clone(&self.recorder),
             span.clone(),
+            permit,
         )
         .instrument(span.clone())
         .await;

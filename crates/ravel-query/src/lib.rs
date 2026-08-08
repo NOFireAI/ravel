@@ -24,6 +24,6 @@ pub use log_fetcher::{
     LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher, StreamAttrEquals,
 };
 pub use query_admission::{
-    DEFAULT_QUERY_ADMISSION_RECONCILE_INTERVAL, QueryAdmissionController, QueryConcurrencyLimit,
-    QueryPermit, QueryRejected, query_admission_snapshot_key, reconcile_query_admission_once,
+    QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,
+    query_admission_snapshot_key, reconcile_query_admission_once,
 };

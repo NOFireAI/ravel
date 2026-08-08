@@ -211,18 +211,36 @@ impl Harness {
 
     /// `DoGet` for a ticket as `token`, returning the decoded batches.
     pub async fn do_get(&self, token: &str, ticket: &Ticket) -> Result<Vec<RecordBatch>, Status> {
+        let stream = self.do_get_stream(token, ticket).await?;
+        collect(stream).await
+    }
+
+    /// `DoGet` for a ticket as `token`, returning the raw, undrained
+    /// `FlightData` stream instead of collecting it. A test holds this to keep
+    /// the execution's concurrency permit (ADR-0061 decision 2) live: the permit
+    /// lives inside the stream's `RecordOnStreamEnd` guard, so it is released the
+    /// moment the returned value is dropped or fully drained, and held until then.
+    pub async fn do_get_stream(
+        &self,
+        token: &str,
+        ticket: &Ticket,
+    ) -> Result<DoGetRawStream, Status> {
         let statement = statement_ticket(ticket);
         let mut request = Request::new(ticket.clone());
         insert(request.metadata_mut(), TOKEN_KEY, token);
 
-        let stream = self
+        Ok(self
             .service
             .do_get_statement(statement, request)
             .await?
-            .into_inner();
-        collect(stream).await
+            .into_inner())
     }
 }
+
+/// The concrete undrained `DoGet` stream type, held open by concurrency tests.
+pub type DoGetRawStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<arrow_flight::FlightData, Status>> + Send + 'static>,
+>;
 
 /// Re-read the `TicketStatementQuery` out of the opaque ticket bytes, which is
 /// what arrow-flight's `do_get` dispatcher does before calling

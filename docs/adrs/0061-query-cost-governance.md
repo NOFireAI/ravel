@@ -213,6 +213,20 @@ in decision 1 which cancels mid-flight. Staleness handling matches
 ADR-0057 section 3 exactly (fail closed on the cap, guess stale sibling =
 zero, self-correcting within `2R`).
 
+On the single-shot HTTP and PromQL surfaces one admission covers a query
+end to end. Flight SQL splits one query across two RPCs, so admission
+happens at both: `get_flight_info_statement` admits before it resolves and
+plans, and `do_get_statement` admits again before it streams and holds
+that permit for the whole result stream (released when the stream ends or
+the client abandons it). The execution-covering admission in
+`do_get_statement` is the load-bearing one: `get_flight_info`'s permit is
+already released by the time the ticket is redeemed, so without a gate in
+`do_get_statement` the actual scan phase would run unbounded. Because the
+two RPCs are separate in time, one Flight query never occupies two slots at
+once, and a client may be rejected at `do_get_statement` even after a
+successful `get_flight_info` — the ticket stays valid within its deadline
+and the DoGet is simply retried.
+
 ### 3. Extend name-postings pruning to literal-prefix-anchored regex, both languages
 
 Extend `postings.rs`'s name-dictionary lookup with a bounded range-scan
