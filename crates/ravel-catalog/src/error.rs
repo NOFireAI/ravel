@@ -96,4 +96,17 @@ pub enum CatalogError {
     /// listing and fresh tenants.
     #[error("provisioning check failed: {0}")]
     Provisioning(#[from] ProvisioningError),
+    /// The HEAD read at the top of a fold carries a `format_version` newer
+    /// than this process understands (ADR-0066 decision 2,
+    /// "fail-closed-on-newer"). Fatal by design: a newer-format HEAD may be a
+    /// multi-part HEAD written by an already-upgraded peer during a rolling
+    /// deployment, and rebuilding a single-part HEAD to CAS-overwrite it would
+    /// silently discard whatever the newer format carries. The fold refuses
+    /// rather than clobber; the operator must upgrade this process. Distinct
+    /// from [`CatalogError::SnapshotFormat`]/`Corrupt`, which is genuine
+    /// corruption and is self-healed by rebuild.
+    #[error(
+        "HEAD format_version {format_version} is newer than this process understands; upgrade this process (it must not rebuild and overwrite a newer HEAD)"
+    )]
+    UnsupportedHeadVersion { format_version: u32 },
 }

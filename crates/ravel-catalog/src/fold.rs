@@ -33,7 +33,9 @@ use crate::catalog::Catalog;
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
-use crate::snapshot_format::{self, HEAD_FORMAT_VERSION, NamePostings, PartLimits};
+use crate::snapshot_format::{
+    self, HEAD_FORMAT_VERSION, NamePostings, PartLimits, SnapshotFormatError,
+};
 
 /// RSEG section kinds needed to decode a segment's catalog
 /// (docs/segment-format.md `SectionKind`). Kinds 1/2 are v1
@@ -147,13 +149,28 @@ enum HeadState {
     Corrupt {
         version: Version,
     },
+    /// HEAD decoded far enough to see a `format_version` this process does
+    /// not understand (ADR-0066 decision 2, "fail-closed-on-newer"). Unlike
+    /// [`HeadState::Corrupt`], this HEAD is NOT rebuildable: a newer-format
+    /// HEAD (e.g. an EH multi-part HEAD written by an already-upgraded peer)
+    /// carries state this older process cannot see, so rebuilding a
+    /// single-part HEAD and CAS-overwriting it would silently discard that
+    /// state. The fold fails loudly instead
+    /// ([`CatalogError::UnsupportedHeadVersion`]). Carries only
+    /// `format_version`: unlike [`HeadState::Corrupt`], this state never CAS-
+    /// writes, so it has no use for the store `Version`.
+    UnsupportedVersion {
+        format_version: u32,
+    },
 }
 
 impl HeadState {
     fn watermark_hour(&self) -> Option<u32> {
         match self {
             HeadState::Valid { head, .. } => Some(head.watermark_hour),
-            HeadState::Absent | HeadState::Corrupt { .. } => None,
+            HeadState::Absent
+            | HeadState::Corrupt { .. }
+            | HeadState::UnsupportedVersion { .. } => None,
         }
     }
 }
@@ -491,6 +508,16 @@ impl Catalog {
                         .await?;
                     (Vec::new(), buckets, true, 0)
                 }
+                // A newer-format HEAD is not rebuildable (ADR-0066 decision
+                // 2): rebuilding a single-part HEAD here would CAS-overwrite
+                // whatever the newer format carries. Fail loudly so the
+                // operator sees this process is too old for this HEAD, rather
+                // than falling into the `Corrupt`/`Absent` rebuild path.
+                HeadState::UnsupportedVersion { format_version, .. } => {
+                    return Err(CatalogError::UnsupportedHeadVersion {
+                        format_version: *format_version,
+                    });
+                }
             };
 
             // Identity -> (index in `entries`, whether that occurrence sits
@@ -797,6 +824,16 @@ impl Catalog {
                     PutMode::CasVersion(version.clone())
                 }
                 HeadState::Absent => PutMode::CreateIfAbsent,
+                // Unreachable in practice: the rebuild-decision match above
+                // returns before we build a HEAD to PUT. Handled explicitly
+                // (never a CAS write) so a future refactor cannot let a
+                // newer-format HEAD reach a clobbering PUT (ADR-0066
+                // decision 2).
+                HeadState::UnsupportedVersion { format_version, .. } => {
+                    return Err(CatalogError::UnsupportedHeadVersion {
+                        format_version: *format_version,
+                    });
+                }
             };
 
             match self
@@ -862,6 +899,19 @@ impl Catalog {
                         head,
                         version: got.version,
                     }),
+                    // A HEAD whose `format_version` this process does not
+                    // understand is NOT corruption and must NOT be rebuilt
+                    // (ADR-0066 decision 2, "fail-closed-on-newer"): rebuilding
+                    // would CAS-clobber a newer HEAD written by an upgraded
+                    // peer. Keep it a distinct state so the fold fails loudly.
+                    Err(SnapshotFormatError::UnsupportedHeadVersion(format_version)) => {
+                        tracing::error!(
+                            key = %head_key,
+                            format_version,
+                            "HEAD is a newer format than this process understands; refusing to rebuild"
+                        );
+                        Ok(HeadState::UnsupportedVersion { format_version })
+                    }
                     Err(err) => {
                         tracing::warn!(error = %err, key = %head_key, "HEAD failed to decode, treating as absent");
                         Ok(HeadState::Corrupt {
@@ -1210,6 +1260,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use prost::Message;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
@@ -1492,6 +1543,126 @@ mod tests {
             .expect("fold after corruption");
         assert!(report.rebuilt);
         assert!(!report.no_op);
+        assert_eq!(report.watermark_hour, Some(12));
+        assert_eq!(report.entry_count, 2);
+    }
+
+    /// A HEAD whose `format_version` is newer than this process understands
+    /// (ADR-0066 decision 2) must fail the fold loudly and, critically, never
+    /// attempt a CAS write: an older process racing a rolling upgrade must not
+    /// rebuild a single-part HEAD over a newer multi-part one written by an
+    /// upgraded peer (the EM/EH clobber bug, issue #765).
+    #[tokio::test]
+    async fn newer_format_head_fails_loudly_and_never_clobbers() {
+        let inner = MemoryStore::new();
+        // Fault EVERY put. The fold must return before writing anything, so
+        // this fault must never fire. Setup writes go through `inner()` and
+        // bypass this counter, so a non-zero count can only mean the fold
+        // itself attempted a PUT.
+        let plan = FaultPlan::empty().with_rule(Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("no write expected on newer-format head".into()),
+        ));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // Seed a HEAD one format version ahead of this build, written
+        // directly so it bypasses `encode_head`'s own version validation. It
+        // decodes as protobuf, so `decode_head` reaches the version check
+        // first and returns `UnsupportedHeadVersion`.
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let newer_head = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION + 1,
+            ..Default::default()
+        };
+        let newer_bytes = newer_head.encode_to_vec();
+        store
+            .inner()
+            .put(
+                &head_key,
+                Bytes::from(newer_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed newer-format head");
+
+        let now = now_at_seal(12);
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .await
+            .expect_err("fold must fail on a newer-format HEAD");
+        assert!(
+            matches!(
+                err,
+                CatalogError::UnsupportedHeadVersion { format_version }
+                    if format_version == HEAD_FORMAT_VERSION + 1
+            ),
+            "expected UnsupportedHeadVersion, got {err:?}"
+        );
+
+        // The core safety property: the old process never attempted a PUT, so
+        // it could not have clobbered the newer HEAD.
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Permanent),
+            0,
+            "fold must not attempt any PUT against a newer-format HEAD"
+        );
+
+        // And the newer HEAD is byte-for-byte intact in the store.
+        let got = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("newer head still present");
+        assert_eq!(got.data.as_ref(), newer_bytes.as_slice());
+    }
+
+    /// The mirror image of the test above: a HEAD that decodes as protobuf and
+    /// carries the CURRENT format version but fails a LATER structural check
+    /// (tenant_hash length) is genuine corruption, not a newer format, and
+    /// must still take the self-healing rebuild-and-CAS-overwrite path. Proves
+    /// the split added for issue #765 is precise and did not block legitimate
+    /// self-healing.
+    #[tokio::test]
+    async fn head_failing_late_validation_still_rebuilds_via_corrupt_path() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_at_seal(10) - NS_PER_HOUR,
+        )
+        .await;
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let corrupt_head = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION,
+            tenant_hash: vec![0u8; 4],
+            ..Default::default()
+        };
+        store
+            .put(
+                &head_key,
+                Bytes::from(corrupt_head.encode_to_vec()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt head");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .await
+            .expect("corrupt head self-heals via rebuild");
+        assert!(report.rebuilt);
+        assert!(
+            report.put_requests >= 1,
+            "rebuild must CAS-overwrite the corrupt head"
+        );
         assert_eq!(report.watermark_hour, Some(12));
         assert_eq!(report.entry_count, 2);
     }

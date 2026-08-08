@@ -523,8 +523,19 @@ impl CommitToken {
             .map_err(|_| TypeError::InvalidCommitToken)?;
         let raw = String::from_utf8(raw).map_err(|_| TypeError::InvalidCommitToken)?;
         let mut parts = raw.split(':');
-        let (Some("v2"), Some(shard), Some(writer), Some(epoch), Some(seq), Some(hour), None) = (
-            parts.next(),
+        // Distinguish a token whose version prefix is well-formed but
+        // unrecognized (e.g. a future "v3") from genuinely malformed input, so
+        // a rolling upgrade can diagnose a too-new token separately from
+        // garbage. Same "typed, not flattened" principle as the HEAD
+        // fail-closed-on-newer rule (ADR-0066 decision 2).
+        match parts.next() {
+            Some("v2") => {}
+            Some(prefix) if is_version_prefix(prefix) => {
+                return Err(TypeError::UnsupportedCommitTokenVersion(prefix.to_string()));
+            }
+            _ => return Err(TypeError::InvalidCommitToken),
+        }
+        let (Some(shard), Some(writer), Some(epoch), Some(seq), Some(hour), None) = (
             parts.next(),
             parts.next(),
             parts.next(),
@@ -544,6 +555,17 @@ impl CommitToken {
     }
 }
 
+/// True for a well-formed version prefix: `v` followed by one or more ASCII
+/// digits (e.g. `v2`, `v3`, `v10`). Lets [`CommitToken::decode`] tell a
+/// recognizable-but-unsupported version apart from a token that has no version
+/// shape at all.
+fn is_version_prefix(s: &str) -> bool {
+    match s.strip_prefix('v') {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TypeError {
     #[error("duplicate label name: {0}")]
@@ -552,6 +574,13 @@ pub enum TypeError {
     InvalidTenantHash,
     #[error("invalid commit token")]
     InvalidCommitToken,
+    /// A commit token whose version prefix is well-formed (`v` + digits) but
+    /// not a version this build supports, e.g. a future `v3` token reaching an
+    /// older process during a rolling upgrade. Distinct from
+    /// [`TypeError::InvalidCommitToken`] (genuinely malformed input) so the
+    /// too-new case is diagnosable on its own. Carries the unrecognized prefix.
+    #[error("unsupported commit token version: {0}")]
+    UnsupportedCommitTokenVersion(String),
     #[error("series identity component exceeds u16::MAX bytes or labels")]
     OversizedSeriesComponent,
 }
@@ -676,6 +705,44 @@ mod tests {
             token
         );
         assert!(CommitToken::decode("not-a-token").is_err());
+    }
+
+    #[test]
+    fn commit_token_unrecognized_version_is_distinct_from_garbage() {
+        // A future "v3" token reaching this older build: well-formed version
+        // prefix, unsupported version. Diagnosable on its own (issue #765).
+        let v3 = URL_SAFE_NO_PAD.encode(b"v3:0:some-writer:1:2:3");
+        assert_eq!(
+            CommitToken::decode(&v3),
+            Err(TypeError::UnsupportedCommitTokenVersion("v3".to_string()))
+        );
+
+        // A downgrade-looking "v1" is equally an unsupported version, not
+        // garbage.
+        let v1 = URL_SAFE_NO_PAD.encode(b"v1:0:w:1:2:3");
+        assert_eq!(
+            CommitToken::decode(&v1),
+            Err(TypeError::UnsupportedCommitTokenVersion("v1".to_string()))
+        );
+
+        // No recognizable version shape at all stays InvalidCommitToken.
+        let garbage = URL_SAFE_NO_PAD.encode(b"xyzzy:0:1:2:3");
+        assert_eq!(
+            CommitToken::decode(&garbage),
+            Err(TypeError::InvalidCommitToken)
+        );
+        // "version" prefix that is not `v`+digits (e.g. `v` then letters) is
+        // garbage, not an unsupported version.
+        let not_versioned = URL_SAFE_NO_PAD.encode(b"vX:0:1:2:3");
+        assert_eq!(
+            CommitToken::decode(&not_versioned),
+            Err(TypeError::InvalidCommitToken)
+        );
+        // Non-base64 input is still InvalidCommitToken.
+        assert_eq!(
+            CommitToken::decode("not-a-token"),
+            Err(TypeError::InvalidCommitToken)
+        );
     }
 
     #[test]
