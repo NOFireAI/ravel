@@ -49,6 +49,7 @@ pub mod error;
 pub mod gc_config;
 pub mod legal_hold;
 pub mod memo_snapshot;
+pub mod migrate;
 pub mod provision_audit;
 pub mod publish;
 pub mod query_audit;
@@ -82,6 +83,9 @@ pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };
 pub use memo_snapshot::{MEMO_PREFIX, memo_key, read_all_memo_snapshots, write_memo_snapshot};
+pub use migrate::{
+    FamilyMigrateReport, MigrateBudget, Verification, count_below_target, migrate_family,
+};
 pub use provision_audit::write_reshard_audit;
 pub use publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record,

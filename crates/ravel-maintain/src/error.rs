@@ -69,6 +69,11 @@ pub enum MaintainError {
     },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
+    #[error(
+        "provisioning-record access failed during a format migration (shard-generation range or \
+         format-floor history): {0}"
+    )]
+    Provisioning(String),
     #[error("audit batch flush failed: {0}")]
     AuditFlush(String),
     #[error(

@@ -12,7 +12,7 @@ use prost::Message;
 use ravel_cli::hold;
 use ravel_cli::maintain::{
     SignalArg, audit_versions, compact, decode_compaction_record, decode_retention_tombstone,
-    status, sweep, verify_custody,
+    migrate, status, sweep, verify_custody,
 };
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
@@ -503,6 +503,94 @@ fn decode_compaction_record_prints_fields() {
         created_unix_ns: 999,
     };
     decode_compaction_record(&record.encode_to_vec()).expect("decode + print");
+}
+
+/// `maintain migrate` glue: on a provisioned tenant with no data below the
+/// target, the walk drains, the fresh re-audit is clean, and the floor is
+/// raised to the signal's current version (the default target). This exercises
+/// the CLI arg defaulting and the verify-then-raise path end to end; the
+/// resumability and race logic themselves are tested in ravel-maintain.
+#[tokio::test]
+async fn migrate_raises_floor_on_a_clean_tenant() {
+    let store = store();
+    let tenant = "cli-migrate-clean";
+    let tenant_hash = TenantId::new(tenant).hash();
+    ravel_catalog::validate_or_adopt(
+        store.as_ref(),
+        &tenant_hash,
+        Signal::Metrics,
+        4,
+        0,
+        ravel_catalog::AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision");
+
+    migrate(store.clone(), tenant, SignalArg::Metrics, 4, None, None, 0)
+        .await
+        .expect("migrate raises the floor on a clean tenant");
+
+    let floor = ravel_catalog::current_floor_from_store(
+        store.as_ref(),
+        &tenant_hash,
+        Signal::Metrics,
+        "rseg",
+    )
+    .await
+    .expect("read floor");
+    assert_eq!(
+        floor,
+        Some(u32::from(VERSION_V6)),
+        "the rseg floor is raised to the current version"
+    );
+}
+
+/// `maintain migrate` glue: a below-target record that the walk cannot migrate
+/// (here, one still in the current, unsealed ingest hour) is caught by the
+/// fresh re-audit, so migrate exits nonzero and does NOT raise the floor. This
+/// is the CLI surface of the EM-T10 race-safety guarantee.
+#[tokio::test]
+async fn migrate_exits_nonzero_and_holds_the_floor_when_a_straggler_survives() {
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem.clone();
+    let tenant = "cli-migrate-straggler";
+    let tenant_hash = TenantId::new(tenant).hash();
+    ravel_catalog::validate_or_adopt(
+        store.as_ref(),
+        &tenant_hash,
+        Signal::Metrics,
+        4,
+        0,
+        ravel_catalog::AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision");
+
+    // A below-target (version 1 < VERSION_V6) commit record in the current,
+    // still-unsealed ingest hour: the walk examines but cannot migrate it, and
+    // the fresh re-audit counts it. `migrate` reads only the record's recorded
+    // version here (never decodes the object), so a placeholder L0 payload is
+    // enough.
+    let now = ravel_cli::now_ns().expect("wall clock");
+    publish_l0(mem.as_ref(), tenant, 0, 1, now).await;
+
+    let err = migrate(store.clone(), tenant, SignalArg::Metrics, 4, None, None, 0)
+        .await
+        .expect_err("a fresh straggler must make migrate exit nonzero");
+    assert!(
+        err.to_string().contains("refused to raise"),
+        "the error must report the refused floor raise: {err}"
+    );
+
+    let floor = ravel_catalog::current_floor_from_store(
+        store.as_ref(),
+        &tenant_hash,
+        Signal::Metrics,
+        "rseg",
+    )
+    .await
+    .expect("read floor");
+    assert_eq!(floor, None, "a refused verify raises no floor");
 }
 
 #[test]

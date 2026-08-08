@@ -464,6 +464,31 @@ enum MaintainCommand {
         #[arg(long, default_value_t = 4)]
         shards: u32,
     },
+    /// Migrate a (tenant, signal, format family) up to a target format version,
+    /// then raise its recorded format floor once a fresh re-audit confirms
+    /// nothing below the target survives (epic EM, EM-T5). Resumable and
+    /// bounded: re-run to resume from the durable cursor after a budget stop.
+    Migrate {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
+        /// Target format version to raise the floor to. Defaults to the
+        /// signal's current supported on-object version.
+        #[arg(long)]
+        target_version: Option<u32>,
+        /// Lowercase format-family identifier the floor is keyed by. Defaults
+        /// to the signal's canonical family (metrics=rseg, logs=rlog,
+        /// spans=rspan).
+        #[arg(long)]
+        family: Option<String>,
+        /// Maximum L0 records to migrate this invocation before persisting the
+        /// cursor and returning (0 = unlimited; drain the whole walk).
+        #[arg(long, default_value_t = 0)]
+        budget_records: u64,
+    },
     /// Re-verify the content-addressed chain for a tenant at rest (both
     /// signals): every live data object's content still hashes to the hash16
     /// its key embeds, and every compaction record's referenced inputs still
@@ -680,6 +705,28 @@ async fn main() -> anyhow::Result<()> {
                 &tenant,
                 shards,
                 versioning_aware,
+            )
+            .await
+        }
+        Command::Maintain {
+            command:
+                MaintainCommand::Migrate {
+                    tenant,
+                    signal,
+                    shards,
+                    target_version,
+                    family,
+                    budget_records,
+                },
+        } => {
+            maintain::migrate(
+                store::build_store(&cli.store)?,
+                &tenant,
+                signal,
+                shards,
+                target_version,
+                family,
+                budget_records,
             )
             .await
         }
