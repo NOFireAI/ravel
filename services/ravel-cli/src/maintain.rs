@@ -11,8 +11,9 @@ use clap::ValueEnum;
 use prost::Message;
 use ravel_commit::keys;
 use ravel_maintain::{
-    Bucket, CompactionOutcome, CompactorConfig, FixedClock, LegalHoldCheck, PublishOutcome,
-    SweepReport, compact_bucket, sweep_shard,
+    Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
+    MigrateBudget, PublishOutcome, SweepReport, Verification, compact_bucket, migrate_family,
+    sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -398,6 +399,135 @@ pub async fn audit_versions(
     }
     println!("audit-versions: all live objects are at a supported version");
     Ok(())
+}
+
+/// The canonical format-family identifier for a signal's on-object format
+/// (ADR-0066 decision 3): the lowercase family string the format floor is keyed
+/// by. One family per signal today (metrics=RSEG, logs=RLOG, spans=RSPAN).
+fn signal_family(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Metrics => "rseg",
+        Signal::Logs => "rlog",
+        Signal::Spans => "rspan",
+        _ => "unknown",
+    }
+}
+
+/// The current supported on-object format version for a signal, read from each
+/// reader crate's own constant so a future version bump does not silently make
+/// the default migration target stale. Mirrors `audit_versions`' supported
+/// versions.
+fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
+    Ok(match signal {
+        Signal::Metrics => u32::from(ravel_segment::VERSION_V6),
+        Signal::Logs => u32::from(ravel_logseg::footer::VERSION),
+        Signal::Spans => u32::from(ravel_rspan::footer::VERSION),
+        other => {
+            return Err(anyhow::anyhow!("migrate does not support signal {other:?}"));
+        }
+    })
+}
+
+/// `maintain migrate`: raise a `(tenant, signal, format family)`'s recorded
+/// format floor to `target_version`, migrating every live record still below it
+/// first (epic EM, EM-T5; issues #770, #463). The same operation the server
+/// maintain loop can call via [`migrate_family`]; this is its one-shot CLI
+/// driver.
+///
+/// Resumable and bounded: one invocation migrates at most `--budget-records` L0
+/// records (0 = unlimited) before persisting its durable cursor and returning,
+/// so a large migration runs across repeated invocations. Once a walk drains
+/// within budget, migrate re-audits fresh and raises the floor only if nothing
+/// below the target survives; if a straggler is found the floor is left
+/// untouched and this exits nonzero, reporting what it found.
+///
+/// `target_version` defaults to the signal's current supported version
+/// ([`signal_current_version`]); `family` defaults to the signal's canonical
+/// family ([`signal_family`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    signal: SignalArg,
+    shards: u32,
+    target_version: Option<u32>,
+    family: Option<String>,
+    budget_records: u64,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    let sig = signal.to_signal();
+    let target = match target_version {
+        Some(v) => v,
+        None => signal_current_version(sig)?,
+    };
+    let family = family.unwrap_or_else(|| signal_family(sig).to_string());
+    let clock = wall_clock()?;
+    let config = CompactorConfig::default();
+    let budget = MigrateBudget {
+        max_records: budget_records,
+    };
+
+    let report: FamilyMigrateReport = migrate_family(
+        store.as_ref(),
+        &clock,
+        &config,
+        tenant_hash,
+        sig,
+        &family,
+        target,
+        shards,
+        budget,
+        "ravel-cli maintain migrate",
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("migrate failed: {err}"))?;
+
+    println!("tenant: {tenant}");
+    println!("signal: {sig:?}");
+    println!("family: {family}");
+    println!("target_version: {target}");
+    println!("budget_records: {budget_records} (0 = unlimited)");
+    println!("buckets_examined: {}", report.buckets_examined);
+    println!("buckets_migrated: {}", report.buckets_migrated);
+    println!("records_migrated: {}", report.records_migrated);
+    if let Some((shard, hour)) = report.cursor_advanced_to {
+        println!("cursor_advanced_to: shard={shard} hour={hour}");
+    }
+    println!("walk_complete: {}", report.walk_complete);
+
+    if !report.walk_complete {
+        println!(
+            "budget exhausted; the walk did not finish. Re-run migrate to resume from the \
+             persisted cursor (the floor is not raised until the walk drains and the re-audit is \
+             clean)."
+        );
+        return Ok(());
+    }
+
+    match report.verification {
+        Some(Verification::FloorRaised { floor_version }) => {
+            println!("verification: clean (no records below target)");
+            println!("floor_raised_to: {floor_version}");
+            Ok(())
+        }
+        Some(Verification::Stragglers { l0, l1 }) => {
+            println!(
+                "verification: FOUND STRAGGLERS l0_commit_records={l0} l1_compaction_parts={l1}"
+            );
+            anyhow::bail!(
+                "migrate refused to raise the {family} floor for tenant {tenant} signal {sig:?}: \
+                 the fresh re-audit found {l0} commit record(s) and {l1} compaction part(s) still \
+                 below target version {target} (data landed below the target between the walk \
+                 finishing and the floor raise, or is not yet migratable). The floor was NOT \
+                 raised; re-run migrate once the stragglers are at or above the target."
+            )
+        }
+        None => {
+            // walk_complete is true, so verification is always set; defend
+            // against a future refactor rather than panicking.
+            anyhow::bail!("migrate completed the walk but produced no verification result")
+        }
+    }
 }
 
 /// The outcome of independently re-hashing one content-addressed object at
