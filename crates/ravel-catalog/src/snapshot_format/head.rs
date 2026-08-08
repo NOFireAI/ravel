@@ -58,6 +58,43 @@ fn validate_head(head: &SnapshotHead) -> Result<(), SnapshotFormatError> {
         }
         max_watermark = max_watermark.max(part.watermark_hour);
     }
+
+    // Multi-part ordering rules (ADR-0063). A single-part head keeps v1
+    // semantics unchanged: its part's min_hour is unconstrained (a legacy
+    // ref decodes min_hour to 0, but a non-zero value is equally valid), so
+    // none of these apply when there is exactly one part.
+    if head.parts.len() > 1 {
+        for (index, part) in head.parts.iter().enumerate() {
+            // Each part's own range must be sane; the head cannot open the
+            // part object to verify this against its header, so it checks the
+            // mirrored ref fields directly.
+            if part.min_hour > part.watermark_hour {
+                return Err(SnapshotFormatError::PartRefRangeInverted {
+                    index,
+                    min_hour: part.min_hour,
+                    watermark: part.watermark_hour,
+                });
+            }
+        }
+        for index in 1..head.parts.len() {
+            let prev = &head.parts[index - 1];
+            let cur = &head.parts[index];
+            // Ascending by min_hour.
+            if cur.min_hour < prev.min_hour {
+                return Err(SnapshotFormatError::PartsNotSortedByMinHour { index });
+            }
+            // Ranges strictly disjoint: an hour bucket belongs to exactly one
+            // part, so the next part must start strictly after the previous
+            // part's watermark.
+            if prev.watermark_hour >= cur.min_hour {
+                return Err(SnapshotFormatError::PartRangesOverlap {
+                    index,
+                    prev_watermark: prev.watermark_hour,
+                    next_min_hour: cur.min_hour,
+                });
+            }
+        }
+    }
     if head.watermark_hour != max_watermark {
         return Err(SnapshotFormatError::HeadWatermarkMismatch {
             head: head.watermark_hour,

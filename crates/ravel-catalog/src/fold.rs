@@ -811,6 +811,9 @@ impl Catalog {
                     size: part_bytes_len,
                     entry_count: entries.len() as u64,
                     watermark_hour,
+                    // Single-part v1 fold: epoch floor. Hour-partitioned
+                    // parts (ADR-0063 T2) set a real min_hour.
+                    min_hour: 0,
                 }],
                 postings: postings_ref,
                 folder_id: folder_id.into_bytes().to_vec(),

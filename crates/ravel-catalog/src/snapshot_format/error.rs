@@ -53,6 +53,10 @@ pub enum SnapshotFormatError {
     DuplicateEntry,
     #[error("entry ingest_hour_bucket {hour} exceeds header watermark_hour {watermark}")]
     WatermarkExceeded { hour: u32, watermark: u32 },
+    #[error("entry ingest_hour_bucket {hour} is below header min_hour {min_hour}")]
+    BelowMinHour { hour: u32, min_hour: u32 },
+    #[error("header min_hour {min_hour} exceeds watermark_hour {watermark}")]
+    MinHourExceedsWatermark { min_hour: u32, watermark: u32 },
     #[error("unsupported entry level {0}")]
     UnsupportedLevel(u32),
     #[error("entry {field} must be {expected} bytes, got {actual}")]
@@ -83,6 +87,22 @@ pub enum SnapshotFormatError {
     },
     #[error("head part[{index}] has an empty key")]
     EmptyPartKey { index: usize },
+    #[error("head part[{index}] min_hour {min_hour} exceeds its watermark_hour {watermark}")]
+    PartRefRangeInverted {
+        index: usize,
+        min_hour: u32,
+        watermark: u32,
+    },
+    #[error("head parts are not sorted by min_hour ascending at part[{index}]")]
+    PartsNotSortedByMinHour { index: usize },
+    #[error(
+        "head part[{index}] min_hour {next_min_hour} overlaps the previous part's watermark_hour {prev_watermark}"
+    )]
+    PartRangesOverlap {
+        index: usize,
+        prev_watermark: u32,
+        next_min_hour: u32,
+    },
     #[error("head postings ref blake3 must be 32 bytes, got {0}")]
     BadPostingsRefBlake3Len(usize),
     #[error("head postings ref has an empty key")]

@@ -113,25 +113,6 @@ proptest! {
     }
 }
 
-fn arb_part_ref() -> impl Strategy<Value = SnapshotPartRef> {
-    (
-        "[a-z0-9/]{1,40}",
-        prop::collection::vec(any::<u8>(), 32),
-        any::<u64>(),
-        any::<u64>(),
-        0u32..1000,
-    )
-        .prop_map(
-            |(key, blake3, size, entry_count, watermark_hour)| SnapshotPartRef {
-                key,
-                blake3,
-                size,
-                entry_count,
-                watermark_hour,
-            },
-        )
-}
-
 fn arb_postings_ref(
     parts: &[SnapshotPartRef],
 ) -> impl Strategy<Value = Option<SnapshotPostingsRef>> + use<> {
@@ -157,12 +138,44 @@ fn arb_postings_ref(
 }
 
 fn arb_head() -> impl Strategy<Value = SnapshotHead> {
+    // Each raw part carries a (gap, span) plus its arbitrary content fields.
+    // `arb_head` folds the gaps/spans into ascending, strictly-disjoint hour
+    // ranges ([min_hour, watermark_hour], each min_hour > the previous
+    // part's watermark_hour) so a multi-part head satisfies `validate_head`'s
+    // ordering, disjointness, and per-part-sanity rules.
     (
-        prop::collection::vec(arb_part_ref(), 1..5),
+        prop::collection::vec(
+            (
+                0u32..5,
+                0u32..10,
+                "[a-z0-9/]{1,40}",
+                prop::collection::vec(any::<u8>(), 32),
+                any::<u64>(),
+                any::<u64>(),
+            ),
+            1..5,
+        ),
         prop::collection::vec(any::<u8>(), 16),
         any::<i64>(),
     )
-        .prop_flat_map(|(parts, folder_id, created_unix_ns)| {
+        .prop_flat_map(|(raw_parts, folder_id, created_unix_ns)| {
+            let mut cursor = 0u32;
+            let parts: Vec<SnapshotPartRef> = raw_parts
+                .into_iter()
+                .map(|(gap, span, key, blake3, size, entry_count)| {
+                    let min_hour = cursor + gap;
+                    let watermark_hour = min_hour + span;
+                    cursor = watermark_hour + 1;
+                    SnapshotPartRef {
+                        key,
+                        blake3,
+                        size,
+                        entry_count,
+                        watermark_hour,
+                        min_hour,
+                    }
+                })
+                .collect();
             arb_postings_ref(&parts).prop_map(move |postings| {
                 let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
                 SnapshotHead {

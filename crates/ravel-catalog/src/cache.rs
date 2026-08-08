@@ -654,6 +654,7 @@ mod tests {
                 watermark_hour,
                 entry_count: 0,
                 entries_uncompressed_len: 0,
+                min_hour: 0,
             },
             entries: vec![],
         }
