@@ -36,6 +36,15 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 ravel-commit = { workspace = true }
+# Builds `ErasureRequest`/`ErasurePredicateMatcher` protobuf values so the
+# engine tests populate `Snapshot::pending_erasure` and drive the real
+# `snapshot_erasure_predicates` mapping (EJ-T3, #753). Workspace-internal
+# crate; the same one `ravel_catalog::Snapshot::pending_erasure` is typed on.
+ravel-proto = { workspace = true }
+# Already a normal dependency (ADR-0046 read cache); also needed in the
+# integration tests to build a RAM `Cache` and prove selective-erasure
+# exclusion runs on cache-served bytes (EJ-T3, tests/log_fetcher.rs).
+ravel-cache = { workspace = true }
 # Path dev-dependency (not a workspace dep): the differential compaction
 # proof (tests/differential_compaction.rs) drives P4's real compactor to
 # produce write_v4 L1 parts. ravel-maintain does not depend on ravel-query,

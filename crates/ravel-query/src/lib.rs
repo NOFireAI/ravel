@@ -5,6 +5,7 @@
 mod cache_correctness;
 mod config;
 mod engine;
+pub mod erasure;
 mod error;
 mod fetcher;
 pub mod http;

@@ -4658,6 +4658,7 @@ dependencies = [
  "ravel-maintain",
  "ravel-object-store",
  "ravel-promql",
+ "ravel-proto",
  "ravel-segment",
  "ravel-types",
  "reqwest 0.13.4",

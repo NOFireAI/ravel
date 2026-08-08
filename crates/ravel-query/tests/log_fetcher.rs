@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
@@ -28,7 +29,9 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{LogQuery, LogSegmentFetcher, StreamAttrEquals};
+use ravel_query::erasure::ErasurePredicate;
+use ravel_query::{CacheFetchError, LogQuery, LogSegmentFetcher, StreamAttrEquals};
+use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
 
@@ -769,4 +772,183 @@ async fn prune_arm_on_unindexed_field_prunes_nothing() {
     let expected: Vec<i64> = base.records.iter().map(|r| r.ts_ns).collect();
     assert_eq!(got, expected, "every matching record is returned");
     assert_eq!(got.len(), 12);
+}
+
+// ---- selective-erasure scan-time exclusion (ADR-0064 decision 2, EJ-T3) ----
+
+/// A windowless erasure predicate on one exact `key = value` matcher.
+fn erase(key: &str, value: &str) -> ErasurePredicate {
+    ErasurePredicate::windowless(vec![(key.to_string(), value.to_string())])
+}
+
+/// Twelve records on one stream, ts 100..=111, alternating a per-record
+/// `user_id` of `u1`/`u2`, for erasure-predicate matching on row attributes.
+fn erasure_records() -> Vec<LogRecord> {
+    (100..=111)
+        .map(|ts| {
+            let uid = if ts % 2 == 0 { "u1" } else { "u2" };
+            record_with_attrs(
+                "api",
+                ts,
+                "ok",
+                &[("user_id".to_string(), AttrValue::Str(uid.to_string()))],
+            )
+        })
+        .collect()
+}
+
+/// A pending erasure predicate on a row attribute drops exactly the matching
+/// rows, and leaves the identical no-predicate query untouched (no regression).
+#[tokio::test]
+async fn erasure_predicate_excludes_matching_log_rows() {
+    let mem = MemoryStore::new();
+    let records = erasure_records();
+    let seg_ref = write_object(&mem, "logs/erase.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+
+    // Baseline: no erasure predicate reads and returns every record.
+    let base = fetcher
+        .fetch(&seg_ref, &LogQuery::new(0, 5000))
+        .await
+        .expect("fetch")
+        .expect("in range");
+    assert_eq!(base.records.len(), 12);
+
+    // The same query with a pending erasure predicate on user_id=u1 returns
+    // strictly fewer rows, and none of the survivors carry user_id=u1.
+    let erased = fetcher
+        .fetch(
+            &seg_ref,
+            &LogQuery::new(0, 5000).with_erasure(vec![erase("user_id", "u1")]),
+        )
+        .await
+        .expect("fetch")
+        .expect("in range");
+    assert!(
+        erased.records.len() < base.records.len(),
+        "erasure must drop the matching rows: {} vs {}",
+        erased.records.len(),
+        base.records.len()
+    );
+    assert_eq!(erased.records.len(), 6, "six u2 rows survive");
+    assert!(
+        erased.records.iter().all(|r| r
+            .attrs
+            .iter()
+            .all(|(k, v)| !(k == "user_id" && *v == AttrValue::Str("u1".into())))),
+        "no surviving row carries the erased user_id=u1"
+    );
+
+    // Explicitly empty erasure list is identical to omitting it entirely.
+    let empty = fetcher
+        .fetch(&seg_ref, &LogQuery::new(0, 5000).with_erasure(vec![]))
+        .await
+        .expect("fetch")
+        .expect("in range");
+    let base_ts: Vec<i64> = base.records.iter().map(|r| r.ts_ns).collect();
+    let empty_ts: Vec<i64> = empty.records.iter().map(|r| r.ts_ns).collect();
+    assert_eq!(empty_ts, base_ts, "empty erasure is the identity");
+}
+
+/// A predicate with an event-time window excludes only the rows whose event
+/// time falls inside the half-open window, keeping the rest of the matching
+/// subject's rows.
+#[tokio::test]
+async fn erasure_window_excludes_only_in_window_rows() {
+    let mem = MemoryStore::new();
+    let records: Vec<LogRecord> = [100i64, 150, 200, 250]
+        .iter()
+        .map(|ts| {
+            record_with_attrs(
+                "api",
+                *ts,
+                "ok",
+                &[("user_id".to_string(), AttrValue::Str("u1".to_string()))],
+            )
+        })
+        .collect();
+    let seg_ref = write_object(&mem, "logs/erase_window.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+
+    // Window [150, 250): drops ts 150 and 200, keeps 100 (before) and 250 (the
+    // exclusive upper bound is not erased).
+    let windowed = ErasurePredicate::new(vec![("user_id".to_string(), "u1".to_string())], 150, 250);
+    let out = fetcher
+        .fetch(
+            &seg_ref,
+            &LogQuery::new(0, 5000).with_erasure(vec![windowed]),
+        )
+        .await
+        .expect("fetch")
+        .expect("in range");
+    let kept: Vec<i64> = out.records.iter().map(|r| r.ts_ns).collect();
+    assert_eq!(kept, vec![100, 250], "only in-window rows are erased");
+}
+
+/// The ordering guarantee this task exists to close (ADR-0064 decision 2):
+/// exclusion runs *after* the cache, so stale cached bytes of a since-erased
+/// subject can never leak. A first fetch with no predicate populates the read
+/// cache with the object's bytes; a second fetch that is served entirely from
+/// that cache (zero new store GETs) still excludes the erased rows.
+#[tokio::test]
+async fn erasure_runs_after_cache_hit() {
+    let tenant = TenantHash([7u8; 16]);
+    let mem = Arc::new(MemoryStore::new());
+    let records = erasure_records();
+    let seg_ref = write_object(&mem, "logs/erase_cached.rlog", &records).await;
+    let counting = Arc::new(CountingStore::new(mem));
+    let cache: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(CacheLimits::new(
+        16 * 1024 * 1024,
+        100,
+        16 * 1024 * 1024,
+    )));
+    let fetcher =
+        LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>).with_cache(cache);
+
+    // First fetch, no erasure: one real store GET, and the bytes land in cache.
+    let warm = fetcher
+        .fetch_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &LogQuery::new(0, 5000),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("fetch")
+        .expect("in range");
+    assert_eq!(warm.records.len(), 12);
+    assert_eq!(counting.get_count(), 1, "first fetch issues one store GET");
+
+    // Second fetch WITH an erasure predicate. It must be served from cache (no
+    // additional store GET), and it must still drop the erased rows. If the
+    // filter ran before the cache, a cache hit would bypass it and leak u1.
+    let erased = fetcher
+        .fetch_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &LogQuery::new(0, 5000).with_erasure(vec![erase("user_id", "u1")]),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("fetch")
+        .expect("in range");
+    assert_eq!(
+        counting.get_count(),
+        1,
+        "second fetch is served from cache, no new store GET"
+    );
+    assert_eq!(
+        erased.records.len(),
+        6,
+        "erasure still applied on cached bytes"
+    );
+    assert!(
+        erased.records.iter().all(|r| r
+            .attrs
+            .iter()
+            .all(|(k, v)| !(k == "user_id" && *v == AttrValue::Str("u1".into())))),
+        "cache-served bytes of the erased subject must not leak"
+    );
 }

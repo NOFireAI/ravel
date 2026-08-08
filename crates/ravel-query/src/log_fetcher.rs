@@ -33,6 +33,7 @@
 
 use std::sync::Arc;
 
+use crate::erasure::ErasurePredicate;
 use bytes::Bytes;
 use ravel_cache::{Cache, CacheKey, SingleFlightError};
 use ravel_catalog::SegmentRef;
@@ -119,6 +120,20 @@ pub struct LogQuery {
     /// attribute equality in `content` instead would drop every record whose
     /// match lives only in its resource or scope attributes.
     pub prune: Vec<Predicate>,
+    /// Pending selective-erasure predicates for this query's resolved snapshot
+    /// (ADR-0064 decision 2, EJ-T3). Every decoded row whose per-record
+    /// attributes match any predicate (intersected with the predicate's
+    /// event-time window) is dropped in [`scan_bytes`](LogSegmentFetcher::
+    /// scan_bytes), after the fetch and after any cache layer, before the
+    /// result reaches the caller. Empty for a query with no pending erasure,
+    /// which reads and returns exactly what it did before this field existed.
+    ///
+    /// The caller populates this from the resolved snapshot's attached
+    /// predicates. That attachment is the resolver's job (EJ-T2); until the
+    /// resolver surfaces them (and the `ravel-sql` logs provider that builds
+    /// this query threads them through), this stays empty and log erasure
+    /// exclusion is inert.
+    pub erasure: Vec<ErasurePredicate>,
 }
 
 impl LogQuery {
@@ -131,6 +146,7 @@ impl LogQuery {
             stream_attrs: Vec::new(),
             content: Vec::new(),
             prune: Vec::new(),
+            erasure: Vec::new(),
         }
     }
 
@@ -151,6 +167,15 @@ impl LogQuery {
     #[must_use]
     pub fn with_prune(mut self, pred: Predicate) -> Self {
         self.prune.push(pred);
+        self
+    }
+
+    /// Attaches the resolved snapshot's pending erasure predicates (see
+    /// [`LogQuery::erasure`]). Rows matching any of them are excluded at scan
+    /// time, after fetch and after cache.
+    #[must_use]
+    pub fn with_erasure(mut self, predicates: Vec<ErasurePredicate>) -> Self {
+        self.erasure = predicates;
         self
     }
 }
@@ -606,9 +631,15 @@ impl LogSegmentFetcher {
         // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
         // amendment 2026-08-03). An empty channel makes this identical to
         // `scan`.
-        let (records, stats) = reader
+        let (mut records, stats) = reader
             .scan_pruned(&pred, &query.prune)
             .map_err(|source| corrupt(key, source))?;
+        // Selective-erasure exclusion (ADR-0064 decision 2, EJ-T3): drop every
+        // row a pending erasure predicate matches. Applied here, on the decoded
+        // records, so it excludes rows identically whether `bytes` came from
+        // the store or from a cache hit -- the whole point of filtering after
+        // fetch and after cache. A no-op when `query.erasure` is empty.
+        crate::erasure::retain_log_records(&mut records, &query.erasure);
         Ok(Some(LogFetchOutput { records, stats }))
     }
 
