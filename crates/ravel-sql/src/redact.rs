@@ -146,7 +146,13 @@ struct LiteralRedactor<'a> {
     key: &'a [u8; 32],
     /// A stack of per-`Query` snapshots of the structural value positions,
     /// captured on entry and restored on exit. See [`Self::pre_visit_query`].
-    structural: Vec<Vec<Value>>,
+    /// Each position is `Some(original)` only when it is a structural literal
+    /// worth restoring (a bare `Value::Number`); `None` marks a position that
+    /// is still visited (so the snapshot and restore passes see the identical
+    /// position sequence -- required for `for_each_structural_value` to stay
+    /// aligned) but must NOT be restored, because it was never a number and
+    /// `pre_visit_value` genuinely tokenized it.
+    structural: Vec<Vec<Option<Value>>>,
 }
 
 impl VisitorMut for LiteralRedactor<'_> {
@@ -162,21 +168,39 @@ impl VisitorMut for LiteralRedactor<'_> {
     /// snapshot those positions here (before `pre_visit_value` tokenizes them)
     /// and restore the originals in `post_visit_query`, after the walk is done.
     /// The stack keeps nested subqueries independent.
+    ///
+    /// Only a bare `Value::Number` is captured as `Some`: those are the
+    /// genuinely structural positions (a `LIMIT`/`OFFSET`/`FETCH` count or an
+    /// `ORDER BY` ordinal) this carve-out exists for. A non-number literal in
+    /// one of these positions (`LIMIT 'x'`, `ORDER BY 'x'` -- not valid SQL
+    /// shape-wise for most of these but sqlparser still parses a bare string
+    /// there) is captured as `None` and left to `pre_visit_value`'s
+    /// tokenization, which `post_visit_query` below must not undo.
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         let mut snapshot = Vec::new();
-        for_each_structural_value(query, |vws| snapshot.push(vws.value.clone()));
+        for_each_structural_value(query, |vws| {
+            snapshot.push(match &vws.value {
+                Value::Number(..) => Some(vws.value.clone()),
+                _ => None,
+            });
+        });
         self.structural.push(snapshot);
         ControlFlow::Continue(())
     }
 
-    /// Restore the structural value literals tokenized during the walk to their
-    /// pre-visit form. Positions align with the snapshot because tokenization
-    /// only rewrites `Value` contents, never the query's structure.
+    /// Restore the structural value literals tokenized during the walk to
+    /// their pre-visit form, but only at a position the snapshot captured as
+    /// `Some` (a bare number). A `None` position was never a number and must
+    /// keep whatever `pre_visit_value` tokenized it to -- restoring it would
+    /// silently undo the redaction and leak the literal in a structural
+    /// position that isn't actually structural. Positions align with the
+    /// snapshot because tokenization only rewrites `Value` contents, never
+    /// the query's structure.
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         if let Some(snapshot) = self.structural.pop() {
             let mut originals = snapshot.into_iter();
             for_each_structural_value(query, |vws| {
-                if let Some(original) = originals.next() {
+                if let Some(Some(original)) = originals.next() {
                     vws.value = original;
                 }
             });
@@ -442,6 +466,43 @@ mod tests {
         );
         assert!(out.contains("tok_"), "hidden value should tokenize: {out}");
         reparse(&out);
+    }
+
+    #[test]
+    fn non_numeric_structural_positions_still_tokenize() {
+        // The structural carve-out is for a bare NUMBER only. A string
+        // literal sitting in one of the four structural positions (ORDER BY,
+        // LIMIT, OFFSET, FETCH) is not a real ordinal or count and must still
+        // tokenize -- the snapshot/restore mechanism must not blindly restore
+        // whatever `pre_visit_value` tokenized there.
+        let cases = [
+            (
+                "SELECT a FROM t ORDER BY 'alice@example.com'",
+                "alice@example.com",
+            ),
+            (
+                "SELECT a FROM t ORDER BY b, 'secret-user-id'",
+                "secret-user-id",
+            ),
+            ("SELECT a FROM t LIMIT 'topsecret'", "topsecret"),
+            ("SELECT a FROM t OFFSET 'topsecret'", "topsecret"),
+            (
+                "SELECT a FROM t FETCH FIRST 'topsecret' ROWS ONLY",
+                "topsecret",
+            ),
+        ];
+        for (query, literal) in cases {
+            let out = redact(query, &KEY_A).expect("redacts");
+            assert!(
+                !out.contains(literal),
+                "non-numeric structural literal leaked for {query:?}: {out}"
+            );
+            assert!(
+                out.contains("tok_"),
+                "non-numeric structural literal should tokenize for {query:?}: {out}"
+            );
+            reparse(&out);
+        }
     }
 
     #[test]
