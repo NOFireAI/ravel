@@ -54,8 +54,9 @@ use std::time::Duration;
 use rand::RngExt as _;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
+use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
-    Clock, CompactorConfig, LegalHoldCheck, MaintainError, RetentionConfig,
+    Clock, CompactorConfig, LegalHoldCheck, MaintainError, RetentionConfig, WorkerSet,
     sweep_idempotency_markers, sweep_shard,
 };
 use ravel_object_store::ObjectStoreBackend;
@@ -217,6 +218,11 @@ pub struct MaintenanceTaskConfig {
     /// default is "no retention", so with no `--retention-*` flags this task
     /// compacts and sweeps but never age-deletes.
     pub retention: RetentionConfig,
+    /// Bounded intra-process unit concurrency (ADR-0065 decision 2's
+    /// stuck-owner mitigation): the maximum number of owned `(signal, shard)`
+    /// units this process maintains at once within a tenant's tick, replacing
+    /// the pre-ADR-0065 strictly-sequential per-shard walk. Default 4.
+    pub unit_concurrency: usize,
 }
 
 impl Default for MaintenanceTaskConfig {
@@ -227,6 +233,7 @@ impl Default for MaintenanceTaskConfig {
             shard_count: 4,
             compactor: CompactorConfig::default(),
             retention: RetentionConfig::default(),
+            unit_concurrency: DEFAULT_UNIT_CONCURRENCY,
         }
     }
 }
@@ -269,6 +276,7 @@ pub fn spawn(
     config: MaintenanceTaskConfig,
     metrics: Arc<TenantDiscoveryMetrics>,
     safety: Arc<MaintenanceSafetyMetrics>,
+    worker: Arc<WorkerSet>,
 ) -> MaintenanceTasks {
     if !config.enabled {
         return MaintenanceTasks::none();
@@ -300,6 +308,7 @@ pub fn spawn(
             interval,
             metrics,
             safety,
+            worker,
             rx,
         )
         .await;
@@ -320,6 +329,7 @@ async fn run_loop(
     interval: Duration,
     metrics: Arc<TenantDiscoveryMetrics>,
     safety: Arc<MaintenanceSafetyMetrics>,
+    worker: Arc<WorkerSet>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     // One memo for the whole process, held across every tick and every
@@ -328,22 +338,56 @@ async fn run_loop(
     // tenant this supervisor discovers. Cold on the first tick, so that tick
     // is a full rescan identical to the pre-memo behavior.
     let mut memo = MaintainMemo::with_default_interval();
+
+    // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
+    // `H`, independent of the (coarser) discovery interval: the heartbeat must
+    // land well inside the `3 * H` liveness window siblings judge this process
+    // against, so it cannot ride the 5-minute discovery tick. The first tick of
+    // `tokio::time::interval` fires immediately, so the heartbeat is written and
+    // the live set computed before the first discovery cycle runs. The live set
+    // computed here is reused by every discovery cycle until the next heartbeat
+    // refreshes it. A live-set read failure keeps the last-known set (fail-open,
+    // ADR-0065 decision 1): ownership stays stable rather than collapsing.
+    let clock = WallClock;
+    let mut live_set = worker.solo_live_set();
+    let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(jittered(interval)) => {}
+            _ = heartbeat.tick() => {
+                let now = clock.now_ns();
+                if let Err(err) = worker.write_heartbeat(store.as_ref(), now).await {
+                    tracing::warn!(
+                        error = %err,
+                        "maintenance: worker heartbeat write failed; self-corrects next interval"
+                    );
+                }
+                match worker.live_set(store.as_ref(), now).await {
+                    Ok(computed) => live_set = computed,
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "maintenance: worker live-set read failed; keeping the last-known live set \
+                         (fail-open, ADR-0065 decision 1)"
+                    ),
+                }
+            }
+            _ = tokio::time::sleep(jittered(interval)) => {
+                run_discovery_cycle(
+                    store.as_ref(),
+                    restrict.as_deref(),
+                    &compactor,
+                    &retention,
+                    shard_count,
+                    &mut memo,
+                    metrics.as_ref(),
+                    safety.as_ref(),
+                    &worker,
+                    &live_set,
+                )
+                .await;
+            }
             _ = &mut shutdown => return,
         }
-        run_discovery_cycle(
-            store.as_ref(),
-            restrict.as_deref(),
-            &compactor,
-            &retention,
-            shard_count,
-            &mut memo,
-            metrics.as_ref(),
-            safety.as_ref(),
-        )
-        .await;
     }
 }
 
@@ -365,6 +409,8 @@ pub async fn run_discovery_cycle(
     memo: &mut MaintainMemo,
     metrics: &TenantDiscoveryMetrics,
     safety: &MaintenanceSafetyMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
 ) -> MaintainReport {
     let outcome = match discover_and_restrict(store, restrict).await {
         Ok(outcome) => outcome,
@@ -396,6 +442,8 @@ pub async fn run_discovery_cycle(
             shard_count,
             memo,
             safety,
+            worker,
+            live_set,
         )
         .await;
         total.retired += report.retired;
@@ -435,6 +483,20 @@ pub async fn run_discovery_cycle(
 /// returned [`MaintainReport`] sums the per-`(signal, shard)` reports of the
 /// retention-and-compaction passes (the sweep pass is logged, not summed);
 /// `skipped_terminal` is the count of buckets the memo let this tick skip.
+///
+/// `worker`/`live_set` gate ownership (ADR-0065 decision 2): a `(signal,
+/// shard)` unit this process does not own under the current live set is skipped
+/// entirely -- neither its retention/compaction pass nor its `sweep_shard` is
+/// attempted (a discovery-time skip, not a mid-work abort). The idempotency-
+/// marker sweep is gated on ownership of shard 0 of the `(tenant, signal)` pair.
+/// Owned units run with bounded intra-process concurrency
+/// ([`WorkerSet::unit_concurrency`]) instead of a strictly sequential walk, so
+/// one pathological unit cannot starve the rest of the process's ownership
+/// (decision 2's stuck-owner mitigation). With a single-replica live set
+/// (`{self}`) every unit is owned and the behavior is byte-for-byte the
+/// pre-ADR-0065 unconditional walk. Tenant discovery and the legal-hold refresh
+/// below stay per-process, never gated on ownership (ADR-0065 decision 2).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tick(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -443,6 +505,8 @@ pub async fn run_tick(
     shard_count: u32,
     memo: &mut MaintainMemo,
     safety: &MaintenanceSafetyMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
 ) -> MaintainReport {
     let clock = WallClock;
 
@@ -528,12 +592,60 @@ pub async fn run_tick(
                     continue;
                 }
             };
-        for shard in 0..scan_shards {
-            match scan_and_maintain_with_memo(
-                memo, store, &clock, compactor, retention, &hold, *tenant, signal, shard,
-            )
-            .await
-            {
+        // Ownership gate (ADR-0065 decision 2): keep only the shards this
+        // process owns under the current live set. A unit it does not own is
+        // not evaluated at all this tick (a discovery-time skip, not a mid-work
+        // abort); whichever worker the rendezvous hash assigns it to runs it.
+        let owned_shards: Vec<u32> = (0..scan_shards)
+            .filter(|shard| worker.owns_unit(live_set, tenant, signal, *shard))
+            .collect();
+
+        // Carve each owned unit's memo slice out of the shared memo so its
+        // concurrent future can mutate it without aliasing another unit's
+        // disjoint bucket space; the slices are merged back (in ascending shard
+        // order) after the fan-out completes.
+        let units: Vec<(u32, MaintainMemo)> = owned_shards
+            .iter()
+            .map(|&shard| (shard, memo.split_unit(*tenant, signal, shard)))
+            .collect();
+
+        // Maintain owned units with bounded intra-process concurrency
+        // (decision 2's stuck-owner mitigation) instead of a strictly
+        // sequential walk, so one pathological unit cannot starve the rest of
+        // the process's ownership. `run_bounded` preserves input (ascending
+        // shard) order in its results, so the serial accounting and logging
+        // below is deterministic and, for a single-replica live set, produces
+        // byte-for-byte the pre-ADR-0065 sequential behavior. Each future runs
+        // one unit's retention/compaction pass and then its sweep, over a
+        // keyspace disjoint from every other unit's.
+        let clock_ref = &clock;
+        let hold_ref = &hold;
+        let unit_results = run_bounded(
+            worker.unit_concurrency(),
+            units,
+            move |(shard, mut unit_memo)| async move {
+                let scan = scan_and_maintain_with_memo(
+                    &mut unit_memo,
+                    store,
+                    clock_ref,
+                    compactor,
+                    retention,
+                    hold_ref,
+                    *tenant,
+                    signal,
+                    shard,
+                )
+                .await;
+                let sweep =
+                    sweep_shard(store, clock_ref, compactor, hold_ref, tenant, signal, shard).await;
+                (shard, unit_memo, scan, sweep)
+            },
+        )
+        .await;
+
+        for (shard, unit_memo, scan_result, sweep_result) in unit_results {
+            memo.merge_unit(unit_memo);
+            match scan_result {
                 Ok(report) => {
                     tracing::info!(
                         tenant = %tenant.to_hex(),
@@ -582,7 +694,7 @@ pub async fn run_tick(
                 }
             }
 
-            match sweep_shard(store, &clock, compactor, &hold, tenant, signal, shard).await {
+            match sweep_result {
                 Ok(report) => {
                     tracing::info!(
                         tenant = %tenant.to_hex(),
@@ -627,9 +739,14 @@ pub async fn run_tick(
         // Idempotency markers exist only for logs and spans (ADR-0051 SS5);
         // the sweep LISTs one coarse prefix covering every shard of the
         // signal, so it runs once per signal here, not inside the per-shard
-        // loop above. Logged like the GC sweep pass, not folded into
-        // `MaintainReport`'s summed fields.
-        if matches!(signal, Signal::Logs | Signal::Spans) {
+        // loop above. Gated on ownership of shard 0 of this (tenant, signal)
+        // pair (ADR-0065 decision 2): the single worker that owns shard 0 runs
+        // the whole-signal marker sweep, so replicas do not double-pay it.
+        // Logged like the GC sweep pass, not folded into `MaintainReport`'s
+        // summed fields.
+        if matches!(signal, Signal::Logs | Signal::Spans)
+            && worker.owns_unit(live_set, tenant, signal, 0)
+        {
             match sweep_idempotency_markers(store, &clock, compactor, &hold, tenant, signal).await {
                 Ok(outcome) => {
                     tracing::info!(
@@ -692,6 +809,134 @@ mod tests {
     /// "now" the same way production does rather than fix a clock).
     const TEST_NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+    /// A single-replica worker for the deterministic tenant-tick tests: its
+    /// solo live set (`{self}`) owns every unit, so `run_tick` and
+    /// `run_discovery_cycle` behave exactly as the pre-ADR-0065 unconditional
+    /// walk. It keeps the default unit concurrency (4), so these tests also
+    /// exercise the bounded-concurrent per-unit path, whose per-shard effects
+    /// are over disjoint keyspaces and therefore identical to a sequential walk.
+    fn solo_worker() -> WorkerSet {
+        WorkerSet::with_defaults(0)
+    }
+
+    /// The acceptance test named by issue #746 / experiment S5-E6 (ADR-0065
+    /// decisions 1 and 2): two maintain replicas sharing one store partition the
+    /// unit set rather than both paying for it.
+    ///
+    /// Two `WorkerSet`s each heartbeat into one shared `MemoryStore`; both
+    /// compute a live set, which must converge to include both processes and be
+    /// identical. For every `(Metrics, shard)` unit both must compute the same
+    /// rendezvous owner (the formula is deterministic given the same live set),
+    /// and exactly one of the two must own it. Finally, running each process's
+    /// `run_tick` over the same tenant with its own cold memo must process every
+    /// unit exactly once across the two -- proven by the combined `already_done`
+    /// equalling the unit count (not twice it: no double-pay), and by the two
+    /// memos partitioning the owned shards disjointly.
+    #[tokio::test]
+    async fn two_replicas_partition_units_without_double_pay() {
+        const SHARDS: u32 = 8;
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // One below-threshold (terminal) bucket per shard: each is a real unit
+        // of maintenance work, classified `already_done` when evaluated.
+        for shard in 0..SHARDS {
+            publish_terminal_bucket_at_shard(&store, &tenant_id, shard).await;
+        }
+
+        // Two replicas, each with the default membership/timing. A single clock
+        // reading for both heartbeats keeps both fresh within the liveness
+        // window.
+        let now = 1_000 * TEST_NS_PER_HOUR;
+        let a = WorkerSet::with_defaults(now);
+        let b = WorkerSet::with_defaults(now);
+        a.write_heartbeat(&store, now).await.expect("a heartbeat");
+        b.write_heartbeat(&store, now).await.expect("b heartbeat");
+
+        // Live sets converge: each sees both processes, and the sorted sets are
+        // identical (so the rendezvous input is identical on both sides).
+        let live_a = a.live_set(&store, now).await.expect("a live set");
+        let live_b = b.live_set(&store, now).await.expect("b live set");
+        assert_eq!(live_a, live_b, "both replicas compute the same live set");
+        assert!(live_a.contains(&a.process_id()) && live_a.contains(&b.process_id()));
+        assert_eq!(live_a.len(), 2);
+
+        // Ownership is computed identically by both, and every unit is owned by
+        // exactly one replica (disjoint and complete).
+        let mut owned_by_a = 0u32;
+        let mut owned_by_b = 0u32;
+        for shard in 0..SHARDS {
+            let a_owns = a.owns_unit(&live_a, &tenant, Signal::Metrics, shard);
+            let b_owns = b.owns_unit(&live_b, &tenant, Signal::Metrics, shard);
+            assert_ne!(
+                a_owns, b_owns,
+                "shard {shard} must be owned by exactly one of the two replicas"
+            );
+            if a_owns {
+                owned_by_a += 1;
+            } else {
+                owned_by_b += 1;
+            }
+        }
+        assert_eq!(owned_by_a + owned_by_b, SHARDS, "every unit is owned");
+
+        // Run both replicas' ticks over the same tenant, each with its own cold
+        // memo. Every unit is processed by exactly one: the combined
+        // `already_done` is the unit count (not double it), and each memo holds
+        // exactly that replica's owned shards.
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+
+        let mut memo_a = MaintainMemo::with_default_interval();
+        let report_a = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_a,
+            &safety,
+            &a,
+            &live_a,
+        )
+        .await;
+
+        let mut memo_b = MaintainMemo::with_default_interval();
+        let report_b = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_b,
+            &safety,
+            &b,
+            &live_b,
+        )
+        .await;
+
+        assert_eq!(
+            report_a.already_done + report_b.already_done,
+            SHARDS as usize,
+            "every unit processed exactly once across the two replicas (no double-pay)"
+        );
+        assert_eq!(
+            report_a.already_done, owned_by_a as usize,
+            "replica A processed exactly the units it owns"
+        );
+        assert_eq!(
+            report_b.already_done, owned_by_b as usize,
+            "replica B processed exactly the units it owns"
+        );
+        assert_eq!(
+            memo_a.len() + memo_b.len(),
+            SHARDS as usize,
+            "the two memos partition the owned shards disjointly and completely"
+        );
+    }
+
     /// The retention floor is validated against the catalog's max_ingest_lag,
     /// which must equal ravel-maintain's own DEFAULT_MAX_INGEST_LAG_NS: the two
     /// crates duplicate the constant behind a sync-contract comment (no
@@ -721,8 +966,9 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
         let report = run_tick(
-            &store, &tenant, &compactor, &retention, 4, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 4, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
         // Nothing to maintain, nothing memoized: a subsequent tick would still
@@ -785,8 +1031,9 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
         run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
 
@@ -1003,11 +1250,12 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
 
         // Static shard_count is 2, matching generation 0's count; the scan
         // range must nonetheless cover shard 3 via the generation history.
         let report = run_tick(
-            &store, &tenant, &compactor, &retention, 2, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 2, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
 
@@ -1038,6 +1286,7 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
 
         // Per-bucket object reads: the memo elides the per-bucket LIST and GET
         // reads, so this is what shrinks between the cold and warm ticks. The
@@ -1049,7 +1298,7 @@ mod tests {
         // gets memoized as terminal.
         let before_first = store.metrics().snapshot();
         let first = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
         let first_reads =
@@ -1062,7 +1311,7 @@ mod tests {
         // Tick 2 (warm memo): the bucket is skipped straight from the memo.
         let before_second = store.metrics().snapshot();
         let second = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
         let second_reads =
@@ -1126,13 +1375,14 @@ mod tests {
         .expect("valid retention policy");
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
 
         // Tick 1: the bucket's one sample is from ingest hour 0 (1970), so any
         // valid retention window is already expired against the real wall
         // clock. Not memoized terminal (Tombstoned isn't a terminal state),
         // so tick 2 re-evaluates it for real rather than skipping it.
         let first = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
         assert_eq!(first.retired, 1, "the expired bucket is tombstoned");
@@ -1141,7 +1391,7 @@ mod tests {
         // horizon), so this tick attempts the physical sweep. The hold must
         // block it entirely.
         let second = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
         assert_eq!(
@@ -1214,9 +1464,10 @@ mod tests {
         .expect("valid retention policy");
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
 
         let report = run_tick(
-            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety,
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
 
@@ -1265,9 +1516,10 @@ mod tests {
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
 
         let report = run_discovery_cycle(
-            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety,
+            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
 
@@ -1298,6 +1550,7 @@ mod tests {
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
         let restrict = [acme.hash()];
 
         let report = run_discovery_cycle(
@@ -1309,6 +1562,8 @@ mod tests {
             &mut memo,
             &metrics,
             &safety,
+            &worker,
+            &worker.solo_live_set(),
         )
         .await;
 
@@ -1355,9 +1610,10 @@ mod tests {
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
 
         let report = run_discovery_cycle(
-            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety,
+            &store, None, &compactor, &retention, 1, &mut memo, &metrics, &safety, &worker, &worker.solo_live_set(),
         )
         .await;
 

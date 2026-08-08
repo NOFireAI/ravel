@@ -104,6 +104,15 @@ pub struct Cli {
     #[arg(long, default_value_t = 300)]
     pub maintain_interval_secs: u64,
 
+    /// Bounded intra-process unit concurrency for the maintenance supervisor
+    /// (`--mode maintain`): the maximum number of owned `(signal, shard)` units
+    /// maintained at once within a tenant's tick, replacing the pre-ADR-0065
+    /// strictly-sequential per-shard walk so one pathological unit cannot starve
+    /// the rest of this process's ownership (ADR-0065 decision 2's stuck-owner
+    /// mitigation). Clamped to at least 1.
+    #[arg(long, default_value_t = 4)]
+    pub maintain_unit_concurrency: usize,
+
     /// Default age-based retention window applied to every tenant with no
     /// explicit `--retention-tenant` override, as a humantime duration
     /// (e.g. `30d`, `720h`). Omitted means no default retention: nothing is

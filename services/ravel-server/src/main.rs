@@ -343,6 +343,7 @@ async fn main() -> anyhow::Result<()> {
             shard_count: cli.shards,
             compactor,
             retention,
+            unit_concurrency: cli.maintain_unit_concurrency,
         },
         alerting: AlertEvalConfig {
             enabled: !alert_rules.is_empty(),
