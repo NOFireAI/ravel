@@ -8,6 +8,7 @@
 pub mod conformance;
 pub mod fault;
 pub mod instrument;
+pub mod kms_routing;
 pub mod memory;
 pub mod s3;
 
@@ -18,6 +19,11 @@ use bytes::Bytes;
 /// wrapping a backend is a zero behavior change (results and
 /// [`Capabilities`] pass through verbatim).
 pub use instrument::{InstrumentedStore, StoreMetrics};
+
+/// Per-tenant SSE-KMS key routing decorator (ADR-0062 decision 1a): routes
+/// tenant writes to lazily-built, cached per-tenant [`s3::S3Store`]s while every
+/// read and non-tenant key delegates to the default store.
+pub use kms_routing::KmsRoutingStore;
 
 /// Content identity: used only for equality assertions between reads of the
 /// same immutable object. Never used as a CAS precondition (that is
