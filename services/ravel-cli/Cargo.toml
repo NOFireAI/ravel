@@ -21,6 +21,11 @@ blake3 = { workspace = true }
 crc32c = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
+# Typed `SubmitError` for the `erase submit` conflict path (a reused
+# request_id that redefines the erasure must fail loudly, not silently
+# report success). Already a workspace pin (ravel-commit uses it); adds no
+# new external crate.
+thiserror = { workspace = true }
 # Humantime durations for the `gc-config set` GC-window flags (ADR-0050
 # section 4, EC4), matching ravel-server's `--retention-*` duration convention.
 # Already a workspace pin (ravel-server uses it); adds no new external crate.

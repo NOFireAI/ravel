@@ -4378,6 +4378,7 @@ dependencies = [
  "ravel-types",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "uuid",
 ]
