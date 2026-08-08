@@ -220,4 +220,11 @@ message RewriteRecord {
   // nothing in this bucket is still recorded as applied).
   repeated RewriteDrop drops = 9;
   sfixed64 created_unix_ns = 10;
+  // The key of the live CompactionRecord or RewriteRecord this rewrite
+  // supersedes as a whole, when the bucket's live record set is already a
+  // compaction or rewrite output rather than raw L0 objects (e.g. a second
+  // erasure pass over a bucket already rewritten once). Exactly one of
+  // `inputs` (non-empty) or `superseded_record_key` (non-empty) is set;
+  // never both, never neither.
+  string superseded_record_key = 11;
 }
