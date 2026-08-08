@@ -24,6 +24,7 @@ use ravel_types::{
 };
 
 use crate::config::{ByteLimit, EngineConfig};
+use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
@@ -921,6 +922,20 @@ impl QueryEngine {
                 return Err(err);
             }
         }
+        // Selective-erasure exclusion (ADR-0064 decision 2, EJ-T3): drop
+        // erased series/samples from every segment's decoded results, after the
+        // fetch and after any cache tier `fetch_soa_and_histograms_accounted`
+        // consulted, before these results reach the PromQL evaluator. A no-op
+        // when the snapshot carries no pending erasure predicate.
+        let erasure = snapshot_erasure_predicates(snapshot);
+        if !erasure.is_empty() {
+            for series in &mut scalar_out {
+                crate::erasure::retain_series_soa(series, &erasure);
+            }
+            for series in &mut histogram_out {
+                crate::erasure::retain_histogram_series(series, &erasure);
+            }
+        }
         Ok((scalar_out, page_stats, histogram_out))
     }
 
@@ -967,8 +982,51 @@ impl QueryEngine {
                 return Err(err);
             }
         }
+        // Selective-erasure exclusion for the labels/label-values/series
+        // metadata path (ADR-0064 decision 2, EJ-T3): a series erased by a
+        // windowless predicate must not appear in label enumeration either. A
+        // windowed predicate erases only some samples and leaves the series
+        // enumerable (see `erasure::retain_series_entries`). No-op when empty.
+        let erasure = snapshot_erasure_predicates(snapshot);
+        if !erasure.is_empty() {
+            for entries in &mut out {
+                crate::erasure::retain_series_entries(entries, &erasure);
+            }
+        }
         Ok(out)
     }
+}
+
+/// The pending selective-erasure predicates attached to a resolved snapshot
+/// (ADR-0064 decision 2, EJ-T3, issue #753). The scan layer excludes every
+/// series/sample matching any of these after fetch and after cache.
+///
+/// EJ-T2 (#752) is the resolver task that lists `t/<th>/<sig>/del/` per resolve
+/// and attaches the decoded pending requests to [`Snapshot::pending_erasure`],
+/// already scoped to this resolve's (tenant, signal). This is the single
+/// connection point between that attachment and the filter machinery: each
+/// `ErasureRequest` becomes one [`ErasurePredicate`], mapping its repeated
+/// `predicate` matchers into `(key, value)` pairs and carrying the half-open
+/// `[window_start_ns, window_end_ns)` event-time bounds through unchanged
+/// (`0` on a bound is "unset" per `ErasurePredicate`). The request's other
+/// fields (`format_version`, `tenant_hash`, `signal`, `request_id`,
+/// `created_unix_ns`, `reason`) play no part in filtering.
+///
+/// Returns an empty vec when the snapshot carries no pending erasure, which is
+/// the common case and makes every call site below a no-op.
+fn snapshot_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate> {
+    snapshot
+        .pending_erasure
+        .iter()
+        .map(|request| {
+            let matchers = request
+                .predicate
+                .iter()
+                .map(|matcher| (matcher.key.clone(), matcher.value.clone()))
+                .collect();
+            ErasurePredicate::new(matchers, request.window_start_ns, request.window_end_ns)
+        })
+        .collect()
 }
 
 /// Builds a `series_id -> labels` map incrementally, rejecting the moment a
@@ -2574,6 +2632,119 @@ mod tests {
                 (SeriesId(id), label_set())
             })
             .collect()
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> LabelSet {
+        LabelSet::new(
+            pairs
+                .iter()
+                .map(|(n, v)| Label {
+                    name: n.to_string(),
+                    value: v.to_string(),
+                })
+                .collect(),
+        )
+        .expect("valid labels")
+    }
+
+    fn soa(lbls: LabelSet, ts: &[i64]) -> FetchedSeriesSoa {
+        FetchedSeriesSoa {
+            series_id: SeriesId([0; 16]),
+            labels: lbls,
+            timestamps: ts.to_vec(),
+            values: ts.iter().map(|_| 1.0).collect(),
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: 0,
+        }
+    }
+
+    /// A snapshot with no `pending_erasure` yields no predicates, so the scan
+    /// filter stays a no-op (the pre-EJ-T2 baseline behavior).
+    #[test]
+    fn snapshot_erasure_predicates_empty_when_no_pending() {
+        let snapshot = Snapshot::default();
+        assert!(snapshot.pending_erasure.is_empty());
+        assert!(snapshot_erasure_predicates(&snapshot).is_empty());
+    }
+
+    /// The real `snapshot_erasure_predicates` maps each `ErasureRequest` in a
+    /// populated `Snapshot::pending_erasure` into an `ErasurePredicate` whose
+    /// matchers and window bounds are carried through, and the resulting
+    /// predicate excludes a matching series from a decoded SoA result via the
+    /// same `retain_series_soa` pass the fetch call sites run. This proves the
+    /// EJ-T2 to EJ-T3 wire-up is live end to end, not merely compiling.
+    #[test]
+    fn snapshot_erasure_predicates_excludes_matching_series() {
+        use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+
+        // A windowless request: the whole matching series must drop. Other
+        // request fields (tenant_hash, signal, request_id, ...) are irrelevant
+        // to filtering and left at their defaults.
+        let request = ErasureRequest {
+            predicate: vec![
+                ErasurePredicateMatcher {
+                    key: "user_id".to_string(),
+                    value: "u1".to_string(),
+                },
+                ErasurePredicateMatcher {
+                    key: "region".to_string(),
+                    value: "eu".to_string(),
+                },
+            ],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            pending_erasure: vec![request],
+            ..Default::default()
+        };
+
+        let predicates = snapshot_erasure_predicates(&snapshot);
+        assert_eq!(predicates.len(), 1, "one predicate per pending request");
+
+        // The mapped predicate excludes the matching series and leaves a
+        // non-matching one untouched.
+        let matching = labels(&[("__name__", "m"), ("user_id", "u1"), ("region", "eu")]);
+        let other = labels(&[("__name__", "m"), ("user_id", "u2"), ("region", "eu")]);
+        let mut series = vec![
+            soa(matching, &[10, 20, 30]),
+            soa(other.clone(), &[10, 20, 30]),
+        ];
+        crate::erasure::retain_series_soa(&mut series, &predicates);
+        assert_eq!(series.len(), 1, "matching series excluded");
+        assert_eq!(series[0].labels, other, "non-matching series survives");
+    }
+
+    /// A windowed request maps its `[window_start_ns, window_end_ns)` bounds
+    /// through, so only in-window samples of a matching series drop.
+    #[test]
+    fn snapshot_erasure_predicates_maps_window_bounds() {
+        use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+
+        let request = ErasureRequest {
+            predicate: vec![ErasurePredicateMatcher {
+                key: "user_id".to_string(),
+                value: "u1".to_string(),
+            }],
+            window_start_ns: 15,
+            window_end_ns: 25,
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            pending_erasure: vec![request],
+            ..Default::default()
+        };
+
+        let predicates = snapshot_erasure_predicates(&snapshot);
+        assert_eq!(predicates.len(), 1);
+
+        let mut series = vec![soa(labels(&[("user_id", "u1")]), &[10, 20, 30])];
+        crate::erasure::retain_series_soa(&mut series, &predicates);
+        // Only the in-window sample (ts=20) is dropped; 10 and 30 survive.
+        assert_eq!(series.len(), 1, "windowed drop keeps out-of-window samples");
+        assert_eq!(series[0].timestamps, vec![10, 30]);
     }
 
     #[test]
