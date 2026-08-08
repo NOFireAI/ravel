@@ -308,6 +308,11 @@ async fn no_del_directory_returns_empty_pending_at_one_list() {
         1,
         "an empty del/ scan costs exactly one LIST and nothing more"
     );
+    assert!(
+        catalog.estimated_catalog_requests(range, now) >= accounting.snapshot().total_s3_requests(),
+        "an empty-window estimate must still be a true upper envelope of the del/ LIST resolve \
+         issues unconditionally"
+    );
 }
 
 #[tokio::test]
@@ -635,5 +640,246 @@ async fn fold_recognizes_rewrite_records_and_matches_resolve() {
         order(&before),
         order(&after),
         "fold reproduces the resolver's rewrite supersession exactly"
+    );
+}
+
+/// The scenario the original Stage 4 checkpoint proved was broken: a rewrite
+/// record publishes into a bucket that was ALREADY sealed and folded by a
+/// PAST fold (ADR-0064 §3.1 scopes the rewrite pass to sealed buckets by
+/// construction, so this is the ordinary case, not an edge case). Without a
+/// reconcile trigger on `RewriteRecord`, the incremental fold path would
+/// never re-list that bucket, the folded snapshot would keep serving the
+/// pre-erasure L0 indefinitely, and the input object stays physically
+/// present (no sweep has run yet) so there is no NotFound-driven re-resolve
+/// to force a refresh either.
+///
+/// Proves the fix two ways: (a) the second fold is genuinely incremental
+/// (`rebuilt == false`) yet still picks up the rewrite, and (b) the
+/// erased-and-rewritten hour resolves with ZERO store requests beyond the
+/// unconditional del/ LIST -- i.e. purely from the folded snapshot, with no
+/// live bucket listing to fall back on and mask a fold bug.
+#[tokio::test]
+async fn reconcile_picks_up_a_rewrite_published_into_an_already_folded_bucket() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let start = i64::from(HOUR) * NS_PER_HOUR;
+
+    // Seed and seal HOUR with a plain L0, and HOUR+1 as the tail so the
+    // first fold has more than one bucket (matching the pattern established
+    // fold reconcile tests use elsewhere in this crate).
+    let a = l0_record(Uuid::new_v4(), 0, 1, HOUR, start + 1, start, start + 100);
+    put_l0(store.as_ref(), &a).await;
+    let tail = l0_record(
+        Uuid::new_v4(),
+        0,
+        1,
+        HOUR + 1,
+        start + NS_PER_HOUR + 1,
+        start + NS_PER_HOUR,
+        start + NS_PER_HOUR + 100,
+    );
+    put_l0(store.as_ref(), &tail).await;
+
+    let now_1 = now_at_seal(HOUR + 1);
+    let first = catalog
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .await
+        .expect("first fold");
+    assert_eq!(first.watermark_hour, Some(HOUR + 1));
+
+    // Confirm HOUR's L0 is live and unrewritten before the rewrite lands.
+    let pre_rewrite = catalog
+        .resolve(
+            &tenant(),
+            Signal::Metrics,
+            TimeRange {
+                start_ns: start,
+                end_ns: start + 100,
+            },
+            &[],
+            now_1,
+        )
+        .await
+        .expect("resolve before rewrite");
+    assert_eq!(pre_rewrite.segments.len(), 1);
+
+    // The rewrite pass runs AFTER the first fold, into the now-sealed,
+    // already-folded HOUR bucket -- exactly ADR-0064 §3.1's scope.
+    let rw = build_rewrite(
+        0,
+        HOUR,
+        &[&a],
+        None,
+        vec![part(0, start, start + 100, 0x77)],
+        &[Uuid::new_v4()],
+        start + 2,
+    );
+    put_rewrite(store.as_ref(), &rw).await;
+
+    // A second, later fold: HOUR is now strictly behind the old watermark, so
+    // only the reconcile pass (not the incremental listing range) can pick up
+    // the rewrite.
+    let now_2 = now_at_seal(HOUR + 3);
+    let second = catalog
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+        .await
+        .expect("second fold");
+    assert!(
+        !second.rebuilt,
+        "must be a genuine incremental+reconcile fold, not a full rebuild that would \
+         trivially re-derive every hour and mask the reconcile-trigger bug"
+    );
+    assert!(!second.no_op);
+
+    // Resolve HOUR again, from a range the snapshot watermark now fully
+    // covers (HOUR < HOUR+3), so this MUST be served purely from the folded
+    // snapshot window path (bounded HEAD GET + part GET(s) + the
+    // unconditional del/ LIST) with no live per-bucket listing, which would
+    // scale with data rather than stay inside the fixed envelope.
+    let hour_range = TimeRange {
+        start_ns: start,
+        end_ns: start + 100,
+    };
+    let accounting = QueryAccounting::new();
+    let post_rewrite = catalog
+        .resolve_with_accounting(
+            &tenant(),
+            Signal::Metrics,
+            hour_range,
+            &[],
+            now_2,
+            &accounting,
+        )
+        .await
+        .expect("resolve after rewrite and reconcile");
+
+    assert!(
+        accounting.snapshot().total_s3_requests()
+            <= catalog.estimated_catalog_requests(hour_range, now_2),
+        "must stay inside the snapshot-window envelope (no live per-bucket LIST fallback, \
+         which would prove this test is only passing via the resolver's own live-listing \
+         supersession rather than a real fold/reconcile fix): got {}, envelope {}",
+        accounting.snapshot().total_s3_requests(),
+        catalog.estimated_catalog_requests(hour_range, now_2)
+    );
+    assert_eq!(
+        post_rewrite.segments.len(),
+        1,
+        "the rewrite's output part must be live"
+    );
+    assert_ne!(
+        post_rewrite.segments[0].content_hash.as_slice(),
+        a.content_hash.as_slice(),
+        "the erased L0's content must not still be served: it must be the rewrite's part, \
+         not the pre-erasure input"
+    );
+}
+
+/// The absent-predecessor path in `resolve_rewrite_supersession`: a rewrite
+/// names a `superseded_record_key` for a compaction record that is no longer
+/// present in the bucket's live listing (already swept). The chase must stop
+/// cleanly (never error, never hang) -- and, critically, must not silently
+/// under-exclude: this test only proves the "never hang/error" half, since a
+/// genuinely absent predecessor by construction carries no inputs this
+/// resolve could discover here. The real safety net for the case the absent
+/// predecessor's OWN inputs are somehow still live (a sweep-ordering anomaly)
+/// is stated as a requirement on EJ-T4's completion verification, not
+/// something this resolver-only task can close.
+#[tokio::test]
+async fn rewrite_naming_an_absent_predecessor_resolves_cleanly() {
+    let (range, now) = hour_range_and_now();
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+    // A rewrite naming a compaction record key that was never published (or
+    // has since been swept) in this bucket.
+    let absent_key =
+        keys::compaction_record_key(&tenant(), Signal::Metrics, 0, HOUR, "0000000000000000")
+            .expect("valid key shape");
+    let rw = build_rewrite(
+        0,
+        HOUR,
+        &[],
+        Some(&absent_key),
+        vec![part(0, range.start_ns, range.start_ns + 100, 0x11)],
+        &[Uuid::new_v4()],
+        range.start_ns + 1,
+    );
+    put_rewrite(store.as_ref(), &rw).await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect("resolve must not error on an absent predecessor");
+    assert_eq!(
+        snapshot.segments.len(),
+        1,
+        "the rewrite's own output part is still live and included"
+    );
+}
+
+/// Two live (non-superseding) rewrite records in one bucket must alarm via
+/// [`Catalog::rewrite_sibling_conflicts`], not pass silently as ordinary
+/// overlap the way two compaction records would.
+#[tokio::test]
+async fn sibling_rewrites_raise_the_conflict_counter() {
+    let (range, now) = hour_range_and_now();
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+    let a = l0_record(
+        Uuid::new_v4(),
+        0,
+        1,
+        HOUR,
+        range.start_ns,
+        range.start_ns,
+        range.start_ns + 1,
+    );
+    let b = l0_record(
+        Uuid::new_v4(),
+        0,
+        2,
+        HOUR,
+        range.start_ns,
+        range.start_ns,
+        range.start_ns + 1,
+    );
+    put_l0(store.as_ref(), &a).await;
+    put_l0(store.as_ref(), &b).await;
+
+    let rw_a = build_rewrite(
+        0,
+        HOUR,
+        &[&a],
+        None,
+        vec![part(0, range.start_ns, range.start_ns + 100, 0x21)],
+        &[Uuid::new_v4()],
+        range.start_ns + 1,
+    );
+    let rw_b = build_rewrite(
+        0,
+        HOUR,
+        &[&b],
+        None,
+        vec![part(0, range.start_ns, range.start_ns + 100, 0x22)],
+        &[Uuid::new_v4()],
+        range.start_ns + 2,
+    );
+    put_rewrite(store.as_ref(), &rw_a).await;
+    put_rewrite(store.as_ref(), &rw_b).await;
+
+    assert_eq!(catalog.rewrite_sibling_conflicts(), 0);
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect("resolve must not error, only alarm");
+    // Both rewrites' parts are still served (harmless-overlap posture), but
+    // the conflict must be visible.
+    assert_eq!(snapshot.segments.len(), 2);
+    assert_eq!(
+        catalog.rewrite_sibling_conflicts(),
+        1,
+        "two live sibling rewrites over one bucket must raise the alarm, not pass silently"
     );
 }

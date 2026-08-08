@@ -339,6 +339,50 @@ The query-audit keyspace is the one derived store that may hold subject
 values (S4-13, matcher values in audited query text); it is deny-deleted
 under ADR-0055 and owned by epic EL — see Consequences.
 
+**Correction (2026-08-08), folded into this section by EJ-T2's Stage 4
+checkpoint:** "the next fold rebuilds snapshots over the rewrite outputs"
+above is true only within `fold_reconcile_window_hours` (default 26h) of
+the fold that observes the rewrite -- ADR-0063's incremental fold does not
+re-list an already-folded hour outside that window, and a rewrite's inputs
+stay physically GET-able (no `NotFound` to force a re-resolve) until the
+horizon-gated sweep runs, so there was no other mechanism to fall back on.
+EJ-T2 closed the in-window case by adding `RewriteRecord` to the fold
+reconcile pass's trigger set (docs/catalog-and-mvcc.md "Fold reconcile
+pass"), so a rewrite into a bucket within the window is picked up by the
+very next fold, same as a late compaction record. The out-of-window case
+remains open: the rewrite pass's own scope (§3.1, "every sealed bucket ...
+all buckets when no range is given") is far wider than 26 hours, so a DSAR
+against data outside the reconcile window is not automatically re-folded,
+and the folded snapshot can keep serving the pre-erasure input until
+something else forces a re-fold of that hour.
+
+This is now a **binding requirement on EJ-T4** (the rewrite pass), not a
+follow-up nicety: T4's completion verification (§4 above, "re-verified by
+a fresh LIST per bucket") must not write `.done` for a bucket based on a
+fresh LIST alone, because a fresh LIST is blind to what the FOLDED
+snapshot currently serves -- it can correctly observe "this bucket's live
+record set is now rewrite-output-only" and still write `.done` while a
+stale folded snapshot, outside the reconcile window, keeps resolving the
+pre-rewrite input. T4 must derive its "is this bucket's contribution
+current" check the same way the resolver and the fold do (through
+`resolve_rewrite_supersession` and `classify_bucket`, not a bucket LIST in
+isolation), or must force a reconcile of every bucket in a request's scope
+(regardless of window) before writing `.done`. Either approach is
+acceptable; writing `.done` from a fresh-LIST check alone is not.
+
+Also folded into this correction: `resolve_rewrite_supersession`'s
+absent-predecessor case (a named `superseded_record_key` no longer present
+in the bucket's live listing) currently stops the chase cleanly and
+excludes only what it has already discovered up to that point. This is
+sound when the predecessor was genuinely swept (its own inputs are gone
+too), but is a silent under-exclusion if a sweep-ordering anomaly ever
+left the predecessor's inputs live while the predecessor record itself was
+removed. T4's completion verification is the intended safety net for this
+case too (a live but un-superseded-per-the-chain input fails the "live
+record set is rewrite-output-only" check), so T4 must not derive that
+check independently of the same exclusion logic the resolver uses, or this
+net has a hole matching the shape above.
+
 ### 5. Erasing the erasure request itself
 
 The `.dreq` contains the subject identifier, so it must not outlive its

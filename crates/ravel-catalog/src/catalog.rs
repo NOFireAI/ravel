@@ -59,6 +59,14 @@ const MIN_TOKEN_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// `estimated_catalog_requests` an under-estimate again. Flagged as an open
 /// gap in ADR-0044 decision 3, not resolved here.
 const SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND: u64 = 3;
+/// One LIST of `t/<tenant_hash>/<signal>/del/` (ADR-0064 decision 2), issued
+/// unconditionally by every resolve regardless of whether the query's window
+/// is empty. Folded into `Catalog::estimated_catalog_requests` unconditionally
+/// too, unlike [`SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`] which only applies
+/// when the window is non-empty: an empty-window resolve still issues this
+/// LIST, so `estimated_catalog_requests` must count it on the `None` branch
+/// as well or it stops being a true upper envelope.
+const PENDING_ERASURE_LIST_UPPER_BOUND: u64 = 1;
 
 /// Listing-based catalog over an object store backend (Phase 1, ADR-0003).
 /// A future compaction phase folds commit records into immutable snapshot
@@ -101,6 +109,17 @@ pub struct Catalog {
     /// sets plus all uncovered L0s are still included (harmless overlap);
     /// the counter surfaces the invariant breach for a human to investigate.
     compaction_input_set_conflicts: AtomicU64,
+    /// Count of buckets observed holding two or more live (non-superseded)
+    /// `RewriteRecord`s neither superseding the other (ADR-0064 decision 3
+    /// point 5). Unlike two compaction records, this is NOT a harmless
+    /// overlap: a rewrite's output deliberately lacks records its sibling's
+    /// input set still carries, so both parts sets being included resurrects
+    /// each rewrite's own erased subject through the other's un-rewritten
+    /// copy. Normal operation batches every pending request for a bucket into
+    /// one rewrite (Consequences), so two live siblings should never occur;
+    /// this counter exists to surface it immediately if it ever does, rather
+    /// than let it pass as ordinary overlap.
+    rewrite_sibling_conflicts: AtomicU64,
     /// Count of hard isolation-breach failures observed: a HEAD or postings
     /// object whose `tenant_hash` does not match the requesting tenant, or a
     /// listing helper result whose key does not begin with the requesting
@@ -161,6 +180,7 @@ impl Catalog {
             byte_cache,
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
+            rewrite_sibling_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             enforce_provisioning: false,
@@ -412,6 +432,15 @@ impl Catalog {
     /// row 11).
     pub fn compaction_input_set_conflicts(&self) -> u64 {
         self.compaction_input_set_conflicts.load(Ordering::Relaxed)
+    }
+
+    /// Number of buckets observed with two or more live (non-superseded)
+    /// rewrite records, neither superseding the other (ADR-0064 decision 3
+    /// point 5). Unlike [`Self::compaction_input_set_conflicts`], this is not
+    /// a harmless-overlap anomaly: it means each sibling's own erased subject
+    /// can still be served through the other's un-rewritten copy.
+    pub fn rewrite_sibling_conflicts(&self) -> u64 {
+        self.rewrite_sibling_conflicts.load(Ordering::Relaxed)
     }
 
     /// Count of hard isolation-breach failures observed across this
@@ -937,6 +966,18 @@ impl Catalog {
     /// - The prefix scan (ADR-0056) issues `O(objects / page_size)` LISTs,
     ///   strictly fewer than the per-bucket loop's `shard_count * hours` base
     ///   for any window it is chosen for, so this bound still holds over it.
+    /// - `resolve` also issues one unconditional `del/` LIST every call
+    ///   (ADR-0064 decision 2), regardless of window emptiness. On the
+    ///   non-empty-window branch this is not separately counted here -- it
+    ///   rides inside [`SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`]'s existing
+    ///   slack, which still exceeds real usage with it included, so the
+    ///   envelope holds without a dedicated term (though with less margin
+    ///   than before; a future addition to that path should re-check this).
+    ///   On the empty-window branch there is no other slack to absorb it, so
+    ///   it is counted explicitly via [`PENDING_ERASURE_LIST_UPPER_BOUND`] --
+    ///   without it this branch under-counted (`0` estimated against `1`
+    ///   actual), which is the one case where this used to not be a true
+    ///   upper envelope.
     ///
     /// It is reported for cost accounting (ADR-0044 decision 3, threaded
     /// through `ravel-query`/`ravel-sql`) and is no longer itself the
@@ -977,7 +1018,7 @@ impl Catalog {
                 }
                 list_requests.saturating_add(SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND)
             }
-            None => 0,
+            None => PENDING_ERASURE_LIST_UPPER_BOUND,
         }
     }
 
@@ -1220,6 +1261,31 @@ impl Catalog {
                 hour,
                 records = input_set_hashes.len(),
                 "compaction interlock breach: sealed bucket holds multiple input sets"
+            );
+        }
+
+        // Two or more live (non-superseded) rewrite records in one bucket,
+        // neither superseding the other: unlike the compaction case above,
+        // this is NOT harmless. A rewrite's output deliberately lacks records
+        // its own erasure dropped, so if a sibling rewrite's un-rewritten
+        // copy of those same records is also included, the erasure is
+        // silently defeated (ADR-0064 decision 3 point 5). Normal operation
+        // never produces this (one rewrite batches every pending request per
+        // bucket); alarm loudly rather than serve it as ordinary overlap.
+        let live_rewrite_count = rewrite_records
+            .iter()
+            .filter(|(rkey, _)| !superseded_records.contains(rkey))
+            .count();
+        if live_rewrite_count > 1 {
+            self.rewrite_sibling_conflicts
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                shard,
+                hour,
+                records = live_rewrite_count,
+                "rewrite interlock breach: sealed bucket holds multiple live, non-superseding \
+                 rewrite records -- each sibling's erasure may be defeated by the other's \
+                 un-rewritten copy"
             );
         }
 
@@ -2228,7 +2294,12 @@ pub(crate) fn resolve_rewrite_supersession(
         if !visited.insert(current_key.clone()) {
             return Err(CatalogError::RewriteSupersessionCycle { key: current_key });
         }
-        if depth > MAX_REWRITE_SUPERSESSION_DEPTH {
+        // `>=`, not `>`: at most `MAX_REWRITE_SUPERSESSION_DEPTH` records are
+        // ever processed by this loop (depth counts records already visited
+        // when this check runs, before the current one), matching the
+        // constant's own "maximum length of a chase" doc exactly rather than
+        // allowing one extra hop past it.
+        if depth >= MAX_REWRITE_SUPERSESSION_DEPTH {
             return Err(CatalogError::RewriteSupersessionChainTooDeep {
                 bucket: bucket_prefix.to_string(),
                 max: MAX_REWRITE_SUPERSESSION_DEPTH,
