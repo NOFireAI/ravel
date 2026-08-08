@@ -878,7 +878,17 @@ mod tests {
         let worker = solo_worker();
         // period == tick so the whole corpus is one slice: a full rotation in
         // one tick.
-        run_cycle(&store, None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
 
         assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
         assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
@@ -921,7 +931,17 @@ mod tests {
 
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
-        run_cycle(&store, None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
 
         assert_eq!(
             metrics.checksum_mismatch(Signal::Metrics),
@@ -943,7 +963,17 @@ mod tests {
         let worker = solo_worker();
         // period (100s) >> tick (1s): the per-tick byte budget covers only a
         // fraction of the corpus, so a rotation takes multiple ticks.
-        run_cycle(&store, None, 1, 100, 1, &metrics, &worker, &worker.solo_live_set()).await;
+        run_cycle(
+            &store,
+            None,
+            1,
+            100,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
         let after_first = metrics.cursor_position(Signal::Metrics);
         assert!(
             after_first > 0.0 && after_first < 1.0,
@@ -952,7 +982,17 @@ mod tests {
 
         // Keep ticking until the rotation completes and wraps.
         for _ in 0..10 {
-            run_cycle(&store, None, 1, 100, 1, &metrics, &worker, &worker.solo_live_set()).await;
+            run_cycle(
+                &store,
+                None,
+                1,
+                100,
+                1,
+                &metrics,
+                &worker,
+                &worker.solo_live_set(),
+            )
+            .await;
             let tenant_hash = tenant().hash();
             let key = cursor_key(&tenant_hash, Signal::Metrics, 0);
             let got = store.get(&key, GetRange::Full).await.expect("cursor");
@@ -972,7 +1012,17 @@ mod tests {
         let store = MemoryStore::new();
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
-        run_cycle(&store, None, 4, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
+        run_cycle(
+            &store,
+            None,
+            4,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
         assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
         assert_eq!(metrics.postings_disagreement(Signal::Metrics), 0);
     }
@@ -1028,7 +1078,17 @@ mod tests {
 
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
-        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
+        run_cycle(
+            store.as_ref(),
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
 
         assert_eq!(metrics.checksum_mismatch(Signal::Metrics), 0);
         assert_eq!(
@@ -1106,7 +1166,17 @@ mod tests {
 
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
-        run_cycle(store.as_ref(), None, 1, 1, 1, &metrics, &worker, &worker.solo_live_set()).await;
+        run_cycle(
+            store.as_ref(),
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
 
         assert_eq!(
             metrics.postings_disagreement(Signal::Metrics),
