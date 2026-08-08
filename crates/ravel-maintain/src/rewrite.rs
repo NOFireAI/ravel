@@ -20,16 +20,25 @@
 //!
 //! ## The N-1 reader
 //!
-//! The primitive does not contain a decoder. It calls
+//! The primitive does not contain a decoder; it calls
 //! [`SegmentCodec::load_input_catalog`] and [`SegmentCodec::build_parts`],
-//! exactly as [`crate::compact::compact_bucket`] does. When ravel-segment
-//! gains an N-1 reader (ADR-0066 decision 1, at first public release), the
-//! codec's existing read path accepts the older version transparently and this
-//! primitive migrates real old-version objects with no change here. Today the
-//! reader accepts only the current version (ADR-0027), so a rewrite is a
-//! current-to-current round trip -- which is exactly the exercise the tests
-//! drive, and exactly what the migration job will run once an N-1 version
-//! exists to read.
+//! exactly as [`crate::compact::compact_bucket`] does. For RLOG and RSPAN
+//! those genuinely decode and re-encode, so once ravel-logseg/ravel-rspan
+//! gain an N-1 reader (ADR-0066 decision 1, at first public release), the
+//! codec's read path accepts the older version and this primitive migrates
+//! real old-version objects with no change here. RSEG is different: its
+//! `build_parts` (`build.rs`) copies page bytes verbatim without decoding
+//! them (ADR-0066 Context), so an RSEG rewrite can never be a real format
+//! migration -- only a same-version round trip. [`RsegCodec`] enforces this:
+//! [`SegmentCodec::validate_rewrite_inputs`] refuses any input recorded below
+//! the current output version before this function decodes or PUTs anything.
+//! Today every real object is at the current version (ADR-0027), so this
+//! guard cannot yet fire; it exists so the day ravel-segment's reader relaxes
+//! to accept N-1, an RSEG rewrite still fails loudly on an old input instead
+//! of silently re-publishing verbatim old-format pages under a current-format
+//! trailer. A true RSEG page-grammar migration needs a real decode-and-
+//! re-encode primitive that does not exist today (ADR-0066 Decision 5); when
+//! it lands, it replaces this guard rather than removing it blind.
 //!
 //! ## Durability is unchanged
 //!
@@ -90,6 +99,7 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     start_ns: i64,
 ) -> Result<RewriteOutcome> {
     let inputs = load_inputs(store, bucket, commit_keys).await?;
+    C::validate_rewrite_inputs(&inputs)?;
     let hash = input_set_hash(&inputs);
 
     // Catalogs aligned one-to-one with `inputs` (canonical order): the merge
@@ -360,6 +370,19 @@ mod tests {
     /// flush writer, so the seeded object is byte-for-byte a real v6 L0 flush.
     /// Returns the data object's bytes.
     async fn seed(store: &dyn ObjectStoreBackend, seq: u64, series: Vec<SeriesInputV3>) -> Bytes {
+        seed_with_version(store, seq, series, VERSION_V6 as u32).await
+    }
+
+    /// Like [`seed`], but records `segment_format_version` in the commit
+    /// record as given rather than the writer's true output version. The
+    /// object bytes are always real v6 -- only the metadata a caller reads
+    /// without decoding (the guard under test) can disagree with them.
+    async fn seed_with_version(
+        store: &dyn ObjectStoreBackend,
+        seq: u64,
+        series: Vec<SeriesInputV3>,
+        segment_format_version: u32,
+    ) -> Bytes {
         let th = tenant_hash();
         let writer_id = Uuid::from_u128(u128::from(seq));
         let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
@@ -408,7 +431,7 @@ mod tests {
             max_event_ts_ns: written.summary.max_event_ts_ns,
             min_ingest_ts_ns: created,
             max_ingest_ts_ns: created,
-            segment_format_version: VERSION_V6 as u32,
+            segment_format_version,
             created_unix_ns: created,
             ingest_hour_bucket: HOUR,
         })
@@ -652,6 +675,47 @@ mod tests {
         assert!(
             read_record(&store).await.is_none(),
             "an up-to-date bucket publishes nothing"
+        );
+    }
+
+    /// RSEG's `build_parts` copies page bytes verbatim without decoding them,
+    /// so an input recorded below the codec's current output version must be
+    /// refused before any decode or PUT, not silently republished under a
+    /// current-format trailer. The guard reads only the commit record's
+    /// `segment_format_version`, so this seeds a real v6 object under a
+    /// commit record that claims an older version -- exactly the shape a
+    /// relaxed N-1 reader would hand the primitive once one exists.
+    #[tokio::test]
+    async fn rseg_rewrite_rejects_input_recorded_below_output_version() {
+        let store = MemoryStore::new();
+        seed_with_version(
+            &store,
+            1,
+            vec![series("alpha", &[(10, 1.0)])],
+            VERSION_V6 as u32 - 1,
+        )
+        .await;
+        let listing = list_bucket(&store, &bucket()).await.expect("list");
+        let clock = FixedClock::new(sealed_now_ns());
+
+        let err = rewrite_and_publish::<RsegCodec>(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &bucket(),
+            &listing.commit_keys,
+            conserve_exact(),
+            sealed_now_ns(),
+        )
+        .await
+        .expect_err("an input recorded below the output version must be rejected");
+        assert!(
+            matches!(err, MaintainError::Invariant(_)),
+            "expected the validate_rewrite_inputs guard error, got {err:?}"
+        );
+        assert!(
+            read_record(&store).await.is_none(),
+            "a rejected input set publishes nothing and PUTs nothing"
         );
     }
 
