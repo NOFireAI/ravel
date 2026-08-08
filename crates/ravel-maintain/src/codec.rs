@@ -100,6 +100,18 @@ pub trait SegmentCodec {
         catalogs: Vec<Self::Catalog>,
         input_set_hash: &[u8; 32],
     ) -> Result<Vec<BuiltPart>>;
+
+    /// Reject an input set [`crate::rewrite::rewrite_and_publish`] must not
+    /// run over, ahead of any decode or PUT. The default accepts everything:
+    /// a codec whose `build_parts` genuinely decodes and re-encodes bytes
+    /// (RLOG, RSPAN) has nothing to reject on version grounds. A codec that
+    /// only copies bytes verbatim without decoding them (RSEG, `build.rs`'s
+    /// module doc) must override this to refuse an input recorded below the
+    /// codec's current output version, since copying-verbatim from an older
+    /// format is not a format migration, it's a mislabeled object.
+    fn validate_rewrite_inputs(_inputs: &[InputRecord]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The metrics codec: a behavior-preserving wrapper over the RSEG logic in
@@ -110,6 +122,19 @@ pub struct RsegCodec;
 
 impl SegmentCodec for RsegCodec {
     type Catalog = crate::read::InputCatalog;
+
+    fn validate_rewrite_inputs(inputs: &[InputRecord]) -> Result<()> {
+        use crate::build::OUTPUT_FORMAT_VERSION;
+        for input in inputs {
+            if input.record.segment_format_version != OUTPUT_FORMAT_VERSION {
+                return Err(crate::error::MaintainError::Invariant(format!(
+                    "RSEG rewrite input {:?} is recorded as format version {}, current output version is {}: build_parts copies pages verbatim without decoding, so it cannot migrate an older RSEG object -- this input needs a real decode-and-re-encode path (ADR-0066), not this primitive",
+                    input.commit_key, input.record.segment_format_version, OUTPUT_FORMAT_VERSION
+                )));
+            }
+        }
+        Ok(())
+    }
 
     async fn load_input_catalog(
         store: &dyn ObjectStoreBackend,
