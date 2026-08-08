@@ -253,6 +253,7 @@ mod tests {
             shard_count,
             created_unix_ns: 1,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         store
             .put(
@@ -354,6 +355,7 @@ mod tests {
             shard_count: 4,
             created_unix_ns: 1,
             generations: Vec::new(),
+            format_floors: Vec::new(),
         };
         store
             .put(
