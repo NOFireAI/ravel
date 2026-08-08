@@ -2,9 +2,9 @@
 
 Hand-authored SVGs. Each file has its own legend. Colors: mid blue for
 services and actors, amber for immutable objects in the object store, green
-for checksum-verified regions, dashed gray/blue for reserved or planned
-items. All diagrams use plain SVG shapes and text, no embedded images, and
-stay under 60 KB.
+for checksum-verified regions, purple/lavender for `tracing` spans, dashed
+gray/blue/purple for reserved or planned items. All diagrams use plain SVG
+shapes and text, no embedded images, and stay under 60 KB.
 
 ## architecture.svg
 
@@ -97,3 +97,25 @@ hash).
 
 Last verified against the code: 2026-07-27 (Phase 1 complete; this is the
 live object-store key layout).
+
+## tracing-export.svg
+
+Two panels. The first nests the six query-path phase spans (`catalog_resolve`,
+`segment_open`, `catalog_decode`, `page_fetch`, `decode`, `evaluate`) inside
+the request-level span (`sql_query`, `analytics_query`, or
+`flight_sql_statement`), with each phase span's recorded fields and level
+(`info` for the request span, `debug` for every phase span), including the
+field-set the logs-signal `page_fetch`/`decode` spans carry instead of the
+metric path's. The second panel shows the subscriber: one `EnvFilter` gating
+both the always-on `fmt` layer (to the local log stream) and the
+off-by-default `OpenTelemetryLayer` (through a `BatchSpanProcessor` to an
+OTLP/gRPC collector), plus a panel on the two export-failure modes and what
+each does today.
+
+Illustrates: docs/guides/tracing.md, docs/adrs/0044-query-cost-accounting.md
+(decision 5), docs/adrs/0060-query-path-otlp-trace-export.md.
+
+Last verified against the code: 2026-08-08 (epic #702 landed the OTLP export
+crate and both binaries' wiring; follow-ups #711 and #720 landed the
+runtime-export-failure warning and the logs-decode-span field parity this
+diagram documents).

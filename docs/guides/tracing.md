@@ -8,6 +8,8 @@ text, a metric name, a label value, or an object key. This is the design of
 [ADR-0044](../adrs/0044-query-cost-accounting.md) section 5, shipped by issues
 #642 and #643.
 
+![query-path tracing: spans and OTLP export](../diagrams/tracing-export.svg)
+
 ## This guide and the observability guide
 
 This guide covers the query-path spans: which spans exist, what each records,
@@ -235,13 +237,16 @@ surfaces an error to the caller
 ([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 6); the ADR
 covers the batch-processor mechanism behind that guarantee.
 
-One limitation to know (issue #711, open): a well-formed but unreachable or
-wrong-collector endpoint currently exports nothing and prints no warning. Only a
-malformed URL, which fails the exporter build at startup, produces an "OTLP
-trace export disabled" warning; a syntactically valid URL is dialed lazily in
-the background, so a wrong host or a down collector is silent. Until #711 adds a
-reachability signal, confirm export is working by checking the collector, not
-the process log.
+Two failure modes, two different signals (issue #711). A malformed URL fails
+the exporter build at startup: a single "OTLP trace export disabled" warning,
+and the process degrades to the log-only subscriber. A well-formed but
+unreachable or wrong-collector endpoint builds fine -- the exporter dials
+lazily -- so this failure only shows up once the background export task
+actually tries to send; a decorator on the exporter logs one distinct warning
+the first time that happens, then stays quiet for the rest of the process's
+life (so a persistently-down collector does not flood the log every batch
+interval). Either way, the warning names the failure; nothing about it blocks
+a query.
 
 ## Known gaps
 
