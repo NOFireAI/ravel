@@ -1,12 +1,23 @@
 //! Crash-matrix rows 1 and 2 (docs/consistency-model.md "Crash matrix").
 //!
 //! Row 2's orphan-CREATION half (a killed commit PUT leaves a live data
-//! object) exercises real production ingest. Its orphan-GC half does NOT:
-//! no production orphan-sweep symbol exists yet (Phase 2 roadmap), so those
-//! assertions drive `common::spec_model_sweep_orphans`, an executable
-//! restatement of the GC rule from docs/consistency-model.md "Deletion and
-//! GC" and ADR-0010 SS11. A green GC-half run is evidence about the spec
-//! model, NOT about a shipped GC path. See finding a11-F04
+//! object) exercises real production ingest. Its orphan-GC half still does
+//! NOT: this crate has no dependency on `ravel-maintain` (see its
+//! `Cargo.toml`), so those assertions drive `common::spec_model_sweep_orphans`,
+//! an executable restatement of the GC rule from docs/consistency-model.md
+//! "Deletion and GC" and ADR-0010 SS11, kept deliberately: it cross-checks the
+//! GC rule against the same fault-injected store this file already builds for
+//! the orphan-creation half, without pulling the sweeper crate into a suite
+//! scoped to ingest crash safety. A green GC-half run here is evidence about
+//! the spec model, NOT about the shipped GC path.
+//!
+//! Production orphan GC now exists (`crates/ravel-maintain/src/sweep.rs`,
+//! ADR-0048 decisions 4-5: record-less L0 deletion re-verified by a batched
+//! fresh LIST, gated by the mass-orphan circuit breaker). Its own crash-matrix
+//! coverage lives in `crates/ravel-maintain/tests/sweep_crash_matrix.rs`
+//! (e.g. row 8's convergence case and `orphan_gc_respects_live_records_and_age_gate`),
+//! which exercises the real `sweep_orphans` fn against a `FaultStore`. See
+//! finding a11-F04
 //! (docs/reviews/2026-07-27-storage-engine-quality-audit/a11-tests-ci-deps.md)
 //! and issue #81.
 #![allow(clippy::expect_used)]

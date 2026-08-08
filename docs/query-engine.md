@@ -780,6 +780,26 @@ oversights.
 
 ## Caching note
 
-Phase 1 caches only decoded commit records (immutable) and parsed footers
-keyed by (object key, etag), both in-memory LRU. Anything else waits for
-measurements.
+ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,
+S3-FIFO eviction, single-flighted) consulted at three funnels:
+`SegmentFetcher::guarded_get`, `Catalog::guarded_get`, and
+`RlogFetcher::fetch`. Cache keys are `(tenant_hash, content_hash, offset,
+len)`, so entries survive object-key churn and two writers producing
+identical bytes share one entry. Each funnel credits its own hit/miss and
+byte counters to `QueryAccounting` (ADR-0044), so a query's `EXPLAIN
+ANALYZE` output distinguishes cache hits from store round trips.
+
+Alongside the byte cache, `ravel-catalog` keeps its five decoded-structure
+caches (commit records, compaction records, HEAD with a TTL, snapshot
+parts, postings), now with hit/miss/byte counters and a capacity bound on
+`HeadCache`.
+
+Deliberately not cached: a suffix GET (the footer-first read on segment
+open) always bypasses the byte cache, because a suffix has no total object
+size to key a `(offset, len)` entry on. A disk tier exists in
+`ravel-cache` but is not wired to any read funnel; passing `--cache-dir`
+fails startup rather than silently caching nothing.
+
+See docs/guides/caching.md for CLI flags, metrics, and known gaps, and
+docs/adrs/0046-read-cache-tier.md for the funnel/keying/eviction design
+and its rejected alternatives.
