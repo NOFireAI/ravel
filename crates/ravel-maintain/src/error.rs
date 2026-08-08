@@ -69,6 +69,8 @@ pub enum MaintainError {
     },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
+    #[error("audit batch flush failed: {0}")]
+    AuditFlush(String),
     #[error(
         "tenant discovery found a prefix under t/ that is not a valid 32-hex-character tenant hash: {0:?} (ADR-0048 decision 3; storage's key-shape discipline never permits a silent skip here)"
     )]
