@@ -2,6 +2,7 @@
 //! cross-segment duplicate-sample resolution, and PromQL evaluation
 //! (docs/query-engine.md "Flow", docs/catalog-and-mvcc.md).
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
@@ -541,7 +542,7 @@ impl QueryEngine {
             window,
             min_tokens,
             now_ns,
-            name_filter,
+            name_filter.as_deref(),
             1,
             attempt,
         )
@@ -674,7 +675,7 @@ impl QueryEngine {
             padded,
             min_tokens,
             now_ns,
-            name_filter,
+            name_filter.as_deref(),
             fetch_multiplier,
             attempt,
         )
@@ -1092,42 +1093,291 @@ fn selector_fetch_window(
     })
 }
 
-/// The literal metric name a single equality `__name__` matcher pins, or
-/// `None` if postings pruning must bypass entirely (docs/metric-index-plan.md
-/// P5b): no `__name__` matcher at all, or any `__name__` matcher that is not
-/// a lone `=` (a regex, a negation, or more than one `__name__` matcher on
-/// the same selector all take the conservative bypass path).
-fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<&str> {
-    let mut found: Option<&str> = None;
+/// Leading sentinel marking a `name_filter` as a literal-prefix range key
+/// rather than an exact `__name__` value (ADR-0061 decision 3, EF-4/#724).
+///
+/// This MUST equal `ravel_catalog`'s
+/// `snapshot_resolve::PREFIX_FILTER_SENTINEL`, the byte the catalog strips to
+/// decide the prefix-vs-exact postings lookup. The value is duplicated inline
+/// here (matching this codebase's language-specific-enforcement precedent for
+/// name filters, #278) rather than shared across the crate boundary; the
+/// catalog pins the value with a test and the postings-pruning oracles in this
+/// file round-trip it end to end, so a silent drift cannot pass.
+const PREFIX_FILTER_SENTINEL: char = '\u{1}';
+
+/// The literal prefix of a fully-anchored `__name__` regex of the exact shape
+/// `^literal.*$`, or `None` for every other shape (ADR-0061 decision 3).
+///
+/// PromQL/SQL regex matchers store the raw pattern text in `LabelMatcher.value`
+/// and are always evaluated fully anchored (Prometheus wraps every pattern as
+/// `^(?:value)$`). A pattern whose value is `literal.*` therefore matches
+/// exactly the names beginning with `literal`, which a sorted-name range scan
+/// resolves precisely. This detector accepts ONLY that shape and rejects
+/// everything else so a misclassification can never prune a segment a query
+/// could match:
+///
+/// - one optional explicit leading `^` and trailing `$` (redundant with the
+///   implicit anchoring) are tolerated;
+/// - the remainder MUST end with an unanchored `.*` wildcard tail;
+/// - the literal before that tail MUST be non-empty and consist solely of
+///   plain metric-name bytes (`[A-Za-z0-9_:]`).
+///
+/// Anything else -- an infix wildcard (`foo.*bar`), an alternation
+/// (`foo|bar`), a character class, `.+`/`foo*`/`.` in the prefix, a
+/// non-`.*` tail, or ANY backslash escape (`^a\.b.*$`) -- is rejected and the
+/// caller falls back to the pre-existing unpruned resolve. Escapes are
+/// deliberately rejected wholesale rather than interpreted: parsing them is
+/// where a mis-read prefix would hide, so the conservative choice is to decline
+/// (ADR-0061 rejects general regex pruning outright; this stays strictly inside
+/// the provably-cheap prefix case).
+fn literal_prefix_from_anchored_regex(pattern: &str) -> Option<String> {
+    let mut p = pattern;
+    p = p.strip_prefix('^').unwrap_or(p);
+    p = p.strip_suffix('$').unwrap_or(p);
+    let literal = p.strip_suffix(".*")?;
+    if literal.is_empty() {
+        return None;
+    }
+    if literal.bytes().all(is_literal_prefix_byte) {
+        Some(literal.to_string())
+    } else {
+        None
+    }
+}
+
+/// A byte that is unambiguously a literal in a Prometheus-anchored regex and a
+/// valid metric-name character. Conservative on purpose: any byte outside this
+/// set (including every regex metacharacter and every escape) forces a bypass.
+fn is_literal_prefix_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b':'
+}
+
+/// The postings pruning key a single `__name__` matcher yields, or `None` if
+/// it cannot be soundly used to prune. An equality matcher yields its literal
+/// value verbatim (the pre-existing exact case); a prefix-anchored regex
+/// matcher (`^foo.*$`) yields the sentinel-encoded literal prefix (ADR-0061
+/// decision 3); a negation, a non-prefix regex, or a non-prefix-shaped regex
+/// yields `None` (the conservative bypass).
+fn name_pruning_key(m: &LabelMatcher) -> Option<Cow<'_, str>> {
+    match &m.op {
+        MatchOp::Eq => Some(Cow::Borrowed(m.value.as_str())),
+        MatchOp::Re(_) => literal_prefix_from_anchored_regex(&m.value)
+            .map(|prefix| Cow::Owned(format!("{PREFIX_FILTER_SENTINEL}{prefix}"))),
+        MatchOp::Ne | MatchOp::Nre(_) => None,
+    }
+}
+
+/// The postings pruning key a single `__name__` matcher pins, or `None` if
+/// postings pruning must bypass entirely (docs/metric-index-plan.md P5b,
+/// ADR-0061 decision 3): no `__name__` matcher at all, more than one
+/// `__name__` matcher on the same selector, or a lone `__name__` matcher whose
+/// shape is neither an exact `=` nor a literal-prefix-anchored regex (`^foo.*$`)
+/// all take the conservative bypass path. The returned key is an exact value
+/// as written, or a sentinel-encoded literal prefix ([`name_pruning_key`]).
+fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<Cow<'_, str>> {
+    let mut found: Option<Cow<'_, str>> = None;
     for m in matchers {
-        if m.name == METRIC_NAME_LABEL {
-            match &m.op {
-                MatchOp::Eq if found.is_none() => found = Some(m.value.as_str()),
-                _ => return None,
-            }
+        if m.name != METRIC_NAME_LABEL {
+            continue;
         }
+        // A second `__name__` matcher of any kind: the pruning key is no longer
+        // well defined, so bypass (unchanged from the equality-only behaviour).
+        if found.is_some() {
+            return None;
+        }
+        found = Some(name_pruning_key(m)?);
     }
     found
 }
 
-/// The equality `__name__` filter shared by every selector in a
-/// multi-selector query (docs/metric-index-plan.md P5b). `prefetch` resolves
-/// one snapshot shared across all of a query's selectors (e.g. `foo + bar`),
-/// so pruning only applies when every selector agrees on one literal name;
-/// otherwise a filter narrower than some other selector's own matchers would
-/// silently drop segments that selector still needs, so this bypasses (`None`)
-/// on any disagreement or on any selector with no equality name of its own.
-fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<&'a str> {
-    let mut shared: Option<&'a str> = None;
+/// The `__name__` pruning key shared by every selector in a multi-selector
+/// query (docs/metric-index-plan.md P5b, ADR-0061 decision 3). `prefetch`
+/// resolves one snapshot shared across all of a query's selectors (e.g.
+/// `foo + bar`), so pruning only applies when every selector agrees on the
+/// same key; otherwise a filter narrower than some other selector's own
+/// matchers would silently drop segments that selector still needs, so this
+/// bypasses (`None`) on any disagreement or on any selector with no usable key
+/// of its own. Keys are compared post-encoding, so an exact `=foo` and a
+/// prefix `^foo.*$` (different encoded strings) never masquerade as a match.
+fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, str>> {
+    let mut shared: Option<Cow<'a, str>> = None;
     for plan in plans {
-        let name = equality_name_filter(&plan.matchers)?;
-        match shared {
-            None => shared = Some(name),
-            Some(s) if s == name => {}
+        let key = equality_name_filter(&plan.matchers)?;
+        match &shared {
+            None => shared = Some(key),
+            Some(s) if *s == key => {}
             Some(_) => return None,
         }
     }
     shared
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod name_filter_tests {
+    use super::*;
+
+    fn encoded(prefix: &str) -> String {
+        format!("{PREFIX_FILTER_SENTINEL}{prefix}")
+    }
+
+    fn re(pattern: &str) -> LabelMatcher {
+        LabelMatcher::regex(METRIC_NAME_LABEL, pattern).expect("compilable regex")
+    }
+
+    /// Every pattern the detector must ACCEPT as a literal-prefix-anchored
+    /// regex, with the exact literal prefix it must extract.
+    #[test]
+    fn detector_accepts_literal_prefix_shapes() {
+        let accept = [
+            ("foo.*", "foo"),
+            ("^foo.*$", "foo"),
+            ("^foo.*", "foo"),
+            ("foo.*$", "foo"),
+            ("a1_b:c.*", "a1_b:c"),
+            ("^A.*$", "A"),
+            ("http_requests_total.*", "http_requests_total"),
+        ];
+        for (pattern, prefix) in accept {
+            assert_eq!(
+                literal_prefix_from_anchored_regex(pattern).as_deref(),
+                Some(prefix),
+                "pattern {pattern:?} must yield prefix {prefix:?}"
+            );
+        }
+    }
+
+    /// Every pattern the detector must REJECT (falling back to the unpruned
+    /// path). Grouped by why each is unsafe to treat as a bare literal prefix.
+    #[test]
+    fn detector_rejects_every_non_prefix_shape() {
+        let reject = [
+            // Exact-equivalent (no wildcard tail): out of scope, bypass.
+            "foo",
+            "^foo$",
+            // Empty prefix: `.*` matches everything, nothing to prune.
+            ".*",
+            "^.*$",
+            "^$",
+            // Infix / trailing-non-`.*` wildcards.
+            ".*foo.*",
+            "foo.*bar.*",
+            "foo.*bar",
+            "fo.o.*",
+            // Non-`.*` quantifier tails.
+            "foo*",
+            "foo.+",
+            "foo?.*", // '?' lands in the literal portion
+            // Alternation and grouping.
+            "foo|bar",
+            "(foo).*",
+            "foo(.*)",
+            // Character classes.
+            "[a-z].*",
+            "foo[0-9].*",
+            // Escapes are rejected wholesale rather than interpreted: a
+            // detector that does not decode escapes must not mis-parse them
+            // (ADR-0061 decision 3). `^a\.b.*$` means literal "a.b" as a
+            // prefix, but we conservatively decline it.
+            r"a\.b.*",
+            r"^a\.b.*$",
+            r"foo\d.*",
+            // Redundant double anchor leaves a stray metacharacter.
+            "^^foo.*$",
+            // A metacharacter-only body.
+            "^.*.*$",
+        ];
+        for pattern in reject {
+            assert_eq!(
+                literal_prefix_from_anchored_regex(pattern),
+                None,
+                "pattern {pattern:?} must be rejected (unpruned bypass)"
+            );
+        }
+    }
+
+    #[test]
+    fn name_pruning_key_encodes_by_matcher_shape() {
+        // Exact equality: verbatim value, borrowed.
+        assert_eq!(
+            name_pruning_key(&LabelMatcher::equal(METRIC_NAME_LABEL, "foo")).as_deref(),
+            Some("foo")
+        );
+        // Prefix regex: sentinel-encoded literal prefix.
+        assert_eq!(
+            name_pruning_key(&re("^foo.*$")).map(|c| c.into_owned()),
+            Some(encoded("foo"))
+        );
+        // Non-prefix regex, negation, negated regex: all bypass.
+        assert!(name_pruning_key(&re("foo|bar")).is_none());
+        assert!(name_pruning_key(&re(".*foo.*")).is_none());
+        assert!(name_pruning_key(&LabelMatcher::not_equal(METRIC_NAME_LABEL, "foo")).is_none());
+        assert!(
+            name_pruning_key(&LabelMatcher::not_regex(METRIC_NAME_LABEL, "^foo.*$").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn equality_name_filter_extends_to_prefix_and_preserves_bypass() {
+        // Exact case unchanged.
+        assert_eq!(
+            equality_name_filter(&[LabelMatcher::equal(METRIC_NAME_LABEL, "foo")]).as_deref(),
+            Some("foo")
+        );
+        // Prefix regex now prunes.
+        assert_eq!(
+            equality_name_filter(&[re("^foo.*$")]).map(|c| c.into_owned()),
+            Some(encoded("foo"))
+        );
+        // A non-`__name__` matcher alongside is ignored.
+        let mixed = vec![LabelMatcher::equal("job", "api"), re("^foo.*$")];
+        assert_eq!(
+            equality_name_filter(&mixed).map(|c| c.into_owned()),
+            Some(encoded("foo"))
+        );
+        // Two `__name__` matchers: bypass, even when each alone would prune.
+        let two = vec![LabelMatcher::equal(METRIC_NAME_LABEL, "foo"), re("^foo.*$")];
+        assert!(equality_name_filter(&two).is_none());
+        // No `__name__` matcher: bypass.
+        assert!(equality_name_filter(&[LabelMatcher::equal("job", "api")]).is_none());
+        // Non-prefix `__name__` regex: bypass.
+        assert!(equality_name_filter(&[re(".*foo.*")]).is_none());
+    }
+
+    #[test]
+    fn shared_filter_agrees_only_on_identical_keys() {
+        let plan = |m: LabelMatcher| SelectorPlan {
+            matchers: vec![m],
+            range_ns: 0,
+            offset_ns: 0,
+            anchor: PlanAnchor::Window,
+        };
+
+        // Same prefix across selectors: shared prefix key.
+        let same = vec![plan(re("^foo.*$")), plan(re("^foo.*$"))];
+        assert_eq!(
+            shared_equality_name_filter(&same).map(|c| c.into_owned()),
+            Some(encoded("foo"))
+        );
+
+        // Exact `foo` vs prefix `^foo.*$`: different encoded keys, so bypass
+        // (the prefix set is a superset of the exact one; pruning to the
+        // narrower exact key would drop segments the prefix selector needs).
+        let exact_vs_prefix = vec![
+            plan(LabelMatcher::equal(METRIC_NAME_LABEL, "foo")),
+            plan(re("^foo.*$")),
+        ];
+        assert!(shared_equality_name_filter(&exact_vs_prefix).is_none());
+
+        // Two different prefixes: bypass.
+        let diff = vec![plan(re("^foo.*$")), plan(re("^bar.*$"))];
+        assert!(shared_equality_name_filter(&diff).is_none());
+
+        // One selector with no usable key: bypass the whole query.
+        let one_bypasses = vec![plan(re("^foo.*$")), plan(re("foo|bar"))];
+        assert!(shared_equality_name_filter(&one_bypasses).is_none());
+    }
 }
 
 /// Parses `query` as a bare vector selector (Phase 1 scope) and returns its
