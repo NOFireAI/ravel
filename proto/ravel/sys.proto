@@ -207,3 +207,51 @@ message AdmissionUsageSnapshot {
   // ADR-0057 section 3).
   sfixed64 snapshot_unix_ns = 6;
 }
+
+// The per-tenant key-epoch record at `t/<tenant_hash>/enc` (ADR-0062
+// decision 1b, epic EL). Tenant-scoped, not per-signal: a tenant's KMS key
+// applies across every signal, so this object sits directly under the tenant
+// prefix beside its per-signal `<sig>/prov` records, not under any one signal.
+//
+// Its purpose is auditability of encryption custody. The first time a tenant's
+// KMS key is configured or changed, one KeyEpoch is appended here under
+// CasVersion (the `prov`/`sys/gc` append-within-record pattern): an append-only
+// list where every object's write time locates it in exactly one epoch, so
+// "which key encrypts what" is answerable from the bucket alone, and
+// verify-custody gains an epoch-consistency check. This is a wholly new
+// additive object type (ADR-0062 authorizes it); no existing layout changes
+// and no version bump is required for existing readers.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message KeyEpochRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout as v1 (matching TenancyMarker/ProvisioningRecord/GcConfig).
+  // = 1.
+  uint32 format_version = 1;
+  bytes tenant_hash = 2;         // 16 bytes; the `t/<tenant_hash>/` prefix owner
+  sfixed64 created_unix_ns = 3;  // informational; when the record was first written
+  // Append-only key-epoch history (ADR-0062 decision 1b). Non-empty once the
+  // record exists: the first configured/changed key writes epoch 0. A key
+  // configuration or rotation appends exactly one KeyEpoch whose activated_ns
+  // is strictly after the last epoch's, via a CasVersion read-append-write.
+  // Decode enforces: dense 0-based epochs and strictly increasing activated_ns.
+  // A record violating either is a typed decode error (fail closed).
+  repeated KeyEpoch epochs = 4;
+}
+
+// One entry in a KeyEpochRecord's append-only key-epoch history (ADR-0062
+// decision 1b). Immutable once appended; a rotation adds a new entry, never
+// edits an existing one. Objects written while an epoch was current stay
+// encrypted under that epoch's key forever (data objects are immutable; no
+// object is ever re-keyed in place, ADR-0062 decision 1d).
+message KeyEpoch {
+  uint32 epoch = 1;          // dense, 0-based
+  // The tenant's KMS key ARN active from activated_ns onward. Empty string
+  // means the deployment default key (or bucket-default SSE), ADR-0062
+  // decision 1c.
+  string key_arn = 2;
+  // Unix ns. Objects written at or after this, and before the next epoch's
+  // activated_ns, are encrypted under this epoch's key.
+  sfixed64 activated_ns = 3;
+}

@@ -436,15 +436,61 @@ async fn check_object(store: &dyn ObjectStoreBackend, key: &str) -> anyhow::Resu
     }
 }
 
+/// Check one live object's write time against the tenant's recorded key-epoch
+/// history (ADR-0062 decision 1b). When `epochs` is `None` the tenant has no
+/// `t/<hash>/enc` record, so every object was written under the deployment
+/// default key and there is no epoch contradiction to check. When it is
+/// `Some`, the object's write time must locate it in exactly one epoch
+/// ([`ravel_catalog::epoch_for_write`] cannot return a gap by construction: it
+/// finds the latest epoch whose `activated_ns <= write_ns`, so any write past
+/// epoch 0's activation always locates); a write time that predates the
+/// tenant's first recorded epoch is a distinct custody anomaly, counted and
+/// reported like a content-hash mismatch.
+///
+/// REQUIRES that whatever writes the first key-epoch record for a tenant
+/// (server startup wiring, EL-7) bootstraps epoch 0 as `key_arn: ""`
+/// (deployment default) with an `activated_ns` at or before the tenant's
+/// earliest live object, not just at "whenever the operator first configures
+/// a per-tenant key." Otherwise every object written before that
+/// configuration moment -- the ordinary case for a tenant that ingested under
+/// the default for months before opting into a per-tenant key -- reads as a
+/// false-positive anomaly here, since it predates the (wrongly late) epoch 0.
+fn check_object_epoch(
+    epochs: Option<&[ravel_catalog::KeyEpoch]>,
+    write_ns: i64,
+    level: &str,
+    object_key: &str,
+    located: &mut usize,
+    inconsistencies: &mut usize,
+    anomalies: &mut usize,
+) {
+    let Some(epochs) = epochs else {
+        return;
+    };
+    match ravel_catalog::epoch_for_write(epochs, write_ns) {
+        Some(_) => *located += 1,
+        None => {
+            *inconsistencies += 1;
+            *anomalies += 1;
+            let first = epochs.first().map(|e| e.activated_ns).unwrap_or(0);
+            println!(
+                "  EPOCH INCONSISTENCY ({level}) {object_key}: write time {write_ns} ns predates \
+                 the tenant's first recorded key epoch (activated_ns {first})  <-- ANOMALY"
+            );
+        }
+    }
+}
+
 /// `maintain verify-custody`: independently re-verify the content-addressed
 /// chain for a tenant, at rest and after the fact (ADR-0042 decision 5). It
 /// extends `audit_versions`'s tenant/shard-scoped per-object walk (same
 /// liveness definition: an L0 object is live iff a surviving commit record
 /// references it, an L1 object iff a surviving compaction record references
-/// it) with two content-hash checks. This command only reads; there is no
-/// `--dry-run` because it never writes or deletes.
+/// it) with two content-hash checks, plus a key-epoch consistency check
+/// (ADR-0062 decision 1b). This command only reads; there is no `--dry-run`
+/// because it never writes or deletes.
 ///
-/// It distinguishes exactly three outcomes:
+/// It distinguishes these outcomes:
 ///
 /// - **content-hash mismatch** (ANOMALY): an object that exists but whose
 ///   bytes no longer hash to the `hash16` its key embeds. Post-write
@@ -452,6 +498,15 @@ async fn check_object(store: &dyn ObjectStoreBackend, key: &str) -> anyhow::Resu
 /// - **missing-and-unexpected** (ANOMALY): a live data object (referenced by a
 ///   surviving commit or compaction record) that is absent from the store.
 ///   A surviving record must have its object.
+/// - **key-epoch inconsistency** (ANOMALY): when the tenant has a
+///   `t/<hash>/enc` key-epoch record, a live object whose write time predates
+///   the tenant's first recorded epoch. Every object's write time must locate
+///   it in exactly one epoch, so "which key encrypts what" stays answerable
+///   from the bucket alone. A tenant with no epoch record used the deployment
+///   default key, so there is no contradiction to check. Requires the epoch-0
+///   bootstrap discipline documented on [`check_object_epoch`] -- otherwise
+///   this reports a false positive for every pre-existing object once a
+///   tenant's first per-tenant key is configured.
 /// - **missing-but-expected** (NOT an anomaly): a compaction record's recorded
 ///   input identity that no longer resolves to a present object. The sweeper
 ///   legitimately reclaims superseded inputs once past their protection
@@ -466,12 +521,38 @@ pub async fn verify_custody(
     let tenant_hash = TenantId::new(tenant).hash();
     let mut anomalies = 0usize;
 
+    // The tenant's key-epoch history (ADR-0062 decision 1b), read once and
+    // fresh. `None` means no per-tenant key was ever configured: every object
+    // is under the deployment default, so the epoch check is skipped. A corrupt
+    // or misfiled record fails closed here rather than being read as "no key".
+    let key_epochs = ravel_catalog::read_epochs_from_store(store.as_ref(), &tenant_hash)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "key-epoch record read failed for tenant {tenant}: {err}; refusing to verify \
+                 custody without a trustworthy epoch history (ADR-0062 decision 1b)"
+            )
+        })?;
+    match &key_epochs {
+        Some(epochs) => println!(
+            "key-epoch history: {} epoch(s) recorded; checking every live object's write time \
+             against it",
+            epochs.len()
+        ),
+        None => println!(
+            "key-epoch history: none recorded; every object is under the deployment default key \
+             (no epoch check)"
+        ),
+    }
+
     // Aggregate counters for the closing summary.
     let mut data_objects_verified = 0usize; // live L0/L1 object, hash matches key
     let mut content_mismatches = 0usize; // exists, wrong hash: ANOMALY
     let mut missing_live_objects = 0usize; // surviving record, object gone: ANOMALY
     let mut inputs_verified = 0usize; // compaction input resolved and hash matches
     let mut inputs_swept = 0usize; // compaction input no longer present: expected
+    let mut epoch_objects_located = 0usize; // live object located in a recorded epoch
+    let mut epoch_inconsistencies = 0usize; // live object outside every recorded epoch: ANOMALY
 
     for signal in [Signal::Metrics, Signal::Logs] {
         println!("== signal {:?} ==", signal);
@@ -547,6 +628,25 @@ pub async fn verify_custody(
                                 );
                             }
                         }
+                        // Key-epoch consistency: the commit record's
+                        // created_unix_ns is used as this object's write time.
+                        // It is an approximation, not the exact PUT time --
+                        // durability order writes the data object first and
+                        // the commit record after, so created_unix_ns is
+                        // always >= the object's real write time. This can
+                        // only make the check MORE permissive at an epoch
+                        // boundary (an object written just before an epoch
+                        // activation but committed just after is attributed
+                        // to the later epoch), never produce a false anomaly.
+                        check_object_epoch(
+                            key_epochs.as_deref(),
+                            record.created_unix_ns,
+                            "l0",
+                            &data_key,
+                            &mut epoch_objects_located,
+                            &mut epoch_inconsistencies,
+                            &mut anomalies,
+                        );
                     }
                     Ok(keys::BucketEntry::CompactionRecord(_)) => {
                         let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
@@ -584,6 +684,21 @@ pub async fn verify_custody(
                                     );
                                 }
                             }
+                            // Key-epoch consistency: an L1 part's write time
+                            // is approximated by its compaction record's
+                            // created_unix_ns (>= the part's real write time,
+                            // same durability-order caveat as the L0 case
+                            // above), shared by every part the record
+                            // produced.
+                            check_object_epoch(
+                                key_epochs.as_deref(),
+                                record.created_unix_ns,
+                                "l1",
+                                &part_key,
+                                &mut epoch_objects_located,
+                                &mut epoch_inconsistencies,
+                                &mut anomalies,
+                            );
                         }
 
                         // Recorded inputs: resolve each identity to the L0 key
@@ -640,14 +755,20 @@ pub async fn verify_custody(
     );
     println!("  content-hash mismatches (ANOMALY): {content_mismatches}");
     println!("  live objects missing from store (ANOMALY): {missing_live_objects}");
+    if key_epochs.is_some() {
+        println!("  live objects located in a recorded key epoch: {epoch_objects_located}");
+        println!("  key-epoch inconsistencies (ANOMALY): {epoch_inconsistencies}");
+    }
     println!("  total anomalies: {anomalies}");
 
     if anomalies > 0 {
         anyhow::bail!(
             "verify-custody found {anomalies} custody anomaly(ies): {content_mismatches} \
-             content-hash mismatch(es) and {missing_live_objects} live object(s) missing from \
-             the store (a mismatch is post-write corruption; a missing live object is a surviving \
-             record whose data vanished)"
+             content-hash mismatch(es), {missing_live_objects} live object(s) missing from the \
+             store, and {epoch_inconsistencies} key-epoch inconsistency(ies) (a mismatch is \
+             post-write corruption; a missing live object is a surviving record whose data \
+             vanished; an epoch inconsistency is a live object whose write time falls outside \
+             every recorded key epoch)"
         );
     }
     println!("verify-custody: content-addressed chain intact for every live object");
@@ -803,5 +924,74 @@ mod tests {
             err.to_string().contains("unsupported version"),
             "expected an unsupported-version anomaly, got: {err}"
         );
+    }
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    const ARN: &str = "arn:aws:kms:us-east-1:111122223333:key/aaaaaaaa";
+
+    /// verify-custody's key-epoch check passes clean when every live object's
+    /// write time falls inside a recorded epoch. The object is written at hour
+    /// 100 (publish_commit_at's fixed created_unix_ns) and the tenant's epoch 0
+    /// activated at hour 50, so the write time locates in exactly one epoch.
+    #[tokio::test]
+    async fn verify_custody_epoch_check_passes_when_object_inside_epoch() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-custody-epoch-ok";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        publish_commit_at(&store, &tenant_hash, 0, 6).await;
+        ravel_catalog::record_key_epoch(store.as_ref(), &tenant_hash, ARN, 50 * NS_PER_HOUR, 0)
+            .await
+            .expect("record epoch 0 activated before the object's write time");
+
+        verify_custody(store.clone(), tenant, 1)
+            .await
+            .expect("every object's write time is inside a recorded epoch");
+    }
+
+    /// verify-custody flags an object written before the tenant's first
+    /// recorded epoch as a distinct key-epoch anomaly, counted separately from
+    /// content-hash mismatches (of which there are none: the object's content
+    /// still matches its key). Object at hour 100, epoch 0 activated at hour
+    /// 200: the write time predates every recorded epoch.
+    #[tokio::test]
+    async fn verify_custody_epoch_check_flags_object_before_first_epoch() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-custody-epoch-anomaly";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        publish_commit_at(&store, &tenant_hash, 0, 6).await;
+        ravel_catalog::record_key_epoch(store.as_ref(), &tenant_hash, ARN, 200 * NS_PER_HOUR, 0)
+            .await
+            .expect("record epoch 0 activated after the object's write time");
+
+        let err = verify_custody(store.clone(), tenant, 1)
+            .await
+            .expect_err("an object predating the first epoch must be a custody anomaly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1 key-epoch inconsistency"),
+            "the epoch anomaly must be counted: {msg}"
+        );
+        assert!(
+            msg.contains("0 content-hash mismatch"),
+            "the epoch anomaly must be counted separately from content mismatches: {msg}"
+        );
+    }
+
+    /// With no `t/<hash>/enc` record, verify-custody runs its content checks and
+    /// skips the epoch check entirely (the tenant used the deployment default
+    /// key), so a clean object passes.
+    #[tokio::test]
+    async fn verify_custody_no_epoch_record_skips_epoch_check() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-custody-no-epoch";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        publish_commit_at(&store, &tenant_hash, 0, 6).await;
+
+        verify_custody(store.clone(), tenant, 1)
+            .await
+            .expect("no epoch record means no epoch check; the object passes clean");
     }
 }

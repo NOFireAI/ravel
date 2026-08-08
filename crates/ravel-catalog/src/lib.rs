@@ -10,6 +10,7 @@ mod config;
 mod covering_postings;
 mod error;
 mod fold;
+mod key_epoch;
 mod provisioning;
 mod seal_divergence;
 mod snapshot;
@@ -28,6 +29,10 @@ pub use config::{
 pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
 pub use error::CatalogError;
 pub use fold::{FoldReport, PostingsBuildError, Transaction, fetch_segment_names};
+pub use key_epoch::{
+    EpochDefect, KEY_EPOCH_FORMAT_VERSION, KeyEpoch, KeyEpochError, KeyEpochOutcome, enc_key,
+    epoch_for_write, read_epochs, read_epochs_checked, read_epochs_from_store, record_key_epoch,
+};
 pub use provisioning::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, GenerationDefect, MAX_SHARD_COUNT,
     PROVISIONING_FORMAT_VERSION, ProvisioningCheck, ProvisioningError, ReshardOutcome,
