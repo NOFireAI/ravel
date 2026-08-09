@@ -157,6 +157,12 @@ pub struct ServerConfig {
     /// folded and maintained. A non-empty list narrows the storage-discovered
     /// set to exactly the named tenants, and a discovered tenant it excludes
     /// is counted, not silently dropped. Independent of `tenant_resolver`.
+    ///
+    /// This is the token-derived *fallback* allow-list: since ADR-0066 decision
+    /// 6 it governs only tenants with no durable config record. A tenant that
+    /// carries a config record is maintained unconditionally regardless of this
+    /// list (removing its token never disables its retention), and no CLI flag
+    /// can exclude a config-recorded tenant.
     pub fold_tenants: Vec<TenantHash>,
     pub fold: FoldTaskConfig,
     /// Background maintenance (compaction, retention, sweep) config. Its

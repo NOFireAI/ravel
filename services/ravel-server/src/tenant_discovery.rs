@@ -80,48 +80,58 @@ pub async fn discover_and_restrict(
 /// is re-derived each cycle from the durable per-tenant config records, not
 /// frozen at startup from the `--tenant-token`/`--maintain-tenant` union.
 ///
-/// A storage-discovered tenant is maintained when EITHER:
+/// Once a tenant carries a durable `t/<hash>/config` record, that record is the
+/// sole authority on whether it is maintained: it is maintained
+/// UNCONDITIONALLY, and no CLI flag can exclude it. All three lifecycle states
+/// keep maintenance running -- `active` fully, `suspended` refuses only
+/// ingest/query, `offboarding` keeps retention running until the data is gone
+/// ([`ravel_catalog::TenantLifecycleState`]) -- so a present record always
+/// keeps the tenant maintained, regardless of state.
 ///
-/// - it carries a durable `t/<hash>/config` record. All three lifecycle states
-///   keep maintenance running -- `active` fully, `suspended` refuses only
-///   ingest/query, `offboarding` keeps retention running until the data is gone
-///   ([`ravel_catalog::TenantLifecycleState`]) -- so a present record always
-///   means "maintained", regardless of state; OR
-/// - it has no config record but the static flag restriction permits it
-///   (`static_restrict` is `None`, or names it). This preserves the pre-EM
-///   behaviour for data that predates per-tenant config records (legacy or
-///   OIDC-only tenants), so this change never *stops* maintaining a tenant that
-///   was maintained before.
+/// `fallback_allow` is the merged `--tenant-token`/`--maintain-tenant` set
+/// (empty means `None`). It is a fallback source that governs ONLY tenants with
+/// no config record yet: such a tenant is maintained when `fallback_allow` is
+/// `None` or names it, and excluded (and counted) otherwise. This preserves the
+/// pre-EM behaviour for data that predates per-tenant config records (legacy or
+/// OIDC-only tenants). It is explicitly NOT a filter that can override a config
+/// record: any flag-derived set that could exclude a config-recorded tenant
+/// would reintroduce the removed-token-disables-retention hazard this whole
+/// design closes, because such a set necessarily shrinks whenever an operator's
+/// static token/`--maintain-tenant` list changes.
 ///
 /// This closes the removed-token-disables-retention hazard named in ADR-0066's
 /// Context: a token lives in `sys/auth`, the lifecycle lives in
-/// `t/<hash>/config`, and removing a token never touches the config record, so a
+/// `t/<hash>/config`, and removing a token (or dropping a `--tenant-token` /
+/// `--maintain-tenant` entry on restart) never touches the config record, so a
 /// deprovisioned-by-token tenant keeps its `active` record and stays maintained
 /// (retention enforcement continues) until its data is actually gone. A tenant
-/// only drops out by having its data (and therefore its `t/` prefix) removed --
-/// fully-completed offboarding, EJ's (#460) mechanism, not EM's.
+/// otherwise only drops out by having its data (and therefore its `t/` prefix)
+/// removed -- fully-completed offboarding, EJ's (#460) mechanism, not EM's.
 ///
-/// A per-tenant config read error is NOT allowed to drop a tenant: that would
-/// reintroduce the very hazard (a transient fault silently disabling
-/// retention). Such a tenant is kept maintained and the error logged, the
-/// fail-safe direction, matching how a whole-cycle discovery failure is never
-/// papered over as "no tenants".
+/// A per-tenant config read error is NOT allowed to drop a tenant on its own:
+/// that would reintroduce the very hazard (a transient fault silently disabling
+/// retention). Such a tenant stays maintained this cycle and the error is
+/// logged, the fail-safe direction, matching how a whole-cycle discovery
+/// failure is never papered over as "no tenants".
 pub async fn discover_and_restrict_by_lifecycle(
     store: &dyn ObjectStoreBackend,
-    static_restrict: Option<&[TenantHash]>,
+    fallback_allow: Option<&[TenantHash]>,
 ) -> Result<DiscoveryOutcome, MaintainError> {
     let discovered = ravel_maintain::discover_tenants(store).await?;
-    let allow: Option<HashSet<TenantHash>> = static_restrict.map(|a| a.iter().copied().collect());
+    let fallback: Option<HashSet<TenantHash>> = fallback_allow.map(|a| a.iter().copied().collect());
     let mut maintained = Vec::with_capacity(discovered.len());
     let mut excluded = 0usize;
     for tenant in &discovered {
         let keep = match read_config_values(store, tenant).await {
-            // A durable config record (any lifecycle state) means maintained.
+            // A durable config record (any lifecycle state) is the sole
+            // authority: the tenant is maintained unconditionally, no flag can
+            // exclude it.
             Ok(Some(_config)) => true,
-            // No record: honour the static flag restriction (backward compat).
-            Ok(None) => allow.as_ref().is_none_or(|a| a.contains(tenant)),
+            // No record yet: honour the token-derived fallback (backward compat
+            // for data that predates per-tenant config records).
+            Ok(None) => fallback.as_ref().is_none_or(|a| a.contains(tenant)),
             // A transient config read fault must never drop a tenant from
-            // maintenance: keep it (retention keeps running) and log.
+            // maintenance on its own: keep it (retention keeps running) and log.
             Err(err) => {
                 tracing::warn!(
                     tenant_hash = %tenant.to_hex(),
@@ -325,7 +335,9 @@ mod tests {
 
         // NEW behaviour (the fix): the lifecycle restriction keeps acme, because
         // its durable config record is untouched by the token removal, so
-        // maintenance (and therefore retention) continues.
+        // maintenance (and therefore retention) continues. The token-derived set
+        // is the `fallback_allow` (which shrank to empty), and there is no
+        // explicit `--maintain-tenant` narrowing.
         let new = discover_and_restrict_by_lifecycle(&store, Some(&after_removal))
             .await
             .expect("ok");
@@ -335,6 +347,101 @@ mod tests {
             "the lifecycle restriction keeps a config-recorded tenant after its token is removed"
         );
         assert_eq!(new.excluded, 0);
+    }
+
+    /// The acute regression this fix closes (ADR-0066 decision 6): a NO-CONFIG
+    /// tenant named only via `--tenant-token` must stay maintained when a
+    /// DIFFERENT tenant is separately named via `--maintain-tenant`. The two
+    /// flags are merged into one `fallback_allow` set, so both `acme` and
+    /// `globex` appear in it; with no config record for either, both are
+    /// maintained. The pre-fix `explicit_restrict` mechanism (a `--maintain-
+    /// tenant`-only final filter) silently dropped `acme` here, even though it
+    /// is named by `--tenant-token`, which its flag's own contract forbids.
+    #[tokio::test]
+    async fn no_config_tenant_named_by_tenant_token_stays_maintained_with_a_separate_maintain_tenant()
+     {
+        let store = MemoryStore::new();
+        let acme = TenantId::new("acme").hash();
+        let globex = TenantId::new("globex").hash();
+        // Neither tenant carries a config record. This reproduces the reviewer's
+        // repro: `--tenant-token acme=... --maintain-tenant globex`, merged into
+        // one fallback allow-list of [acme, globex].
+        for tenant in [acme, globex] {
+            store
+                .put(
+                    &format!("t/{}/catalog/m/HEAD", tenant.to_hex()),
+                    bytes::Bytes::from_static(b"x"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+        }
+
+        let outcome = discover_and_restrict_by_lifecycle(&store, Some(&[acme, globex]))
+            .await
+            .expect("ok");
+        let mut maintained = outcome.maintained.clone();
+        maintained.sort_by_key(|t| t.to_hex());
+        let mut expected = vec![acme, globex];
+        expected.sort_by_key(|t| t.to_hex());
+        assert_eq!(
+            maintained, expected,
+            "a no-config tenant named by --tenant-token stays maintained even when a \
+             different tenant is named by --maintain-tenant"
+        );
+        assert_eq!(outcome.excluded, 0);
+    }
+
+    /// The property this whole redesign rests on: a tenant WITH a durable config
+    /// record stays maintained even when `fallback_allow` is a non-empty set
+    /// that does NOT name it. A config record is the sole authority; no CLI flag
+    /// can exclude it. This is the direct replacement for the deleted
+    /// `explicit_maintain_tenant_restriction_excludes_a_config_recorded_tenant`,
+    /// asserting the opposite outcome now mandated by ADR-0066 decision 6.
+    #[tokio::test]
+    async fn config_recorded_tenant_stays_maintained_even_when_fallback_excludes_it() {
+        use ravel_catalog::{TenantConfig, TenantLifecycleState, set_tenant_config};
+
+        let store = MemoryStore::new();
+        let acme = TenantId::new("acme").hash();
+        let globex = TenantId::new("globex").hash();
+        // Both tenants hold data AND carry a durable config record.
+        for tenant in [acme, globex] {
+            store
+                .put(
+                    &format!("t/{}/catalog/m/HEAD", tenant.to_hex()),
+                    bytes::Bytes::from_static(b"x"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+            set_tenant_config(
+                &store,
+                &tenant,
+                &TenantConfig::new(TenantLifecycleState::Active),
+                1_000,
+            )
+            .await
+            .expect("write config");
+        }
+
+        // A non-empty fallback naming only globex: acme is NOT named by it. Its
+        // config record must keep it maintained anyway.
+        let outcome = discover_and_restrict_by_lifecycle(&store, Some(&[globex]))
+            .await
+            .expect("ok");
+        let mut maintained = outcome.maintained.clone();
+        maintained.sort_by_key(|t| t.to_hex());
+        let mut expected = vec![acme, globex];
+        expected.sort_by_key(|t| t.to_hex());
+        assert_eq!(
+            maintained, expected,
+            "a config-recorded tenant stays maintained even when the fallback set does not name it"
+        );
+        assert_eq!(
+            outcome.excluded, 0,
+            "no config-recorded tenant is excluded by the fallback set"
+        );
     }
 
     /// A discovered tenant with NO config record still honours the static flag

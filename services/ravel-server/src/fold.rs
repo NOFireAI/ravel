@@ -9,10 +9,12 @@
 //!
 //! One loop per [`FOLD_SIGNALS`] entry, not one per tenant: each tick
 //! re-enumerates tenants from storage
-//! ([`crate::tenant_discovery::discover_and_restrict`]) and folds every
-//! tenant the cycle discovers (narrowed to the configured
-//! `--tenant-token`/`--maintain-tenant` restriction, when one is set). A
-//! tenant onboarded mid-run is folded starting the next tick with no restart.
+//! ([`crate::tenant_discovery::discover_and_restrict_by_lifecycle`]) and folds
+//! every tenant the cycle discovers, narrowed by each tenant's durable
+//! lifecycle state and the flag fallback (ADR-0066 decision 6: a config record
+//! keeps a tenant in the set unconditionally regardless of its token, and no
+//! flag can exclude a config-recorded tenant). A tenant onboarded mid-run is
+//! folded starting the next tick with no restart.
 //! A discovery failure skips that signal's whole cycle -- no tenant is folded
 //! -- and is retried next tick; it never falls back to an empty set, since
 //! fold is best-effort and a quiet failure here would look identical to
@@ -110,15 +112,16 @@ const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans]
 /// mean a signal-aware short-circuit inside `ravel-catalog`, deliberately out
 /// of scope here.
 ///
-/// `restrict` is the merged `--tenant-token`/`--maintain-tenant` set: empty
-/// means unconfigured (every storage-discovered tenant is folded), non-empty
-/// narrows the discovered set to exactly those tenants (ADR-0048 decision 3).
-/// Returns immediately; tasks run in the background until
+/// `fallback_allow` is the merged `--tenant-token`/`--maintain-tenant` set:
+/// empty means unconfigured, and it otherwise governs only tenants with no
+/// durable config record (ADR-0048 decision 3, ADR-0066 decision 6). A tenant
+/// carrying a config record is maintained unconditionally, so no flag can
+/// exclude it. Returns immediately; tasks run in the background until
 /// [`FoldTasks::shutdown`].
 pub fn spawn(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
-    restrict: &[TenantHash],
+    fallback_allow: &[TenantHash],
     config: FoldTaskConfig,
 ) -> FoldTasks {
     if !config.enabled {
@@ -128,10 +131,10 @@ pub fn spawn(
     // One folder_id per process start (proto/ravel/catalog.proto,
     // `SnapshotHead.folder_id`), shared by every signal loop in this process.
     let folder_id = Uuid::new_v4();
-    let restrict = if restrict.is_empty() {
+    let fallback_allow = if fallback_allow.is_empty() {
         None
     } else {
-        Some(restrict.to_vec())
+        Some(fallback_allow.to_vec())
     };
     let mut shutdown = Vec::new();
     let mut handles = Vec::new();
@@ -139,10 +142,19 @@ pub fn spawn(
         let (tx, rx) = oneshot::channel();
         let catalog = catalog.clone();
         let store = store.clone();
-        let restrict = restrict.clone();
+        let fallback_allow = fallback_allow.clone();
         let interval = config.fold_interval;
         let handle = tokio::spawn(async move {
-            run_loop(catalog, store, signal, restrict, folder_id, interval, rx).await;
+            run_loop(
+                catalog,
+                store,
+                signal,
+                fallback_allow,
+                folder_id,
+                interval,
+                rx,
+            )
+            .await;
         });
         shutdown.push(tx);
         handles.push(handle);
@@ -155,7 +167,7 @@ async fn run_loop(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     signal: Signal,
-    restrict: Option<Vec<TenantHash>>,
+    fallback_allow: Option<Vec<TenantHash>>,
     folder_id: Uuid,
     interval: Duration,
     mut shutdown: oneshot::Receiver<()>,
@@ -166,8 +178,11 @@ async fn run_loop(
             _ = &mut shutdown => return,
         }
 
-        let outcome = match discover_and_restrict_by_lifecycle(store.as_ref(), restrict.as_deref())
-            .await
+        let outcome = match discover_and_restrict_by_lifecycle(
+            store.as_ref(),
+            fallback_allow.as_deref(),
+        )
+        .await
         {
             Ok(outcome) => outcome,
             Err(err) => {
