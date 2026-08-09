@@ -24,7 +24,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use prost::Message;
 use ravel_ingest::{IngestPoint, WriteMode};
 use ravel_otap::normalize::normalize_decoded;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
@@ -36,6 +35,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::ingest::{IngestRequestError, IngestState};
 use crate::otlp_grpc::metadata_to_headers;
 use crate::otlp_http::{GatewayState, now_ns, write_mode_from_headers};
+use crate::wire_byte_count::{WireByteCounter, wire_byte_counter};
 
 pub struct GrpcArrowMetricsService {
     state: Arc<GatewayState>,
@@ -59,6 +59,13 @@ struct StreamCtx {
     tenant: TenantId,
     mode: WriteMode,
     finished: bool,
+    /// Queue of completed gRPC message-frame byte lengths `WireByteCountLayer`
+    /// has parsed off this stream's request body, in wire order (issue #803).
+    /// `process_batch` pops exactly one entry per batch it decodes: each
+    /// `.message()` call that yields a batch corresponds to exactly one
+    /// completed frame the layer already queued, since the layer parses the
+    /// same bytes the decoder consumes.
+    wire_bytes: WireByteCounter,
 }
 
 type BatchStatusStream = Pin<Box<dyn Stream<Item = Result<BatchStatus, Status>> + Send>>;
@@ -82,6 +89,7 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
             .resolve(&headers)
             .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
         let mode = write_mode_from_headers(&headers);
+        let wire_bytes = wire_byte_counter(&request)?;
 
         let ctx = StreamCtx {
             inbound: request.into_inner(),
@@ -90,6 +98,7 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
             tenant,
             mode,
             finished: false,
+            wire_bytes,
         };
 
         let stream = futures::stream::unfold(ctx, |mut ctx| async move {
@@ -121,16 +130,39 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
 /// `BatchStatus` to reply and whether the stream must be torn down after it.
 async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchStatus, bool) {
     // Captured before `decode` consumes the batch, so a decode error can still
-    // name the batch it rejects, and so the byte-rate check below sees the
-    // wire size before anything is decoded out of it.
+    // name the batch it rejects.
     let batch_id = batch.batch_id;
-    let batch_bytes = batch.encoded_len() as u64;
 
-    // Layer 2 (ADR-0051 section 1, layer 2): byte rate on the wire batch,
-    // charged before decode so over-rate bytes cost one buffered body and
-    // nothing else. The ADR pins this check ahead of decode for exactly that
-    // cost reason, so it cannot move to run on the decoded batch size.
-    //
+    // Layer 2 (ADR-0051 section 1, layer 2; issue #803): byte rate on this
+    // batch's wire bytes, charged before decode so over-rate bytes cost one
+    // buffered body and nothing else. `WireByteCountLayer` parses this
+    // stream's request body into discrete gRPC message frames as
+    // `ctx.inbound` reads them and queues each frame's length in wire order;
+    // the `.message().await` call that produced this batch corresponds to
+    // exactly one queued frame, so popping one entry here charges this
+    // batch's own bytes, not an arbitrary running total sampled at whatever
+    // moment the transport happened to hand bytes to the body (a stream can
+    // have several batches' bytes arrive in one underlying read, well ahead
+    // of the decoder yielding them one message at a time). This keeps the
+    // same pre-decode ordering the ADR pins, without walking the decoded
+    // batch with `Message::encoded_len`.
+    let batch_bytes = match ctx.wire_bytes.pop_message_bytes() {
+        Some(bytes) => bytes,
+        // `ctx.inbound.message()` just returned a decoded batch, so the same
+        // bytes must already be a completed frame in the queue; a miss here
+        // means the layer and the decoder disagree about framing.
+        None => {
+            return (
+                nack(
+                    batch_id,
+                    StatusCode::Internal,
+                    "ingest admission: wire-byte count unavailable for this batch".to_string(),
+                ),
+                true,
+            );
+        }
+    };
+
     // A pre-decode rejection means this batch's Schema/DictionaryBatch IPC
     // messages never reach the stateful per-`DecoderKey` `StreamDecoder`
     // (crates/ravel-otap/src/stream.rs): the decoder caches schema and

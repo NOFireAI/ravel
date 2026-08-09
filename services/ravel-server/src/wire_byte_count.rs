@@ -5,90 +5,94 @@
 //! an `O(message)` walk of the decoded protobuf tree, on every request, after
 //! tonic had already decoded it. [`WireByteCountLayer`] replaces that with a
 //! tower layer wrapping the tonic service stack: it swaps the request body
-//! for a [`CountingBody`] that tallies `DATA` frame bytes into a
-//! [`WireByteCounter`] as tonic's decoder reads them, and places that counter
-//! in the request's extensions before the inner service (and eventually the
-//! handler) runs. This also aligns the charged quantity with the HTTP
-//! ingest path, which has always charged wire body bytes.
+//! for a [`CountingBody`] that parses gRPC's length-delimited message
+//! framing directly off the wire bytes as tonic's decoder reads them, and
+//! places the resulting [`WireByteCounter`] in the request's extensions
+//! before the inner service (and eventually the handler) runs. This also
+//! aligns the charged quantity with the HTTP ingest path, which has always
+//! charged wire body bytes.
+//!
+//! Parsing frames at the body level rather than reading a single running
+//! total matters for a streaming call (OTAP): the underlying transport can
+//! (and over a fast loopback connection routinely does) hand a body's
+//! `poll_frame` several messages' worth of bytes in one chunk, ahead of
+//! tonic's decoder actually consuming them message by message. A single
+//! cumulative byte count read at arbitrary times would then attribute a
+//! later message's bytes to an earlier charge. Detecting each message's
+//! frame boundary (a 1-byte compression flag plus a 4-byte big-endian
+//! length, per the gRPC wire format) as bytes arrive sidesteps that: each
+//! completed frame's total length (header included) is queued in arrival
+//! order, and a handler charges exactly one queue entry per message it
+//! decodes, in the same order.
 //!
 //! Install [`WireByteCountLayer`] once on the `tonic::transport::Server`
 //! builder that serves the gRPC listener; it wraps every service added to
-//! that builder, unary and streaming alike. A unary handler reads the
-//! completed count with [`wire_request_bytes`]. A streaming handler (OTAP)
-//! reads the running counter directly with [`wire_byte_counter`] and tracks
-//! its own previous read to charge each message's delta.
+//! that builder, unary and streaming alike. A unary handler reads its one
+//! message's charge with [`wire_request_bytes`]. A streaming handler (OTAP)
+//! reads the [`WireByteCounter`] itself with [`wire_byte_counter`] and pops
+//! one entry per decoded message.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
+use parking_lot::Mutex;
 use tonic::body::Body as TonicBody;
 use tonic::{Request, Status};
 use tower::{Layer, Service};
 
-/// Shared, cloneable handle to one request's wire-byte count. Placed in the
+/// Shared, cloneable handle to the completed gRPC message frames read off one
+/// request's (or stream's) body so far, in arrival order. Placed in the
 /// request's extensions by [`WireByteCountLayer`]; read back by the handler
 /// via [`wire_request_bytes`] or [`wire_byte_counter`].
 #[derive(Clone)]
-pub struct WireByteCounter(Arc<Counter>);
-
-struct Counter {
-    bytes: AtomicU64,
-    complete: AtomicBool,
-}
+pub struct WireByteCounter(Arc<Mutex<VecDeque<u64>>>);
 
 impl WireByteCounter {
     fn new() -> Self {
-        WireByteCounter(Arc::new(Counter {
-            bytes: AtomicU64::new(0),
-            complete: AtomicBool::new(false),
-        }))
+        WireByteCounter(Arc::new(Mutex::new(VecDeque::new())))
     }
 
-    fn add(&self, n: u64) {
-        self.0.bytes.fetch_add(n, Ordering::Relaxed);
+    fn push_message(&self, total_bytes: u64) {
+        self.0.lock().push_back(total_bytes);
     }
 
-    fn mark_complete(&self) {
-        self.0.complete.store(true, Ordering::Relaxed);
-    }
-
-    /// Cumulative `DATA`-frame bytes read from the request body so far. For a
-    /// unary call this is the whole request once [`is_complete`](Self::is_complete)
-    /// is true. For a stream it keeps growing as more messages arrive; a
-    /// per-message caller charges the delta since its own last read (see
-    /// `otap_grpc.rs`).
-    pub fn bytes(&self) -> u64 {
-        self.0.bytes.load(Ordering::Relaxed)
-    }
-
-    fn is_complete(&self) -> bool {
-        self.0.complete.load(Ordering::Relaxed)
+    /// Pops the next completed message's total wire length (its 5-byte gRPC
+    /// frame header plus payload), in the order frames completed on the
+    /// wire. `None` if no complete frame has been counted yet.
+    pub fn pop_message_bytes(&self) -> Option<u64> {
+        self.0.lock().pop_front()
     }
 }
 
-/// Reads the completed wire-byte count for a unary gRPC request charged by
-/// [`WireByteCountLayer`]. `Err` only if the layer was never installed on the
-/// listener this request arrived on -- a wiring bug, not something a client
-/// can trigger.
+/// Reads the wire-byte count for a unary gRPC request's one message, charged
+/// by [`WireByteCountLayer`]. `Err` if the layer was never installed on the
+/// listener this request arrived on (a wiring bug, not something a client
+/// can trigger), or if, contrary to the gRPC wire format's guarantee of
+/// exactly one message frame per unary call, no complete frame was counted.
 pub fn wire_request_bytes<T>(request: &Request<T>) -> Result<u64, Status> {
     let counter = wire_byte_counter(request)?;
-    // A unary request body is fully buffered (and thus fully counted) before
-    // tonic decodes the single message and hands it to the handler, so the
-    // count read here must already be final.
+    let bytes = counter.pop_message_bytes();
+    // Tonic already decoded this request's one message before calling the
+    // handler, which means `CountingBody` -- sitting underneath that same
+    // decode, watching the same bytes -- must already have a completed frame
+    // queued. A `None` here would mean the two disagree about how many bytes
+    // make up this message.
     debug_assert!(
-        counter.is_complete(),
-        "wire-byte counter read before its unary request body finished"
+        bytes.is_some(),
+        "unary gRPC request decoded but WireByteCountLayer counted no complete message frame"
     );
-    Ok(counter.bytes())
+    bytes.ok_or_else(|| {
+        Status::internal("ingest admission: wire-byte count unavailable for this request")
+    })
 }
 
-/// Reads the [`WireByteCounter`] itself, for a streaming call that must
-/// charge per-message deltas across the stream's lifetime rather than one
-/// completed total.
+/// Reads the [`WireByteCounter`] itself, for a streaming call that charges
+/// one queue entry per message it decodes rather than a single completed
+/// total.
 pub fn wire_byte_counter<T>(request: &Request<T>) -> Result<WireByteCounter, Status> {
     request
         .extensions()
@@ -141,20 +145,95 @@ where
         let counted = CountingBody {
             inner: body,
             counter,
+            parser: FrameParser::new(),
         };
         let req = http::Request::from_parts(parts, TonicBody::new(counted));
         self.inner.call(req)
     }
 }
 
-/// Wraps a tonic request body, adding each `DATA` frame's byte length to a
-/// shared [`WireByteCounter`] as the frame is pulled off the body, and
-/// marking the counter complete once the body reports end-of-stream.
-/// `tonic::body::Body` is `Unpin` (it boxes its inner body), which is what
-/// lets [`Pin::get_mut`] below skip a pin-projection crate.
+/// A gRPC-over-HTTP/2 length-delimited message frame is a 1-byte compression
+/// flag followed by a 4-byte big-endian payload length, then that many
+/// payload bytes (<https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>).
+/// `FrameParser` walks `DATA` frame bytes through that shape without
+/// buffering or decoding the payload itself, so it can tell a body wrapper
+/// exactly when one message's bytes are complete regardless of how the
+/// underlying transport chunked them.
+struct FrameParser {
+    state: FrameState,
+}
+
+enum FrameState {
+    Header { buf: [u8; 5], filled: u8 },
+    Payload { remaining: u32, total: u64 },
+}
+
+impl FrameParser {
+    fn new() -> Self {
+        FrameParser {
+            state: FrameState::Header {
+                buf: [0; 5],
+                filled: 0,
+            },
+        }
+    }
+
+    /// Feeds `data` through the frame state machine, pushing each frame's
+    /// total length (header plus payload) to `counter` the moment it
+    /// completes -- possibly several times in one call, if `data` spans more
+    /// than one message.
+    fn feed(&mut self, mut data: &[u8], counter: &WireByteCounter) {
+        loop {
+            match &mut self.state {
+                FrameState::Header { buf, filled } => {
+                    if data.is_empty() {
+                        return;
+                    }
+                    let need = 5 - usize::from(*filled);
+                    let take = need.min(data.len());
+                    buf[usize::from(*filled)..usize::from(*filled) + take]
+                        .copy_from_slice(&data[..take]);
+                    *filled += take as u8;
+                    data = &data[take..];
+                    if usize::from(*filled) < 5 {
+                        return;
+                    }
+                    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                    self.state = FrameState::Payload {
+                        remaining: len,
+                        total: 5 + u64::from(len),
+                    };
+                }
+                FrameState::Payload { remaining, total } => {
+                    if *remaining == 0 {
+                        counter.push_message(*total);
+                        self.state = FrameState::Header {
+                            buf: [0; 5],
+                            filled: 0,
+                        };
+                        continue;
+                    }
+                    if data.is_empty() {
+                        return;
+                    }
+                    let take = (*remaining as usize).min(data.len());
+                    *remaining -= take as u32;
+                    data = &data[take..];
+                }
+            }
+        }
+    }
+}
+
+/// Wraps a tonic request body, feeding each `DATA` frame's bytes through a
+/// [`FrameParser`] and pushing every completed gRPC message frame's length to
+/// a shared [`WireByteCounter`]. `tonic::body::Body` is `Unpin` (it boxes its
+/// inner body), which is what lets [`Pin::get_mut`] below skip a
+/// pin-projection crate.
 struct CountingBody {
     inner: TonicBody,
     counter: WireByteCounter,
+    parser: FrameParser,
 }
 
 impl Body for CountingBody {
@@ -167,14 +246,10 @@ impl Body for CountingBody {
     ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_frame(cx);
-        match &poll {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    this.counter.add(data.len() as u64);
-                }
-            }
-            Poll::Ready(None) => this.counter.mark_complete(),
-            _ => {}
+        if let Poll::Ready(Some(Ok(frame))) = &poll
+            && let Some(data) = frame.data_ref()
+        {
+            this.parser.feed(data, &this.counter);
         }
         poll
     }
