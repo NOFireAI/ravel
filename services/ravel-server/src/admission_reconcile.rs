@@ -60,10 +60,13 @@ pub fn spawn(
     interval: Duration,
 ) -> AdmissionReconcileTask {
     let (tx, mut rx) = oneshot::channel();
+    // Production OS-entropy jitter (ADR-0068 decision 2), the same default the
+    // fold and maintenance loops use; the harness does not drive this loop.
+    let rng: Arc<dyn ravel_commit::rng::RngSource> = Arc::new(ravel_commit::rng::SystemRng);
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(jittered(interval)) => {}
+                _ = tokio::time::sleep(jittered(interval, rng.as_ref())) => {}
                 _ = &mut rx => return,
             }
             let now_ns = SystemClock.now_ns();

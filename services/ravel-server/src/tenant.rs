@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::HeaderMap;
-use rand::RngExt as _;
+use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_query::http::{
     AuthError, DevHeaderTenantResolver, MtlsResolver, OidcJwksCache, OidcResolver,
     StaticBearerTokenResolver, TenantResolver,
@@ -164,8 +164,11 @@ impl JwksRefreshTask {
 /// loop writes.
 pub fn spawn_jwks_refresh(params: OidcRefreshParams) -> JwksRefreshTask {
     let (tx, rx) = oneshot::channel();
+    // Production OS-entropy jitter (ADR-0068 decision 2); the simulation
+    // harness does not drive JWKS refresh, so there is no injected variant.
+    let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
     let handle = tokio::spawn(async move {
-        refresh_loop(params.cache, params.jwks_url, params.interval, rx).await;
+        refresh_loop(params.cache, params.jwks_url, params.interval, rng, rx).await;
     });
     JwksRefreshTask {
         shutdown: Some(tx),
@@ -177,11 +180,12 @@ async fn refresh_loop(
     cache: Arc<OidcJwksCache>,
     jwks_url: String,
     interval: Duration,
+    rng: Arc<dyn RngSource>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(jittered(interval)) => {}
+            _ = tokio::time::sleep(jittered(interval, rng.as_ref())) => {}
             _ = &mut shutdown => return,
         }
         match cache.refresh(&jwks_url).await {
@@ -199,11 +203,11 @@ async fn refresh_loop(
 
 /// Up to 10% jitter over `base`, so co-started replicas do not refetch the JWKS
 /// in lockstep (same rationale as the fold, maintenance, and alert tasks).
-fn jittered(base: Duration) -> Duration {
+fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
     if jitter_bound_ms == 0 {
         return base;
     }
-    let extra_ms = rand::rng().random_range(0..=jitter_bound_ms);
+    let extra_ms = rng.jitter_ms(jitter_bound_ms);
     base + Duration::from_millis(extra_ms)
 }

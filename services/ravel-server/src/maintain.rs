@@ -73,7 +73,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rand::RngExt as _;
+use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
 use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
@@ -310,11 +310,15 @@ pub fn spawn(
         return MaintenanceTasks::none();
     }
 
+    // Production OS-entropy source (ADR-0068 decision 2) for the compactor
+    // writer id and the per-tick loop jitter. The server always uses the
+    // OS-entropy default; the simulation harness does not drive this loop.
+    let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
     // One compactor writer_id per process start, shared across every tenant
     // this supervisor maintains (recorded in each L1 part's footer;
     // informational, never dedup-priority).
     let mut compactor = config.compactor.clone();
-    compactor.compactor_writer_id = Uuid::new_v4();
+    compactor.compactor_writer_id = rng.new_uuid();
     let compactor = Arc::new(compactor);
     let retention = Arc::new(config.retention.clone());
     let fallback_allow = if fallback_allow.is_empty() {
@@ -337,6 +341,7 @@ pub fn spawn(
             metrics,
             safety,
             worker,
+            rng,
             rx,
         )
         .await;
@@ -358,6 +363,7 @@ async fn run_loop(
     metrics: Arc<TenantDiscoveryMetrics>,
     safety: Arc<MaintenanceSafetyMetrics>,
     worker: Arc<WorkerSet>,
+    rng: Arc<dyn RngSource>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     // One memo for the whole process, held across every tick and every
@@ -407,7 +413,7 @@ async fn run_loop(
     // the loop so `select!` only ever polls the same underlying timer across
     // iterations, and reset it (with a fresh jittered duration) only when it
     // actually fires.
-    let discovery_sleep = tokio::time::sleep(jittered(interval));
+    let discovery_sleep = tokio::time::sleep(jittered(interval, rng.as_ref()));
     tokio::pin!(discovery_sleep);
     loop {
         tokio::select! {
@@ -500,7 +506,9 @@ async fn run_loop(
                 )
                 .await;
 
-                discovery_sleep.as_mut().reset(tokio::time::Instant::now() + jittered(interval));
+                discovery_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + jittered(interval, rng.as_ref()));
             }
             _ = &mut shutdown => return,
         }
@@ -1065,12 +1073,12 @@ async fn persist_memo_snapshot(
 
 /// Up to 10% jitter over `base`, so co-started replicas' maintenance ticks do
 /// not run in lockstep (same rationale as the fold task's jitter).
-fn jittered(base: Duration) -> Duration {
+fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
     if jitter_bound_ms == 0 {
         return base;
     }
-    let extra_ms = rand::rng().random_range(0..=jitter_bound_ms);
+    let extra_ms = rng.jitter_ms(jitter_bound_ms);
     base + Duration::from_millis(extra_ms)
 }
 
@@ -2162,6 +2170,7 @@ mod tests {
             metrics.clone(),
             safety,
             worker,
+            Arc::new(SystemRng),
             shutdown_rx,
         ));
 

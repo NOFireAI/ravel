@@ -55,13 +55,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use rand::RngExt as _;
 use ravel_alerting::{
     AlertId, AlertRecord, AlertState, QueryResultSummary, Rule, RuleCondition, RuleQuery,
     ThresholdOp, compute_alert_id, condition_met, evaluate_transition, write_alert_record,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
+use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
 use ravel_logseg::{ObjectIdentity, Predicate, RlogConfig, RlogReader};
@@ -251,8 +251,11 @@ pub fn spawn(
         )?;
         let (tx, rx) = oneshot::channel();
         let interval = config.interval;
+        // Production OS-entropy jitter (ADR-0068 decision 2); the harness does
+        // not drive alert evaluators, so there is no injected variant.
+        let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
         let handle = tokio::spawn(async move {
-            run_loop(&mut evaluator, interval, rx).await;
+            run_loop(&mut evaluator, interval, rng, rx).await;
         });
         shutdown.push(tx);
         handles.push(handle);
@@ -269,11 +272,12 @@ pub fn spawn(
 async fn run_loop(
     evaluator: &mut AlertEvaluator,
     interval: Duration,
+    rng: Arc<dyn RngSource>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(jittered(interval)) => {}
+            _ = tokio::time::sleep(jittered(interval, rng.as_ref())) => {}
             _ = &mut shutdown => return,
         }
         let report = evaluator.run_tick().await;
@@ -291,12 +295,12 @@ async fn run_loop(
 
 /// Up to 10% jitter over `base`, so co-started replicas' evaluation ticks do
 /// not run in lockstep (same rationale as the fold and maintenance tasks).
-fn jittered(base: Duration) -> Duration {
+fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
     if jitter_bound_ms == 0 {
         return base;
     }
-    let extra_ms = rand::rng().random_range(0..=jitter_bound_ms);
+    let extra_ms = rng.jitter_ms(jitter_bound_ms);
     base + Duration::from_millis(extra_ms)
 }
 

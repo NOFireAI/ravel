@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_types::CommitToken;
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::IngestConfig;
@@ -101,12 +101,18 @@ impl SpanIngestRouter {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let metrics = Arc::new(SpanIngestMetrics::default());
+        // Production OS-entropy source for writer ids and PUT-retry jitter
+        // (ADR-0068 decision 2). Like the log router, the span pipeline has no
+        // seeded-injection caller; routing through the seam still keeps
+        // `rand::rng()` and `Uuid::new_v4()` off this production path.
+        let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
         let factory = {
             let store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
+            let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             move |shard_count: u32| -> Vec<SpanShardHandle> {
-                let writer_id = Uuid::new_v4();
+                let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
                 (0..shard_count)
@@ -118,6 +124,7 @@ impl SpanIngestRouter {
                             epoch,
                             Arc::clone(&store),
                             Arc::clone(&clock),
+                            Arc::clone(&rng),
                             config,
                             Arc::clone(&metrics),
                             rx,
