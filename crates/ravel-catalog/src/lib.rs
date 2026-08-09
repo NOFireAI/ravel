@@ -4,6 +4,7 @@
 //! listing-based discovery behind the Catalog API; snapshots come with
 //! compaction.
 
+mod auth_token_map;
 mod cache;
 mod catalog;
 mod config;
@@ -16,7 +17,13 @@ mod seal_divergence;
 mod snapshot;
 mod snapshot_format;
 mod snapshot_resolve;
+mod tenant_config;
 
+pub use auth_token_map::{
+    AUTH_KEY, AUTH_TOKEN_MAP_FORMAT_VERSION, AuthMapDefect, AuthTokenMap, AuthTokenMapError,
+    KEY_FINGERPRINT_LEN, SetOutcome as AuthSetOutcome, TOKEN_HASH_LEN, TokenEntry, key_fingerprint,
+    read_auth_map, remove_token, tenant_for_token, token_hash, upsert_token,
+};
 pub use catalog::Catalog;
 pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
@@ -50,4 +57,9 @@ pub use snapshot_format::{
     DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, DecodedPostings,
     HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits, SnapshotFormatError,
     VERSION, decode_head, decode_part, decode_postings, encode_head, encode_part, encode_postings,
+};
+pub use tenant_config::{
+    SetOutcome as TenantConfigSetOutcome, TENANT_CONFIG_FORMAT_VERSION, TenantConfig,
+    TenantConfigError, TenantLifecycleState, config_key, read_config, read_config_values,
+    set_tenant_config,
 };

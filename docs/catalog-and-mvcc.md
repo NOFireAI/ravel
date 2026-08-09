@@ -17,6 +17,7 @@ t/<tenant_hash>/<signal>/del/<request_id>.dreq                          erasure 
 t/<tenant_hash>/<signal>/del/<request_id>.done                          erasure completion (CreateIfAbsent, immutable, PII-free; ADR-0064)
 t/<tenant_hash>/<signal>/prov                                           shard_count provisioning record (write-once, additive; ADR-0050 §5)
 t/<tenant_hash>/enc                                                     per-tenant KMS key-epoch record (CAS append-only, additive; ADR-0062 §1b)
+t/<tenant_hash>/config                                                  per-tenant lifecycle/limits/retention config (CAS whole-record replace, additive; ADR-0066 §6)
 t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
@@ -24,6 +25,7 @@ t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name pos
 sys/qualification                                                       store qualification record (write-once, additive)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
+sys/auth                                                                deployment-wide keyed-token-hash -> tenant map (CAS whole-record replace, additive; ADR-0066 §6)
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
 sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite; ADR-0065 §1)
@@ -142,6 +144,50 @@ the deployment default key, which is not an error (`read_epochs_from_store`
 returns `Ok(None)`). This record is durable audit metadata only; it is not
 read on the live write path (the routing decorator carries the active key),
 so a slightly stale reader cannot misroute a write.
+
+`t/<tenant_hash>/config` (ADR-0066 §6, epic EM) is the durable per-tenant
+config record that moves tenant lifecycle state, admission-limit overrides,
+retention, and indexed-field config off process flags and into durable state.
+A tenant-scoped object (not per-signal, since these apply across every signal)
+holding `tenant_hash`, a `format_version` floor, a `lifecycle_state`
+(`active` / `suspended` / `offboarding`), optional admission-limit and
+retention overrides, an optional indexed-field set, and `created`/`updated`
+timestamps (proto/ravel/sys.proto `TenantConfigRecord`). Defaults still come
+from flags/limits-file at startup; a field present here overrides the default
+for this tenant, an absent one leaves the default in place. Unlike the
+append-only `prov`/`enc` histories, it is mutated by **whole-record
+CAS-replace** (`ravel_catalog::set_tenant_config`, the `sys/gc` `set_gc_config`
+pattern): a config override is mutable current state whose latest value is the
+only one that matters and which must support lowering a limit or clearing an
+override, so the record is read for its version and swapped in place under
+`CasVersion`; a concurrent write is a typed conflict the loser re-reads, never
+a silent overwrite. On a tenant with no record the first write bootstraps with
+`CreateIfAbsent`. A tenant with no `config` record runs entirely on the
+deployment defaults (`read_config` returns `Ok(None)`). This record is durable
+control state only; the bounded-staleness refresh loop that reads it on a
+horizon and re-invokes the admission controller's `set_tenant_limits` is a
+separate concern (epic EM, EM-T8).
+
+`sys/auth` (ADR-0066 §6, epic EM) is the durable, deployment-wide bearer-token
+map replacing the startup-frozen `--tenant-token` allowlist: a bucket-root
+object (never under a tenant prefix, since an entry maps a token to whichever
+tenant it grants) holding a `format_version` floor, a 16-byte deployment-key
+fingerprint, and `entries` mapping a token hash to a tenant id
+(proto/ravel/sys.proto `AuthTokenMap`/`TokenHashEntry`). The bucket **never**
+holds a plaintext token: each `token_hash` is
+`blake3::keyed_hash(deployment_key, token)`, so the map is useless without the
+deployment key and a low-entropy token is not recoverable by an offline
+dictionary attack (the tenant-hash-v2 keyed-hashing pattern). The stored
+fingerprint lets a reader configured with the wrong deployment key refuse
+rather than silently mismatch every hash. Like `t/<tenant_hash>/config` it is
+mutated by whole-record CAS-replace (`ravel_catalog::upsert_token` /
+`remove_token`): the map is current-state and revocation (removing an entry) is
+a first-class operation an append-only history cannot express. A deployment
+with no provisioned tokens (or one using only OIDC/mTLS) has no `sys/auth`
+object, which is not an error (`read_auth_map` returns `Ok(None)`). The
+resolver refresh loop (rate-limited on-miss re-read, fail-closed revocation) is
+EM-T8's concern; this module supplies only the object shape, the keyed hash,
+and the CAS read/write helpers.
 
 - `keyhash32` (idempotency marker keys only, ADR-0051 §5): 32 lowercase hex
   chars, the first 16 bytes of `blake3("ravel-idem-v1" || tenant_id ||
