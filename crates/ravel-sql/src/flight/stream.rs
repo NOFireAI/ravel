@@ -768,6 +768,41 @@ mod tests {
         );
     }
 
+    /// The error path yields the ORIGINAL stream error even when the audit
+    /// flush itself fails. The clean-stream fail-closed substitution does not
+    /// apply here: the client is already being handed a real error, and
+    /// replacing it with `Unavailable` would hide why the query actually
+    /// failed behind an audit-infrastructure message.
+    #[tokio::test]
+    async fn a_failed_flush_on_the_error_path_still_yields_the_original_error() {
+        let inner = inner_stream(vec![
+            Ok(FlightData::default()),
+            Err(Status::internal("boom")),
+        ]);
+        let stream = audited_stream(
+            inner,
+            Arc::new(FailingSink),
+            TENANT,
+            42,
+            "SELECT 1".to_string(),
+        );
+
+        let items = drain(stream).await;
+        assert_eq!(items.len(), 2, "one data item, then the original error");
+        assert!(items[0].is_ok());
+        let err = items[1].as_ref().expect_err("the mid-stream error");
+        assert_eq!(
+            err.code(),
+            tonic::Code::Internal,
+            "the original error code survives a failed audit flush"
+        );
+        assert_eq!(
+            err.message(),
+            "boom",
+            "the original error message survives a failed audit flush"
+        );
+    }
+
     /// Fail-closed: when the audit flush fails in `required` mode, a clean
     /// stream's end is turned into a trailing `Unavailable` error so the client
     /// never believes an unaudited query succeeded.
