@@ -187,14 +187,19 @@ compact summary of what it has verified, to a second self-owned key:
 sys/maintain/memo/<process_id>
 ```
 
-Payload (versioned-tag protobuf), per owned `(tenant, signal, shard)`:
+Only terminal buckets (compacted / below-threshold / swept-empty) are
+recorded; a bucket still doing work carries no entry. Adjacent hours in the
+same terminal state collapse to one run, whose `verified_unix_ns` is the
+minimum over the run (conservative for freshness). Payload (versioned-tag
+protobuf), per owned `(tenant, signal, shard)`:
 
-- `terminal_frontier_hour`: every bucket at or below this hour was verified
-  terminal (compacted / below-threshold / swept-empty), with
-  `frontier_verified_unix_ns`.
-- an exception list of `(hour, state, verified_unix_ns)` for the sparse
-  non-terminal stragglers at or below the frontier (pending horizon-gated
-  sweeps, just-compacted buckets awaiting their stable re-verify).
+- a `frontier` run: the **longest contiguous same-state terminal run** in the
+  unit (ties broken toward the highest end hour), encoded as
+  `(start_hour, end_hour, state, verified_unix_ns)`. The interior of a
+  retention window is one such run, which is where the compression comes from.
+- an exception list of the unit's **other terminal runs** — the terminal
+  spans that fall outside the frontier run — each encoded as
+  `(start_hour, length, state, verified_unix_ns)`.
 
 Run-length encoding against the frontier keeps this KBs per unit (the
 interior of a retention window is one run), so the snapshot stays a small

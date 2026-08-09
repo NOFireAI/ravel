@@ -421,7 +421,7 @@ async fn run_loop(
                         // to this process; request a warm start so its terminal
                         // facts are seeded from the departing worker's snapshot
                         // rather than rescanned cold (ADR-0065 decision 3).
-                        if computed != live_set {
+                        if membership_changed(&live_set, &computed) {
                             reseed = true;
                         }
                         live_set = computed;
@@ -452,14 +452,22 @@ async fn run_loop(
                                     "maintenance: warm-started memo from durable snapshots"
                                 );
                             }
+                            // Clear the pending reseed only on a successful read.
+                            // A single transient LIST/GET fault must leave reseed
+                            // set so the next cycle retries: in a single-replica
+                            // deployment `computed != live_set` is structurally
+                            // never true (live_set is solo_live_set()), so this
+                            // first-tick reseed is the only warm-start trigger the
+                            // worker ever gets. Clearing it on the Err arm would
+                            // leave that worker cold for its whole process life.
+                            reseed = false;
                         }
                         Err(err) => tracing::warn!(
                             error = %err,
                             "maintenance: memo snapshot read failed; cold start for all units \
-                             this cycle (fail-open, ADR-0065 decision 3)"
+                             this cycle, reseed retried next cycle (fail-open, ADR-0065 decision 3)"
                         ),
                     }
-                    reseed = false;
                 }
 
                 run_discovery_cycle(
@@ -972,6 +980,18 @@ pub async fn run_tick(
 /// with a debug line (fail-open: cold start for whatever it would have seeded),
 /// never a panic. Returns `(seeded_units, seeded_buckets)` summed across the
 /// snapshots, for the caller's log line.
+/// Whether a recomputed live set differs from the one last held, which is the
+/// warm-start reseed trigger (ADR-0065 decision 3): a membership change may have
+/// moved a unit's rendezvous ownership onto this process, so its terminal facts
+/// should be seeded from the departing worker's snapshot rather than rescanned
+/// cold. Extracted from the discovery loop so the trigger is unit-testable: it
+/// must fire on a genuine handoff (live set changed) and stay quiet on stable
+/// membership. Both sets are sorted-and-deduped by [`WorkerSet::live_set`], so a
+/// plain slice comparison is order-stable.
+fn membership_changed(previous: &[Uuid], computed: &[Uuid]) -> bool {
+    previous != computed
+}
+
 fn seed_memo_from_snapshots(
     memo: &mut MaintainMemo,
     snapshots: &[Vec<u8>],
@@ -2195,6 +2215,129 @@ mod tests {
             "B skips A's terminal bucket after a store-backed warm start"
         );
         assert_eq!(report.already_done, 0, "no per-bucket work redone by B");
+    }
+
+    /// ADR-0065 decision 3 (issue #747): the reseed trigger and the ownership
+    /// filter under a *genuine* handoff, with two independent live-set views
+    /// rather than two `solo_live_set()`s (which make ownership unconditional and
+    /// the `computed != live_set` filter vacuous). Two replicas A and B share a
+    /// live set `{A, B}`; a shard the rendezvous assigns to A is warmed and
+    /// snapshotted by A. When A departs, B's live set becomes `{B}` and that
+    /// shard's ownership moves to B. This test asserts:
+    ///
+    /// 1. `membership_changed` fires on the real change (`{A,B}` -> `{B}`) and
+    ///    stays quiet on stable membership (`{A,B}` == `{A,B}`), so a transient
+    ///    single-replica worker is not stuck cold and a stable one does not
+    ///    reseed every heartbeat.
+    /// 2. Seeding from A's snapshot with B's *pre-handoff* view `{A,B}` seeds
+    ///    nothing (B did not own the shard then) -- proving the `owns_unit`
+    ///    filter is genuine, not vacuously true.
+    /// 3. Seeding with B's *post-handoff* view `{B}` seeds the shard and B's tick
+    ///    skips it rather than cold-rescanning.
+    #[tokio::test]
+    async fn reseed_and_seeding_track_genuine_ownership_handoff() {
+        const SHARDS: u32 = 8;
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // Two live replicas sharing one store; both compute the same live set.
+        let now = SystemClock.now_ns();
+        let a = WorkerSet::with_defaults(now);
+        let b = WorkerSet::with_defaults(now);
+        a.write_heartbeat(&store, now).await.expect("a heartbeat");
+        b.write_heartbeat(&store, now).await.expect("b heartbeat");
+        let live_ab = a.live_set(&store, now).await.expect("a live set");
+        assert_eq!(live_ab, b.live_set(&store, now).await.expect("b live set"));
+        assert_eq!(live_ab.len(), 2, "both replicas are live");
+
+        // Pick a shard the rendezvous assigns to A under {A, B}: B does not own
+        // it yet, so the pre-handoff filter must reject it.
+        let a_shard = (0..SHARDS)
+            .find(|shard| a.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
+            .expect("A owns at least one shard");
+        assert!(
+            !b.owns_unit(&live_ab, &tenant, Signal::Metrics, a_shard),
+            "the chosen shard is A's, not B's, before the handoff"
+        );
+        publish_terminal_bucket_at_shard(&store, &tenant_id, a_shard).await;
+
+        // A warms its memo over its owned shards and persists a durable snapshot.
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let mut memo_a = MaintainMemo::with_default_interval();
+        run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_a,
+            &safety,
+            &a,
+            &live_ab,
+        )
+        .await;
+        assert_eq!(memo_a.len(), 1, "A memoized its one terminal bucket");
+        let snap_now = SystemClock.now_ns();
+        let mut last_body = None;
+        assert!(
+            persist_memo_snapshot(&store, &a, &memo_a, &mut last_body, snap_now).await,
+            "A persists its snapshot"
+        );
+
+        // Reseed trigger: stable membership is quiet; the real handoff fires it.
+        assert!(
+            !membership_changed(&live_ab, &live_ab),
+            "stable membership must not trigger a reseed"
+        );
+        let live_b = b.solo_live_set();
+        assert!(
+            membership_changed(&live_ab, &live_b),
+            "A's departure ({{A,B}} -> {{B}}) must trigger a reseed"
+        );
+
+        let snapshots = read_all_memo_snapshots(&store)
+            .await
+            .expect("read snapshots");
+
+        // Counter-case: B's PRE-handoff view {A,B} does not own the shard, so
+        // seeding filters it out. Proves the ownership filter is not vacuous.
+        let mut memo_b_before = MaintainMemo::with_default_interval();
+        let (units_before, buckets_before) =
+            seed_memo_from_snapshots(&mut memo_b_before, &snapshots, snap_now, &b, &live_ab);
+        assert_eq!(
+            (units_before, buckets_before),
+            (0, 0),
+            "B seeds nothing while it does not yet own the shard"
+        );
+        assert_eq!(memo_b_before.len(), 0);
+
+        // Post-handoff view {B}: B now owns the shard and seeds it from A's
+        // snapshot, then skips it on its own tick (no cold rescan).
+        let mut memo_b = MaintainMemo::with_default_interval();
+        let (units, buckets) =
+            seed_memo_from_snapshots(&mut memo_b, &snapshots, snap_now, &b, &live_b);
+        assert_eq!(units, 1, "B seeds the one unit it took over");
+        assert_eq!(buckets, 1);
+
+        let report = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_b,
+            &safety,
+            &b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            report.skipped_terminal, 1,
+            "B skips the handed-over terminal bucket instead of cold-rescanning"
+        );
     }
 
     /// The un-trip an operator must not read as "resolved" (ADR-0048 decision

@@ -584,6 +584,19 @@ impl MaintainMemo {
             }
             stats.seeded_units += 1;
             for (hour, state, verified_ns) in unit.entries {
+                // Clamp each entry's verified_ns to the snapshot's own
+                // snapshot_unix_ns. By construction a snapshot is written at
+                // tick time and every entry was verified at or before that
+                // write, so `snapshot_unix_ns >= max(entry.verified_at_ns)`
+                // always holds for an honest snapshot (see the staleness bound
+                // doc above). A corrupted or clock-skewed entry with a future
+                // verified_ns would otherwise read as eternally fresh through
+                // `is_fresh_terminal` and, because the memo is re-encoded and
+                // republished each cycle, self-propagate fleet-wide. The clamp
+                // makes it structurally impossible for a decoded entry to be
+                // fresher than the snapshot it came from, which the header-level
+                // too_future guard has already bounded against `now_ns`.
+                let verified_ns = verified_ns.min(decoded.snapshot_unix_ns);
                 self.seed_entry(
                     (unit.tenant, unit.signal, unit.shard, hour),
                     state,
@@ -1362,5 +1375,142 @@ mod memo_snapshot_tests {
         let body_from_full_1 = &a.encode_snapshot(1)[9..];
         let body_from_full_2 = &a.encode_snapshot(999)[9..];
         assert_eq!(body_from_full_1, body_from_full_2);
+    }
+
+    /// Finding 1 (issue #747): a decoded entry whose `verified_ns` is past the
+    /// snapshot's own `snapshot_unix_ns` -- a corrupted or clock-skewed run --
+    /// is clamped to `snapshot_unix_ns` at the seed site, never trusted at its
+    /// raw future value. Without the clamp such an entry reads as eternally
+    /// fresh and, because the memo is re-encoded and republished each cycle,
+    /// self-propagates fleet-wide, permanently suppressing retention/compaction
+    /// for its bucket. The header stays fresh so only the per-entry value is out
+    /// of range, isolating the guard this test proves.
+    #[test]
+    fn future_dated_entry_is_clamped_to_snapshot_time() {
+        let t = tenant();
+        let snapshot_unix_ns = 5 * NS_PER_HOUR;
+        // Roughly a century past the snapshot's own write time.
+        let future_ns = snapshot_unix_ns + 100 * 365 * 24 * NS_PER_HOUR;
+
+        let mut poisoned = MaintainMemo::with_default_interval();
+        poisoned.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::Compacted,
+            future_ns,
+        );
+        // Re-frame the poisoned body under an honest, fresh header, so the
+        // whole-snapshot staleness gate passes and only the entry is skewed.
+        let bytes =
+            MaintainMemo::snapshot_bytes_from_body(&poisoned.snapshot_body(), snapshot_unix_ns);
+
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(
+                &bytes,
+                snapshot_unix_ns,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("decode");
+        assert_eq!(stats.seeded_buckets, 1);
+
+        let key = (t, Signal::Metrics, 0, 1);
+        let entry = seeded.entries.get(&key).expect("seeded entry");
+        assert_eq!(
+            entry.verified_at_ns, snapshot_unix_ns,
+            "a future-dated entry is clamped to the snapshot's own time"
+        );
+        // The clamp restores normal expiry: fresh at snapshot time, but no
+        // longer fresh one re-verify interval later (not eternally fresh).
+        assert!(seeded.is_fresh_terminal(&key, snapshot_unix_ns));
+        assert!(
+            !seeded.is_fresh_terminal(
+                &key,
+                snapshot_unix_ns + DEFAULT_MEMO_REVERIFY_INTERVAL_NS + 1
+            ),
+            "clamped entry expires on schedule instead of suppressing reads forever"
+        );
+    }
+
+    fn state_of(code: u8) -> TerminalState {
+        match code % 3 {
+            0 => TerminalState::Compacted,
+            1 => TerminalState::BelowThreshold,
+            _ => TerminalState::SweptEmpty,
+        }
+    }
+
+    proptest::proptest! {
+        /// Finding 4 (issue #747): RLE memo codec round-trip. For an arbitrary
+        /// per-hour terminal/non-terminal state sequence (independent choices at
+        /// each hour, so consecutive hours may alternate state), `decode(encode)`
+        /// reproduces the *effective* per-hour state and verified_ns. Effective
+        /// accounts for the codec's run collapse: `terminal_runs` folds a maximal
+        /// contiguous same-state span to that span's minimum verified_ns
+        /// (conservative for freshness), and every hour in the span decodes to
+        /// that minimum. The snapshot's write time is set at or above every
+        /// entry, so fix 1's clamp is a no-op here and the round-trip is exact
+        /// against that effective expectation.
+        #[test]
+        fn rle_snapshot_round_trips_per_hour(
+            hours in proptest::collection::vec(
+                proptest::option::of((0u8..3u8, 1i64..1_000_000i64)),
+                0usize..48usize,
+            )
+        ) {
+            let t = tenant();
+            let mut memo = MaintainMemo::with_default_interval();
+            let mut present: Vec<(u32, TerminalState, i64)> = Vec::new();
+            for (hour, cell) in hours.iter().enumerate() {
+                if let Some((code, verified_ns)) = cell {
+                    let hour = hour as u32;
+                    let state = state_of(*code);
+                    memo.mark_terminal((t, Signal::Metrics, 0, hour), state, *verified_ns);
+                    present.push((hour, state, *verified_ns));
+                }
+            }
+
+            // Independent oracle for the effective per-hour values: collapse each
+            // maximal contiguous same-state span to its minimum verified_ns.
+            present.sort_by_key(|e| e.0);
+            let mut expected: Vec<(u32, TerminalState, i64)> = Vec::new();
+            let mut i = 0;
+            while i < present.len() {
+                let (_, state, _) = present[i];
+                let mut j = i;
+                let mut run_min = present[i].2;
+                while j + 1 < present.len()
+                    && present[j].0 + 1 == present[j + 1].0
+                    && present[j + 1].1 == state
+                {
+                    j += 1;
+                    run_min = run_min.min(present[j].2);
+                }
+                for entry in present.iter().take(j + 1).skip(i) {
+                    expected.push((entry.0, state, run_min));
+                }
+                i = j + 1;
+            }
+
+            // Honest write time: at or after every entry, so the clamp is a no-op.
+            let snapshot_unix_ns = present.iter().map(|e| e.2).max().unwrap_or(0);
+            let bytes = memo.encode_snapshot(snapshot_unix_ns);
+
+            let mut seeded = MaintainMemo::with_default_interval();
+            seeded
+                .seed_from_snapshot(&bytes, snapshot_unix_ns, 0, |_, _, _| true)
+                .expect("decode");
+
+            proptest::prop_assert_eq!(seeded.len(), expected.len());
+            for (hour, state, verified_ns) in expected {
+                let key = (t, Signal::Metrics, 0, hour);
+                proptest::prop_assert_eq!(
+                    seeded.terminal_state(t, Signal::Metrics, 0, hour),
+                    Some(state)
+                );
+                let entry = seeded.entries.get(&key).expect("entry");
+                proptest::prop_assert_eq!(entry.verified_at_ns, verified_ns);
+            }
+        }
     }
 }
