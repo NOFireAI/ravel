@@ -220,6 +220,8 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, metric: &str, samples: 
 
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("addr"),

@@ -301,6 +301,34 @@ pub struct Cli {
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
 
+    /// Per-shard bound on concurrently in-flight flushes for the metrics
+    /// ingest pipeline (ADR-0067 decision 2, issue #814). Each shard's flush
+    /// runs in a spawned task the shard actor no longer waits on; this caps
+    /// how many such tasks a single shard may have outstanding at once, so
+    /// pipelining trades bounded extra memory (buffers held by in-flight
+    /// flushes) for overlapped PUT latency instead of unbounded fan-out.
+    /// Matches [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own
+    /// default of 1 (today's non-pipelined behavior). `0` is rejected by
+    /// [`Cli::validate`]: it would deadlock every flush, since a shard could
+    /// never acquire a permit to run one. Applies only to the metrics ingest
+    /// pipeline; log and span shard actors are unaffected (they keep their
+    /// existing inline flush).
+    #[arg(long = "max-inflight-flushes", default_value_t = 1)]
+    pub max_inflight_flushes: u32,
+
+    /// Enables the adaptive flush-delay corridor for the metrics ingest
+    /// pipeline (ADR-0067 decision 3, issue #814): instead of always
+    /// flushing a tenant's buffer on the fixed `--max-flush-delay` age, the
+    /// age threshold adapts within `[500ms floor, ceiling]`, where the
+    /// ceiling derives from the shard's observed PUT p99 RTT and the
+    /// strict-write visibility budget. Off by default
+    /// (matches [`ravel_ingest::IngestConfig::adaptive_flush_delay`]'s own
+    /// default), which keeps today's fixed-delay behavior so an operator
+    /// opts in deliberately. Applies only to the metrics ingest pipeline;
+    /// log and span shard actors are unaffected.
+    #[arg(long = "adaptive-flush-delay")]
+    pub adaptive_flush_delay: bool,
+
     /// The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime
     /// duration (e.g. `7d`). The content-tier scrubber rotates through the
     /// whole object corpus once per `P`, so sustained scrub read bandwidth is
@@ -814,6 +842,14 @@ impl Cli {
         // so a malformed future extension of this flag fails startup rather
         // than at the first ingest request.
         self.parse_ingest_concurrency_limit()?;
+
+        if self.max_inflight_flushes == 0 {
+            anyhow::bail!(
+                "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
+                 acquire a permit to run one. Set a positive count (1 keeps today's \
+                 non-pipelined behavior)."
+            );
+        }
 
         if self.dev_insecure_tenant_header && !self.listen_http.ip().is_loopback() {
             anyhow::bail!(
@@ -2087,6 +2123,42 @@ mod tests {
             err.to_string().contains("--dev-insecure-tenant-header"),
             "error names the specific dev-header case, not just the generic alias: {err}"
         );
+    }
+
+    #[test]
+    fn zero_max_inflight_flushes_fails_validate() {
+        let err = cli(&["--max-inflight-flushes", "0"])
+            .validate()
+            .expect_err("--max-inflight-flushes 0 would deadlock every flush");
+        assert!(
+            err.to_string().contains("--max-inflight-flushes"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn positive_max_inflight_flushes_validates() {
+        cli(&["--max-inflight-flushes", "3"])
+            .validate()
+            .expect("a positive --max-inflight-flushes is fine");
+    }
+
+    #[test]
+    fn max_inflight_flushes_and_adaptive_flush_delay_default() {
+        let parsed = cli(&[]);
+        assert_eq!(
+            parsed.max_inflight_flushes, 1,
+            "default matches ravel_ingest::IngestConfig::max_inflight_flushes"
+        );
+        assert!(
+            !parsed.adaptive_flush_delay,
+            "default matches ravel_ingest::IngestConfig::adaptive_flush_delay"
+        );
+    }
+
+    #[test]
+    fn adaptive_flush_delay_flag_enables_it() {
+        assert!(cli(&["--adaptive-flush-delay"]).adaptive_flush_delay);
     }
 
     #[test]

@@ -38,6 +38,8 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// window) and the maintenance loop left disabled, so only the scrubber acts.
 fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
     ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),

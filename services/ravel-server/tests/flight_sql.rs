@@ -453,6 +453,8 @@ async fn the_server_registers_the_real_flight_sql_service() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
     let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode: Mode::Query,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),

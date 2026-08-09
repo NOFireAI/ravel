@@ -341,6 +341,8 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
 
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
@@ -471,6 +473,8 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
 
     let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),

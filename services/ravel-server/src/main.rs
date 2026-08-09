@@ -330,6 +330,8 @@ async fn main() -> anyhow::Result<()> {
         listen_http: cli.listen_http,
         listen_grpc: cli.listen_grpc,
         shard_count: cli.shards,
+        max_inflight_flushes: cli.max_inflight_flushes,
+        adaptive_flush_delay: cli.adaptive_flush_delay,
         tenant_resolver: resolver_bundle.resolver,
         mtls_listener,
         fold_tenants,

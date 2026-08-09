@@ -3,7 +3,11 @@
 //! actor keeps draining its mailbox while a flush is stuck in flight, and (b)
 //! two flushes held concurrently and released out of submission order still
 //! ack each caller with its own pinned identity, never swapped with the
-//! other's.
+//! other's. A third test proves reachability of a configured depth greater
+//! than the 2 exercised above: with `max_inflight_flushes: 3`, three
+//! independent tenants' flushes (each entering through the public
+//! `IngestRouter::write`, which delegates to the crate-private
+//! `write_points`) can all be genuinely in flight on one shard at once.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -235,6 +239,88 @@ async fn actor_drains_while_flush_inflight() {
         .await
         .expect("stuck write task")
         .expect("stuck write eventually acks once its PUT is released");
+
+    router.flush_all().await;
+}
+
+/// Reachability at a configured depth greater than the 2 exercised by
+/// `pipelined_flushes_overlap_and_ack_isolation` above: with
+/// `max_inflight_flushes: 3`, three different tenants' strict writes (each
+/// entering through the public `IngestRouter::write`, which delegates
+/// internally to the crate-private `write_points`) can all have their flush
+/// genuinely in flight on the same shard at once, and the in-flight-flush
+/// gauge reports exactly 3, not merely "more than 1".
+#[tokio::test]
+async fn pipelining_reaches_the_full_configured_depth_of_three() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let clock = TestClock::new(1_700_000_000_000_000_000);
+    let config = IngestConfig {
+        shard_count: 1,
+        target_bytes: 8,
+        max_flush_delay: Duration::from_secs(3600),
+        max_inflight_flushes: 3,
+        ..IngestConfig::default()
+    };
+    let router = Arc::new(IngestRouter::new(
+        config,
+        store,
+        Signal::Metrics,
+        clock.clone(),
+    ));
+
+    let tenants: Vec<_> = ["acme", "globex", "initech"]
+        .into_iter()
+        .map(tenant)
+        .collect();
+
+    // Held at the data-object PUT only, so each flush's commit PUT resolves
+    // on its own once released.
+    let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
+
+    let mut writes = Vec::new();
+    for t in &tenants {
+        let router = Arc::clone(&router);
+        let t = t.clone();
+        writes.push(tokio::spawn(async move {
+            let points = vec![make_point(&t, "cpu_usage", &[("host", "a")], 1_000, 1.0)];
+            router
+                .write(t, points, WriteMode::Strict, Duration::from_secs(30))
+                .await
+        }));
+        // Stagger submission so the actor pins each flush's identity before
+        // the next tenant's write is even sent; not load-bearing for this
+        // test's assertion (unlike the ack-isolation test above), but keeps
+        // the three writes from racing each other into the channel.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    gate.wait_until_held(3).await;
+    assert_eq!(
+        gate.held_count(),
+        3,
+        "all three tenants' data PUTs must be held at once"
+    );
+    assert_eq!(
+        router.metrics().snapshot().in_flight_flushes_total,
+        3,
+        "in-flight flush gauge must report the full configured depth of 3, \
+         proving max_inflight_flushes: 3 is reachable end-to-end through \
+         IngestRouter::write / write_points, not capped at some lower depth"
+    );
+
+    for id in gate.held() {
+        assert!(gate.release(id));
+    }
+    assert_eq!(gate.held_count(), 0);
+
+    for (t, write) in tenants.iter().zip(writes) {
+        let receipt = write
+            .await
+            .unwrap_or_else(|e| panic!("{t:?} write task: {e}"))
+            .unwrap_or_else(|e| panic!("{t:?} write acks: {e}"));
+        assert_eq!(receipt.tokens.len(), 1);
+    }
 
     router.flush_all().await;
 }
