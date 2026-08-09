@@ -1,11 +1,24 @@
 //! One actor per shard: actor-local buffering, adaptive flush, and the
 //! pinned-identity commit sequence (docs/ingest.md "Shard actor",
 //! docs/catalog-and-mvcc.md "Pinned flush identity" and "Commit sequence").
+//!
+//! Buffer ownership and flush execution are split (ADR-0067 decision 1): the
+//! actor is the single-threaded owner of buffered state and, at flush
+//! trigger, pins the flush's identity and moves its `TenantBuf` (including
+//! its waiters) into a task spawned onto [`FlushCtx::run_flush`], then keeps
+//! draining its channel. `max_inflight_flushes` (ADR-0067 decision 2) bounds
+//! how many such tasks may run at once per shard via a semaphore acquired
+//! before spawning; at the bound, the acquire blocks the flush trigger (and
+//! therefore the actor's ability to pull its next message), which is exactly
+//! where backpressure is meant to propagate. The adaptive age trigger
+//! (ADR-0067 decision 3) is `age_threshold_ns`/`adaptive_age_threshold_ns`
+//! below.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use rand::RngExt as _;
@@ -18,8 +31,11 @@ use ravel_segment::{
     ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3,
     SeriesValues,
 };
-use ravel_types::{CommitToken, ExemplarCap, LabelSet, Sample, SeriesId, Signal, TenantId};
-use tokio::sync::{mpsc, oneshot};
+use ravel_types::{
+    CommitToken, ExemplarCap, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId,
+};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -126,10 +142,30 @@ struct TenantBuf {
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
     waiters: Vec<Ack>,
+    /// Arrival timestamp of the last `merge` call into this buffer, and an
+    /// EWMA (alpha = 1/4) of the gaps between successive arrivals. Feeds the
+    /// adaptive age trigger's observed-arrival-rate signal (ADR-0067
+    /// decision 3, `adaptive_age_threshold_ns`). Scoped to the buffer's own
+    /// lifetime (reset on flush) deliberately: the buffer's lifetime already
+    /// spans exactly the window "since this tenant's last flush", which is
+    /// the rate a fresh flush decision should react to. `avg_gap_ns == 0`
+    /// (no gap observed yet, e.g. the buffer's first arrival) clamps to the
+    /// corridor floor in `adaptive_age_threshold_ns` with no special case.
+    last_arrival_ns: Option<i64>,
+    avg_gap_ns: i64,
 }
 
 impl TenantBuf {
     fn note_arrival(&mut self, arrival_ns: i64) {
+        if let Some(last) = self.last_arrival_ns {
+            let gap = arrival_ns.saturating_sub(last).max(0);
+            self.avg_gap_ns = if self.avg_gap_ns == 0 {
+                gap
+            } else {
+                self.avg_gap_ns + (gap - self.avg_gap_ns) / 4
+            };
+        }
+        self.last_arrival_ns = Some(arrival_ns);
         self.oldest_arrival_ns.get_or_insert(arrival_ns);
         self.min_ingest_ts_ns = Some(match self.min_ingest_ts_ns {
             Some(m) => m.min(arrival_ns),
@@ -220,10 +256,10 @@ impl TenantBuf {
     /// either.
     ///
     /// No admission decision happens here: the cap is flush-scoped
-    /// (`flush_tenant`), because a cap that outlived a flush would hold an
-    /// unbounded per-series map for the shard's lifetime. Buffering an
-    /// exemplar the flush will drop costs its record width once; keeping the
-    /// cap costs a map entry per series forever.
+    /// (`FlushCtx::admit_exemplars`), because a cap that outlived a flush
+    /// would hold an unbounded per-series map for the shard's lifetime.
+    /// Buffering an exemplar the flush will drop costs its record width
+    /// once; keeping the cap costs a map entry per series forever.
     fn absorb_exemplars(&mut self, exemplars: Vec<IngestExemplar>) -> usize {
         let mut bytes_added = 0usize;
         self.exemplars.reserve(exemplars.len());
@@ -236,279 +272,156 @@ impl TenantBuf {
     }
 }
 
-pub(crate) struct ShardActor {
+/// Bounded-history PUT round-trip tracker feeding the adaptive-delay ceiling
+/// (ADR-0067 decision 3). A simple quantile estimate over the most recent
+/// samples, not an EWMA of the mean: an EWMA-of-mean tracks the typical
+/// case, but the ceiling needs the tail (p99) the ADR names. Fed from
+/// spawned flush tasks (concurrent with each other and with the actor) and
+/// read by the actor's own task (`ShardActor::age_threshold_ns`), so it must
+/// tolerate concurrent writers without becoming a hot-path bottleneck; a
+/// `Mutex` guarding a small bounded `Vec` is cheap enough for both, since it
+/// is touched at most once per PUT attempt, never per message.
+struct RttTracker {
+    samples: Mutex<Vec<i64>>,
+}
+
+impl RttTracker {
+    const CAPACITY: usize = 64;
+
+    fn new() -> Self {
+        RttTracker {
+            samples: Mutex::new(Vec::with_capacity(Self::CAPACITY)),
+        }
+    }
+
+    fn record(&self, sample_ns: i64) {
+        let mut samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if samples.len() == Self::CAPACITY {
+            samples.remove(0);
+        }
+        samples.push(sample_ns);
+    }
+
+    /// The p99 sample over the current window, or `None` with no
+    /// observations yet.
+    fn p99_ns(&self) -> Option<i64> {
+        let samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let idx = sorted
+            .len()
+            .saturating_mul(99)
+            .div_ceil(100)
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
+        Some(sorted[idx])
+    }
+}
+
+/// Strict-mode visibility p99 budget the adaptive ceiling is derived from
+/// (ADR-0067 decision 3, docs/consistency-model.md's strict-mode ack
+/// contract), never a free-standing constant chosen for this feature alone.
+const STRICT_VISIBILITY_BUDGET_NS: i64 = 1_000_000_000;
+
+/// Corridor ceiling for the adaptive age trigger: the strict visibility
+/// budget minus two PUT round trips (data object, then commit record) at
+/// their observed p99, minus one retry's base backoff as headroom, floored
+/// at `floor_ns` so the corridor never inverts. `None` RTT (no observations
+/// yet) collapses the ceiling to `floor_ns`: with nothing measured,
+/// adapting upward would be a guess the budget cannot back, and a bursty
+/// tenant must keep today's behavior from the first flush, not just after
+/// warm-up.
+fn visibility_ceiling_ns(floor_ns: i64, rtt_p99_ns: Option<i64>, retry_headroom_ns: i64) -> i64 {
+    let Some(rtt_p99_ns) = rtt_p99_ns else {
+        return floor_ns;
+    };
+    let ceiling = STRICT_VISIBILITY_BUDGET_NS
+        .saturating_sub(2 * rtt_p99_ns)
+        .saturating_sub(retry_headroom_ns);
+    ceiling.max(floor_ns)
+}
+
+/// The adaptive age threshold for one (shard, tenant): the tenant's observed
+/// inter-arrival gap, clamped into `[floor_ns, ceiling_ns]`. A bursty tenant
+/// (small gap) clamps up to `floor_ns` -- today's fixed 500 ms behavior,
+/// unchanged; a trickle tenant (large gap) clamps down to `ceiling_ns`
+/// instead of waiting indefinitely for a full `target_bytes` batch.
+fn adaptive_age_threshold_ns(avg_gap_ns: i64, floor_ns: i64, ceiling_ns: i64) -> i64 {
+    avg_gap_ns.clamp(floor_ns, ceiling_ns)
+}
+
+/// Everything one flush task needs to encode, PUT twice, and ack, bundled so
+/// it can be handed to a spawned task by move (ADR-0067 decision 1: "no
+/// shared mutable state is introduced"). Built once per shard actor and
+/// shared by every flush's task through an `Arc`; nothing here is mutated
+/// after construction except the interior-mutable [`RttTracker`] and the
+/// atomics inside `metrics`, both already safe for concurrent access from
+/// many in-flight flush tasks at once.
+struct FlushCtx {
     shard: u32,
     signal: Signal,
     writer_id: Uuid,
     epoch: u64,
-    next_seq: u64,
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
     config: IngestConfig,
     metrics: Arc<IngestMetrics>,
-    rx: mpsc::Receiver<ShardMsg>,
-    tenants: HashMap<TenantId, TenantBuf>,
+    rtt: Arc<RttTracker>,
 }
 
-impl ShardActor {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        shard: u32,
-        signal: Signal,
-        writer_id: Uuid,
-        epoch: u64,
-        store: Arc<dyn ObjectStoreBackend>,
-        clock: Arc<dyn Clock>,
-        config: IngestConfig,
-        metrics: Arc<IngestMetrics>,
-        rx: mpsc::Receiver<ShardMsg>,
-    ) -> Self {
-        ShardActor {
-            shard,
-            signal,
-            writer_id,
-            epoch,
-            next_seq: 0,
-            store,
-            clock,
-            config,
-            metrics,
-            rx,
-            tenants: HashMap::new(),
-        }
-    }
+/// One flush's identity and payload, pinned by the actor before the flush
+/// task takes over (docs/catalog-and-mvcc.md "Pinned flush identity"):
+/// `seq`, `ingest_hour_bucket`, and every field derived from the clock are
+/// fixed here and carried verbatim into the task. Nothing in
+/// [`FlushCtx::run_flush`] may re-read the clock or re-derive any of these.
+struct PinnedFlush {
+    tenant_hash: TenantHash,
+    seq: u64,
+    identity: SegmentIdentity,
+    ingest_bounds: IngestBounds,
+    ingest_hour_bucket: u32,
+    flush_open_ns: i64,
+    deadline_ns: i64,
+    min_ingest_ts_ns: i64,
+    max_ingest_ts_ns: i64,
+    series: HashMap<SeriesId, SeriesAccum>,
+    exemplars: Vec<IngestExemplar>,
+    waiters: Vec<Ack>,
+}
 
-    pub(crate) async fn run(mut self) {
-        // The flush-tick cadence runs on the injected `Clock`, not the tokio
-        // timer, so age-based flush timing shares the one clock the age check
-        // itself reads (docs/ingest.md "Shard actor"; finding a8-F04). A test
-        // that advances the injected clock past `max_flush_delay` therefore
-        // drives a flush tick deterministically, with no real sleep.
-        //
-        // `next_tick_ns` is the next tick deadline in injected-clock
-        // nanoseconds, recomputed after every tick. Anchoring the deadline
-        // rather than restarting a relative sleep each loop iteration keeps
-        // the cadence fixed under a burst of writes: a busy shard cannot
-        // starve the age check of a quiet tenant sharing the actor, matching
-        // the old `tokio::time::interval` with `MissedTickBehavior::Delay`.
-        let clock = Arc::clone(&self.clock);
-        let flush_tick_ns = i64::try_from(self.config.flush_tick.as_nanos()).unwrap_or(i64::MAX);
-        let mut next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
-        loop {
-            let until_ns = next_tick_ns.saturating_sub(clock.now_ns()).max(0);
-            let until = Duration::from_nanos(u64::try_from(until_ns).unwrap_or(u64::MAX));
-            tokio::select! {
-                msg = self.rx.recv() => {
-                    match msg {
-                        Some(ShardMsg::Write { tenant, points, exemplars, ack }) => {
-                            self.handle_write(tenant, points, exemplars, ack).await;
-                        }
-                        Some(ShardMsg::FlushNow { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
-                            let _ = done.send(());
-                        }
-                        Some(ShardMsg::Shutdown { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
-                            let _ = done.send(());
-                            break;
-                        }
-                        None => {
-                            // Every `mpsc::Sender` was dropped: the router was
-                            // dropped without `shutdown()` (services/ravel-server
-                            // lib.rs reaches this when `Arc::try_unwrap` fails or
-                            // `Running::shutdown` returns early). A graceful
-                            // teardown is not a crash, and buffered-mode points
-                            // are only permitted to be lost to a crash
-                            // (docs/consistency-model.md "Buffered mode"). Flush
-                            // before breaking so acknowledged points are not
-                            // silently discarded; log first so the close is
-                            // observable even if the flush itself is abandoned
-                            // and counted (docs/ingest.md "Shard actor" step 5).
-                            if !self.tenants.is_empty() {
-                                let (tenant_count, buffered_points) = self.buffered_summary();
-                                tracing::warn!(
-                                    shard = self.shard,
-                                    tenant_count,
-                                    buffered_points,
-                                    "shard actor channel closed without shutdown; \
-                                     flushing buffered tenants before stopping"
-                                );
-                            }
-                            self.flush_all(FlushTrigger::Manual).await;
-                            break;
-                        }
-                    }
-                }
-                _ = clock.sleep(until) => {
-                    self.flush_aged().await;
-                    next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
-                }
-            }
-        }
-    }
-
-    async fn handle_write(
-        &mut self,
-        tenant: TenantId,
-        points: Vec<IngestPoint>,
-        exemplars: Vec<IngestExemplar>,
-        ack: Option<Ack>,
-    ) {
-        if points.is_empty() && exemplars.is_empty() && ack.is_none() {
-            return;
-        }
-        let arrival_ns = self.clock.now_ns();
-        let points_len = points.len() as u64;
-        let target_bytes = self.config.target_bytes;
-
-        let buf = self.tenants.entry(tenant.clone()).or_default();
-        // Merge before enqueuing the waiter: a series-id collision rejects
-        // the whole batch fail-loud (ADR-0005) and leaves the buffer
-        // untouched, so its ack must carry the error rather than ride the
-        // next flush of the surviving series.
-        let mut bytes_added = match buf.merge(points, arrival_ns) {
-            Ok(bytes_added) => bytes_added,
-            Err(err) => {
-                self.metrics.record_series_id_collision();
-                if let Some(ack) = ack {
-                    self.ack_waiters(vec![ack], Err(err));
-                }
-                return;
-            }
-        };
-        bytes_added += buf.absorb_exemplars(exemplars);
-        if let Some(ack) = ack {
-            buf.waiters.push(ack);
-        }
-        self.metrics.record_buffered(bytes_added as u64, points_len);
-
-        let should_flush = self
-            .tenants
-            .get(&tenant)
-            .map(|b| b.est_bytes >= target_bytes)
-            .unwrap_or(false);
-        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
-        }
-    }
-
-    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
-    /// already justifies a PUT on the fast `max_flush_delay` clock; anything
-    /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7, S2-06). Strict-mode ack latency is unaffected:
-    /// a strict write always leaves `waiters` non-empty for its whole flush
-    /// window.
-    fn age_threshold_ns(&self, buf: &TenantBuf) -> i64 {
-        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
-        if has_priority {
-            self.config.max_flush_delay.as_nanos() as i64
-        } else {
-            self.config.max_flush_delay_idle.as_nanos() as i64
-        }
-    }
-
-    async fn flush_aged(&mut self) {
-        let now = self.clock.now_ns();
-        let due: Vec<TenantId> = self
-            .tenants
-            .iter()
-            .filter(|(_, buf)| {
-                buf.oldest_arrival_ns
-                    .map(|t| now.saturating_sub(t) >= self.age_threshold_ns(buf))
-                    .unwrap_or(false)
-            })
-            .map(|(t, _)| t.clone())
-            .collect();
-        for tenant in due {
-            if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
-            }
-        }
-    }
-
-    /// Returns `(tenant_count, buffered_point_count)` across every currently
-    /// buffered tenant, for the channel-close log line. Point count is the
-    /// sum of all buffered samples, matching `record_buffered`'s point unit.
-    fn buffered_summary(&self) -> (usize, u64) {
-        let points: u64 = self
-            .tenants
-            .values()
-            .flat_map(|buf| buf.series.values())
-            .map(|accum| accum.values.len() as u64)
-            .sum();
-        (self.tenants.len(), points)
-    }
-
-    async fn flush_all(&mut self, trigger: FlushTrigger) {
-        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
-        for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, trigger).await;
-            }
-        }
-    }
-
-    /// Runs the full pinned-identity commit sequence for one tenant's
-    /// buffer: `seq`, `ingest_hour_bucket`, the serialized segment, and its
-    /// blake3 hash are each computed exactly once here and reused verbatim
-    /// by every retry inside `put_data_object_with_retry` and
-    /// `publish_with_retry` (docs/catalog-and-mvcc.md "Pinned flush
-    /// identity"). Nothing below may re-serialize, accrete new samples, or
-    /// re-read the clock.
-    async fn flush_tenant(&mut self, tenant: TenantId, buf: TenantBuf, trigger: FlushTrigger) {
-        let TenantBuf {
+impl FlushCtx {
+    /// Runs the full pinned-identity commit sequence for one flush: the
+    /// serialized segment and its blake3 hash are each computed exactly once
+    /// here and reused verbatim by every retry inside
+    /// `put_data_object_with_retry` and `publish_with_retry`
+    /// (docs/catalog-and-mvcc.md "Pinned flush identity"). Nothing below may
+    /// re-serialize, accrete new samples, or re-read the clock for identity
+    /// purposes (RTT sampling inside the retry helpers is the one clock read
+    /// that is not identity-affecting).
+    async fn run_flush(&self, pinned: PinnedFlush) {
+        let PinnedFlush {
+            tenant_hash,
+            seq,
+            identity,
+            ingest_bounds,
+            ingest_hour_bucket,
+            flush_open_ns,
+            deadline_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
             series,
             exemplars,
-            min_ingest_ts_ns,
-            max_ingest_ts_ns,
             waiters,
-            ..
-        } = buf;
-        if series.is_empty() {
-            // Nothing to write. Exemplars without any buffered sample cannot
-            // be written at all (an exemplar points at a measurement), so they
-            // are dropped, and counted so the drop stays visible.
-            if !exemplars.is_empty() {
-                self.metrics.record_exemplars(0, exemplars.len() as u64);
-            }
-            // `waiters` is empty here by construction: the router mints a
-            // strict-mode ack only for a shard that received points, so a
-            // shard holding nothing but exemplars has nobody to answer. If
-            // that ever changes, this returns without acking and the router
-            // reads the dropped oneshot as a dead shard.
-            debug_assert!(waiters.is_empty());
-            return;
-        }
-        self.metrics.record_flush(trigger);
-
-        let tenant_hash = tenant.hash();
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let flush_open_ns = self.clock.now_ns();
-        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
-            Ok(bucket) => bucket,
-            Err(msg) => {
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(WriteError::SegmentBuild(msg)));
-                return;
-            }
-        };
-        let deadline_ns =
-            flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
-
-        let identity = SegmentIdentity {
-            tenant_hash: tenant_hash.0,
-            shard: self.shard,
-            writer_id: self.writer_id.to_string(),
-            writer_epoch: self.epoch,
-            writer_seq: seq,
-        };
-        let min_ingest_ts_ns = min_ingest_ts_ns.unwrap_or(flush_open_ns);
-        let max_ingest_ts_ns = max_ingest_ts_ns.unwrap_or(flush_open_ns);
-        let ingest_bounds = IngestBounds {
-            min_ingest_ts_ns,
-            max_ingest_ts_ns,
-        };
+        } = pinned;
 
         let exemplar_inputs = self.admit_exemplars(exemplars, &series);
 
@@ -669,6 +582,11 @@ impl ShardActor {
         admitted
     }
 
+    /// Acks exactly this flush's own waiters with exactly this flush's own
+    /// result (ADR-0067 decision 1's ack-isolation requirement): `waiters`
+    /// was moved out of this flush's `TenantBuf` at pin time and never
+    /// merged with another flush's, so there is no other waiter list this
+    /// call could reach.
     fn ack_waiters(&self, waiters: Vec<Ack>, result: Result<CommitToken, WriteError>) {
         let ok = result.is_ok();
         self.metrics.record_acks(waiters.len(), ok);
@@ -715,18 +633,29 @@ impl ShardActor {
     /// attempt itself is bounded to `deadline_ns` via `bound_to_deadline`, so
     /// a timeout (like a retryable store error) never retries past the
     /// deadline and is treated exactly like the existing abandonment path.
+    /// Every attempt that actually completes (whether it succeeds or fails)
+    /// feeds its wall time into `self.rtt`, the observed-RTT input to the
+    /// adaptive-delay ceiling (ADR-0067 decision 3); an attempt that never
+    /// completes before `deadline_ns` teaches nothing about RTT and is not
+    /// recorded.
     async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
         let mut attempt: u32 = 0;
         loop {
             let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
-            match self.bound_to_deadline(deadline_ns, call).await {
+            let started_ns = self.clock.now_ns();
+            let outcome = self.bound_to_deadline(deadline_ns, call).await;
+            if outcome.is_some() {
+                self.rtt
+                    .record(self.clock.now_ns().saturating_sub(started_ns));
+            }
+            match outcome {
                 Some(Ok(())) => return true,
                 Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
                     // `put_retry_max_attempts` is the number of retries after
                     // the first attempt (total attempts = this + 1), matching
-                    // `ravel_commit::publish::RetryPolicy`. Check the budget
-                    // before consuming a retry so the first attempt is not
-                    // itself counted against it.
+                    // `ravel_commit::publish::RetryPolicy::max_attempts`'s own
+                    // convention. Check the budget before consuming a retry so
+                    // the first attempt is not itself counted against it.
                     if attempt >= self.config.put_retry_max_attempts
                         || self.clock.now_ns() >= deadline_ns
                     {
@@ -746,7 +675,8 @@ impl ShardActor {
     /// exactly once per call, letting this loop check `deadline_ns` between
     /// attempts (the crate's own internal retry loop has no such hook). Each
     /// attempt itself is bounded to `deadline_ns` via `bound_to_deadline`,
-    /// same as `put_data_object_with_retry`.
+    /// same as `put_data_object_with_retry`, and feeds `self.rtt` the same
+    /// way.
     async fn publish_with_retry(
         &self,
         record: &CommitRecord,
@@ -760,7 +690,13 @@ impl ShardActor {
         let mut attempt: u32 = 0;
         loop {
             let call = publish::publish(self.store.as_ref(), record, &single_attempt);
-            match self.bound_to_deadline(deadline_ns, call).await {
+            let started_ns = self.clock.now_ns();
+            let outcome = self.bound_to_deadline(deadline_ns, call).await;
+            if outcome.is_some() {
+                self.rtt
+                    .record(self.clock.now_ns().saturating_sub(started_ns));
+            }
+            match outcome {
                 Some(Ok(token)) => return Some(token),
                 Some(Err(PublishError::SplitBrain { this, stored })) => {
                     // Identity is pinned at flush open, so this cannot fire
@@ -802,5 +738,440 @@ impl ShardActor {
         // path already uses (`bound_to_deadline`) and a test can drive it
         // deterministically by advancing that clock, with no real sleep.
         self.clock.sleep(Duration::from_millis(jittered_ms)).await;
+    }
+}
+
+/// Handles one reaped flush task's outcome. A panic inside
+/// [`FlushCtx::run_flush`] (the `SplitBrain` panic on a broken pinning
+/// invariant, or any other) must still take this shard actor down with it,
+/// exactly as it did before flush execution moved into its own spawned task
+/// (issue #65 / audit finding a8-F03, `tests/shard_death_observable.rs`):
+/// resuming the unwind here propagates it out of `run()`'s own task, which
+/// drops this actor (and `rx` with it), so the router observes the closed
+/// mailbox and reports `ShardUnavailable` exactly as it did when the flush
+/// ran inline. A task ending by cancellation (never triggered in today's
+/// code; `flushes` is never explicitly aborted) is merely logged, since it
+/// carries no panic payload to propagate.
+fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinError>) {
+    if let Err(join_err) = result {
+        if join_err.is_panic() {
+            std::panic::resume_unwind(join_err.into_panic());
+        }
+        tracing::error!(
+            shard,
+            error = %join_err,
+            "ravel-ingest: flush task ended abnormally (cancelled)"
+        );
+    }
+}
+
+/// RAII in-flight-flush accounting: incremented when a flush task is
+/// spawned, decremented on `Drop` when it ends, including on panic. Moved
+/// into the spawned task itself (not held by the actor) so the decrement
+/// fires exactly once, whenever that task's future is finally dropped,
+/// with no separate bookkeeping the actor could get out of sync with.
+struct InFlightFlushGuard {
+    metrics: Arc<IngestMetrics>,
+    shard: u32,
+}
+
+impl Drop for InFlightFlushGuard {
+    fn drop(&mut self) {
+        self.metrics.record_inflight_flush_delta(self.shard, -1);
+    }
+}
+
+pub(crate) struct ShardActor {
+    shard: u32,
+    writer_id: Uuid,
+    epoch: u64,
+    next_seq: u64,
+    clock: Arc<dyn Clock>,
+    config: IngestConfig,
+    metrics: Arc<IngestMetrics>,
+    /// Shared with `ctx` (both hold the same `Arc`): the actor reads it in
+    /// `age_threshold_ns`, flush tasks spawned from `ctx` write to it after
+    /// every completed PUT attempt.
+    rtt: Arc<RttTracker>,
+    /// Immutable bundle handed by `Arc::clone` to every spawned flush task
+    /// (ADR-0067 decision 1).
+    ctx: Arc<FlushCtx>,
+    /// Bounds concurrently in-flight flush tasks (ADR-0067 decision 2).
+    semaphore: Arc<Semaphore>,
+    /// Tracks spawned flush tasks so `join_all_flushes` can await durability
+    /// before `FlushNow`/`Shutdown`/the channel-close drain return, and so
+    /// the actor loop can opportunistically reap finished ones (the `select!`
+    /// branch in `run`) rather than growing this set for the shard's whole
+    /// lifetime.
+    flushes: JoinSet<()>,
+    rx: mpsc::Receiver<ShardMsg>,
+    tenants: HashMap<TenantId, TenantBuf>,
+}
+
+impl ShardActor {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        shard: u32,
+        signal: Signal,
+        writer_id: Uuid,
+        epoch: u64,
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<dyn Clock>,
+        config: IngestConfig,
+        metrics: Arc<IngestMetrics>,
+        rx: mpsc::Receiver<ShardMsg>,
+    ) -> Self {
+        let rtt = Arc::new(RttTracker::new());
+        let ctx = Arc::new(FlushCtx {
+            shard,
+            signal,
+            writer_id,
+            epoch,
+            store,
+            clock: Arc::clone(&clock),
+            config,
+            metrics: Arc::clone(&metrics),
+            rtt: Arc::clone(&rtt),
+        });
+        ShardActor {
+            shard,
+            writer_id,
+            epoch,
+            next_seq: 0,
+            clock,
+            config,
+            metrics,
+            rtt,
+            ctx,
+            semaphore: Arc::new(Semaphore::new(config.max_inflight_flushes as usize)),
+            flushes: JoinSet::new(),
+            rx,
+            tenants: HashMap::new(),
+        }
+    }
+
+    pub(crate) async fn run(mut self) {
+        // The flush-tick cadence runs on the injected `Clock`, not the tokio
+        // timer, so age-based flush timing shares the one clock the age check
+        // itself reads (docs/ingest.md "Shard actor"; finding a8-F04). A test
+        // that advances the injected clock past `max_flush_delay` therefore
+        // drives a flush tick deterministically, with no real sleep.
+        //
+        // `next_tick_ns` is the next tick deadline in injected-clock
+        // nanoseconds, recomputed after every tick. Anchoring the deadline
+        // rather than restarting a relative sleep each loop iteration keeps
+        // the cadence fixed under a burst of writes: a busy shard cannot
+        // starve the age check of a quiet tenant sharing the actor, matching
+        // the old `tokio::time::interval` with `MissedTickBehavior::Delay`.
+        let clock = Arc::clone(&self.clock);
+        let flush_tick_ns = i64::try_from(self.config.flush_tick.as_nanos()).unwrap_or(i64::MAX);
+        let mut next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
+        loop {
+            let until_ns = next_tick_ns.saturating_sub(clock.now_ns()).max(0);
+            let until = Duration::from_nanos(u64::try_from(until_ns).unwrap_or(u64::MAX));
+            tokio::select! {
+                msg = self.rx.recv() => {
+                    match msg {
+                        Some(ShardMsg::Write { tenant, points, exemplars, ack }) => {
+                            self.handle_write(tenant, points, exemplars, ack).await;
+                        }
+                        Some(ShardMsg::FlushNow { done }) => {
+                            self.flush_all(FlushTrigger::Manual).await;
+                            let _ = done.send(());
+                        }
+                        Some(ShardMsg::Shutdown { done }) => {
+                            self.flush_all(FlushTrigger::Manual).await;
+                            let _ = done.send(());
+                            break;
+                        }
+                        None => {
+                            // Every `mpsc::Sender` was dropped: the router was
+                            // dropped without `shutdown()` (services/ravel-server
+                            // lib.rs reaches this when `Arc::try_unwrap` fails or
+                            // `Running::shutdown` returns early). A graceful
+                            // teardown is not a crash, and buffered-mode points
+                            // are only permitted to be lost to a crash
+                            // (docs/consistency-model.md "Buffered mode"). Flush
+                            // before breaking so acknowledged points are not
+                            // silently discarded; log first so the close is
+                            // observable even if the flush itself is abandoned
+                            // and counted (docs/ingest.md "Shard actor" step 5).
+                            if !self.tenants.is_empty() {
+                                let (tenant_count, buffered_points) = self.buffered_summary();
+                                tracing::warn!(
+                                    shard = self.shard,
+                                    tenant_count,
+                                    buffered_points,
+                                    "shard actor channel closed without shutdown; \
+                                     flushing buffered tenants before stopping"
+                                );
+                            }
+                            self.flush_all(FlushTrigger::Manual).await;
+                            break;
+                        }
+                    }
+                }
+                _ = clock.sleep(until) => {
+                    self.flush_aged().await;
+                    next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
+                }
+                Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
+                    handle_flush_join_result(self.shard, result);
+                }
+            }
+        }
+    }
+
+    async fn handle_write(
+        &mut self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        ack: Option<Ack>,
+    ) {
+        if points.is_empty() && exemplars.is_empty() && ack.is_none() {
+            return;
+        }
+        let arrival_ns = self.clock.now_ns();
+        let points_len = points.len() as u64;
+        let target_bytes = self.config.target_bytes;
+
+        let buf = self.tenants.entry(tenant.clone()).or_default();
+        // Merge before enqueuing the waiter: a series-id collision rejects
+        // the whole batch fail-loud (ADR-0005) and leaves the buffer
+        // untouched, so its ack must carry the error rather than ride the
+        // next flush of the surviving series.
+        let mut bytes_added = match buf.merge(points, arrival_ns) {
+            Ok(bytes_added) => bytes_added,
+            Err(err) => {
+                self.metrics.record_series_id_collision();
+                if let Some(ack) = ack {
+                    self.ctx.ack_waiters(vec![ack], Err(err));
+                }
+                return;
+            }
+        };
+        bytes_added += buf.absorb_exemplars(exemplars);
+        if let Some(ack) = ack {
+            buf.waiters.push(ack);
+        }
+        self.metrics.record_buffered(bytes_added as u64, points_len);
+
+        let should_flush = self
+            .tenants
+            .get(&tenant)
+            .map(|b| b.est_bytes >= target_bytes)
+            .unwrap_or(false);
+        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+        }
+    }
+
+    /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
+    /// already justifies a PUT on the fast age clock; anything else is idle
+    /// and waits for the slower `max_flush_delay_idle` instead (ADR-0051
+    /// section 7, S2-06). Strict-mode ack latency is unaffected: a strict
+    /// write always leaves `waiters` non-empty for its whole flush window.
+    ///
+    /// The fast clock itself is either the fixed `max_flush_delay` (today's
+    /// 500 ms, and always the value used when `adaptive_flush_delay` is
+    /// off) or, with adaptive delay on, a per-tenant threshold within
+    /// `[max_flush_delay, ceiling]` derived from this tenant's observed
+    /// arrival rate and this shard's observed PUT RTT (ADR-0067 decision 3).
+    /// Returns the trigger to record alongside the threshold, so a flush the
+    /// adaptive corridor actually stretched past the floor is distinguished
+    /// from one that used the fixed value (`IngestMetrics`'s
+    /// `flushes_by_age` vs `flushes_by_age_adaptive`).
+    fn age_threshold_ns(&self, buf: &TenantBuf) -> (i64, FlushTrigger) {
+        let has_priority = !buf.waiters.is_empty() || buf.est_bytes >= self.config.min_flush_bytes;
+        if !has_priority {
+            return (
+                self.config.max_flush_delay_idle.as_nanos() as i64,
+                FlushTrigger::Age,
+            );
+        }
+        let floor_ns = self.config.max_flush_delay.as_nanos() as i64;
+        if !self.config.adaptive_flush_delay {
+            return (floor_ns, FlushTrigger::Age);
+        }
+        let retry_headroom_ns = self.config.put_retry_base_delay.as_nanos() as i64;
+        let ceiling_ns = visibility_ceiling_ns(floor_ns, self.rtt.p99_ns(), retry_headroom_ns);
+        let threshold_ns = adaptive_age_threshold_ns(buf.avg_gap_ns, floor_ns, ceiling_ns);
+        let trigger = if threshold_ns > floor_ns {
+            FlushTrigger::AgeAdaptive
+        } else {
+            FlushTrigger::Age
+        };
+        (threshold_ns, trigger)
+    }
+
+    async fn flush_aged(&mut self) {
+        let now = self.clock.now_ns();
+        let due: Vec<(TenantId, FlushTrigger)> = self
+            .tenants
+            .iter()
+            .filter_map(|(tenant, buf)| {
+                let oldest = buf.oldest_arrival_ns?;
+                let (threshold_ns, trigger) = self.age_threshold_ns(buf);
+                if now.saturating_sub(oldest) >= threshold_ns {
+                    Some((tenant.clone(), trigger))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (tenant, trigger) in due {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, trigger).await;
+            }
+        }
+    }
+
+    /// Returns `(tenant_count, buffered_point_count)` across every currently
+    /// buffered tenant, for the channel-close log line. Point count is the
+    /// sum of all buffered samples, matching `record_buffered`'s point unit.
+    fn buffered_summary(&self) -> (usize, u64) {
+        let points: u64 = self
+            .tenants
+            .values()
+            .flat_map(|buf| buf.series.values())
+            .map(|accum| accum.values.len() as u64)
+            .sum();
+        (self.tenants.len(), points)
+    }
+
+    async fn flush_all(&mut self, trigger: FlushTrigger) {
+        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
+        for tenant in tenants {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, trigger).await;
+            }
+        }
+        self.join_all_flushes().await;
+    }
+
+    /// Awaits every spawned flush task, not only ones triggered by this
+    /// call: any still in flight from an earlier size/age trigger too. So a
+    /// caller of `flush_all` (`FlushNow`, `Shutdown`, or the channel-close
+    /// drain) only observes completion once every flush this shard has ever
+    /// opened is durable or abandoned. Without this, pipelining would let
+    /// `Shutdown` return (and the process exit) while an earlier flush's PUT
+    /// was still in flight, silently discarding an acknowledged point --
+    /// docs/consistency-model.md's "Buffered mode" tolerates only crash
+    /// loss, not a graceful shutdown racing its own flushes.
+    async fn join_all_flushes(&mut self) {
+        while let Some(result) = self.flushes.join_next().await {
+            handle_flush_join_result(self.shard, result);
+        }
+    }
+
+    /// Pins `buf`'s flush identity, then moves `buf`'s payload and waiters
+    /// into a task spawned onto [`FlushCtx::run_flush`] (ADR-0067 decision
+    /// 1). Everything up to and including the semaphore acquire runs here,
+    /// on the actor; nothing after it does, so a slow encode or a slow PUT
+    /// never blocks the actor from processing its next message once a
+    /// permit is free (the ADR's "encode leaves the actor task" consequence,
+    /// true even at `max_inflight_flushes == 1`: the actor still returns
+    /// from this call, and therefore drains its channel, the moment the task
+    /// is spawned rather than when that task finishes).
+    ///
+    /// An empty buffer (exemplars only, no samples) never reaches the
+    /// semaphore or a spawned task at all: there is nothing to encode, and a
+    /// flush identity pinned for nothing would burn a `seq` for no object.
+    async fn flush_tenant(&mut self, tenant: TenantId, buf: TenantBuf, trigger: FlushTrigger) {
+        let TenantBuf {
+            series,
+            exemplars,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            waiters,
+            ..
+        } = buf;
+        if series.is_empty() {
+            // Nothing to write. Exemplars without any buffered sample cannot
+            // be written at all (an exemplar points at a measurement), so they
+            // are dropped, and counted so the drop stays visible.
+            if !exemplars.is_empty() {
+                self.metrics.record_exemplars(0, exemplars.len() as u64);
+            }
+            // `waiters` is empty here by construction: the router mints a
+            // strict-mode ack only for a shard that received points, so a
+            // shard holding nothing but exemplars has nobody to answer. If
+            // that ever changes, this returns without acking and the router
+            // reads the dropped oneshot as a dead shard.
+            debug_assert!(waiters.is_empty());
+            return;
+        }
+        self.metrics.record_flush(trigger);
+
+        let tenant_hash = tenant.hash();
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let flush_open_ns = self.clock.now_ns();
+        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
+            Ok(bucket) => bucket,
+            Err(msg) => {
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(waiters, Err(WriteError::SegmentBuild(msg)));
+                return;
+            }
+        };
+        let deadline_ns =
+            flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
+
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: self.shard,
+            writer_id: self.writer_id.to_string(),
+            writer_epoch: self.epoch,
+            writer_seq: seq,
+        };
+        let min_ingest_ts_ns = min_ingest_ts_ns.unwrap_or(flush_open_ns);
+        let max_ingest_ts_ns = max_ingest_ts_ns.unwrap_or(flush_open_ns);
+        let ingest_bounds = IngestBounds {
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+
+        let pinned = PinnedFlush {
+            tenant_hash,
+            seq,
+            identity,
+            ingest_bounds,
+            ingest_hour_bucket,
+            flush_open_ns,
+            deadline_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            series,
+            exemplars,
+            waiters,
+        };
+
+        // ADR-0067 decision 2: the only place a flush trigger blocks. At
+        // `max_inflight_flushes` already-spawned tasks, this await parks
+        // until one ends and releases its permit; because `flush_tenant` is
+        // itself awaited from `handle_write`/`flush_aged`/`flush_all`, that
+        // park keeps the actor from pulling its next channel message,
+        // exactly the backpressure path the bounded mpsc already relies on.
+        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => panic!(
+                "ravel-ingest: flush semaphore closed unexpectedly on shard {}",
+                self.shard
+            ),
+        };
+        self.metrics.record_inflight_flush_delta(self.shard, 1);
+        let guard = InFlightFlushGuard {
+            metrics: Arc::clone(&self.metrics),
+            shard: self.shard,
+        };
+        let ctx = Arc::clone(&self.ctx);
+        self.flushes.spawn(async move {
+            let _permit = permit;
+            let _guard = guard;
+            ctx.run_flush(pinned).await;
+        });
     }
 }

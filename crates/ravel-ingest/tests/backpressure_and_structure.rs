@@ -66,10 +66,18 @@ async fn full_channel_blocks_the_producer_instead_of_growing_memory() {
     // its flush before we start filling the channel behind it.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // Fill the channel to its configured depth with buffered writes; these
-    // should enqueue without blocking since the actor's mailbox still has
-    // room even though the actor itself is stuck flushing.
-    for i in 0..channel_depth {
+    // Fill the channel to its configured depth with buffered writes. This
+    // takes one write more than `channel_depth` under pipelined flushes
+    // (ADR-0067 decision 1): the actor pins the stuck write's flush
+    // identity, moves its buffer into a spawned task, and returns to
+    // `recv()` immediately rather than staying parked inside the PUT
+    // itself. It therefore eagerly dequeues the very next write, hits
+    // `max_inflight_flushes` (default 1, already held by the stuck task)
+    // at that write's own flush trigger, and blocks there -- inside
+    // processing, not in the mailbox. That first post-stall write is
+    // absorbed for free; the mailbox only starts filling from the one
+    // after it, so `channel_depth` more writes enqueue without blocking.
+    for i in 0..=channel_depth {
         let points = vec![make_point(
             &tenant,
             "cpu_usage",
