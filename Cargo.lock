@@ -4780,6 +4780,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-sim"
+version = "0.1.0"
+dependencies = [
+ "rand 0.10.2",
+ "ravel-catalog",
+ "ravel-ingest",
+ "ravel-object-store",
+ "ravel-promql",
+ "ravel-query",
+ "ravel-segment",
+ "ravel-types",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "ravel-sql"
 version = "0.1.0"
 dependencies = [
