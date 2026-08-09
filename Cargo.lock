@@ -4807,6 +4807,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-commit",
  "ravel-ingest",
+ "ravel-maintain",
  "ravel-object-store",
  "ravel-promql",
  "ravel-query",

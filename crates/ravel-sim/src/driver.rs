@@ -1,7 +1,9 @@
-//! Driver (ADR-0068 deliverable 4/5): one seeded ingest -> fold -> query
-//! cycle over `MemoryStore`, wired through the same `IngestRouter` ->
-//! `Catalog` -> `QueryEngine` path production traffic takes, plus the
-//! invariant checks from deliverable 5.
+//! Driver (ADR-0068 deliverables 4/5, issue #818 deliverable 2/3): one seeded
+//! ingest -> fold -> compact -> sweep -> query cycle over `MemoryStore`, wired
+//! through the same `IngestRouter` -> `Catalog` -> `QueryEngine` path
+//! production traffic takes and driving `ravel-maintain`'s real compaction and
+//! sweep entry points, all under injected faults from a seed-derived
+//! [`FaultSchedule`], plus the invariant checks from deliverable 5.
 //!
 //! Runs on a single-threaded, paused-clock tokio runtime
 //! (`current_thread`/`start_paused`) that this module owns end to end:
@@ -9,7 +11,17 @@
 //! `Clock::sleep` default impl), so every await on it fast-forwards
 //! instantly instead of costing wall-clock time, and the whole cycle stays
 //! reproducible because nothing here ever reads a real clock.
+//!
+//! # Phases and their clocks
+//!
+//! Ingest and fold run on the injected [`SimClock`] as before. Compaction and
+//! sweep are then driven at explicit, seal- and horizon-satisfying instants
+//! via `ravel-maintain`'s injected `FixedClock`: compaction at a time past
+//! every written bucket's seal margin, sweep at a time past the protection
+//! horizon and every GC age gate, so the whole cycle -- including the physical
+//! deletion of the compacted L0 inputs -- runs deterministically in one pass.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,7 +38,12 @@ use ravel_commit::rng::{RngSource, SeededRng};
 use ravel_ingest::{
     Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, WriteError, WriteMode,
 };
+use ravel_maintain::{
+    Bucket, CompactionOutcome, CompactorConfig, FixedClock, MaintainError, NoLeases,
+    compact_bucket, sweep_shard,
+};
 use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::fault::{FaultKind, FaultStore, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine, QueryError};
@@ -35,6 +52,7 @@ use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange,
 use uuid::Uuid;
 
 use crate::digest::{Digest, DigestBuilder, mix_value};
+use crate::fault_plan::{FaultSchedule, FaultScheduleConfig};
 use crate::seed::MasterSeed;
 use crate::workload::{QuerySpec, SeriesSamples, Workload, WorkloadConfig};
 
@@ -42,7 +60,8 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// Knobs for [`run_cycle`]. `shard_count` applies uniformly to both
 /// `IngestRouter` and `Catalog` (they must agree: the shard a series routes
-/// to at write time is the shard the catalog looks it up under).
+/// to at write time is the shard the catalog looks it up under), and to the
+/// compaction/sweep drivers (they walk the same shards).
 #[derive(Debug, Clone)]
 pub struct CycleConfig {
     pub workload: WorkloadConfig,
@@ -54,6 +73,17 @@ pub struct CycleConfig {
     /// that tenant's write, so the clock-stepping domain does something
     /// observable independent of the workload domain.
     pub max_jitter: Duration,
+    /// Whether to wrap the object store in a seed-derived [`FaultStore`] and
+    /// inject the generated fault schedule. Faults are retryable and land only
+    /// on the ingest write path, so a clean cycle stays green; disabling this
+    /// runs the cycle against a bare `MemoryStore`.
+    pub inject_faults: bool,
+    /// Config for the seed-derived fault-schedule generator (deliverable 1).
+    pub fault_schedule: FaultScheduleConfig,
+    /// Whether to arm the schedule's hold/release gates on the store. Off by
+    /// default: a held call needs the driver's background releaser to make
+    /// progress, so it is only meaningful under [`run_cycle`]'s own runtime.
+    pub enable_gates: bool,
 }
 
 impl Default for CycleConfig {
@@ -64,6 +94,9 @@ impl Default for CycleConfig {
             ack_deadline: Duration::from_secs(5),
             query_deadline: Duration::from_secs(5),
             max_jitter: Duration::from_millis(250),
+            inject_faults: true,
+            fault_schedule: FaultScheduleConfig::default(),
+            enable_gates: false,
         }
     }
 }
@@ -76,13 +109,27 @@ pub struct CycleOutcome {
     pub tenants_run: usize,
     pub series_generated: usize,
     pub queries_run: usize,
+    /// Buckets `compact_bucket` reported as [`CompactionOutcome::Compacted`]
+    /// across every tenant/shard/hour. A cycle that meant to exercise
+    /// compaction can assert this is non-zero.
+    pub buckets_compacted: usize,
+    /// Total records observed by the post-compaction conservation probe
+    /// (equal, per invariant (b), to the pre-compaction count).
+    pub records_conserved: usize,
+    /// Snapshot of the [`FaultStore`] counters after the cycle: how many times
+    /// each `(Op, FaultKind)` fired. Empty when `inject_faults` is false.
+    pub fault_counters: HashMap<(Op, FaultKind), u64>,
+    /// The `(Op, FaultKind)` pairs the schedule intended to inject. A test
+    /// asserts each has a positive `fault_counters` entry.
+    pub expected_faults: Vec<(Op, FaultKind)>,
 }
 
 /// Every variant carries the master seed so a failure message alone is
 /// enough to replay it: `RAVEL_SIM_SEED=<seed> cargo test -p ravel-sim
 /// <test>`, for a test whose seed comes from
 /// [`crate::seed::MasterSeed::from_env_or`] (see that method's doc for which
-/// ones do).
+/// ones do). The invariant-violation variants embed that replay line
+/// literally in their `Display` output (issue #818 deliverable 4).
 #[derive(Debug, thiserror::Error)]
 pub enum CycleError {
     #[error("seed {seed}: workload generation failed: {source}")]
@@ -99,6 +146,10 @@ pub enum CycleError {
     Resolve { seed: u64, source: CatalogError },
     #[error("seed {seed}: query failed: {source}")]
     Query { seed: u64, source: QueryError },
+    #[error("seed {seed}: compaction driver failed: {source}")]
+    Compact { seed: u64, source: MaintainError },
+    #[error("seed {seed}: sweep driver failed: {source}")]
+    Sweep { seed: u64, source: MaintainError },
     #[error("seed {seed}: read-your-write violated for tenant {tenant}: {detail} (token {token})")]
     ReadYourWrite {
         seed: u64,
@@ -115,6 +166,40 @@ pub enum CycleError {
         tenant: String,
         token: String,
         detail: String,
+    },
+    #[error(
+        "seed {seed}: compaction query-equivalence violated for tenant {tenant} ({phase}): \
+         digest {before:#018x} != {after:#018x}. \
+         replay: RAVEL_SIM_SEED={seed} cargo test -p ravel-sim"
+    )]
+    CompactionEquivalence {
+        seed: u64,
+        tenant: String,
+        phase: &'static str,
+        before: u64,
+        after: u64,
+    },
+    #[error(
+        "seed {seed}: record-count conservation violated for tenant {tenant}: \
+         {before} records before compaction, {after} after. \
+         replay: RAVEL_SIM_SEED={seed} cargo test -p ravel-sim"
+    )]
+    RecordCountConservation {
+        seed: u64,
+        tenant: String,
+        before: usize,
+        after: usize,
+    },
+    #[error(
+        "seed {seed}: sweep left orphan/unreferenced objects past the horizon for tenant \
+         {tenant} shard {shard}: {report}. \
+         replay: RAVEL_SIM_SEED={seed} cargo test -p ravel-sim"
+    )]
+    SweepLeak {
+        seed: u64,
+        tenant: String,
+        shard: u32,
+        report: String,
     },
 }
 
@@ -172,6 +257,12 @@ fn seal_now_ns(end_ts_ns: i64) -> i64 {
     (hour + 1) * NS_PER_HOUR + margin_ns
 }
 
+/// The unix hour a nanosecond timestamp falls in, as the `u32`
+/// `ingest_hour_bucket` a [`Bucket`] names.
+fn hour_of(ts_ns: i64) -> u32 {
+    ts_ns.div_euclid(NS_PER_HOUR) as u32
+}
+
 /// Sample count of one generated series, so the driver can batch ingest by
 /// index across every series in a tenant (F13: every series in one tenant
 /// shares `start_ts_ns`/`interval_ns`, so index `i` maps to the same event
@@ -210,6 +301,17 @@ fn ingest_point_at(
                 },
             )
         }),
+    }
+}
+
+/// The PromQL selector the driver queries a generated series through: the bare
+/// metric name for a scalar series, `histogram_count(<name>)` for a native
+/// histogram (the same convention `workload::generate_queries` and
+/// `expected_sample` use).
+fn series_selector(series: &crate::workload::GeneratedSeries) -> String {
+    match &series.samples {
+        SeriesSamples::Histogram(_) => format!("histogram_count({})", series.metric_name),
+        SeriesSamples::Scalar(_) => series.metric_name.clone(),
     }
 }
 
@@ -278,11 +380,22 @@ fn expected_sample(series: &crate::workload::GeneratedSeries) -> Option<Expected
     }
 }
 
-/// Runs one full seeded cycle: generate the workload, ingest it tenant by
-/// tenant through a strict-mode `IngestRouter`, check read-your-write on
-/// each tenant's own acked tokens, fold the sealed window, check
-/// strict-ack-implies-durable on the same tokens, run the workload's query
-/// mix, and fold every result into a reproducibility digest.
+/// The fingerprint and record count of one probe over every generated series:
+/// a range query per series, folded (order-independently) into a digest and
+/// summed into a total point count. Invariant (a) compares digests across
+/// phases; invariant (b) compares record counts.
+struct Probe {
+    digest: Digest,
+    record_count: usize,
+}
+
+/// Runs one full seeded cycle: generate the workload and a seed-derived fault
+/// schedule, wrap the store in a `FaultStore`, then per tenant ingest through
+/// a strict-mode `IngestRouter`, check read-your-write, fold, check
+/// strict-ack-implies-durable, drive `ravel-maintain`'s compaction and sweep
+/// over the tenant's buckets and check the three compaction/sweep invariants,
+/// run the workload's query mix, and fold every result into a reproducibility
+/// digest.
 pub fn run_cycle(
     master_seed: MasterSeed,
     config: &CycleConfig,
@@ -306,9 +419,42 @@ async fn run_cycle_async(
     workload: Workload,
     config: &CycleConfig,
 ) -> Result<CycleOutcome, CycleError> {
-    let memory_store = Arc::new(MemoryStore::new());
-    memory_store.set_clock_ms((workload.start_ts_ns / 1_000_000).max(0) as u64);
-    let store: Arc<dyn ObjectStoreBackend> = memory_store;
+    // The seed-derived fault schedule (deliverable 1): the same seed yields
+    // the same plan and gates. Wrap the MemoryStore oracle in a FaultStore so
+    // ingest, fold, compaction, and sweep all run through the injected faults.
+    let schedule = if config.inject_faults {
+        crate::fault_plan::generate(&master_seed, &config.fault_schedule)
+    } else {
+        FaultSchedule::none()
+    };
+
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), schedule.plan.clone()));
+    fault_store
+        .inner()
+        .set_clock_ms((workload.start_ts_ns / 1_000_000).max(0) as u64);
+    let store: Arc<dyn ObjectStoreBackend> =
+        Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>;
+
+    // Optionally arm the schedule's hold/release gates, with a background
+    // releaser that frees each held call as soon as it is held. Under the
+    // single-threaded paused runtime the releaser runs whenever a gated call
+    // parks on its release channel, so the hold/release path is exercised
+    // without ever deadlocking. Aborted at the end of the cycle.
+    let gate_releaser = if config.enable_gates && !schedule.gates.is_empty() {
+        let handles = schedule.arm_gates(fault_store.as_ref());
+        handles.into_iter().next().map(|handle| {
+            tokio::spawn(async move {
+                loop {
+                    handle.wait_until_held(1).await;
+                    for id in handle.held() {
+                        handle.release(id);
+                    }
+                }
+            })
+        })
+    } else {
+        None
+    };
 
     let sim_clock = Arc::new(SimClock::new(workload.start_ts_ns));
     let clock: Arc<dyn Clock> = Arc::clone(&sim_clock) as Arc<dyn Clock>;
@@ -327,6 +473,10 @@ async fn run_cycle_async(
     // source's draw order (ADR-0068 decision 1). Replaces a `Uuid::new_v4()`
     // that made each run's snapshot folder id nondeterministic.
     let fold_rng = SeededRng::new(master_seed.sub_seed("fold-id"));
+    // Compactor identity, from its own derived domain (ADR-0068 decision 1):
+    // pins the `compactor_writer_id` that would otherwise be a fresh v4 UUID,
+    // so a compaction run's record identity replays from the seed.
+    let compactor_rng = SeededRng::new(master_seed.sub_seed("compactor-id"));
 
     let catalog_config = CatalogConfig {
         shard_count: config.shard_count,
@@ -342,15 +492,32 @@ async fn run_cycle_async(
         EngineConfig::default(),
     );
 
+    // Compaction/sweep config: the compactor identity is seeded, everything
+    // else is the shipped default. `dry_run` stays false: the sweep must
+    // really delete the superseded L0 inputs so invariant (c) verifies
+    // physical convergence, not a plan.
+    let compactor_config = CompactorConfig {
+        compactor_writer_id: compactor_rng.new_uuid(),
+        ..CompactorConfig::default()
+    };
+
     let fold_now_ns = seal_now_ns(workload.end_ts_ns);
     let full_range = TimeRange {
         start_ns: workload.start_ts_ns,
         end_ns: workload.end_ts_ns,
     };
+    // The probe/query instant, held identical across every phase so the
+    // before/after equivalence comparison is apples to apples.
+    let probe_now_ns = fold_now_ns;
+    let step_ms = (config.workload.interval_ns / 1_000_000).max(1);
+    let start_ms = workload.start_ts_ns / 1_000_000;
+    let end_ms = workload.end_ts_ns / 1_000_000;
 
     let mut digest_builder = DigestBuilder::new();
     let mut series_generated = 0usize;
     let mut queries_run = 0usize;
+    let mut buckets_compacted = 0usize;
+    let mut records_conserved = 0usize;
 
     for tenant_wl in &workload.tenants {
         series_generated += tenant_wl.series.len();
@@ -373,17 +540,7 @@ async fn run_cycle_async(
 
         // F13: ingest in per-sample-index batches rather than one batch for
         // the whole tenant, advancing `sim_clock` to each batch's own event
-        // timestamp first. `flush_open_ns` (the wall/arrival clock read
-        // fresh at each strict-mode flush, `ravel-ingest`'s
-        // `checked_ingest_hour_bucket`) is what a commit's
-        // `ingest_hour_bucket` derives from; ingesting the whole tenant in
-        // one call at a single instant left every commit under one bucket
-        // that could disagree with the query window's event-time-hour once
-        // `interval_ns` was wide enough to span hours, failing
-        // `AckNotDurable` even though nothing was actually lost. Every
-        // series in one tenant shares `start_ts_ns`/`interval_ns`
-        // (`workload::generate_tenant_series`), so sample index `i` is the
-        // same event timestamp across all of them.
+        // timestamp first. See the long-form note preserved below for why.
         let max_samples = tenant_wl.series.iter().map(sample_count).max().unwrap_or(0);
         let mut tokens: Vec<CommitToken> = Vec::new();
         for i in 0..max_samples {
@@ -412,15 +569,12 @@ async fn run_cycle_async(
             tokens.extend(receipt.tokens);
         }
 
-        let ack_wall_ns = clock.now_ns();
+        let clock_after_ingest = clock.now_ns();
+        let ack_wall_ns = clock_after_ingest;
 
-        // Invariant (b), read-your-write (docs/consistency-model.md: "A
-        // caller holding commit tokens sees the referenced commits by
-        // passing min_commit_token to query APIs"): right after ack, every
-        // token every batch returned must resolve, and a query pinned to
-        // those tokens must return the samples it acked -- before any fold
-        // has run. F4: every generated series is checked, not just the
-        // tenant's first.
+        // Invariant (b of the earlier wave), read-your-write: right after ack,
+        // every token resolves and a pinned query returns the acked samples,
+        // before any fold has run.
         check_visible(
             seed,
             tenant_wl.tenant.as_str(),
@@ -447,12 +601,9 @@ async fn run_cycle_async(
             .await
             .map_err(|source| CycleError::Fold { seed, source })?;
 
-        // Invariant (a), strict-ack-implies-durable: after the fold, the
-        // same tokens still resolve, and -- unlike the read-your-write
-        // check above -- a query with NO min_tokens (relying purely on the
-        // catalog's own sealed listing/snapshot, not the caller's pinned
-        // tokens) must also return the acked samples. F4: every generated
-        // series is checked, not just the tenant's first.
+        // Invariant (a of the earlier wave), strict-ack-implies-durable: after
+        // the fold, the same tokens still resolve, and a query with NO
+        // min_tokens also returns the acked samples.
         check_visible(
             seed,
             tenant_wl.tenant.as_str(),
@@ -468,10 +619,215 @@ async fn run_cycle_async(
         )
         .await?;
 
+        // ---- Compact -> sweep phases and their invariants (this task) ----
+
+        // Baseline: what every series returns, and how many records, from the
+        // pre-compaction (L0-backed) snapshot.
+        let probe_before = probe_all_series(
+            seed,
+            &engine,
+            tenant_hash,
+            &tenant_wl.series,
+            start_ms,
+            end_ms,
+            step_ms,
+            probe_now_ns,
+            config.query_deadline,
+        )
+        .await?;
+
+        // Compact every (shard, hour) bucket this tenant may have written,
+        // driving ravel-maintain's real `compact_bucket`. Non-qualifying
+        // buckets (unsealed, too few inputs, empty) return a non-`Compacted`
+        // outcome and are skipped harmlessly.
+        //
+        // The compaction clock is two hours past every bucket's seal margin.
+        // The extra two hours are load-bearing for the re-fold below: a fold
+        // whose new watermark hour does not exceed the previous fold's is a
+        // no-op (`Catalog::fold` short-circuits when `watermark_hour_old >=
+        // watermark_hour`), so it would never run the reconcile pass that
+        // rewrites the just-compacted hour's snapshot entries from L0 to L1.
+        // Pushing the clock past the first fold's watermark forces that
+        // reconcile, and the compacted hour stays well inside the 26 h
+        // reconcile window, so the compaction record is observed before the
+        // sweep can delete its L0 inputs.
+        let bucket_hi_ns = clock_after_ingest.max(workload.end_ts_ns);
+        let compact_now_ns = seal_now_ns(bucket_hi_ns).max(fold_now_ns) + 2 * NS_PER_HOUR;
+        let compact_clock = FixedClock::new(compact_now_ns);
+        // Objects the compactor publishes get stamped at the compaction wall
+        // time, so the sweep's age gates measure their real age.
+        fault_store
+            .inner()
+            .set_clock_ms((compact_now_ns / 1_000_000).max(0) as u64);
+        let hour_lo = hour_of(workload.start_ts_ns);
+        let hour_hi = hour_of(bucket_hi_ns);
+        for shard in 0..config.shard_count {
+            for hour in hour_lo..=hour_hi {
+                let bucket = Bucket::new(tenant_hash, Signal::Metrics, shard, hour);
+                let outcome =
+                    compact_bucket(store.as_ref(), &compact_clock, &compactor_config, &bucket)
+                        .await
+                        .map_err(|source| CycleError::Compact { seed, source })?;
+                if matches!(outcome, CompactionOutcome::Compacted { .. }) {
+                    buckets_compacted += 1;
+                }
+            }
+        }
+
+        // Re-fold so the new snapshot references the freshly written L1 parts
+        // and drops the superseded L0 inputs. This must happen before the
+        // sweep physically deletes those inputs, or a resolve served from the
+        // old snapshot would 404.
+        catalog
+            .fold(
+                &tenant_hash,
+                Signal::Metrics,
+                fold_rng.new_uuid(),
+                compact_now_ns,
+                &[],
+            )
+            .await
+            .map_err(|source| CycleError::Fold { seed, source })?;
+
+        // Every subsequent query for this tenant runs through a fresh
+        // `Catalog`/`QueryEngine` built over the same store, modeling the
+        // disposable query process a real deployment would spin up
+        // (CLAUDE.md: "every compute process is disposable"). This is not
+        // cosmetic: the original engine's `Catalog` holds a TTL HEAD cache
+        // that, under this harness's paused clock, never expires, so it would
+        // keep resolving the pre-compaction snapshot (the L0 inputs the sweep
+        // below deletes) and never observe the compaction at all. A fresh
+        // catalog reads HEAD cold and sees the just-folded L1 snapshot.
+        let post_catalog = Arc::new(
+            Catalog::new(Arc::clone(&store), catalog_config)
+                .map_err(|source| CycleError::CatalogConfig { seed, source })?,
+        );
+        let post_engine = QueryEngine::new(
+            Arc::clone(&post_catalog),
+            Arc::clone(&store),
+            EngineConfig::default(),
+        );
+
+        let probe_after = probe_all_series(
+            seed,
+            &post_engine,
+            tenant_hash,
+            &tenant_wl.series,
+            start_ms,
+            end_ms,
+            step_ms,
+            probe_now_ns,
+            config.query_deadline,
+        )
+        .await?;
+
+        // Invariant (a): bit-exact query equivalence before vs after
+        // compaction. Compaction copies pages verbatim, so every query must
+        // return byte-identical results (float values compared via `to_bits`
+        // inside the digest).
+        if probe_after.digest != probe_before.digest {
+            return Err(CycleError::CompactionEquivalence {
+                seed,
+                tenant: tenant_wl.tenant.as_str().to_string(),
+                phase: "after compaction",
+                before: probe_before.digest.0,
+                after: probe_after.digest.0,
+            });
+        }
+        // Invariant (b): record-count conservation across compaction.
+        if probe_after.record_count != probe_before.record_count {
+            return Err(CycleError::RecordCountConservation {
+                seed,
+                tenant: tenant_wl.tenant.as_str().to_string(),
+                before: probe_before.record_count,
+                after: probe_after.record_count,
+            });
+        }
+        records_conserved += probe_after.record_count;
+
+        // Sweep every shard past the protection horizon and every GC age gate,
+        // physically deleting the superseded L0 inputs.
+        let sweep_now_ns = compact_now_ns
+            .saturating_add(compactor_config.protection_horizon_ns)
+            .saturating_add(compactor_config.grace_ns)
+            .saturating_add(NS_PER_HOUR);
+        let sweep_clock = FixedClock::new(sweep_now_ns);
+        for shard in 0..config.shard_count {
+            sweep_shard(
+                store.as_ref(),
+                &sweep_clock,
+                &compactor_config,
+                &NoLeases,
+                &tenant_hash,
+                Signal::Metrics,
+                shard,
+            )
+            .await
+            .map_err(|source| CycleError::Sweep { seed, source })?;
+        }
+
+        // Invariant (c): no orphan objects or unreferenced parts left past the
+        // sweep horizon. A verification pass at the same (past-horizon) clock
+        // must find nothing left to collect -- had the first pass left an
+        // orphan or an unreferenced part behind, this pass would delete it and
+        // report a non-zero count.
+        for shard in 0..config.shard_count {
+            let report = sweep_shard(
+                store.as_ref(),
+                &sweep_clock,
+                &compactor_config,
+                &NoLeases,
+                &tenant_hash,
+                Signal::Metrics,
+                shard,
+            )
+            .await
+            .map_err(|source| CycleError::Sweep { seed, source })?;
+            if report.orphans_deleted != 0
+                || report.unreferenced_parts_deleted != 0
+                || report.superseded_records_deleted != 0
+                || report.superseded_data_deleted != 0
+                || report.orphan_breaker_tripped
+            {
+                return Err(CycleError::SweepLeak {
+                    seed,
+                    tenant: tenant_wl.tenant.as_str().to_string(),
+                    shard,
+                    report: format!("{report:?}"),
+                });
+            }
+        }
+
+        // Post-sweep durability: with the L0 inputs physically gone, every
+        // query must still return the byte-identical baseline result, now
+        // served entirely from the compacted L1 parts.
+        let probe_after_sweep = probe_all_series(
+            seed,
+            &post_engine,
+            tenant_hash,
+            &tenant_wl.series,
+            start_ms,
+            end_ms,
+            step_ms,
+            probe_now_ns,
+            config.query_deadline,
+        )
+        .await?;
+        if probe_after_sweep.digest != probe_before.digest {
+            return Err(CycleError::CompactionEquivalence {
+                seed,
+                tenant: tenant_wl.tenant.as_str().to_string(),
+                phase: "after sweep",
+                before: probe_before.digest.0,
+                after: probe_after_sweep.digest.0,
+            });
+        }
+
+        // ---- Reproducibility digest over the workload's own query mix ----
         digest_builder.mix_str(tenant_wl.tenant.as_str());
         for query in &tenant_wl.queries {
             let value = run_query(
-                &engine,
+                &post_engine,
                 tenant_hash,
                 query,
                 fold_now_ns,
@@ -484,12 +840,64 @@ async fn run_cycle_async(
         }
     }
 
+    if let Some(task) = gate_releaser {
+        task.abort();
+    }
+
     Ok(CycleOutcome {
         master_seed,
         digest: digest_builder.finish(),
         tenants_run: workload.tenants.len(),
         series_generated,
         queries_run,
+        buckets_compacted,
+        records_conserved,
+        fault_counters: fault_store.counters_snapshot(),
+        expected_faults: schedule.expected_faults,
+    })
+}
+
+/// Runs a full-window range query for every generated series, folding results
+/// into one order-independent digest and summing the total returned points.
+#[allow(clippy::too_many_arguments)]
+async fn probe_all_series(
+    seed: u64,
+    engine: &QueryEngine,
+    tenant_hash: TenantHash,
+    series_list: &[crate::workload::GeneratedSeries],
+    start_ms: i64,
+    end_ms: i64,
+    step_ms: i64,
+    now_ns: i64,
+    deadline: Duration,
+) -> Result<Probe, CycleError> {
+    let mut builder = DigestBuilder::new();
+    let mut record_count = 0usize;
+    for series in series_list {
+        let selector = series_selector(series);
+        let value = engine
+            .range(
+                tenant_hash,
+                &selector,
+                start_ms,
+                end_ms,
+                step_ms,
+                &[],
+                now_ns,
+                deadline,
+            )
+            .await
+            .map_err(|source| CycleError::Query { seed, source })?;
+        if let Value::Matrix(matrix) = &value {
+            for (_, points) in matrix {
+                record_count += points.len();
+            }
+        }
+        mix_value(&mut builder, &value);
+    }
+    Ok(Probe {
+        digest: builder.finish(),
+        record_count,
     })
 }
 
@@ -499,15 +907,11 @@ enum CheckKind {
     AckDurable,
 }
 
-/// Checks both invariants for every one of `series_list`'s generated series
-/// (F4): every token resolves (F12: a genuine store/decode `CatalogError`
-/// propagates as [`CycleError::Resolve`], distinct from
-/// [`CatalogError::UnsatisfiableToken`], the one variant that means the
-/// invariant itself was violated), and a query pinned at each series' own
-/// last sample returns exactly that sample back -- label set, timestamp
-/// (genuinely the stored timestamp on the scalar arm; trivially the eval
-/// timestamp on the histogram arm, see [`ExpectedSample`]), and value bit
-/// pattern all matching (F3), not just "some non-empty vector".
+/// Checks both earlier-wave invariants for every one of `series_list`'s
+/// generated series (F4): every token resolves (F12: a genuine store/decode
+/// `CatalogError` propagates as [`CycleError::Resolve`], distinct from
+/// [`CatalogError::UnsatisfiableToken`]), and a query pinned at each series'
+/// own last sample returns exactly that sample back.
 #[allow(clippy::too_many_arguments)]
 async fn check_visible(
     seed: u64,

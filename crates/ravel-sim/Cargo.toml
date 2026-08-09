@@ -11,6 +11,7 @@ ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-ingest = { workspace = true }
+ravel-maintain = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-query = { workspace = true }
