@@ -183,6 +183,14 @@ connection, a pushed-but-broken main).
   the `verify-dispatch` skill, which adds narrow adversarial checks on
   top) before merging any fleet result — a crate-scoped or warm-cache
   gate run has let a broken branch through before.
+- `scripts/affected-tests.sh [-n] -p CRATE [-p CRATE ...]` — runs tests
+  for the named crates plus every workspace crate that depends on them
+  (transitively), with the `ci` cargo profile; `-n` prints the affected
+  set without running. This is the executor-side test gate in fleet
+  specs: full-workspace tests still run at merge time
+  (verify-dispatch-gates.sh and PR CI), so executors only pay for the
+  blast radius of their change. Doctests included (nextest skips them,
+  the script runs them separately).
 
 ### Writing gate and poll shell
 
