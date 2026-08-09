@@ -286,10 +286,23 @@ impl AuditCtx {
 enum AuditPhase {
     /// Passing batches through from the inner encoded stream.
     Streaming,
-    /// The inner stream reached its terminal event; the audit event is in
+    /// The inner stream ended cleanly (terminal `None`); the audit event is in
     /// flight and its durability is being awaited before the client observes
     /// the stream's end.
     Flushing(Pin<Box<dyn Future<Output = ravel_maintain::Result<()>> + Send>>),
+    /// The inner stream yielded an error item (terminal on a real transport:
+    /// tonic's server-role `EncodeBody` ends the body on the first `Err` and
+    /// never polls again). The audit event is in flight and its durability is
+    /// being awaited before the client observes the error; once the flush
+    /// resolves, the carried original stream error `Status` is yielded to the
+    /// client (never the flush's own error -- see the poll impl). This mirrors
+    /// `Flushing`'s await-before-yield discipline for the error path, so the
+    /// audit is submitted and awaited inline rather than fire-and-forget from
+    /// `Drop` (issue #413, ADR-0062 §2a).
+    FlushingError(
+        Pin<Box<dyn Future<Output = ravel_maintain::Result<()>> + Send>>,
+        Status,
+    ),
     /// The stream is exhausted.
     Done,
 }
@@ -306,6 +319,15 @@ enum AuditPhase {
 /// `audit_mode=required` a flush failure turns the stream's end into a trailing
 /// `Unavailable` error so the client fails closed rather than believing an
 /// unaudited query succeeded.
+///
+/// The error path is awaited inline just like the success path: a mid-stream
+/// error is the terminal event on a real transport (tonic's server-role
+/// `EncodeBody` stops polling after the first `Err`), so the `Error` audit is
+/// submitted and its durability awaited before that error item is released to
+/// the client, rather than being left to `Drop`'s detached best-effort task
+/// (which would race the response). `Drop` remains only for the one path that
+/// genuinely cannot await -- client cancellation, where no response is left to
+/// gate.
 struct AuditedStream {
     inner: DoGetStream,
     /// The audit context, taken when the audit begins (terminal event) or when
@@ -347,12 +369,51 @@ impl Stream for AuditedStream {
                         return Poll::Ready(Some(Err(Status::unavailable(AUDIT_UNAVAILABLE_MSG))));
                     }
                 },
+                AuditPhase::FlushingError(fut, _) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    // The audit for the failed query is now durable. Yield the
+                    // ORIGINAL stream error to the client, whether the flush
+                    // itself succeeded or failed: the client is already being
+                    // handed a real error, so the success-path fail-closed
+                    // `Unavailable` substitution does not apply here. Take the
+                    // carried `Status` out by replacing the phase with `Done`.
+                    Poll::Ready(_) => {
+                        let AuditPhase::FlushingError(_, status) =
+                            std::mem::replace(&mut this.phase, AuditPhase::Done)
+                        else {
+                            unreachable!("phase is FlushingError in this arm")
+                        };
+                        return Poll::Ready(Some(Err(status)));
+                    }
+                },
                 AuditPhase::Streaming => match this.inner.poll_next_unpin(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Ok(batch))) => return Poll::Ready(Some(Ok(batch))),
                     Poll::Ready(Some(Err(status))) => {
+                        // A mid-stream error is the true terminal event on a
+                        // real transport (tonic's server-role `EncodeBody` ends
+                        // the body on the first `Err` and never polls again), so
+                        // this is where the query's outcome must be audited and
+                        // its durability awaited -- not later from `Drop`'s
+                        // detached, unawaited task, which races the response the
+                        // client has already received (issue #413, ADR-0062
+                        // §2a). Follow the same await-before-yield discipline as
+                        // the terminal-`None` success path: take `ctx`, submit
+                        // the `Error` audit, and hold the original `status` in
+                        // `FlushingError` to yield once the flush resolves.
                         this.saw_error = true;
-                        return Poll::Ready(Some(Err(status)));
+                        let Some(ctx) = this.ctx.take() else {
+                            // `ctx` already consumed (defensive: unreachable on
+                            // a live poll path, since a terminal event is seen
+                            // at most once). Nothing left to audit inline.
+                            return Poll::Ready(Some(Err(status)));
+                        };
+                        let event = ctx.event(QueryStatus::Error);
+                        let sink = Arc::clone(&ctx.sink);
+                        this.phase = AuditPhase::FlushingError(
+                            Box::pin(async move { sink.submit(event).await }),
+                            status,
+                        );
                     }
                     Poll::Ready(None) => {
                         // Terminal: submit the audit with the real outcome and
@@ -578,11 +639,20 @@ mod tests {
         Box::pin(futures::stream::iter(items))
     }
 
-    /// Drain a whole stream, returning the ordered items.
+    /// Drain a stream the way a real transport consumes it: pull items until
+    /// the first `Err`, then stop. tonic's server-role `EncodeBody` ends the
+    /// response body on the first `Err` item and never polls the stream again,
+    /// so a test that kept polling past an error would exercise a terminal
+    /// `None` branch no live client ever reaches -- and would let an audit that
+    /// only fires on that unreachable branch masquerade as covered.
     async fn drain(mut stream: DoGetStream) -> Vec<Result<FlightData, Status>> {
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
+            let is_err = item.is_err();
             out.push(item);
+            if is_err {
+                break;
+            }
         }
         out
     }
@@ -641,6 +711,58 @@ mod tests {
             status_text(&guard[0]),
             "ERROR",
             "a stream that failed partway must record error, not a blind ok"
+        );
+    }
+
+    /// The regression guard for the mid-stream-error fire-and-forget bug: under
+    /// real-transport consumption (poll until the first `Err`, then stop -- the
+    /// way tonic's server-role `EncodeBody` does), the `Error` audit must be
+    /// submitted AND awaited by the time the client observes that error item,
+    /// not deferred to `Drop`'s detached task.
+    ///
+    /// This fails on the unfixed code: there the error item was returned from
+    /// `poll_next` immediately, with the audit only ever submitted later from
+    /// `Drop`'s unawaited `handle.spawn`, so `events` is still empty at the
+    /// moment the error is observed. The stream is deliberately NOT dropped and
+    /// no yield point is crossed before the assertion, so a racing `Drop`
+    /// submission cannot make it pass spuriously.
+    #[tokio::test]
+    async fn mid_stream_error_audit_is_awaited_under_tonic_consumption() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            events: Arc::clone(&events),
+        });
+        let inner = inner_stream(vec![
+            Ok(FlightData::default()),
+            Err(Status::internal("boom")),
+        ]);
+        let mut stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+
+        // Consume as tonic's server role does: the first batch, then the error.
+        let first = stream.next().await;
+        assert!(
+            first.is_some_and(|i| i.is_ok()),
+            "first batch reached client"
+        );
+        let err = stream.next().await;
+        assert!(
+            err.is_some_and(|i| i.is_err()),
+            "the mid-stream error reached the client"
+        );
+
+        // The moment the client observes the error, the audit must already be
+        // durable. Check synchronously, without dropping the stream or awaiting
+        // anything, so this cannot be satisfied by `Drop`'s detached task.
+        let guard = events.lock().expect("lock");
+        assert_eq!(
+            guard.len(),
+            1,
+            "the Error audit must be submitted and awaited before the error item is released"
+        );
+        assert_eq!(
+            status_text(&guard[0]),
+            "ERROR",
+            "the audit for a failed query records error"
         );
     }
 
