@@ -57,7 +57,7 @@ use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum, Version,
     list_all,
 };
-use ravel_proto::commit::v1::CompactionRecord;
+use ravel_proto::commit::v1::{CompactionRecord, RewriteRecord};
 use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
@@ -333,6 +333,26 @@ pub async fn count_below_target(
                     let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
                         MaintainError::Invariant(format!(
                             "compaction record {} is corrupt during migration re-audit: {err}",
+                            meta.key
+                        ))
+                    })?;
+                    for part in &rec.parts {
+                        if part.segment_format_version < target_version {
+                            l1_below += 1;
+                        }
+                    }
+                }
+                // A rewrite record (selective erasure, ADR-0064) carries the
+                // same CompactionPart parts as a compaction record; its
+                // surviving parts can sit below the target version and must
+                // count toward the re-audit exactly like L1 parts, or a
+                // "migration complete" claim could pass over unmigrated
+                // rewritten objects.
+                Ok(keys::BucketEntry::RewriteRecord(_)) => {
+                    let got = store.get(&meta.key, GetRange::Full).await?;
+                    let rec = RewriteRecord::decode(got.data.as_ref()).map_err(|err| {
+                        MaintainError::Invariant(format!(
+                            "rewrite record {} is corrupt during migration re-audit: {err}",
                             meta.key
                         ))
                     })?;
