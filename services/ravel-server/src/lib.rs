@@ -43,6 +43,7 @@ pub mod tenant_discovery;
 #[cfg(all(test, feature = "sql"))]
 mod tests;
 pub mod traces_ingest;
+pub mod wire_byte_count;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -996,7 +997,16 @@ pub async fn start(
     let serve_grpc = metrics_service.is_some();
 
     let (grpc_addr, grpc_shutdown, grpc_task) = if serve_grpc {
+        // Issue #803: every ingest service on this listener charges layer-2
+        // byte-rate admission on wire bytes, counted by this layer as tonic's
+        // decoder reads them, instead of re-walking the decoded protobuf tree
+        // (`Message::encoded_len`) per request. Applies uniformly to every
+        // service registered below, unary and streaming alike; the Flight SQL
+        // service shares the listener but is a query surface with no
+        // byte-rate admission, so the layer is a no-op cost for it (an unread
+        // extension).
         let grpc = tonic::transport::Server::builder()
+            .layer(wire_byte_count::WireByteCountLayer)
             .add_optional_service(metrics_service)
             .add_optional_service(logs_service)
             .add_optional_service(traces_service);

@@ -7,7 +7,6 @@ use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use prost::Message;
 use ravel_ingest::RequestRejection;
 use ravel_types::Signal;
 use tonic::metadata::{KeyAndValueRef, MetadataMap, MetadataValue};
@@ -15,6 +14,7 @@ use tonic::{Request, Response, Status};
 
 use crate::ingest::IngestRequestError;
 use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, now_ns, write_mode_from_headers};
+use crate::wire_byte_count::wire_request_bytes;
 
 pub struct GrpcMetricsService {
     state: Arc<GatewayState>,
@@ -82,11 +82,10 @@ impl MetricsService for GrpcMetricsService {
             .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
         let mode = write_mode_from_headers(&headers);
 
-        // Layer 2 (ADR-0051 section 2): byte rate on the decoded message's
-        // encoded length as a proxy for wire bytes (tonic has already decoded
-        // by the time this handler runs), before this request reaches
-        // `handle_export`.
-        let request_bytes = request.get_ref().encoded_len() as u64;
+        // Layer 2 (ADR-0051 section 2): byte rate on wire bytes, counted by
+        // `WireByteCountLayer` as tonic's decoder reads them off the request
+        // body, before this request reaches `handle_export`.
+        let request_bytes = wire_request_bytes(&request)?;
         if let Err(rejection) =
             self.state
                 .admission

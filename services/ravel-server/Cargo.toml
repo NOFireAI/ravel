@@ -41,6 +41,16 @@ parking_lot = { workspace = true }
 # outside this task's scope). No new crate enters Cargo.lock: 0.17.x is already
 # resolved.
 ring = "0.17"
+# The gRPC wire-byte-count admission layer (issue #803) is a `tower::Layer`
+# operating on `http::Request<tonic::body::Body>`. `tower` is already a
+# normal (workspace) dependency version; promoted here from dev-only because
+# `wire_byte_count.rs` is production code, not test code. `http` and
+# `http-body` are already resolved in this workspace's dependency graph
+# (tonic/axum/hyper all depend on them); pinned directly here for the same
+# reason `ring` above is -- no new crate enters Cargo.lock.
+tower = { workspace = true }
+http = "1.4"
+http-body = "1.1"
 # OTAP (OpenTelemetry Arrow) ingest, linked only by the `otap` feature. It
 # pulls the arrow / arrow-ipc dependency tree, so it stays out of the default
 # build (docs/otap-ingest.md risk mitigation).
@@ -141,7 +151,6 @@ reqwest = { version = "0.13", features = ["json", "query"] }
 tonic = { workspace = true, features = ["channel"] }
 async-trait = { workspace = true }
 snap = { workspace = true }
-tower = { workspace = true }
 # Test-only: the cache warmup deadline test needs virtual time
 # (`tokio::time::pause`/`advance`) to prove a `tokio::time::timeout` fires
 # without the test actually waiting out the real deadline.
