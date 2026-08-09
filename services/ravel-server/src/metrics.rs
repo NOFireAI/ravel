@@ -963,6 +963,25 @@ fn render_tenancy_family(out: &mut String, mode: Mode, v1_unkeyed_adoptions: u64
     );
 }
 
+/// Process-wide in-flight ingest-request shed counter (issue #802). Mode-only
+/// labeled like `render_tenancy_family` above: the controller is a single
+/// semaphore shared across OTLP metrics/logs/traces and Remote Write, on
+/// every listener and transport, with no per-signal breakdown to render.
+fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u64) {
+    write_header(
+        out,
+        "ravel_ingest_concurrency_shed_total",
+        "Ingest requests rejected immediately by the process-wide in-flight concurrency ceiling (--max-inflight-ingest-requests).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_concurrency_shed_total",
+        &[Label::Mode(mode)],
+        shed_total,
+    );
+}
+
 /// The logs prune-selectivity family (ADR-0049, issue #511 deliverable 2):
 /// blocks the logs scans saw, survived, and pruned by postings, cumulative
 /// across queries. Reads the `LogsScanExec` DataFusion counters (#544) that
@@ -2038,6 +2057,7 @@ pub fn render(
     catalog_cache: Option<&CacheMetricsSnapshot>,
     admission: &AdmissionCountersSnapshot,
     query_accounting: &[QueryAccountingRow],
+    ingest_concurrency_shed_total: u64,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -2073,6 +2093,7 @@ pub fn render(
     }
     render_admission_family(&mut out, mode, admission);
     render_query_family(&mut out, mode, query_accounting);
+    render_ingest_concurrency_family(&mut out, mode, ingest_concurrency_shed_total);
     out
 }
 
@@ -2122,6 +2143,11 @@ pub struct MetricsState {
     /// section 4), written by every query handler and read here at scrape time.
     /// Always present; renders no samples until a query records into it.
     pub query_accounting: Arc<QueryAccountingMetrics>,
+    /// The process-wide in-flight ingest-request ceiling (issue #802), shared
+    /// with every OTLP HTTP/gRPC service and Remote Write on both the public
+    /// and mTLS listeners. Always present; its `shed_total` is simply `0`
+    /// until the ceiling first rejects a request.
+    pub ingest_concurrency: Arc<crate::ingest_concurrency::IngestConcurrencyController>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -2217,6 +2243,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     // lock-and-copy, no `.await`).
     let query_rows = state.query_accounting.snapshot();
 
+    let ingest_concurrency_shed_total = state.ingest_concurrency.shed_total();
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -2229,6 +2257,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         catalog_cache_snapshot.as_ref(),
         &admission_snapshot,
         &query_rows,
+        ingest_concurrency_shed_total,
     );
     (
         StatusCode::OK,
@@ -2294,6 +2323,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(
@@ -2421,6 +2451,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         let postings_lines: Vec<&str> = body
@@ -2545,6 +2576,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -2695,6 +2727,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(
@@ -2717,6 +2750,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -2771,6 +2805,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(
@@ -2811,6 +2846,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(
@@ -2843,6 +2879,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -2894,6 +2931,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(
@@ -2970,6 +3008,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(
@@ -3043,6 +3082,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -3084,6 +3124,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         for line in body.lines() {
@@ -3150,6 +3191,7 @@ mod tests {
             Some(&catalog),
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -3244,6 +3286,7 @@ mod tests {
             Some(&catalog),
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -3271,6 +3314,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &[],
+            0,
         );
 
         assert!(
@@ -3348,6 +3392,7 @@ mod tests {
             None,
             &snapshot,
             &[],
+            0,
         );
 
         assert_eq!(
@@ -3414,6 +3459,7 @@ mod tests {
             None,
             &snapshot,
             &[],
+            0,
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -3487,6 +3533,7 @@ mod tests {
             None,
             &AdmissionCountersSnapshot::default(),
             &metrics.snapshot(),
+            0,
         )
     }
 

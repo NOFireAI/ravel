@@ -182,6 +182,9 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         )),
         metrics_tenant_labels: false,
         query_accounting,
+        ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
+            crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+        ),
     });
 
     Harness {

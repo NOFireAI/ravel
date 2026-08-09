@@ -53,12 +53,27 @@ pub(crate) fn admission_rejection_status(rejection: RequestRejection) -> Status 
     Status::resource_exhausted(rejection.reason.to_string())
 }
 
+/// A shed over the process-wide in-flight ceiling (issue #802), as
+/// `RESOURCE_EXHAUSTED`: before tenant resolution or any per-signal
+/// admission check, so a shed request touches no shard and carries no commit
+/// token. Shared by every gRPC ingest service, the same discipline
+/// [`admission_rejection_status`] follows.
+pub(crate) fn ingest_concurrency_shed_status() -> Status {
+    Status::resource_exhausted("process in-flight ingest-request limit reached")
+}
+
 #[tonic::async_trait]
 impl MetricsService for GrpcMetricsService {
     async fn export(
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+        let _permit = self
+            .state
+            .ingest_concurrency
+            .try_admit()
+            .map_err(|_| ingest_concurrency_shed_status())?;
+
         let headers = metadata_to_headers(request.metadata());
         let tenant = self
             .state

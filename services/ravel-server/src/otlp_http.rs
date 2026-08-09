@@ -22,6 +22,7 @@ use ravel_query::http::TenantResolver;
 use ravel_types::Signal;
 
 use crate::ingest::{IngestRequestError, IngestState};
+use crate::ingest_concurrency::IngestConcurrencyController;
 use crate::logs_ingest::{LogIngestRequestError, LogIngestState};
 use crate::traces_ingest::{SpanIngestRequestError, SpanIngestState};
 
@@ -62,6 +63,12 @@ pub struct GatewayState {
     /// Tenant admission (ADR-0051): shared by all three signals for the
     /// layer-2 byte-rate check, done here on wire bytes before decode.
     pub admission: Arc<AdmissionController>,
+    /// The process-wide in-flight ingest-request ceiling (issue #802), shared
+    /// with every OTLP HTTP/gRPC service and Remote Write on this listener
+    /// and the mTLS listener. Checked first in every handler below, ahead of
+    /// tenant resolution and the layer-2 byte-rate check, so a shed request
+    /// does none of that work.
+    pub ingest_concurrency: Arc<IngestConcurrencyController>,
 }
 
 pub fn router(state: Arc<GatewayState>) -> Router {
@@ -89,6 +96,29 @@ fn admission_rejection_response(rejection: RequestRejection) -> Response {
 fn retry_after_seconds(retry_after_ns: i64) -> u64 {
     let ns = retry_after_ns.max(0) as u64;
     ns.div_ceil(1_000_000_000).max(1)
+}
+
+/// A fixed `Retry-After` for the process-wide in-flight shed (issue #802): the
+/// controller tracks no per-caller refill time the way `RequestRejection`
+/// does, and a slot can free up as soon as any in-flight request completes,
+/// so a short fixed wait is the right shape here (no per-error estimate is
+/// available, the same situation `remote_write::RETRY_AFTER_SECONDS`
+/// documents).
+const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// 429 for a request shed by the process-wide in-flight ceiling, before
+/// tenant resolution or any per-signal admission check: no shard is touched
+/// and no commit token is issued.
+fn ingest_concurrency_shed_response() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "process in-flight ingest-request limit reached",
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// Attaches the encoded protobuf `body` as an OTLP response, plus the
@@ -190,6 +220,11 @@ async fn export_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let _permit = match state.ingest_concurrency.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return ingest_concurrency_shed_response(),
+    };
+
     let tenant = match state.tenant_resolver.resolve(&headers) {
         Ok(tenant) => tenant,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
@@ -241,6 +276,11 @@ async fn export_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let _permit = match state.ingest_concurrency.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return ingest_concurrency_shed_response(),
+    };
+
     let tenant = match state.tenant_resolver.resolve(&headers) {
         Ok(tenant) => tenant,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
@@ -306,6 +346,11 @@ async fn export_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let _permit = match state.ingest_concurrency.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return ingest_concurrency_shed_response(),
+    };
+
     let tenant = match state.tenant_resolver.resolve(&headers) {
         Ok(tenant) => tenant,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),

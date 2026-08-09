@@ -191,6 +191,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         )),
         metrics_tenant_labels: false,
         query_accounting: Arc::clone(&query_accounting),
+        ingest_concurrency: ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
+            ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+        ),
     });
 
     Surfaces {
@@ -573,6 +576,10 @@ mod flight {
             )),
             metrics_tenant_labels: false,
             query_accounting: Arc::clone(&query_accounting),
+            ingest_concurrency:
+                ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
+                    ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+                ),
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![

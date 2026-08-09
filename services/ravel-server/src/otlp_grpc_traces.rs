@@ -14,7 +14,9 @@ use ravel_types::Signal;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
-use crate::otlp_grpc::{admission_rejection_status, metadata_to_headers};
+use crate::otlp_grpc::{
+    admission_rejection_status, ingest_concurrency_shed_status, metadata_to_headers,
+};
 use crate::otlp_http::{
     COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns,
     write_mode_from_headers,
@@ -37,6 +39,12 @@ impl TraceService for GrpcTraceService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        let _permit = self
+            .state
+            .ingest_concurrency
+            .try_admit()
+            .map_err(|_| ingest_concurrency_shed_status())?;
+
         let headers = metadata_to_headers(request.metadata());
         let tenant = self
             .state
