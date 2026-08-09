@@ -30,7 +30,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::tenant_discovery::discover_and_restrict;
+use crate::tenant_discovery::discover_and_restrict_by_lifecycle;
 
 /// Default `fold_interval`: 5 minutes (docs/metric-index-plan.md section 4).
 pub const DEFAULT_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -166,7 +166,9 @@ async fn run_loop(
             _ = &mut shutdown => return,
         }
 
-        let outcome = match discover_and_restrict(store.as_ref(), restrict.as_deref()).await {
+        let outcome = match discover_and_restrict_by_lifecycle(store.as_ref(), restrict.as_deref())
+            .await
+        {
             Ok(outcome) => outcome,
             Err(err) => {
                 tracing::error!(

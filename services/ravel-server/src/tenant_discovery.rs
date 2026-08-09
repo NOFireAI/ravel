@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ravel_catalog::read_config_values;
 use ravel_maintain::MaintainError;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
@@ -68,6 +69,75 @@ pub async fn discover_and_restrict(
             (maintained, excluded)
         }
     };
+    Ok(DiscoveryOutcome {
+        discovered,
+        maintained,
+        excluded,
+    })
+}
+
+/// Lifecycle-aware discovery (ADR-0066 decision 6, EM-T8): the maintained set
+/// is re-derived each cycle from the durable per-tenant config records, not
+/// frozen at startup from the `--tenant-token`/`--maintain-tenant` union.
+///
+/// A storage-discovered tenant is maintained when EITHER:
+///
+/// - it carries a durable `t/<hash>/config` record. All three lifecycle states
+///   keep maintenance running -- `active` fully, `suspended` refuses only
+///   ingest/query, `offboarding` keeps retention running until the data is gone
+///   ([`ravel_catalog::TenantLifecycleState`]) -- so a present record always
+///   means "maintained", regardless of state; OR
+/// - it has no config record but the static flag restriction permits it
+///   (`static_restrict` is `None`, or names it). This preserves the pre-EM
+///   behaviour for data that predates per-tenant config records (legacy or
+///   OIDC-only tenants), so this change never *stops* maintaining a tenant that
+///   was maintained before.
+///
+/// This closes the removed-token-disables-retention hazard named in ADR-0066's
+/// Context: a token lives in `sys/auth`, the lifecycle lives in
+/// `t/<hash>/config`, and removing a token never touches the config record, so a
+/// deprovisioned-by-token tenant keeps its `active` record and stays maintained
+/// (retention enforcement continues) until its data is actually gone. A tenant
+/// only drops out by having its data (and therefore its `t/` prefix) removed --
+/// fully-completed offboarding, EJ's (#460) mechanism, not EM's.
+///
+/// A per-tenant config read error is NOT allowed to drop a tenant: that would
+/// reintroduce the very hazard (a transient fault silently disabling
+/// retention). Such a tenant is kept maintained and the error logged, the
+/// fail-safe direction, matching how a whole-cycle discovery failure is never
+/// papered over as "no tenants".
+pub async fn discover_and_restrict_by_lifecycle(
+    store: &dyn ObjectStoreBackend,
+    static_restrict: Option<&[TenantHash]>,
+) -> Result<DiscoveryOutcome, MaintainError> {
+    let discovered = ravel_maintain::discover_tenants(store).await?;
+    let allow: Option<HashSet<TenantHash>> = static_restrict.map(|a| a.iter().copied().collect());
+    let mut maintained = Vec::with_capacity(discovered.len());
+    let mut excluded = 0usize;
+    for tenant in &discovered {
+        let keep = match read_config_values(store, tenant).await {
+            // A durable config record (any lifecycle state) means maintained.
+            Ok(Some(_config)) => true,
+            // No record: honour the static flag restriction (backward compat).
+            Ok(None) => allow.as_ref().is_none_or(|a| a.contains(tenant)),
+            // A transient config read fault must never drop a tenant from
+            // maintenance: keep it (retention keeps running) and log.
+            Err(err) => {
+                tracing::warn!(
+                    tenant_hash = %tenant.to_hex(),
+                    error = %err,
+                    "lifecycle discovery: config record read failed; keeping the tenant \
+                     maintained this cycle rather than disabling its retention, retried next cycle"
+                );
+                true
+            }
+        };
+        if keep {
+            maintained.push(*tenant);
+        } else {
+            excluded += 1;
+        }
+    }
     Ok(DiscoveryOutcome {
         discovered,
         maintained,
@@ -171,6 +241,139 @@ mod tests {
         assert_eq!(discovered, expected);
         assert_eq!(outcome.maintained, vec![acme]);
         assert_eq!(outcome.excluded, 1);
+    }
+
+    /// THE deliverable-3 regression test (ADR-0066 decision 6): removing a
+    /// tenant's token from `sys/auth` must NOT drop it from the maintained set,
+    /// so its retention keeps running. This is a genuine before/after: the OLD
+    /// startup-frozen restriction (`discover_and_restrict`) DROPS a tenant once
+    /// the restriction no longer names it (the bug), while the new
+    /// lifecycle-aware restriction (`discover_and_restrict_by_lifecycle`) KEEPS
+    /// it because its durable config record is untouched by the token removal.
+    #[tokio::test]
+    async fn removing_a_token_never_drops_a_tenant_with_a_config_record() {
+        use ravel_catalog::{
+            TenantConfig, TenantLifecycleState, read_auth_map, remove_token, set_tenant_config,
+            tenant_for_token, upsert_token,
+        };
+
+        const KEY: &[u8; 32] = &[0x42u8; 32];
+        let store = MemoryStore::new();
+        let acme_id = TenantId::new("acme");
+        let acme = acme_id.hash();
+
+        // acme has data (so it is discovered), a durable config record (active),
+        // and a bearer token in sys/auth.
+        store
+            .put(
+                &format!("t/{}/catalog/m/HEAD", acme.to_hex()),
+                bytes::Bytes::from_static(b"x"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+        set_tenant_config(
+            &store,
+            &acme,
+            &TenantConfig::new(TenantLifecycleState::Active),
+            1_000,
+        )
+        .await
+        .expect("write config");
+        upsert_token(&store, KEY, b"acme-token", "acme", 1_000)
+            .await
+            .expect("provision token");
+
+        // While the token is present, both the old token-derived restriction
+        // and the new lifecycle restriction maintain acme.
+        let token_set = vec![acme];
+        assert_eq!(
+            discover_and_restrict(&store, Some(&token_set))
+                .await
+                .expect("ok")
+                .maintained,
+            vec![acme],
+            "with the token present, both restrictions maintain the tenant"
+        );
+
+        // The operator removes acme's token from sys/auth.
+        remove_token(&store, KEY, b"acme-token", 2_000)
+            .await
+            .expect("revoke token");
+        let (map, _v) = read_auth_map(&store, KEY)
+            .await
+            .expect("read auth")
+            .expect("present");
+        assert!(
+            tenant_for_token(&map, KEY, b"acme-token").is_none(),
+            "sanity: the token no longer resolves, so a token-derived maintained set would drop acme"
+        );
+
+        // OLD behaviour (the bug): with the restriction now empty (the token is
+        // gone), acme is EXCLUDED -- its retention would stop even though its
+        // data is still present.
+        let after_removal: Vec<TenantHash> = Vec::new();
+        let old = discover_and_restrict(&store, Some(&after_removal))
+            .await
+            .expect("ok");
+        assert_eq!(
+            old.maintained,
+            Vec::<TenantHash>::new(),
+            "the old frozen restriction drops the tenant once its token is gone (the bug)"
+        );
+        assert_eq!(old.excluded, 1);
+
+        // NEW behaviour (the fix): the lifecycle restriction keeps acme, because
+        // its durable config record is untouched by the token removal, so
+        // maintenance (and therefore retention) continues.
+        let new = discover_and_restrict_by_lifecycle(&store, Some(&after_removal))
+            .await
+            .expect("ok");
+        assert_eq!(
+            new.maintained,
+            vec![acme],
+            "the lifecycle restriction keeps a config-recorded tenant after its token is removed"
+        );
+        assert_eq!(new.excluded, 0);
+    }
+
+    /// A discovered tenant with NO config record still honours the static flag
+    /// restriction (backward compatibility for legacy/OIDC data that predates
+    /// per-tenant config records): named by the restriction it is maintained,
+    /// not named it is excluded, exactly as before EM-T8.
+    #[tokio::test]
+    async fn lifecycle_discovery_falls_back_to_flag_restriction_without_a_config_record() {
+        let store = MemoryStore::new();
+        let acme = TenantId::new("acme").hash();
+        let globex = TenantId::new("globex").hash();
+        for tenant in [acme, globex] {
+            store
+                .put(
+                    &format!("t/{}/catalog/m/HEAD", tenant.to_hex()),
+                    bytes::Bytes::from_static(b"x"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+        }
+        // Neither tenant has a config record. With a restriction naming only
+        // acme, globex is excluded (the flag restriction still governs
+        // no-config-record tenants); with no restriction, both are maintained.
+        let restricted = discover_and_restrict_by_lifecycle(&store, Some(&[acme]))
+            .await
+            .expect("ok");
+        assert_eq!(restricted.maintained, vec![acme]);
+        assert_eq!(restricted.excluded, 1);
+
+        let unrestricted = discover_and_restrict_by_lifecycle(&store, None)
+            .await
+            .expect("ok");
+        assert_eq!(
+            unrestricted.maintained.len(),
+            2,
+            "no restriction maintains both"
+        );
+        assert_eq!(unrestricted.excluded, 0);
     }
 
     #[test]
