@@ -1,0 +1,20 @@
+[package]
+name = "ravel-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-ingest = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-query = { workspace = true }
+ravel-promql = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
