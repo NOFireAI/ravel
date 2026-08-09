@@ -11,8 +11,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::float_cmp)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -133,6 +134,14 @@ fn one_series(tenant: &TenantId, metric: &str, samples: &[(i64, f64)]) -> Series
 }
 
 fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantId>) -> Router {
+    build_router_with_sink(store, tokens, Arc::new(ravel_maintain::NoopQueryAuditSink))
+}
+
+fn build_router_with_sink(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+    audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
+) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let engine = QueryEngine::new(catalog, store, EngineConfig::default());
@@ -143,6 +152,7 @@ fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, Tena
         query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
+        audit_sink,
     })
 }
 
@@ -562,4 +572,94 @@ async fn an_unauthenticated_request_is_a_401() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let value: Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(value["errorType"], "unauthorized");
+}
+
+// ---------------------------------------------------------------------------
+// Evidential audit coverage (ADR-0062 §2a, epic EL / issue #762)
+// ---------------------------------------------------------------------------
+
+/// Captures every submitted audit event and reports durability success.
+struct RecordingSink {
+    events: Arc<Mutex<Vec<ravel_maintain::AuditEvent>>>,
+}
+
+#[async_trait]
+impl ravel_maintain::QueryAuditSink for RecordingSink {
+    async fn submit(
+        &self,
+        event: ravel_maintain::AuditEvent,
+    ) -> Result<(), ravel_maintain::MaintainError> {
+        self.events.lock().expect("lock").push(event);
+        Ok(())
+    }
+}
+
+/// The value of a string `attrs` entry.
+fn audit_attr<'a>(event: &'a ravel_maintain::AuditEvent, key: &str) -> Option<&'a str> {
+    event
+        .attrs
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            ravel_logseg::AttrValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+}
+
+/// An executed analytics query submits exactly one audit event through the
+/// sink, with `query.language=analytics` and the outcome status, and awaits its
+/// durability before the response is released.
+#[tokio::test]
+async fn analytics_submits_one_audit_event_per_executed_query() {
+    let step_ns = 10 * NS_PER_SEC;
+    let values: Vec<f64> = (0..12).map(|i| 5.0 + (i % 3) as f64).collect();
+    let (samples, end_sec) = grid_samples(step_ns, &values);
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish(
+        store.as_ref(),
+        &tenant,
+        0,
+        vec![one_series(&tenant, "au_metric", &samples)],
+    )
+    .await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = build_router_with_sink(
+        store,
+        tokens(&[("acme-token", "acme")]),
+        Arc::new(RecordingSink {
+            events: Arc::clone(&events),
+        }),
+    );
+
+    let (status, _value) = post_json(
+        &app,
+        "acme-token",
+        analytics_body(
+            "au_metric",
+            0.0,
+            end_sec,
+            "10s",
+            serde_json::json!({"type": "summary", "percentiles": [0.5]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let guard = events.lock().expect("lock");
+    assert_eq!(
+        guard.len(),
+        1,
+        "exactly one audit event per analytics query"
+    );
+    let event = &guard[0];
+    assert_eq!(audit_attr(event, "kind"), Some("query"));
+    assert_eq!(audit_attr(event, "query.language"), Some("analytics"));
+    assert_eq!(audit_attr(event, "query.status"), Some("ok"));
+    assert_eq!(audit_attr(event, "query.text"), Some("au_metric"));
+    assert_eq!(
+        audit_attr(event, "query.tenant"),
+        Some(tenant.hash().to_hex().as_str())
+    );
 }

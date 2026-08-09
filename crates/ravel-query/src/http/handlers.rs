@@ -7,12 +7,13 @@ use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Body};
 
+use ravel_maintain::{QueryStatus, query_audit_event};
 use ravel_promql::LabelMatcher;
 use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot, QueryWorkloadClass};
-use ravel_types::{LabelSet, SeriesId, TimeRange};
+use ravel_types::{LabelSet, SeriesId, TenantHash, TimeRange};
 
 use crate::engine::parse_match_selector;
-use crate::http::error::ApiError;
+use crate::http::error::{ApiError, MSG_UNAVAILABLE};
 use crate::http::json::{
     ApiResponse, QueryResponseData, instant_value_to_json, range_value_to_json, series_to_json,
     with_stats,
@@ -89,6 +90,60 @@ async fn authenticate(
     Ok(state.tenant_resolver.resolve(headers)?.hash())
 }
 
+/// Submit one evidential audit event for a query that reached execution for a
+/// resolved tenant, await its durability, and only then release `result` to
+/// the caller (ADR-0062 §2a, epic EL / issue #762).
+///
+/// `result` is the outcome of the surface's actual read: `Ok` audits
+/// `QueryStatus::Ok`, any `Err` audits `QueryStatus::Error`, so the audit trail
+/// records the attempt regardless of outcome, exactly as the SQL HTTP path
+/// does. The event is submitted through [`AppState::audit_sink`] and its
+/// durability is awaited before this returns, so a completed handler never
+/// releases its response ahead of its own audit record. When submission fails
+/// (`audit_mode=required` surfacing a flush error, or a stopped pipeline) the
+/// request fails closed with a retryable 503 rather than running unaudited --
+/// the deliberate inversion of "queries outlive the trail". A request rejected
+/// before it reached here (auth, param parse) never calls this and is not
+/// audited: there is no executed read to attribute.
+async fn audit_and_release<T>(
+    state: &AppState,
+    tenant_hash: TenantHash,
+    query_text: &str,
+    language: &str,
+    window: (i64, i64),
+    now_ns: i64,
+    result: Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let status = if result.is_ok() {
+        QueryStatus::Ok
+    } else {
+        QueryStatus::Error
+    };
+    let event = query_audit_event(
+        &tenant_hash,
+        now_ns,
+        query_text,
+        language,
+        status,
+        window.0,
+        window.1,
+    );
+    state
+        .audit_sink
+        .submit(event)
+        .await
+        .map_err(|_| ApiError::Unavailable(MSG_UNAVAILABLE.to_string()))?;
+    result
+}
+
+/// Nanosecond form of a millisecond timestamp for an audit window bound,
+/// saturating rather than overflowing (the audit record is best-effort
+/// informational for the window; the query itself already validated its
+/// range).
+fn ms_to_ns(ms: i64) -> i64 {
+    ms.saturating_mul(1_000_000)
+}
+
 pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Response {
     // Fleet-global concurrency admission (ADR-0061 decision 2): decide before any
     // resolve or GET. The permit is held for the whole handler and released on
@@ -120,10 +175,27 @@ async fn handle_query(
     let min_tokens = decode_commit_tokens(params.all("min_commit_token"))?;
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
 
-    let (value, annotations, stats) = state
+    // The query now reaches execution for a resolved tenant, so it is
+    // auditable: run it, then submit one audit event for the outcome and await
+    // its durability before releasing the response (ADR-0062 §2a). The instant
+    // query's window is the single evaluation instant, recorded as a zero-width
+    // range.
+    let exec = state
         .engine
         .instant_with_stats_annotated(tenant_hash, query, time_ms, &min_tokens, now, deadline)
-        .await?;
+        .await
+        .map_err(ApiError::from);
+    let time_ns = ms_to_ns(time_ms);
+    let (value, annotations, stats) = audit_and_release(
+        state,
+        tenant_hash,
+        query,
+        "promql",
+        (time_ns, time_ns),
+        now,
+        exec,
+    )
+    .await?;
     let (warnings, infos) = annotations.into_parts();
     // Copy the counters out before `stats` is moved into the response body, so
     // the numbers folded into /metrics are exactly the numbers the response
@@ -169,7 +241,11 @@ async fn handle_query_range(
     let deadline = parse_deadline(&params, state.engine.config().deadline)?;
     let now = now_ns();
 
-    let (value, annotations, stats) = state
+    // Auditable once the range evaluation runs for a resolved tenant: run it,
+    // then submit one audit event for the outcome and await durability before
+    // releasing the response (ADR-0062 §2a). The recorded window is the
+    // request's resolved `[start, end]` range.
+    let exec = state
         .engine
         .range_with_stats_annotated(
             tenant_hash,
@@ -181,7 +257,18 @@ async fn handle_query_range(
             now,
             deadline,
         )
-        .await?;
+        .await
+        .map_err(ApiError::from);
+    let (value, annotations, stats) = audit_and_release(
+        state,
+        tenant_hash,
+        query,
+        "promql",
+        (ms_to_ns(start_ms), ms_to_ns(end_ms)),
+        now,
+        exec,
+    )
+    .await?;
     let (warnings, infos) = annotations.into_parts();
     // See handle_query: record the same counters the response reports, once
     // the range payload has rendered.
@@ -220,7 +307,7 @@ async fn handle_labels(state: &AppState, req: Request<Body>) -> Result<Vec<Strin
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
-    let series = resolve_matched_series(state, tenant_hash, &params).await?;
+    let series = resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
 
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &series {
@@ -254,7 +341,7 @@ async fn handle_label_values(
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
-    let series = resolve_matched_series(state, tenant_hash, &params).await?;
+    let series = resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
 
     let mut values: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &series {
@@ -288,7 +375,7 @@ async fn handle_series(
             "missing required parameter \"match[]\"".to_string(),
         ));
     }
-    let series = resolve_matched_series(state, tenant_hash, &params).await?;
+    let series = resolve_and_audit_series(state, tenant_hash, &params, "series").await?;
     Ok(series_to_json(series))
 }
 
@@ -306,6 +393,36 @@ fn resolve_window(params: &Params, now: i64) -> Result<TimeRange, ApiError> {
         None => now,
     };
     Ok(TimeRange { start_ns, end_ns })
+}
+
+/// Resolve the matched series for a metadata request (labels / label_values /
+/// series) and audit the outcome before releasing it (ADR-0062 §2a). The
+/// metadata surfaces carry no single query string; the audited text is the
+/// request's `match[]` selectors joined, and the audited window is the resolved
+/// `[start, end]` these surfaces read over. `language` distinguishes the
+/// surface (`labels` or `series`) so the record shape stays one schema.
+async fn resolve_and_audit_series(
+    state: &AppState,
+    tenant_hash: TenantHash,
+    params: &Params,
+    language: &str,
+) -> Result<Vec<(SeriesId, LabelSet)>, ApiError> {
+    // Window bounds parse before any read; a bad `start`/`end` is a request
+    // error, not an executed read, so it is not audited (it returns here).
+    let now = now_ns();
+    let window = resolve_window(params, now)?;
+    let selectors_text = params.all("match[]").join("; ");
+    let result = resolve_matched_series(state, tenant_hash, params).await;
+    audit_and_release(
+        state,
+        tenant_hash,
+        &selectors_text,
+        language,
+        (window.start_ns, window.end_ns),
+        now,
+        result,
+    )
+    .await
 }
 
 async fn resolve_matched_series(

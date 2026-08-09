@@ -106,6 +106,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ravel_catalog::{Catalog, SegmentLevel, SegmentRef};
 use ravel_ingest::Clock;
+use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series, plan_selectors};
 use ravel_query::http::{QueryErrorResponse, TenantResolver};
@@ -187,6 +188,12 @@ pub struct ExemplarsState {
     /// it from, so it is this endpoint's own budget rather than a mirrored
     /// one.
     pub max_exemplars: usize,
+    /// The evidential audit sink one event per executed exemplar query is
+    /// submitted through, its durability awaited before the response is
+    /// released (ADR-0062 §2a, epic EL / issue #762). Defaults to the no-op
+    /// ([`from_engine`](Self::from_engine)); a deployment attaches the one
+    /// shared pipeline with [`with_audit_sink`](Self::with_audit_sink).
+    pub audit_sink: Arc<dyn QueryAuditSink>,
 }
 
 impl ExemplarsState {
@@ -210,7 +217,15 @@ impl ExemplarsState {
             deadline: config.deadline,
             max_segments: config.max_segments,
             max_exemplars: DEFAULT_MAX_EXEMPLARS,
+            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         }
+    }
+
+    /// Attach the shared evidential audit sink (ADR-0062 §2a). Returns `self`
+    /// so it chains off [`from_engine`](Self::from_engine).
+    pub fn with_audit_sink(mut self, audit_sink: Arc<dyn QueryAuditSink>) -> Self {
+        self.audit_sink = audit_sink;
+        self
     }
 }
 
@@ -262,12 +277,40 @@ async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, ApiE
     // The whole request runs under one wall deadline, exactly as the query
     // engine wraps its own evaluation: an elapsed timeout is the same
     // `DeadlineExceeded` (504) a sample query would surface.
-    let (series, stats) = tokio::time::timeout(
+    //
+    // The read now runs for a resolved tenant, so it is auditable (ADR-0062
+    // §2a): capture its outcome, submit one audit event, and await durability
+    // before releasing the response. A request rejected earlier (auth, missing
+    // or invalid parameters) never reached here and is not audited. The
+    // recorded window is the request's `[start, end]`.
+    let audit_now = state.clock.now_ns();
+    let outcome = match tokio::time::timeout(
         deadline,
         collect_exemplars(&state, tenant_hash, &query, start_ns, end_ns, &min_tokens),
     )
     .await
-    .map_err(|_| ApiError::from_query(QueryError::DeadlineExceeded { deadline }))??;
+    {
+        Ok(inner) => inner,
+        Err(_) => Err(ApiError::from_query(QueryError::DeadlineExceeded {
+            deadline,
+        })),
+    };
+    let status = if outcome.is_ok() {
+        QueryStatus::Ok
+    } else {
+        QueryStatus::Error
+    };
+    submit_audit(
+        &state,
+        tenant_hash,
+        audit_now,
+        &query,
+        status,
+        start_ns,
+        end_ns,
+    )
+    .await?;
+    let (series, stats) = outcome?;
 
     Ok((StatusCode::OK, axum::Json(Envelope::success(series, stats))).into_response())
 }
@@ -1243,6 +1286,37 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Submit one query-audit event for an executed exemplar query and await its
+/// durability before the response is released (ADR-0062 §2a). `language` is
+/// `exemplars` so the record shape stays one schema across surfaces. On a
+/// submission failure the request fails closed with a retryable 503
+/// (`audit_mode=required`); in best-effort mode the pipeline resolves it to
+/// `Ok`.
+async fn submit_audit(
+    state: &ExemplarsState,
+    tenant_hash: TenantHash,
+    now_ns: i64,
+    query_text: &str,
+    status: QueryStatus,
+    window_start_ns: i64,
+    window_end_ns: i64,
+) -> Result<(), ApiError> {
+    let event = query_audit_event(
+        &tenant_hash,
+        now_ns,
+        query_text,
+        "exemplars",
+        status,
+        window_start_ns,
+        window_end_ns,
+    );
+    state.audit_sink.submit(event).await.map_err(|_| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error_type: "unavailable",
+        message: "query audit is temporarily unavailable; retry".to_string(),
+    })
+}
+
 fn authenticate(state: &ExemplarsState, headers: &HeaderMap) -> Result<TenantHash, ApiError> {
     state
         .tenant_resolver
@@ -1589,8 +1663,66 @@ mod tests {
             deadline,
             max_segments,
             max_exemplars,
+            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         };
         router(state)
+    }
+
+    /// Captures every submitted audit event and reports durability success.
+    struct RecordingSink {
+        events: Arc<std::sync::Mutex<Vec<ravel_maintain::AuditEvent>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ravel_maintain::QueryAuditSink for RecordingSink {
+        async fn submit(
+            &self,
+            event: ravel_maintain::AuditEvent,
+        ) -> Result<(), ravel_maintain::MaintainError> {
+            self.events.lock().expect("lock").push(event);
+            Ok(())
+        }
+    }
+
+    /// A router over `store` whose exemplar surface audits through a recording
+    /// sink, returning the shared event log for assertion.
+    fn build_router_recording(
+        store: Arc<MemoryStore>,
+    ) -> (
+        Router,
+        Arc<std::sync::Mutex<Vec<ravel_maintain::AuditEvent>>>,
+    ) {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+        let mut tokens = HashMap::new();
+        tokens.insert(TOKEN.to_string(), tenant());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = ExemplarsState {
+            catalog,
+            store: backend,
+            tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+            clock: Arc::new(FixedClock(NOW)),
+            deadline: Duration::from_secs(30),
+            max_segments: 1000,
+            max_exemplars: DEFAULT_MAX_EXEMPLARS,
+            audit_sink: Arc::new(RecordingSink {
+                events: Arc::clone(&events),
+            }),
+        };
+        (router(state), events)
+    }
+
+    /// The value of a string `attrs` entry of an audit event.
+    fn audit_attr<'a>(event: &'a ravel_maintain::AuditEvent, key: &str) -> Option<&'a str> {
+        event
+            .attrs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                ravel_logseg::AttrValue::Str(s) => Some(s.as_str()),
+                _ => None,
+            })
     }
 
     /// Percent-encodes everything except unreserved characters so a PromQL
@@ -2458,6 +2590,50 @@ mod tests {
         assert!(
             body["data"].is_null(),
             "an unauthorized response carries no data"
+        );
+    }
+
+    /// An executed exemplar query submits exactly one audit event through the
+    /// sink, with `query.language=exemplars` and `ok` status, its durability
+    /// awaited before the response is released (ADR-0062 §2a, issue #762).
+    #[tokio::test]
+    async fn query_exemplars_submits_one_audit_event() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&store, 1, vec![series], vec![ex]).await;
+
+        let (app, events) = build_router_recording(store);
+        let (status, _body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let guard = events.lock().expect("lock");
+        assert_eq!(guard.len(), 1, "exactly one audit event per exemplar query");
+        let event = &guard[0];
+        assert_eq!(audit_attr(event, "kind"), Some("query"));
+        assert_eq!(audit_attr(event, "query.language"), Some("exemplars"));
+        assert_eq!(audit_attr(event, "query.status"), Some("ok"));
+        assert_eq!(audit_attr(event, "query.text"), Some("m"));
+        assert_eq!(
+            audit_attr(event, "query.tenant"),
+            Some(tenant().hash().to_hex().as_str())
+        );
+    }
+
+    /// A request rejected before execution (no `Authorization`) is not audited.
+    #[tokio::test]
+    async fn an_unauthenticated_exemplar_request_is_not_audited() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&store, 1, vec![series], vec![ex]).await;
+
+        let (app, events) = build_router_recording(store);
+        let (status, _body) = query_as(&app, "m", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            events.lock().expect("lock").is_empty(),
+            "a request rejected before execution writes no audit event"
         );
     }
 }

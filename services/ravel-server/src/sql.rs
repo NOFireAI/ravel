@@ -59,7 +59,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ravel_ingest::Clock;
-use ravel_maintain::{QueryStatus, write_query_audit};
+use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
@@ -90,6 +90,15 @@ pub struct SqlState {
     /// decision 4). The audit record is written by the server itself, never
     /// derived from a client body, so a tenant cannot forge or suppress it.
     pub store: Arc<dyn ObjectStoreBackend>,
+    /// The evidential audit sink this endpoint submits one
+    /// [`AuditEvent`](ravel_maintain::AuditEvent) through per executed query,
+    /// awaiting its durability before releasing the response (ADR-0062 §2a,
+    /// epic EL / issue #762). Migrated from the direct `write_query_audit`
+    /// call this endpoint previously made, so every query surface now audits
+    /// through one seam. Defaults to
+    /// [`NoopQueryAuditSink`](ravel_maintain::NoopQueryAuditSink); a deployment
+    /// attaches the one shared pipeline.
+    pub audit_sink: Arc<dyn QueryAuditSink>,
     /// Injected clock. Library logic never calls `SystemTime::now()`; the
     /// endpoint reads the clock once per request and threads the same
     /// `now_ns` through resolution and the snapshot retry.
@@ -187,11 +196,12 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     );
 
     // The query has now reached execution for a resolved tenant, so it is
-    // auditable (ADR-0042 decision 4). Run it, then write exactly one
-    // query-audit record for the outcome - success or the specific SqlError -
-    // before mapping the result to a response. Requests rejected earlier (no
-    // tenant, an unreadable body, or invalid request parameters) never reach
-    // here and are not audited: there is no executed query to attribute.
+    // auditable (ADR-0042 decision 4, ADR-0062 §2a). Run it, then submit
+    // exactly one query-audit event for the outcome - success or the specific
+    // SqlError - through the shared sink and await its durability before
+    // mapping the result to a response. Requests rejected earlier (no tenant,
+    // an unreadable body, or invalid request parameters) never reach here and
+    // are not audited: there is no executed query to attribute.
     let result = state
         .executor
         .execute(tenant_hash, &request)
@@ -201,7 +211,7 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         Ok(_) => QueryStatus::Ok,
         Err(_) => QueryStatus::Error,
     };
-    write_audit(
+    submit_audit(
         state,
         tenant_hash,
         now_ns,
@@ -210,7 +220,7 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         request.window.start_ns,
         request.window.end_ns,
     )
-    .await;
+    .await?;
 
     let outcome = result.map_err(|err| ApiError::from_sql(err, tenant_hash))?;
 
@@ -245,13 +255,19 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     encode(&headers, &outcome, tenant_hash, stats)
 }
 
-/// Write the query-audit record for one request. The audit trail is a
-/// server-side obligation independent of the query result, so a failure to
-/// write it must never change the client's response: it is logged loudly
-/// (`tracing::error!`) - a silently dropped audit record would defeat the whole
-/// feature - and then swallowed, so a successful query stays a success.
+/// Submit the query-audit event for one request through the shared sink and
+/// await its durability (ADR-0062 §2a). Unlike the pre-EL direct-write path
+/// this replaced -- which logged and swallowed a write failure so a successful
+/// query stayed a success -- the audit trail is now a release gate: in
+/// `audit_mode=required` a flush failure (or a stopped pipeline) returns an
+/// error here and the request fails closed with a retryable 503, the
+/// deliberate inversion of "queries outlive the trail". In
+/// `audit_mode=best-effort` the pipeline resolves the submission to `Ok`, so
+/// this returns `Ok` and the response is released. The record is written by the
+/// server from the resolved tenant, never derived from a client body, so a
+/// tenant cannot forge or suppress it.
 #[allow(clippy::too_many_arguments)]
-async fn write_audit(
+async fn submit_audit(
     state: &SqlState,
     tenant_hash: TenantHash,
     now_ns: i64,
@@ -259,9 +275,8 @@ async fn write_audit(
     status: QueryStatus,
     window_start_ns: i64,
     window_end_ns: i64,
-) {
-    if let Err(err) = write_query_audit(
-        state.store.as_ref(),
+) -> Result<(), ApiError> {
+    let event = query_audit_event(
         &tenant_hash,
         now_ns,
         query_text,
@@ -269,16 +284,19 @@ async fn write_audit(
         status,
         window_start_ns,
         window_end_ns,
-    )
-    .await
-    {
-        tracing::error!(
+    );
+    state.audit_sink.submit(event).await.map_err(|err| {
+        tracing::warn!(
             tenant = %tenant_hash.to_hex(),
             error = %err,
-            "failed to write query-audit record; client response unaffected but the audit \
-             trail is now incomplete for this request",
+            "query-audit submission failed; failing the request closed (audit_mode=required)",
         );
-    }
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "unavailable",
+            message: "query audit is temporarily unavailable; retry".to_string(),
+        }
+    })
 }
 
 fn authenticate(state: &SqlState, headers: &HeaderMap) -> Result<TenantHash, ApiError> {

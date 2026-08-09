@@ -234,6 +234,14 @@ async fn publish_log_segment(
 }
 
 fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantId>) -> Router {
+    build_router_with_sink(store, tokens, Arc::new(ravel_maintain::NoopQueryAuditSink))
+}
+
+fn build_router_with_sink(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+    audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
+) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -255,7 +263,32 @@ fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, Tena
         query_admission: ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
+        audit_sink,
     })
+}
+
+/// A group-commit [`AuditPipeline`] for `tenant` over `store`, as the shared
+/// sink for the audit tests. `max_batch = 1` flushes on every submit, so a
+/// single query's event is durable in `store` by the time the response returns
+/// -- exactly what `submit` awaiting durability guarantees -- and the existing
+/// `query_audit_records` helper reads it straight back out of the store.
+fn audit_pipeline(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &TenantId,
+    mode: ravel_maintain::AuditMode,
+) -> Arc<dyn ravel_maintain::QueryAuditSink> {
+    let config = ravel_maintain::AuditPipelineConfig {
+        max_batch: 1,
+        max_age: Duration::from_millis(5),
+        shard: QUERY_AUDIT_SHARD,
+        audit_mode: mode,
+        channel_capacity: 64,
+    };
+    Arc::new(ravel_maintain::AuditPipeline::spawn(
+        store,
+        tenant.hash(),
+        config,
+    ))
 }
 
 fn tokens(pairs: &[(&str, &str)]) -> HashMap<String, TenantId> {
@@ -1060,7 +1093,15 @@ async fn a_successful_query_writes_one_ok_audit_record() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
-    let app = build_router(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+    let app = build_router_with_sink(
+        Arc::clone(&store),
+        tokens(&[("acme-token", "acme")]),
+        audit_pipeline(
+            Arc::clone(&store),
+            &tenant,
+            ravel_maintain::AuditMode::Required,
+        ),
+    );
 
     let sql = "SELECT ts, value FROM samples ORDER BY ts";
     let (status, value) = post_json(&app, "acme-token", sql).await;
@@ -1096,7 +1137,15 @@ async fn a_failed_query_writes_one_error_audit_record() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     publish_segment(store.as_ref(), &tenant, 0, "m", &[(1, 1.0)]).await;
-    let app = build_router(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+    let app = build_router_with_sink(
+        Arc::clone(&store),
+        tokens(&[("acme-token", "acme")]),
+        audit_pipeline(
+            Arc::clone(&store),
+            &tenant,
+            ravel_maintain::AuditMode::Required,
+        ),
+    );
 
     // An unknown column reaches the executor and fails to plan.
     let sql = "SELECT no_such_column FROM samples";
@@ -1123,7 +1172,15 @@ async fn a_request_rejected_before_execution_is_not_audited() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     publish_segment(store.as_ref(), &tenant, 0, "m", &[(1, 1.0)]).await;
-    let app = build_router(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+    let app = build_router_with_sink(
+        Arc::clone(&store),
+        tokens(&[("acme-token", "acme")]),
+        audit_pipeline(
+            Arc::clone(&store),
+            &tenant,
+            ravel_maintain::AuditMode::Required,
+        ),
+    );
 
     let (status, _bytes) = post(&app, Some("acme-token"), None, "{ not json".to_string()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1135,11 +1192,14 @@ async fn a_request_rejected_before_execution_is_not_audited() {
     );
 }
 
-/// (c) An audit-write failure must not fail the client response. Every PUT to
-/// the `Signal::Audit` keyspace is faulted, so the audit record cannot be
-/// written; the query still succeeds and the client still gets its rows.
+/// (c) An audit-write failure fails the query CLOSED in `audit_mode=required`
+/// (ADR-0062 §2b): every PUT to the `Signal::Audit` keyspace is faulted, so the
+/// pipeline's flush fails and `submit` returns an error; the endpoint must then
+/// return 503 rather than release an unaudited 200. This is the deliberate
+/// inversion of the pre-EL "log and swallow" behavior -- "queries outlive the
+/// trail" is exactly the gap the epic closes.
 #[tokio::test]
-async fn an_audit_write_failure_does_not_fail_the_query_response() {
+async fn an_audit_write_failure_fails_the_query_closed_in_required_mode() {
     let plan = FaultPlan::empty().with_rule(
         Rule::new(
             Op::Put,
@@ -1152,7 +1212,15 @@ async fn an_audit_write_failure_does_not_fail_the_query_response() {
     let tenant = TenantId::new("acme".to_string());
     // Metric segments live under "/m/", so setup is unaffected by the audit fault.
     publish_segment(backend.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
-    let app = build_router(Arc::clone(&backend), tokens(&[("acme-token", "acme")]));
+    let app = build_router_with_sink(
+        Arc::clone(&backend),
+        tokens(&[("acme-token", "acme")]),
+        audit_pipeline(
+            Arc::clone(&backend),
+            &tenant,
+            ravel_maintain::AuditMode::Required,
+        ),
+    );
 
     let (status, value) = post_json(
         &app,
@@ -1160,15 +1228,18 @@ async fn an_audit_write_failure_does_not_fail_the_query_response() {
         "SELECT ts, value FROM samples ORDER BY ts",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{value}");
-    assert_eq!(value["status"], "success");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a required-mode audit flush failure must fail the query closed, got {value}"
+    );
 
-    // The audit PUT was faulted, so no record persisted: the failure was
-    // swallowed (and logged), never turned into a 5xx.
+    // No record persisted (the audit PUT was faulted), and the response was a
+    // 503, not a 200: the query did not outlive its trail.
     let records = query_audit_records(backend.as_ref(), &tenant).await;
     assert!(
         records.is_empty(),
-        "the audit PUT was faulted, so nothing persisted, yet the query still succeeded"
+        "the audit PUT was faulted, so nothing durable persisted"
     );
     // The fault really fired, proving the assertion above is not vacuous.
     assert!(

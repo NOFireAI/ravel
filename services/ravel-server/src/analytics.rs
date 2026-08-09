@@ -86,6 +86,7 @@ use ravel_analytics::{
     AnalyticsError, ChangeKind, ChangePointParams, ChangePointResult, SummaryParams, SummaryResult,
 };
 use ravel_ingest::Clock;
+use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_promql::Value;
 use ravel_query::http::{QueryErrorResponse, TenantResolver};
 use ravel_query::{QueryEngine, QueryError};
@@ -121,6 +122,12 @@ pub struct AnalyticsState {
     /// `/api/v1/query_range` does, so its accounting folds into `/metrics`
     /// exactly like a range query's would.
     pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
+    /// The evidential audit sink one event per executed analytics query is
+    /// submitted through, its durability awaited before the response is
+    /// released (ADR-0062 §2a, epic EL / issue #762). Defaults to the no-op in
+    /// deployments with no pipeline; a deployment attaches the one shared
+    /// pipeline.
+    pub audit_sink: Arc<dyn QueryAuditSink>,
 }
 
 /// The `/api/v1/analytics` router.
@@ -237,7 +244,12 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
         s3_requests = tracing::field::Empty,
         s3_bytes = tracing::field::Empty,
     );
-    let (value, stats) = state
+    // The range evaluation now runs for a resolved tenant, so it is auditable
+    // (ADR-0062 §2a): run it, submit one audit event for the outcome, and await
+    // its durability before releasing the response. A request rejected earlier
+    // (auth, body parse, invalid parameters) never reached here and is not
+    // audited. The recorded window is the request's resolved `[start, end]`.
+    let eval = state
         .engine
         .range_with_stats(
             tenant_hash,
@@ -250,8 +262,23 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
             deadline,
         )
         .instrument(span.clone())
-        .await
-        .map_err(ApiError::from_query)?;
+        .await;
+    let status = if eval.is_ok() {
+        QueryStatus::Ok
+    } else {
+        QueryStatus::Error
+    };
+    submit_audit(
+        state,
+        tenant_hash,
+        now_ns,
+        &body.query,
+        status,
+        ms_to_ns(start_ms),
+        ms_to_ns(end_ms),
+    )
+    .await?;
+    let (value, stats) = eval.map_err(ApiError::from_query)?;
 
     // Fold this query's actual cost and its pre-execution estimate into the
     // process-global aggregator for `/metrics` (ADR-0044 section 4) and record
@@ -340,6 +367,44 @@ fn apply_op(
             })
         })
         .collect()
+}
+
+/// Submit one query-audit event for an executed analytics query and await its
+/// durability before the response is released (ADR-0062 §2a). `language` is
+/// `analytics` so the record shape stays one schema across surfaces. On a
+/// submission failure the request fails closed with a retryable 503
+/// (`audit_mode=required`); in best-effort mode the pipeline resolves it to
+/// `Ok` and the response is released.
+#[allow(clippy::too_many_arguments)]
+async fn submit_audit(
+    state: &AnalyticsState,
+    tenant_hash: TenantHash,
+    now_ns: i64,
+    query_text: &str,
+    status: QueryStatus,
+    window_start_ns: i64,
+    window_end_ns: i64,
+) -> Result<(), ApiError> {
+    let event = query_audit_event(
+        &tenant_hash,
+        now_ns,
+        query_text,
+        "analytics",
+        status,
+        window_start_ns,
+        window_end_ns,
+    );
+    state.audit_sink.submit(event).await.map_err(|_| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error_type: "unavailable",
+        message: "query audit is temporarily unavailable; retry".to_string(),
+    })
+}
+
+/// Nanosecond form of a millisecond bound for an audit window, saturating
+/// rather than overflowing.
+fn ms_to_ns(ms: i64) -> i64 {
+    ms.saturating_mul(1_000_000)
 }
 
 fn authenticate(state: &AnalyticsState, headers: &HeaderMap) -> Result<TenantHash, ApiError> {

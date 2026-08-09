@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::get;
+use ravel_maintain::{NoopQueryAuditSink, QueryAuditSink};
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
 
 pub use error::{MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, QueryErrorResponse};
@@ -53,6 +54,17 @@ pub struct AppState {
     /// behaves exactly as before this mechanism existed; a deployment attaches
     /// the one shared controller with [`AppState::with_query_admission`].
     pub query_admission: Arc<QueryAdmissionController>,
+    /// The evidential audit sink every query surface submits one
+    /// [`AuditEvent`](ravel_maintain::AuditEvent) through before releasing its
+    /// response (ADR-0062 §2a, epic EL / issue #762). Submission awaits the
+    /// event's durability, so a completed handler's response is released only
+    /// after its audit record is durable (or, in best-effort mode, after the
+    /// pipeline decided to release it anyway). Defaults to
+    /// [`NoopQueryAuditSink`] in [`AppState::new`], so a caller that mounts the
+    /// router without an audit pipeline (and every test) runs unaudited exactly
+    /// as before this seam existed; a deployment attaches the one shared
+    /// pipeline with [`AppState::with_audit_sink`].
+    pub audit_sink: Arc<dyn QueryAuditSink>,
 }
 
 impl AppState {
@@ -64,6 +76,7 @@ impl AppState {
             tenant_resolver,
             cost_recorder: Arc::new(NoopQueryCostRecorder),
             query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+            audit_sink: Arc::new(NoopQueryAuditSink),
         }
     }
 
@@ -81,6 +94,16 @@ impl AppState {
     /// across every query transport.
     pub fn with_query_admission(mut self, query_admission: Arc<QueryAdmissionController>) -> Self {
         self.query_admission = query_admission;
+        self
+    }
+
+    /// Set the evidential audit sink every query surface submits one event
+    /// through and awaits durability on before responding (ADR-0062 §2a).
+    /// Returns `self` so it chains off [`AppState::new`]. A deployment passes
+    /// the one shared [`AuditPipeline`](ravel_maintain::AuditPipeline) instance
+    /// so every read surface's audit trail lands through one seam.
+    pub fn with_audit_sink(mut self, audit_sink: Arc<dyn QueryAuditSink>) -> Self {
+        self.audit_sink = audit_sink;
         self
     }
 }

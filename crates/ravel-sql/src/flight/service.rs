@@ -37,8 +37,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use prost::Message;
-use ravel_maintain::{QueryStatus, write_query_audit};
-use ravel_object_store::ObjectStoreBackend;
+use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_query::QueryAdmissionController;
 use ravel_types::TenantHash;
 use ravel_types::accounting::{QueryAccounting, QueryCostRecorder, QueryWorkloadClass};
@@ -50,7 +49,7 @@ use rand::Rng as _;
 
 use crate::executor::SqlExecutor;
 use crate::flight::request::{sql_request, status_from_sql};
-use crate::flight::stream::{DoGetStream, statement_stream};
+use crate::flight::stream::{DoGetStream, audited_stream, statement_stream};
 use crate::flight::{ClockRef, FlightAuth, FlightClock, FlightSqlConfig, metadata};
 use crate::flight_ticket::{FlightTicket, SegmentPin, TicketKey};
 use crate::validate::validate;
@@ -80,14 +79,18 @@ pub struct RavelFlightSqlService {
     /// restarts is not implemented; see the module docs if a deployment ever
     /// needs tickets to survive a restart.
     ticket_key: TicketKey,
-    /// Object store handle used to write the query-audit record (ADR-0042
-    /// decision 4, issue #395). The record is written by the server itself
-    /// from the statement-execution path, never derived from the client's
-    /// ticket, so a tenant using Flight SQL cannot forge or suppress its own
-    /// query-audit trail any more than an HTTP `POST /api/v1/sql` caller can.
-    /// Shared with the HTTP endpoint's own store handle in a process that runs
-    /// both, exactly as `executor` is.
-    store: Arc<dyn ObjectStoreBackend>,
+    /// The evidential audit sink one event per executed statement is submitted
+    /// through (ADR-0042 decision 4, ADR-0062 §2a, issues #395/#762/#413).
+    /// Migrated from the raw object-store handle this service previously wrote
+    /// the record to directly at stream *construction*: the audit is now
+    /// submitted at stream *completion* (see [`do_get_statement`]), so the
+    /// recorded status reflects the stream's actual outcome, and its durability
+    /// is awaited before the client observes the stream end. The record is
+    /// written by the server from the resolved tenant, never derived from the
+    /// client's ticket, so a tenant cannot forge or suppress it. Defaults to
+    /// [`NoopQueryAuditSink`](ravel_maintain::NoopQueryAuditSink); a deployment
+    /// passes the one shared pipeline.
+    audit_sink: Arc<dyn QueryAuditSink>,
     /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
     /// #425). Each Flight statement folds its cost into it: `GetFlightInfo`
     /// records the resolve-and-plan cost with the query's estimate, and `DoGet`
@@ -115,15 +118,16 @@ impl RavelFlightSqlService {
     /// there, so a tenant's Flight and HTTP queries account against one
     /// budget rather than two independent ones.
     ///
-    /// `store` is the object store the query-audit record is written to (issue
-    /// #395). It is the same handle the HTTP endpoint's `SqlState` carries, so
-    /// both transports write the audit trail through one store.
+    /// `audit_sink` is the evidential seam one event per executed statement is
+    /// submitted through (issues #395/#762). It defaults to the no-op when a
+    /// deployment installs no pipeline; use [`with_audit_sink`](Self::with_audit_sink)
+    /// to attach the shared pipeline. Keeping it out of `new`'s signature lets
+    /// existing call sites stay unchanged.
     pub fn new(
         executor: Arc<SqlExecutor>,
         auth: Arc<dyn FlightAuth>,
         clock: Arc<dyn FlightClock>,
         config: FlightSqlConfig,
-        store: Arc<dyn ObjectStoreBackend>,
         recorder: Arc<dyn QueryCostRecorder>,
         query_admission: Arc<QueryAdmissionController>,
     ) -> Self {
@@ -135,56 +139,17 @@ impl RavelFlightSqlService {
             clock,
             config,
             ticket_key,
-            store,
+            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
             recorder,
             query_admission,
         }
     }
 
-    /// Write the query-audit record for one executed statement (ADR-0042
-    /// decision 4, issue #395).
-    ///
-    /// The audit trail is a server-side obligation independent of the query
-    /// outcome, so a failure to write it never changes the client's response:
-    /// it is logged loudly (`tracing::error!`) - a silently dropped audit
-    /// record would defeat the whole feature - and then swallowed, the same
-    /// failure-isolation discipline `services/ravel-server/src/sql.rs` applies
-    /// to the HTTP path.
-    ///
-    /// The window bounds are recorded as `0, 0`. Unlike the HTTP request body,
-    /// a Flight statement carries no event-time window on the redemption path:
-    /// the window a client sends via metadata is consumed at `GetFlightInfo`
-    /// to resolve and pin the snapshot, and is not carried in the ticket, so at
-    /// `DoGet` - where the statement actually executes and this record is
-    /// written - no resolved window is available to record. Recording `0, 0`
-    /// states "unknown" plainly rather than fabricating a plausible-looking
-    /// range the request never used.
-    async fn write_audit(
-        &self,
-        tenant: TenantHash,
-        now_ns: i64,
-        query_text: &str,
-        status: QueryStatus,
-    ) {
-        if let Err(err) = write_query_audit(
-            self.store.as_ref(),
-            &tenant,
-            now_ns,
-            query_text,
-            "sql",
-            status,
-            0,
-            0,
-        )
-        .await
-        {
-            tracing::error!(
-                tenant = %tenant.to_hex(),
-                error = %err,
-                "failed to write flight sql query-audit record; client response \
-                 unaffected but the audit trail is now incomplete for this request",
-            );
-        }
+    /// Attach the shared evidential audit sink (ADR-0062 §2a). Returns `self`
+    /// so it chains off [`new`](Self::new).
+    pub fn with_audit_sink(mut self, audit_sink: Arc<dyn QueryAuditSink>) -> Self {
+        self.audit_sink = audit_sink;
+        self
     }
 
     /// The in-process key this service signs and verifies tickets with.
@@ -419,21 +384,24 @@ impl FlightSqlService for RavelFlightSqlService {
         })?;
 
         // The statement now reaches execution against its pinned snapshot for a
-        // resolved tenant, so it is auditable (ADR-0042 decision 4), exactly as
-        // `POST /api/v1/sql` audits after `SqlExecutor::execute` returns. Run
-        // it, then write one query-audit record for the outcome - success, or
-        // the specific `SqlError` `statement_stream` surfaced as a redacted
-        // `Status` - before handing the stream (or the error) back. A request
-        // rejected above (an undecodable or MAC-invalid ticket, or a ticket
-        // presented under a different tenant) returned before this point and is
-        // not audited: no statement executed, so there is nothing to attribute,
-        // the same rule the HTTP endpoint follows for its own early rejections.
+        // resolved tenant, so it is auditable (ADR-0042 decision 4, ADR-0062
+        // §2a). A request rejected above (an undecodable or MAC-invalid ticket,
+        // or a ticket presented under a different tenant) returned before this
+        // point and is not audited: no statement executed, so there is nothing
+        // to attribute, the same rule the HTTP endpoint follows for its own
+        // early rejections.
         //
-        // The audit is written here, synchronously, from whether execution
-        // *started* (the first batch was pulled without error), not from the
-        // whole stream draining: buffering the entire result to learn the final
-        // status would defeat streaming and block the response, and the HTTP
-        // path likewise audits the executor's result before the encoder runs.
+        // The audit is submitted at stream *completion*, not construction
+        // (issue #413). Writing it here from whether the first batch pulled
+        // cleanly recorded "ok" for a query that then failed partway or was
+        // cancelled by the client -- the status-accuracy gap this closes. The
+        // returned stream is wrapped by `audited_stream` so the recorded status
+        // is the stream's actual terminal outcome (ok / errored / cancelled),
+        // and the event's durability is awaited before the client observes the
+        // stream's end. A statement that fails before any stream exists (a plan
+        // or first-batch error surfaced by `statement_stream` as a redacted
+        // `Status`) is that query's final outcome, so it is audited Error and
+        // awaited here, synchronously, before the error is returned.
         let now_ns = self.clock.now_ns();
         let query_text = decoded.statement.clone();
 
@@ -483,13 +451,41 @@ impl FlightSqlService for RavelFlightSqlService {
         )
         .instrument(span.clone())
         .await;
-        let status = match &result {
-            Ok(_) => QueryStatus::Ok,
-            Err(_) => QueryStatus::Error,
-        };
-        self.write_audit(tenant, now_ns, &query_text, status).await;
 
-        result.map(Response::new)
+        match result {
+            // The stream started: wrap it so the audit fires at completion with
+            // the stream's real terminal status, awaiting durability before the
+            // client observes the stream end (issue #413).
+            Ok(stream) => Ok(Response::new(audited_stream(
+                stream,
+                Arc::clone(&self.audit_sink),
+                tenant,
+                now_ns,
+                query_text,
+            ))),
+            // The statement never produced a stream (plan / first-batch error):
+            // that is its final outcome. Audit Error and await durability before
+            // returning; a submission failure fails the request closed with an
+            // `Unavailable` status (audit_mode=required), the deliberate
+            // inversion of "queries outlive the trail".
+            Err(status) => {
+                let event = query_audit_event(
+                    &tenant,
+                    now_ns,
+                    &query_text,
+                    "sql",
+                    QueryStatus::Error,
+                    0,
+                    0,
+                );
+                if self.audit_sink.submit(event).await.is_err() {
+                    return Err(Status::unavailable(
+                        "query audit is temporarily unavailable; retry",
+                    ));
+                }
+                Err(status)
+            }
+        }
     }
 
     // -----------------------------------------------------------------

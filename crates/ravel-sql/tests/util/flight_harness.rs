@@ -169,7 +169,6 @@ impl Harness {
                 max_deadline: Duration::from_secs(30),
                 ..FlightSqlConfig::default()
             },
-            Arc::clone(&store),
             recorder,
             ravel_query::QueryAdmissionController::shared(
                 ravel_query::QueryConcurrencyLimit::Unlimited,

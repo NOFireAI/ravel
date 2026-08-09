@@ -87,7 +87,7 @@ pub use publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record,
     publish_record_with_conservation,
 };
-pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, write_query_audit};
+pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, query_audit_event, write_query_audit};
 pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite_and_publish};
 pub use rlog::RlogCodec;
