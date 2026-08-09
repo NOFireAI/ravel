@@ -44,7 +44,29 @@ ShardMsg::Write { tenant, points: Vec<NormalizedPoint>, ack: Option<oneshot::Sen
 
 Channel: `tokio::sync::mpsc` bounded (default 256 messages per shard).
 `send` awaiting on a full channel IS the backpressure mechanism; the gateway
-holds the request open and its own concurrency limits bound global memory.
+holds the request open while it awaits.
+
+What actually bounds gateway memory is a process-wide in-flight
+ingest-request ceiling (issue #802), `--max-inflight-ingest-requests`
+(default 1024, 0 disables it). One `tokio::sync::Semaphore`, shared across
+every OTLP metrics/logs/traces and Remote Write handler, on both the public
+and mTLS listeners and both the HTTP and gRPC transports. A request that does
+not get a permit is shed immediately, never queued: HTTP 429 with
+`Retry-After`, gRPC `RESOURCE_EXHAUSTED`. Query, health, and `/metrics` are
+not covered.
+
+Worst-case memory bound at the default: each in-flight request holds at most
+one decoded request body. The largest single-request cap on any covered
+route is Remote Write's post-decompression limit
+(`MAX_DECOMPRESSED_PAYLOAD_BYTES`, 64 MiB); OTLP's per-request cap is smaller
+(`MAX_DECODED_MESSAGE_BYTES`/`MAX_REQUEST_BODY_BYTES`, 16 MiB). So the
+process-wide worst case is 1024 * 64 MiB = 64 GiB if every in-flight slot
+happens to be a max-size Remote Write request, or 1024 * 16 MiB = 16 GiB if
+all are OTLP. This is a coarse ceiling, not a target: it bounds the worst
+case the operator is exposed to, not typical usage, which is why the default
+is sized for concurrency headroom rather than to fit a specific memory
+budget. Operators tune `--max-inflight-ingest-requests` down to bring the
+worst case in line with available memory.
 
 ### Generation live switch (ADR-0052)
 
@@ -374,7 +396,7 @@ carries max token per shard).
 | max_flush_delay_idle | 10 s |
 | min_flush_bytes | 64 KiB |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
-| max in-flight strict requests per conn | transport-level (tonic/axum concurrency limits) |
+| max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 
 ## Metrics (self-observability)
 

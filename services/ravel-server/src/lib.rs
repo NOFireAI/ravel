@@ -15,6 +15,7 @@ pub mod fold;
 pub mod gc_config;
 pub mod health;
 pub mod ingest;
+pub mod ingest_concurrency;
 pub mod logs_ingest;
 pub mod maintain;
 pub mod metrics;
@@ -254,6 +255,16 @@ pub struct ServerConfig {
     /// [`query::build_catalog`]) from one number (issue #553). Ignored when
     /// `disable_cache` is set.
     pub cache_max_bytes: u64,
+    /// The process-wide in-flight ingest-request ceiling (issue #802), from
+    /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
+    /// `Unlimited`). [`start`] builds one shared
+    /// [`ingest_concurrency::IngestConcurrencyController`] from this and
+    /// hands it to every `GatewayState`/`RemoteWriteState` it constructs, on
+    /// both the public and mTLS listeners, so this single ceiling bounds
+    /// in-flight OTLP and Remote Write requests process-wide. Unlike
+    /// `query_concurrency_limit` above, this is never reconciled fleet-wide:
+    /// each process sheds independently against its own local bound.
+    pub ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -363,6 +374,7 @@ fn gateway_state(
     store: &Arc<dyn ObjectStoreBackend>,
     recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
+    ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -392,6 +404,7 @@ fn gateway_state(
             provisioning: provisioning.clone(),
         },
         admission: admission.clone(),
+        ingest_concurrency: ingest_concurrency.clone(),
     })
 }
 
@@ -401,6 +414,7 @@ fn remote_write_state(
     admission: &Arc<AdmissionController>,
     recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
+    ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -411,6 +425,7 @@ fn remote_write_state(
         admission: admission.clone(),
         recovery: recovery.clone(),
         provisioning: provisioning.clone(),
+        ingest_concurrency: ingest_concurrency.clone(),
     })
 }
 
@@ -524,6 +539,15 @@ pub async fn start(
     let query_admission =
         ravel_query::QueryAdmissionController::shared(config.query_concurrency_limit);
 
+    // Process-wide in-flight ingest-request ceiling (issue #802): one shared
+    // controller per process, threaded into every `GatewayState`/
+    // `RemoteWriteState` below (public and mTLS listeners alike), so HTTP,
+    // gRPC, and both listeners draw down the same ceiling. Unlike
+    // `query_admission` above, this is never fleet-reconciled: each process
+    // sheds independently against its own local bound.
+    let ingest_concurrency =
+        ingest_concurrency::IngestConcurrencyController::shared(config.ingest_concurrency_limit);
+
     // Per-query cost aggregator (ADR-0044 section 4, issue #425): one per
     // process, shared with every query handler below and read at scrape time by
     // the `/metrics` route. Its per-tenant allowlist is the tenants an operator
@@ -573,6 +597,7 @@ pub async fn start(
             &store,
             &recovery,
             &provisioning_writer,
+            &ingest_concurrency,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -581,6 +606,7 @@ pub async fn start(
             &admission,
             &recovery,
             &provisioning_writer,
+            &ingest_concurrency,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -594,6 +620,7 @@ pub async fn start(
                 &store,
                 &recovery,
                 &provisioning_writer,
+                &ingest_concurrency,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -601,6 +628,7 @@ pub async fn start(
                 &admission,
                 &recovery,
                 &provisioning_writer,
+                &ingest_concurrency,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
@@ -656,6 +684,7 @@ pub async fn start(
         admission: admission.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),
+        ingest_concurrency: ingest_concurrency.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 
@@ -893,6 +922,7 @@ pub async fn start(
             &store,
             &recovery,
             &provisioning_writer,
+            &ingest_concurrency,
         )),
         _ => None,
     };

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ingest_concurrency::IngestConcurrencyController;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -135,6 +136,10 @@ pub struct RemoteWriteState {
     /// Durable shard_count provisioning-record writer (ADR-0050 section 5),
     /// pins the (tenant, Metrics) record on the tenant's first write.
     pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
+    /// The process-wide in-flight ingest-request ceiling (issue #802), the
+    /// same shared controller `otlp_http::GatewayState` carries. Checked
+    /// first in [`remote_write`], ahead of tenant resolution.
+    pub ingest_concurrency: Arc<IngestConcurrencyController>,
 }
 
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
@@ -224,11 +229,37 @@ fn retry_after_seconds(retry_after_ns: i64) -> u64 {
     ns.div_ceil(1_000_000_000).max(1)
 }
 
+/// A fixed `Retry-After` for the process-wide in-flight shed (issue #802),
+/// the same rationale as [`RETRY_AFTER_SECONDS`] above: no per-caller refill
+/// time is tracked, and a slot can free up as soon as any in-flight request
+/// completes, so a short fixed wait is the right shape.
+const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// 429 for a request shed by the process-wide in-flight ceiling, before
+/// tenant resolution or any per-signal admission check: no shard is touched
+/// and no commit token is issued.
+fn ingest_concurrency_shed_response() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "process in-flight ingest-request limit reached",
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(RETRY_AFTER_HEADER, value);
+    }
+    response
+}
+
 async fn remote_write(
     State(state): State<Arc<RemoteWriteState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let _permit = match state.ingest_concurrency.try_admit() {
+        Ok(permit) => permit,
+        Err(_) => return ingest_concurrency_shed_response(),
+    };
+
     let tenant: TenantId = match state.tenant_resolver.resolve(&headers) {
         Ok(tenant) => tenant,
         Err(_) => {

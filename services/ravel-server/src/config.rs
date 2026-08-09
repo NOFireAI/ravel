@@ -288,6 +288,19 @@ pub struct Cli {
     #[arg(long = "max-concurrent-queries", value_name = "COUNT")]
     pub max_concurrent_queries: Option<u64>,
 
+    /// The process-wide in-flight ingest-request ceiling (issue #802): the
+    /// maximum number of OTLP metrics/logs/traces and Remote Write requests
+    /// this process admits at once, across every listener (public and mTLS)
+    /// and every transport (HTTP and gRPC). Over the limit, a request is
+    /// shed immediately, never queued: HTTP gets 429 with `Retry-After`,
+    /// gRPC gets `RESOURCE_EXHAUSTED`. Unlike `--max-concurrent-queries`,
+    /// this is never fleet-reconciled: each process enforces its own local
+    /// bound independently, since it exists to cap this process's own
+    /// worst-case buffered memory, not to shape aggregate fleet fan-out.
+    /// `0` disables the limit.
+    #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
+    pub max_inflight_ingest_requests: u64,
+
     /// The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime
     /// duration (e.g. `7d`). The content-tier scrubber rotates through the
     /// whole object corpus once per `P`, so sustained scrub read bandwidth is
@@ -745,6 +758,21 @@ impl Cli {
         }
     }
 
+    /// Parse `--max-inflight-ingest-requests` into an
+    /// [`crate::ingest_concurrency::IngestConcurrencyLimit`] (issue #802),
+    /// mapping `0` to `Unlimited` like every other admission ceiling in this
+    /// crate that spells "no limit" as `0` rather than a sentinel
+    /// `u64::MAX`. Always `Ok`: unlike `--max-concurrent-queries`, `0` here
+    /// is a deliberate, documented value, not a footgun worth rejecting.
+    pub fn parse_ingest_concurrency_limit(
+        &self,
+    ) -> anyhow::Result<crate::ingest_concurrency::IngestConcurrencyLimit> {
+        Ok(match self.max_inflight_ingest_requests {
+            0 => crate::ingest_concurrency::IngestConcurrencyLimit::Unlimited,
+            n => crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(n),
+        })
+    }
+
     /// Parse `--scrub-period` into a duration (ADR-0059 decision 1), defaulting
     /// to [`crate::scrub::DEFAULT_SCRUB_PERIOD`] when unset. Rejects a zero or
     /// unparseable duration rather than rotating the scrubber in a tight loop,
@@ -781,6 +809,12 @@ impl Cli {
     /// dev-header loopback rule this consolidates from `main`). Every case
     /// here refuses startup outright; none of them warn and continue.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // No value of `--max-inflight-ingest-requests` is invalid (`0` is a
+        // deliberate "unlimited", not a footgun), but it is still parsed here
+        // so a malformed future extension of this flag fails startup rather
+        // than at the first ingest request.
+        self.parse_ingest_concurrency_limit()?;
+
         if self.dev_insecure_tenant_header && !self.listen_http.ip().is_loopback() {
             anyhow::bail!(
                 "--dev-insecure-tenant-header refuses to enable unless --listen-http binds a \

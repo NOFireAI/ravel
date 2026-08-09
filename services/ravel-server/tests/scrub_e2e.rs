@@ -62,6 +62,9 @@ fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
         indexed_fields: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
     }
 }
 

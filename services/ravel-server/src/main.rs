@@ -376,6 +376,9 @@ async fn main() -> anyhow::Result<()> {
         indexed_fields,
         disable_cache: cli.disable_cache,
         cache_max_bytes: cli.cache_max_bytes,
+        ingest_concurrency_limit: cli
+            .parse_ingest_concurrency_limit()
+            .context("failed to parse --max-inflight-ingest-requests")?,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;
