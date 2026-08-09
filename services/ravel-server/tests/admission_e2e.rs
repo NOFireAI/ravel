@@ -257,6 +257,51 @@ async fn grpc_byte_rate_exceeded_yields_resource_exhausted() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// Issue #803: gRPC byte-rate admission must charge the request's wire
+/// bytes (what `WireByteCountLayer` counts off the transport), not
+/// `Message::encoded_len()` (the decoded protobuf tree's size). A gRPC
+/// message on the wire is `encoded_len()` payload bytes plus a 5-byte
+/// length-delimited frame header (1-byte compression flag, 4-byte
+/// big-endian length) -- 5 bytes neither charging scheme could confuse for
+/// the other. Setting the byte-rate burst to exactly `encoded_len()`
+/// discriminates the two: charging `encoded_len()` would land exactly on a
+/// full bucket and admit; charging wire bytes must reject, since wire size
+/// is `encoded_len() + 5 > burst`.
+#[tokio::test]
+async fn grpc_byte_rate_charges_wire_bytes_not_encoded_len() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+    let request_proto = multi_series_export_request(&["grpc_wire_bytes_not_encoded_len"], now_ns());
+    let encoded_len = request_proto.encoded_len() as u64;
+
+    let running = start_test_server_with_limits(AdmissionLimits {
+        ingest_byte_rate: RateLimit::Bounded {
+            per_sec: 1,
+            burst: encoded_len,
+        },
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+
+    let mut request = tonic::Request::new(request_proto);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+
+    let status = client.export(request).await.expect_err(
+        "wire bytes (encoded_len + 5-byte gRPC frame header) must exceed a burst set to \
+         exactly encoded_len; a pass here would mean admission is still charging encoded_len()",
+    );
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// One `ExportLogsServiceRequest` carrying `scope_names.len()` distinct log
 /// streams (distinct scope name, same resource), one `LogRecord` each.
 /// `log_stream_id` hashes resource attrs + scope name/version/attrs

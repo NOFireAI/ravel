@@ -352,8 +352,12 @@ Four layers, each enforced before the allocation it bounds, in this order:
    no single shared insertion point: it runs once per transport handler
    (all three OTLP HTTP handlers, all three OTLP gRPC services, OTAP's
    per-batch handler, and Remote Write), eight call sites in total. A gRPC
-   handler measures `request.get_ref().encoded_len()` since tonic has
-   already decoded the message by the time the handler runs.
+   handler reads wire bytes from a `WireByteCountLayer`
+   (`services/ravel-server/src/wire_byte_count.rs`), a `tower::Layer`
+   installed on the gRPC listener that parses gRPC's length-delimited
+   message framing off the transport bytes as tonic's decoder reads them,
+   rather than measuring `request.get_ref().encoded_len()` (a walk of the
+   already-decoded protobuf tree) after the fact.
 3. **Event-time skew.** Out of scope for this change; unchanged.
 4. **Series/stream admission**, metrics and logs only (spans excluded).
    `check_series_creation_rate`/`check_stream_creation_rate` first (a
