@@ -1526,12 +1526,17 @@ not racing your restore: a running `--mode maintain` loop keeps sweeping every
 tick, and its orphan-GC rule deletes the very objects you are trying to
 reattach.
 
-1. **Stop or restrict maintenance for the tenant.** Either stop the
-   `--mode maintain` process entirely, or restart it restricted to other
-   tenants with `--maintain-tenant` (the tenant you are repairing must not be
-   in that set). Do not rely on the mass-orphan breaker to hold the shard
-   open: it is not self-clearing in the way an operator expects (see the
-   runbook above), and small-scale record loss may never trip it at all.
+1. **Stop maintenance for the tenant.** Stop the `--mode maintain` process
+   entirely. This is the one method that reliably protects a tenant under
+   repair regardless of its config-record status. `--maintain-tenant` only
+   excludes tenants that do not yet carry a durable `t/<hash>/config` record;
+   once a tenant carries one, no CLI flag can exclude it from maintenance, so
+   restarting restricted to other tenants will not keep the sweeper off a
+   config-recorded tenant (issue #857 tracks a durable per-tenant
+   maintenance-exclusion mechanism). Do not rely on the mass-orphan breaker to
+   hold the shard open either: it is not self-clearing in the way an operator
+   expects (see the runbook above), and small-scale record loss may never trip
+   it at all.
 2. **Reconstruct the missing records**, one shard at a time:
 
    ```sh

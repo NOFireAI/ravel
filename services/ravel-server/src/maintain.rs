@@ -23,11 +23,14 @@
 //! [`spawn`] runs one supervisor task, not one task per tenant: at the start
 //! of every tick it re-enumerates tenants from storage
 //! ([`ravel_maintain::discover_tenants`] via
-//! [`crate::tenant_discovery::discover_and_restrict`]), optionally narrows
-//! that set to the configured `--tenant-token`/`--maintain-tenant`
-//! restriction, then runs [`run_tick`] for each tenant in the result. A
+//! [`crate::tenant_discovery::discover_and_restrict_by_lifecycle`]), narrows
+//! that set by each tenant's durable lifecycle state and the flag fallback
+//! (ADR-0066 decision 6: a config record keeps a tenant maintained
+//! unconditionally regardless of its token, and no flag can exclude a
+//! config-recorded tenant), then runs [`run_tick`] for each tenant in the
+//! result. A
 //! tenant that first writes data mid-run is picked up on the next cycle with
-//! no restart, and a tenant removed from the restriction (but still holding
+//! no restart, and a tenant removed from the maintained set (but still holding
 //! data) is counted as excluded rather than silently dropped. Discovery
 //! failure (the LIST errors) skips the whole cycle -- no tenant's tick runs
 //! -- with a logged warning and a failure counter; it never falls back to an
@@ -288,15 +291,16 @@ impl MaintenanceTasks {
 }
 
 /// Spawn one supervisor task that re-discovers the tenant set from storage
-/// every tick (ADR-0048 decision 3). `restrict` is the merged
-/// `--tenant-token`/`--maintain-tenant` set: empty means unconfigured (every
-/// discovered tenant is maintained), non-empty narrows the discovered set to
-/// exactly those tenants. Returns immediately; the task runs until
+/// every tick (ADR-0048 decision 3, ADR-0066 decision 6). `fallback_allow` is
+/// the merged `--tenant-token`/`--maintain-tenant` set: empty means unconfigured
+/// and it otherwise governs only tenants with no durable config record. A tenant
+/// carrying a config record is maintained unconditionally, so no flag can
+/// exclude it. Returns immediately; the task runs until
 /// [`MaintenanceTasks::shutdown`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
-    restrict: Vec<TenantHash>,
+    fallback_allow: Vec<TenantHash>,
     config: MaintenanceTaskConfig,
     metrics: Arc<TenantDiscoveryMetrics>,
     safety: Arc<MaintenanceSafetyMetrics>,
@@ -313,10 +317,10 @@ pub fn spawn(
     compactor.compactor_writer_id = Uuid::new_v4();
     let compactor = Arc::new(compactor);
     let retention = Arc::new(config.retention.clone());
-    let restrict = if restrict.is_empty() {
+    let fallback_allow = if fallback_allow.is_empty() {
         None
     } else {
-        Some(restrict)
+        Some(fallback_allow)
     };
 
     let (tx, rx) = oneshot::channel();
@@ -325,7 +329,7 @@ pub fn spawn(
     let handle = tokio::spawn(async move {
         run_loop(
             store,
-            restrict,
+            fallback_allow,
             compactor,
             retention,
             shard_count,
@@ -346,7 +350,7 @@ pub fn spawn(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     store: Arc<dyn ObjectStoreBackend>,
-    restrict: Option<Vec<TenantHash>>,
+    fallback_allow: Option<Vec<TenantHash>>,
     compactor: Arc<CompactorConfig>,
     retention: Arc<RetentionConfig>,
     shard_count: u32,
@@ -472,7 +476,7 @@ async fn run_loop(
 
                 run_discovery_cycle(
                     store.as_ref(),
-                    restrict.as_deref(),
+                    fallback_allow.as_deref(),
                     &compactor,
                     &retention,
                     shard_count,
@@ -503,18 +507,21 @@ async fn run_loop(
     }
 }
 
-/// One discovery cycle: re-enumerate tenants from storage, narrow to
-/// `restrict` when configured, then run [`run_tick`] for each tenant in the
-/// result (ADR-0048 decision 3, issue #504). `metrics` records the discovered
-/// and maintained gauges on success; a discovery failure -- the LIST itself
-/// erroring -- skips the whole cycle (no tenant's tick runs) and only bumps
-/// the failure counter, never falling back to an empty set. Falling back
-/// would render identically to "storage has no tenants," the exact silent
-/// failure findings S2-17/S5-09 describe.
+/// One discovery cycle: re-enumerate tenants from storage, narrow by lifecycle
+/// state and the flag fallback, then run [`run_tick`] for each tenant in the
+/// result (ADR-0048 decision 3, ADR-0066 decision 6, issue #504).
+/// `fallback_allow` is the token-derived allow-list governing no-config tenants;
+/// a tenant carrying a config record is maintained unconditionally, so no flag
+/// can exclude it. `metrics` records the discovered and maintained gauges on
+/// success; a discovery failure -- the LIST itself erroring -- skips the whole
+/// cycle (no tenant's tick runs) and only bumps the failure counter, never
+/// falling back to an empty set. Falling back would render identically to
+/// "storage has no tenants," the exact silent failure findings S2-17/S5-09
+/// describe.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_discovery_cycle(
     store: &dyn ObjectStoreBackend,
-    restrict: Option<&[TenantHash]>,
+    fallback_allow: Option<&[TenantHash]>,
     compactor: &CompactorConfig,
     retention: &RetentionConfig,
     shard_count: u32,
@@ -524,7 +531,7 @@ pub async fn run_discovery_cycle(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
-    let outcome = match discover_and_restrict_by_lifecycle(store, restrict).await {
+    let outcome = match discover_and_restrict_by_lifecycle(store, fallback_allow).await {
         Ok(outcome) => outcome,
         Err(err) => {
             tracing::error!(
@@ -1338,6 +1345,8 @@ mod tests {
         );
 
         // The fix: the lifecycle-aware discovery keeps the tenant maintained.
+        // The empty set is the token-derived fallback; no explicit
+        // `--maintain-tenant` narrowing is configured.
         let discovered = discover_and_restrict_by_lifecycle(&store, Some(&empty_restrict))
             .await
             .expect("lifecycle discover");

@@ -75,10 +75,21 @@ populates neither `--tenant-token` nor `--maintain-tenant` -- still compact,
 retain, and GC every tenant it holds data for; previously the tenant set came
 only from those flags, so such a deployment silently maintained nothing
 (findings S2-17, S5-09). `--tenant-token`/`--maintain-tenant` are now an
-optional *restriction* on the discovered set, not its source: unset, every
-discovered tenant is maintained; set, the discovered set is narrowed to
-exactly the named tenants, and an excluded discovered tenant is counted, not
-silently dropped. A discovery failure (the LIST itself erroring) skips the
+optional *restriction* on the discovered set, not its source, and it governs
+only tenants with no durable config record: for such a tenant, unset means it
+is maintained, and set narrows the no-config discovered set to exactly the
+named tenants, with an excluded no-config tenant counted, not silently dropped.
+Under ADR-0066 decision 6 the maintenance and fold supervisors consult each
+tenant's durable `t/<hash>/config` lifecycle record, and once a tenant carries
+one that record is the sole authority: the tenant stays maintained
+unconditionally, and no CLI flag -- not `--tenant-token`, not
+`--maintain-tenant` -- can exclude it from fold or maintenance today. This is
+what makes removing a token (or dropping a `--tenant-token`/`--maintain-tenant`
+entry on restart) never silently disable a config-recorded tenant's retention.
+The `discovered`/`maintained`/`excluded` counting still applies to the
+no-config-record case: an excluded no-config tenant shows up as the
+`tenants_discovered` minus `tenants_maintained` gap on `/metrics` and in a
+logged line, never a silent drop. A discovery failure (the LIST itself erroring) skips the
 whole cycle -- no tenant's tick runs -- and is retried next cycle; it never
 falls back to an empty tenant set, since that would look identical to a
 healthy "nothing to do" on the very dashboard meant to catch this failure

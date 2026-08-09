@@ -8,10 +8,15 @@
 //!
 //! # One tick
 //!
-//! Each tick re-discovers the tenant set from storage (the same
-//! [`crate::tenant_discovery::discover_and_restrict`] the maintenance
-//! supervisor uses) and, for every `(tenant, signal, shard)` it holds data
-//! for, runs the content tier over the shard's committed L0 data objects:
+//! Each tick re-discovers the tenant set from storage via the flag-restriction
+//! [`crate::tenant_discovery::discover_and_restrict`] and, for every
+//! `(tenant, signal, shard)` it holds data for, runs the content tier over the
+//! shard's committed L0 data objects. (The maintenance and fold supervisors
+//! have since moved to the lifecycle-aware
+//! [`crate::tenant_discovery::discover_and_restrict_by_lifecycle`] under
+//! ADR-0066 decision 6; the scrubber has not yet been migrated, so its tenant
+//! set is still the startup flag restriction rather than the durable per-tenant
+//! lifecycle records.)
 //!
 //! 1. LIST the shard's commit records, decode each, and reconstruct the data
 //!    object key it points at, building the rotation corpus

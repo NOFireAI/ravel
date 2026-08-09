@@ -416,6 +416,98 @@ mod tests {
         );
     }
 
+    /// BLOCK 2 regression (ADR-0066 decision 6 x ADR-0057): a refresh cycle
+    /// whose durable config record is UNCHANGED must not clobber the per-process
+    /// fleet share that reconciliation narrowed the caps to. The lifecycle loop
+    /// re-invokes `set_tenant_limits` every horizon for every known tenant even
+    /// when nothing changed; before the per-dimension guard in
+    /// `TenantState::set_limits`, that unconditionally overwrote
+    /// `fleet_max_active_series` back to the raw configured cap and rebuilt the
+    /// rate bucket at full burst under the un-divided `per_sec`, re-admitting the
+    /// full un-divided fleet cap for a reconcile interval out of every horizon.
+    /// This seeds a base, narrows both the count cap and the byte rate via
+    /// `apply_reconciliation`, runs an unchanged-config refresh, and asserts the
+    /// narrowed values survive.
+    ///
+    /// Reverting the guard (restoring the unconditional overwrite in
+    /// `set_limits`) makes this fail exactly as the reviewer's proof did: the
+    /// effective series cap snaps back from the narrowed 25 to the raw 100 and
+    /// the byte rate from 250 back to 1000.
+    #[tokio::test]
+    async fn refresh_with_unchanged_config_preserves_the_reconciled_fleet_share() {
+        use crate::admission::TenantReconcileApply;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme");
+        // Raw configured (un-divided) limits: a count cap of 100 and a bounded
+        // byte rate of 1000/s, both of which reconciliation will narrow.
+        let base = AdmissionLimits {
+            max_active_series: CountLimit::Bounded(100),
+            max_active_streams: CountLimit::Unlimited,
+            ingest_byte_rate: RateLimit::Bounded {
+                per_sec: 1_000,
+                burst: 5_000,
+            },
+            series_creation_rate: RateLimit::Unlimited,
+        };
+        let controller = AdmissionController::new(Arc::new(SystemClock), base);
+        // Startup seeds the tenant at the raw configured caps.
+        controller.set_tenant_limits(tenant.clone(), base);
+        assert_eq!(
+            controller.effective_max_active_series(&tenant),
+            Some(CountLimit::Bounded(100)),
+            "startup installs the raw configured count cap"
+        );
+        assert_eq!(
+            controller.effective_byte_rate_per_sec(&tenant),
+            Some(1_000),
+            "startup installs the raw configured byte rate"
+        );
+
+        // A reconciliation cycle narrows this process's share to a quarter of
+        // the fleet cap (a 4-process fleet splitting 100 -> 25, 1000/s -> 250/s).
+        controller.apply_reconciliation(&TenantReconcileApply {
+            tenant: tenant.clone(),
+            series_cap: Some(CountLimit::Bounded(25)),
+            streams_cap: None,
+            byte_rate_per_sec: Some(250),
+            creation_rate_per_sec: None,
+            baseline_bytes: 0,
+            baseline_created: 0,
+        });
+        assert_eq!(
+            controller.effective_max_active_series(&tenant),
+            Some(CountLimit::Bounded(25)),
+            "reconciliation narrowed the count cap to this process's share"
+        );
+        assert_eq!(
+            controller.effective_byte_rate_per_sec(&tenant),
+            Some(250),
+            "reconciliation narrowed the byte rate to this process's share"
+        );
+
+        // A lifecycle refresh with the durable record UNCHANGED (here: no record
+        // at all, so the identical base is re-applied). Nothing about the
+        // tenant's configured limits changed, so the reconciled share must
+        // survive rather than being clobbered back to the raw configured values.
+        let got = refresh_tenant_limits_once(&controller, store.as_ref(), &tenant, base)
+            .await
+            .expect("refresh");
+        assert!(got.is_none(), "no durable record: the base is re-applied");
+        assert_eq!(
+            controller.effective_max_active_series(&tenant),
+            Some(CountLimit::Bounded(25)),
+            "an unchanged-config refresh must NOT clobber the reconciled count \
+             share back to the raw configured cap of 100"
+        );
+        assert_eq!(
+            controller.effective_byte_rate_per_sec(&tenant),
+            Some(250),
+            "an unchanged-config refresh must NOT rebuild the bucket back to the \
+             raw configured byte rate of 1000 (nor hand out a fresh full burst)"
+        );
+    }
+
     /// No durable record re-applies the base limits (the tenant runs on its
     /// startup value), and a store fault is propagated so the caller can keep
     /// the last-known limits rather than resetting to base on a transient fault.

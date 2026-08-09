@@ -418,24 +418,55 @@ impl TenantState {
         }
     }
 
-    /// Replaces this tenant's limits. Both rate buckets are rebuilt at full
-    /// burst capacity under the new rate: limits load once at startup
-    /// (ADR-0051 section 3, "changing limits is a restart"), so there is no
-    /// live-traffic case where preserving a bucket's partial fill across a
-    /// limit change matters. The effective fleet caps are reset to the new
-    /// configured caps, so a limits change never leaves a stale reconciled
-    /// value in force until the next reconciliation cycle.
+    /// Replaces this tenant's limits, resetting only the dimensions whose
+    /// *configured* value actually changed since the last apply.
+    ///
+    /// Per-dimension guarding is load-bearing, not an optimization. The
+    /// lifecycle refresh loop (ADR-0066 decision 6) now calls this every
+    /// horizon for every known tenant, even when the durable config record is
+    /// byte-identical to what was last applied -- it is no longer the
+    /// startup-only "changing limits is a restart" path of ADR-0051 section 3.
+    /// An unconditional overwrite would, on every horizon tick, clobber the
+    /// per-process fleet share that [`AdmissionController::apply_reconciliation`]
+    /// (ADR-0057) narrowed `fleet_max_active_series`/`fleet_max_active_streams`
+    /// to, and rebuild each rate bucket at full burst under the raw un-divided
+    /// `per_sec` -- discarding the narrowed `rate_per_sec` and handing out a
+    /// free full burst refill that the next reconciliation cannot claw back (it
+    /// only ever narrows `rate_per_sec`, never token counts). The result: every
+    /// such tenant admits the full un-divided fleet cap for up to one reconcile
+    /// interval out of every horizon (N times the intended ceiling across an
+    /// N-process fleet). Guarding per dimension keeps a genuinely changed config
+    /// taking effect within one horizon (a changed dimension still resets and
+    /// its fleet cap reverts to the new configured value, to be re-narrowed by
+    /// the next reconciliation) while leaving reconciliation's narrowing intact
+    /// for every unchanged dimension -- honouring this method's long-standing
+    /// "only a changed rate's bucket is reset" contract for the fleet-cap fields
+    /// too. A changed rate's bucket is still rebuilt at full burst: limits
+    /// genuinely changing is rare and operator-driven, so a one-time burst there
+    /// is acceptable, whereas an unchanged-config refresh must be a true no-op.
     fn set_limits(&mut self, limits: AdmissionLimits, now_ns: i64) {
-        self.byte_rate = match limits.ingest_byte_rate {
-            RateLimit::Bounded { per_sec, burst } => Some(TokenBucket::new(per_sec, burst, now_ns)),
-            RateLimit::Unlimited => None,
-        };
-        self.creation_rate = match limits.series_creation_rate {
-            RateLimit::Bounded { per_sec, burst } => Some(TokenBucket::new(per_sec, burst, now_ns)),
-            RateLimit::Unlimited => None,
-        };
-        self.fleet_max_active_series = limits.max_active_series;
-        self.fleet_max_active_streams = limits.max_active_streams;
+        if limits.ingest_byte_rate != self.limits.ingest_byte_rate {
+            self.byte_rate = match limits.ingest_byte_rate {
+                RateLimit::Bounded { per_sec, burst } => {
+                    Some(TokenBucket::new(per_sec, burst, now_ns))
+                }
+                RateLimit::Unlimited => None,
+            };
+        }
+        if limits.series_creation_rate != self.limits.series_creation_rate {
+            self.creation_rate = match limits.series_creation_rate {
+                RateLimit::Bounded { per_sec, burst } => {
+                    Some(TokenBucket::new(per_sec, burst, now_ns))
+                }
+                RateLimit::Unlimited => None,
+            };
+        }
+        if limits.max_active_series != self.limits.max_active_series {
+            self.fleet_max_active_series = limits.max_active_series;
+        }
+        if limits.max_active_streams != self.limits.max_active_streams {
+            self.fleet_max_active_streams = limits.max_active_streams;
+        }
         self.limits = limits;
     }
 }
@@ -484,10 +515,14 @@ impl AdmissionController {
         self.clock.now_ns()
     }
 
-    /// Installs or replaces a tenant's limits (ADR-0051 section 3: loaded
-    /// once at startup from the limits file; changing limits is a
-    /// restart). Existing active-series/stream state is preserved; only a
-    /// changed rate's bucket is reset to the new rate at full burst capacity.
+    /// Installs or replaces a tenant's limits. Called once at startup from the
+    /// limits file (ADR-0051 section 3) and, since ADR-0066 decision 6, again
+    /// every refresh horizon by the lifecycle loop with each tenant's durable
+    /// config record laid over its startup base. Existing active-series/stream
+    /// state is preserved, and only a dimension whose configured value actually
+    /// changed since the last apply is reset (see [`TenantState::set_limits`]);
+    /// an unchanged-config refresh is a true no-op that leaves any
+    /// fleet-reconciled narrowing (ADR-0057) in force.
     pub fn set_tenant_limits(&self, tenant: TenantId, limits: AdmissionLimits) {
         let now_ns = self.now_ns();
         let mut tenants = lock(&self.tenants);
