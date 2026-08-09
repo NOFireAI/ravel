@@ -190,10 +190,87 @@ object written) rather than defaulting to bucket 0 (ADR-0051 section 7,
 issue #494): a fallback bucket would make the data undiscoverable by hour
 with no trace of the failure.
 
-The PUTs run inline in the actor for Phase 1: simple, and per-shard flush
-ordering falls out. If PUT latency limits per-shard throughput, Phase 2 can
-pipeline flushes (seq allocated at flush start, commits may land out of
-order; catalog tolerates seq gaps already).
+### Pipelined flushes (ADR-0067, issue #814)
+
+The PUTs no longer run inline in the actor. At flush-open the actor pins
+the flush's identity synchronously (seq, waiters, ingest-hour bucket) in
+its own message-processing order, then moves the buffer out and hands
+steps 1-5 above to a spawned task by ownership transfer -- no shared
+mutable state, per ADR-0067 decision 1. The actor returns immediately to
+`select!` and keeps draining its mailbox, merging new points and opening
+further flushes, while any number of earlier flushes are still stuck in
+their PUTs.
+
+Because identity is pinned before the spawned task ever issues a PUT,
+submission order still determines `seq` order even when two flushes'
+PUTs resolve out of order (the slower one first): ack isolation keys off
+pinned identity, not completion order, so a caller's `write()` always
+resolves to its own token regardless of which flush's PUT the store lets
+through first.
+
+`max_inflight_flushes` (`IngestConfig::max_inflight_flushes`, CLI
+`--max-inflight-flushes`, default **1**) bounds how many such spawned
+tasks one shard may have outstanding at once, via a per-shard
+`tokio::sync::Semaphore`. It is the only thing a flush trigger can now
+block on. Default 1 reproduces today's one-flush-at-a-time behavior bit
+for bit; raising it trades bounded extra per-shard memory (buffers held
+open by the extra in-flight flushes, up to `max_inflight_flushes - 1`
+flush windows' worth) for overlapped PUT latency, and should be raised
+only as a measured decision recorded in BENCHMARKS.md. `0` is rejected at
+the CLI edge (`Cli::validate`): it would deadlock every flush, since a
+shard could never acquire a permit to run one.
+
+Pipelining does not change what the catalog already tolerates: a
+flush's seq is allocated at pin time, not at commit time, so two
+overlapped flushes for the same shard can publish their commit records
+out of seq order when the store resolves their PUTs out of order. This
+is the same seq-gap tolerance the per-(writer,shard) commit protocol
+already provides (docs/catalog-and-mvcc.md) for a writer restart or a
+retried, abandoned flush; pipelining just makes it a routine occurrence
+under concurrency greater than 1 instead of an edge case. Nothing about
+resolution or read-your-write changes: a commit token still names its
+exact object directly.
+
+This applies to the metrics ingest pipeline only. The log and span
+shard actors (below) keep their existing inline flush; extending
+pipelining to them is follow-up work, not part of #814.
+
+### Adaptive flush delay (ADR-0067 decision 3, issue #814)
+
+`adaptive_flush_delay` (`IngestConfig::adaptive_flush_delay`, CLI
+`--adaptive-flush-delay`, default **false**) replaces the fixed
+`max_flush_delay` age threshold, for a buffer with a strict-mode waiter
+or already past `min_flush_bytes`, with a per-(shard, tenant) threshold
+clamped into a corridor `[max_flush_delay, ceiling]`:
+
+- **Floor**: `max_flush_delay` (500 ms default), unchanged from today.
+- **Ceiling**: the strict-mode visibility budget (1 s, the same budget
+  docs/consistency-model.md's strict-mode ack contract names) minus two
+  PUT round trips at their observed p99 (data object, then commit
+  record) minus one retry's base backoff as headroom, floored at
+  `max_flush_delay` so the corridor never inverts. With no PUT RTT
+  observed yet, the ceiling collapses to the floor: adapting upward
+  would be a guess the budget cannot back, so a tenant sees today's
+  fixed 500 ms from its very first flush, not just after warm-up. RTT is
+  sampled from both PUTs of every flush (from spawned tasks, concurrently
+  with the actor and with each other), kept as a bounded p99 estimate
+  (last 64 samples) per shard.
+- **Threshold**: the tenant's own observed inter-arrival gap, clamped
+  into `[floor, ceiling]`. A bursty tenant (small gap) clamps up to the
+  floor -- today's behavior, unchanged. A trickle tenant (large gap)
+  clamps down to the ceiling instead of a fixed-delay actor waiting on it
+  indefinitely for a full `target_bytes` batch.
+
+Off by default, which keeps today's fixed-delay behavior so an operator
+opts in deliberately; A/B'd against the fixed corridor in the ingest
+bench. A flush the corridor actually stretched past the floor is counted
+separately from one that used the fixed value or the idle threshold
+(`flushes_by_age_adaptive` vs `flushes_by_age`, "Metrics" below). Strict
+write ack latency for a buffer that already has a waiter is bounded by
+whichever threshold applies the same way it always was; adaptive delay
+changes only where in `[floor, ceiling]` that threshold sits, never
+whether a strict waiter's flush eventually fires. Applies to the metrics
+ingest pipeline only, same as `max_inflight_flushes` above.
 
 ## Log pipeline
 
@@ -401,6 +478,8 @@ carries max token per shard).
 | min_flush_bytes | 64 KiB |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
+| max_inflight_flushes (per shard, metrics pipeline only) | 1 (`--max-inflight-flushes`, rejects 0) |
+| adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 
 ## Metrics (self-observability)
 
@@ -412,12 +491,17 @@ tenants of the process.
 
 Counters recorded today:
 
-- `flushes_by_size`, `flushes_by_age`, `flushes_manual`: flush count by trigger.
-  `flushes_manual` covers explicit `FlushNow`, the `Shutdown` drain, and the
-  channel-close drop-path drain. These are **attempt-time**: incremented when a
-  flush is opened, before the segment build or any PUT, so a later-abandoned
-  flush is counted here as well as in an `abandoned_*` counter. Successful
-  flushes = the three trigger counters minus the two `abandoned_*` counters.
+- `flushes_by_size`, `flushes_by_age`, `flushes_by_age_adaptive`,
+  `flushes_manual`: flush count by trigger. `flushes_by_age_adaptive` is the
+  subset of age-triggered flushes where `adaptive_flush_delay` actually
+  stretched the threshold past `max_flush_delay`; it is zero unless that knob
+  is enabled, and is disjoint from `flushes_by_age` (a flush counts in exactly
+  one of the two). `flushes_manual` covers explicit `FlushNow`, the `Shutdown`
+  drain, and the channel-close drop-path drain. These are **attempt-time**:
+  incremented when a flush is opened, before the segment build or any PUT, so
+  a later-abandoned flush is counted here as well as in an `abandoned_*`
+  counter. Successful flushes = the four trigger counters minus the two
+  `abandoned_*` counters.
 - `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
   budget or `max_flush_lifetime` elapsed (`WriteError::Abandoned`). Durability
   signal; retryable.
@@ -436,6 +520,13 @@ Counters recorded today:
   collision.
 - `shard_deaths`: distinct shard actors observed dead by the router, counted
   once per shard.
+- `in_flight_flushes_total`: gauge, sum across shards of flush tasks spawned
+  but not yet acked (ADR-0067 decision 2 consequence of pipelining). Unlike
+  every other counter here it is per-shard underneath
+  (`IngestMetrics::in_flight_flushes_by_shard`) before being summed into this
+  flat total; a shard with no flush in flight contributes 0. With
+  `max_inflight_flushes` at its default of 1, this never exceeds
+  `shard_count`.
 
 Tracked future work (not yet implemented; own ticket, see a8-F05): a per-shard
 and per-tenant dimensioned model — per-shard buffered bytes/points, flush
