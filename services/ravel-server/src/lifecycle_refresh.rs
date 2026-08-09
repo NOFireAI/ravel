@@ -434,9 +434,20 @@ pub fn spawn(
     }
     let (tx, mut rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
+        // The horizon deadline is held OUTSIDE the select!, not rebuilt as a
+        // fresh `sleep(interval)` on every iteration. The miss arm below fires
+        // on every unknown-token request (the rate limiter gates the re-read,
+        // not the wakeup), and this resolver sits last in the fallback chain, so
+        // it sees every bearer token no other resolver could answer. A
+        // re-created timer would be reset by each of those wakeups, and a single
+        // misconfigured agent (or any scanner) retrying more often than once per
+        // horizon would starve the horizon arm forever, so the durable
+        // per-tenant limits refresh would never run.
+        let mut next_refresh = tokio::time::Instant::now() + jittered(interval);
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(jittered(interval)) => {
+                _ = tokio::time::sleep_until(next_refresh) => {
+                    next_refresh = tokio::time::Instant::now() + jittered(interval);
                     let now_ns = SystemClock.now_ns();
                     refresh_cycle(auth.as_deref(), store.as_ref(), limits.as_ref(), now_ns).await;
                 }
@@ -621,6 +632,95 @@ mod tests {
             state.stale_fail_closed() >= 1,
             "the fail-closed staleness metric incremented"
         );
+    }
+
+    /// A steady stream of unknown-token requests must NOT starve the horizon
+    /// refresh. Every miss wakes the loop's miss arm (the on-miss rate limiter
+    /// gates the re-read, not the wakeup), so a horizon timer re-created inside
+    /// the `select!` would be reset by each miss and the durable per-tenant
+    /// limits refresh would never run. Under paused time this drives 300
+    /// simulated seconds of one-miss-per-second traffic against a 60s horizon
+    /// and asserts the durable cap was applied anyway, observed through real
+    /// admission behaviour (five series admitted where the startup base cap of
+    /// two would admit two).
+    #[tokio::test(start_paused = true)]
+    async fn token_misses_do_not_starve_the_horizon_limits_refresh() {
+        use std::collections::HashMap;
+
+        use ravel_catalog::{TenantConfig, TenantLifecycleState, set_tenant_config};
+        use ravel_ingest::{CountLimit, RateLimit};
+        use ravel_types::SeriesId;
+
+        fn base_limits(cap: u64) -> AdmissionLimits {
+            AdmissionLimits {
+                max_active_series: CountLimit::Bounded(cap),
+                max_active_streams: CountLimit::Unlimited,
+                ingest_byte_rate: RateLimit::Unlimited,
+                series_creation_rate: RateLimit::Unlimited,
+            }
+        }
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme");
+        let base = base_limits(2);
+
+        // A durable config record raises acme's active-series cap to 5. Only the
+        // horizon refresh can apply it.
+        set_tenant_config(
+            store.as_ref(),
+            &tenant.hash(),
+            &TenantConfig {
+                max_active_series: Some(5),
+                ..TenantConfig::new(TenantLifecycleState::Active)
+            },
+            1_000,
+        )
+        .await
+        .expect("write config record");
+
+        let admission = Arc::new(AdmissionController::new(Arc::new(SystemClock), base));
+        // Startup seeds the tenant at its --limits-file base cap of 2.
+        admission.set_tenant_limits(tenant.clone(), base);
+
+        let now = SystemClock.now_ns();
+        let auth = Arc::new(state_over(store.clone(), now));
+        let task = spawn(
+            Some(auth.clone()),
+            store.clone(),
+            Some(LimitsRefresh {
+                admission: admission.clone(),
+                defaults: base,
+                tenant_overrides: HashMap::from([(tenant.clone(), base)]),
+            }),
+            Duration::from_secs(60),
+        );
+
+        // Five simulated minutes of one unknown-token request per second: five
+        // horizons' worth of misses, each of which wakes the loop.
+        for _ in 0..300 {
+            assert_eq!(
+                auth.resolve_token(b"unknown-token", now),
+                AuthResolution::Miss,
+                "an unknown token is a miss, which signals the loop"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        task.shutdown().await;
+
+        // The durable cap of 5 was applied despite the miss traffic: admission
+        // now admits five fresh series where the base cap of 2 would admit two.
+        let admitted = admission.admit_series(
+            &tenant,
+            (1u8..=5).map(|b| SeriesId([b; 16])),
+            SystemClock.now_ns(),
+        );
+        assert_eq!(
+            admitted.admitted.len(),
+            5,
+            "the horizon refresh applied the durable cap of 5 despite continuous token misses; \
+             a miss-reset horizon timer would leave the startup cap of 2 in force"
+        );
+        assert!(admitted.rejected.is_empty());
     }
 
     /// The `TenantResolver` surface: a hard-stale or unknown-token request is an
