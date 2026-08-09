@@ -40,8 +40,8 @@ use ravel_types::TenantHash;
 
 /// Format floor written into every config record this build emits, and the
 /// highest record version it understands. A record declaring a higher version is
-/// refused rather than misread under this layout, matching the `prov` / `enc` /
-/// `sys/gc` records' version guards.
+/// refused rather than misread under this layout, matching the `prov` / `enc`
+/// records' version guards (both other `t/<hash>/` records in this crate).
 pub const TENANT_CONFIG_FORMAT_VERSION: u32 = 1;
 
 /// Object key for a tenant's config record: `t/<hex>/config`. Tenant-scoped, not

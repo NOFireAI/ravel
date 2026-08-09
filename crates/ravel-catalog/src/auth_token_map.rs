@@ -43,7 +43,9 @@ pub const AUTH_KEY: &str = "sys/auth";
 
 /// Format version written into every `sys/auth` object this module emits, and
 /// the highest version it reads. A future version is refused rather than misread
-/// under the v1 layout, matching every other durable object's guard.
+/// under the v1 layout, matching the `prov` / `enc` / `t/<hash>/config` records'
+/// fail-closed-on-newer guard (each uses its own comparison operator; see each
+/// module for its exact check).
 pub const AUTH_TOKEN_MAP_FORMAT_VERSION: u32 = 1;
 
 /// Width of a token hash: a full blake3 output, 32 bytes.
