@@ -83,8 +83,9 @@ work). Nothing deletes these heartbeats (staleness detection replaces a sweep).
 per-worker memo snapshot: the same self-owned, root-level, `Overwrite` pattern
 beside the heartbeat prefix. On its discovery cadence each maintain process
 writes a compact summary of the `(tenant, signal, shard)` buckets it has
-verified terminal -- per unit a `terminal_frontier_hour` frontier run plus a
-sparse RLE exception list, so the retention-window interior is one run and the
+verified terminal -- per unit a frontier run (the longest contiguous
+same-state terminal run) plus a sparse RLE exception list of the other
+terminal runs outside it, so the retention-window interior is one run and the
 object stays KBs even at large retention -- **debounced**, so a tick that
 verified nothing new writes nothing (the debounce compares the timestamp-free
 body, so it rides the existing tick and needs no separate timer). On startup,
