@@ -50,6 +50,9 @@
 //! the way down (crate::memory, review F13). A second release mechanism here
 //! would double-count against the tenant budget.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arrow_flight::FlightData;
@@ -58,6 +61,7 @@ use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use futures::{Stream, StreamExt};
 use ravel_catalog::Snapshot;
+use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_query::QueryPermit;
 use ravel_types::TenantHash;
 use ravel_types::accounting::{
@@ -243,6 +247,184 @@ impl Drop for RecordOnStreamEnd {
     }
 }
 
+/// The fixed client message when a `required`-mode audit flush fails and the
+/// Flight stream must fail closed. Carries no server state.
+const AUDIT_UNAVAILABLE_MSG: &str = "query audit is temporarily unavailable; retry";
+
+/// The evidential-audit context one Flight statement submits at stream
+/// completion: the sink, the resolved tenant, the request timestamp, and the
+/// statement text. Held by [`AuditedStream`] until the terminal event, then
+/// consumed to build and submit the [`AuditEvent`](ravel_maintain::AuditEvent).
+struct AuditCtx {
+    sink: Arc<dyn QueryAuditSink>,
+    tenant: TenantHash,
+    now_ns: i64,
+    query_text: String,
+}
+
+impl AuditCtx {
+    /// Build the query-audit event for this statement at `status`. The window
+    /// bounds are recorded as `0, 0`: a Flight statement carries no event-time
+    /// window on the `DoGet` redemption path (the window a client sends via
+    /// metadata is consumed at `GetFlightInfo` to resolve and pin the snapshot
+    /// and is not carried in the ticket), so recording `0, 0` states "unknown"
+    /// plainly rather than fabricating a range the request never used.
+    fn event(&self, status: QueryStatus) -> ravel_maintain::AuditEvent {
+        query_audit_event(
+            &self.tenant,
+            self.now_ns,
+            &self.query_text,
+            "sql",
+            status,
+            0,
+            0,
+        )
+    }
+}
+
+/// The phase of an [`AuditedStream`].
+enum AuditPhase {
+    /// Passing batches through from the inner encoded stream.
+    Streaming,
+    /// The inner stream reached its terminal event; the audit event is in
+    /// flight and its durability is being awaited before the client observes
+    /// the stream's end.
+    Flushing(Pin<Box<dyn Future<Output = ravel_maintain::Result<()>> + Send>>),
+    /// The stream is exhausted.
+    Done,
+}
+
+/// Wraps a `DoGet` result stream so exactly one audit event is submitted at
+/// stream *completion*, with the stream's actual terminal status, and its
+/// durability is awaited before the client observes the stream's end (ADR-0062
+/// §2a, issue #413).
+///
+/// This closes the status-accuracy gap of auditing at stream construction: the
+/// recorded status is `Ok` only when the inner stream ended with no error
+/// item, `Error` when any error item was seen (a query that failed partway),
+/// and `Error` on client cancellation (see the `Drop` impl). In
+/// `audit_mode=required` a flush failure turns the stream's end into a trailing
+/// `Unavailable` error so the client fails closed rather than believing an
+/// unaudited query succeeded.
+struct AuditedStream {
+    inner: DoGetStream,
+    /// The audit context, taken when the audit begins (terminal event) or when
+    /// the stream is dropped before completion. `None` once taken, so the audit
+    /// fires at most once across both the poll path and `Drop`.
+    ctx: Option<AuditCtx>,
+    /// Set when the inner stream yielded an error item, so the terminal audit
+    /// records `Error` rather than `Ok`.
+    saw_error: bool,
+    phase: AuditPhase,
+}
+
+impl Stream for AuditedStream {
+    type Item = Result<FlightData, Status>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // `AuditedStream` is `Unpin` (every field is: a boxed stream, an
+        // `Option`, a `bool`, and a phase whose only non-trivial variant holds
+        // a boxed future), so it is safe to operate on `&mut Self`.
+        let this = self.get_mut();
+        loop {
+            match &mut this.phase {
+                AuditPhase::Done => return Poll::Ready(None),
+                AuditPhase::Flushing(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {
+                        this.phase = AuditPhase::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(Err(_)) => {
+                        this.phase = AuditPhase::Done;
+                        // Fail closed on an audit flush failure, unless the
+                        // client already saw a real error item for this stream
+                        // (then the failure is already signalled and a second
+                        // error item would be noise).
+                        if this.saw_error {
+                            return Poll::Ready(None);
+                        }
+                        return Poll::Ready(Some(Err(Status::unavailable(AUDIT_UNAVAILABLE_MSG))));
+                    }
+                },
+                AuditPhase::Streaming => match this.inner.poll_next_unpin(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(batch))) => return Poll::Ready(Some(Ok(batch))),
+                    Poll::Ready(Some(Err(status))) => {
+                        this.saw_error = true;
+                        return Poll::Ready(Some(Err(status)));
+                    }
+                    Poll::Ready(None) => {
+                        // Terminal: submit the audit with the real outcome and
+                        // await durability before the client observes the end.
+                        // `ctx` is present exactly once (the pre-completion Drop
+                        // path also takes it), so the audit fires at most once.
+                        let Some(ctx) = this.ctx.take() else {
+                            this.phase = AuditPhase::Done;
+                            return Poll::Ready(None);
+                        };
+                        let status = if this.saw_error {
+                            QueryStatus::Error
+                        } else {
+                            QueryStatus::Ok
+                        };
+                        let event = ctx.event(status);
+                        let sink = Arc::clone(&ctx.sink);
+                        this.phase =
+                            AuditPhase::Flushing(Box::pin(async move { sink.submit(event).await }));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl Drop for AuditedStream {
+    fn drop(&mut self) {
+        // If `ctx` is still present the stream was dropped before its terminal
+        // event: the client cancelled (disconnected) mid-stream. Record that
+        // outcome as `Error` so the trail never shows a false "ok" for a
+        // cancelled query (issue #413). This is the one audit path that cannot
+        // await durability: `Drop` is synchronous and there is no response left
+        // to gate -- the client is already gone -- so it is submitted
+        // best-effort on a detached task rather than fire-and-forget on a live
+        // response path. Once the terminal poll path has taken `ctx` (audit
+        // submitted and awaited inline), this does nothing.
+        if let Some(ctx) = self.ctx.take() {
+            let event = ctx.event(QueryStatus::Error);
+            let sink = ctx.sink;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = sink.submit(event).await;
+                });
+            }
+        }
+    }
+}
+
+/// Wrap `inner` so exactly one audit event is submitted at stream completion
+/// with the stream's actual terminal status, its durability awaited before the
+/// client observes the end (issue #413). See [`AuditedStream`].
+pub(super) fn audited_stream(
+    inner: DoGetStream,
+    sink: Arc<dyn QueryAuditSink>,
+    tenant: TenantHash,
+    now_ns: i64,
+    query_text: String,
+) -> DoGetStream {
+    Box::pin(AuditedStream {
+        inner,
+        ctx: Some(AuditCtx {
+            sink,
+            tenant,
+            now_ns,
+            query_text,
+        }),
+        saw_error: false,
+        phase: AuditPhase::Streaming,
+    })
+}
+
 /// Nanoseconds left before `deadline_ns`, as a duration. Never negative; the
 /// caller has already rejected an expired ticket, so a zero here can only come
 /// from a deadline reached between that check and this call.
@@ -357,5 +539,168 @@ mod tests {
         let status = flight_error_to_status(FlightError::Tonic(Box::new(inner)));
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert_eq!(status.message(), "storage temporarily unavailable");
+    }
+
+    // -----------------------------------------------------------------
+    // Stream-completion audit (ADR-0062 §2a, issue #413)
+    // -----------------------------------------------------------------
+
+    use std::sync::Mutex;
+
+    use ravel_maintain::{AuditEvent, MaintainError};
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+
+    /// Captures every submitted audit event and reports durability success.
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<AuditEvent>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl QueryAuditSink for RecordingSink {
+        async fn submit(&self, event: AuditEvent) -> Result<(), MaintainError> {
+            self.events.lock().expect("lock").push(event);
+            Ok(())
+        }
+    }
+
+    /// Always fails its submission (an `audit_mode=required` flush failure).
+    struct FailingSink;
+
+    #[async_trait::async_trait]
+    impl QueryAuditSink for FailingSink {
+        async fn submit(&self, _event: AuditEvent) -> Result<(), MaintainError> {
+            Err(MaintainError::AuditFlush("down".to_string()))
+        }
+    }
+
+    fn inner_stream(items: Vec<Result<FlightData, Status>>) -> DoGetStream {
+        Box::pin(futures::stream::iter(items))
+    }
+
+    /// Drain a whole stream, returning the ordered items.
+    async fn drain(mut stream: DoGetStream) -> Vec<Result<FlightData, Status>> {
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(item);
+        }
+        out
+    }
+
+    fn status_text(event: &AuditEvent) -> &str {
+        // `query_audit_event` derives severity from status: INFO for ok, ERROR
+        // for error. Asserting on it avoids naming the attr value type here.
+        &event.severity_text
+    }
+
+    /// A clean stream (no error item) records exactly one `ok` audit event at
+    /// completion.
+    #[tokio::test]
+    async fn a_clean_stream_records_one_ok_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            events: Arc::clone(&events),
+        });
+        let inner = inner_stream(vec![Ok(FlightData::default())]);
+        let stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+
+        let items = drain(stream).await;
+        assert_eq!(items.len(), 1, "the one data item passes through");
+        assert!(items[0].is_ok());
+
+        let guard = events.lock().expect("lock");
+        assert_eq!(guard.len(), 1, "exactly one audit event at completion");
+        assert_eq!(status_text(&guard[0]), "INFO", "a clean stream records ok");
+    }
+
+    /// THE #413 status-accuracy proof: a stream that fails partway records
+    /// `error`, not the blind "started/ok" the construction-time audit would
+    /// have written after the first batch pulled cleanly.
+    #[tokio::test]
+    async fn a_stream_that_fails_partway_records_error_not_ok() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            events: Arc::clone(&events),
+        });
+        // First batch succeeds (a construction-time audit would record "ok"
+        // here), then the stream errors partway.
+        let inner = inner_stream(vec![
+            Ok(FlightData::default()),
+            Err(Status::internal("boom")),
+        ]);
+        let stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+
+        let items = drain(stream).await;
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok(), "first batch reached the client");
+        assert!(items[1].is_err(), "the mid-stream error reached the client");
+
+        let guard = events.lock().expect("lock");
+        assert_eq!(guard.len(), 1, "exactly one audit event");
+        assert_eq!(
+            status_text(&guard[0]),
+            "ERROR",
+            "a stream that failed partway must record error, not a blind ok"
+        );
+    }
+
+    /// Fail-closed: when the audit flush fails in `required` mode, a clean
+    /// stream's end is turned into a trailing `Unavailable` error so the client
+    /// never believes an unaudited query succeeded.
+    #[tokio::test]
+    async fn a_required_audit_flush_failure_fails_the_stream_closed() {
+        let inner = inner_stream(vec![Ok(FlightData::default())]);
+        let stream = audited_stream(
+            inner,
+            Arc::new(FailingSink),
+            TENANT,
+            42,
+            "SELECT 1".to_string(),
+        );
+
+        let items = drain(stream).await;
+        assert_eq!(items.len(), 2, "one data item, then a trailing audit error");
+        assert!(items[0].is_ok());
+        let err = items[1].as_ref().expect_err("trailing error");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    /// A client that cancels (drops the stream) mid-flight records `error`
+    /// best-effort, so the trail never shows a false "ok" for a cancelled
+    /// query. This is the one audit path that cannot await durability (Drop is
+    /// synchronous and no response is pending); it is submitted on a detached
+    /// task, so the assertion allows it a moment to run.
+    #[tokio::test]
+    async fn a_cancelled_stream_records_error_best_effort() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            events: Arc::clone(&events),
+        });
+        // A stream that yields one batch then would continue; we drop it after
+        // the first item, before its terminal event.
+        let inner = inner_stream(vec![Ok(FlightData::default()), Ok(FlightData::default())]);
+        let mut stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+        let first = stream.next().await;
+        assert!(first.is_some_and(|i| i.is_ok()), "pulled the first batch");
+        drop(stream);
+
+        // The Drop path spawns the cancellation audit; give it a moment.
+        for _ in 0..50 {
+            if !events.lock().expect("lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let guard = events.lock().expect("lock");
+        assert_eq!(
+            guard.len(),
+            1,
+            "a cancelled stream records exactly one event"
+        );
+        assert_eq!(
+            status_text(&guard[0]),
+            "ERROR",
+            "a cancelled stream records error, never a blind ok"
+        );
     }
 }

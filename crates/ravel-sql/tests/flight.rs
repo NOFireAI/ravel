@@ -88,6 +88,83 @@ async fn get_flight_info_then_do_get_returns_the_http_rows() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Evidential audit at stream completion (ADR-0062 §2a, issue #413)
+// ---------------------------------------------------------------------------
+
+/// Captures every submitted audit event, reporting durability success.
+struct RecordingSink {
+    events: Arc<std::sync::Mutex<Vec<ravel_maintain::AuditEvent>>>,
+}
+
+#[async_trait::async_trait]
+impl ravel_maintain::QueryAuditSink for RecordingSink {
+    async fn submit(
+        &self,
+        event: ravel_maintain::AuditEvent,
+    ) -> Result<(), ravel_maintain::MaintainError> {
+        self.events.lock().expect("lock").push(event);
+        Ok(())
+    }
+}
+
+/// A full `GetFlightInfo` -> `DoGet` over the real service submits exactly one
+/// audit event, at stream completion, with `ok` status and the statement text.
+/// The audit fires only once the result stream is fully drained (`do_get`
+/// collects it), proving the audit is bound to completion, not construction.
+#[tokio::test]
+async fn a_completed_do_get_records_one_ok_audit_event_at_stream_end() {
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let mut harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    harness.service = RavelFlightSqlService::new(
+        Arc::clone(&harness.executor),
+        TestAuth::new(&[("acme", &tenant)]),
+        Arc::clone(&harness.clock) as Arc<dyn FlightClock>,
+        FlightSqlConfig {
+            max_deadline: Duration::from_secs(30),
+            ..FlightSqlConfig::default()
+        },
+        Arc::new(NoopQueryCostRecorder),
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+    )
+    .with_audit_sink(Arc::new(RecordingSink {
+        events: Arc::clone(&events),
+    }));
+
+    let ticket = harness
+        .get_flight_info("acme", QUERY)
+        .await
+        .expect("flight info");
+    // No audit yet: GetFlightInfo only plans; nothing has executed.
+    assert!(
+        events.lock().expect("lock").is_empty(),
+        "GetFlightInfo must not audit; the statement has not executed"
+    );
+
+    let rows = harness.do_get("acme", &ticket).await.expect("do get");
+    assert!(!rows.is_empty(), "the fixture produces rows");
+
+    let guard = events.lock().expect("lock");
+    assert_eq!(guard.len(), 1, "exactly one audit event per executed DoGet");
+    let event = &guard[0];
+    assert_eq!(
+        event.severity_text, "INFO",
+        "a fully-drained successful stream records ok"
+    );
+    let text = event
+        .attrs
+        .iter()
+        .find(|(k, _)| k == "query.text")
+        .and_then(|(_, v)| match v {
+            ravel_logseg::AttrValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        });
+    assert_eq!(text, Some(QUERY), "the audited text is the statement");
+}
+
 /// The pin is what makes the two RPCs one query: a commit landing between
 /// `GetFlightInfo` and `DoGet` must not appear in the results, because the
 /// ticket already fixed the snapshot. A `DoGet` that re-resolved would return
@@ -212,7 +289,6 @@ async fn the_ticket_deadline_is_bounded_by_the_gc_protection_horizon() {
             gc_protection_horizon: Duration::from_secs(5),
             ..FlightSqlConfig::default()
         },
-        Arc::clone(&harness.store),
         Arc::new(NoopQueryCostRecorder),
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
@@ -310,7 +386,6 @@ async fn do_get_bounds_a_stalled_read_to_the_gc_horizon_not_the_tickets_own_dead
             gc_protection_horizon: Duration::from_millis(50),
             ..FlightSqlConfig::default()
         },
-        Arc::clone(&harness.store),
         Arc::new(NoopQueryCostRecorder),
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
@@ -689,15 +764,59 @@ fn str_attr<'a>(row: &'a ravel_logseg::LogRecord, key: &str) -> Option<&'a str> 
     })
 }
 
+/// Install a group-commit [`AuditPipeline`] over `store` as `harness`'s audit
+/// sink (EL-5 routes Flight audit through the sink; EL-7 installs the real
+/// process pipeline). `max_batch = 1` flushes on every submit so a single
+/// statement's record is durable by the time the audited stream ends, which is
+/// what lets `read_query_audit` read it straight back out of `store`.
+fn install_pipeline_sink(
+    harness: &mut Harness,
+    tenant: &TenantId,
+    store: Arc<dyn ObjectStoreBackend>,
+    mode: ravel_maintain::AuditMode,
+) {
+    let config = ravel_maintain::AuditPipelineConfig {
+        max_batch: 1,
+        max_age: Duration::from_millis(5),
+        shard: ravel_maintain::QUERY_AUDIT_SHARD,
+        audit_mode: mode,
+        channel_capacity: 64,
+    };
+    let sink: Arc<dyn ravel_maintain::QueryAuditSink> = Arc::new(
+        ravel_maintain::AuditPipeline::spawn(store, tenant.hash(), config),
+    );
+    harness.service = RavelFlightSqlService::new(
+        Arc::clone(&harness.executor),
+        TestAuth::new(&[("acme", tenant)]),
+        Arc::clone(&harness.clock) as Arc<dyn FlightClock>,
+        FlightSqlConfig {
+            max_deadline: Duration::from_secs(30),
+            ..FlightSqlConfig::default()
+        },
+        Arc::new(NoopQueryCostRecorder),
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+    )
+    .with_audit_sink(sink);
+}
+
 /// A successful Flight statement execution writes exactly one `ok` query-audit
 /// record, attributed to the resolved tenant, carrying the statement text
 /// verbatim. This is the transport-level analogue of
-/// `a_successful_query_writes_one_ok_audit_record` on the HTTP endpoint.
+/// `a_successful_query_writes_one_ok_audit_record` on the HTTP endpoint. The
+/// record is written by the pipeline at stream completion, so a fully-drained
+/// `DoGet` is what makes it durable.
 #[tokio::test]
 async fn a_successful_flight_statement_writes_one_ok_audit_record() {
     let tenant = tenant_id("acme");
     let seg_specs = specs();
-    let harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+    let mut harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+    let store = Arc::clone(&harness.store);
+    install_pipeline_sink(
+        &mut harness,
+        &tenant,
+        store,
+        ravel_maintain::AuditMode::Required,
+    );
 
     let ticket = harness
         .get_flight_info("acme", QUERY)
@@ -708,7 +827,7 @@ async fn a_successful_flight_statement_writes_one_ok_audit_record() {
     assert!(rows > 0, "the fixture must produce rows");
 
     // Exactly one record: `GetFlightInfo` only plans (it writes no audit), and
-    // the single `DoGet` executes the statement once.
+    // the single `DoGet` executes the statement once and audits at completion.
     let audit = read_query_audit(harness.store.as_ref(), &tenant.hash()).await;
     assert_eq!(
         audit.len(),
@@ -731,8 +850,10 @@ async fn a_successful_flight_statement_writes_one_ok_audit_record() {
 /// A statement that plans cleanly at `GetFlightInfo` but fails at `DoGet` (its
 /// pinned segments have vanished) still writes exactly one audit record, with
 /// `status = error`. The fault targets only metric L0 segment reads (`/m/l0/`),
-/// so snapshot resolution and the audit read-back both work: only the scan
-/// fails, which is what turns a planned statement into a failed execution.
+/// so snapshot resolution, the audit write (`/u/`), and the audit read-back all
+/// work: only the scan fails, which is what turns a planned statement into a
+/// failed execution -- and the audited status reflects that failure, not a
+/// blind "started" (issue #413).
 #[tokio::test]
 async fn a_failed_flight_statement_writes_a_status_error_audit_record() {
     let tenant = tenant_id("acme");
@@ -746,7 +867,13 @@ async fn a_failed_flight_statement_writes_a_status_error_audit_record() {
         MemoryStore::new(),
         plan,
     ));
-    let harness = Harness::build(store, &[(&tenant, &seg_specs)]).await;
+    let mut harness = Harness::build(Arc::clone(&store), &[(&tenant, &seg_specs)]).await;
+    install_pipeline_sink(
+        &mut harness,
+        &tenant,
+        Arc::clone(&store),
+        ravel_maintain::AuditMode::Required,
+    );
 
     let ticket = harness
         .get_flight_info("acme", QUERY)
@@ -765,13 +892,15 @@ async fn a_failed_flight_statement_writes_a_status_error_audit_record() {
     assert_eq!(audit[0].severity_text, "ERROR");
 }
 
-/// An audit-write failure never turns a successful Flight query into an error
-/// response. The fault fails every PUT under the audit signal path (`/u/`), so
-/// the audit record cannot be written, but the query itself (all reads) still
-/// streams its rows back to the client unaffected. This is the transport-level
-/// analogue of the HTTP endpoint's failure-isolation discipline.
+/// An audit-write failure fails a Flight query CLOSED in `audit_mode=required`
+/// (ADR-0062 §2b). The fault fails every PUT under the audit signal path
+/// (`/u/`), so the pipeline's completion flush cannot land; the audited stream
+/// then ends in an `Unavailable` error rather than a silent success, so a
+/// client never believes an unaudited query completed. This is the deliberate
+/// inversion of the pre-EL "log and swallow" behavior -- the transport-level
+/// analogue of the HTTP endpoint's fail-closed test.
 #[tokio::test]
-async fn an_audit_write_failure_does_not_fail_the_flight_response() {
+async fn an_audit_write_failure_fails_the_flight_response_closed() {
     let tenant = tenant_id("acme");
     let seg_specs = specs();
     let plan = FaultPlan::empty().with_rule(
@@ -787,33 +916,36 @@ async fn an_audit_write_failure_does_not_fail_the_flight_response() {
         plan,
     ));
     let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
-    let harness = Harness::build(backend, &[(&tenant, &seg_specs)]).await;
+    let mut harness = Harness::build(Arc::clone(&backend), &[(&tenant, &seg_specs)]).await;
+    install_pipeline_sink(
+        &mut harness,
+        &tenant,
+        Arc::clone(&backend),
+        ravel_maintain::AuditMode::Required,
+    );
 
     let ticket = harness
         .get_flight_info("acme", QUERY)
         .await
         .expect("flight info");
-    // The client's query succeeds and returns its rows, even though the audit
-    // write below it cannot land.
-    let batches = harness
+    // The reads all succeed, but the completion audit flush fails, so the
+    // stream ends in an Unavailable error: the query fails closed.
+    let status = harness
         .do_get("acme", &ticket)
         .await
-        .expect("the query response is unaffected by the audit-write failure");
-    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    assert!(rows > 0, "the client still receives its result rows");
+        .expect_err("a required-mode audit flush failure must fail the query closed");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
 
-    // Prove the fault actually fired against the audit write, not that the path
-    // was simply never taken.
+    // Prove the fault actually fired against the audit write.
     assert!(
         store.fault_count(Op::Put, FaultKind::Permanent) >= 1,
         "the audit write must have attempted a PUT and been faulted"
     );
-    // And the record genuinely did not land: the trail is incomplete for this
-    // request, which is the loudly-logged, swallowed outcome.
+    // And the record genuinely did not land.
     let audit = read_query_audit(harness.store.as_ref(), &tenant.hash()).await;
     assert!(
         audit.is_empty(),
-        "the faulted audit write leaves no record behind"
+        "the faulted audit write leaves no durable record behind"
     );
 }
 
@@ -924,7 +1056,6 @@ async fn ceiling_harness(
             max_deadline: Duration::from_secs(30),
             ..FlightSqlConfig::default()
         },
-        Arc::clone(&harness.store),
         Arc::new(NoopQueryCostRecorder),
         Arc::clone(&controller),
     );

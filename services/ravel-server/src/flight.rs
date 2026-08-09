@@ -93,24 +93,27 @@ pub fn service(
         gc_protection_horizon: gc_ticket_ceiling,
         ..FlightSqlConfig::default()
     };
-    FlightServiceServer::new(RavelFlightSqlService::new(
-        Arc::clone(&state.executor),
-        auth,
-        clock,
-        config,
-        // The same object store `SqlState` writes the HTTP endpoint's
-        // query-audit record to, so Flight statements are audited through the
-        // same store (issue #395).
-        Arc::clone(&state.store),
-        // The same per-query cost aggregator every other read surface folds
-        // into, cloned out of `SqlState` the way `store` is, so Flight SQL cost
-        // reaches the one process `ravel_query_*` family (ADR-0044 section 4,
-        // issue #425).
-        Arc::clone(&state.query_accounting) as Arc<dyn ravel_types::accounting::QueryCostRecorder>,
-        // The one shared fleet-global query concurrency controller (ADR-0061
-        // decision 2), cloned out of `SqlState` the way `store` and the cost
-        // recorder are, so Flight SQL `GetFlightInfo` admits against the same
-        // process-wide in-flight count the PromQL and HTTP SQL surfaces do.
-        Arc::clone(&state.query_admission),
-    ))
+    FlightServiceServer::new(
+        RavelFlightSqlService::new(
+            Arc::clone(&state.executor),
+            auth,
+            clock,
+            config,
+            // The same per-query cost aggregator every other read surface folds
+            // into, cloned out of `SqlState`, so Flight SQL cost reaches the one
+            // process `ravel_query_*` family (ADR-0044 section 4, issue #425).
+            Arc::clone(&state.query_accounting)
+                as Arc<dyn ravel_types::accounting::QueryCostRecorder>,
+            // The one shared fleet-global query concurrency controller (ADR-0061
+            // decision 2), cloned out of `SqlState`, so Flight SQL
+            // `GetFlightInfo` admits against the same process-wide in-flight
+            // count the PromQL and HTTP SQL surfaces do.
+            Arc::clone(&state.query_admission),
+        )
+        // The same evidential audit sink the HTTP SQL endpoint submits through
+        // (ADR-0062 §2a). Flight SQL audits at stream completion through it
+        // (issue #413), so both transports' query-audit trails land through one
+        // seam.
+        .with_audit_sink(Arc::clone(&state.audit_sink)),
+    )
 }

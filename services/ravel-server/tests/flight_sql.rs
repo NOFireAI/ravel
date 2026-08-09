@@ -171,6 +171,7 @@ fn sql_state(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantI
         query_admission: ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
+        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
     }
 }
 

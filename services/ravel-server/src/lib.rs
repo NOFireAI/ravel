@@ -777,6 +777,10 @@ pub async fn start(
             tenant_resolver: config.tenant_resolver.clone(),
             clock: Arc::new(SystemClock),
             query_accounting: query_accounting.clone(),
+            // EL-5 routes analytics through the QueryAuditSink seam; the
+            // process-wide AuditPipeline install is EL-7, so this is the no-op
+            // sink today (the handler already submits and awaits through it).
+            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         };
         http_router = http_router.merge(analytics::router(analytics_state));
         if let Some(mtls) = &config.mtls_listener {
@@ -785,6 +789,7 @@ pub async fn start(
                 tenant_resolver: mtls.resolver.clone(),
                 clock: Arc::new(SystemClock),
                 query_accounting: query_accounting.clone(),
+                audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
             };
             mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
         }

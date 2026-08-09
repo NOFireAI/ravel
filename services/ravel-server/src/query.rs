@@ -188,6 +188,11 @@ pub fn build_sql_state(
         max_deadline,
         query_accounting,
         query_admission,
+        // EL-5 routes the SQL HTTP audit through the QueryAuditSink seam;
+        // installing the process-wide AuditPipeline is EL-7's server-wiring
+        // task, so this defaults to the no-op today. The endpoint already
+        // submits and awaits through the trait, so EL-7 is a one-line swap.
+        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
     })
 }
 

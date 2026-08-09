@@ -13,6 +13,12 @@ ravel-catalog = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-cache = { workspace = true }
+# The evidential query-audit sink (QueryAuditSink/AuditEvent) the PromQL HTTP
+# handlers submit through and await durability on (ADR-0062 §2a, epic EL /
+# issue #762). ravel-maintain does not depend on ravel-query, so this edge is
+# acyclic; it was previously a path dev-dependency here and is now a normal
+# one because the sink is held by AppState on the production read path.
+ravel-maintain = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

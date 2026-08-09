@@ -61,6 +61,7 @@ use ravel_types::TenantHash;
 use ravel_types::logstream::log_stream_id;
 use uuid::Uuid;
 
+use crate::audit_pipeline::AuditEvent;
 use crate::audit_write::{AuditWrite, write_audit_object};
 use crate::error::Result;
 
@@ -122,17 +123,25 @@ impl QueryStatus {
     }
 }
 
-/// Write one immutable query-audit record for `tenant` at `now_ns`, recording
-/// that a `language` query with `query_text` finished with `status`.
+/// Build one query-audit [`AuditEvent`] for `tenant` at `now_ns`, recording
+/// that a `language` query with `query_text` finished with `status`, over the
+/// resolved `[window_start_ns, window_end_ns]` range.
 ///
-/// The record is written by the server, never derived from a client body, so a
-/// tenant cannot forge or suppress it. A fresh `Uuid` is minted per call for
-/// the object identity; the record is otherwise a pure function of its inputs.
-/// The write is idempotent on the data object (content-addressed) exactly like
-/// every other L0 audit write.
-#[allow(clippy::too_many_arguments)]
-pub async fn write_query_audit(
-    store: &dyn ObjectStoreBackend,
+/// This is the record content every query surface submits through the
+/// [`QueryAuditSink`](crate::audit_pipeline::QueryAuditSink) seam (ADR-0062
+/// §2a, epic EL / issue #762). It is the single source of the query-audit
+/// record shape: the attrs, the shared log stream, and the status-derived
+/// severity live here so every surface -- PromQL, SQL HTTP, Flight SQL,
+/// analytics, exemplars -- emits one identical schema differing only in the
+/// `language` value and the recorded text/status/window. [`write_query_audit`]
+/// is the degenerate direct-write path built on this same event, kept for the
+/// callers that write a single record per call without a pipeline.
+///
+/// The event carries the record content only; the pipeline owns the shard and
+/// mints the per-batch object identity (`record_id`). The `query.tenant` attr
+/// records `tenant` so the record is attributed to the resolved tenant, never
+/// to a client-supplied identity.
+pub fn query_audit_event(
     tenant: &TenantHash,
     now_ns: i64,
     query_text: &str,
@@ -140,7 +149,7 @@ pub async fn write_query_audit(
     status: QueryStatus,
     window_start_ns: i64,
     window_end_ns: i64,
-) -> Result<()> {
+) -> AuditEvent {
     let (stream_id, stream_attrs) = query_stream();
     let (severity_num, severity_text) = status.severity();
     let attrs = vec![
@@ -162,19 +171,59 @@ pub async fn write_query_audit(
         (ATTR_TEXT.to_string(), AttrValue::Str(query_text.into())),
     ];
     let body = format!("{language} query {}", status.as_str());
+    AuditEvent {
+        now_ns,
+        stream_id,
+        stream_attrs,
+        severity_num,
+        severity_text: severity_text.to_string(),
+        body,
+        attrs,
+    }
+}
+
+/// Write one immutable query-audit record for `tenant` at `now_ns`, recording
+/// that a `language` query with `query_text` finished with `status`.
+///
+/// The record is written by the server, never derived from a client body, so a
+/// tenant cannot forge or suppress it. A fresh `Uuid` is minted per call for
+/// the object identity; the record is otherwise a pure function of its inputs.
+/// The write is idempotent on the data object (content-addressed) exactly like
+/// every other L0 audit write. The record content is built by
+/// [`query_audit_event`], the same shape every pipeline-backed surface submits.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_query_audit(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    now_ns: i64,
+    query_text: &str,
+    language: &str,
+    status: QueryStatus,
+    window_start_ns: i64,
+    window_end_ns: i64,
+) -> Result<()> {
+    let event = query_audit_event(
+        tenant,
+        now_ns,
+        query_text,
+        language,
+        status,
+        window_start_ns,
+        window_end_ns,
+    );
     write_audit_object(
         store,
         tenant,
         AuditWrite {
             shard: QUERY_AUDIT_SHARD,
             record_id: Uuid::new_v4(),
-            now_ns,
-            stream_id,
-            stream_attrs,
-            severity_num,
-            severity_text: severity_text.to_string(),
-            body,
-            attrs,
+            now_ns: event.now_ns,
+            stream_id: event.stream_id,
+            stream_attrs: event.stream_attrs,
+            severity_num: event.severity_num,
+            severity_text: event.severity_text,
+            body: event.body,
+            attrs: event.attrs,
         },
     )
     .await

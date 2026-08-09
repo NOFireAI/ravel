@@ -161,6 +161,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         query_admission: ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
+        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
     });
 
     let catalog_cache_metrics = catalog.byte_cache_metrics();
