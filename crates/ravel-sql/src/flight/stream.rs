@@ -369,20 +369,22 @@ impl Stream for AuditedStream {
                         return Poll::Ready(Some(Err(Status::unavailable(AUDIT_UNAVAILABLE_MSG))));
                     }
                 },
-                AuditPhase::FlushingError(fut, _) => match fut.as_mut().poll(cx) {
+                AuditPhase::FlushingError(fut, carried) => match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     // The audit for the failed query is now durable. Yield the
                     // ORIGINAL stream error to the client, whether the flush
                     // itself succeeded or failed: the client is already being
                     // handed a real error, so the success-path fail-closed
-                    // `Unavailable` substitution does not apply here. Take the
-                    // carried `Status` out by replacing the phase with `Done`.
+                    // `Unavailable` substitution does not apply here. The
+                    // carried `Status` is swapped out in place rather than
+                    // destructured out of a re-matched phase, so no
+                    // unreachable-arm panic is needed: panicking in a query
+                    // path is never an acceptable failure mode (`start_pinned`
+                    // takes the same rule). The placeholder left behind is
+                    // never observed; the phase becomes `Done` immediately.
                     Poll::Ready(_) => {
-                        let AuditPhase::FlushingError(_, status) =
-                            std::mem::replace(&mut this.phase, AuditPhase::Done)
-                        else {
-                            unreachable!("phase is FlushingError in this arm")
-                        };
+                        let status = std::mem::replace(carried, Status::ok(""));
+                        this.phase = AuditPhase::Done;
                         return Poll::Ready(Some(Err(status)));
                     }
                 },
