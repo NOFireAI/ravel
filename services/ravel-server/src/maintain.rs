@@ -2,7 +2,12 @@
 //! #115; storage-derived tenant set is ADR-0048 decision 3, issue #504).
 //! Periodically runs age-based retention, L0->L1 compaction, and the GC
 //! sweeper over every `(signal, shard)` of every tenant storage holds data
-//! for.
+//! for. It also brings the query-audit shard (`Signal::Audit` /
+//! `QUERY_AUDIT_SHARD`) into the maintained set (issue #763, EL-6): after the
+//! data-signal loop it compacts that shard, cleans up the compacted L0 inputs,
+//! and runs a dedicated age-based retention sweep on its own 90-day window,
+//! separate from the ADR-0019 per-tenant data retention. The legal-hold shard
+//! (`AUDIT_HOLD_SHARD` = 0) is never a delete target.
 //!
 //! Unlike fold (a pure query-cost optimization), this task deletes and rewrites
 //! durable objects, but it changes nothing about *what* any sweep, retention,
@@ -56,8 +61,8 @@ use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
 use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
-    Clock, CompactorConfig, LegalHoldCheck, MaintainError, RetentionConfig, WorkerSet,
-    sweep_idempotency_markers, sweep_shard,
+    Clock, CompactorConfig, LegalHoldCheck, MaintainError, QUERY_AUDIT_SHARD, RetentionConfig,
+    WorkerSet, scan_and_compact, sweep_audit_retention, sweep_idempotency_markers, sweep_shard,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
@@ -83,9 +88,13 @@ impl Clock for WallClock {
     }
 }
 
-/// The signals this server ingests, and therefore maintains, today. Metrics
-/// (RSEG) and logs (RLOG) both flow through the same signal-generic
-/// compaction/retention/sweep code (ADR-0032).
+/// The data signals this server ingests, and therefore maintains, today.
+/// Metrics (RSEG), logs (RLOG), and spans all flow through the same
+/// signal-generic compaction/retention/sweep code (ADR-0032), carrying ADR-0019
+/// per-tenant retention and per-signal shard counts. `Signal::Audit` is
+/// deliberately absent: the query-audit shard is a fixed control-plane shard
+/// maintained separately at the end of [`run_tick`] on its own window (issue
+/// #763, EL-6), and the legal-hold shard is never a delete target at all.
 pub(crate) const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
 /// Position of `signal` within [`MAINTAINED_SIGNALS`], and therefore within
@@ -780,6 +789,93 @@ pub async fn run_tick(
             }
         }
     }
+
+    // Query-audit shard maintenance (issue #763, EL-6). The query-audit shard
+    // (Signal::Audit / QUERY_AUDIT_SHARD) is brought into the maintained set on
+    // its own terms: a dedicated age-based retention sweep on
+    // `compactor.audit_retention_window_ns` (default 90 days), then RLOG
+    // compaction of its sealed buckets, then cleanup of the compacted L0 inputs.
+    // Retention runs before compaction, matching the data-signal path's
+    // efficiency-preferred ordering (retention.rs `maintain_bucket`): an expired
+    // bucket's records are deleted first, so compaction never rewrites data that
+    // is about to be swept. It is deliberately NOT part of the MAINTAINED_SIGNALS
+    // data-shard loop above: those carry ADR-0019 per-tenant retention and
+    // per-signal shard counts, while the query-audit shard is a fixed
+    // control-plane shard with its own lifetime. The legal-hold shard
+    // (AUDIT_HOLD_SHARD = 0) is never touched: `compact_bucket` guards on the
+    // shard, and every sweep here is scoped to QUERY_AUDIT_SHARD. Gated on
+    // ownership of this one unit (ADR-0065 decision 2); the same `hold` snapshot
+    // from above gates every delete, so a legal hold covering the query-audit
+    // shard blocks it. Logged, not folded into `MaintainReport` (whose fields
+    // describe the data-signal passes), and it never touches
+    // `MaintenanceSafetyMetrics`, whose per-signal arrays cover only
+    // MAINTAINED_SIGNALS.
+    if worker.owns_unit(live_set, tenant, Signal::Audit, QUERY_AUDIT_SHARD) {
+        match sweep_audit_retention(store, &clock, compactor, &hold, tenant).await {
+            Ok(outcome) => tracing::info!(
+                tenant = %tenant.to_hex(),
+                records = outcome.records_deleted,
+                data = outcome.data_deleted,
+                parts = outcome.parts_deleted,
+                kept = outcome.kept,
+                "maintenance: query-audit retention sweep complete"
+            ),
+            Err(err) => tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: query-audit retention sweep failed; retried next tick"
+            ),
+        }
+
+        match scan_and_compact(
+            store,
+            &clock,
+            compactor,
+            *tenant,
+            Signal::Audit,
+            QUERY_AUDIT_SHARD,
+        )
+        .await
+        {
+            Ok(report) => tracing::info!(
+                tenant = %tenant.to_hex(),
+                compacted = report.compacted,
+                already_done = report.already_done,
+                "maintenance: query-audit compaction pass complete"
+            ),
+            Err(err) => tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: query-audit compaction pass failed; retried next tick"
+            ),
+        }
+
+        match sweep_shard(
+            store,
+            &clock,
+            compactor,
+            &hold,
+            tenant,
+            Signal::Audit,
+            QUERY_AUDIT_SHARD,
+        )
+        .await
+        {
+            Ok(report) => tracing::info!(
+                tenant = %tenant.to_hex(),
+                superseded_records = report.superseded_records_deleted,
+                superseded_data = report.superseded_data_deleted,
+                unreferenced_parts = report.unreferenced_parts_deleted,
+                "maintenance: query-audit input-cleanup sweep complete"
+            ),
+            Err(err) => tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: query-audit input-cleanup sweep failed; retried next tick"
+            ),
+        }
+    }
+
     total
 }
 

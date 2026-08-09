@@ -88,6 +88,25 @@ pub async fn compact_bucket(
             run_pipeline::<SpanCodec>(store, clock, config, bucket, &listing.commit_keys, start_ns)
                 .await
         }
+        // Query-audit records ride RLOG (see `query_audit`), so they compact
+        // through the same RLOG codec as logs -- the machinery is reused, only
+        // the signal and shard are new (issue #763, EL-6). The legal-hold shard
+        // (`legal_hold::AUDIT_HOLD_SHARD` = 0) is deliberately excluded: the
+        // legal-hold fold (`legal_hold::load_hold_records`) reads L0 commit
+        // records only and ignores compaction records, so compacting its records
+        // into L1 and letting the superseded sweep delete the L0 originals would
+        // silently drop every hold from the fold. Only the query-audit shard
+        // gains compaction here.
+        Signal::Audit if bucket.shard == crate::query_audit::QUERY_AUDIT_SHARD => {
+            run_pipeline::<RlogCodec>(store, clock, config, bucket, &listing.commit_keys, start_ns)
+                .await
+        }
+        Signal::Audit => Err(MaintainError::Invariant(format!(
+            "audit compaction is only implemented for the query-audit shard \
+             (QUERY_AUDIT_SHARD = {}), never the legal-hold shard; got shard {}",
+            crate::query_audit::QUERY_AUDIT_SHARD,
+            bucket.shard
+        ))),
         other => Err(MaintainError::Invariant(format!(
             "compaction is not implemented for signal {other:?}"
         ))),

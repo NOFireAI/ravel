@@ -36,6 +36,7 @@
 //! [`CompactionRecord`]: ravel_proto::commit::v1::CompactionRecord
 
 pub mod audit_pipeline;
+pub mod audit_retention;
 mod audit_write;
 pub mod bucket;
 pub mod build;
@@ -61,6 +62,7 @@ pub mod sweep;
 pub mod worker_set;
 
 pub use audit_pipeline::{AuditEvent, AuditPipeline, NoopQueryAuditSink, QueryAuditSink};
+pub use audit_retention::{AuditRetentionOutcome, sweep_audit_retention};
 pub use bucket::Bucket;
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
