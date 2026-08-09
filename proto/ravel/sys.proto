@@ -332,3 +332,127 @@ message KeyEpoch {
   // activated_ns, are encrypted under this epoch's key.
   sfixed64 activated_ns = 3;
 }
+
+// The per-tenant lifecycle state recorded in a TenantConfigRecord (ADR-0066
+// decision 6, epic EM). Written explicitly on every config record; a record
+// carrying UNSPECIFIED is corrupt and refused on decode (fail closed), the same
+// discipline every other durable record applies to its own enums (Signal,
+// TenantHashScheme). Its three real states drive the admission/query/maintenance
+// gates the EM-T8 refresh loop consumes: `active` is unrestricted; `suspended`
+// refuses ingest and query but keeps maintenance running; `offboarding` also
+// refuses ingest and query, and keeps maintenance and retention running until
+// the tenant's data is gone (the hook epic EJ / #460 consumes to delete it).
+enum TenantLifecycleState {
+  TENANT_LIFECYCLE_STATE_UNSPECIFIED = 0;  // never written; a record carrying it is corrupt
+  TENANT_LIFECYCLE_STATE_ACTIVE = 1;
+  TENANT_LIFECYCLE_STATE_SUSPENDED = 2;
+  TENANT_LIFECYCLE_STATE_OFFBOARDING = 3;
+}
+
+// The set of attribute keys promoted to indexed columns for one tenant, carried
+// as an optional sub-message of TenantConfigRecord so its three states are
+// distinct: absent sub-message means "no override, use the deployment default";
+// a present sub-message with an empty `fields` list means "override to no
+// indexed fields"; a present non-empty list is the explicit override set.
+message IndexedFieldConfig {
+  repeated string fields = 1;  // attribute keys promoted to indexed columns
+}
+
+// The durable, per-tenant configuration record at `t/<tenant_hash>/config`
+// (ADR-0066 decision 6, epic EM). Moves per-tenant lifecycle state, admission
+// limits, retention, and indexed-field config off process flags and into a
+// durable control object the EM-T8 refresh loop reads on a bounded-staleness
+// horizon (the GenerationSwitch / ADR-0057 pattern) and applies by re-invoking
+// the admission controller's existing `set_tenant_limits`. Defaults still come
+// from flags/limits-file at startup; a present field here overrides the default
+// for this tenant, an absent one leaves the default in place.
+//
+// Under the tenant's own prefix beside its per-signal `<sig>/prov` and
+// tenant-scoped `enc` records, never a bucket-root `sys/` object: it is
+// per-tenant state, like `enc`, not deployment-wide state, like `sys/gc`.
+//
+// Mutation shape: whole-record CAS-replace, mirroring `sys/gc`'s `set_gc_config`
+// (the read-current-version, swap-with-CasVersion pattern), NOT the append-only
+// repeated-field shape of `generations`/`format_floors`/`epochs`. Those histories
+// are append-only because each entry is an immutable historical fact whose order
+// is load-bearing and which must never be lost. A config override is the
+// opposite: a mutable current-state knob whose latest value is the only one that
+// matters, and which must support lowering a limit or clearing an override (a
+// revocation an append-only list cannot express). So the current value is stored
+// in place and swapped under CasVersion; a concurrent write is a caught conflict
+// the loser re-reads, never a silent overwrite.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message TenantConfigRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout, matching every other durable record's version guard. = 1.
+  uint32 format_version = 1;
+  bytes tenant_hash = 2;              // 16 bytes; the `t/<tenant_hash>/` prefix owner
+  TenantLifecycleState lifecycle_state = 3;
+  // Admission-limit overrides. proto3 explicit presence distinguishes "override
+  // this cap to N" (present) from "no override, use the deployment default"
+  // (absent); the four caps mirror ADR-0051's admission dimensions. A present
+  // value of 0 is a real override (an explicit zero cap), never "unset".
+  optional uint64 max_active_series = 4;
+  optional uint64 max_active_streams = 5;
+  optional uint64 max_ingest_byte_rate = 6;
+  optional uint64 max_series_creation_rate = 7;
+  // Per-tenant retention override, in ns; absent leaves the deployment default.
+  optional sfixed64 retention_ns = 8;
+  // Indexed-field override; absent leaves the deployment default (see
+  // IndexedFieldConfig for the present-but-empty vs absent distinction).
+  IndexedFieldConfig indexed_fields = 9;
+  sfixed64 created_unix_ns = 10;      // informational; when the record was first written
+  sfixed64 updated_unix_ns = 11;      // informational; when it was last swapped
+}
+
+// One entry of the durable `sys/auth` token map (ADR-0066 decision 6, epic EM):
+// a keyed hash of a bearer token mapped to the tenant id it authenticates as.
+// The bucket NEVER holds a plaintext token; `token_hash` is
+// `blake3::keyed_hash(deployment_key, token_bytes)`, so the map is useless to an
+// attacker who reads the bucket without the deployment key, and a low-entropy
+// token is not recoverable by an offline dictionary attack (the key is
+// load-bearing, the tenant-hash-v2 keyed-hashing pattern).
+message TokenHashEntry {
+  bytes token_hash = 1;  // 32 bytes: blake3 keyed hash of the bearer token
+  string tenant_id = 2;  // the tenant this token authenticates as
+}
+
+// The durable, deployment-wide bearer-token map at the bucket root `sys/auth`
+// (ADR-0066 decision 6, epic EM). Deployment-wide, not per-tenant, so it lives
+// at the bucket root beside `sys/tenancy` and `sys/gc`, never under a tenant
+// prefix: it maps a token to whichever tenant it grants, so it cannot be keyed
+// under any one tenant. It replaces the startup-frozen `--tenant-token` allowlist
+// with durable state the EM-T8 resolver refreshes on a bounded-staleness horizon,
+// so a provisioned token authenticates within seconds and a removed one stops
+// authenticating within the horizon, fail-closed — no fleet restart per change.
+//
+// Mutation shape: whole-record CAS-replace, mirroring `sys/gc`, for the same
+// reason as TenantConfigRecord: the map is current-state (a token is present or
+// it is not), and revocation — removing an entry — is a first-class operation an
+// append-only history cannot express. Adding, replacing, or removing a token
+// reads the current map and its version, edits the entry set, and swaps under
+// CasVersion; a concurrent write is a caught conflict, never a silent overwrite.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message AuthTokenMap {
+  // Format floor: the minimum reader version that understands this object. A
+  // reader that only knows a lower version refuses rather than misread a future
+  // layout, matching every other durable object's version guard. = 1.
+  uint32 format_version = 1;
+  // A 16-byte fingerprint of the deployment key the token hashes are keyed
+  // under: blake3::derive_key("ravel-auth-v1-fingerprint", deployment_key)
+  // truncated to 16 bytes, the TenancyMarker key_fingerprint pattern. A reader
+  // whose configured deployment key fingerprints differently is using the wrong
+  // key: every token hash would silently mismatch and all auth would fail
+  // opaquely, so the reader refuses rather than open that silent hole. Never the
+  // key itself.
+  bytes key_fingerprint = 2;
+  // The token->tenant entries. Decode enforces: every token_hash is 32 bytes,
+  // every tenant_id is non-empty, and no token_hash repeats (a duplicate would
+  // make resolution ambiguous). Any violation is a typed decode error (fail
+  // closed).
+  repeated TokenHashEntry entries = 3;
+  sfixed64 updated_unix_ns = 4;  // informational; when the map was last swapped
+}
