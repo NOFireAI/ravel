@@ -126,6 +126,14 @@ pub fn mix_value(builder: &mut DigestBuilder, value: &Value) {
             let mut samples: Vec<_> = vector.iter().collect();
             samples.sort_by_key(|a| label_sort_key(&a.labels));
             builder.mix_u64(samples.len() as u64);
+            // `InstantSample::histogram` is deliberately not mixed in: every
+            // histogram series `workload::generate_queries` emits is wrapped
+            // in `histogram_count(...)`, which reduces to `value` and leaves
+            // `histogram: None` on the result element, so this field never
+            // carries data for any query this driver runs today. A future
+            // query type that returns a bare native-histogram selector would
+            // need to mix `sample.histogram` here too, or it silently drops
+            // out of the reproducibility digest.
             for sample in samples {
                 builder.mix_label_set(&sample.labels);
                 builder.mix_i64(sample.ts_ns);

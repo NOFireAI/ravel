@@ -1,7 +1,10 @@
 //! Seeded foundation (ADR-0068 deliverable 1): every sub-system draws its
 //! randomness from one master seed via domain-separated hashing into
 //! `StdRng::seed_from_u64`, so a whole cycle is reproducible from a single
-//! `u64` and a failure can be replayed with `RAVEL_SIM_SEED=<seed>`.
+//! `u64` and a failure can be replayed with `RAVEL_SIM_SEED=<seed>`, for
+//! every entry point that resolves its seed via [`MasterSeed::from_env_or`]
+//! rather than [`MasterSeed::new`] directly -- see that method's doc for
+//! which ones do.
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -26,6 +29,14 @@ impl MasterSeed {
     /// `RAVEL_SIM_SEED` overrides `default` when set and parses as a `u64`;
     /// an unset or unparseable value falls back to `default` rather than
     /// erroring, so a plain `cargo test` run never needs the variable set.
+    ///
+    /// Only a test that wants to be replayable this way should call this
+    /// instead of [`MasterSeed::new`] directly: `tests/seed_batch.rs` and
+    /// `tests/different_seed_different_workload.rs` deliberately don't, since
+    /// each already names its seed(s) directly in its own assertion output
+    /// (a batch of fixed seeds, and an explicit seed-vs-seed comparison)
+    /// where an env override would either be redundant or would break the
+    /// comparison itself.
     pub fn from_env_or(default: u64) -> Self {
         MasterSeed(resolve_seed(
             std::env::var(RAVEL_SIM_SEED_ENV).ok(),

@@ -29,7 +29,8 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine, QueryError};
-use ravel_types::{CommitToken, Signal, TenantHash, TimeRange, TypeError};
+use ravel_segment::HistogramCounts;
+use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange, TypeError};
 use uuid::Uuid;
 
 use crate::digest::{Digest, DigestBuilder, mix_value};
@@ -77,7 +78,10 @@ pub struct CycleOutcome {
 }
 
 /// Every variant carries the master seed so a failure message alone is
-/// enough to replay it: `RAVEL_SIM_SEED=<seed> cargo test -p ravel-sim`.
+/// enough to replay it: `RAVEL_SIM_SEED=<seed> cargo test -p ravel-sim
+/// <test>`, for a test whose seed comes from
+/// [`crate::seed::MasterSeed::from_env_or`] (see that method's doc for which
+/// ones do).
 #[derive(Debug, thiserror::Error)]
 pub enum CycleError {
     #[error("seed {seed}: workload generation failed: {source}")]
@@ -132,6 +136,14 @@ impl SimClock {
             now_ns: AtomicI64::new(start_ns),
         }
     }
+
+    /// Advances `now_ns` to `target_ns`, monotonically: a `target_ns` at or
+    /// behind the current value is a no-op. Lets the driver track the
+    /// clock to each ingest batch's own event time (F13) without ever
+    /// stepping it backwards, regardless of generation order.
+    fn advance_to(&self, target_ns: i64) {
+        self.now_ns.fetch_max(target_ns, Ordering::SeqCst);
+    }
 }
 
 impl Clock for SimClock {
@@ -161,39 +173,101 @@ fn seal_now_ns(end_ts_ns: i64) -> i64 {
     (hour + 1) * NS_PER_HOUR + margin_ns
 }
 
-fn to_ingest_points(series: &crate::workload::GeneratedSeries) -> Vec<IngestPoint> {
+/// Sample count of one generated series, so the driver can batch ingest by
+/// index across every series in a tenant (F13: every series in one tenant
+/// shares `start_ts_ns`/`interval_ns`, so index `i` maps to the same event
+/// timestamp in every series -- see `workload::generate_tenant_series`).
+fn sample_count(series: &crate::workload::GeneratedSeries) -> usize {
     match &series.samples {
-        SeriesSamples::Scalar(points) => points
-            .iter()
-            .map(|sample| IngestPoint {
-                series_id: series.series_id,
-                labels: series.labels.clone(),
-                value: IngestValue::Scalar(*sample),
-            })
-            .collect(),
-        SeriesSamples::Histogram(points) => points
-            .iter()
-            .map(|sample| IngestPoint {
-                series_id: series.series_id,
-                labels: series.labels.clone(),
-                value: IngestValue::Histogram(sample.clone()),
-            })
-            .collect(),
+        SeriesSamples::Scalar(points) => points.len(),
+        SeriesSamples::Histogram(points) => points.len(),
     }
 }
 
-fn representative_query(series: &crate::workload::GeneratedSeries, t_ms: i64) -> (String, i64) {
-    let query = match series.samples {
-        SeriesSamples::Histogram(_) => format!("histogram_count({})", series.metric_name),
-        SeriesSamples::Scalar(_) => series.metric_name.clone(),
-    };
-    (query, t_ms)
+/// The event timestamp and ingest point for `series`' sample at index `i`,
+/// or `None` if that series has fewer than `i + 1` samples.
+fn ingest_point_at(
+    series: &crate::workload::GeneratedSeries,
+    i: usize,
+) -> Option<(i64, IngestPoint)> {
+    match &series.samples {
+        SeriesSamples::Scalar(points) => points.get(i).map(|sample| {
+            (
+                sample.ts_ns,
+                IngestPoint {
+                    series_id: series.series_id,
+                    labels: series.labels.clone(),
+                    value: IngestValue::Scalar(*sample),
+                },
+            )
+        }),
+        SeriesSamples::Histogram(points) => points.get(i).map(|sample| {
+            (
+                sample.ts_ns,
+                IngestPoint {
+                    series_id: series.series_id,
+                    labels: series.labels.clone(),
+                    value: IngestValue::Histogram(sample.clone()),
+                },
+            )
+        }),
+    }
 }
 
-fn last_sample_ts_ms(series: &crate::workload::GeneratedSeries) -> Option<i64> {
+/// What `check_visible` (F3) expects a query pinned at `t_ms` to return for
+/// one generated series: the exact label set the query result carries (for
+/// a histogram query, `histogram_count()` drops `__name__` -- ravel-promql's
+/// `drop_metric_name`, confirmed by its own
+/// `histogram_count_reads_count_and_drops_name` test), the sample's own
+/// stored timestamp (`InstantSample::orig_sample_ts_ns`, not the query eval
+/// timestamp), and its value compared by bit pattern.
+struct ExpectedSample<'a> {
+    query: String,
+    t_ms: i64,
+    orig_ts_ns: i64,
+    label_pairs: Vec<(&'a str, &'a str)>,
+    value_bits: u64,
+}
+
+fn label_pairs(labels: &ravel_types::LabelSet) -> Vec<(&str, &str)> {
+    labels
+        .iter()
+        .map(|l| (l.name.as_str(), l.value.as_str()))
+        .collect()
+}
+
+fn expected_sample(series: &crate::workload::GeneratedSeries) -> Option<ExpectedSample<'_>> {
     match &series.samples {
-        SeriesSamples::Scalar(points) => points.last().map(|s| s.ts_ns / 1_000_000),
-        SeriesSamples::Histogram(points) => points.last().map(|s| s.ts_ns / 1_000_000),
+        SeriesSamples::Scalar(points) => {
+            let last = points.last()?;
+            Some(ExpectedSample {
+                query: series.metric_name.clone(),
+                t_ms: last.ts_ns / 1_000_000,
+                orig_ts_ns: last.ts_ns,
+                label_pairs: label_pairs(&series.labels),
+                value_bits: last.value.to_bits(),
+            })
+        }
+        SeriesSamples::Histogram(points) => {
+            let last = points.last()?;
+            let count = match &last.value.counts {
+                HistogramCounts::Int { count, .. } => *count as f64,
+                HistogramCounts::Float { count, .. } => *count,
+            };
+            let name_dropped_pairs = series
+                .labels
+                .iter()
+                .filter(|l| l.name != METRIC_NAME_LABEL)
+                .map(|l| (l.name.as_str(), l.value.as_str()))
+                .collect();
+            Some(ExpectedSample {
+                query: format!("histogram_count({})", series.metric_name),
+                t_ms: last.ts_ns / 1_000_000,
+                orig_ts_ns: last.ts_ns,
+                label_pairs: name_dropped_pairs,
+                value_bits: count.to_bits(),
+            })
+        }
     }
 }
 
@@ -229,7 +303,8 @@ async fn run_cycle_async(
     memory_store.set_clock_ms((workload.start_ts_ns / 1_000_000).max(0) as u64);
     let store: Arc<dyn ObjectStoreBackend> = memory_store;
 
-    let clock: Arc<dyn Clock> = Arc::new(SimClock::new(workload.start_ts_ns));
+    let sim_clock = Arc::new(SimClock::new(workload.start_ts_ns));
+    let clock: Arc<dyn Clock> = Arc::clone(&sim_clock) as Arc<dyn Clock>;
     let mut clock_rng: StdRng = master_seed.rng("clock");
 
     let catalog_config = CatalogConfig {
@@ -274,43 +349,70 @@ async fn run_cycle_async(
             Arc::clone(&clock),
         );
 
-        let points: Vec<IngestPoint> = tenant_wl.series.iter().flat_map(to_ingest_points).collect();
+        // F13: ingest in per-sample-index batches rather than one batch for
+        // the whole tenant, advancing `sim_clock` to each batch's own event
+        // timestamp first. `flush_open_ns` (the wall/arrival clock read
+        // fresh at each strict-mode flush, `ravel-ingest`'s
+        // `checked_ingest_hour_bucket`) is what a commit's
+        // `ingest_hour_bucket` derives from; ingesting the whole tenant in
+        // one call at a single instant left every commit under one bucket
+        // that could disagree with the query window's event-time-hour once
+        // `interval_ns` was wide enough to span hours, failing
+        // `AckNotDurable` even though nothing was actually lost. Every
+        // series in one tenant shares `start_ts_ns`/`interval_ns`
+        // (`workload::generate_tenant_series`), so sample index `i` is the
+        // same event timestamp across all of them.
+        let max_samples = tenant_wl.series.iter().map(sample_count).max().unwrap_or(0);
+        let mut tokens: Vec<CommitToken> = Vec::new();
+        for i in 0..max_samples {
+            let mut batch_ts_ns = None;
+            let mut points = Vec::with_capacity(tenant_wl.series.len());
+            for series in &tenant_wl.series {
+                if let Some((ts_ns, point)) = ingest_point_at(series, i) {
+                    batch_ts_ns.get_or_insert(ts_ns);
+                    points.push(point);
+                }
+            }
+            if points.is_empty() {
+                continue;
+            }
+            sim_clock.advance_to(batch_ts_ns.unwrap_or(workload.start_ts_ns));
 
-        let receipt = router
-            .write_values(
-                tenant_wl.tenant.clone(),
-                points,
-                WriteMode::Strict,
-                config.ack_deadline,
-            )
-            .await
-            .map_err(|source| CycleError::Ingest { seed, source })?;
-        router.flush_all().await;
+            let receipt = router
+                .write_values(
+                    tenant_wl.tenant.clone(),
+                    points,
+                    WriteMode::Strict,
+                    config.ack_deadline,
+                )
+                .await
+                .map_err(|source| CycleError::Ingest { seed, source })?;
+            tokens.extend(receipt.tokens);
+        }
 
         let ack_wall_ns = clock.now_ns();
 
         // Invariant (b), read-your-write (docs/consistency-model.md: "A
         // caller holding commit tokens sees the referenced commits by
         // passing min_commit_token to query APIs"): right after ack, every
-        // token this write returned must resolve, and a query pinned to
-        // those tokens must return the sample it acked -- before any fold
-        // has run.
-        if let Some(first_series) = tenant_wl.series.first() {
-            check_visible(
-                seed,
-                tenant_wl.tenant.as_str(),
-                &catalog,
-                &engine,
-                &tenant_hash,
-                full_range,
-                &receipt.tokens,
-                ack_wall_ns,
-                config.query_deadline,
-                first_series,
-                CheckKind::ReadYourWrite,
-            )
-            .await?;
-        }
+        // token every batch returned must resolve, and a query pinned to
+        // those tokens must return the samples it acked -- before any fold
+        // has run. F4: every generated series is checked, not just the
+        // tenant's first.
+        check_visible(
+            seed,
+            tenant_wl.tenant.as_str(),
+            &catalog,
+            &engine,
+            &tenant_hash,
+            full_range,
+            &tokens,
+            ack_wall_ns,
+            config.query_deadline,
+            &tenant_wl.series,
+            CheckKind::ReadYourWrite,
+        )
+        .await?;
 
         catalog
             .fold(
@@ -327,23 +429,22 @@ async fn run_cycle_async(
         // same tokens still resolve, and -- unlike the read-your-write
         // check above -- a query with NO min_tokens (relying purely on the
         // catalog's own sealed listing/snapshot, not the caller's pinned
-        // tokens) must also return the acked samples.
-        if let Some(first_series) = tenant_wl.series.first() {
-            check_visible(
-                seed,
-                tenant_wl.tenant.as_str(),
-                &catalog,
-                &engine,
-                &tenant_hash,
-                full_range,
-                &receipt.tokens,
-                fold_now_ns,
-                config.query_deadline,
-                first_series,
-                CheckKind::AckDurable,
-            )
-            .await?;
-        }
+        // tokens) must also return the acked samples. F4: every generated
+        // series is checked, not just the tenant's first.
+        check_visible(
+            seed,
+            tenant_wl.tenant.as_str(),
+            &catalog,
+            &engine,
+            &tenant_hash,
+            full_range,
+            &tokens,
+            fold_now_ns,
+            config.query_deadline,
+            &tenant_wl.series,
+            CheckKind::AckDurable,
+        )
+        .await?;
 
         digest_builder.mix_str(tenant_wl.tenant.as_str());
         for query in &tenant_wl.queries {
@@ -370,11 +471,20 @@ async fn run_cycle_async(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
 enum CheckKind {
     ReadYourWrite,
     AckDurable,
 }
 
+/// Checks both invariants for every one of `series_list`'s generated series
+/// (F4): every token resolves (F12: a genuine store/decode `CatalogError`
+/// propagates as [`CycleError::Resolve`], distinct from
+/// [`CatalogError::UnsatisfiableToken`], the one variant that means the
+/// invariant itself was violated), and a query pinned at each series' own
+/// last sample returns exactly that sample back -- label set, real stored
+/// timestamp, and value bit pattern all matching (F3), not just "some
+/// non-empty vector".
 #[allow(clippy::too_many_arguments)]
 async fn check_visible(
     seed: u64,
@@ -386,52 +496,63 @@ async fn check_visible(
     tokens: &[CommitToken],
     now_ns: i64,
     deadline: Duration,
-    representative: &crate::workload::GeneratedSeries,
+    series_list: &[crate::workload::GeneratedSeries],
     kind: CheckKind,
 ) -> Result<(), CycleError> {
     for token in tokens {
         let min_tokens = std::slice::from_ref(token);
-        let resolved = catalog
+        match catalog
             .resolve(tenant_hash, Signal::Metrics, full_range, min_tokens, now_ns)
-            .await;
-        let token_ok = resolved.is_ok();
-        if !token_ok {
-            return Err(violation(seed, tenant_label, token, kind));
+            .await
+        {
+            Ok(_) => {}
+            Err(CatalogError::UnsatisfiableToken { .. }) => {
+                return Err(violation(seed, tenant_label, token, kind));
+            }
+            Err(source) => {
+                return Err(CycleError::Resolve { seed, source });
+            }
         }
     }
 
-    let Some(t_ms) = last_sample_ts_ms(representative) else {
-        return Ok(());
-    };
-    let (query, t_ms) = representative_query(representative, t_ms);
     let query_min_tokens: &[CommitToken] = match kind {
         CheckKind::ReadYourWrite => tokens,
         CheckKind::AckDurable => &[],
     };
-    let value = engine
-        .instant(
-            *tenant_hash,
-            &query,
-            t_ms,
-            query_min_tokens,
-            now_ns,
-            deadline,
-        )
-        .await
-        .map_err(|source| CycleError::Query { seed, source })?;
-    let visible = match value {
-        Value::Vector(v) => !v.is_empty(),
-        _ => false,
-    };
-    if !visible {
-        let token = tokens.first().cloned().unwrap_or(CommitToken {
-            shard: 0,
-            writer_id: Uuid::nil(),
-            epoch: 0,
-            seq: 0,
-            ingest_hour_bucket: 0,
-        });
-        return Err(violation(seed, tenant_label, &token, kind));
+    let fallback_token = tokens.first().cloned().unwrap_or(CommitToken {
+        shard: 0,
+        writer_id: Uuid::nil(),
+        epoch: 0,
+        seq: 0,
+        ingest_hour_bucket: 0,
+    });
+
+    for series in series_list {
+        let Some(expected) = expected_sample(series) else {
+            continue;
+        };
+        let value = engine
+            .instant(
+                *tenant_hash,
+                &expected.query,
+                expected.t_ms,
+                query_min_tokens,
+                now_ns,
+                deadline,
+            )
+            .await
+            .map_err(|source| CycleError::Query { seed, source })?;
+        let matched = match &value {
+            Value::Vector(v) => v.iter().any(|sample| {
+                label_pairs(&sample.labels) == expected.label_pairs
+                    && sample.orig_sample_ts_ns == expected.orig_ts_ns
+                    && sample.value.to_bits() == expected.value_bits
+            }),
+            _ => false,
+        };
+        if !matched {
+            return Err(violation(seed, tenant_label, &fallback_token, kind));
+        }
     }
     Ok(())
 }

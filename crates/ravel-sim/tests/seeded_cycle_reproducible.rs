@@ -16,7 +16,7 @@ use ravel_sim::{CycleConfig, MasterSeed, run_cycle};
 
 #[test]
 fn seeded_cycle_reproducible() {
-    let seed = MasterSeed::new(4242);
+    let seed = MasterSeed::from_env_or(4242);
     let config = CycleConfig::default();
 
     let a = run_cycle(seed, &config).expect("first cycle");
