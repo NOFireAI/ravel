@@ -1175,3 +1175,100 @@ impl ShardActor {
         });
     }
 }
+
+#[cfg(test)]
+mod adaptive_delay_tests {
+    use super::{STRICT_VISIBILITY_BUDGET_NS, adaptive_age_threshold_ns, visibility_ceiling_ns};
+
+    const FLOOR_NS: i64 = 500_000_000;
+    const RETRY_HEADROOM_NS: i64 = 100_000_000;
+
+    /// ADR-0067 decision 3's corridor, `[max_flush_delay, ceiling]`, exercised
+    /// directly against the two pure functions it is built from rather than
+    /// through a live shard actor: the ceiling is a budget-minus-RTT
+    /// computation and the threshold is a plain clamp, so their correctness
+    /// is a property of the math, not of timing a real flush. Racing a real
+    /// actor's periodic age-check tick against injected-clock arrivals to
+    /// observe the same corridor is possible but inherently timing-fragile
+    /// (the tick that would prove a threshold was capped necessarily fires
+    /// after enough clock time has already elapsed to satisfy the
+    /// uncapped value too); this is the deterministic alternative.
+    /// `adaptive_flush_delay_true_uses_the_corridor_above_the_floor` and
+    /// `adaptive_flush_delay_false_keeps_the_fixed_floor_under_the_same_pattern`
+    /// (both in `tests/adaptive_flush_delay.rs`) cover the remaining question
+    /// this test cannot: that `IngestConfig::adaptive_flush_delay` actually
+    /// reaches this code path in a live shard actor.
+    #[test]
+    fn adaptive_delay_respects_visibility_ceiling() {
+        // No RTT observed yet: the ceiling collapses to the floor, so a
+        // trickle tenant gets today's fixed-delay behavior until at least
+        // one PUT has been timed.
+        assert_eq!(
+            visibility_ceiling_ns(FLOOR_NS, None, RETRY_HEADROOM_NS),
+            FLOOR_NS
+        );
+
+        // A cheap, fast backend leaves most of the 1s strict-visibility
+        // budget spare, so the ceiling sits well above the floor.
+        let cheap_rtt_ns = 50_000_000; // 50ms
+        let ceiling_cheap = visibility_ceiling_ns(FLOOR_NS, Some(cheap_rtt_ns), RETRY_HEADROOM_NS);
+        assert_eq!(
+            ceiling_cheap,
+            STRICT_VISIBILITY_BUDGET_NS - 2 * cheap_rtt_ns - RETRY_HEADROOM_NS
+        );
+        assert!(ceiling_cheap > FLOOR_NS);
+
+        // As observed RTT grows, two round trips' worth of it eat further
+        // into the budget, so the ceiling shrinks monotonically.
+        let pricier_rtt_ns = 200_000_000; // 200ms
+        let ceiling_pricier =
+            visibility_ceiling_ns(FLOOR_NS, Some(pricier_rtt_ns), RETRY_HEADROOM_NS);
+        assert!(
+            ceiling_pricier < ceiling_cheap,
+            "a slower observed backend must narrow the corridor, not widen it"
+        );
+
+        // A backend slow enough that 2*rtt plus retry headroom would eat the
+        // whole budget (or overshoot it) must never invert the corridor: the
+        // ceiling is floored at floor_ns, exactly like the None case.
+        let very_slow_rtt_ns = 600_000_000; // 600ms: 2*rtt alone exceeds the 1s budget
+        assert_eq!(
+            visibility_ceiling_ns(FLOOR_NS, Some(very_slow_rtt_ns), RETRY_HEADROOM_NS),
+            FLOOR_NS,
+            "a corridor that inverted (ceiling < floor) would make an already-slow \
+             backend flush even less often; the floor must win"
+        );
+
+        // Corridor clamp, ceiling comfortably above the floor (550ms, from
+        // the cheap-RTT case above).
+        let ceiling_ns = ceiling_cheap;
+
+        // A bursty tenant's short observed gap clamps *up* to the floor:
+        // unchanged from today's fixed-delay behavior.
+        assert_eq!(
+            adaptive_age_threshold_ns(10_000_000, FLOOR_NS, ceiling_ns),
+            FLOOR_NS
+        );
+        // No gap observed yet (a buffer's first arrival) is the same
+        // fixed-floor case, not a special-cased zero.
+        assert_eq!(adaptive_age_threshold_ns(0, FLOOR_NS, ceiling_ns), FLOOR_NS);
+
+        // A gap that already lands inside the corridor passes through
+        // unchanged.
+        let inside_gap_ns = (FLOOR_NS + ceiling_ns) / 2;
+        assert_eq!(
+            adaptive_age_threshold_ns(inside_gap_ns, FLOOR_NS, ceiling_ns),
+            inside_gap_ns
+        );
+
+        // A trickle tenant's long observed gap clamps *down* to the
+        // ceiling, never waiting the full raw gap: this is the cap the
+        // strict-visibility budget requires.
+        let trickle_gap_ns = ceiling_ns * 10;
+        assert_eq!(
+            adaptive_age_threshold_ns(trickle_gap_ns, FLOOR_NS, ceiling_ns),
+            ceiling_ns,
+            "the corridor must cap a large observed gap at the ceiling, not pass it through"
+        );
+    }
+}
