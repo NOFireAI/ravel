@@ -94,9 +94,11 @@ jobs:
             exit 0
           fi
           # docs-only: every changed path ends in .md or .svg (prose plus the
-          # diagrams that illustrate it). Areas are irrelevant then -- no
-          # compiling job runs at all -- so report them false.
-          if ! echo "$changed" | grep -qvE '\.(md|svg)$'; then
+          # diagrams that illustrate it) or lives under bench/reports/ (raw
+          # benchmark output committed as evidence; nothing compiles it).
+          # Areas are irrelevant then -- no compiling job runs at all -- so
+          # report them false.
+          if ! echo "$changed" | grep -qvE '\.(md|svg)$|^bench/reports/'; then
             echo "::notice::docs-only change, skipping compiling jobs"
             emit true false false false false
             exit 0
