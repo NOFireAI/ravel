@@ -559,12 +559,31 @@ metrics, `l` logs, `s` spans). Control objects live at the bucket root under
 | `admission/` | `t/<hash>/<sig>/admission/<process_id>.snapshot` | `t/*/*/admission/*` |
 | `prov` | `t/<hash>/<sig>/prov` | `t/*/*/prov` |
 | `catalog/<sig>/…` | `t/<hash>/catalog/<sig>/…` | `t/*/catalog/*/*` |
-| audit prefix (`u/…`) | `t/<hash>/u/…` | `t/*/u/*` |
+| audit prefix (`u/…`), read/write | `t/<hash>/u/…` | `t/*/u/*` |
+| legal-hold shard (deny-delete) | `t/<hash>/u/*/0000/…` | `t/*/u/*/0000/*` |
+| query-audit shard (Maintain delete) | `t/<hash>/u/*/0001/…` | `t/*/u/*/0001/*` |
 | `sys/tenancy`, `sys/qualification`, `sys/gc` | bucket root | as written |
 
 The `c/` commit prefix (`t/<hash>/<sig>/c/…`) and the catalog prefix
 (`t/<hash>/catalog/<sig>/…`) are distinct paths: no wildcard for one matches
 the other, so Maintain's delete grant on `c/` never reaches catalog objects.
+
+The audit prefix (`t/<hash>/u/…`) holds two fixed control-plane shards that the
+policies treat differently on delete (ADR-0055 §3, as amended by EL-6, issue
+#763). Every audit object key carries its shard as a four-digit segment
+(`t/<hash>/u/<l0|c|l1>/<shard>/…`), so `0000` and `0001` name disjoint paths a
+wildcard can separate:
+
+- **Legal-hold shard `0000`** (`t/*/u/*/0000/*`): hold set/clear records. Every
+  role — including Maintain — denies delete here, so a legal hold can never be
+  destroyed. This is the only audit path in `DenyDeleteProtected`.
+- **Query-audit shard `0001`** (`t/*/u/*/0001/*`): the append-only query
+  activity log. It is compacted and age-swept on a 90-day retention window by
+  the Maintain process (`ravel-maintain`'s `sweep_audit_retention`), so
+  **Maintain — and only Maintain — grants delete on it** (`MaintainDelete`).
+  Because `0000` and `0001` are separate key paths, Maintain's delete grant on
+  `0001` never reaches the legal-hold shard, and the `0000` deny never blocks a
+  query-audit sweep.
 
 `CreateIfAbsent`, `CasVersion`, and plain `Put` are all `s3:PutObject` at the
 IAM layer; the difference between them is a request precondition header
@@ -583,9 +602,12 @@ the IAM principal (user or role) whose access key you put in that role's
 Kubernetes Secret. Every policy — including Gateway's, Query's, and Admin's,
 which have no delete grant at all — carries the same explicit `Deny` on
 `s3:DeleteObject`/`s3:DeleteObjectVersion` over the six protected prefixes
-(ADR-0055 section 3). An explicit `Deny` overrides any `Allow`, so this makes
-those prefixes undeletable even by a role that otherwise has delete rights
-(Maintain).
+(ADR-0055 section 3, as amended by EL-6). An explicit `Deny` overrides any
+`Allow`, so this makes those prefixes undeletable even by a role that otherwise
+has delete rights (Maintain). The sixth of those prefixes is the audit
+**legal-hold shard** only (`t/*/u/*/0000/*`), not the whole audit prefix: EL-6
+(issue #763) narrowed it there so the query-audit shard (`t/*/u/*/0001/*`) can
+be age-swept, and added that query-audit path to Maintain's delete grant alone.
 
 **Gateway:**
 
@@ -646,7 +668,7 @@ those prefixes undeletable even by a role that otherwise has delete rights
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
       ]
     }
   ]
@@ -729,7 +751,7 @@ role holds a delete grant for it to need denying.
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
       ]
     }
   ]
@@ -815,7 +837,8 @@ need denying.
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0001/*"
       ]
     },
     {
@@ -828,7 +851,7 @@ need denying.
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
       ]
     }
   ]
@@ -836,11 +859,18 @@ need denying.
 ```
 
 Maintain's `MaintainDelete` grants delete on `l0/`, `l1/`, `c/`, `idem/` — the
-same four prefixes Ravel's own sweep and retention code deletes from today.
-The `DenyDeleteProtected` block still applies to Maintain: its `c/` delete
-grant covers commit records, compaction records, and tombstones
+four prefixes Ravel's own sweep and retention code deletes from today — plus
+the query-audit shard `t/*/u/*/0001/*` (EL-6, issue #763): the Maintain process
+compacts and age-sweeps the query-audit activity log on its own 90-day window
+(`ravel-maintain`'s `sweep_audit_retention`), so it needs delete there. The
+`DenyDeleteProtected` block still applies to Maintain: its `c/` delete grant
+covers commit records, compaction records, and tombstones
 (`t/<hash>/<sig>/c/…`), but the catalog objects at `t/<hash>/catalog/<sig>/…`
-are a different path the `Deny` protects, so Maintain cannot delete them.
+are a different path the `Deny` protects, so Maintain cannot delete them. The
+same is true within the audit prefix: the deny covers only the legal-hold shard
+`t/*/u/*/0000/*`, a separate path from the query-audit shard `…/0001/*`
+`MaintainDelete` grants, so Maintain can age-sweep query-audit records but can
+never delete a legal-hold record.
 `MaintainRead` includes `t/*/*/l1/*` (the lost-CAS-race convergence path
 HEADs a compacted part to re-verify it exists before retrying a publish) and
 `t/*/*/maint/*` (the advisory scan cursor is read before its own CAS
@@ -896,7 +926,7 @@ mutation).
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/u/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
       ]
     }
   ]

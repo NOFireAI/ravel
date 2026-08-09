@@ -172,6 +172,15 @@ pub const DEFAULT_ORPHAN_BREAKER_MIN_COUNT: usize = 50;
 /// in a large shard is never mistaken for mass record loss.
 pub const DEFAULT_ORPHAN_BREAKER_MAX_RATIO: f64 = 0.10;
 
+/// Default `audit_retention_window_ns`: 90 days (issue #763, EL-6). The
+/// dedicated retention window for query-audit records on
+/// [`crate::query_audit::QUERY_AUDIT_SHARD`], independent of the ADR-0019
+/// per-tenant data-retention windows ([`RetentionConfig`]): query-audit is a
+/// server-written activity log with its own fixed lifetime, not tenant data,
+/// and it is not tombstone-gated through the resolver (no snapshot excludes it),
+/// so it has its own age-based sweep rather than the bucket-tombstone flow.
+pub const DEFAULT_AUDIT_RETENTION_NS: i64 = 90 * 24 * NS_PER_HOUR;
+
 /// Default `idem_dedup_window_hours` (ADR-0051 §5): this crate's own policy
 /// default, chosen to match the 24h dedup window ADR-0051 documents.
 /// `ravel_ingest::idempotency::read_marker` has no default of its own --
@@ -315,6 +324,17 @@ pub struct CompactorConfig {
     /// default matching the window ADR-0051 documents, not a shared
     /// code-level default (`read_marker` has no default of its own).
     pub idem_dedup_window_hours: u32,
+    /// Retention window for query-audit records on
+    /// [`crate::query_audit::QUERY_AUDIT_SHARD`] (issue #763, EL-6). A
+    /// query-audit record whose newest event is older than this is swept by
+    /// [`crate::audit_retention::sweep_audit_retention`], horizon-gated on the
+    /// record's durable `created_unix_ns` and legal-hold-gated exactly as the
+    /// superseded-input sweep is. Independent of [`RetentionConfig`]'s
+    /// per-tenant ADR-0019 windows, which govern tenant data, not this
+    /// server-written activity log. Threaded through the config like every
+    /// other sweep knob so `..CompactorConfig::default()` call sites are
+    /// unaffected. Default [`DEFAULT_AUDIT_RETENTION_NS`] (90 days).
+    pub audit_retention_window_ns: i64,
     /// Dry-run switch (plan §8, P8). When `true`, every maintenance path
     /// computes exactly the same eligible set and decision it would in a real
     /// run -- all reads (LIST/GET/HEAD, re-verify listings, k-way merges,
@@ -353,6 +373,7 @@ impl Default for CompactorConfig {
             orphan_breaker_max_ratio: DEFAULT_ORPHAN_BREAKER_MAX_RATIO,
             force_orphan_gc: false,
             idem_dedup_window_hours: DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
+            audit_retention_window_ns: DEFAULT_AUDIT_RETENTION_NS,
             dry_run: false,
             merge_memory_tracker: None,
         }

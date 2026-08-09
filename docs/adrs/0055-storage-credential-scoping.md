@@ -155,7 +155,7 @@ to reject an in-process authorization side channel.
 |---|---|---|---|---|
 | **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | none |
 | **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race) | none |
-| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep) — **the only role with any delete grant at all** |
+| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep, EL-6 — see Amendment 2026-08-09) — **the only role with any delete grant at all** |
 | **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see Amendment 2026-08-07) | none (Admin never deletes; delete stays exclusively Maintain's) |
 
 **Correction (2026-08-06), found during epic EE wave 1's adversarial checkpoint:**
@@ -203,7 +203,7 @@ flowchart TB
     MT -->|"Get (read inputs)"| L0R["l0/**, c/** (read)"]
     MT -->|"CreateIfAbsent"| L1["l1/**"]
     MT -->|"CreateIfAbsent / Put"| C2["c/**l1.cmt, retire.tmb"]
-    MT ==>|"Delete — only role that can"| DEL["l0/** · l1/** · c/** · idem/**"]
+    MT ==>|"Delete — only role that can"| DEL["l0/** · l1/** · c/** · idem/**\nu/&lt;query-audit shard&gt;/** (EL-6)"]
 
     AD -->|"CasVersion"| PROVA["prov (reshard)"]
     AD -->|"CasVersion"| GC["sys/gc (set)"]
@@ -214,7 +214,7 @@ flowchart TB
         SYS["sys/tenancy\nsys/qualification\nsys/gc"]
         PROVD["prov"]
         CATD["catalog/*"]
-        AUDD["u/* (audit)"]
+        AUDD["u/&lt;legal-hold shard 0&gt;/* (holds only)"]
     end
 
     style MT fill:#fc9,stroke:#960,stroke-width:2px
@@ -229,7 +229,8 @@ flowchart TB
 Four distinct credentials, each scoped to one process's actual call sites.
 Only Maintain's policy grants `DeleteObject`, and only over `l0/`, `l1/`,
 `c/`, `idem/` — the same four prefixes Ravel's own sweep and retention code
-already deletes from today. The green box is denied to every role,
+already deletes from today — plus the query-audit shard `t/<hash>/u/0001/**`
+added by the 2026-08-09 amendment (EL-6). The green box is denied to every role,
 including Maintain: nothing currently deletes there, so nothing legitimate
 loses capability, and NF-10 (deleting `sys/tenancy` to brick every
 process's fail-closed startup) becomes unreachable regardless of which
@@ -246,8 +247,9 @@ anywhere, ever. It can corrupt or forge new data within its write grant
 reconstruction tool and legal-hold's fail-closed posture matter
 independently), but it cannot make existing data disappear. Only a
 compromised Maintain credential retains delete capability, and only over
-`l0/`, `l1/`, `c/`, `idem/` — never `sys/`, `prov`, `catalog/`, or the audit
-prefix, which brings us to §3.
+`l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**` (EL-6,
+2026-08-09 amendment) — never `sys/`, `prov`, `catalog/`, or the legal-hold
+shard `u/0000/**` of the audit prefix, which brings us to §3.
 
 ### 3. Deny-delete, everywhere, on the four prefixes nothing deletes
 
@@ -257,7 +259,9 @@ where the backend distinguishes it, `s3:DeleteObjectVersion`) on:
 - `sys/tenancy`, `sys/qualification`, `sys/gc`
 - `t/<hash>/<sig>/prov`
 - `t/<hash>/catalog/<sig>/**` (snap parts, HEAD, name postings)
-- `t/<hash>/u/**` (legal hold and query audit records)
+- `t/<hash>/u/<AUDIT_HOLD_SHARD>/**` (legal-hold records only — the query-audit
+  shard was removed from this deny by the 2026-08-09 amendment below, so it can
+  be age-swept; legal-hold shard 0 stays deny-delete-forever)
 
 This closes NF-10 directly: nobody, including a fully compromised Maintain
 process, can delete `sys/tenancy` and brick every process's fail-closed
@@ -415,10 +419,12 @@ stays the documented, informationally-probed gap ADR-0042 already named.
   the program by leverage.
 - **A compromised Gateway, Query, or Admin credential can no longer delete
   anything, anywhere.** A compromised Maintain credential can still delete
-  within `l0/`, `l1/`, `c/`, `idem/` — the same set Ravel's own maintenance
-  code already deletes from today — but nothing else.
+  within `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**`
+  (EL-6, 2026-08-09 amendment) — the same set Ravel's own maintenance code
+  deletes from today — but nothing else.
 - **`sys/tenancy`, `sys/qualification`, `sys/gc`, `prov`, `catalog/*`, and
-  the audit prefix are undeletable by any role's policy.** This closes NF-10
+  the legal-hold shard of the audit prefix (`u/0000/**`) are undeletable by
+  any role's policy.** This closes NF-10
   outright and removes the "roll back a control object via delete-then-
   recreate" class of attack the review raised against the new resharding
   and readiness machinery, without weakening anything sweep or retention
@@ -477,3 +483,46 @@ not yet been deployed against a narrower Admin credential (epic EE's own
 landing is still in flight), so nothing has provisioned an Admin policy
 without this grant yet. The matching IAM policy JSON in
 `docs/guides/operations.md` (`AdminWrite`) is updated in the same change.
+
+## Amendment (2026-08-09): the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete
+
+Epic EL's EL-6 (issue #763, program #462) brings the query-audit shard
+(`Signal::Audit` / `QUERY_AUDIT_SHARD` = 1) into the maintained set:
+`ravel-maintain` now compacts it and age-sweeps it on a dedicated 90-day
+retention window (`sweep_audit_retention`), horizon-gated and legal-hold-gated
+exactly as the superseded-input sweep is. That sweep needs a delete grant on the
+query-audit shard, which §3's original blanket deny on the whole audit prefix
+(`t/<hash>/u/**`) forbade for every role, Maintain included.
+
+The audit prefix holds two fixed control-plane shards on disjoint key paths
+(the shard is a four-digit key segment, `t/<hash>/u/<l0|c|l1>/<shard>/…`), so
+the two can be scoped independently:
+
+- **Legal-hold shard 0** (`t/*/u/*/0000/*`) stays deny-delete-forever for every
+  role, Maintain included. A legal hold must never be destroyable, and the hold
+  fold reads L0 records directly, so these are never compacted either
+  (`compact_bucket` refuses the legal-hold shard). This is the sole audit path
+  left in `DenyDeleteProtected`.
+- **Query-audit shard 1** (`t/*/u/*/0001/*`) is removed from every role's
+  `DenyDeleteProtected` and added to **Maintain's `MaintainDelete` alone**. No
+  other role gains any audit delete: Gateway/Query/Admin still have no delete
+  grant on `u/**` at all, so narrowing the deny grants them nothing. Only
+  Maintain's explicit `Allow` reaches the query-audit shard, and it cannot reach
+  shard 0 because `…/0000/*` and `…/0001/*` are separate paths.
+
+Before/after, expressed as the operations.md IAM wildcards:
+
+- Deny-delete (all four roles): `t/*/u/*` → `t/*/u/*/0000/*`.
+- Maintain delete grant (`MaintainDelete` only): add `t/*/u/*/0001/*`.
+
+This does not weaken NF-10 or the review's delete-deny asks: `sys/*`, `prov`,
+`catalog/*`, and the legal-hold shard remain undeletable by any role. It only
+lets the one role that already owns every delete (Maintain) reclaim the
+query-audit activity log, which — unlike a legal hold or a control object — is
+append-only telemetry with a bounded lifetime, not a durability anchor. Amended
+in place (§1 table Maintain row, §2, §3 deny list, the diagram, and
+Consequences) for the same reason as the amendments above: the role split has
+not yet been provisioned against a narrower credential, so no deployed policy
+predates this change. The matching IAM policy JSON in
+`docs/guides/operations.md` (`MaintainDelete` and all four `DenyDeleteProtected`
+blocks) is updated in the same change.
