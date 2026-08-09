@@ -9,7 +9,6 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Trac
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
-use prost::Message;
 use ravel_types::Signal;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
@@ -22,6 +21,7 @@ use crate::otlp_http::{
     write_mode_from_headers,
 };
 use crate::traces_ingest::SpanIngestRequestError;
+use crate::wire_byte_count::wire_request_bytes;
 
 pub struct GrpcTraceService {
     state: Arc<GatewayState>,
@@ -55,8 +55,10 @@ impl TraceService for GrpcTraceService {
 
         // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every
         // signal including spans, even though spans get no layer-4 admission
-        // (ADR-0051 excludes spans from series/stream admission).
-        let request_bytes = request.get_ref().encoded_len() as u64;
+        // (ADR-0051 excludes spans from series/stream admission). Counted by
+        // `WireByteCountLayer` on wire bytes, not the decoded message's
+        // encoded length.
+        let request_bytes = wire_request_bytes(&request)?;
         if let Err(rejection) =
             self.state
                 .admission

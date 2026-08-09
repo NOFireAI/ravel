@@ -4737,6 +4737,8 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "http",
+ "http-body",
  "humantime",
  "jsonwebtoken",
  "opentelemetry-proto",
