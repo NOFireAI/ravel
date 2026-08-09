@@ -38,6 +38,7 @@ ravel-commit = { path = "crates/ravel-commit", version = "0.1.0" }
 ravel-catalog = { path = "crates/ravel-catalog", version = "0.1.0" }
 ravel-cache = { path = "crates/ravel-cache", version = "0.1.0" }
 ravel-maintain = { path = "crates/ravel-maintain", version = "0.1.0" }
+ravel-fleet = { path = "crates/ravel-fleet", version = "0.1.0" }
 ravel-otlp = { path = "crates/ravel-otlp", version = "0.1.0" }
 ravel-otap = { path = "crates/ravel-otap", version = "0.1.0" }
 ravel-remote-write = { path = "crates/ravel-remote-write", version = "0.1.0" }

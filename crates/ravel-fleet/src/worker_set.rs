@@ -38,7 +38,7 @@
 //! behavior is byte-for-byte the pre-ADR-0065 unconditional walk.
 //!
 //! This is deliberately **not** called a lease: the existing
-//! [`crate::sweep::LeaseCheck`] trait is the GC reader-protection gate, a
+//! `ravel_maintain::sweep::LeaseCheck` trait is the GC reader-protection gate, a
 //! different concept, and the two must not blur (ADR-0065 decision 1). The
 //! vocabulary here is `WorkerSet`, `live_set`, `owner`, `owns`.
 
@@ -151,7 +151,7 @@ pub fn owns(unit_key: &[u8], process_id: Uuid, live_set: &[Uuid]) -> bool {
 /// implausible heartbeat (whether corrupt, future-version, or impossibly
 /// future-dated) is the one direction that is safe under every other
 /// exclusion this module already makes.
-fn is_stale(now_ns: i64, heartbeat_unix_ns: i64, liveness_window_ns: i64) -> bool {
+pub(crate) fn is_stale(now_ns: i64, heartbeat_unix_ns: i64, liveness_window_ns: i64) -> bool {
     let too_old = now_ns.saturating_sub(heartbeat_unix_ns) > liveness_window_ns;
     let too_future = heartbeat_unix_ns.saturating_sub(now_ns) > liveness_window_ns;
     too_old || too_future

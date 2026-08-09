@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
+ravel-fleet = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
