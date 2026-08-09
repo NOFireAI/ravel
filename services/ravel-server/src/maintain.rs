@@ -971,15 +971,6 @@ pub async fn run_tick(
     total
 }
 
-/// Seed `memo` from durable memo snapshots (ADR-0065 decision 3's warm start
-/// and handoff). Each snapshot is gated on ownership -- only units this process
-/// owns under `live_set` are seeded, so a departing worker's units are picked up
-/// by whichever survivor the rendezvous hash now assigns them to -- and on
-/// staleness ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]). Merging several snapshots
-/// keeps the freshest verdict per bucket. An undecodable snapshot is skipped
-/// with a debug line (fail-open: cold start for whatever it would have seeded),
-/// never a panic. Returns `(seeded_units, seeded_buckets)` summed across the
-/// snapshots, for the caller's log line.
 /// Whether a recomputed live set differs from the one last held, which is the
 /// warm-start reseed trigger (ADR-0065 decision 3): a membership change may have
 /// moved a unit's rendezvous ownership onto this process, so its terminal facts
@@ -992,6 +983,15 @@ fn membership_changed(previous: &[Uuid], computed: &[Uuid]) -> bool {
     previous != computed
 }
 
+/// Seed `memo` from durable memo snapshots (ADR-0065 decision 3's warm start
+/// and handoff). Each snapshot is gated on ownership -- only units this process
+/// owns under `live_set` are seeded, so a departing worker's units are picked up
+/// by whichever survivor the rendezvous hash now assigns them to -- and on
+/// staleness ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]). Merging several snapshots
+/// keeps the freshest verdict per bucket. An undecodable snapshot is skipped
+/// with a debug line (fail-open: cold start for whatever it would have seeded),
+/// never a panic. Returns `(seeded_units, seeded_buckets)` summed across the
+/// snapshots, for the caller's log line.
 fn seed_memo_from_snapshots(
     memo: &mut MaintainMemo,
     snapshots: &[Vec<u8>],
