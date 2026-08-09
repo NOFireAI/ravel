@@ -135,7 +135,11 @@ impl LogIngestMetrics {
     pub(crate) fn record_flush(&self, trigger: FlushTrigger) {
         let counter = match trigger {
             FlushTrigger::Size => &self.flushes_by_size,
-            FlushTrigger::Age => &self.flushes_by_age,
+            // The log shard actor has no adaptive-delay trigger of its own
+            // (ADR-0067 decisions 1-3 scope to the metrics pipeline only);
+            // this arm exists only so the shared `FlushTrigger` enum stays
+            // exhaustive here, and is never reached from this actor.
+            FlushTrigger::Age | FlushTrigger::AgeAdaptive => &self.flushes_by_age,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);

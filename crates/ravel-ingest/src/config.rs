@@ -107,6 +107,23 @@ pub struct IngestConfig {
     /// outlive a request) already carries the cross-request window; this one
     /// bounds what one object can hold.
     pub exemplar_cap_window_ns: i64,
+    /// Upper bound on concurrently in-flight flush tasks per shard
+    /// (ADR-0067 decision 2). The shard actor pins a flush's identity and
+    /// moves its buffer into a spawned task while continuing to drain its
+    /// channel; this semaphore is the only thing that can make a flush
+    /// trigger block. Default 1 reproduces today's one-flush-at-a-time
+    /// behavior bit for bit; raising it is a measured decision recorded in
+    /// BENCHMARKS.md, not a routine tuning change. Must be at least 1: a
+    /// value of 0 deadlocks every flush (`services/ravel-server`'s
+    /// `Cli::validate` rejects it at the edge).
+    pub max_inflight_flushes: u32,
+    /// Enables the per-(shard, tenant) adaptive age trigger (ADR-0067
+    /// decision 3): the fast age threshold moves within
+    /// `[max_flush_delay, ceiling]` based on observed arrival rate and PUT
+    /// RTT, instead of always using the fixed `max_flush_delay`. `false`
+    /// (the default) keeps today's fixed-delay behavior for a clean A/B
+    /// against the adaptive corridor in the ingest bench.
+    pub adaptive_flush_delay: bool,
 }
 
 impl Default for IngestConfig {
@@ -124,6 +141,8 @@ impl Default for IngestConfig {
             put_retry_max_delay: Duration::from_secs(2),
             max_flush_lifetime: Duration::from_secs(3600),
             exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
+            max_inflight_flushes: 1,
+            adaptive_flush_delay: false,
         }
     }
 }
@@ -152,6 +171,10 @@ mod tests {
             cfg.exemplar_cap_window_ns,
             ravel_types::ExemplarCap::DEFAULT_WINDOW_NS
         );
+        // ADR-0067 decision 2: default reproduces today's one-flush-at-a-time
+        // behavior bit for bit; the flip to 3 is a later measured decision.
+        assert_eq!(cfg.max_inflight_flushes, 1);
+        assert!(!cfg.adaptive_flush_delay);
     }
 
     #[test]

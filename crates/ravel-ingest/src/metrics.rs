@@ -35,12 +35,20 @@
 //! `publish_with_retry`); the first attempt of each is not a retry and is not
 //! counted.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushTrigger {
     Size,
+    /// Buffer aged past the fixed `max_flush_delay` (or `max_flush_delay_idle`)
+    /// threshold: adaptive delay disabled, or no observed-rate/RTT data yet.
     Age,
+    /// Buffer aged past a per-(shard, tenant) threshold computed within the
+    /// adaptive-delay corridor (ADR-0067 decision 3), rather than the fixed
+    /// `max_flush_delay` constant.
+    AgeAdaptive,
     Manual,
 }
 
@@ -50,9 +58,19 @@ pub struct IngestMetrics {
     /// Attempt-time: incremented at flush open, so it includes flushes later
     /// abandoned.
     flushes_by_size: AtomicU64,
-    /// Flushes opened because the tenant buffer aged past `max_flush_delay`.
-    /// Attempt-time, same as `flushes_by_size`.
+    /// Flushes opened because the tenant buffer aged past the fixed
+    /// `max_flush_delay`/`max_flush_delay_idle` threshold. Attempt-time, same
+    /// as `flushes_by_size`. When adaptive delay is enabled this still covers
+    /// idle-threshold flushes and any flush opened before an adaptive
+    /// estimate exists; see `flushes_by_age_adaptive` for the corridor-driven
+    /// case (ADR-0067 decision 3).
     flushes_by_age: AtomicU64,
+    /// Flushes opened because the tenant buffer aged past a per-(shard,
+    /// tenant) threshold computed within the adaptive-delay corridor, rather
+    /// than the fixed `max_flush_delay` constant (ADR-0067 decision 3).
+    /// Zero unless adaptive delay is enabled. Attempt-time, same as
+    /// `flushes_by_size`.
+    flushes_by_age_adaptive: AtomicU64,
     /// Flushes opened by any `FlushTrigger::Manual` path: an explicit
     /// `FlushNow`, the `Shutdown` drain, or the channel-close drop-path drain.
     /// Attempt-time.
@@ -110,6 +128,16 @@ pub struct IngestMetrics {
     /// background refresher is not keeping views current and writes are being
     /// refused rather than routed on a possibly-missed activation.
     stale_provisioning_flushes: AtomicU64,
+    /// Per-shard count of flushes whose flush task has been spawned but has
+    /// not yet acked its waiters (ADR-0067 decision 2 consequence: pipelining
+    /// raises per-shard memory by up to `(max_inflight_flushes - 1)` flush
+    /// windows, and this gauge is how that stays observable). Keyed by shard
+    /// index; a shard with no flush in flight has no entry, equivalent to 0.
+    /// Not part of [`IngestMetricsSnapshot`]'s flat counters because it is a
+    /// gauge with a per-shard dimension, unlike everything else in this
+    /// struct (see the module docs' "no per-shard dimension" note); read it
+    /// via [`IngestMetrics::in_flight_flushes_by_shard`].
+    in_flight_flushes: Mutex<HashMap<u32, i64>>,
 }
 
 /// Point-in-time copy of [`IngestMetrics`] for scraping. See the
@@ -118,6 +146,7 @@ pub struct IngestMetrics {
 pub struct IngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
+    pub flushes_by_age_adaptive: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -131,6 +160,10 @@ pub struct IngestMetricsSnapshot {
     pub exemplars_written_total: u64,
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
+    /// Sum across shards of [`IngestMetrics::in_flight_flushes_by_shard`] at
+    /// snapshot time. The per-shard breakdown does not fit this struct's flat
+    /// Copy shape; call `in_flight_flushes_by_shard` directly for that.
+    pub in_flight_flushes_total: u64,
 }
 
 impl IngestMetrics {
@@ -138,9 +171,40 @@ impl IngestMetrics {
         let counter = match trigger {
             FlushTrigger::Size => &self.flushes_by_size,
             FlushTrigger::Age => &self.flushes_by_age,
+            FlushTrigger::AgeAdaptive => &self.flushes_by_age_adaptive,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta` (+1 when a
+    /// flush task is spawned, -1 when it ends, including on panic via
+    /// `shard.rs`'s `InFlightFlushGuard`). Poison recovery rather than a
+    /// panic on a poisoned lock: a gauge is best-effort self-observability,
+    /// not a durability path, so a prior panicked holder must not take this
+    /// one down with it.
+    pub(crate) fn record_inflight_flush_delta(&self, shard: u32, delta: i64) {
+        let mut map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_insert(0);
+        *entry += delta;
+    }
+
+    /// Point-in-time per-shard in-flight-flush counts, sorted by shard index.
+    /// A shard with none in flight is simply absent, equivalent to 0.
+    pub fn in_flight_flushes_by_shard(&self) -> Vec<(u32, u64)> {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counts: Vec<(u32, u64)> = map
+            .iter()
+            .map(|(&shard, &count)| (shard, count.max(0) as u64))
+            .collect();
+        counts.sort_unstable_by_key(|&(shard, _)| shard);
+        counts
     }
 
     pub(crate) fn record_put_retry(&self) {
@@ -203,6 +267,7 @@ impl IngestMetrics {
         IngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
+            flushes_by_age_adaptive: self.flushes_by_age_adaptive.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -216,6 +281,11 @@ impl IngestMetrics {
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
+            in_flight_flushes_total: self
+                .in_flight_flushes_by_shard()
+                .into_iter()
+                .map(|(_, count)| count)
+                .sum(),
         }
     }
 }
@@ -255,6 +325,32 @@ mod tests {
         assert_eq!(snap.acks_err, 1);
         assert_eq!(snap.series_id_collisions, 1);
         assert_eq!(snap.shard_deaths, 1);
+    }
+
+    #[test]
+    fn age_adaptive_trigger_counts_separately_from_fixed_age() {
+        let metrics = IngestMetrics::default();
+        metrics.record_flush(FlushTrigger::Age);
+        metrics.record_flush(FlushTrigger::AgeAdaptive);
+        metrics.record_flush(FlushTrigger::AgeAdaptive);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_age_adaptive, 2);
+    }
+
+    #[test]
+    fn in_flight_flush_gauge_tracks_per_shard_deltas() {
+        let metrics = IngestMetrics::default();
+        metrics.record_inflight_flush_delta(0, 1);
+        metrics.record_inflight_flush_delta(0, 1);
+        metrics.record_inflight_flush_delta(1, 1);
+        assert_eq!(metrics.in_flight_flushes_by_shard(), vec![(0, 2), (1, 1)]);
+        assert_eq!(metrics.snapshot().in_flight_flushes_total, 3);
+
+        metrics.record_inflight_flush_delta(0, -1);
+        assert_eq!(metrics.in_flight_flushes_by_shard(), vec![(0, 1), (1, 1)]);
+        assert_eq!(metrics.snapshot().in_flight_flushes_total, 2);
     }
 
     #[test]
