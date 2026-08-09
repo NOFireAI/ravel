@@ -128,6 +128,17 @@ pub struct ServerConfig {
     pub listen_http: SocketAddr,
     pub listen_grpc: SocketAddr,
     pub shard_count: u32,
+    /// Per-shard in-flight flush bound for the metrics ingest pipeline
+    /// (ADR-0067 decision 2, issue #814), forwarded to
+    /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]. Does not apply
+    /// to the log or span ingest pipelines, which keep their existing inline
+    /// flush. See `--max-inflight-flushes`.
+    pub max_inflight_flushes: u32,
+    /// Enables the adaptive flush-delay corridor for the metrics ingest
+    /// pipeline (ADR-0067 decision 3, issue #814), forwarded to
+    /// [`ravel_ingest::IngestConfig::adaptive_flush_delay`]. Does not apply
+    /// to the log or span ingest pipelines. See `--adaptive-flush-delay`.
+    pub adaptive_flush_delay: bool,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     /// The dedicated mTLS listener (ADR-0050 section 1), `None` unless
     /// `--mtls-enabled`. Serves the same ingest and query surface as the
@@ -442,6 +453,8 @@ pub async fn start(
         Some(Arc::new(IngestRouter::new(
             IngestConfig {
                 shard_count: config.shard_count,
+                max_inflight_flushes: config.max_inflight_flushes,
+                adaptive_flush_delay: config.adaptive_flush_delay,
                 ..IngestConfig::default()
             },
             store.clone(),

@@ -87,6 +87,8 @@ async fn start_test_server() -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode: Mode::All,
         // Bound to loopback but reachable from the collector container via
         // `--network host` (Linux only; no Docker Desktop fallback).

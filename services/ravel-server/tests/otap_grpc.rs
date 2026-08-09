@@ -43,6 +43,8 @@ async fn start_test_server() -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
@@ -94,6 +96,8 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
     let mut tenants = HashMap::new();
     tenants.insert(TenantId::new("acme"), tenant_limits);
     let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
