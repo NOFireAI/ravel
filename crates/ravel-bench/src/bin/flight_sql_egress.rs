@@ -195,7 +195,6 @@ async fn run(args: &Args) -> Report {
         }),
         Arc::new(BenchClock),
         FlightSqlConfig::default(),
-        Arc::clone(&store),
         // This binary measures egress bytes, not process metrics. There is no
         // `/metrics` route here to fold a cost into, and folding one would put
         // the benchmark's own synthetic queries into the same counters a real
