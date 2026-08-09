@@ -85,7 +85,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::tenant_discovery::{TenantDiscoveryMetrics, discover_and_restrict};
+use crate::tenant_discovery::{TenantDiscoveryMetrics, discover_and_restrict_by_lifecycle};
 
 /// Default `maintain_interval`: 5 minutes.
 pub const DEFAULT_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -524,7 +524,7 @@ pub async fn run_discovery_cycle(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
-    let outcome = match discover_and_restrict(store, restrict).await {
+    let outcome = match discover_and_restrict_by_lifecycle(store, restrict).await {
         Ok(outcome) => outcome,
         Err(err) => {
             tracing::error!(
@@ -1267,6 +1267,117 @@ mod tests {
         // find nothing to skip.
         assert_eq!(report, MaintainReport::default());
         assert!(memo.is_empty());
+    }
+
+    /// THE deliverable-3 acceptance test (ADR-0066 decision 6): retention keeps
+    /// running for a tenant whose token was removed from `sys/auth`. This closes
+    /// the named bug -- removing a token to "deprovision" a tenant must not
+    /// silently stop compacting, sweeping, or retention-enforcing its still
+    /// present data.
+    ///
+    /// The tenant has a durable config record (active) and one sealed bucket at
+    /// ingest hour 0 (1970), decades past any retention window. The discovery
+    /// cycle is run with the flag restriction EMPTY -- exactly what a
+    /// token-derived restriction becomes once the tenant's token is removed --
+    /// and retention must still retire the expired bucket, because the
+    /// lifecycle-aware discovery keeps the tenant maintained on the strength of
+    /// its config record, not its token. As a control, the pre-fix
+    /// `discover_and_restrict` excludes the tenant under the same empty
+    /// restriction, so its retention would NOT run.
+    #[tokio::test]
+    async fn retention_continues_after_token_removal_when_a_config_record_is_present() {
+        use ravel_catalog::{TenantConfig, TenantLifecycleState, set_tenant_config};
+
+        use crate::tenant_discovery::{
+            TenantDiscoveryMetrics, discover_and_restrict, discover_and_restrict_by_lifecycle,
+        };
+
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // One sealed bucket at ingest hour 0 (1970): decades older than any
+        // retention window, so retention must retire it.
+        publish_terminal_bucket(&store, &tenant_id).await;
+        // A durable config record marks the tenant active. This is what keeps it
+        // maintained after its token is gone.
+        set_tenant_config(
+            &store,
+            &tenant,
+            &TenantConfig::new(TenantLifecycleState::Active),
+            1_000,
+        )
+        .await
+        .expect("write config record");
+
+        // A retention config that would retire the 1970 bucket: a one-year
+        // window, comfortably above the ADR-0019 floor and far below the
+        // bucket's age against the real wall clock.
+        const YEAR_NS: i64 = 365 * 24 * 3_600 * 1_000_000_000;
+        let compactor = CompactorConfig::default();
+        let max_lag = ravel_catalog::CatalogConfig::default().max_ingest_lag_ns;
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(YEAR_NS),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            max_lag,
+        )
+        .expect("valid retention config");
+
+        // The token was removed, so the flag restriction is now empty. Control:
+        // the pre-fix restriction drops the tenant entirely.
+        let empty_restrict: Vec<TenantHash> = Vec::new();
+        let old = discover_and_restrict(&store, Some(&empty_restrict))
+            .await
+            .expect("discover");
+        assert!(
+            old.maintained.is_empty(),
+            "control: the pre-fix restriction drops the tenant once its token is gone"
+        );
+
+        // The fix: the lifecycle-aware discovery keeps the tenant maintained.
+        let discovered = discover_and_restrict_by_lifecycle(&store, Some(&empty_restrict))
+            .await
+            .expect("lifecycle discover");
+        assert_eq!(
+            discovered.maintained,
+            vec![tenant],
+            "the tenant stays maintained on its config record despite the empty token restriction"
+        );
+
+        // Drive the real maintenance discovery cycle (which uses the
+        // lifecycle-aware discovery) with the empty restriction and assert its
+        // retention actually retired the expired bucket -- maintenance genuinely
+        // continues for the deprovisioned-by-token tenant.
+        let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let worker = solo_worker();
+        let mut memo = MaintainMemo::with_default_interval();
+        let report = run_discovery_cycle(
+            &store,
+            Some(&empty_restrict),
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+            &safety,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert!(
+            report.retired >= 1,
+            "retention retired the expired bucket for the token-removed tenant \
+             (retention enforcement continues), got {report:?}"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "the discovery cycle recorded the tenant as maintained"
+        );
     }
 
     /// `run_tick` must actually call the idempotency-marker sweep for logs

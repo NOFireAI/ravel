@@ -16,6 +16,7 @@ pub mod gc_config;
 pub mod health;
 pub mod ingest;
 pub mod ingest_concurrency;
+pub mod lifecycle_refresh;
 pub mod logs_ingest;
 pub mod maintain;
 pub mod metrics;
@@ -304,6 +305,7 @@ pub struct Running {
     admission_reconcile_task: admission_reconcile::AdmissionReconcileTask,
     query_admission_reconcile_task: query_admission_reconcile::QueryAdmissionReconcileTask,
     scrub_task: scrub::ScrubTask,
+    lifecycle_refresh_task: lifecycle_refresh::LifecycleRefreshTask,
 }
 
 impl Running {
@@ -371,6 +373,7 @@ impl Running {
         self.admission_reconcile_task.shutdown().await;
         self.query_admission_reconcile_task.shutdown().await;
         self.scrub_task.shutdown().await;
+        self.lifecycle_refresh_task.shutdown().await;
 
         Ok(())
     }
@@ -444,7 +447,7 @@ fn remote_write_state(
 /// Binds both listeners (as configured by `mode`) and starts serving in the
 /// background. Returns immediately; call [`Running::shutdown`] to stop.
 pub async fn start(
-    config: ServerConfig,
+    mut config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
     store_metrics: Arc<StoreMetrics>,
     cache: Option<Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>>,
@@ -543,6 +546,49 @@ pub async fn start(
     ));
     for (tenant, limits) in &config.limits.tenants {
         admission.set_tenant_limits(tenant.clone(), *limits);
+    }
+
+    // Restart-free tenant lifecycle (ADR-0066 decision 6, EM-T8). On a keyed
+    // bucket in a tenant-resolving mode, resolve bearer tokens against the
+    // durable `sys/auth` map read on a bounded-staleness horizon: a freshly
+    // provisioned token authenticates within seconds (on-miss re-read), a
+    // removed one within one horizon, and a process that cannot refresh past a
+    // hard multiple of the horizon fails auth closed. The durable resolver is
+    // appended AFTER the static/OIDC chain, so it only ever answers a request
+    // the existing resolvers could not (an unknown opaque token -- exactly the
+    // freshly-provisioned case), and a hard-stale durable map never swallows a
+    // request the static bearer or OIDC resolver could still answer. An unkeyed
+    // bucket has no keyed-hash token map, so durable auth is unavailable there.
+    let now_ns = <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock);
+    let durable_auth: Option<Arc<lifecycle_refresh::DurableAuthState>> =
+        if matches!(config.mode, Mode::All | Mode::Gateway | Mode::Query) {
+            config.deployment_key.as_ref().map(|key| {
+                Arc::new(lifecycle_refresh::DurableAuthState::with_defaults(
+                    store.clone(),
+                    **key,
+                    now_ns,
+                ))
+            })
+        } else {
+            None
+        };
+    if let Some(state) = &durable_auth {
+        // One best-effort refresh before serving, so a bucket that already has a
+        // token map resolves from the first request rather than after the first
+        // horizon. A failure here is not fatal: the gate was seeded fresh, so the
+        // background loop has a full hard-bound window to succeed before auth
+        // would fail closed.
+        if let Err(err) = state.refresh(now_ns).await {
+            tracing::warn!(
+                error = %err,
+                "initial durable auth map refresh failed; will retry on the horizon \
+                 (ADR-0066 decision 6)"
+            );
+        }
+        config.tenant_resolver = Arc::new(tenant::FallbackResolver::new(vec![
+            config.tenant_resolver.clone(),
+            Arc::new(lifecycle_refresh::DurableBearerResolver::new(state.clone())),
+        ]));
     }
 
     // Fleet-global query concurrency ceiling (ADR-0061 decision 2): one shared
@@ -1165,6 +1211,32 @@ pub async fn start(
         _ => scrub::ScrubTask::none(),
     };
 
+    // Durable lifecycle refresh loop (ADR-0066 decision 6, EM-T8): refresh the
+    // `sys/auth` map on the horizon (and on-miss) so token grants/revocations
+    // take effect without a restart, and re-invoke `set_tenant_limits` from each
+    // known tenant's durable config record so per-tenant admission overrides do
+    // too. The auth half runs in tenant-resolving modes on a keyed bucket (where
+    // `durable_auth` is `Some`); the limits half runs in the ingest-serving
+    // modes (the only ones that admit). In `Mode::Maintain` both are absent and
+    // `spawn` returns a no-op handle -- the lifecycle thaw there is the discovery
+    // loop's `discover_and_restrict_by_lifecycle`, not this task.
+    let lifecycle_refresh_task = {
+        let limits = if matches!(config.mode, Mode::All | Mode::Gateway) {
+            Some(lifecycle_refresh::LimitsRefresh {
+                admission: admission.clone(),
+                defaults: config.limits.defaults,
+                tenant_overrides: config.limits.tenants.clone(),
+            })
+        } else {
+            None
+        };
+        let interval = Duration::from_nanos(
+            u64::try_from(ravel_ingest::DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS)
+                .unwrap_or(60_000_000_000),
+        );
+        lifecycle_refresh::spawn(durable_auth.clone(), store.clone(), limits, interval)
+    };
+
     Ok(Running {
         http_addr,
         grpc_addr,
@@ -1186,5 +1258,6 @@ pub async fn start(
         admission_reconcile_task,
         query_admission_reconcile_task,
         scrub_task,
+        lifecycle_refresh_task,
     })
 }

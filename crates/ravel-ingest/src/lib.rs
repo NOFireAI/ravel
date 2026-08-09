@@ -11,6 +11,7 @@ mod config;
 mod error;
 mod generation;
 mod idempotency;
+mod lifecycle;
 mod log_error;
 mod log_metrics;
 mod log_router;
@@ -39,6 +40,10 @@ pub use idempotency::{
     IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, IdempotencyReceipt, LookupOutcome, MARKER_SUFFIX,
     MarkerError, MarkerWriteError, WriteOutcome, decode_marker, keyhash32, marker_key, read_marker,
     write_marker,
+};
+pub use lifecycle::{
+    DEFAULT_HARD_STALENESS_MULTIPLE, DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS, StalenessGate,
+    overlay_admission_limits, refresh_tenant_limits_once,
 };
 pub use log_error::LogWriteError;
 pub use log_metrics::{LogIngestMetrics, LogIngestMetricsSnapshot};
