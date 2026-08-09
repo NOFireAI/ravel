@@ -61,7 +61,10 @@ pub mod rspan_codec;
 pub mod scan;
 pub mod scrub;
 pub mod sweep;
-pub mod worker_set;
+/// Worker membership and rendezvous-hash work partitioning (ADR-0065 decisions
+/// 1 and 2). Relocated to the `ravel-fleet` crate (ADR-0071) and re-exported
+/// here at its original path, so maintain's callers compile unchanged.
+pub use ravel_fleet::worker_set;
 
 pub use audit_pipeline::{AuditEvent, AuditPipeline, NoopQueryAuditSink, QueryAuditSink};
 pub use audit_retention::{AuditRetentionOutcome, sweep_audit_retention};
@@ -92,6 +95,7 @@ pub use publish::{
     publish_record_with_conservation,
 };
 pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, query_audit_event, write_query_audit};
+pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
 pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
 pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite_and_publish};
 pub use rlog::RlogCodec;
@@ -109,4 +113,18 @@ pub use sweep::{
     sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_superseded,
     sweep_unreferenced_catalog_objects, sweep_unreferenced_parts,
 };
-pub use worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
+
+#[cfg(test)]
+mod reexport_tests {
+    //! The worker-set move (ADR-0071, #863) must keep every path maintain's
+    //! callers already use resolvable here. This is a compile-level assertion:
+    //! if any re-export regressed, these `use`s fail to compile.
+
+    #[allow(unused_imports)]
+    use crate::worker_set::{
+        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY, WorkerSet,
+        owner, owns, run_bounded, unit_key,
+    };
+    #[allow(unused_imports)]
+    use crate::{WorkerSet as CrateRootWorkerSet, owner as crate_root_owner};
+}

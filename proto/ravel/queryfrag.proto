@@ -1,0 +1,220 @@
+// Distributed read fan-out fragment protocol (ADR-0071).
+//
+// This is a TRANSIENT wire contract between query processes, NOT a persistent
+// stored format: no byte defined here is ever written to object storage. It is
+// versioned from day one via FetchRequest.protocol_version (ADR-0071's
+// reject-unknown / silent-fallback-to-local rule for version skew). Field
+// numbers are frozen once this file merges, and every evolution is additive,
+// the same discipline the persistent schemas follow.
+//
+// The coordinator resolves ONE pinned snapshot and dispatches slices; a worker
+// executes the existing fetch path over only the listed segments and streams
+// series runs back with f64 values as raw bit patterns (NaN payloads, -0.0, and
+// the staleness marker all preserved). See docs/adrs/0071-distributed-read-fanout.md.
+syntax = "proto3";
+
+package ravel.queryfrag.v1;
+
+// One dispatched slice of a query (ADR-0071 protocol paragraph). The scope is
+// either pinned segment identities (intra-cluster: the coordinator resolved the
+// snapshot and ships explicit, reconstruct-and-verify segment references) or
+// resolve-mode matchers (cross-cluster federation: the remote resolves its own
+// snapshot). Matchers, window, budgets, deadline, erasure, and trace context
+// are threaded per fragment exactly as the local query threads them.
+message FetchRequest {
+  // The queryfrag protocol version the coordinator speaks. A worker that does
+  // not understand it triggers the coordinator's silent fallback to fully local
+  // execution (ADR-0071 failure semantics), never an error.
+  uint32 protocol_version = 1;
+  bytes query_id = 2;       // 16 bytes; correlates slices of one query
+  bytes tenant_hash = 3;    // 16 bytes
+  uint32 signal = 4;        // ravel_types::Signal discriminant
+
+  // Exactly one scope. Pinned for intra-cluster fan-out; resolve for
+  // cross-cluster federation (no segment references, no S3 credentials cross a
+  // trust boundary).
+  oneof scope {
+    PinnedScope pinned = 5;
+    ResolveScope resolve = 6;
+  }
+
+  repeated LabelMatcher matchers = 7;
+  sint64 window_start_ns = 8;   // padded event-time window, inclusive start
+  sint64 window_end_ns = 9;     // padded event-time window, inclusive end
+  Budgets budgets = 10;         // this slice's budget shares
+  sint64 deadline_unix_ns = 11; // absolute coordinator deadline
+  repeated ErasurePredicate erasure = 12;
+  string trace_context = 13;    // propagated tracing context (e.g. traceparent)
+}
+
+// Intra-cluster scope: the explicit segment set for this slice, reconstructed
+// and verified by the worker per ADR-0071's reconstruct-don't-trust rule.
+message PinnedScope {
+  repeated SegmentIdentity segments = 1;
+}
+
+// The durable identity of one segment the worker must fetch. Every field is
+// reconstructed metadata the worker re-derives and verifies against the fetched
+// object's footer; the coordinator ships identity, never trusted bytes.
+message SegmentIdentity {
+  uint32 level = 1;
+  uint32 shard = 2;
+  uint32 ingest_hour_bucket = 3;
+  string writer_id = 4;
+  uint64 writer_epoch = 5;
+  uint64 writer_seq = 6;
+  bytes input_set_hash = 7;
+  uint32 part_index = 8;
+  bytes content_hash = 9;   // 32 bytes; blake3 of the object
+  uint64 object_size = 10;
+  uint32 segment_format_version = 11;
+}
+
+// Cross-cluster scope: the remote resolves its own snapshot from these commit
+// tokens' floor, enforcing its own admission, limits, tenancy, and erasure.
+message ResolveScope {
+  repeated string min_commit_token = 1;
+}
+
+// One label matcher, mirroring the PromQL matcher operators.
+message LabelMatcher {
+  enum Op {
+    EQ = 0;   // name == value
+    NEQ = 1;  // name != value
+    RE = 2;   // name matches regex value
+    NRE = 3;  // name does not match regex value
+  }
+  string name = 1;
+  Op op = 2;
+  string value = 3;
+}
+
+// Per-slice budget shares (ADR-0044 dimensions), tripped into the same typed
+// errors the local path produces.
+message Budgets {
+  uint64 max_series = 1;
+  uint64 max_samples = 2;
+  uint64 max_bytes_scanned = 3;
+  uint64 max_segments = 4;
+}
+
+// One erasure predicate: series whose labels all match `equals` are erased
+// within the given event-time window (right-to-erasure filtering, applied by
+// the worker before streaming).
+message ErasurePredicate {
+  repeated LabelEquals equals = 1;
+  sint64 window_start_ns = 2;
+  sint64 window_end_ns = 3;
+}
+
+message LabelEquals {
+  string name = 1;
+  string value = 2;
+}
+
+// One streamed frame of a slice's response. A slice streams zero or more
+// series/histogram frames and ends with exactly one summary frame; a slice
+// contributes to the coordinator merge only after its terminal summary arrives
+// (ADR-0071 slice atomicity), so partial frames from a failed attempt are
+// discarded whole.
+message FetchResponse {
+  oneof frame {
+    SeriesFrame series = 1;
+    HistogramFrame hist = 2;
+    Summary summary = 3;
+  }
+}
+
+// One scalar series: its labels once, then its dedup-ordered runs.
+message SeriesFrame {
+  bytes series_id = 1;          // 16 bytes; canonical series identity
+  repeated Label labels = 2;
+  repeated Run runs = 3;
+}
+
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+// One run of samples from a single writer segment, in the merge total order.
+// Values are raw f64 bit patterns (fixed64), never proto doubles, so NaN
+// payloads, -0.0, and the staleness marker survive the wire byte-for-byte.
+// Timestamps are zig-zag deltas (sint64), so negative deltas encode compactly.
+message Run {
+  sint64 created_unix_ns = 1;
+  uint64 writer_epoch = 2;
+  uint64 writer_seq = 3;
+  repeated sint64 ts_delta = 4 [packed = true];
+  repeated fixed64 value_bits = 5 [packed = true];
+}
+
+// One histogram series. Mirrors SeriesFrame, but each run carries an opaque
+// encoded span payload instead of scalar value bits. The payload grammar is a
+// later ticket; the field is reserved here as opaque bytes with its number
+// frozen, so adding the grammar is a decode-side change, not a wire change.
+message HistogramFrame {
+  bytes series_id = 1;
+  repeated Label labels = 2;
+  repeated HistogramRun runs = 3;
+}
+
+message HistogramRun {
+  sint64 created_unix_ns = 1;
+  uint64 writer_epoch = 2;
+  uint64 writer_seq = 3;
+  repeated sint64 ts_delta = 4 [packed = true];
+  // Opaque encoded histogram span payload for this run. Grammar deferred to a
+  // later ticket; treated as an opaque blob by this contract.
+  bytes span_payload = 5;
+}
+
+// The terminal frame of a slice: the worker's accounting snapshot, the counts
+// it returned, and its typed status.
+message Summary {
+  QueryAccountingSnapshot accounting = 1;
+  uint64 series_returned = 2;
+  uint64 samples_returned = 3;
+  Status status = 4;
+}
+
+// Typed per-slice status, mirroring the local query's typed errors so the
+// coordinator maps each to the same outcome (ADR-0071 failure semantics).
+message Status {
+  enum Code {
+    OK = 0;
+    BAD_DATA = 1;
+    UNSUPPORTED = 2;
+    CORRUPT = 3;
+    UNAVAILABLE = 4;
+    TIMEOUT = 5;
+    SNAPSHOT_INVALIDATED = 6;
+    BUDGET_EXCEEDED = 7;
+    INTERNAL = 8;
+  }
+  Code code = 1;
+  string message = 2;
+}
+
+// The worker's per-slice cost accounting, mirroring
+// ravel_types::accounting::QueryAccountingSnapshot's counters as flat u64
+// fields (its fixed-size s3_requests/s3_bytes arrays are flattened per
+// AccountedOp: Get, List, Head, in AccountedOp::index order). Summed across
+// slices by the coordinator to report one query's total cost.
+message QueryAccountingSnapshot {
+  uint64 s3_get_requests = 1;
+  uint64 s3_list_requests = 2;
+  uint64 s3_head_requests = 3;
+  uint64 s3_get_bytes = 4;
+  uint64 s3_list_bytes = 5;
+  uint64 s3_head_bytes = 6;
+  uint64 cache_hits = 7;
+  uint64 cache_misses = 8;
+  uint64 cache_bytes = 9;
+  uint64 decompressed_bytes = 10;
+  uint64 segments_opened = 11;
+  uint64 segments_pruned = 12;
+  uint64 series_matched = 13;
+  uint64 bytes_reused = 14;
+  uint64 peak_intermediate_bytes = 15;
+}

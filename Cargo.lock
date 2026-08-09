@@ -4435,6 +4435,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-fleet"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "prost",
+ "ravel-object-store",
+ "ravel-proto",
+ "ravel-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ravel-ingest"
 version = "0.1.0"
 dependencies = [
@@ -4494,6 +4511,7 @@ dependencies = [
  "prost",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-fleet",
  "ravel-ingest",
  "ravel-logseg",
  "ravel-object-store",
