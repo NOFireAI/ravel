@@ -6,14 +6,36 @@
 //! internally and returns `Err` on violation, so success here is the
 //! assertion.
 //!
-//! "prove-the-test": confirmed by commenting out the `catalog.fold(...)`
-//! call in `src/driver.rs`'s `run_cycle_async` (the fold between the two
-//! `check_visible` calls). With the fold skipped, the second check --
-//! invariant (a), which queries with no pinned `min_tokens` and so depends
-//! on the catalog's own sealed snapshot rather than the caller's tokens --
-//! failed with `CycleError::AckNotDurable` as expected, since nothing had
-//! made the write listable outside of the caller's own token pin yet. The
-//! fold call was then restored.
+//! "prove-the-test": this test does NOT prove the fold is load-bearing, and
+//! an earlier version of this comment claimed it did -- that claim was
+//! false. Commenting out the `catalog.fold(...)` call in
+//! `src/driver.rs`'s `run_cycle_async` and re-running this test leaves it
+//! passing. Two separate resolves happen per checked series here, and
+//! neither depends on the fold at this workload's scale:
+//!
+//! - `check_visible`'s own per-token loop (`catalog.resolve(...,
+//!   min_tokens=[token], ...)`, run for every token regardless of
+//!   `CheckKind`) is satisfied by `Catalog::resolve_min_token`'s direct GET
+//!   on that token's own commit-record key. That GET succeeds whether or
+//!   not any fold ever ran, because fold does not delete or move the L0
+//!   commit record it reads.
+//! - Invariant (a)'s query (`CheckKind::AckDurable`, `query_min_tokens =
+//!   &[]`) resolves with no pinned tokens, so it is the one path a fold
+//!   could actually make cheaper -- but at this test's scale (one shard,
+//!   one tenant, a handful of samples in a single hour) the per-bucket
+//!   commit-record LIST fallback (`Catalog::resolve`'s per-(shard, hour)
+//!   listing pass) satisfies it just as well with no fold at all. The fold
+//!   changes *how* this resolves, not *whether* it resolves, so this test
+//!   cannot tell the two cases apart by pass/fail.
+//!
+//! The genuine, fault-injection-backed proof that the fold is load-bearing
+//! for a no-pinned-tokens resolve -- it lets that resolve be served
+//! entirely from the folded snapshot's GET-based part index, with the
+//! commit-record LIST fallback disabled and never hit -- lives in
+//! `tests/fold_makes_resolve_list_free.rs`. This test still exercises the
+//! fold as part of a realistic cycle and still asserts every token resolves
+//! and every acked sample is readable before and after it; it just does not,
+//! by itself, demonstrate that the fold was necessary for either.
 
 use ravel_sim::workload::{CardinalityShape, WorkloadConfig};
 use ravel_sim::{CycleConfig, MasterSeed};
@@ -32,7 +54,7 @@ fn ack_implies_durable_and_token_resolves() {
         ..CycleConfig::default()
     };
 
-    let outcome = ravel_sim::run_cycle(MasterSeed::new(7), &config)
+    let outcome = ravel_sim::run_cycle(MasterSeed::from_env_or(7), &config)
         .expect("small seeded cycle should satisfy read-your-write and ack-durability");
 
     assert_eq!(outcome.tenants_run, 1);
