@@ -21,10 +21,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rand::RngExt as _;
 use ravel_commit::keys;
 use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
+use ravel_commit::rng::RngSource;
 use ravel_logseg::{LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
@@ -156,6 +156,7 @@ pub(crate) struct LogShardActor {
     next_seq: u64,
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
+    rng: Arc<dyn RngSource>,
     config: IngestConfig,
     metrics: Arc<LogIngestMetrics>,
     rx: mpsc::Receiver<LogShardMsg>,
@@ -173,6 +174,7 @@ impl LogShardActor {
         epoch: u64,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
+        rng: Arc<dyn RngSource>,
         config: IngestConfig,
         metrics: Arc<LogIngestMetrics>,
         rx: mpsc::Receiver<LogShardMsg>,
@@ -185,6 +187,7 @@ impl LogShardActor {
             next_seq: 0,
             store,
             clock,
+            rng,
             config,
             metrics,
             rx,
@@ -626,7 +629,7 @@ impl LogShardActor {
             .saturating_mul(1u32 << shift);
         let capped = exp.min(self.config.put_retry_max_delay);
         let capped_ms = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);
-        let jittered_ms = rand::rng().random_range(0..=capped_ms);
+        let jittered_ms = self.rng.jitter_ms(capped_ms);
         // Route the backoff wait through the injected `Clock`, not the tokio
         // timer, so retry timing shares the one clock the rest of the flush
         // path already uses (`bound_to_deadline`) and a test can drive it
@@ -753,6 +756,7 @@ mod tests {
                 7,
                 Arc::clone(&store),
                 clock.clone(),
+                Arc::new(ravel_commit::rng::SystemRng),
                 config,
                 Arc::clone(&metrics),
                 rx,

@@ -4787,6 +4787,7 @@ version = "0.1.0"
 dependencies = [
  "rand 0.10.2",
  "ravel-catalog",
+ "ravel-commit",
  "ravel-ingest",
  "ravel-object-store",
  "ravel-promql",

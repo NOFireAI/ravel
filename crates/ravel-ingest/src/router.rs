@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::NormalizedPoint;
 use ravel_types::{CommitToken, Signal, TenantId, shard_for};
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::IngestConfig;
@@ -63,11 +63,28 @@ pub struct IngestRouter {
 }
 
 impl IngestRouter {
+    /// Construct with the production OS-entropy randomness source. Writer ids
+    /// and PUT-retry backoff jitter draw from OS entropy, unchanged from
+    /// before the [`RngSource`] seam (ADR-0068 decision 2).
     pub fn new(
         config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         signal: Signal,
         clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::with_rng(config, store, signal, clock, Arc::new(SystemRng))
+    }
+
+    /// Construct with an injected [`RngSource`]. The simulation harness passes
+    /// a seeded source derived from its master seed so writer ids and retry
+    /// jitter are reproducible (ADR-0068 decision 2); production wiring uses
+    /// [`IngestRouter::new`], whose source is OS entropy.
+    pub fn with_rng(
+        config: IngestConfig,
+        store: Arc<dyn ObjectStoreBackend>,
+        signal: Signal,
+        clock: Arc<dyn Clock>,
+        rng: Arc<dyn RngSource>,
     ) -> Self {
         let metrics = Arc::new(IngestMetrics::default());
         // Each generation's shard-actor set gets a fresh writer identity, so
@@ -75,9 +92,10 @@ impl IngestRouter {
         let factory = {
             let store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
+            let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             move |shard_count: u32| -> Vec<ShardHandle> {
-                let writer_id = Uuid::new_v4();
+                let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
                 (0..shard_count)
@@ -90,6 +108,7 @@ impl IngestRouter {
                             epoch,
                             Arc::clone(&store),
                             Arc::clone(&clock),
+                            Arc::clone(&rng),
                             config,
                             Arc::clone(&metrics),
                             rx,

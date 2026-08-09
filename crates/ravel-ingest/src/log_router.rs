@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_types::{CommitToken, TenantHash, shard_for_log};
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::IngestConfig;
@@ -105,13 +105,20 @@ impl LogIngestRouter {
         indexed_fields: Arc<dyn LogIndexedFields>,
     ) -> Self {
         let metrics = Arc::new(LogIngestMetrics::default());
+        // Production OS-entropy source for writer ids and PUT-retry jitter
+        // (ADR-0068 decision 2). The log pipeline is not exercised by the
+        // seeded simulation driver, so this router has no injected variant;
+        // routing every draw through the seam still keeps `rand::rng()` and
+        // `Uuid::new_v4()` off this production path.
+        let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
         let factory = {
             let store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
+            let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             let indexed_fields = Arc::clone(&indexed_fields);
             move |shard_count: u32| -> Vec<LogShardHandle> {
-                let writer_id = Uuid::new_v4();
+                let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
                 (0..shard_count)
@@ -123,6 +130,7 @@ impl LogIngestRouter {
                             epoch,
                             Arc::clone(&store),
                             Arc::clone(&clock),
+                            Arc::clone(&rng),
                             config,
                             Arc::clone(&metrics),
                             rx,

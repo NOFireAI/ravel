@@ -23,8 +23,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::RngExt as _;
 use ravel_catalog::Catalog;
+use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock, SystemClock};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::{Signal, TenantHash};
@@ -128,9 +128,15 @@ pub fn spawn(
         return FoldTasks::none();
     }
 
+    // Production OS-entropy randomness (ADR-0068 decision 2): the folder id
+    // and the per-tick loop jitter both draw from this one source instead of
+    // `Uuid::new_v4()` / `rand::rng()` directly. The server always uses the
+    // OS-entropy default; only the simulation harness injects a seeded source,
+    // and it does not drive this loop.
+    let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
     // One folder_id per process start (proto/ravel/catalog.proto,
     // `SnapshotHead.folder_id`), shared by every signal loop in this process.
-    let folder_id = Uuid::new_v4();
+    let folder_id = rng.new_uuid();
     let fallback_allow = if fallback_allow.is_empty() {
         None
     } else {
@@ -144,6 +150,7 @@ pub fn spawn(
         let store = store.clone();
         let fallback_allow = fallback_allow.clone();
         let interval = config.fold_interval;
+        let rng = Arc::clone(&rng);
         let handle = tokio::spawn(async move {
             run_loop(
                 catalog,
@@ -152,6 +159,7 @@ pub fn spawn(
                 fallback_allow,
                 folder_id,
                 interval,
+                rng,
                 rx,
             )
             .await;
@@ -170,11 +178,12 @@ async fn run_loop(
     fallback_allow: Option<Vec<TenantHash>>,
     folder_id: Uuid,
     interval: Duration,
+    rng: Arc<dyn RngSource>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(jittered(interval)) => {}
+            _ = tokio::time::sleep(jittered(interval, rng.as_ref())) => {}
             _ = &mut shutdown => return,
         }
 
@@ -271,12 +280,12 @@ async fn run_tenant_tick(
 /// (started at roughly the same time) don't tick in lockstep forever. Shared
 /// with the store-reachability probe ([`crate::store_probe`]), which reuses this
 /// single helper rather than growing a second copy of the same jitter rule.
-pub(crate) fn jittered(base: Duration) -> Duration {
+pub(crate) fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
     if jitter_bound_ms == 0 {
         return base;
     }
-    let extra_ms = rand::rng().random_range(0..=jitter_bound_ms);
+    let extra_ms = rng.jitter_ms(jitter_bound_ms);
     base + Duration::from_millis(extra_ms)
 }
 

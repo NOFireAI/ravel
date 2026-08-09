@@ -270,10 +270,13 @@ pub fn spawn(
     let tick_secs = tick.as_secs().max(1);
 
     let (tx, mut rx) = oneshot::channel();
+    // Production OS-entropy jitter (ADR-0068 decision 2), the same default the
+    // fold and maintenance loops use; the harness does not drive scrub.
+    let rng: Arc<dyn ravel_commit::rng::RngSource> = Arc::new(ravel_commit::rng::SystemRng);
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(jittered(tick)) => {}
+                _ = tokio::time::sleep(jittered(tick, rng.as_ref())) => {}
                 _ = &mut rx => return,
             }
             // Ownership gating (ADR-0065 decision 2): scrub shares the maintain

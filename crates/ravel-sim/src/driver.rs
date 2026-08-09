@@ -22,6 +22,7 @@ use ravel_catalog::{
     Catalog, CatalogConfig, CatalogError, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
     DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS,
 };
+use ravel_commit::rng::{RngSource, SeededRng};
 use ravel_ingest::{
     Clock, IngestConfig, IngestPoint, IngestRouter, IngestValue, WriteError, WriteMode,
 };
@@ -313,6 +314,20 @@ async fn run_cycle_async(
     let clock: Arc<dyn Clock> = Arc::clone(&sim_clock) as Arc<dyn Clock>;
     let mut clock_rng: StdRng = master_seed.rng("clock");
 
+    // Seeded randomness for the ingest component (ADR-0068 decisions 1 and 2):
+    // writer-id generation and PUT-retry backoff jitter draw from this
+    // master-seed-derived source instead of OS entropy, so a whole cycle's
+    // identities and jitter replay from the seed. One source is shared across
+    // every tenant's router (its own derived domain), so writer ids stay
+    // distinct within a run yet identical across runs of the same seed.
+    let ingest_rng: Arc<dyn RngSource> =
+        Arc::new(SeededRng::new(master_seed.sub_seed("ingest-rng")));
+    // Folder identity for the driver's own `Catalog::fold` calls, from its own
+    // derived domain so it neither perturbs nor is perturbed by the ingest
+    // source's draw order (ADR-0068 decision 1). Replaces a `Uuid::new_v4()`
+    // that made each run's snapshot folder id nondeterministic.
+    let fold_rng = SeededRng::new(master_seed.sub_seed("fold-id"));
+
     let catalog_config = CatalogConfig {
         shard_count: config.shard_count,
         ..CatalogConfig::default()
@@ -348,11 +363,12 @@ async fn run_cycle_async(
             shard_count: config.shard_count,
             ..IngestConfig::default()
         };
-        let router = IngestRouter::new(
+        let router = IngestRouter::with_rng(
             ingest_config,
             Arc::clone(&store),
             Signal::Metrics,
             Arc::clone(&clock),
+            Arc::clone(&ingest_rng),
         );
 
         // F13: ingest in per-sample-index batches rather than one batch for
@@ -424,7 +440,7 @@ async fn run_cycle_async(
             .fold(
                 &tenant_hash,
                 Signal::Metrics,
-                Uuid::new_v4(),
+                fold_rng.new_uuid(),
                 fold_now_ns,
                 &[],
             )

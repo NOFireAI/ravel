@@ -177,11 +177,15 @@ impl StoreProbeTask {
 /// reads. Returns immediately; the task runs until [`StoreProbeTask::shutdown`].
 pub fn spawn(store: Arc<dyn ObjectStoreBackend>, interval: Duration) -> StoreProbeTask {
     let (tx, mut rx) = oneshot::channel();
+    // Production OS-entropy jitter source (ADR-0068 decision 2), the same
+    // default the fold and maintenance loops use; only the simulation harness
+    // injects a seeded source, and it does not drive this probe.
+    let rng: Arc<dyn ravel_commit::rng::RngSource> = Arc::new(ravel_commit::rng::SystemRng);
     let handle = tokio::spawn(async move {
         let mut hysteresis = ProbeHysteresis::new();
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(crate::fold::jittered(interval)) => {}
+                _ = tokio::time::sleep(crate::fold::jittered(interval, rng.as_ref())) => {}
                 _ = &mut rx => return,
             }
             let reachable = run_probe_cycle(store.as_ref(), &mut hysteresis).await;

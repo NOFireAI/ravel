@@ -433,6 +433,7 @@ pub fn spawn(
         return LifecycleRefreshTask::none();
     }
     let (tx, mut rx) = oneshot::channel();
+    let rng: Arc<dyn ravel_commit::rng::RngSource> = Arc::new(ravel_commit::rng::SystemRng);
     let handle = tokio::spawn(async move {
         // The horizon deadline is held OUTSIDE the select!, not rebuilt as a
         // fresh `sleep(interval)` on every iteration. The miss arm below fires
@@ -443,11 +444,11 @@ pub fn spawn(
         // misconfigured agent (or any scanner) retrying more often than once per
         // horizon would starve the horizon arm forever, so the durable
         // per-tenant limits refresh would never run.
-        let mut next_refresh = tokio::time::Instant::now() + jittered(interval);
+        let mut next_refresh = tokio::time::Instant::now() + jittered(interval, rng.as_ref());
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(next_refresh) => {
-                    next_refresh = tokio::time::Instant::now() + jittered(interval);
+                    next_refresh = tokio::time::Instant::now() + jittered(interval, rng.as_ref());
                     let now_ns = SystemClock.now_ns();
                     refresh_cycle(auth.as_deref(), store.as_ref(), limits.as_ref(), now_ns).await;
                 }

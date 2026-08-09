@@ -4,13 +4,13 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use rand::RngExt as _;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum};
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_types::CommitToken;
 
 use crate::keys::{self, KeyError};
 use crate::record::{self, RecordError};
+use crate::rng::{RngSource, SystemRng};
 
 /// Jittered exponential backoff bounds for retryable store errors
 /// (`Throttled`, `Timeout`, `Transient`; see `StoreError::is_retryable`).
@@ -53,12 +53,12 @@ pub enum PublishError {
     },
 }
 
-async fn backoff_sleep(attempt: u32, policy: &RetryPolicy) {
+async fn backoff_sleep(attempt: u32, policy: &RetryPolicy, rng: &dyn RngSource) {
     let shift = attempt.min(20);
     let exp = policy.base_delay.saturating_mul(1u32 << shift);
     let capped = exp.min(policy.max_delay);
     let capped_ms = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);
-    let jittered_ms = rand::rng().random_range(0..=capped_ms);
+    let jittered_ms = rng.jitter_ms(capped_ms);
     tokio::time::sleep(Duration::from_millis(jittered_ms)).await;
 }
 
@@ -68,11 +68,25 @@ async fn backoff_sleep(attempt: u32, policy: &RetryPolicy) {
 /// previous attempt already landed and this is a retry); different is a
 /// fatal split-brain. Retryable store errors get jittered exponential
 /// backoff, bounded by `retry_policy.max_attempts`.
-#[tracing::instrument(skip(store, record, retry_policy), fields(commit_key))]
 pub async fn publish(
     store: &dyn ObjectStoreBackend,
     record: &CommitRecord,
     retry_policy: &RetryPolicy,
+) -> Result<CommitToken, PublishError> {
+    publish_with_rng(store, record, retry_policy, &SystemRng).await
+}
+
+/// [`publish`] with the backoff-jitter source injected (ADR-0068 decision 2).
+/// `publish` calls this with the OS-entropy [`SystemRng`]; the simulation
+/// harness injects a seeded [`crate::rng::SeededRng`] so retry timing is
+/// reproducible from the master seed. Behavior with the default source is
+/// identical to the pre-seam code.
+#[tracing::instrument(skip(store, record, retry_policy, rng), fields(commit_key))]
+pub async fn publish_with_rng(
+    store: &dyn ObjectStoreBackend,
+    record: &CommitRecord,
+    retry_policy: &RetryPolicy,
+    rng: &dyn RngSource,
 ) -> Result<CommitToken, PublishError> {
     record::validate(record)?;
     let commit_key = keys::commit_key_for_record(record)?;
@@ -93,7 +107,7 @@ pub async fn publish(
             }
             Err(e) if e.is_retryable() && attempt < retry_policy.max_attempts => {
                 tracing::warn!(attempt, error = %e, "retrying commit publish after store error");
-                backoff_sleep(attempt, retry_policy).await;
+                backoff_sleep(attempt, retry_policy, rng).await;
                 attempt += 1;
             }
             Err(e) => {
