@@ -8,11 +8,14 @@
 //!
 //! This has to shell out rather than call `MasterSeed::from_env_or`
 //! in-process: setting the variable for one test would require
-//! `std::env::set_var`, which is `unsafe` and this workspace forbids
-//! `unsafe_code` outright (`unsafe_code = "forbid"`, deny-overridable
-//! lints wouldn't even apply here). `examples/print_master_seed.rs` exists
-//! solely so this test has an external process whose environment it can
-//! control freely.
+//! `std::env::set_var`, which is `unsafe` in edition 2024 and unsound under
+//! a multi-threaded test runner regardless. (This crate does not yet opt
+//! into the workspace `[lints]` table -- tracked separately -- so the
+//! workspace-level `unsafe_code = "forbid"` does not currently reach it;
+//! the subprocess design is chosen on soundness grounds, not because the
+//! lint would reject the alternative.) `examples/print_master_seed.rs`
+//! exists solely so this test has an external process whose environment it
+//! can control freely.
 //!
 //! "prove-the-test": run below, both with the variable unset (must print
 //! the example's own default, `1`) and set to `999999` (must print
@@ -23,9 +26,13 @@ use std::process::Command;
 
 fn run_example(seed_env: Option<&str>) -> u64 {
     let mut cmd = Command::new(env!("CARGO"));
+    // `--locked` keeps the nested build's resolution identical to every
+    // other cargo invocation in a CI job; without it this inner `cargo run`
+    // could resolve dependencies differently from the outer `--locked` run.
     cmd.args([
         "run",
         "--quiet",
+        "--locked",
         "-p",
         "ravel-sim",
         "--example",

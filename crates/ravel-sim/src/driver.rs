@@ -98,24 +98,22 @@ pub enum CycleError {
     Resolve { seed: u64, source: CatalogError },
     #[error("seed {seed}: query failed: {source}")]
     Query { seed: u64, source: QueryError },
-    #[error(
-        "seed {seed}: read-your-write violated for tenant {tenant}: commit token {token} did \
-         not resolve, or the query engine did not return the samples it acked"
-    )]
+    #[error("seed {seed}: read-your-write violated for tenant {tenant}: {detail} (token {token})")]
     ReadYourWrite {
         seed: u64,
         tenant: String,
         token: String,
+        detail: String,
     },
     #[error(
-        "seed {seed}: strict-ack-implies-durable violated for tenant {tenant}: commit token \
-         {token} did not resolve after the fold, or the folded snapshot did not return the \
-         acked samples"
+        "seed {seed}: strict-ack-implies-durable violated for tenant {tenant}: {detail} \
+         (token {token})"
     )]
     AckNotDurable {
         seed: u64,
         tenant: String,
         token: String,
+        detail: String,
     },
 }
 
@@ -218,9 +216,17 @@ fn ingest_point_at(
 /// one generated series: the exact label set the query result carries (for
 /// a histogram query, `histogram_count()` drops `__name__` -- ravel-promql's
 /// `drop_metric_name`, confirmed by its own
-/// `histogram_count_reads_count_and_drops_name` test), the sample's own
-/// stored timestamp (`InstantSample::orig_sample_ts_ns`, not the query eval
-/// timestamp), and its value compared by bit pattern.
+/// `histogram_count_reads_count_and_drops_name` test), a timestamp check,
+/// and its value compared by bit pattern.
+///
+/// Timestamp-check honesty: for a scalar query,
+/// `InstantSample::orig_sample_ts_ns` is the sample's own stored timestamp,
+/// so the comparison genuinely verifies stored time. For `histogram_count()`
+/// results, ravel-promql's `histogram_native.rs` sets `orig_sample_ts_ns`
+/// to the evaluation timestamp, and since this check evaluates exactly at
+/// the sample's own `t_ms`, the equality holds trivially on that arm: the
+/// stored-timestamp guarantee for histogram series rests on the value-bits
+/// check and the scalar arm, not on this field.
 struct ExpectedSample<'a> {
     query: String,
     t_ms: i64,
@@ -482,9 +488,10 @@ enum CheckKind {
 /// propagates as [`CycleError::Resolve`], distinct from
 /// [`CatalogError::UnsatisfiableToken`], the one variant that means the
 /// invariant itself was violated), and a query pinned at each series' own
-/// last sample returns exactly that sample back -- label set, real stored
-/// timestamp, and value bit pattern all matching (F3), not just "some
-/// non-empty vector".
+/// last sample returns exactly that sample back -- label set, timestamp
+/// (genuinely the stored timestamp on the scalar arm; trivially the eval
+/// timestamp on the histogram arm, see [`ExpectedSample`]), and value bit
+/// pattern all matching (F3), not just "some non-empty vector".
 #[allow(clippy::too_many_arguments)]
 async fn check_visible(
     seed: u64,
@@ -507,7 +514,13 @@ async fn check_visible(
         {
             Ok(_) => {}
             Err(CatalogError::UnsatisfiableToken { .. }) => {
-                return Err(violation(seed, tenant_label, token, kind));
+                return Err(violation(
+                    seed,
+                    tenant_label,
+                    token,
+                    kind,
+                    "commit token did not resolve".to_string(),
+                ));
             }
             Err(source) => {
                 return Err(CycleError::Resolve { seed, source });
@@ -551,24 +564,45 @@ async fn check_visible(
             _ => false,
         };
         if !matched {
-            return Err(violation(seed, tenant_label, &fallback_token, kind));
+            return Err(violation(
+                seed,
+                tenant_label,
+                &fallback_token,
+                kind,
+                format!(
+                    "every token resolved, but query {} did not return the acked sample \
+                     (label set / timestamp / value bits mismatch)",
+                    expected.query
+                ),
+            ));
         }
     }
     Ok(())
 }
 
-fn violation(seed: u64, tenant_label: &str, token: &CommitToken, kind: CheckKind) -> CycleError {
+/// `detail` says which check actually failed -- token resolution or a
+/// content mismatch on an already-resolved token -- so a value corruption is
+/// never reported as a token-durability failure against an innocent token.
+fn violation(
+    seed: u64,
+    tenant_label: &str,
+    token: &CommitToken,
+    kind: CheckKind,
+    detail: String,
+) -> CycleError {
     let token = token.encode();
     match kind {
         CheckKind::ReadYourWrite => CycleError::ReadYourWrite {
             seed,
             tenant: tenant_label.to_string(),
             token,
+            detail,
         },
         CheckKind::AckDurable => CycleError::AckNotDurable {
             seed,
             tenant: tenant_label.to_string(),
             token,
+            detail,
         },
     }
 }
