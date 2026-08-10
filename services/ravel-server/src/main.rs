@@ -387,6 +387,9 @@ async fn main() -> anyhow::Result<()> {
         idle_tenant_state_ttl: cli
             .parse_idle_tenant_state_ttl()
             .context("failed to parse --idle-tenant-state-ttl")?,
+        distrib: cli
+            .parse_distrib_settings()
+            .context("failed to resolve --distributed-query settings")?,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;

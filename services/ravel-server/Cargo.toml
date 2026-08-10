@@ -12,6 +12,11 @@ ravel-cache = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }
+# Query-worker registration/liveness and rendezvous slice ownership for the
+# ADR-0071 distributed read fan-out (issue #865): sys/query/workers heartbeats
+# (ravel_fleet::query_workers) and highest-random-weight slice ownership
+# (ravel_fleet::worker_set).
+ravel-fleet = { workspace = true }
 ravel-ingest = { workspace = true }
 ravel-logseg = { workspace = true }
 ravel-otlp = { workspace = true }
@@ -55,13 +60,26 @@ http-body = "1.1"
 # pulls the arrow / arrow-ipc dependency tree, so it stays out of the default
 # build (docs/otap-ingest.md risk mitigation).
 ravel-otap = { workspace = true, optional = true }
-# The `otap` gRPC service returns a `BatchStatus` stream; `futures` provides
-# the stream combinator that drives one batch to one status. Also a
-# dev-dependency (Flight SQL tests), independent of this optional link.
-futures = { workspace = true, optional = true }
+# Stream combinators. The ADR-0071 coordinator (`distrib.rs`, issue #865)
+# drives the in-process fragment service's `SeriesFetch` frame stream to
+# completion for a self-mapped (no-hop) slice, so `futures` is production code
+# in the default build, not only under `otap` or in tests. The `otap` gRPC
+# service also uses it (one `BatchStatus` per batch); that link no longer needs
+# a `dep:futures` toggle now that the crate is always present.
+futures = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
+# `channel` (a tonic client transport) is off in tonic's default feature set,
+# which the server binary otherwise keeps. The ADR-0071 coordinator
+# (`distrib.rs`) is a `queryfrag` gRPC *client*: it dials remote query workers
+# to dispatch slices, so the client transport is production code here, not just
+# a test dependency (the dev-dependency below keeps the same feature for the
+# Flight startup test).
+tonic = { workspace = true, features = ["channel"] }
 tonic-prost = { workspace = true }
+# The ADR-0071 `SliceFetcher` trait (ravel_query::distrib::client) is an
+# `#[async_trait]` trait the coordinator's routing fetcher implements, so
+# async-trait is production code here, not only a test dependency.
+async-trait = { workspace = true }
 axum = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
@@ -126,7 +144,7 @@ arrow-flight = { workspace = true, optional = true }
 # it carries (docs/otap-ingest.md: "the gateway builds without it by default
 # until the bench panel justifies default-on"). Metrics only for now; the OTAP
 # logs and traces services are follow-up work.
-otap = ["dep:ravel-otap", "dep:futures"]
+otap = ["dep:ravel-otap"]
 
 # `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
 # server binary, and the SQL surface is opt-in per deployment
@@ -149,15 +167,11 @@ reqwest = { version = "0.13", features = ["json", "query"] }
 # startup test needs a gRPC client to call the server it just started. The
 # server binary itself keeps the default (server-only) tonic.
 tonic = { workspace = true, features = ["channel"] }
-async-trait = { workspace = true }
 snap = { workspace = true }
 # Test-only: the cache warmup deadline test needs virtual time
 # (`tokio::time::pause`/`advance`) to prove a `tokio::time::timeout` fires
 # without the test actually waiting out the real deadline.
 tokio = { workspace = true, features = ["test-util"] }
-# Test-only: the Flight SQL tests adapt a `tonic::Streaming` into the stream
-# `arrow_flight::decode` consumes, which needs the `TryStreamExt` combinators.
-futures = { workspace = true }
 # Test-only, same reason for spans: the trace ingest end-to-end test decodes the
 # RSPAN object the write flushed. ravel-rspan (ADR-0041) is new and not yet
 # listed in the workspace [workspace.dependencies]; the root Cargo.toml is out

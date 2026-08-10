@@ -170,6 +170,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
+        None,
     );
     let promql = promql_router(app_state);
 
@@ -197,6 +198,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         ingest_concurrency: ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
             ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
         ),
+        distrib: None,
     });
 
     Surfaces {
@@ -587,6 +589,7 @@ mod flight {
                 ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
                     ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
                 ),
+            distrib: None,
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![

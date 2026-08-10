@@ -352,6 +352,7 @@ async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),

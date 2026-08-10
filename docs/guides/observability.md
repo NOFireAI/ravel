@@ -248,6 +248,32 @@ carries `interactive` or `background`. Only `interactive` occurs today.
 | `ravel_query_estimated_store_bytes_total` | Pre-execution upper-envelope estimate of object-store bytes. |
 | `ravel_query_estimated_decompressed_bytes_total` | Pre-execution upper-envelope estimate of decompressed sample bytes. |
 
+### Distributed read fan-out (`ravel_distrib_*`)
+
+Labels: `mode` only, plus `le` on the histogram buckets. This family carries no
+per-shard, per-worker, or per-tenant label (ADR-0044 section 4): a fan-out
+spanning many workers and tenants must not turn one query into a cardinality
+explosion. It renders only when the process runs with `--distributed-query`
+(ADR-0071, issue #865); a local-only process omits the family entirely.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_distrib_fragment_requests_total` | Inbound fragment (`SeriesFetch`) requests served after passing token auth and fragment admission. Worker side. |
+| `ravel_distrib_fragment_auth_failures_total` | Inbound fragment requests refused for a missing or invalid cluster bearer token. |
+| `ravel_distrib_fragment_inflight` | Gauge. Fragment requests currently holding a fragment-admission permit. |
+| `ravel_distrib_slices_local_total` | Slices this coordinator executed locally because it owns them (self-mapped, no network hop). |
+| `ravel_distrib_slices_remote_total` | Slices this coordinator dispatched to a remote worker and read back over the wire. |
+| `ravel_distrib_slices_fallback_total` | Slices whose remote dispatch failed at transport and fell back to local execution rather than failing the query. |
+| `ravel_distrib_slice_fetch_seconds` | Per-slice fetch latency histogram, covering both locally-run and remote slices. |
+
+Fragment admission is a distinct workload class from client-query admission
+(`--max-inflight-fragments`, separate from the query concurrency limit), so a
+burst of inbound fragments cannot starve the coordinator's own client queries
+and vice versa. A rising `ravel_distrib_slices_fallback_total` means a worker
+named in the live set is unreachable: the query still returns correct results
+(the coordinator can read any slice itself), but the fan-out is degrading to
+local execution and latency will climb.
+
 ## Reading estimate against actual
 
 The estimate is an upper envelope, never a prediction (ADR-0044 section 3).
