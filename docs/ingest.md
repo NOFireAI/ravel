@@ -458,6 +458,64 @@ always answers 2xx with the true written count once body-size and rate
 checks pass, and reserves 429 for the rate-limit rows only, never for an
 active-series-cap breach.
 
+## Process-wide ingest buffer byte budget (ADR-0069)
+
+The per-(tenant, shard, signal) buffer cap (~`target_bytes`) bounds each
+tenant, but not their *sum*: a burst of active tenants can grow resident
+memory without any per-tenant limit tripping (ADR-0069). One process-wide
+atomic gauge (`ravel_ingest::IngestByteBudget`) bounds that sum. It is shared
+by `Arc` across the metrics, log, and span routers, so a single ceiling
+covers every signal.
+
+Each ingest write charges its estimated buffered bytes into the gauge in the
+router's write path, after decode/normalize/admission and before any shard
+buffer is touched (`IngestPoint::est_charge_bytes`: 16 bytes per sample plus
+the point's label name/value bytes, plus each exemplar's buffered width). If
+the charge would push the gauge past the ceiling
+(`--max-ingest-buffer-bytes`, default 512 MiB, `0` = unlimited) the request
+is shed *before* buffering: no shard is touched, no commit token is minted,
+the shed counter increments, and the caller gets HTTP 429 with `Retry-After`
+(gRPC `RESOURCE_EXHAUSTED`), exactly like the layer-2 byte-rate rejection and
+the #802 in-flight shed. The charge is an RAII guard cloned into every shard
+message the request fans out to; each shard buffer holds its clones and moves
+them into the flush, and the guard refunds the exact charged amount when the
+last buffer holding any of the request's bytes flushes (or its flush fails or
+is abandoned). In-flight pipelined flushes (ADR-0067) therefore stay charged
+until their PUTs complete, so pipelining depth is automatically accounted
+for. The gauge, its configured ceiling, and the shed counter render on
+`/metrics` as `ravel_ingest_buffer_bytes`, `ravel_ingest_buffer_bytes_limit`,
+and `ravel_ingest_buffer_shed_total`.
+
+### Worst-case resident memory
+
+Worst-case ingest resident memory is the sum of three named, config-bounded
+terms:
+
+1. **Buffered ingest state**: `--max-ingest-buffer-bytes` (default 512 MiB).
+   This ceiling covers the estimated bytes of every shard buffer *and* every
+   in-flight pipelined flush across all tenants and signals at once, since a
+   flush's buffer stays charged until its PUTs complete. The charge is an
+   estimate (`est_charge_bytes`), a deliberate slight over-count of the live
+   buffer (it counts a series' label bytes on every point, not only first
+   sight), so the true buffered RSS is at or below this term.
+2. **In-flight decode overhead**: each admitted in-flight request transiently
+   holds one decoded/normalized request body during normalization, before its
+   points reach a buffer. This is bounded by
+   `--max-inflight-ingest-requests` (default 1024) times the largest
+   per-request decoded size (Remote Write's 64 MiB post-decompression cap, or
+   OTLP's 16 MiB) — the same worst case the concurrency limit already
+   documents above. It is *not* covered by the buffer budget, which is
+   charged post-decode.
+3. **Fixed overhead**: shard-actor and router state, the admission
+   controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
+   all bounded independently of ingest volume.
+
+So an operator sizes ingest RSS as
+`max_ingest_buffer_bytes + (max_inflight_ingest_requests x largest_decoded_body)
++ fixed_overhead`, every term a knob. Lowering `--max-ingest-buffer-bytes`
+tightens term 1 directly, trading a lower memory ceiling for earlier shedding
+under a many-tenant burst.
+
 ## Modes
 
 `mode=strict` (default): ack after step 3 for every flush the request's
@@ -478,6 +536,7 @@ carries max token per shard).
 | min_flush_bytes | 64 KiB |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
+| max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
 | max_inflight_flushes (per shard, metrics pipeline only) | 1 (`--max-inflight-flushes`, rejects 0) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 
