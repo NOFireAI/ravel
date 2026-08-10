@@ -2085,16 +2085,6 @@ fn render_query_family(out: &mut String, mode: Mode, rows: &[QueryAccountingRow]
     }
 }
 
-/// Render every source this module knows about into one Prometheus text
-/// exposition document. `ingest` is empty in a mode that builds no ingest
-/// router (`Mode::Query`, `Mode::Maintain`): those families are omitted
-/// entirely rather than rendered with no samples, since the pipelines
-/// structurally do not exist in that mode. `store` and `catalog` are always
-/// present: the store and the catalog are built in every mode. `maintain` is
-/// `None` in every mode but [`Mode::Maintain`], the only mode that runs
-/// [`crate::maintain::spawn`]. `admission` is always present: the controller
-/// is built in every mode (ADR-0051), and renders no per-tenant samples in a
-/// mode that serves no ingest.
 /// One scrape's ADR-0071 distributed read fan-out counters (issue #865). Read
 /// at scrape time from [`crate::distrib::FragmentMetrics`]; `Some` only when the
 /// process serves queries with `--distributed-query` on. Carries no per-shard,
@@ -2231,6 +2221,16 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
 // them into one struct would only move the same list behind a name without
 // removing a caller's need to build every field, so the sources stay
 // positional and this lint is allowed here rather than worked around.
+/// Render every source this module knows about into one Prometheus text
+/// exposition document. `ingest` is empty in a mode that builds no ingest
+/// router (`Mode::Query`, `Mode::Maintain`): those families are omitted
+/// entirely rather than rendered with no samples, since the pipelines
+/// structurally do not exist in that mode. `store` and `catalog` are always
+/// present: the store and the catalog are built in every mode. `maintain` is
+/// `None` in every mode but [`Mode::Maintain`], the only mode that runs
+/// [`crate::maintain::spawn`]. `admission` is always present: the controller
+/// is built in every mode (ADR-0051), and renders no per-tenant samples in a
+/// mode that serves no ingest.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     mode: Mode,

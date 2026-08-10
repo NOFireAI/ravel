@@ -249,20 +249,29 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
     // its durability before releasing the response. A request rejected earlier
     // (auth, body parse, invalid parameters) never reached here and is not
     // audited. The recorded window is the request's resolved `[start, end]`.
-    let eval = state
-        .engine
-        .range_with_stats(
-            tenant_hash,
-            &body.query,
-            start_ms,
-            end_ms,
-            step_ms,
-            &min_tokens,
-            now_ns,
-            deadline,
-        )
-        .instrument(span.clone())
-        .await;
+    // Collect per-slice fragment observability (ADR-0071 stats.fragments[],
+    // issue #865) for the duration of the range evaluation. The sink is
+    // installed in task-local storage so every distributed slice the engine
+    // dispatches records into it; a non-distributed engine (or a query the cost
+    // gate declined to fan out) records nothing, and the field stays absent.
+    let fragment_sink = crate::distrib::FragmentStatsSink::new();
+    let eval = crate::distrib::with_fragment_stats(
+        fragment_sink.clone(),
+        state
+            .engine
+            .range_with_stats(
+                tenant_hash,
+                &body.query,
+                start_ms,
+                end_ms,
+                step_ms,
+                &min_tokens,
+                now_ns,
+                deadline,
+            )
+            .instrument(span.clone()),
+    )
+    .await;
     let status = if eval.is_ok() {
         QueryStatus::Ok
     } else {
@@ -291,7 +300,19 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
         &stats.accounting,
         &stats.estimate,
     );
-    let stats_json = crate::query::accounting_stats_json(&stats.accounting, &stats.estimate);
+    let mut stats_json = crate::query::accounting_stats_json(&stats.accounting, &stats.estimate);
+    // ADR-0071 (issue #865): a distributed run attaches a per-slice
+    // `fragments[]` beside `accounting`/`estimate`; a non-distributed run
+    // collected no entries, so the field is omitted rather than an empty array.
+    let fragments = fragment_sink.take();
+    if !fragments.is_empty()
+        && let Some(object) = stats_json.as_object_mut()
+    {
+        object.insert(
+            "fragments".to_string(),
+            crate::query::fragments_json(&fragments),
+        );
+    }
 
     let matrix = match value {
         Value::Matrix(matrix) => matrix,

@@ -156,6 +156,65 @@ fn build_router_with_sink(
     })
 }
 
+/// Like [`build_router`], but the query engine has an ADR-0071 distributed
+/// context attached with an always-open cost gate. The live worker set is
+/// empty, so every slice self-maps and runs locally through the
+/// `RoutingSliceFetcher` (no network), which still records a per-slice
+/// `stats.fragments[]` entry, exactly the surface finding 4 delivers.
+fn build_router_distributed(
+    store: Arc<dyn ObjectStoreBackend>,
+    tokens: HashMap<String, TenantId>,
+) -> Router {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_query::distrib::Distributed;
+    use ravel_query::distrib::partition::DistribThresholds;
+    use ravel_server::distrib::{
+        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let metrics = Arc::new(FragmentMetrics::new());
+    let clock: Arc<dyn Clock> = Arc::new(FixedClock);
+    let service = FragmentService::new(
+        "cluster-token".to_string(),
+        FragmentAdmission::new(8, metrics.clone()),
+        catalog.clone(),
+        Arc::clone(&store),
+        None,
+        clock.clone(),
+        metrics.clone(),
+    );
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        Arc::new(OnceLock::new()),
+        Arc::new(RwLock::new(Arc::new(Vec::new()))),
+        "cluster-token".to_string(),
+        service,
+        metrics,
+    ));
+    let distributed = Arc::new(Distributed::new(
+        fetcher,
+        DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: 8,
+        },
+    ));
+    let engine =
+        QueryEngine::new(catalog, store, EngineConfig::default()).with_distributed(distributed);
+    router(AnalyticsState {
+        engine: Arc::new(engine),
+        tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+        clock,
+        query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
+        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+    })
+}
+
 fn tokens(pairs: &[(&str, &str)]) -> HashMap<String, TenantId> {
     pairs
         .iter()
@@ -290,6 +349,74 @@ async fn change_point_detects_an_injected_step() {
     assert!(
         (ts_ns - boundary).abs() <= tolerance,
         "change located at {ts_ns} ns, expected near {boundary} ns"
+    );
+}
+
+/// ADR-0071 (finding 4): a distributed analytics run attaches a per-slice
+/// `stats.fragments[]` to the response with the delivered field shape, and a
+/// non-distributed run omits the field entirely.
+#[tokio::test]
+async fn analytics_stats_carries_fragments_only_when_distributed() {
+    let step_ns = 10 * NS_PER_SEC;
+    let values: Vec<f64> = (0..60).map(|i| 10.0 + (i % 5) as f64 * 0.01).collect();
+    let (samples, end_sec) = grid_samples(step_ns, &values);
+    let body = || {
+        analytics_body(
+            "frag_metric",
+            0.0,
+            end_sec,
+            "10s",
+            serde_json::json!({"type": "change_point"}),
+        )
+    };
+    let tenant = TenantId::new("acme".to_string());
+
+    // Distributed: fragments[] present, one entry per fanned-out slice with the
+    // delivered field shape (worker endpoint, segment count, reported bytes,
+    // outcome).
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish(
+        store.as_ref(),
+        &tenant,
+        0,
+        vec![one_series(&tenant, "frag_metric", &samples)],
+    )
+    .await;
+    let distributed =
+        build_router_distributed(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+    let (status, value) = post_json(&distributed, "acme-token", body()).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let fragments = value["stats"]["fragments"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a distributed run must carry a fragments array: {value}"));
+    assert!(
+        !fragments.is_empty(),
+        "at least one slice fanned out: {value}"
+    );
+    let first = &fragments[0];
+    assert!(first["workerEndpoint"].is_string(), "{first}");
+    assert!(first["segmentCount"].is_u64(), "{first}");
+    assert!(first["bytesReported"].is_u64(), "{first}");
+    assert_eq!(
+        first["status"], "ok",
+        "the self-mapped local slice ran to completion: {first}"
+    );
+
+    // Non-distributed: no fragments field at all.
+    let store2: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish(
+        store2.as_ref(),
+        &tenant,
+        0,
+        vec![one_series(&tenant, "frag_metric", &samples)],
+    )
+    .await;
+    let plain = build_router(Arc::clone(&store2), tokens(&[("acme-token", "acme")]));
+    let (status, value) = post_json(&plain, "acme-token", body()).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(
+        value["stats"]["fragments"].is_null(),
+        "a non-distributed run must omit fragments: {value}"
     );
 }
 

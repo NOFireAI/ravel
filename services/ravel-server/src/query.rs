@@ -55,6 +55,31 @@ pub fn accounting_stats_json(
     })
 }
 
+/// Render the per-slice `stats.fragments[]` array for a distributed query
+/// (ADR-0071 observability deliverable, issue #865): one object per dispatched
+/// slice, in camelCase to match the rest of the stats JSON. A query handler
+/// attaches this beside `accounting`/`estimate` only when a distributed run
+/// collected entries; a non-distributed query collects none, so the field is
+/// absent entirely. Each entry carries the slice's worker endpoint, its pinned
+/// segment count, the store bytes the worker reported, and the routing outcome
+/// (`ok` / `fallback` / `error`). No per-shard cardinality beyond the entries
+/// themselves: this is the response body, not the metric allowlist.
+pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_json::Value {
+    serde_json::Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "workerEndpoint": entry.worker_endpoint,
+                    "segmentCount": entry.segment_count,
+                    "bytesReported": entry.bytes_reported,
+                    "status": entry.status,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Builds the shared [`Catalog`] used both for query resolve and for the
 /// background fold task (docs/metric-index-plan.md section 4): one instance
 /// per process so its decoded HEAD/part caches serve both paths.
@@ -268,6 +293,43 @@ mod catalog_cache_tests {
             catalog.config().byte_cache_max_bytes,
             0,
             "the disabled catalog config carries the byte-cache disable sentinel"
+        );
+    }
+
+    /// ADR-0071 (finding 4): `fragments_json` renders one camelCase object per
+    /// slice with the deliverable's four fields, and an empty input renders an
+    /// empty array (the query handler then omits the field entirely).
+    #[test]
+    fn fragments_json_renders_camelcase_per_slice_shape() {
+        let entries = vec![
+            crate::distrib::FragmentStatEntry {
+                worker_endpoint: "10.0.0.1:7000".to_string(),
+                segment_count: 3,
+                bytes_reported: 4096,
+                status: "ok",
+            },
+            crate::distrib::FragmentStatEntry {
+                worker_endpoint: "192.0.2.1:9".to_string(),
+                segment_count: 1,
+                bytes_reported: 0,
+                status: "fallback",
+            },
+        ];
+        let json = fragments_json(&entries);
+        let array = json.as_array().expect("fragments is a JSON array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0]["workerEndpoint"], "10.0.0.1:7000");
+        assert_eq!(array[0]["segmentCount"], 3);
+        assert_eq!(array[0]["bytesReported"], 4096);
+        assert_eq!(array[0]["status"], "ok");
+        assert_eq!(array[1]["workerEndpoint"], "192.0.2.1:9");
+        assert_eq!(array[1]["status"], "fallback");
+        assert!(
+            fragments_json(&[])
+                .as_array()
+                .expect("empty renders an array")
+                .is_empty(),
+            "no entries render an empty array, which the handler omits"
         );
     }
 
