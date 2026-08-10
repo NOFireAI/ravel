@@ -39,6 +39,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
+use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
 use crate::error::WriteError;
@@ -57,6 +58,15 @@ pub(crate) enum ShardMsg {
         /// and therefore in the same flushed object.
         exemplars: Vec<IngestExemplar>,
         ack: Option<Ack>,
+        /// This request's global ingest-byte-budget charge (ADR-0069), cloned
+        /// into every shard message the request fanned out to. The shard holds
+        /// it in the tenant buffer and moves it into the flush task, whose
+        /// completion (or failure) drops it and refunds the bytes. Held as an
+        /// `Arc` so one request's single charge is refunded exactly once, when
+        /// the last shard buffer holding a clone has flushed. `None` only for a
+        /// test write that bypasses the budget (production always charges via
+        /// [`crate::IngestRouter`]).
+        charge: Option<Arc<IngestByteCharge>>,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
     FlushNow { done: oneshot::Sender<()> },
@@ -142,6 +152,14 @@ struct TenantBuf {
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
     waiters: Vec<Ack>,
+    /// Global ingest-byte-budget charges (ADR-0069) for every request whose
+    /// points or exemplars this buffer currently holds. Moved into the flush
+    /// task with the rest of the buffer at flush open, and dropped there when
+    /// the flush completes or fails -- that drop is the budget refund. An empty
+    /// (exemplar-only) buffer that never spawns a flush drops these directly in
+    /// `flush_tenant`, and a fail-loud rejection in `merge` never adds one, so
+    /// no path holds a charge past the bytes it covers.
+    charges: Vec<Arc<IngestByteCharge>>,
     /// Arrival timestamp of the last `merge` call into this buffer, and an
     /// EWMA (alpha = 1/4) of the gaps between successive arrivals. Feeds the
     /// adaptive age trigger's observed-arrival-rate signal (ADR-0067
@@ -397,6 +415,10 @@ struct PinnedFlush {
     series: HashMap<SeriesId, SeriesAccum>,
     exemplars: Vec<IngestExemplar>,
     waiters: Vec<Ack>,
+    /// The global ingest-byte-budget charges this flush's buffer held (ADR-0069).
+    /// Carried into the flush task purely so they are dropped -- and the bytes
+    /// refunded -- when the flush's terminal outcome is reached, no earlier.
+    charges: Vec<Arc<IngestByteCharge>>,
 }
 
 impl FlushCtx {
@@ -422,7 +444,12 @@ impl FlushCtx {
             series,
             exemplars,
             waiters,
+            charges,
         } = pinned;
+        // Held to this flush's terminal outcome (every early `return` below is
+        // still inside this scope), then dropped here: that drop is the
+        // ADR-0069 budget refund for exactly the bytes this buffer held.
+        let _charges = charges;
 
         let exemplar_inputs = self.admit_exemplars(exemplars, &series);
 
@@ -875,8 +902,8 @@ impl ShardActor {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(ShardMsg::Write { tenant, points, exemplars, ack }) => {
-                            self.handle_write(tenant, points, exemplars, ack).await;
+                        Some(ShardMsg::Write { tenant, points, exemplars, ack, charge }) => {
+                            self.handle_write(tenant, points, exemplars, ack, charge).await;
                         }
                         Some(ShardMsg::FlushNow { done }) => {
                             self.flush_all(FlushTrigger::Manual).await;
@@ -931,8 +958,11 @@ impl ShardActor {
         points: Vec<IngestPoint>,
         exemplars: Vec<IngestExemplar>,
         ack: Option<Ack>,
+        charge: Option<Arc<IngestByteCharge>>,
     ) {
         if points.is_empty() && exemplars.is_empty() && ack.is_none() {
+            // Nothing buffered: drop the charge now so its bytes are refunded
+            // rather than held for a message that touched no buffer.
             return;
         }
         let arrival_ns = self.clock.now_ns();
@@ -947,6 +977,10 @@ impl ShardActor {
         let mut bytes_added = match buf.merge(points, arrival_ns) {
             Ok(bytes_added) => bytes_added,
             Err(err) => {
+                // Fail-loud rejection: the buffer is untouched, so this
+                // request's bytes were never held. Returning drops `charge`,
+                // refunding them (ADR-0069) rather than pinning the budget to a
+                // batch that was rejected.
                 self.metrics.record_series_id_collision();
                 if let Some(ack) = ack {
                     self.ctx.ack_waiters(vec![ack], Err(err));
@@ -955,6 +989,12 @@ impl ShardActor {
             }
         };
         bytes_added += buf.absorb_exemplars(exemplars);
+        // The batch is now in the buffer: keep its charge alive with the buffer
+        // until it flushes (ADR-0069). It moves into the flush task in
+        // `flush_tenant` and is refunded when that flush's outcome is reached.
+        if let Some(charge) = charge {
+            buf.charges.push(charge);
+        }
         if let Some(ack) = ack {
             buf.waiters.push(ack);
         }
@@ -1088,12 +1128,16 @@ impl ShardActor {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
+            charges,
             ..
         } = buf;
         if series.is_empty() {
             // Nothing to write. Exemplars without any buffered sample cannot
             // be written at all (an exemplar points at a measurement), so they
-            // are dropped, and counted so the drop stays visible.
+            // are dropped, and counted so the drop stays visible. Dropping
+            // `charges` here refunds the budget for those exemplars (ADR-0069):
+            // no flush task will run to do it, since this buffer never spawns one.
+            drop(charges);
             if !exemplars.is_empty() {
                 self.metrics.record_exemplars(0, exemplars.len() as u64);
             }
@@ -1150,6 +1194,7 @@ impl ShardActor {
             series,
             exemplars,
             waiters,
+            charges,
         };
 
         // ADR-0067 decision 2: the only place a flush trigger blocks. At

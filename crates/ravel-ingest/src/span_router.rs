@@ -18,13 +18,14 @@ use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_types::CommitToken;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::router::WriteMode;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
-use crate::span_shard::{SpanShardActor, SpanShardMsg};
+use crate::span_shard::{SpanShardActor, SpanShardMsg, est_span_bytes};
 
 /// Routing v1 for spans (persistent contract, ADR-0041 decision 2): shard from
 /// the trace id's leading bytes, in exactly the style
@@ -92,6 +93,11 @@ pub struct SpanIngestRouter {
     clock: Arc<dyn Clock>,
     metrics: Arc<SpanIngestMetrics>,
     config: IngestConfig,
+    /// Process-wide ingest buffer byte budget (ADR-0069 decision 1), shared by
+    /// `Arc` with the metrics and log routers. Defaults to `Unlimited`;
+    /// `services/ravel-server` installs the configured budget via
+    /// [`SpanIngestRouter::with_budget`].
+    budget: Arc<IngestByteBudget>,
 }
 
 impl SpanIngestRouter {
@@ -147,7 +153,15 @@ impl SpanIngestRouter {
             clock,
             metrics,
             config,
+            budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
         }
+    }
+
+    /// Installs the shared process-wide ingest buffer byte budget (ADR-0069).
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
+        self.budget = budget;
+        self
     }
 
     pub fn metrics(&self) -> &SpanIngestMetrics {
@@ -212,6 +226,23 @@ impl SpanIngestRouter {
         if spans.is_empty() {
             return Ok(SpanWriteReceipt::default());
         }
+
+        // Global ingest byte budget (ADR-0069 decision 1): charge the estimated
+        // buffered bytes and shed at the ceiling before routing, so a shed
+        // request touches no shard and mints no commit token. The charge is
+        // cloned into every shard message below and refunded when the flush(es)
+        // holding these bytes complete or fail; any early return from here on
+        // drops the not-yet-handed-off clones, so nothing leaks.
+        let estimate: u64 = spans
+            .iter()
+            .map(|s| est_span_bytes(s) as u64)
+            .fold(0u64, u64::saturating_add);
+        let charge = Arc::new(
+            self.budget
+                .try_charge(estimate)
+                .map_err(|_| SpanWriteError::BufferBudgetExceeded)?,
+        );
+
         // Route against the tenant's current generation view, re-reading the
         // provisioning record when the cache is older than `C` and failing
         // closed if that read cannot complete (ADR-0052 section 3).
@@ -249,6 +280,7 @@ impl SpanIngestRouter {
                 tenant: tenant.clone(),
                 spans,
                 ack,
+                charge: Some(Arc::clone(&charge)),
             };
             if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver
