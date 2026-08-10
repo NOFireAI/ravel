@@ -371,6 +371,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
@@ -504,6 +505,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),

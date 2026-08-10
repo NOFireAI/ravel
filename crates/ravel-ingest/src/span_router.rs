@@ -212,6 +212,15 @@ impl SpanIngestRouter {
         self.config.shard_count
     }
 
+    /// Evict every cached generation view last touched before `now_ns - ttl_ns`
+    /// (ADR-0069 decision 2, idle-tenant state eviction). Returns the number of
+    /// views dropped. Mirrors [`crate::IngestRouter::evict_idle_generation_views`];
+    /// an evicted view is re-derived from the provisioning record on the
+    /// tenant's next span write.
+    pub fn evict_idle_generation_views(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        self.switch.evict_idle(now_ns, ttl_ns)
+    }
+
     /// Groups `spans` by [`shard_for_span`], sends one `SpanShardMsg::Write`
     /// per involved shard, and (in strict mode) awaits every involved shard's
     /// ack within `ack_deadline`. Sending blocks on a full channel: that

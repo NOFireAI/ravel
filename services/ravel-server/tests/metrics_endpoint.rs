@@ -52,6 +52,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
@@ -308,6 +309,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),

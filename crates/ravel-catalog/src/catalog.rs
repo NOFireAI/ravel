@@ -145,6 +145,17 @@ pub struct Catalog {
     /// the query and is never adopted here (adoption is an ingest/maintain/CLI
     /// action; a query-only node may hold write-restricted credentials).
     provisioning_checked: Mutex<HashSet<(TenantHash, Signal)>>,
+    /// Last-touch wall-clock (`now_ns`) per tenant, stamped at the start of
+    /// every [`Catalog::resolve_impl`] (ADR-0069 decision 2, issue #820). The
+    /// idle-tenant sweep loop reads it to decide which tenants' re-derivable
+    /// per-tenant cache entries to evict, and stamps nothing itself, so no
+    /// clock is read in this crate. A tenant absent from this map has never
+    /// resolved through this catalog, so it holds no per-tenant cache state to
+    /// evict; a present-but-idle tenant is evicted by
+    /// [`Catalog::evict_idle_tenants`]. `now_ns` is caller-supplied and may go
+    /// backwards across callers with skewed clocks, which only ever delays an
+    /// eviction, never causes a wrong one.
+    tenant_activity: Mutex<HashMap<TenantHash, i64>>,
 }
 
 impl Catalog {
@@ -185,6 +196,7 @@ impl Catalog {
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             enforce_provisioning: false,
             provisioning_checked: Mutex::new(HashSet::new()),
+            tenant_activity: Mutex::new(HashMap::new()),
         })
     }
 
@@ -517,6 +529,52 @@ impl Catalog {
         &self.part_cache
     }
 
+    /// Evict every per-tenant cache outer-map entry for tenants last touched
+    /// before `now_ns - ttl_ns` (ADR-0069 decision 2, idle-tenant state
+    /// eviction). Returns the number of tenants evicted.
+    ///
+    /// A tenant's last touch is stamped in [`Catalog::resolve_impl`] on the
+    /// injected `now_ns`; both `now_ns` and `ttl_ns` here are caller-supplied
+    /// (the server's idle-tenant sweep loop), so this reads no clock and is
+    /// deterministic under test. For each idle tenant every per-tenant cache
+    /// map is swept — the commit-record, compaction-record, decoded-HEAD,
+    /// decoded-part, and decoded-postings caches — dropping that tenant's whole
+    /// outer-map entry. Every one of those caches holds only immutable,
+    /// content-addressed or TTL-revalidated state, so an evicted entry is
+    /// re-derived on the tenant's next resolve by a re-read, never a wrong
+    /// result (the caches are "already reconstructible by definition",
+    /// ADR-0069). The byte cache is a process-wide LRU keyed by content hash,
+    /// not partitioned per tenant, so it is not swept here; its own capacity
+    /// bound reclaims it.
+    ///
+    /// Admission-controller state is not held by the catalog and is explicitly
+    /// out of scope for eviction (ADR-0069 decision 2); nothing here touches it.
+    pub fn evict_idle_tenants(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        // Collect the idle tenants under the activity lock, then drop the lock
+        // before touching the cache locks: never hold two cache-related locks
+        // at once, so this can never deadlock against a concurrent resolve.
+        let idle: Vec<TenantHash> = {
+            let mut activity = self.tenant_activity.lock();
+            let idle: Vec<TenantHash> = activity
+                .iter()
+                .filter(|&(_, &last)| now_ns.saturating_sub(last) > ttl_ns)
+                .map(|(tenant, _)| *tenant)
+                .collect();
+            for tenant in &idle {
+                activity.remove(tenant);
+            }
+            idle
+        };
+        for tenant in &idle {
+            self.cache.evict_tenant(tenant);
+            self.compaction_cache.evict_tenant(tenant);
+            self.head_cache.evict_tenant(tenant);
+            self.part_cache.evict_tenant(tenant);
+            self.postings_cache.evict_tenant(tenant);
+        }
+        idle.len()
+    }
+
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-postings
     /// cache (P5b).
     pub(crate) fn postings_cache(&self) -> &PostingsCache {
@@ -699,6 +757,13 @@ impl Catalog {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
     ) -> Result<Snapshot, CatalogError> {
+        // Idle-tenant eviction last-touch (ADR-0069 decision 2, issue #820):
+        // stamp this tenant's activity with the caller's injected `now_ns`
+        // before the fan-out. Every resolve entry point funnels through here,
+        // and the fan-out below is what populates the per-tenant caches the
+        // sweep evicts, so stamping first keeps a tenant's last-touch coherent
+        // with the cache entries it is about to fill.
+        self.tenant_activity.lock().insert(*tenant, now_ns);
         let span = tracing::debug_span!(
             "catalog_resolve",
             tenant_hash = %tenant.to_hex(),
@@ -2515,6 +2580,111 @@ mod tests {
         );
         assert_eq!(seg.shard, 0);
         assert_eq!(seg.content_hash.to_vec(), record.content_hash);
+    }
+
+    fn synthetic_head(tenant_hash: TenantHash) -> ravel_proto::catalog::v1::SnapshotHead {
+        ravel_proto::catalog::v1::SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_proto::commit::v1::Signal::Metrics as u32,
+            shard_count: 1,
+            watermark_hour: 1,
+            parts: vec![],
+            postings: None,
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            shard_generation_count: 1,
+        }
+    }
+
+    /// ADR-0069 decision 2 (issue #820): a tenant idle past the TTL has its
+    /// per-tenant catalog cache outer-map entry evicted, the evicted state is
+    /// re-derived on the next resolve, and an active tenant's cache entry
+    /// survives the same sweep. Deterministic via the injected `now_ns`.
+    #[tokio::test]
+    async fn idle_tenant_catalog_cache_evicted_and_rederived() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let idle = tenant();
+        let active = TenantHash([0x11; 16]);
+        let ttl_ns = 100 * NS_PER_HOUR;
+
+        // Publish and resolve a real segment for the idle tenant at t0: the
+        // resolve stamps its last-touch and its listing populates the decoded
+        // record cache.
+        let t0 = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        let record = publish_segment(&store, 0, 1, 500_000, t0, t0 - 1_000, t0).await;
+        let range = TimeRange {
+            start_ns: t0 - 1_000,
+            end_ns: t0,
+        };
+        let cold = catalog
+            .resolve(&idle, Signal::Metrics, range, &[], t0)
+            .await
+            .expect("cold resolve");
+        assert_eq!(cold.segments.len(), 1);
+
+        // Seed the decoded-HEAD cache directly for both tenants so each has an
+        // observable per-tenant outer-map entry to assert on.
+        let acc = QueryAccounting::new();
+        catalog.head_cache().insert(
+            idle,
+            Signal::Metrics,
+            Arc::new(synthetic_head(idle)),
+            1,
+            t0,
+            8,
+        );
+        catalog.head_cache().insert(
+            active,
+            Signal::Metrics,
+            Arc::new(synthetic_head(active)),
+            1,
+            t0,
+            8,
+        );
+
+        // The active tenant resolves again right before the sweep, so its
+        // last-touch is recent while the idle tenant's is still t0.
+        let sweep_ns = t0 + ttl_ns + 1;
+        catalog
+            .resolve(&active, Signal::Metrics, range, &[], sweep_ns)
+            .await
+            .expect("active resolve at sweep");
+
+        // Sweep: exactly the idle tenant is evicted.
+        let evicted = catalog.evict_idle_tenants(sweep_ns, ttl_ns);
+        assert_eq!(evicted, 1, "only the idle tenant is evicted");
+
+        // The active tenant's HEAD cache entry survives; the idle tenant's is
+        // gone (its whole outer-map entry was dropped).
+        assert!(
+            catalog
+                .head_cache()
+                .get(&active, Signal::Metrics, sweep_ns, i64::MAX, &acc)
+                .is_some(),
+            "the active tenant's cache entry survives the sweep"
+        );
+        assert!(
+            catalog
+                .head_cache()
+                .get(&idle, Signal::Metrics, sweep_ns, i64::MAX, &acc)
+                .is_none(),
+            "the idle tenant's cache entry is evicted"
+        );
+
+        // Re-derivation: a resolve for the evicted tenant rebuilds its cache
+        // from the store and returns the same segment, byte-identical.
+        let warm = catalog
+            .resolve(&idle, Signal::Metrics, range, &[], sweep_ns)
+            .await
+            .expect("re-resolve after eviction re-derives from the store");
+        assert_eq!(warm.segments.len(), 1);
+        assert_eq!(
+            warm.segments[0].data_object_key,
+            keys::reconstruct_data_key(&record).expect("key")
+        );
     }
 
     /// A bare `RewriteRecord` naming a `superseded_record_key`, for exercising

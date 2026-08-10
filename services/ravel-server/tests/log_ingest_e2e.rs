@@ -116,6 +116,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),

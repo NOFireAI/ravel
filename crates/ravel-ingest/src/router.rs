@@ -206,6 +206,15 @@ impl IngestRouter {
         self.config.shard_count
     }
 
+    /// Evict every cached generation view last touched before `now_ns - ttl_ns`
+    /// (ADR-0069 decision 2, idle-tenant state eviction). Returns the number of
+    /// views dropped. The server's idle-tenant sweep loop drives this; an
+    /// evicted view is re-derived from the provisioning record on the tenant's
+    /// next write ([`GenerationSwitch::evict_idle`]).
+    pub fn evict_idle_generation_views(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        self.switch.evict_idle(now_ns, ttl_ns)
+    }
+
     /// Groups `points` by `shard_for`, sends one `ShardMsg::Write` per
     /// involved shard, and (in strict mode) awaits every involved shard's
     /// ack within `ack_deadline`. Sending blocks on a full channel: that

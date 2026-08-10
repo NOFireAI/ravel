@@ -70,10 +70,19 @@ fn hour_of(now_ns: i64) -> u32 {
 /// A tenant's cached view of its provisioning record's generation history, plus
 /// when the router last refreshed it. `refreshed_at_ns` is what the staleness
 /// guard compares against `C`.
+///
+/// `last_touched_ns` is a separate stamp used only by idle-tenant eviction
+/// (ADR-0069 decision 2): it advances on every access (a cache-hit route as
+/// well as a refresh), whereas `refreshed_at_ns` advances only on a refresh.
+/// The two differ precisely for a tenant whose view stays fresh under `C` and
+/// is hit repeatedly without a re-read: it is not idle, but its
+/// `refreshed_at_ns` does not move. Eviction keys off last touch so such a
+/// tenant is never evicted mid-use.
 #[derive(Debug, Clone)]
 struct TenantView {
     generations: Vec<ShardGeneration>,
     refreshed_at_ns: i64,
+    last_touched_ns: i64,
 }
 
 /// The outcome of consulting the cache for a tenant's write ([`GenerationSwitch::route_cached`]).
@@ -185,15 +194,20 @@ impl<H> GenerationSwitch<H> {
     /// default view.
     pub fn route_cached(&self, tenant: TenantHash, now_ns: i64) -> Routed<H> {
         let mut inner = self.lock();
-        match inner.views.get(&tenant) {
+        // Stamp last-touch on a cache hit so idle-tenant eviction (ADR-0069
+        // decision 2) never reaps a view that is still routing writes, even one
+        // whose `refreshed_at_ns` has not moved since its last re-read. `get_mut`
+        // so the stamp is recorded; the borrow ends before `ensure_set`.
+        let count = match inner.views.get_mut(&tenant) {
             Some(view)
                 if now_ns.saturating_sub(view.refreshed_at_ns) <= self.refresh_interval_ns =>
             {
-                let count = active_shard_count(&view.generations, hour_of(now_ns));
-                Routed::Fresh(self.ensure_set(&mut inner, count))
+                view.last_touched_ns = now_ns;
+                active_shard_count(&view.generations, hour_of(now_ns))
             }
-            Some(_) | None => Routed::Stale,
-        }
+            Some(_) | None => return Routed::Stale,
+        };
+        Routed::Fresh(self.ensure_set(&mut inner, count))
     }
 
     /// Install a freshly-read generation history for a tenant, stamp the refresh
@@ -226,9 +240,38 @@ impl<H> GenerationSwitch<H> {
             TenantView {
                 generations,
                 refreshed_at_ns: now_ns,
+                last_touched_ns: now_ns,
             },
         );
         set
+    }
+
+    /// Evict every cached tenant view last touched before `now_ns - ttl_ns`
+    /// (ADR-0069 decision 2, idle-tenant state eviction). Returns the number of
+    /// views dropped.
+    ///
+    /// Only the per-tenant `views` map is swept: the `sets` map holds one
+    /// shard-actor set per distinct active `shard_count`, shared across every
+    /// tenant at that count and drained on its own (ADR-0052 section 2), so it
+    /// is topology, not per-tenant idle state, and is never touched here.
+    ///
+    /// Evicting a view is safe because it is re-derivable: the next
+    /// [`GenerationSwitch::route_cached`] for that tenant returns
+    /// [`Routed::Stale`] exactly as a first-touch tenant does, so the router
+    /// re-reads the provisioning record and refreshes before routing. The cost
+    /// is one provisioning-record read on the tenant's next write, bounded and
+    /// rare (ADR-0069 consequences).
+    ///
+    /// `ttl_ns` is the injected idle threshold and `now_ns` the injected clock
+    /// reading; this type never reads a clock (the caller's sweep loop supplies
+    /// both), so eviction is deterministic under test.
+    pub fn evict_idle(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        let mut inner = self.lock();
+        let before = inner.views.len();
+        inner
+            .views
+            .retain(|_, view| now_ns.saturating_sub(view.last_touched_ns) <= ttl_ns);
+        before - inner.views.len()
     }
 
     /// Every live shard-actor set, for the router's `flush_all`/`shutdown`
@@ -284,6 +327,7 @@ pub(crate) async fn load_generations(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -382,6 +426,81 @@ mod tests {
         // A refresh clears staleness.
         sw.refresh(t, vec![gen0(4)], t0 + c + 1);
         assert!(matches!(sw.route_cached(t, t0 + c + 1), Routed::Fresh(_)));
+    }
+
+    /// ADR-0069 decision 2 (issue #820): an idle tenant's generation view is
+    /// evicted once it has gone untouched past the TTL, its next access
+    /// re-derives it by re-reading the provisioning record and succeeds, and a
+    /// tenant still being written survives the same sweep.
+    ///
+    /// Deterministic via the injected `now_ns`: no clock is read anywhere on
+    /// this path. The re-read step drives the real [`load_generations`] free
+    /// function against a `MemoryStore` (a `NotFound` record resolves to the
+    /// implicit generation 0, a genuine successful re-read), then `refresh`
+    /// reinstalls the view exactly as the router's `active_set` does after a
+    /// `Routed::Stale`.
+    #[tokio::test]
+    async fn idle_tenant_state_evicted_and_rederived() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let ttl_ns = 100 * NS_PER_HOUR;
+        // A refresh interval `C` far larger than the whole test window, so a
+        // cached view never goes stale-by-`C`: this isolates the last-touch
+        // refinement (which advances on a cache-hit route, not only a refresh)
+        // as the sole thing keeping the active tenant alive across the sweep.
+        let big_c = 1_000_000 * NS_PER_HOUR;
+        let sw = index_switch(4, big_c);
+        let idle = tenant(1);
+        let active = tenant(2);
+
+        // Both tenants routed at t0: each gets a cached view.
+        let t0 = 1_000 * NS_PER_HOUR;
+        sw.refresh(idle, vec![gen0(4)], t0);
+        sw.refresh(active, vec![gen0(4)], t0);
+
+        // The active tenant keeps writing: a cache-hit route just before the
+        // sweep advances its last-touch even though its `refreshed_at_ns` (t0)
+        // does not move. This is the case last-touch tracking exists to protect.
+        let sweep_ns = t0 + ttl_ns + 1;
+        assert!(
+            matches!(sw.route_cached(active, sweep_ns), Routed::Fresh(_)),
+            "the active tenant routes from cache right before the sweep"
+        );
+
+        // Sweep: the idle tenant is past the TTL (last touched at t0), the
+        // active tenant was just touched, so exactly one view is evicted.
+        let evicted = sw.evict_idle(sweep_ns, ttl_ns);
+        assert_eq!(evicted, 1, "only the idle tenant's view is evicted");
+
+        // The active tenant's view survives: still routes from cache.
+        assert!(
+            matches!(sw.route_cached(active, sweep_ns), Routed::Fresh(_)),
+            "the active tenant's view survives the sweep"
+        );
+        // The idle tenant's view is gone: it now reports Stale exactly like a
+        // first-touch tenant, which is the trigger for the router to re-read.
+        assert!(
+            matches!(sw.route_cached(idle, sweep_ns), Routed::Stale),
+            "the evicted view forces a re-read on the next access"
+        );
+
+        // Re-derive: the router's stale path re-reads the provisioning record
+        // via `load_generations` and refreshes. The record is absent, which is
+        // a successful read resolving to the implicit generation 0.
+        let store = MemoryStore::new();
+        let generations = load_generations(&store, Signal::Metrics, &idle, sw.default_count())
+            .await
+            .expect("re-read of the provisioning record succeeds");
+        let set = sw.refresh(idle, generations, sweep_ns);
+        assert_eq!(
+            set.len(),
+            4,
+            "the re-derived view routes to the default set"
+        );
+        assert!(
+            matches!(sw.route_cached(idle, sweep_ns), Routed::Fresh(_)),
+            "after re-derivation the idle tenant routes from cache again"
+        );
     }
 
     /// `all_sets` exposes every live generation's set for the flush/shutdown

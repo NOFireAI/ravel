@@ -96,3 +96,31 @@ flowchart LR
   (one provisioning-record GET for generation views); bounded and rare.
 - The admission-state exclusion is an honest gap, documented, with a named
   follow-up rather than an unsafe eviction.
+
+## Implementation notes (idle-tenant eviction, issue #820)
+
+Decision 2 is implemented as one background sweep in `services/ravel-server`
+(`idle_tenant_state.rs`), spawned alongside the other worker loops with the
+same jittered-interval shutdown shape and driven by the injected `SystemClock`.
+The flag is `--idle-tenant-state-ttl` (default `1h`, `0` disables the sweep).
+Each owning crate exposes a deterministic, clock-free eviction entry point that
+the sweep drives with the injected `now_ns` and the TTL:
+
+- `ravel-ingest`: `GenerationSwitch::evict_idle` (via each router's
+  `evict_idle_generation_views`). Last touch advances on every cache-hit route
+  and every refresh; an evicted view re-reads the provisioning record on the
+  next write and succeeds. Only the per-tenant `views` map is swept — the
+  shared-by-count `sets` map is topology, not per-tenant idle state.
+- `ravel-catalog`: `Catalog::evict_idle_tenants`. Last touch is stamped per
+  tenant at the head of `resolve_impl`; a swept tenant loses its whole
+  outer-map entry in every per-tenant decoded cache and re-reads on the next
+  resolve. The process-wide content-hash-keyed byte cache is not partitioned
+  per tenant and is reclaimed by its own capacity bound instead.
+- `ravel-sql`: `SqlExecutor::evict_idle_accountants`, guarded on zero
+  outstanding reservations so an accountant backing a live query is never
+  evicted (that would stop the tenant ceiling being shared across its
+  concurrent queries). Last touch is stamped in the shared `resolve` funnel, so
+  both the HTTP and Flight SQL paths keep an active tenant out of the sweep.
+
+The admission-controller maps are not evictors and are never registered with
+the sweep, so decision 2's exclusion is structural, not merely a convention.

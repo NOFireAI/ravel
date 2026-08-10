@@ -14,6 +14,7 @@ pub mod flight_auth;
 pub mod fold;
 pub mod gc_config;
 pub mod health;
+pub mod idle_tenant_state;
 pub mod ingest;
 pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
@@ -296,6 +297,17 @@ pub struct ServerConfig {
     /// bounds the sum of buffered ingest bytes across every signal. Like
     /// `ingest_concurrency_limit`, a per-process local bound, never reconciled.
     pub ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit,
+    /// How long re-derivable per-tenant state may sit idle before the
+    /// background sweep evicts it (ADR-0069 decision 2, issue #820), from
+    /// `--idle-tenant-state-ttl` (default 1h; `Duration::ZERO` disables the
+    /// sweep). [`start`] spawns one sweep task per process that evicts idle
+    /// generation views (ingest-serving modes), catalog per-tenant caches
+    /// (every mode builds a catalog), and SQL memory accountants with zero
+    /// outstanding reservations (query-serving modes). Admission-controller
+    /// state is explicitly excluded: its caps are correctness-bearing
+    /// (ADR-0069 decision 2). Every evicted entry is re-derived on the tenant's
+    /// next access.
+    pub idle_tenant_state_ttl: Duration,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -324,6 +336,7 @@ pub struct Running {
     query_admission_reconcile_task: query_admission_reconcile::QueryAdmissionReconcileTask,
     scrub_task: scrub::ScrubTask,
     lifecycle_refresh_task: lifecycle_refresh::LifecycleRefreshTask,
+    idle_tenant_state_task: idle_tenant_state::IdleTenantStateTask,
 }
 
 impl Running {
@@ -392,6 +405,7 @@ impl Running {
         self.query_admission_reconcile_task.shutdown().await;
         self.scrub_task.shutdown().await;
         self.lifecycle_refresh_task.shutdown().await;
+        self.idle_tenant_state_task.shutdown().await;
 
         Ok(())
     }
@@ -792,6 +806,18 @@ pub async fn start(
     #[cfg(feature = "flight-sql")]
     let mut sql_state: Option<sql::SqlState> = None;
 
+    // The catalog handle the idle-tenant sweep evicts per-tenant caches from
+    // (ADR-0069 decision 2). Cloned here because `catalog` is moved into
+    // `fold::spawn` below in every non-maintain mode; the sweep is spawned
+    // afterwards and needs its own `Arc`.
+    let sweep_catalog = catalog.clone();
+    // The SQL executor the idle-tenant sweep evicts idle memory accountants
+    // from. Assigned inside the query block below (the one place the executor
+    // is built) and read at the sweep spawn site; `None` in a mode that builds
+    // no SQL surface.
+    #[cfg(feature = "sql")]
+    let mut sweep_sql_executor: Option<Arc<ravel_sql::SqlExecutor>> = None;
+
     // The alert evaluator runs in exactly the modes that build a query engine:
     // a rule is a query, and a gateway-only or maintain-only process has
     // nothing to evaluate it with. Filled in below so it can borrow the same
@@ -847,6 +873,10 @@ pub async fn start(
                 query_admission.clone(),
             )?;
             alert_sql_executor = Some(state.executor.clone());
+            // The same executor the idle-tenant sweep evicts idle accountants
+            // from (ADR-0069 decision 2): built once here, shared, never a
+            // second instance with its own per-tenant accounting.
+            sweep_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));
             // The mTLS listener's SQL route shares the same executor (built
             // once above) rather than calling `build_sql_state` a second
@@ -1273,6 +1303,34 @@ pub async fn start(
         lifecycle_refresh::spawn(durable_auth.clone(), store.clone(), limits, interval)
     };
 
+    // Idle-tenant state eviction sweep (ADR-0069 decision 2, issue #820): one
+    // task per process that evicts re-derivable per-tenant state idle past
+    // `--idle-tenant-state-ttl`. The evictor set is built from whatever
+    // re-derivable state this mode actually holds: the three generation-view
+    // routers (ingest-serving modes only, `Some` together), the catalog's
+    // per-tenant caches (built in every mode), and the SQL memory accountants
+    // (query-serving modes with the `sql` feature). Admission-controller state
+    // is deliberately absent from this list: its caps are correctness-bearing
+    // (ADR-0069 decision 2). A zero TTL or an empty list spawns no task.
+    let idle_tenant_state_task = {
+        let mut evictors: Vec<Arc<dyn idle_tenant_state::IdleTenantEvictor>> = Vec::new();
+        if let Some(router) = &ingest_router {
+            evictors.push(router.clone());
+        }
+        if let Some(router) = &log_ingest_router {
+            evictors.push(router.clone());
+        }
+        if let Some(router) = &span_ingest_router {
+            evictors.push(router.clone());
+        }
+        evictors.push(sweep_catalog);
+        #[cfg(feature = "sql")]
+        if let Some(executor) = sweep_sql_executor {
+            evictors.push(executor);
+        }
+        idle_tenant_state::spawn(evictors, config.idle_tenant_state_ttl)
+    };
+
     Ok(Running {
         http_addr,
         grpc_addr,
@@ -1295,5 +1353,6 @@ pub async fn start(
         query_admission_reconcile_task,
         scrub_task,
         lifecycle_refresh_task,
+        idle_tenant_state_task,
     })
 }
