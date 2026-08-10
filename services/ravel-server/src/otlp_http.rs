@@ -139,7 +139,8 @@ fn ingest_buffer_budget_shed_response() -> Response {
         "ingest buffer byte budget reached",
     )
         .into_response();
-    if let Ok(value) = HeaderValue::from_str(&INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS.to_string()) {
+    if let Ok(value) = HeaderValue::from_str(&INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS.to_string())
+    {
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response

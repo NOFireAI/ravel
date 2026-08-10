@@ -67,14 +67,14 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub use alerting::AlertEvalConfig;
-/// Re-exported so callers building a [`ServerConfig`] can name the ingest
-/// buffer byte budget ceiling (ADR-0069) without depending on `ravel-ingest`
-/// directly, the same way [`ingest_concurrency`] surfaces its limit type.
-pub use ravel_ingest::IngestByteBudgetLimit;
 pub use config::limits::{LimitsConfig, QueryLimits};
 pub use config::{Cli, Mode, StoreKind};
 pub use fold::FoldTaskConfig;
 pub use maintain::MaintenanceTaskConfig;
+/// Re-exported so callers building a [`ServerConfig`] can name the ingest
+/// buffer byte budget ceiling (ADR-0069) without depending on `ravel-ingest`
+/// directly, the same way [`ingest_concurrency`] surfaces its limit type.
+pub use ravel_ingest::IngestByteBudgetLimit;
 
 const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -475,7 +475,8 @@ pub async fn start(
     // single `--max-ingest-buffer-bytes` ceiling bounds the sum of buffered
     // ingest bytes across every signal. Built unconditionally (cheap, and the
     // `/metrics` exporter reads its gauge and shed counter regardless of mode).
-    let ingest_buffer_budget = ravel_ingest::IngestByteBudget::shared(config.ingest_buffer_budget_limit);
+    let ingest_buffer_budget =
+        ravel_ingest::IngestByteBudget::shared(config.ingest_buffer_budget_limit);
 
     let ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
         Some(Arc::new(

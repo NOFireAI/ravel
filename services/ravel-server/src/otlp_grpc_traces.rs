@@ -84,9 +84,9 @@ impl TraceService for GrpcTraceService {
             }
             // Buffer-budget shed (ADR-0069): RESOURCE_EXHAUSTED, not the
             // UNAVAILABLE the other retryable write failures take.
-            err @ SpanIngestRequestError::Write(ravel_ingest::SpanWriteError::BufferBudgetExceeded) => {
-                Status::resource_exhausted(err.to_string())
-            }
+            err @ SpanIngestRequestError::Write(
+                ravel_ingest::SpanWriteError::BufferBudgetExceeded,
+            ) => Status::resource_exhausted(err.to_string()),
             err if err.is_retryable() => Status::unavailable(err.to_string()),
             err => Status::internal(err.to_string()),
         })?;

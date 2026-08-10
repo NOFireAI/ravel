@@ -819,7 +819,9 @@ impl Cli {
     /// #819), mapping `0` to `Unlimited` like `--max-inflight-ingest-requests`
     /// above. Always `Ok`: `0` is a deliberate, documented "no ceiling", not a
     /// footgun worth rejecting.
-    pub fn parse_ingest_buffer_budget(&self) -> anyhow::Result<ravel_ingest::IngestByteBudgetLimit> {
+    pub fn parse_ingest_buffer_budget(
+        &self,
+    ) -> anyhow::Result<ravel_ingest::IngestByteBudgetLimit> {
         Ok(match self.max_ingest_buffer_bytes {
             0 => ravel_ingest::IngestByteBudgetLimit::Unlimited,
             n => ravel_ingest::IngestByteBudgetLimit::Bounded(n),

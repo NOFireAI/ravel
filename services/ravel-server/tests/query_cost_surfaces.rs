@@ -191,7 +191,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         )),
         metrics_tenant_labels: false,
         query_accounting: Arc::clone(&query_accounting),
-        ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
+        ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        ),
         ingest_concurrency: ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
             ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
         ),
@@ -578,7 +580,9 @@ mod flight {
             )),
             metrics_tenant_labels: false,
             query_accounting: Arc::clone(&query_accounting),
-            ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
+            ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+                ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            ),
             ingest_concurrency:
                 ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
                     ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
