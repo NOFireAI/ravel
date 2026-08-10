@@ -493,6 +493,68 @@ pub struct Cli {
     /// never blocking a query (ADR-0060 decisions 3 and 6).
     #[arg(long = "otlp-trace-endpoint", value_name = "URL")]
     pub otlp_trace_endpoint: Option<String>,
+
+    /// Opt this process into ADR-0071 distributed read fan-out (issue #865).
+    /// Off by default: a process with this unset resolves and fetches every
+    /// query on the byte-identical local path, exactly as before this flag
+    /// existed, and never registers the cluster-internal fragment gRPC surface.
+    /// When set, a query-serving process (`all`, `query`) both registers the
+    /// `SeriesFetch` fragment service on its cluster-internal gRPC listener AND
+    /// runs as a coordinator that may fan a large query's snapshot out to live
+    /// query workers. Requires `--fragment-auth-token-file`: the fragment
+    /// surface is only ever exposed behind a shared cluster-internal bearer
+    /// token, so `--distributed-query` without a token file fails startup rather
+    /// than exposing an unauthenticated fetch surface.
+    #[arg(long = "distributed-query")]
+    pub distributed_query: bool,
+
+    /// Path to the shared cluster-internal bearer token that guards the ADR-0071
+    /// fragment `SeriesFetch` surface (issue #865). A file, never an inline
+    /// value or env var, so the secret never appears in a process listing
+    /// (mirrors `--tenant-hash-key-file`). Every worker and coordinator in one
+    /// cluster reads the same file: a coordinator presents this exact token on
+    /// each slice dispatch, and a worker refuses any fragment request whose
+    /// bearer token is missing or unequal. The fragment surface is bound only on
+    /// the cluster-internal gRPC listener, never on the external client HTTP or
+    /// mTLS listeners. Meaningful only with `--distributed-query`.
+    #[arg(long = "fragment-auth-token-file", value_name = "PATH")]
+    pub fragment_auth_token_file: Option<PathBuf>,
+
+    /// The distinct internal-workload admission cap for inbound fragment
+    /// (`SeriesFetch`) requests (ADR-0071, issue #865): the maximum number of
+    /// slice fetches this process serves concurrently for remote coordinators.
+    /// This is a separate class from `--max-concurrent-queries`, which gates
+    /// client queries: a coordinator holding a client-query permit while it
+    /// waits on its own dispatched fragments can never deadlock behind client
+    /// queries queued on the client cap, because fragments admit against this
+    /// independent bound. Over the cap a fragment request queues (it is not
+    /// rejected). Default 32.
+    #[arg(long = "max-inflight-fragments", default_value_t = 32)]
+    pub max_inflight_fragments: u64,
+
+    /// The estimated-store-bytes axis of the ADR-0071 cost gate (issue #865): a
+    /// query whose pre-fetch cost estimate reaches this many bytes is worth
+    /// distributing; a cheaper query on both axes runs fully locally. Feeds
+    /// `DistribThresholds::min_store_bytes`. Meaningful only with
+    /// `--distributed-query`. Default 256 MiB (ADR-0071's initial gate,
+    /// `ravel_query::distrib::DISTRIBUTE_MIN_STORE_BYTES`).
+    #[arg(long = "distribute-bytes-threshold", default_value_t = ravel_query::distrib::DISTRIBUTE_MIN_STORE_BYTES)]
+    pub distribute_bytes_threshold: u64,
+
+    /// The segment-count axis of the ADR-0071 cost gate (issue #865): either
+    /// axis alone trips the gate. Feeds `DistribThresholds::min_segments`.
+    /// Meaningful only with `--distributed-query`. Default 64 (ADR-0071's
+    /// initial gate, `ravel_query::distrib::DISTRIBUTE_MIN_SEGMENTS`).
+    #[arg(long = "distribute-segments-threshold", default_value_t = ravel_query::distrib::DISTRIBUTE_MIN_SEGMENTS)]
+    pub distribute_segments_threshold: u64,
+
+    /// The ceiling on concurrently dispatched slices per distributed query
+    /// (ADR-0071, issue #865): bounds fan-out width so a wide snapshot does not
+    /// spawn an unbounded number of remote fetches. Feeds
+    /// `DistribThresholds::max_parallel_slices`; clamped to at least 1. Default
+    /// 8 (`ravel_query::distrib::partition::DEFAULT_MAX_PARALLEL_SLICES`).
+    #[arg(long = "max-parallel-slices", default_value_t = 8)]
+    pub max_parallel_slices: usize,
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
@@ -520,6 +582,22 @@ pub struct AuthResolverSettings {
     pub oidc: Option<OidcSettings>,
     /// The trusted client-cert header, `Some` only when `--mtls-enabled`.
     pub mtls_header: Option<String>,
+}
+
+/// The resolved ADR-0071 distributed read fan-out settings (issue #865),
+/// `Some` only when `--distributed-query` is set. Carries the shared
+/// cluster-internal bearer token (read from `--fragment-auth-token-file`), the
+/// fragment admission cap, and the cost gate/fan-out thresholds.
+#[derive(Debug, Clone)]
+pub struct DistribSettings {
+    /// The shared cluster-internal bearer token guarding the fragment surface,
+    /// read and trimmed from `--fragment-auth-token-file`.
+    pub auth_token: String,
+    /// The fragment (`SeriesFetch`) admission cap, a distinct workload class
+    /// from client-query admission (`--max-inflight-fragments`, clamped `>= 1`).
+    pub max_inflight_fragments: usize,
+    /// The cost gate and fan-out width (`DistribThresholds`).
+    pub thresholds: ravel_query::distrib::partition::DistribThresholds,
 }
 
 impl Cli {
@@ -829,6 +907,44 @@ impl Cli {
         })
     }
 
+    /// Resolve the ADR-0071 distributed read fan-out settings (issue #865).
+    /// `Ok(None)` when `--distributed-query` is off (the local-only default).
+    /// When on, reads and trims the `--fragment-auth-token-file` bearer token
+    /// (failing on an unreadable or empty file), and packages the admission cap
+    /// and cost-gate thresholds. The token file, not an inline value, keeps the
+    /// secret out of the process listing (mirrors `--tenant-hash-key-file`).
+    pub fn parse_distrib_settings(&self) -> anyhow::Result<Option<DistribSettings>> {
+        if !self.distributed_query {
+            return Ok(None);
+        }
+        let path = self.fragment_auth_token_file.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--distributed-query requires --fragment-auth-token-file")
+        })?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read --fragment-auth-token-file {}: {e}",
+                path.display()
+            )
+        })?;
+        let auth_token = raw.trim().to_string();
+        if auth_token.is_empty() {
+            anyhow::bail!(
+                "--fragment-auth-token-file {} is empty; the fragment bearer token must be \
+                 non-empty",
+                path.display()
+            );
+        }
+        Ok(Some(DistribSettings {
+            auth_token,
+            max_inflight_fragments: self.max_inflight_fragments.max(1) as usize,
+            thresholds: ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: self.distribute_bytes_threshold,
+                min_segments: self.distribute_segments_threshold,
+                max_parallel_slices: self.max_parallel_slices.max(1),
+            },
+        }))
+    }
+
     /// Parse `--max-ingest-buffer-bytes` into a
     /// [`ravel_ingest::IngestByteBudgetLimit`] (ADR-0069 decision 1, issue
     /// #819), mapping `0` to `Unlimited` like `--max-inflight-ingest-requests`
@@ -937,6 +1053,36 @@ impl Cli {
                  its own dedicated listener (ADR-0050 section 1), never on the public HTTP or \
                  gRPC/Flight listeners."
             );
+        }
+
+        // ADR-0071 fragment surface pairing (issue #865): the cluster-internal
+        // SeriesFetch surface is only ever exposed behind a shared bearer
+        // token, and the token file is only read when the surface is enabled.
+        // Reject either half of the pair on its own so a misconfiguration fails
+        // startup rather than exposing an unauthenticated fetch surface or
+        // leaving a configured secret inert.
+        if self.distributed_query && self.fragment_auth_token_file.is_none() {
+            anyhow::bail!(
+                "--distributed-query requires --fragment-auth-token-file: the ADR-0071 fragment \
+                 SeriesFetch surface is only exposed behind a shared cluster-internal bearer \
+                 token. Provide the token file, or drop --distributed-query."
+            );
+        }
+        if self.fragment_auth_token_file.is_some() && !self.distributed_query {
+            anyhow::bail!(
+                "--fragment-auth-token-file was set but --distributed-query was not: the fragment \
+                 surface is only registered under --distributed-query, so the token file would be \
+                 inert. Set --distributed-query, or drop --fragment-auth-token-file."
+            );
+        }
+        if self.distributed_query {
+            // Reading it here (not only in `parse_distrib_settings`) fails
+            // startup on an unreadable or empty token file at the same point
+            // every other credential file is validated.
+            self.parse_distrib_settings()?;
+        }
+        if self.max_parallel_slices == 0 {
+            anyhow::bail!("--max-parallel-slices must be at least 1");
         }
 
         // The disk tier has no attachment point in the fetcher funnels this

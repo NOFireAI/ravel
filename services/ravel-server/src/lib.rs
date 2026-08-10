@@ -7,6 +7,7 @@ pub mod alerting;
 pub mod analytics;
 pub mod cache_warm;
 pub mod config;
+pub mod distrib;
 pub mod exemplars;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
@@ -308,6 +309,17 @@ pub struct ServerConfig {
     /// (ADR-0069 decision 2). Every evicted entry is re-derived on the tenant's
     /// next access.
     pub idle_tenant_state_ttl: Duration,
+    /// The resolved ADR-0071 distributed read fan-out settings (issue #865),
+    /// `Some` only under `--distributed-query` (which requires
+    /// `--fragment-auth-token-file`). In a query-serving mode
+    /// ([`Mode::All`]/[`Mode::Query`]) [`start`] then registers the
+    /// cluster-internal, token-guarded fragment `SeriesFetch` service on the
+    /// gRPC listener (never the public HTTP or mTLS listeners), spawns the
+    /// query-worker heartbeat under `sys/query/workers/`, and wires a
+    /// coordinator [`ravel_query::distrib::Distributed`] context into the query
+    /// engine. `None` (the default) leaves every query on the byte-identical
+    /// local path and never binds the fragment surface.
+    pub distrib: Option<crate::config::DistribSettings>,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -774,6 +786,61 @@ pub async fn start(
     let scrub_metrics =
         matches!(config.mode, Mode::Maintain).then(|| Arc::new(scrub::ScrubMetrics::default()));
 
+    // --- ADR-0071 distributed read fan-out scaffolding (issue #865) ---
+    // The coordinator (a `RoutingSliceFetcher` wrapped in a `Distributed`), the
+    // worker-side `FragmentService`, and their shared `FragmentMetrics` are
+    // built here, before the `/metrics` state and the query engine, because the
+    // metrics renderer needs the metrics handle, `build_app_state` needs the
+    // `Distributed` to wire the engine's distributed seam, and the gRPC listener
+    // (which binds the real fragment endpoint late) needs the `FragmentService`
+    // to mount and the worker-identity cell to fill once that endpoint is known.
+    // All `None`/empty unless the process serves queries (Mode::All/Query) and
+    // `--distributed-query` is set (`config.distrib` is `Some`). Until the first
+    // heartbeat fills `distrib_live_workers`, the router sees an empty live set
+    // and runs every slice locally, which is always correct.
+    let distrib_metrics: Option<Arc<distrib::FragmentMetrics>>;
+    let fragment_service: Option<distrib::FragmentService>;
+    let distributed: Option<Arc<ravel_query::distrib::Distributed>>;
+    let distrib_self_id: Arc<std::sync::OnceLock<uuid::Uuid>> =
+        Arc::new(std::sync::OnceLock::new());
+    let distrib_live_workers: Arc<
+        parking_lot::RwLock<Arc<Vec<ravel_fleet::query_workers::QueryWorkerRecord>>>,
+    > = Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new())));
+    if let (Some(settings), true) = (
+        config.distrib.as_ref(),
+        matches!(config.mode, Mode::All | Mode::Query),
+    ) {
+        let metrics = Arc::new(distrib::FragmentMetrics::new());
+        let admission =
+            distrib::FragmentAdmission::new(settings.max_inflight_fragments, metrics.clone());
+        let service = distrib::FragmentService::new(
+            settings.auth_token.clone(),
+            admission,
+            catalog.clone(),
+            store.clone(),
+            cache.clone(),
+            Arc::new(SystemClock),
+            metrics.clone(),
+        );
+        let fetcher = Arc::new(distrib::RoutingSliceFetcher::new(
+            distrib_self_id.clone(),
+            distrib_live_workers.clone(),
+            settings.auth_token.clone(),
+            service.clone(),
+            metrics.clone(),
+        ));
+        distributed = Some(Arc::new(ravel_query::distrib::Distributed::new(
+            fetcher,
+            settings.thresholds,
+        )));
+        fragment_service = Some(service);
+        distrib_metrics = Some(metrics);
+    } else {
+        distrib_metrics = None;
+        fragment_service = None;
+        distributed = None;
+    }
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
@@ -795,6 +862,7 @@ pub async fn start(
         query_accounting: query_accounting.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_buffer_budget: ingest_buffer_budget.clone(),
+        distrib: distrib_metrics.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 
@@ -850,6 +918,7 @@ pub async fn start(
             engine_config,
             query_accounting.clone(),
             query_admission.clone(),
+            distributed.clone(),
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
@@ -1116,10 +1185,16 @@ pub async fn start(
             .as_ref()
             .map(|state| flight::service(state, ceiling))
     };
+    // The ADR-0071 fragment `SeriesFetch` service (issue #865) is a
+    // cluster-internal query surface: it binds this listener too, so a
+    // query-only process with `--distributed-query` on (but no OTLP ingest and
+    // no Flight SQL) still stands the listener up to serve fragment fetches. It
+    // is only ever added here, never to the mTLS client listener below.
     #[cfg(feature = "flight-sql")]
-    let serve_grpc = metrics_service.is_some() || flight_service.is_some();
+    let serve_grpc =
+        metrics_service.is_some() || flight_service.is_some() || fragment_service.is_some();
     #[cfg(not(feature = "flight-sql"))]
-    let serve_grpc = metrics_service.is_some();
+    let serve_grpc = metrics_service.is_some() || fragment_service.is_some();
 
     let (grpc_addr, grpc_shutdown, grpc_task) = if serve_grpc {
         // Issue #803: every ingest service on this listener charges layer-2
@@ -1139,6 +1214,10 @@ pub async fn start(
         let grpc = grpc.add_optional_service(flight_service);
         #[cfg(feature = "otap")]
         let grpc = grpc.add_optional_service(arrow_metrics_service);
+        // ADR-0071 fragment service (issue #865), token-guarded inside the
+        // handler. Present only when `--distributed-query` is on; absent
+        // entirely otherwise, so the service cannot be reached without the flag.
+        let grpc = grpc.add_optional_service(fragment_service.as_ref().map(|s| s.into_server()));
         let (tx, rx) = oneshot::channel::<()>();
         // Bound here rather than inside `serve_with_shutdown` so the reported
         // address is the one actually bound; with port 0 the configured value
@@ -1158,6 +1237,34 @@ pub async fn start(
         (Some(addr), Some(tx), Some(task))
     } else {
         (None, None, None)
+    };
+
+    // ADR-0071 query-worker heartbeat (issue #865). The fragment endpoint other
+    // coordinators dial is the address the gRPC listener actually bound, known
+    // only now, so the `QueryWorkers` identity is built here rather than with
+    // the coordinator scaffolding above. Its generated UUID is published into
+    // the shared `distrib_self_id` cell so the router recognizes self-mapped
+    // slices (before this, the cell is empty and every slice runs locally). The
+    // heartbeat loop then writes `sys/query/workers/<uuid>` and refreshes the
+    // live set on its cadence. Spawned detached: it runs for the process's life
+    // and needs no join at shutdown (a stale record ages out on its own).
+    let _query_worker_heartbeat: Option<JoinHandle<()>> = match (distributed.as_ref(), grpc_addr) {
+        (Some(_), Some(addr)) => {
+            let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
+                addr.to_string(),
+                ravel_query::distrib::codec::PROTOCOL_VERSION,
+            ));
+            // Ignore a set() race: `start` sets this exactly once, so the
+            // first (only) write wins and any later call is a no-op.
+            let _ = distrib_self_id.set(workers.process_id());
+            Some(distrib::spawn_heartbeat(
+                workers,
+                store.clone(),
+                Arc::new(SystemClock),
+                distrib_live_workers.clone(),
+            ))
+        }
+        _ => None,
     };
 
     // The dedicated mTLS listener (ADR-0050 section 1): bound only when

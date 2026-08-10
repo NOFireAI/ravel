@@ -2095,6 +2095,138 @@ fn render_query_family(out: &mut String, mode: Mode, rows: &[QueryAccountingRow]
 /// [`crate::maintain::spawn`]. `admission` is always present: the controller
 /// is built in every mode (ADR-0051), and renders no per-tenant samples in a
 /// mode that serves no ingest.
+/// One scrape's ADR-0071 distributed read fan-out counters (issue #865). Read
+/// at scrape time from [`crate::distrib::FragmentMetrics`]; `Some` only when the
+/// process serves queries with `--distributed-query` on. Carries no per-shard,
+/// per-worker, or per-tenant field: the `ravel_distrib_*` family renders under
+/// the closed `{mode}` label alone (ADR-0044 section 4).
+#[derive(Debug, Clone)]
+pub struct DistribSnapshot {
+    pub fragment_requests_total: u64,
+    pub fragment_auth_failures_total: u64,
+    pub fragment_inflight: u64,
+    pub slices_local_total: u64,
+    pub slices_remote_total: u64,
+    pub slices_fallback_total: u64,
+    pub slice_fetch_micros_buckets: [u64; LATENCY_BUCKET_COUNT],
+    pub slice_fetch_nanos_total: u64,
+}
+
+/// The ADR-0071 distributed read fan-out family (issue #865). Follows the store
+/// and maintenance families exactly: every series carries only `{mode}`, and the
+/// three slice-routing outcomes are distinct metric names rather than one metric
+/// with a `route` label, so no label outside the closed [`Label`] allowlist is
+/// introduced. The slice-fetch histogram reuses the store-latency bucket layout
+/// (`LATENCY_BUCKET_BOUNDS_MICROS`).
+fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapshot) {
+    write_header(
+        out,
+        "ravel_distrib_fragment_requests_total",
+        "Inbound fragment SeriesFetch requests served after token auth and admission.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_fragment_requests_total",
+        &[Label::Mode(mode)],
+        snapshot.fragment_requests_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_fragment_auth_failures_total",
+        "Inbound fragment requests refused for a missing or invalid bearer token.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_fragment_auth_failures_total",
+        &[Label::Mode(mode)],
+        snapshot.fragment_auth_failures_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_fragment_inflight",
+        "Fragment requests currently holding an admission permit.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_fragment_inflight",
+        &[Label::Mode(mode)],
+        snapshot.fragment_inflight,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_slices_local_total",
+        "Query slices this coordinator executed locally with no network hop.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_slices_local_total",
+        &[Label::Mode(mode)],
+        snapshot.slices_local_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_slices_remote_total",
+        "Query slices this coordinator dispatched to a remote worker successfully.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_slices_remote_total",
+        &[Label::Mode(mode)],
+        snapshot.slices_remote_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_slices_fallback_total",
+        "Query slices whose remote dispatch failed at transport and fell back to local.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_slices_fallback_total",
+        &[Label::Mode(mode)],
+        snapshot.slices_fallback_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_slice_fetch_seconds",
+        "Per-slice fetch latency, local and remote alike.",
+        "histogram",
+    );
+    let cumulative = cumulative_buckets(&snapshot.slice_fetch_micros_buckets);
+    for (i, count) in cumulative.iter().enumerate() {
+        write_histogram_bucket(
+            out,
+            "ravel_distrib_slice_fetch_seconds_bucket",
+            &[Label::Mode(mode)],
+            &bucket_le(i),
+            *count,
+        );
+    }
+    write_sample_f64(
+        out,
+        "ravel_distrib_slice_fetch_seconds_sum",
+        &[Label::Mode(mode)],
+        snapshot.slice_fetch_nanos_total as f64 / 1_000_000_000.0,
+    );
+    write_sample(
+        out,
+        "ravel_distrib_slice_fetch_seconds_count",
+        &[Label::Mode(mode)],
+        cumulative[LATENCY_BUCKET_COUNT - 1],
+    );
+}
+
 // One argument per metric source, each a distinct snapshot type: bundling
 // them into one struct would only move the same list behind a name without
 // removing a caller's need to build every field, so the sources stay
@@ -2114,6 +2246,7 @@ pub fn render(
     query_accounting: &[QueryAccountingRow],
     ingest_concurrency_shed_total: u64,
     ingest_buffer_budget: IngestBufferBudgetSnapshot,
+    distrib: Option<&DistribSnapshot>,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -2157,6 +2290,9 @@ pub fn render(
         ingest_buffer_budget.ceiling,
         ingest_buffer_budget.shed_total,
     );
+    if let Some(snapshot) = distrib {
+        render_distrib_family(&mut out, mode, snapshot);
+    }
     out
 }
 
@@ -2225,6 +2361,10 @@ pub struct MetricsState {
     /// at scrape time for the `ravel_ingest_buffer_bytes` gauge, its limit, and
     /// the `ravel_ingest_buffer_shed_total` counter.
     pub ingest_buffer_budget: Arc<ravel_ingest::IngestByteBudget>,
+    /// The ADR-0071 distributed read fan-out counters (issue #865). `Some` only
+    /// when the process serves queries with `--distributed-query` on; `None`
+    /// otherwise leaves the whole `ravel_distrib_*` family off the exposition.
+    pub distrib: Option<Arc<crate::distrib::FragmentMetrics>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -2328,6 +2468,17 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         shed_total: state.ingest_buffer_budget.shed_total(),
     };
 
+    let distrib_snapshot = state.distrib.as_ref().map(|metrics| DistribSnapshot {
+        fragment_requests_total: metrics.fragment_requests_total(),
+        fragment_auth_failures_total: metrics.fragment_auth_failures_total(),
+        fragment_inflight: metrics.fragment_inflight(),
+        slices_local_total: metrics.slices_local_total(),
+        slices_remote_total: metrics.slices_remote_total(),
+        slices_fallback_total: metrics.slices_fallback_total(),
+        slice_fetch_micros_buckets: metrics.slice_fetch_buckets(),
+        slice_fetch_nanos_total: metrics.slice_fetch_nanos_total(),
+    });
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -2342,6 +2493,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &query_rows,
         ingest_concurrency_shed_total,
         ingest_buffer_budget,
+        distrib_snapshot.as_ref(),
     );
     (
         StatusCode::OK,
@@ -2409,6 +2561,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -2538,6 +2691,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         let postings_lines: Vec<&str> = body
@@ -2664,6 +2818,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -2816,6 +2971,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -2840,6 +2996,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -2896,6 +3053,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -2938,6 +3096,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -2972,6 +3131,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -3025,6 +3185,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -3067,6 +3228,111 @@ mod tests {
         );
     }
 
+    /// The ADR-0071 distributed read fan-out family (issue #865) renders under
+    /// the new `ravel_distrib_*` names, and every one of its series carries only
+    /// the closed `{mode}` label: no per-shard, per-worker, or per-tenant label
+    /// (ADR-0044 section 4). Also asserts the family is absent entirely when the
+    /// snapshot is `None`, matching the "off unless --distributed-query" wiring.
+    #[test]
+    fn render_includes_distrib_family_with_only_allowlisted_labels() {
+        let mut buckets = [0u64; LATENCY_BUCKET_COUNT];
+        buckets[0] = 5;
+        buckets[2] = 3;
+        let snapshot = DistribSnapshot {
+            fragment_requests_total: 11,
+            fragment_auth_failures_total: 2,
+            fragment_inflight: 1,
+            slices_local_total: 7,
+            slices_remote_total: 4,
+            slices_fallback_total: 1,
+            slice_fetch_micros_buckets: buckets,
+            slice_fetch_nanos_total: 123_000,
+        };
+        let body = render(
+            Mode::Query,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            Some(&snapshot),
+        );
+
+        for expected in [
+            "ravel_distrib_fragment_requests_total{mode=\"query\"} 11",
+            "ravel_distrib_fragment_auth_failures_total{mode=\"query\"} 2",
+            "ravel_distrib_fragment_inflight{mode=\"query\"} 1",
+            "ravel_distrib_slices_local_total{mode=\"query\"} 7",
+            "ravel_distrib_slices_remote_total{mode=\"query\"} 4",
+            "ravel_distrib_slices_fallback_total{mode=\"query\"} 1",
+        ] {
+            assert!(body.contains(expected), "missing `{expected}`:\n{body}");
+        }
+        // The histogram: cumulative buckets, a `_sum` in seconds, and a `_count`
+        // equal to the `+Inf` bucket (5 + 3 = 8 observations).
+        assert!(
+            body.contains("ravel_distrib_slice_fetch_seconds_bucket{mode=\"query\",le=\"+Inf\"} 8"),
+            "histogram +Inf bucket must total every observation:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_distrib_slice_fetch_seconds_count{mode=\"query\"} 8"),
+            "histogram _count must equal the +Inf bucket:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_distrib_slice_fetch_seconds_sum{mode=\"query\"} 0.000123"),
+            "histogram _sum must render seconds:\n{body}"
+        );
+
+        // Every ravel_distrib_ series line carries exactly the `{mode}` label
+        // (plus `le` on histogram buckets); no disallowed label leaks in.
+        for line in body.lines() {
+            if !line.starts_with("ravel_distrib_") {
+                continue;
+            }
+            let labels = line
+                .split_once('{')
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(labels, _)| labels)
+                .unwrap_or("");
+            for pair in labels.split(',').filter(|p| !p.is_empty()) {
+                let key = pair.split('=').next().unwrap_or(pair);
+                assert!(
+                    key == "mode" || key == "le",
+                    "disallowed label `{key}` on ravel_distrib series: {line}"
+                );
+            }
+        }
+
+        // Absent entirely when the process is not distributing.
+        let off = render(
+            Mode::Query,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+        );
+        assert!(
+            !off.contains("ravel_distrib_"),
+            "the distrib family must be absent without --distributed-query:\n{off}"
+        );
+    }
+
     #[test]
     fn render_includes_scrub_family() {
         let snapshot = ScrubSnapshot {
@@ -3103,6 +3369,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -3178,6 +3445,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -3221,6 +3489,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         for line in body.lines() {
@@ -3289,6 +3558,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -3385,6 +3655,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -3414,6 +3685,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert!(
@@ -3493,6 +3765,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         assert_eq!(
@@ -3561,6 +3834,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -3636,6 +3910,7 @@ mod tests {
             &metrics.snapshot(),
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
         )
     }
 

@@ -100,6 +100,7 @@ pub fn build_catalog(
 /// `EngineConfig` whose `deadline` was validated against `sys/gc` in `main`, so
 /// the engine that actually enforces the deadline uses the validated value
 /// rather than an independent `EngineConfig::default()`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_app_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
@@ -108,10 +109,17 @@ pub fn build_app_state(
     engine_config: EngineConfig,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
+    distributed: Option<Arc<ravel_query::distrib::Distributed>>,
 ) -> AppState {
     let mut engine = QueryEngine::new(catalog, store, engine_config);
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
+    }
+    // ADR-0071 distributed read fan-out (issue #865): attach a coordinator
+    // context only under `--distributed-query`. Absent it, the engine keeps the
+    // byte-identical local path (`with_distributed` is the sole opt-in seam).
+    if let Some(distributed) = distributed {
+        engine = engine.with_distributed(distributed);
     }
     // Fold every completed Prometheus-shaped query into the same process
     // aggregator the SQL and analytics paths use (ADR-0044 section 4, issue
@@ -234,6 +242,7 @@ mod catalog_cache_tests {
                 std::collections::HashSet::new(),
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
         );
         assert_eq!(
             state.engine.config().max_bytes_scanned,
