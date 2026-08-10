@@ -76,13 +76,20 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
     let series = vec![SeriesInput {
         series_id: SeriesId::compute(tenant, METRIC, &label_set).expect("series id"),
         labels: label_set,
+        // Space the two samples three minutes apart so each is the winning
+        // (latest-at-or-before) sample at some 60s grid step: the earlier
+        // sample wins at steps in [base, base+3min), the later one from
+        // base+3min on. Samples packed within one step (the earlier bug) made
+        // every grid step resolve to the later sample, so a per-sample
+        // divergence in the distributed decode path was unobservable and the
+        // acceptance equality could not detect it.
         samples: vec![
             Sample {
-                ts_ns: base_ns + 100_000_000,
+                ts_ns: base_ns,
                 value: 1.0,
             },
             Sample {
-                ts_ns: base_ns + 200_000_000,
+                ts_ns: base_ns + 3 * NS_PER_MIN,
                 value: 2.5,
             },
         ],
@@ -122,7 +129,7 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
         segment_format_version: 1,
-        created_unix_ns: base_ns + 300_000_000,
+        created_unix_ns: base_ns + 4 * NS_PER_MIN,
         ingest_hour_bucket: u32::try_from(base_ns / NS_PER_HOUR).expect("hour bucket fits u32"),
     })
     .expect("valid commit record");
@@ -426,4 +433,144 @@ async fn fragment_surface_requires_token_and_flag() {
 
     distributed.shutdown().await.expect("A shuts down");
     local.shutdown().await.expect("B shuts down");
+}
+
+/// A slice that rendezvous-maps to another engine's fragment endpoint really
+/// travels over the network, and the result is still byte-identical to local.
+///
+/// Every other test in this repo either starts with an empty routing table (so
+/// the coordinator self-maps every slice and runs it locally) or points a slice
+/// at an unreachable endpoint (so it falls back to local). Neither proves a
+/// slice ever left the process. Here server A runs the real `SeriesFetch` gRPC
+/// surface over the shared store, and the coordinator engine's routing table
+/// names A as the sole live worker with a `self_id` absent from that table, so
+/// every slice rendezvous-maps to A and dispatches over a real `tonic` channel.
+/// The `ravel_distrib_slices_remote_total` counter proves the hop fired, and
+/// the decoded result equals a local-only engine's byte for byte.
+#[tokio::test]
+async fn distributed_query_dispatches_a_real_remote_hop() {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+    let (start_ms, end_ms, step_ms) = (
+        (now - 15 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        now / NS_PER_SEC * 1000,
+        60_000,
+    );
+
+    // Server A: a real --distributed-query process exposing the SeriesFetch
+    // fragment gRPC surface over the shared store.
+    let server_a = start_server(Arc::clone(&store), Some(always_distribute_settings())).await;
+    let a_grpc = server_a.grpc_addr.expect("gRPC listener binds in All mode");
+
+    // The coordinator's slice fetcher: A is the only live worker, and self is a
+    // uuid absent from the worker set, so rendezvous ownership of every unit
+    // falls to A (never a self-mapped local shortcut).
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = FragmentAdmission::new(8, metrics.clone());
+    let local_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        FRAGMENT_TOKEN.to_string(),
+        admission,
+        local_catalog,
+        store.clone(),
+        None,
+        clock,
+        metrics.clone(),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell
+        .set(uuid::Uuid::from_u128(0xF00D))
+        .expect("set self id");
+    let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+        process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
+        fragment_endpoint: a_grpc.to_string(),
+        protocol_version: codec::PROTOCOL_VERSION,
+        started_unix_ns: 0,
+    }])));
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        FRAGMENT_TOKEN.to_string(),
+        local_service,
+        metrics.clone(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+
+    // The coordinator engine (distributed) and a local-only engine, both over
+    // the shared store.
+    let coordinator_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
+        .with_distributed(distributed);
+    let plain_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let plain = QueryEngine::new(plain_catalog, store.clone(), EngineConfig::default());
+
+    let tenant_hash = tenant.hash();
+    let deadline = EngineConfig::default().deadline;
+    let (remote_value, _) = coordinator
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            deadline,
+        )
+        .await
+        .expect("distributed query over the remote hop succeeds");
+    let (local_value, _) = plain
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            deadline,
+        )
+        .await
+        .expect("local query succeeds");
+
+    assert_eq!(
+        remote_value, local_value,
+        "a query fanned out over a real network hop must be byte-identical to local"
+    );
+    assert!(
+        metrics.slices_remote_total() > 0,
+        "at least one slice must have traveled to the remote worker; \
+         remote={}, local={}, fallback={}",
+        metrics.slices_remote_total(),
+        metrics.slices_local_total(),
+        metrics.slices_fallback_total(),
+    );
+    assert_eq!(
+        metrics.slices_fallback_total(),
+        0,
+        "the remote worker is reachable, so no slice should fall back to local"
+    );
+
+    server_a.shutdown().await.expect("A shuts down");
 }

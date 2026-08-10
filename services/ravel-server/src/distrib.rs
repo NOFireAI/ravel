@@ -24,14 +24,19 @@
 //!   `sys/query/workers/<uuid>` heartbeat every interval and refreshes the
 //!   shared live-worker set the router reads.
 //!
-//! # Scope note (reported gap)
+//! # Observability
 //!
-//! ADR-0071's `stats.fragments[]` per-slice observability belongs in the PromQL
-//! stats JSON, which lives in `ravel-query` (`QueryStatsJson`), a crate outside
-//! this task's scope. This module surfaces the in-scope observability instead:
-//! the `ravel_distrib_*` metric family ([`FragmentMetrics`]). The PromQL-body
-//! `stats.fragments` field is left for the `ravel-query` owner; see the issue
-//! #865 report.
+//! ADR-0071 defines two observability surfaces, both delivered here. The
+//! `ravel_distrib_*` metric family ([`FragmentMetrics`]) carries the
+//! process-global, cardinality-safe counters (rendered under the closed
+//! `{mode}` label alone). The per-slice `stats.fragments[]` detail
+//! ([`FragmentStatEntry`], collected through a task-local [`FragmentStatsSink`])
+//! is attached to a distributed query's stats JSON by the query handler: one
+//! entry per dispatched slice, carrying its worker endpoint, segment count,
+//! reported bytes, and outcome. It is absent when distribution is off, since no
+//! fan-out records anything. The metric family and the stats field are
+//! independent: per-slice cardinality lives only in the response body's
+//! `fragments[]`, never as a metric label.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -459,6 +464,108 @@ impl SeriesFetch for FragmentService {
     }
 }
 
+/// One per-slice entry in a distributed query's `stats.fragments[]` (ADR-0071
+/// observability deliverable, issue #865). [`RoutingSliceFetcher`] records one
+/// for every slice a distributed query dispatches; the query handler renders
+/// the collected entries into the stats JSON via [`crate::query::fragments_json`].
+/// The family carries per-slice cardinality here, in the response body, never as
+/// a metric label (ADR-0044 section 4).
+#[derive(Debug, Clone)]
+pub struct FragmentStatEntry {
+    /// The worker the slice ran on: a remote worker's `host:port` fragment
+    /// endpoint, or `"local"` for a self-mapped slice or one that fell back to
+    /// local execution after a transport failure.
+    pub worker_endpoint: String,
+    /// Pinned segments the slice covered.
+    pub segment_count: u64,
+    /// Store bytes the slice's worker reported reading (its per-slice accounting
+    /// `total_s3_bytes`); `0` when the slice ended in an error.
+    pub bytes_reported: u64,
+    /// The slice's outcome: `"ok"` (ran to completion, local or remote),
+    /// `"fallback"` (remote dispatch failed at transport and the coordinator
+    /// re-ran it locally), or `"error"` (the fetch returned a hard error).
+    pub status: &'static str,
+}
+
+tokio::task_local! {
+    /// Per-query fragment-stats sink, installed by a query handler around its
+    /// engine call (see [`with_fragment_stats`]). Every [`RoutingSliceFetcher`]
+    /// slice driven on the same task records into it; unset on any task no
+    /// handler scoped (an inbound gRPC fetch, or a distribution-off path), where
+    /// recording is a silent no-op.
+    static FRAGMENT_STATS: FragmentStatsSink;
+}
+
+/// A per-query collector the coordinator installs in task-local storage so each
+/// dispatched slice records a [`FragmentStatEntry`]. Cheap to clone (an `Arc`):
+/// the handler keeps one clone to [`take`](Self::take) the entries after the
+/// query resolves while the engine's fan-out records into another.
+#[derive(Clone, Default)]
+pub struct FragmentStatsSink {
+    entries: Arc<Mutex<Vec<FragmentStatEntry>>>,
+}
+
+impl FragmentStatsSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&self, entry: FragmentStatEntry) {
+        self.entries.lock().push(entry);
+    }
+
+    /// Drain the collected per-slice entries.
+    pub fn take(&self) -> Vec<FragmentStatEntry> {
+        std::mem::take(&mut self.entries.lock())
+    }
+}
+
+/// Run `future` with `sink` installed as the task-local fragment-stats sink, so
+/// every [`RoutingSliceFetcher`] slice the future drives on this task records
+/// into `sink`. The caller keeps its own clone of `sink` to read the entries
+/// once the future resolves. The engine's fan-out polls its slice futures inline
+/// (`buffer_unordered`, never a detached `spawn`), so they share this task's
+/// local and every slice is captured.
+pub async fn with_fragment_stats<F>(sink: FragmentStatsSink, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    FRAGMENT_STATS.scope(sink, future).await
+}
+
+/// Record one completed slice into the task-local [`FragmentStatsSink`], if a
+/// query handler scoped one on this task; a no-op otherwise.
+fn record_fragment_stat(
+    result: &Result<SliceResponse, DistribError>,
+    worker_endpoint: String,
+    segment_count: u64,
+    fell_back: bool,
+) {
+    let (bytes_reported, status) = match result {
+        Ok(response) => (
+            response.accounting.total_s3_bytes(),
+            if fell_back { "fallback" } else { "ok" },
+        ),
+        Err(_) => (0, "error"),
+    };
+    let entry = FragmentStatEntry {
+        worker_endpoint,
+        segment_count,
+        bytes_reported,
+        status,
+    };
+    let _ = FRAGMENT_STATS.try_with(|sink| sink.record(entry));
+}
+
+/// The count of pinned segments a slice request carries, `0` for a request with
+/// no pinned scope.
+fn pinned_segment_count(request: &pb::FetchRequest) -> u64 {
+    match &request.scope {
+        Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments.len() as u64,
+        _ => 0,
+    }
+}
+
 /// Where a slice is routed after rendezvous mapping.
 enum Route {
     /// Execute locally, with no network hop.
@@ -590,15 +697,20 @@ impl RoutingSliceFetcher {
 impl SliceFetcher for RoutingSliceFetcher {
     async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
         let start = Instant::now();
-        let result = match self.route(&request) {
+        let segment_count = pinned_segment_count(&request);
+        let (result, worker_endpoint, fell_back) = match self.route(&request) {
             Route::Local => {
                 self.metrics.record_slice_local();
-                self.local.run_local(request).await
+                (
+                    self.local.run_local(request).await,
+                    "local".to_string(),
+                    false,
+                )
             }
             Route::Remote(endpoint) => match self.remote_fetch(&endpoint, request.clone()).await {
                 Ok(response) => {
                     self.metrics.record_slice_remote();
-                    Ok(response)
+                    (Ok(response), endpoint, false)
                 }
                 // A transport failure to a remote worker is not fatal: the
                 // coordinator has the same store access and can read the slice
@@ -611,12 +723,13 @@ impl SliceFetcher for RoutingSliceFetcher {
                         "remote slice fetch failed at transport; falling back to local"
                     );
                     self.metrics.record_slice_fallback();
-                    self.local.run_local(request).await
+                    (self.local.run_local(request).await, endpoint, true)
                 }
-                Err(other) => Err(other),
+                Err(other) => (Err(other), endpoint, false),
             },
         };
         self.metrics.observe_slice_fetch(start.elapsed());
+        record_fragment_stat(&result, worker_endpoint, segment_count, fell_back);
         result
     }
 }
@@ -1106,5 +1219,152 @@ mod tests {
                 .any(|r| r.process_id == workers.process_id().to_string()),
             "the stale worker has aged out of the live set"
         );
+    }
+
+    /// The real no-deadlock property (ADR-0071 deliverable 2): a coordinator
+    /// holding the only client-query permit while it awaits the fragments it
+    /// dispatched still makes progress, because the worker serving those
+    /// fragments admits them against the INDEPENDENT fragment class, not the
+    /// saturated client cap. [`fragment_admission_bounds_and_releases`] above
+    /// only exercised the fragment semaphore in isolation; this drives the two
+    /// caps together, which is where a shared bound would deadlock.
+    #[tokio::test]
+    async fn coordinator_awaiting_fragments_does_not_deadlock_behind_client_cap() {
+        // Client-query cap and fragment class, each size 1, so a single
+        // in-flight coordinator saturates the client cap.
+        let client_cap = Arc::new(tokio::sync::Semaphore::new(1));
+        let metrics = Arc::new(FragmentMetrics::new());
+        let fragment_admission = FragmentAdmission::new(1, metrics.clone());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            // The coordinator query admits against the client cap and holds its
+            // only permit for its whole lifetime, including while it awaits the
+            // fragments it dispatched.
+            let _client_permit = client_cap
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("coordinator admits against the client cap");
+
+            // The worker serving the coordinator's fragment admits it here, on
+            // the independent class, so the permit is granted even though the
+            // client cap is fully held by this same coordinator.
+            //
+            // NON-VACUITY (finding 3): point fragment admission at the client
+            // cap by replacing the next statement with
+            //     let _fragment_permit = client_cap.clone().acquire_owned().await;
+            // The coordinator then waits for a client permit it is itself
+            // holding -- a deadlock -- and the 30s timeout fires. Reverting
+            // restores the independent class and the test passes at once.
+            let _fragment_permit = fragment_admission
+                .acquire()
+                .await
+                .expect("fragment admitted against its own class");
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a coordinator holding the only client-cap permit must still acquire \
+             a fragment permit from the independent class; a timeout here means \
+             the two admission classes share a bound and deadlock"
+        );
+    }
+
+    /// A distributed query's per-slice fragment stats (ADR-0071
+    /// `stats.fragments[]`, finding 4) are collected through the task-local
+    /// sink: a self-mapped local slice records a `local`/`ok` entry, and a slice
+    /// whose remote owner is unreachable records a `fallback` entry naming the
+    /// endpoint it tried. Outside a scope, recording is a silent no-op.
+    #[tokio::test]
+    async fn fragment_stats_sink_collects_per_slice_entries() {
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = test_service(metrics.clone());
+        let self_id = uuid::Uuid::from_u128(1);
+        let other_id = uuid::Uuid::from_u128(2);
+        let self_cell = Arc::new(OnceLock::new());
+        self_cell.set(self_id).expect("set self id");
+        let live = Arc::new(RwLock::new(Arc::new(vec![
+            QueryWorkerRecord {
+                process_id: self_id.to_string(),
+                fragment_endpoint: "127.0.0.1:1".to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            },
+            QueryWorkerRecord {
+                process_id: other_id.to_string(),
+                fragment_endpoint: "192.0.2.1:9".to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            },
+        ])));
+        let fetcher = RoutingSliceFetcher::new(
+            self_cell,
+            live,
+            "cluster-token".to_string(),
+            service,
+            metrics.clone(),
+        );
+
+        // Outside a scope: recording is a no-op (must not panic, records
+        // nothing).
+        fetcher
+            .fetch(pinned_request([5u8; 16], &[0]))
+            .await
+            .expect("fetch outside a scope");
+
+        // Inside a scope: drive distinct units until both a local and a fallback
+        // slice are observed.
+        let sink = FragmentStatsSink::new();
+        with_fragment_stats(sink.clone(), async {
+            let mut saw_local = false;
+            let mut saw_fallback = false;
+            for i in 0..256u128 {
+                let tenant = uuid::Uuid::from_u128(i).into_bytes();
+                let local_before = metrics.slices_local_total();
+                let fallback_before = metrics.slices_fallback_total();
+                fetcher
+                    .fetch(pinned_request(tenant, &[0]))
+                    .await
+                    .expect("fetch inside the scope");
+                if metrics.slices_local_total() > local_before {
+                    saw_local = true;
+                }
+                if metrics.slices_fallback_total() > fallback_before {
+                    saw_fallback = true;
+                }
+                if saw_local && saw_fallback {
+                    break;
+                }
+            }
+            assert!(
+                saw_local && saw_fallback,
+                "need both a local and a fallback slice to inspect"
+            );
+        })
+        .await;
+
+        let recorded = sink.take();
+        assert!(
+            !recorded.is_empty(),
+            "the scope collected per-slice entries"
+        );
+        let local = recorded
+            .iter()
+            .find(|e| e.status == "ok" && e.worker_endpoint == "local")
+            .expect("a self-mapped local slice records a local/ok entry");
+        assert_eq!(
+            local.segment_count, 1,
+            "the slice covered one pinned segment"
+        );
+        let fallback = recorded
+            .iter()
+            .find(|e| e.status == "fallback")
+            .expect("a slice whose remote owner is unreachable records a fallback entry");
+        assert_eq!(
+            fallback.worker_endpoint, "192.0.2.1:9",
+            "the fallback entry names the unreachable remote endpoint it tried"
+        );
+        assert_eq!(fallback.segment_count, 1);
     }
 }
