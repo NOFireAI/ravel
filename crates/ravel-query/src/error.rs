@@ -41,6 +41,8 @@ pub enum QueryError {
     DeadlineExceeded { deadline: Duration },
     #[error("snapshot invalidated by a concurrent GC/compaction; retry also failed")]
     SnapshotInvalidated,
+    #[error("distributed slice fetch failed: {reason}")]
+    Distrib { reason: String },
     #[error("decoded segment run is not ascending by timestamp: {prev} was followed by {next}")]
     NonMonotonicSamples { prev: i64, next: i64 },
 }

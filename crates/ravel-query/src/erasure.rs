@@ -98,6 +98,26 @@ impl ErasurePredicate {
         self.window_start_ns != 0 || self.window_end_ns != 0
     }
 
+    /// The conjunction's `(key, value)` matchers, in construction order. Read
+    /// by the ADR-0071 distributed codec (`distrib::codec`) to carry a resolved
+    /// snapshot's pending predicates in a slice's `FetchRequest`, so a worker
+    /// applies the identical exclusion the local path would.
+    pub fn matchers(&self) -> &[(String, String)] {
+        &self.matchers
+    }
+
+    /// The half-open window's lower bound (`0` means unset; see the module
+    /// docs). Read by the ADR-0071 distributed codec.
+    pub fn window_start_ns(&self) -> i64 {
+        self.window_start_ns
+    }
+
+    /// The half-open window's upper bound (`0` means unset; see the module
+    /// docs). Read by the ADR-0071 distributed codec.
+    pub fn window_end_ns(&self) -> i64 {
+        self.window_end_ns
+    }
+
     /// Whether `ts_ns` falls inside the half-open window `[start, end)`, with
     /// zero-as-unset bounds. Always `true` when the predicate is windowless.
     pub fn ts_in_window(&self, ts_ns: i64) -> bool {

@@ -199,8 +199,11 @@ message Status {
 // The worker's per-slice cost accounting, mirroring
 // ravel_types::accounting::QueryAccountingSnapshot's counters as flat u64
 // fields (its fixed-size s3_requests/s3_bytes arrays are flattened per
-// AccountedOp: Get, List, Head, in AccountedOp::index order). Summed across
-// slices by the coordinator to report one query's total cost.
+// AccountedOp: Get, List, Head, in AccountedOp::index order). Combined across
+// slices by the coordinator to report one query's total cost: every counter
+// sums, but peak_intermediate_bytes is merged via max, never summed. It is a
+// per-worker-process high-water mark, so the query's peak is the largest
+// single slice's peak, not a total that no process ever held at once.
 message QueryAccountingSnapshot {
   uint64 s3_get_requests = 1;
   uint64 s3_list_requests = 2;

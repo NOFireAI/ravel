@@ -4,6 +4,7 @@
 #[cfg(test)]
 mod cache_correctness;
 mod config;
+pub mod distrib;
 mod engine;
 pub mod erasure;
 mod error;

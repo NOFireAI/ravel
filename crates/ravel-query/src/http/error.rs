@@ -117,6 +117,11 @@ impl From<QueryError> for ApiError {
             QueryError::Catalog(_)
             | QueryError::Fetch(_)
             | QueryError::SnapshotInvalidated
+            // A distributed slice failure is a server-side outage from the
+            // client's view (a worker was unreachable, corrupt, or framed a bad
+            // response); its `reason` may carry internal detail, so it is
+            // redacted to the same retryable 503 as the other storage faults.
+            | QueryError::Distrib { .. }
             | QueryError::NonMonotonicSamples { .. } => {
                 ApiError::Unavailable(MSG_UNAVAILABLE.to_string())
             }
