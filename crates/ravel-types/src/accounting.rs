@@ -33,6 +33,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::TenantHash;
 
+/// Adds `add` to an atomic counter, saturating at `u64::MAX` instead of
+/// wrapping. A plain `fetch_add` wraps silently even under `overflow-checks`
+/// (atomics are not the checked arithmetic operators), which would let a
+/// wrapped-low aggregate slip under a bytes-scanned budget the coordinator
+/// re-enforces; this clamps instead. The compare-exchange loop retries only
+/// under contention, and never past the clamp.
+fn saturating_fetch_add(counter: &AtomicU64, add: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(add);
+        if next == current {
+            return;
+        }
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// The store operation kinds a query can be charged for. Distinct from
 /// `ravel_object_store::instrument::StoreOp`: this crate does not depend on
 /// `ravel-object-store`, and a query only ever issues gets, lists, and
@@ -200,44 +220,27 @@ impl QueryAccounting {
     /// (ADR-0071 distributed read fan-out): the coordinator calls this with
     /// each slice worker's returned [`QueryAccountingSnapshot`] so the query's
     /// aggregate cost reflects the remote fetches it dispatched. Every counter
-    /// accumulates; `peak_intermediate_bytes` merges through
-    /// [`Self::observe_intermediate_bytes`] (a max), never a sum, because it is
-    /// a per-worker-process high-water mark, not a total any single process
-    /// ever held. This is the live-handle counterpart of
-    /// [`QueryAccountingSnapshot::saturating_merge`].
+    /// accumulates **saturating** at `u64::MAX`; `peak_intermediate_bytes`
+    /// merges through [`Self::observe_intermediate_bytes`] (a max), never a
+    /// sum, because it is a per-worker-process high-water mark, not a total any
+    /// single process ever held. This is the live-handle counterpart of
+    /// [`QueryAccountingSnapshot::saturating_merge`], and clamps identically: a
+    /// worker reporting a counter near `u64::MAX` pins the aggregate at the
+    /// maximum rather than wrapping it (a wrapped low value would silently slip
+    /// under a bytes-scanned budget the coordinator re-enforces).
     pub fn merge_snapshot(&self, other: &QueryAccountingSnapshot) {
         for op in AccountedOp::ALL {
-            self.0.ops[op.index()]
-                .requests
-                .fetch_add(other.s3_requests(op), Ordering::Relaxed);
-            self.0.ops[op.index()]
-                .bytes
-                .fetch_add(other.s3_bytes(op), Ordering::Relaxed);
+            saturating_fetch_add(&self.0.ops[op.index()].requests, other.s3_requests(op));
+            saturating_fetch_add(&self.0.ops[op.index()].bytes, other.s3_bytes(op));
         }
-        self.0
-            .cache_hits
-            .fetch_add(other.cache_hits, Ordering::Relaxed);
-        self.0
-            .cache_misses
-            .fetch_add(other.cache_misses, Ordering::Relaxed);
-        self.0
-            .cache_bytes
-            .fetch_add(other.cache_bytes, Ordering::Relaxed);
-        self.0
-            .decompressed_bytes
-            .fetch_add(other.decompressed_bytes, Ordering::Relaxed);
-        self.0
-            .segments_opened
-            .fetch_add(other.segments_opened, Ordering::Relaxed);
-        self.0
-            .segments_pruned
-            .fetch_add(other.segments_pruned, Ordering::Relaxed);
-        self.0
-            .series_matched
-            .fetch_add(other.series_matched, Ordering::Relaxed);
-        self.0
-            .bytes_reused
-            .fetch_add(other.bytes_reused, Ordering::Relaxed);
+        saturating_fetch_add(&self.0.cache_hits, other.cache_hits);
+        saturating_fetch_add(&self.0.cache_misses, other.cache_misses);
+        saturating_fetch_add(&self.0.cache_bytes, other.cache_bytes);
+        saturating_fetch_add(&self.0.decompressed_bytes, other.decompressed_bytes);
+        saturating_fetch_add(&self.0.segments_opened, other.segments_opened);
+        saturating_fetch_add(&self.0.segments_pruned, other.segments_pruned);
+        saturating_fetch_add(&self.0.series_matched, other.series_matched);
+        saturating_fetch_add(&self.0.bytes_reused, other.bytes_reused);
         self.observe_intermediate_bytes(other.peak_intermediate_bytes);
     }
 
@@ -300,14 +303,25 @@ impl QueryAccountingSnapshot {
         self.s3_bytes[op.index()]
     }
 
-    /// Requests issued across every operation kind.
+    /// Requests issued across every operation kind. Saturating: a coordinator
+    /// folds several workers' saturated snapshots (ADR-0071), so a plain sum
+    /// could overflow and panic under `overflow-checks`; the total pins at
+    /// `u64::MAX` instead.
     pub fn total_s3_requests(&self) -> u64 {
-        self.s3_requests.iter().sum()
+        self.s3_requests
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add)
     }
 
-    /// Bytes transferred across every operation kind.
+    /// Bytes transferred across every operation kind. Saturating, for the same
+    /// reason as [`Self::total_s3_requests`]: this is the value the
+    /// bytes-scanned budget is checked against, so it must never wrap.
     pub fn total_s3_bytes(&self) -> u64 {
-        self.s3_bytes.iter().sum()
+        self.s3_bytes
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Field-wise saturating sum of two snapshots, for one request that runs
@@ -760,6 +774,37 @@ mod tests {
         assert_eq!(
             merged.peak_intermediate_bytes, 200,
             "peak is the max across folded slices and the handle's own, never a sum"
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_saturates_and_total_does_not_wrap_or_panic() {
+        // A worker reporting a byte counter near u64::MAX must clamp the live
+        // handle at the maximum, never wrap it down to a small value that
+        // slips under a bytes-scanned budget (ADR-0071 coordinator
+        // re-enforcement). And total_s3_bytes must sum the clamped per-op
+        // fields without panicking under overflow-checks.
+        let agg = QueryAccounting::new();
+        let near_max = QueryAccountingSnapshot {
+            s3_bytes: [u64::MAX - 5, 0, 0],
+            ..QueryAccountingSnapshot::default()
+        };
+        let more = QueryAccountingSnapshot {
+            s3_bytes: [100, u64::MAX, 0],
+            ..QueryAccountingSnapshot::default()
+        };
+        agg.merge_snapshot(&near_max);
+        agg.merge_snapshot(&more);
+        let merged = agg.snapshot();
+        assert_eq!(
+            merged.s3_bytes(AccountedOp::Get),
+            u64::MAX,
+            "get bytes clamp at u64::MAX rather than wrapping to a small value"
+        );
+        assert_eq!(
+            merged.total_s3_bytes(),
+            u64::MAX,
+            "the budget-checked total saturates instead of panicking on overflow"
         );
     }
 

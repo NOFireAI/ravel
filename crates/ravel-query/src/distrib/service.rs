@@ -34,12 +34,14 @@ use std::sync::Arc;
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::TenantHash;
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::{Signal, TenantHash};
 
+use crate::config::ByteLimit;
 use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
-use crate::fetcher::{FetchError, SegmentFetcher};
+use crate::engine::bytes_scanned_exceeded;
+use crate::fetcher::{FetchError, FetchStats, SegmentFetcher};
 
 /// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
 /// worker fetches. The production resolver (ticket #865) reconstructs the
@@ -106,12 +108,19 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     async fn run_slice(&self, request: pb::FetchRequest) -> Vec<pb::FetchResponse> {
         match self.run_slice_inner(request).await {
             Ok(frames) => frames,
+            // Pre-fetch/transport-shaped failures (version skew, malformed
+            // request, a vanished pinned segment, a hard fetch error) carry no
+            // accounting: nothing was scanned, or the query fails outright and
+            // the aggregate is moot. Post-fetch outcomes that *did* spend
+            // (budget trip, histogram fallback) build their own summary with
+            // real accounting inside `run_slice_inner`.
             Err((code, message)) => vec![summary_frame(
                 &QueryAccountingSnapshot::default(),
                 0,
                 0,
                 code,
                 message,
+                &FetchStats::default(),
             )],
         }
     }
@@ -123,6 +132,20 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // Version skew: the coordinator falls back to local when it sees this.
         codec::check_protocol_version(request.protocol_version)
             .map_err(|e| (pb::status::Code::Unsupported, e.to_string()))?;
+
+        // Signal validation. An unknown discriminant is malformed (BadData); a
+        // known non-metrics signal is simply not distributed yet, so hand it to
+        // the coordinator's local fallback (Unsupported) rather than return a
+        // wrong or partial result. `signal_from_u32` is otherwise only exercised
+        // by codec round-trip tests; this is its production caller.
+        let signal = codec::signal_from_u32(request.signal)
+            .map_err(|e| (pb::status::Code::BadData, e.to_string()))?;
+        if signal != Signal::Metrics {
+            return Err((
+                pb::status::Code::Unsupported,
+                format!("signal {signal:?} is not distributed yet; only Metrics"),
+            ));
+        }
 
         let tenant_hash =
             decode_tenant_hash(&request.tenant_hash).map_err(|m| (pb::status::Code::BadData, m))?;
@@ -158,13 +181,22 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         }
 
+        // Per-slice bytes-scanned budget, enforced per completed segment
+        // exactly as the local path does (ADR-0061 decision 1): `0` is the wire
+        // sentinel for "no cap" (a real fetch never scans zero bytes).
+        let byte_limit = match request.budgets.as_ref().map(|b| b.max_bytes_scanned) {
+            Some(0) | None => ByteLimit::Unlimited,
+            Some(max) => ByteLimit::Bounded(max),
+        };
+
         // One fresh accounting handle per slice: the coordinator folds the
         // returned snapshot into the query's aggregate (ADR-0071).
         let accounting = QueryAccounting::new();
         let mut scalar = Vec::new();
         let mut any_histograms = false;
+        let mut stats = FetchStats::default();
         for seg in &segments {
-            let (seg_scalar, _stats, seg_hist) = self
+            let (seg_scalar, seg_stats, seg_hist) = self
                 .fetcher
                 .fetch_soa_and_histograms_accounted(tenant_hash, seg, &matchers, &accounting)
                 .await
@@ -172,16 +204,44 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             if !seg_hist.is_empty() {
                 any_histograms = true;
             }
+            stats.raw_f64_pages += seg_stats.raw_f64_pages;
+            stats.raw_f64_bytes += seg_stats.raw_f64_bytes;
             scalar.push(seg_scalar);
+            // Short-circuit the moment a completed segment fetch pushes this
+            // slice over budget, matching the local per-segment check. The
+            // terminal summary carries the accounting spent so far so the
+            // coordinator folds the slice's real cost before failing the query
+            // (never a lost double-spend); the message is the same typed
+            // `TooManyBytesScanned` string the local path produces.
+            if let Some(err) =
+                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), byte_limit)
+            {
+                return Ok(vec![summary_frame(
+                    &accounting.snapshot(),
+                    0,
+                    0,
+                    pb::status::Code::BudgetExceeded,
+                    err.to_string(),
+                    &stats,
+                )]);
+            }
         }
 
         // Scalar-only distribution: hand a histogram-bearing slice back to the
-        // coordinator's local fallback rather than return partial results.
+        // coordinator's local fallback rather than return partial results. The
+        // summary still carries this slice's accounting/stats so the
+        // coordinator folds its spend before falling back to local (ADR-0071);
+        // otherwise the histogram query would pay for this fetch twice and
+        // report it once.
         if any_histograms {
-            return Err((
+            return Ok(vec![summary_frame(
+                &accounting.snapshot(),
+                0,
+                0,
                 pb::status::Code::Unsupported,
                 "histogram series are not distributed yet".to_string(),
-            ));
+                &stats,
+            )]);
         }
 
         // Selective-erasure exclusion, applied post-decode exactly as the local
@@ -213,6 +273,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             samples_returned,
             pb::status::Code::Ok,
             String::new(),
+            &stats,
         ));
         Ok(frames)
     }
@@ -244,6 +305,7 @@ fn summary_frame(
     samples_returned: u64,
     code: pb::status::Code,
     message: String,
+    stats: &FetchStats,
 ) -> pb::FetchResponse {
     pb::FetchResponse {
         frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
@@ -254,6 +316,8 @@ fn summary_frame(
                 code: code as i32,
                 message,
             }),
+            raw_f64_pages: stats.raw_f64_pages,
+            raw_f64_bytes: stats.raw_f64_bytes,
         })),
     }
 }
