@@ -51,6 +51,18 @@ pub fn query_worker_key(process_id: &str) -> String {
     format!("{QUERY_WORKERS_PREFIX}{process_id}")
 }
 
+/// The process id a heartbeat key names, or `None` if the key is not a
+/// well-formed `sys/query/workers/<uuid>` key. Worker identity is the key, not
+/// the record body (mirrors [`crate::worker_set`]'s `process_id_of`): the key
+/// is the one thing a single writer alone controls, so deriving identity from
+/// it means a record whose body disagrees with its key cannot smuggle a false
+/// identity into the live set. `list_all` yields the prefix itself and any
+/// unexpected nested key under it; both parse to `None` and are skipped.
+fn process_id_of(key: &str) -> Option<Uuid> {
+    let raw = key.strip_prefix(QUERY_WORKERS_PREFIX)?;
+    Uuid::parse_str(raw).ok()
+}
+
 /// One query-worker process's self-owned membership record (ADR-0071),
 /// advertised at `sys/query/workers/<process_id>` with [`PutMode::Overwrite`].
 ///
@@ -201,20 +213,35 @@ impl QueryWorkers {
     /// never disowns itself. The returned set is sorted by `process_id` and
     /// deduplicated for a deterministic order.
     ///
-    /// A corrupt sibling record is skipped (treated as absent, self-correcting
-    /// next interval); only a failed LIST or GET is an `Err`, which the caller
-    /// treats fail-open, never freezing fan-out on a transient read fault.
+    /// Worker identity is derived from the object key, never trusted from the
+    /// record body (mirrors [`crate::worker_set::WorkerSet::live_set`]): a key
+    /// that is not a well-formed `sys/query/workers/<uuid>` is skipped, and a
+    /// record whose body `process_id` disagrees with the id its key names is
+    /// skipped as malformed. A single writer alone controls its own key, so a
+    /// body/key mismatch means a corrupt or forged record and must not enter
+    /// the live set under either identity.
+    ///
+    /// A corrupt or mismatched sibling record is skipped (treated as absent,
+    /// self-correcting next interval); only a failed LIST or GET is an `Err`,
+    /// which the caller treats fail-open, never freezing fan-out on a transient
+    /// read fault.
     pub async fn live_set(
         &self,
         store: &dyn ObjectStoreBackend,
         now_ns: i64,
     ) -> Result<Vec<QueryWorkerRecord>, StoreError> {
         let window = self.liveness_window_ns();
-        let self_key = query_worker_key(&self.process_id.to_string());
         let objects = list_all(store, QUERY_WORKERS_PREFIX).await?;
         let mut live = vec![self.record_at(now_ns)];
         for meta in objects {
-            if meta.key == self_key {
+            let Some(pid) = process_id_of(&meta.key) else {
+                tracing::debug!(
+                    key = %meta.key,
+                    "query_workers: skipping a key that is not sys/query/workers/<uuid>"
+                );
+                continue;
+            };
+            if pid == self.process_id {
                 continue;
             }
             let got = store.get(&meta.key, GetRange::Full).await?;
@@ -225,6 +252,16 @@ impl QueryWorkers {
                 );
                 continue;
             };
+            // The record body must name the same process id its key does. A
+            // disagreement is a corrupt or forged record; trust the key.
+            if record.process_id != pid.to_string() {
+                tracing::debug!(
+                    key = %meta.key,
+                    body_process_id = %record.process_id,
+                    "query_workers: skipping a record whose body process_id disagrees with its key"
+                );
+                continue;
+            }
             if is_stale(now_ns, record.started_unix_ns, window) {
                 continue;
             }
@@ -313,6 +350,63 @@ mod tests {
         );
         assert_eq!(live.len(), 1, "only self survives");
         assert_eq!(live[0].process_id, a.process_id().to_string());
+    }
+
+    /// A record whose body `process_id` disagrees with the id its key names is
+    /// skipped: worker identity is the key, not the trusted body. A key that is
+    /// not `sys/query/workers/<uuid>` at all is likewise skipped, not a panic.
+    #[tokio::test]
+    async fn record_with_body_key_mismatch_is_excluded() {
+        let store = MemoryStore::new();
+        let reader = worker();
+        let now = 1_000 * H_NS;
+
+        // A fresh, non-stale record written under the key of `key_id` but whose
+        // body claims a different `body_id`. The stamp is current, so only the
+        // identity mismatch can exclude it.
+        let key_id = Uuid::new_v4();
+        let body_id = Uuid::new_v4();
+        assert_ne!(key_id, body_id);
+        let forged = QueryWorkerRecord {
+            process_id: body_id.to_string(),
+            fragment_endpoint: "10.9.9.9:9443".to_string(),
+            protocol_version: 1,
+            started_unix_ns: now,
+        };
+        store
+            .put(
+                &query_worker_key(&key_id.to_string()),
+                forged.encode().expect("encode forged").into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("put forged");
+
+        // A key under the prefix that is not a UUID at all.
+        store
+            .put(
+                &format!("{QUERY_WORKERS_PREFIX}not-a-uuid"),
+                b"{}".to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("put junk key");
+
+        let live = reader.live_set(&store, now).await.expect("live set");
+        assert_eq!(live.len(), 1, "only the reader itself survives");
+        assert_eq!(live[0].process_id, reader.process_id().to_string());
+        assert!(
+            !live
+                .iter()
+                .any(|r| r.process_id == body_id.to_string() || r.process_id == key_id.to_string()),
+            "neither the key id nor the forged body id may enter the live set"
+        );
     }
 
     /// A far-future-dated record must be excluded exactly like a far-past one,

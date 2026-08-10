@@ -224,6 +224,11 @@ pub struct QueryEngine {
     catalog: Arc<Catalog>,
     fetcher: SegmentFetcher,
     config: EngineConfig,
+    /// ADR-0071 distributed read fan-out (issue #864). `None` is the default:
+    /// the engine runs the local fetch path untouched. `Some` opts this engine
+    /// into cost-gated fan-out to slice workers; see
+    /// [`QueryEngine::with_distributed`].
+    distributed: Option<Arc<crate::distrib::Distributed>>,
 }
 
 impl QueryEngine {
@@ -236,7 +241,19 @@ impl QueryEngine {
             catalog,
             fetcher: SegmentFetcher::new(store),
             config,
+            distributed: None,
         }
+    }
+
+    /// Opts this engine into ADR-0071 distributed read fan-out (issue #864).
+    /// Mirrors [`Self::with_cache`]: `QueryEngine::new` builds a local-only
+    /// engine, and this is the single seam a caller uses to attach a
+    /// distributed context after construction. Off by default; with no
+    /// distributed context every query runs the byte-identical local path.
+    #[must_use]
+    pub fn with_distributed(mut self, distributed: Arc<crate::distrib::Distributed>) -> Self {
+        self.distributed = Some(distributed);
+        self
     }
 
     /// Attaches the ADR-0046 read cache to this engine's fetcher, via
@@ -628,7 +645,7 @@ impl QueryEngine {
                         // query's scan and cancels it mid-fetch, not after the
                         // merge has already paid for every byte.
                         let (scalar_fetched, page_stats, hist_fetched) = self
-                            .fetch_all_samples_and_histograms(
+                            .fetch_samples_and_histograms_maybe_distributed(
                                 tenant_hash,
                                 snapshot,
                                 &plan.matchers,
@@ -937,6 +954,78 @@ impl QueryEngine {
             }
         }
         Ok((scalar_out, page_stats, histogram_out))
+    }
+
+    /// The distribution seam (ADR-0071, issue #864). When this engine has a
+    /// distributed context AND the pre-fetch cost estimate trips the gate, fan
+    /// the snapshot out to slice workers; otherwise (the default, or a
+    /// below-threshold query, or a worker that signalled a fall-back) run the
+    /// byte-identical local [`Self::fetch_all_samples_and_histograms`].
+    ///
+    /// The distributed path returns the same triple the local path does, with
+    /// erasure already applied worker-side (so this method does not re-apply
+    /// it), so the caller's merge step is identical for both. When
+    /// `self.distributed` is `None` this is exactly a call to the local
+    /// fetch, which is why an engine that never opts in behaves precisely as
+    /// it did before this seam existed.
+    async fn fetch_samples_and_histograms_maybe_distributed(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: &Snapshot,
+        matchers: &[LabelMatcher],
+        accounting: &QueryAccounting,
+        max_bytes_scanned: ByteLimit,
+    ) -> Result<
+        (
+            Vec<Vec<FetchedSeriesSoa>>,
+            FetchStats,
+            Vec<Vec<FetchedHistogramSeries>>,
+        ),
+        QueryError,
+    > {
+        if let Some(distributed) = &self.distributed {
+            // The cost gate reads the same estimate shape the engine already
+            // computes (ADR-0044); a single per-segment pass (multiplier 1, no
+            // catalog term) is the right coarse signal for "is this snapshot
+            // big enough to distribute".
+            let cost = estimate_cost(snapshot, 1, 0);
+            if crate::distrib::partition::should_distribute(distributed.thresholds(), &cost) {
+                let erasure = snapshot_erasure_predicates(snapshot);
+                if let Some(triple) = distributed
+                    .fetch(
+                        tenant_hash,
+                        Signal::Metrics,
+                        snapshot,
+                        matchers,
+                        &erasure,
+                        accounting,
+                        &self.config,
+                    )
+                    .await?
+                {
+                    // The bytes-scanned budget is a coordinator-side invariant
+                    // too: re-check it against the folded accounting so a
+                    // distributed query is bounded exactly as a local one.
+                    if let Some(err) = bytes_scanned_exceeded(
+                        accounting.snapshot().total_s3_bytes(),
+                        max_bytes_scanned,
+                    ) {
+                        return Err(err);
+                    }
+                    return Ok(triple);
+                }
+                // `None`: a worker asked for local fallback (version skew, a
+                // histogram-bearing slice). Fall through to the local path.
+            }
+        }
+        self.fetch_all_samples_and_histograms(
+            tenant_hash,
+            snapshot,
+            matchers,
+            accounting,
+            max_bytes_scanned,
+        )
+        .await
     }
 
     async fn fetch_all_series(
@@ -1614,7 +1703,11 @@ impl YieldBudget {
 /// moment a new series id would push the map past the cap (issue #470,
 /// ADR-0051 S7 / S4-07), so peak map size is bounded by the cap rather than
 /// by however many distinct series the fetch actually returned.
-fn merge_soa_runs(
+// `pub(crate)` (not private) so the ADR-0071 distributed acceptance test
+// (`distrib::tests`) merges a distributed fetch with the exact same total-order
+// k-way merge the local path uses, proving byte-identical results rather than
+// re-implementing the merge in the test.
+pub(crate) fn merge_soa_runs(
     fetched: Vec<Vec<FetchedSeriesSoa>>,
     max_series: usize,
     max_samples: usize,
@@ -3389,6 +3482,88 @@ mod prefetch_tests {
         let catalog =
             Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
         QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default())
+    }
+
+    /// A slice fetcher double that reports `SnapshotInvalidated` for every
+    /// slice and counts its dispatches, so the seam test can assert exactly
+    /// one whole-query re-resolve (two dispatches for a one-slice snapshot).
+    struct CountingInvalidated {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for CountingInvalidated {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::SnapshotInvalidated,
+                status_message: "vanished".to_string(),
+            })
+        }
+    }
+
+    /// ADR-0071 failure semantics: a slice reporting `SNAPSHOT_INVALIDATED`
+    /// makes the coordinator re-resolve and re-dispatch the *whole* query
+    /// exactly once, then give up with `SnapshotInvalidated` -- it does not
+    /// retry per slice or loop. The dispatch counter proves "exactly once":
+    /// one segment resolves to one slice, so two dispatches total means the
+    /// initial attempt plus a single re-resolve.
+    #[tokio::test]
+    async fn distributed_snapshot_invalidation_reresolves_once() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let distributed = Arc::new(crate::distrib::Distributed::new(
+            Arc::new(CountingInvalidated {
+                calls: Arc::clone(&calls),
+            }),
+            // Thresholds of 0 force the cost gate on for even this one-segment
+            // snapshot, so the seam takes the distributed path.
+            crate::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let eng = engine(Arc::clone(&store)).with_distributed(distributed);
+
+        let plans = vec![window_plan("metric_a")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let err = match eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+        {
+            Ok(_) => panic!("an always-invalidated worker must fail the query"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, QueryError::SnapshotInvalidated),
+            "expected SnapshotInvalidated after the single retry, got {err:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one slice dispatched on the initial attempt and once more after \
+             exactly one re-resolve"
+        );
     }
 
     /// Two selectors for two disjoint metrics: the merged source must

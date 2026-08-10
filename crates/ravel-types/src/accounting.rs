@@ -196,6 +196,51 @@ impl QueryAccounting {
         }
     }
 
+    /// Folds a cost snapshot reported by another process into this handle
+    /// (ADR-0071 distributed read fan-out): the coordinator calls this with
+    /// each slice worker's returned [`QueryAccountingSnapshot`] so the query's
+    /// aggregate cost reflects the remote fetches it dispatched. Every counter
+    /// accumulates; `peak_intermediate_bytes` merges through
+    /// [`Self::observe_intermediate_bytes`] (a max), never a sum, because it is
+    /// a per-worker-process high-water mark, not a total any single process
+    /// ever held. This is the live-handle counterpart of
+    /// [`QueryAccountingSnapshot::saturating_merge`].
+    pub fn merge_snapshot(&self, other: &QueryAccountingSnapshot) {
+        for op in AccountedOp::ALL {
+            self.0.ops[op.index()]
+                .requests
+                .fetch_add(other.s3_requests(op), Ordering::Relaxed);
+            self.0.ops[op.index()]
+                .bytes
+                .fetch_add(other.s3_bytes(op), Ordering::Relaxed);
+        }
+        self.0
+            .cache_hits
+            .fetch_add(other.cache_hits, Ordering::Relaxed);
+        self.0
+            .cache_misses
+            .fetch_add(other.cache_misses, Ordering::Relaxed);
+        self.0
+            .cache_bytes
+            .fetch_add(other.cache_bytes, Ordering::Relaxed);
+        self.0
+            .decompressed_bytes
+            .fetch_add(other.decompressed_bytes, Ordering::Relaxed);
+        self.0
+            .segments_opened
+            .fetch_add(other.segments_opened, Ordering::Relaxed);
+        self.0
+            .segments_pruned
+            .fetch_add(other.segments_pruned, Ordering::Relaxed);
+        self.0
+            .series_matched
+            .fetch_add(other.series_matched, Ordering::Relaxed);
+        self.0
+            .bytes_reused
+            .fetch_add(other.bytes_reused, Ordering::Relaxed);
+        self.observe_intermediate_bytes(other.peak_intermediate_bytes);
+    }
+
     /// Point-in-time copy of every counter. Not atomic across fields:
     /// concurrent increments may land between two reads, so this is a
     /// scrape, not a consistent cut, mirroring
@@ -299,6 +344,28 @@ impl QueryAccountingSnapshot {
                 .peak_intermediate_bytes
                 .max(other.peak_intermediate_bytes),
         }
+    }
+
+    /// Field-wise combine of a coordinator's per-slice accounting snapshots
+    /// into one query total (ADR-0071 distributed read fan-out). Each slice
+    /// runs the existing fetch path over a disjoint segment set under its own
+    /// [`QueryAccounting`] handle and returns a snapshot in its terminal
+    /// summary frame; the coordinator merges them to report the whole query's
+    /// cost, exactly as it merges per-selector snapshots locally.
+    ///
+    /// The per-field semantics are identical to [`saturating_add`], and this
+    /// delegates to it so the two can never drift: every accumulating counter
+    /// adds saturating (the slices touched disjoint segments, so their request,
+    /// byte, and matched counts genuinely sum), while `peak_intermediate_bytes`
+    /// takes the maximum, never the sum. The peak is a per-process high-water
+    /// mark of memory held at one instant; slices run in separate worker
+    /// processes, so the query's peak is the largest single slice's peak, not
+    /// the total that never coexisted. Summing it would fabricate a peak no
+    /// process ever reached.
+    ///
+    /// [`saturating_add`]: QueryAccountingSnapshot::saturating_add
+    pub fn saturating_merge(&self, other: &QueryAccountingSnapshot) -> QueryAccountingSnapshot {
+        self.saturating_add(other)
     }
 }
 
@@ -597,6 +664,120 @@ mod tests {
         assert_eq!(
             sum.peak_intermediate_bytes, 500,
             "peak is the max of the two peaks, never their sum"
+        );
+    }
+
+    #[test]
+    fn snapshot_saturating_merge_sums_counters_but_maxes_the_peak() {
+        // Two per-slice snapshots as a coordinator would receive them: disjoint
+        // segment work, so counters sum, but the peak is a per-process
+        // high-water mark that must never be summed (ADR-0071 merge rule).
+        let a = QueryAccounting::new();
+        a.record_s3_request(AccountedOp::Get);
+        a.record_s3_request(AccountedOp::Head);
+        a.add_s3_bytes(AccountedOp::Get, 100);
+        a.add_decompressed_bytes(70);
+        a.observe_intermediate_bytes(300);
+        let b = QueryAccounting::new();
+        b.record_s3_request(AccountedOp::Get);
+        b.add_s3_bytes(AccountedOp::Get, 40);
+        b.add_decompressed_bytes(30);
+        b.observe_intermediate_bytes(900);
+
+        let merged = a.snapshot().saturating_merge(&b.snapshot());
+        assert_eq!(merged.s3_requests(AccountedOp::Get), 2, "get requests sum");
+        assert_eq!(
+            merged.s3_requests(AccountedOp::Head),
+            1,
+            "head requests sum"
+        );
+        assert_eq!(merged.s3_bytes(AccountedOp::Get), 140, "get bytes sum");
+        assert_eq!(merged.decompressed_bytes, 100, "decompressed bytes sum");
+        assert_eq!(
+            merged.peak_intermediate_bytes, 900,
+            "peak is the max of the two slices' peaks, never their sum"
+        );
+    }
+
+    #[test]
+    fn snapshot_saturating_merge_matches_saturating_add_field_for_field() {
+        // The coordinator merge and the per-selector sum share one field math
+        // by contract; delegating keeps them from drifting. Prove they agree
+        // on a snapshot exercising every counter and a large peak.
+        let a = QueryAccounting::new();
+        a.record_s3_request(AccountedOp::List);
+        a.add_s3_bytes(AccountedOp::List, 11);
+        a.record_cache_hit();
+        a.record_cache_miss();
+        a.add_cache_bytes(5);
+        a.add_bytes_reused(9);
+        a.observe_intermediate_bytes(1_234);
+        let b = QueryAccounting::new();
+        b.record_s3_request(AccountedOp::Head);
+        b.add_s3_bytes(AccountedOp::Head, 3);
+        b.record_cache_hit();
+        b.add_cache_bytes(7);
+        b.observe_intermediate_bytes(4_321);
+
+        let sa = a.snapshot();
+        let sb = b.snapshot();
+        assert_eq!(sa.saturating_merge(&sb), sa.saturating_add(&sb));
+    }
+
+    #[test]
+    fn merge_snapshot_folds_slice_snapshots_into_a_live_handle() {
+        // The coordinator's live handle after folding several slice snapshots:
+        // counters accumulate across every slice, and the peak is the max of
+        // the folded peaks (and any the handle already held), never a sum.
+        let agg = QueryAccounting::new();
+        agg.observe_intermediate_bytes(120); // a peak the handle already holds
+
+        let s1 = QueryAccounting::new();
+        s1.record_s3_request(AccountedOp::Get);
+        s1.add_s3_bytes(AccountedOp::Get, 100);
+        s1.add_series_matched(3);
+        s1.observe_intermediate_bytes(200);
+
+        let s2 = QueryAccounting::new();
+        s2.record_s3_request(AccountedOp::Get);
+        s2.record_s3_request(AccountedOp::List);
+        s2.add_s3_bytes(AccountedOp::Get, 40);
+        s2.add_series_matched(5);
+        s2.observe_intermediate_bytes(90);
+
+        agg.merge_snapshot(&s1.snapshot());
+        agg.merge_snapshot(&s2.snapshot());
+
+        let merged = agg.snapshot();
+        assert_eq!(merged.s3_requests(AccountedOp::Get), 2, "get requests sum");
+        assert_eq!(
+            merged.s3_requests(AccountedOp::List),
+            1,
+            "list requests sum"
+        );
+        assert_eq!(merged.s3_bytes(AccountedOp::Get), 140, "get bytes sum");
+        assert_eq!(merged.series_matched, 8, "series matched sum across slices");
+        assert_eq!(
+            merged.peak_intermediate_bytes, 200,
+            "peak is the max across folded slices and the handle's own, never a sum"
+        );
+    }
+
+    #[test]
+    fn snapshot_saturating_merge_counters_saturate_at_u64_max() {
+        let a = QueryAccountingSnapshot {
+            bytes_reused: u64::MAX,
+            ..QueryAccountingSnapshot::default()
+        };
+        let b = QueryAccountingSnapshot {
+            bytes_reused: 10,
+            ..QueryAccountingSnapshot::default()
+        };
+        let merged = a.saturating_merge(&b);
+        assert_eq!(
+            merged.bytes_reused,
+            u64::MAX,
+            "a lying/overflowing slice cannot wrap the coordinator total"
         );
     }
 
