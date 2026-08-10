@@ -168,7 +168,9 @@ evaluation or final aggregation dominates; that ceiling is explicit and is
 what a future aggregation-pushdown ADR would move. Network bytes to the
 coordinator are matcher-pruned, window-clipped decoded samples, bounded by
 the existing per-selector budgets; total S3 request count is identical to
-local execution, and instantaneous rate is capped by
+local execution for scalar-only queries (a histogram-bearing query pays the
+distributed fetch and then the local fallback fetch, with both folded into
+its reported cost), and instantaneous rate is capped by
 `max_parallel_slices` times the per-worker GET semaphore. Initial gate
 thresholds (distribute above 256 MiB estimated store bytes or 64 segments)
 are set from the crossover benchmark before defaults freeze, and every later

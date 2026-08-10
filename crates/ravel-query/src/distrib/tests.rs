@@ -1086,10 +1086,10 @@ fn coordinator_fold_saturates_overflowing_worker_reports() {
 /// so the worker's summary carries the slice's true accounting and stats, and
 /// the coordinator folds them into the query's accounting handle BEFORE
 /// signalling local fallback (`Ok(None)`). Without the fold, a histogram query
-/// pays for the distributed fetch twice and reports it once. This also pins the
-/// documented consequence: post-fallback, the local path re-enforces
-/// `max_bytes_scanned` against a handle that already carries the remote spend,
-/// so distributed-then-fallback reports (and bounds against) TRUE total cost.
+/// pays for the distributed fetch twice and reports it once. The fold this
+/// pins is the precondition for the documented engine consequence (the local
+/// fallback re-enforces `max_bytes_scanned` against a handle carrying the
+/// remote spend -- see the fallthrough comment in `engine.rs`).
 /// Deleting the worker's `any_histograms` Unsupported branch, or the
 /// coordinator's pre-fallback fold, fails the assertions below.
 #[test]
