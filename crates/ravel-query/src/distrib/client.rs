@@ -12,7 +12,7 @@ use tonic::transport::Channel;
 
 use crate::distrib::codec::{self, CodecError};
 use crate::distrib::proto::series_fetch_client::SeriesFetchClient;
-use crate::fetcher::FetchedSeriesSoa;
+use crate::fetcher::{FetchStats, FetchedSeriesSoa};
 
 /// A distributed fetch failed in a way that is not a per-slice typed status.
 /// Distinct from a [`pb::Status`] a worker returns in a summary (which the
@@ -50,6 +50,10 @@ pub struct SliceResponse {
     pub scalar: Vec<FetchedSeriesSoa>,
     /// The worker's per-slice cost accounting.
     pub accounting: ravel_types::accounting::QueryAccountingSnapshot,
+    /// The worker's per-slice `FetchStats` page counters, folded (summed) by
+    /// the coordinator so a distributed query reports the same raw-page cost in
+    /// its stats JSON the local path would (ADR-0071).
+    pub stats: FetchStats,
     /// Series the worker reported returning (for coordinator budget re-checks).
     pub series_returned: u64,
     /// Samples the worker reported returning.
@@ -130,6 +134,10 @@ impl SliceFetcher for RemoteSliceFetcher {
         Ok(SliceResponse {
             scalar,
             accounting,
+            stats: FetchStats {
+                raw_f64_pages: summary.raw_f64_pages,
+                raw_f64_bytes: summary.raw_f64_bytes,
+            },
             series_returned: summary.series_returned,
             samples_returned: summary.samples_returned,
             status: code,

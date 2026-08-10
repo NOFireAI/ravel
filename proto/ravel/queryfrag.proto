@@ -176,6 +176,14 @@ message Summary {
   uint64 series_returned = 2;
   uint64 samples_returned = 3;
   Status status = 4;
+  // The worker's per-slice FetchStats page counters (ravel_query::FetchStats),
+  // so the coordinator can report a distributed query's raw-page cost in its
+  // stats JSON exactly as the local path does, rather than defaulting to zero.
+  // Summed across slices by the coordinator; carried on every terminal summary,
+  // including non-OK ones, so a slice's spend is never lost when it falls back
+  // (ADR-0071). Additive fields, appended after the frozen 1..4.
+  uint64 raw_f64_pages = 5;
+  uint64 raw_f64_bytes = 6;
 }
 
 // Typed per-slice status, mirroring the local query's typed errors so the

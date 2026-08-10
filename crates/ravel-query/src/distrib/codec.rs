@@ -338,7 +338,13 @@ pub fn encode_segment_identity(seg: &SegmentRef) -> pb::SegmentIdentity {
         part_index,
         content_hash: seg.content_hash.to_vec(),
         object_size: seg.object_size,
-        segment_format_version: 0,
+        // The single readable/writable RSEG version (ADR-0027). `SegmentRef`
+        // carries no per-segment format version, so every current segment is a
+        // VERSION_V6 object; shipping the real constant rather than a
+        // meaningless hardcoded 0 gives #865's reconstruct-and-verify path the
+        // version to check the fetched footer against. See the final report's
+        // note on the `SegmentRef` limitation.
+        segment_format_version: u32::from(ravel_segment::VERSION_V6),
     }
 }
 
@@ -688,6 +694,11 @@ mod tests {
         assert_eq!(identity.level, 1);
         assert_eq!(identity.shard, 7);
         assert_eq!(identity.part_index, 4);
+        assert_eq!(
+            identity.segment_format_version,
+            u32::from(ravel_segment::VERSION_V6),
+            "the shipped identity names the real RSEG version, not a hardcoded 0"
+        );
         assert_eq!(identity_content_hash(&identity).expect("hash"), [5u8; 32]);
 
         let mut bad = identity;
@@ -704,5 +715,38 @@ mod tests {
             decode_status_code(-1),
             Err(CodecError::UnknownStatusCode(-1))
         );
+    }
+
+    #[test]
+    fn erasure_predicates_round_trip() {
+        // The worker must apply the identical exclusion the local path would,
+        // so every predicate's matchers and window bounds must survive the
+        // wire. A windowed and a windowless predicate together.
+        let predicates = vec![
+            ErasurePredicate::new(
+                vec![
+                    ("__name__".to_string(), "http_requests".to_string()),
+                    ("tenant".to_string(), "acme".to_string()),
+                ],
+                1_000,
+                2_000,
+            ),
+            ErasurePredicate::windowless(vec![("__name__".to_string(), "secret".to_string())]),
+        ];
+        let decoded = decode_erasure(encode_erasure(&predicates));
+        assert_eq!(decoded.len(), predicates.len());
+        for (a, b) in decoded.iter().zip(predicates.iter()) {
+            assert_eq!(a.matchers(), b.matchers(), "erasure matchers changed");
+            assert_eq!(
+                a.window_start_ns(),
+                b.window_start_ns(),
+                "erasure window start changed"
+            );
+            assert_eq!(
+                a.window_end_ns(),
+                b.window_end_ns(),
+                "erasure window end changed"
+            );
+        }
     }
 }

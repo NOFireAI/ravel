@@ -36,12 +36,13 @@ use futures::{StreamExt, stream};
 use ravel_catalog::Snapshot;
 use ravel_promql::LabelMatcher;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{SeriesId, Signal, TenantHash};
 
 use crate::config::{ByteLimit, EngineConfig};
 use crate::distrib::client::{DistribError, SliceFetcher};
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
+use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
@@ -79,8 +80,9 @@ impl Distributed {
         &self.thresholds
     }
 
-    /// Partitions the snapshot, dispatches one request per slice, and collects
-    /// the results.
+    /// Partitions the snapshot, dispatches one request per slice, and folds the
+    /// results incrementally as each slice completes (so a budget trip or a
+    /// hard error short-circuits without draining the rest).
     ///
     /// Returns:
     /// - `Ok(Some(triple))` when every slice succeeded: the coordinator merges
@@ -121,7 +123,7 @@ impl Distributed {
         let signal_disc = codec::signal_to_u32(signal);
 
         let concurrency = self.thresholds.max_parallel_slices.max(1);
-        let responses: Vec<Result<client::SliceResponse, DistribError>> = stream::iter(slices)
+        let mut stream = stream::iter(slices)
             .map(|slice| {
                 let request = pb::FetchRequest {
                     protocol_version: codec::PROTOCOL_VERSION,
@@ -146,23 +148,84 @@ impl Distributed {
                 let fetcher = Arc::clone(&self.fetcher);
                 async move { fetcher.fetch(request).await }
             })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+            .buffer_unordered(concurrency);
 
-        // Classify the slice outcomes. A terminal hard error dominates (fail
-        // the query); a snapshot invalidation triggers the engine's single
-        // re-resolve/retry; an Unsupported status triggers the silent local
-        // fallback. Only when every slice is OK do we build the merged triple.
-        let mut ok = Vec::with_capacity(responses.len());
+        // Process slices incrementally as each completes, so the coordinator's
+        // budget re-enforcement short-circuits at slice granularity: a hard
+        // error or a budget trip returns immediately, dropping `stream`, which
+        // stops polling and cancels the in-flight slice futures (they are
+        // polled inline by `buffer_unordered`, never `tokio::spawn`ed, so there
+        // is nothing to leak). Soft outcomes (a snapshot invalidation or an
+        // Unsupported fallback) are recorded and draining continues, so a later
+        // hard error still dominates them (precedence: hard > invalidated >
+        // unsupported), matching the former collect-then-classify behavior.
+        let mut distinct: HashSet<SeriesId> = HashSet::new();
+        let mut per_slice: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
+        // Running fold of the per-slice accounting snapshots (ADR-0071),
+        // combined via the saturating merge so a worker near `u64::MAX` clamps
+        // rather than wrapping past the bytes-scanned budget. This is the
+        // coordinator's own view for the incremental budget check; each slice
+        // is also folded into the live `accounting` handle so the query's
+        // reported cost reflects every dispatched fetch even when the query
+        // then fails or falls back.
+        let mut running = QueryAccountingSnapshot::default();
+        let mut stats = FetchStats::default();
         let mut invalidated = false;
         let mut unsupported = false;
-        for response in responses {
-            let response = response.map_err(distrib_error)?;
+
+        while let Some(result) = stream.next().await {
+            let response = result.map_err(distrib_error)?;
             match response.status {
-                pb::status::Code::Ok => ok.push(response),
+                pb::status::Code::Ok => {
+                    fold_slice(accounting, &mut running, &mut stats, &response);
+                    // Series cap re-enforcement: a lying worker cannot overrun
+                    // the query's distinct-series cap. The sample cap is
+                    // enforced downstream by the k-way merge, after
+                    // cross-segment dedup, which is where a sample total is
+                    // meaningful.
+                    for fs in &response.scalar {
+                        if !distinct.contains(&fs.series_id) && distinct.len() >= config.max_series
+                        {
+                            return Err(QueryError::TooManySeries {
+                                count: distinct.len() + 1,
+                                max: config.max_series,
+                            });
+                        }
+                        distinct.insert(fs.series_id);
+                    }
+                    // Bytes-scanned cap re-enforcement over the folded total so
+                    // far, so a distributed query is bounded as tightly as a
+                    // local one even if a worker under-reports its own trip.
+                    if let Some(err) =
+                        bytes_scanned_exceeded(running.total_s3_bytes(), config.max_bytes_scanned)
+                    {
+                        return Err(err);
+                    }
+                    per_slice.push(response.scalar);
+                }
                 pb::status::Code::SnapshotInvalidated => invalidated = true,
-                pb::status::Code::Unsupported => unsupported = true,
+                pb::status::Code::Unsupported => {
+                    // Fold the slice's spend before the fallback: the whole
+                    // query re-runs locally, so without this the already-paid
+                    // remote fetch would be silently dropped from the reported
+                    // cost (a histogram-bearing query would pay ~2x, report 1x).
+                    fold_slice(accounting, &mut running, &mut stats, &response);
+                    unsupported = true;
+                }
+                pb::status::Code::BudgetExceeded => {
+                    // Fold the slice's real spend, then fail with the same
+                    // typed error the local path raises. The worker tripped on
+                    // the full per-slice budget (which equals the query's), so
+                    // the folded total is at or over it.
+                    fold_slice(accounting, &mut running, &mut stats, &response);
+                    return Err(bytes_scanned_exceeded(
+                        running.total_s3_bytes(),
+                        config.max_bytes_scanned,
+                    )
+                    .unwrap_or_else(|| QueryError::Distrib {
+                        reason: format!("slice tripped its budget: {}", response.status_message),
+                    }));
+                }
                 other => {
                     return Err(QueryError::Distrib {
                         reason: format!("slice returned {other:?}: {}", response.status_message),
@@ -174,6 +237,9 @@ impl Distributed {
         if invalidated {
             // Map to the same error the local fetch raises for a vanished
             // segment, so `resolve_snapshot_with_retry` handles it identically.
+            // Accounting folded above is retained on the live handle: the local
+            // path likewise accumulates the cost of a fetch that then hits a
+            // NotFound and retries.
             return Err(QueryError::Fetch(FetchError::Store {
                 key: "distributed-slice".to_string(),
                 source: ravel_object_store::StoreError::NotFound,
@@ -183,30 +249,29 @@ impl Distributed {
             return Ok(None);
         }
 
-        // Coordinator budget re-enforcement (ADR-0071): a lying worker cannot
-        // overrun the query's series cap. Count distinct series across every
-        // slice against `max_series`, independent of any per-slice budget the
-        // worker was supposed to honor. The sample cap is enforced downstream
-        // by the k-way merge, after cross-segment dedup, which is where a
-        // sample total is meaningful.
-        let mut distinct: HashSet<SeriesId> = HashSet::new();
-        let mut per_slice: Vec<Vec<FetchedSeriesSoa>> = Vec::with_capacity(ok.len());
-        for response in ok {
-            accounting.merge_snapshot(&response.accounting);
-            for fs in &response.scalar {
-                if !distinct.contains(&fs.series_id) && distinct.len() >= config.max_series {
-                    return Err(QueryError::TooManySeries {
-                        count: distinct.len() + 1,
-                        max: config.max_series,
-                    });
-                }
-                distinct.insert(fs.series_id);
-            }
-            per_slice.push(response.scalar);
-        }
-
-        Ok(Some((per_slice, FetchStats::default(), Vec::new())))
+        Ok(Some((per_slice, stats, Vec::new())))
     }
+}
+
+/// Folds one OK/Unsupported slice's reported cost into both the query's live
+/// accounting handle (so the reported total reflects it) and the coordinator's
+/// running snapshot (the basis for the incremental bytes-scanned check), and
+/// sums its `FetchStats` page counters. Both accounting folds saturate, so a
+/// worker reporting a counter near `u64::MAX` clamps rather than wrapping.
+fn fold_slice(
+    live: &QueryAccounting,
+    running: &mut QueryAccountingSnapshot,
+    stats: &mut FetchStats,
+    response: &client::SliceResponse,
+) {
+    live.merge_snapshot(&response.accounting);
+    *running = running.saturating_merge(&response.accounting);
+    stats.raw_f64_pages = stats
+        .raw_f64_pages
+        .saturating_add(response.stats.raw_f64_pages);
+    stats.raw_f64_bytes = stats
+        .raw_f64_bytes
+        .saturating_add(response.stats.raw_f64_bytes);
 }
 
 /// Maps a per-slice `Budgets` share from the engine config. `Unlimited` bytes

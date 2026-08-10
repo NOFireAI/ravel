@@ -1003,9 +1003,14 @@ impl QueryEngine {
                     )
                     .await?
                 {
-                    // The bytes-scanned budget is a coordinator-side invariant
-                    // too: re-check it against the folded accounting so a
-                    // distributed query is bounded exactly as a local one.
+                    // Bytes-scanned enforcement is two-tiered (ADR-0071):
+                    // slice-granularity short-circuit at the coordinator (it
+                    // folds each slice's accounting as that slice completes and
+                    // trips this budget before draining the rest) plus
+                    // segment-granularity enforcement on each worker. This
+                    // final re-check is a backstop against a worker that
+                    // under-reports: it re-evaluates the same budget over the
+                    // fully-folded accounting the distributed fetch returned.
                     if let Some(err) = bytes_scanned_exceeded(
                         accounting.snapshot().total_s3_bytes(),
                         max_bytes_scanned,
@@ -1186,7 +1191,10 @@ impl From<SeriesBuildError> for QueryError {
 /// segment concurrency, so a tripped budget cancels the remaining in-flight
 /// fetches instead of paying for them; [`ByteLimit::Unlimited`] never trips,
 /// so a caller that does not opt in behaves exactly as before.
-fn bytes_scanned_exceeded(bytes_scanned: u64, max_bytes_scanned: ByteLimit) -> Option<QueryError> {
+pub(crate) fn bytes_scanned_exceeded(
+    bytes_scanned: u64,
+    max_bytes_scanned: ByteLimit,
+) -> Option<QueryError> {
     match max_bytes_scanned {
         ByteLimit::Bounded(max) if bytes_scanned > max => Some(QueryError::TooManyBytesScanned {
             scanned: bytes_scanned,
@@ -3502,6 +3510,7 @@ mod prefetch_tests {
             Ok(crate::distrib::client::SliceResponse {
                 scalar: Vec::new(),
                 accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: crate::fetcher::FetchStats::default(),
                 series_returned: 0,
                 samples_returned: 0,
                 status: ravel_proto::queryfrag::v1::status::Code::SnapshotInvalidated,

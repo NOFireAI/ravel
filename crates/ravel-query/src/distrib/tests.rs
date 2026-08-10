@@ -24,7 +24,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::SeriesData;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -38,6 +38,7 @@ use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, Sli
 use crate::distrib::partition::DistribThresholds;
 use crate::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
 use crate::engine::merge_soa_runs;
+use crate::erasure::ErasurePredicate;
 use crate::fetcher::SegmentFetcher;
 
 const NS: i64 = 1_000_000;
@@ -64,9 +65,14 @@ struct SeriesDesc {
 }
 
 /// Writes one real RSEG segment holding `descs` and returns its `SegmentRef`.
-/// Each segment gets a unique `writer_seq`/`created_unix_ns` (from `seq`) so
-/// the ADR-0010 cross-segment dedup total order is fully determined and the
-/// merge result cannot depend on slice grouping.
+///
+/// The corpus deliberately gives every segment the *same* `created_unix_ns`
+/// (0) and a per-segment `writer_seq` (from `seq`), leaving `writer_epoch`
+/// constant at 1. So the ADR-0010 cross-segment dedup total order
+/// `(created_unix_ns, writer_epoch, writer_seq, ...)` is decided by
+/// `writer_seq`, not `created_unix_ns` -- exercising a tie-break field past the
+/// first across the wire (finding 9). The full four-field chain is isolated
+/// field-by-field in [`dedup_tiebreak_chain_survives_the_wire`].
 async fn write_segment(
     store: &MemoryStore,
     seq: u64,
@@ -74,13 +80,35 @@ async fn write_segment(
     hour_bucket: u32,
     descs: &[SeriesDesc],
 ) -> SegmentRef {
-    let writer_id = Uuid::from_u128(u128::from(seq) + 1);
+    write_segment_prov(store, seq, 0, 1, seq, shard, hour_bucket, descs).await
+}
+
+/// Writes one real RSEG segment with explicit dedup-provenance fields. `key`
+/// makes the object key and `writer_id` unique even when the dedup priority
+/// tuple `(created_unix_ns, writer_epoch, writer_seq)` collides with another
+/// segment's (writer_id is not part of the priority, so a pair can tie on the
+/// whole prefix and be decided by the value bit pattern). The written RSEG
+/// `SegmentIdentity` carries `writer_epoch`/`writer_seq` so the fetch path's
+/// footer identity check passes; `created_unix_ns` lives on the `SegmentRef`
+/// only (it is not part of the footer identity), so it can be set freely.
+#[allow(clippy::too_many_arguments)]
+async fn write_segment_prov(
+    store: &MemoryStore,
+    key: u64,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    shard: u32,
+    hour_bucket: u32,
+    descs: &[SeriesDesc],
+) -> SegmentRef {
+    let writer_id = Uuid::from_u128(u128::from(key) + 1);
     let identity = SegmentIdentity {
         tenant_hash: TENANT.0,
         shard,
         writer_id: writer_id.to_string(),
-        writer_epoch: 1,
-        writer_seq: seq,
+        writer_epoch,
+        writer_seq,
     };
     let series: Vec<SeriesInput> = descs
         .iter()
@@ -107,13 +135,13 @@ async fn write_segment(
         max_ingest_ts_ns: 0,
     };
     let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
-    let key = format!("seg/{seq}.rseg");
+    let object_key = format!("seg/{key}.rseg");
     store
-        .put(&key, written.bytes.clone(), PutOptions::default())
+        .put(&object_key, written.bytes.clone(), PutOptions::default())
         .await
         .expect("put segment");
     SegmentRef {
-        data_object_key: key,
+        data_object_key: object_key,
         object_size: written.bytes.len() as u64,
         min_event_ts_ns: written.summary.min_event_ts_ns,
         max_event_ts_ns: written.summary.max_event_ts_ns,
@@ -123,10 +151,9 @@ async fn write_segment(
         shard,
         content_hash: written.summary.blake3,
         writer_id,
-        writer_epoch: 1,
-        writer_seq: seq,
-        // Unique per segment so the dedup priority prefix is a total order.
-        created_unix_ns: seq as i64,
+        writer_epoch,
+        writer_seq,
+        created_unix_ns,
         level: SegmentLevel::L0,
     }
 }
@@ -163,22 +190,32 @@ async fn spawn_worker(
 /// The local reference: fetch every snapshot segment's scalar runs directly,
 /// exactly as `QueryEngine::fetch_all_samples_and_histograms` does (no matchers,
 /// no erasure -- the corpus carries none), producing the per-segment run pool
-/// the local path would merge.
+/// the local path would merge, plus the accounting snapshot and summed
+/// `FetchStats` the local path reports. The distributed path must reproduce all
+/// three (finding 4: a distributed query reports the same cost and stats a
+/// local one does, not zeros).
 async fn local_scalar(
     store: Arc<MemoryStore>,
     snapshot: &Snapshot,
-) -> Vec<Vec<crate::fetcher::FetchedSeriesSoa>> {
+) -> (
+    Vec<Vec<crate::fetcher::FetchedSeriesSoa>>,
+    QueryAccountingSnapshot,
+    crate::fetcher::FetchStats,
+) {
     let fetcher = SegmentFetcher::new(store);
     let accounting = QueryAccounting::new();
     let mut out = Vec::with_capacity(snapshot.segments.len());
+    let mut stats = crate::fetcher::FetchStats::default();
     for seg in &snapshot.segments {
-        let (scalar, _stats, _hist) = fetcher
+        let (scalar, seg_stats, _hist) = fetcher
             .fetch_soa_and_histograms_accounted(TENANT, seg, &[], &accounting)
             .await
             .expect("local fetch");
+        stats.raw_f64_pages += seg_stats.raw_f64_pages;
+        stats.raw_f64_bytes += seg_stats.raw_f64_bytes;
         out.push(scalar);
     }
-    out
+    (out, accounting.snapshot(), stats)
 }
 
 fn assert_series_bit_identical(local: &[SeriesData], distributed: &[SeriesData]) {
@@ -216,9 +253,8 @@ fn assert_series_bit_identical(local: &[SeriesData], distributed: &[SeriesData])
     }
 }
 
-/// Runs one acceptance case: build the corpus, resolve it as a snapshot, fetch
-/// it both locally and distributed over the loopback worker, and assert the two
-/// coordinator-merged results are byte-identical.
+/// Runs one acceptance case: build the corpus, then assert the distributed
+/// fetch matches the local one over it.
 async fn run_acceptance(
     segments_desc: Vec<(u32, u32, Vec<SeriesDesc>)>,
     max_parallel_slices: usize,
@@ -228,6 +264,17 @@ async fn run_acceptance(
     for (seq, (shard, hour, descs)) in segments_desc.into_iter().enumerate() {
         segments.push(write_segment(&store, seq as u64, shard, hour, &descs).await);
     }
+    assert_distributed_matches_local(store, segments, max_parallel_slices).await;
+}
+
+/// Fetches `segments` both locally and distributed over a loopback worker and
+/// asserts the two coordinator-merged results are byte-identical and that the
+/// distributed path reports the same accounting and stats the local path does.
+async fn assert_distributed_matches_local(
+    store: Arc<MemoryStore>,
+    segments: Vec<SegmentRef>,
+    max_parallel_slices: usize,
+) {
     let snapshot = Snapshot {
         segments: segments.clone(),
         segments_pruned: 0,
@@ -235,7 +282,7 @@ async fn run_acceptance(
     };
 
     // Local reference.
-    let local_runs = local_scalar(Arc::clone(&store), &snapshot).await;
+    let (local_runs, local_acct, local_stats) = local_scalar(Arc::clone(&store), &snapshot).await;
     let local_merged = merge_soa_runs(local_runs, usize::MAX, usize::MAX).expect("local merge");
 
     // Distributed over a real tonic worker.
@@ -261,9 +308,23 @@ async fn run_acceptance(
         .await
         .expect("distributed fetch")
         .expect("distributed produced a result (not a fallback)");
+    let distributed_stats = triple.1;
     let distributed_merged = merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("dist merge");
 
     assert_series_bit_identical(&local_merged, &distributed_merged);
+    // The distributed path folds every slice's accounting and stats, so it
+    // reports the same cost the local path does over the same disjoint
+    // segments -- not `FetchStats::default()` zeros, and not a wrapped or
+    // dropped accounting counter (findings 3 and 4).
+    assert_eq!(
+        accounting.snapshot(),
+        local_acct,
+        "distributed accounting must equal local accounting"
+    );
+    assert_eq!(
+        distributed_stats, local_stats,
+        "distributed FetchStats must equal local FetchStats, not zeros"
+    );
     server.abort();
 }
 
@@ -296,7 +357,12 @@ fn arb_segment() -> impl Strategy<Value = (u32, u32, Vec<SeriesDesc>)> {
             })
             .collect::<Vec<_>>()
     });
-    (0u32..3, 100u32..104, series)
+    // Shards span 0..8 (finding 10): with up to 7 segments below, a corpus can
+    // hold more distinct shards than the slice cap (1..=6), so the cap actually
+    // binds and slice counts past the cap boundary are generated -- caps 4..6
+    // are no longer indistinguishable from 3. A narrower `0u32..3` capped
+    // distinct shards at 3, so every cap >= 3 behaved identically.
+    (0u32..8, 100u32..104, series)
 }
 
 proptest! {
@@ -307,7 +373,7 @@ proptest! {
     /// arbitrary slice counts.
     #[test]
     fn distributed_merge_equals_local_bitwise(
-        segments in prop::collection::vec(arb_segment(), 1..6),
+        segments in prop::collection::vec(arb_segment(), 1..8),
         cap in 1usize..=6,
     ) {
         let rt = Runtime::new().expect("runtime");
@@ -344,6 +410,190 @@ fn reshard_activation_hour_series_spans_two_slices() {
         ];
         // cap 2 => the two shards land in two distinct slices.
         run_acceptance(corpus, 2).await;
+    });
+}
+
+// --- worker-side erasure ---------------------------------------------------
+
+/// Runs a distributed fetch with the given erasure predicates over a loopback
+/// worker, merges the result, and returns the sorted set of `__name__`s
+/// present. Threads erasure through the fetch exactly as the engine does.
+async fn distributed_metric_names(
+    store: Arc<MemoryStore>,
+    segments: Vec<SegmentRef>,
+    snapshot: &Snapshot,
+    erasure: &[ErasurePredicate],
+    cap: usize,
+) -> Vec<String> {
+    let (fetcher, server) = spawn_worker(store, segments).await;
+    let distributed = Distributed::new(
+        Arc::new(fetcher),
+        DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: cap,
+        },
+    );
+    let accounting = QueryAccounting::new();
+    let triple = distributed
+        .fetch(
+            TENANT,
+            Signal::Metrics,
+            snapshot,
+            &[],
+            erasure,
+            &accounting,
+            &EngineConfig::default(),
+        )
+        .await
+        .expect("distributed fetch")
+        .expect("distributed produced a result");
+    let merged = merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("merge");
+    server.abort();
+    let mut names: Vec<String> = merged
+        .iter()
+        .map(|s| {
+            s.labels
+                .iter()
+                .find(|l| l.name == "__name__")
+                .map(|l| l.value.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The worker applies the request's erasure predicates post-decode, before
+/// streaming, exactly as the local path would (ADR-0064, ADR-0071): the
+/// coordinator does not re-apply, so a series the predicate erases must be
+/// absent from the distributed result. Deleting the worker's
+/// `retain_series_soa` call (`service.rs`) makes the erased series reappear and
+/// the "erased absent" assertion below fails (finding 8).
+#[test]
+fn worker_applies_erasure_before_streaming() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let descs = vec![
+            SeriesDesc {
+                metric: "keep".to_string(),
+                samples: vec![(NS, 1.0f64.to_bits()), (2 * NS, 2.0f64.to_bits())],
+            },
+            SeriesDesc {
+                metric: "erased".to_string(),
+                samples: vec![(NS, 3.0f64.to_bits()), (2 * NS, 4.0f64.to_bits())],
+            },
+        ];
+        let seg = write_segment(&store, 0, 0, 100, &descs).await;
+        let segments = vec![seg];
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // No erasure: both series present (baseline, so the assertion below is
+        // about erasure, not a corpus that never held the series).
+        let both =
+            distributed_metric_names(Arc::clone(&store), segments.clone(), &snapshot, &[], 1).await;
+        assert_eq!(
+            both,
+            vec!["erased".to_string(), "keep".to_string()],
+            "without erasure both series are present"
+        );
+
+        // Windowless predicate on __name__="erased": the whole series is erased.
+        let erasure = vec![ErasurePredicate::windowless(vec![(
+            "__name__".to_string(),
+            "erased".to_string(),
+        )])];
+        let kept =
+            distributed_metric_names(Arc::clone(&store), segments, &snapshot, &erasure, 1).await;
+        assert_eq!(
+            kept,
+            vec!["keep".to_string()],
+            "the erased series must be absent from the distributed result"
+        );
+    });
+}
+
+// --- dedup tie-break chain across the wire ---------------------------------
+
+/// Exercises every field of the ADR-0010 cross-segment dedup total order
+/// -- `(created_unix_ns, writer_epoch, writer_seq, ...)` then the f64 value bit
+/// pattern -- end to end across the wire. For each of four metrics, two
+/// single-series segments carry the *same* `(series_id, ts)` duplicate and
+/// differ in exactly one priority field; the field's winner is engineered to
+/// carry the *smaller* value bit pattern, so if that field were dropped on the
+/// wire (encoded as 0) the value tie-break would pick the other record and the
+/// distributed result would diverge from local. Deleting `created_unix_ns`,
+/// `writer_epoch`, or `writer_seq` from `encode_series_frame` (`codec.rs`)
+/// therefore fails this differential (finding 9); the local path always uses
+/// the real provenance, so only the wire-carried side changes.
+/// One segment of a dedup tie-break pair: its provenance priority fields and
+/// the value bit pattern it carries for a single sample at `ts=NS`.
+struct TiebreakRecord {
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    value_bits: u64,
+}
+
+#[test]
+fn dedup_tiebreak_chain_survives_the_wire() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        // Two segments per metric carry the same (series_id, ts) duplicate and
+        // differ in exactly one priority field; the winner (higher priority)
+        // carries the smaller value, so zeroing the deciding field on the wire
+        // flips the winner to the loser.
+        let hi = 9.0f64.to_bits(); // larger value bits
+        let lo = 1.0f64.to_bits(); // smaller value bits
+        let rec = |created_unix_ns, writer_epoch, writer_seq, value_bits| TiebreakRecord {
+            created_unix_ns,
+            writer_epoch,
+            writer_seq,
+            value_bits,
+        };
+        // created decides: equal epoch/seq, created 10 vs 20; winner=created 20.
+        // epoch decides:   equal created/seq, epoch 1 vs 2;   winner=epoch 2.
+        // seq decides:     equal created/epoch, seq 1 vs 2;    winner=seq 2.
+        // value decides:   equal created/epoch/seq;            winner=hi value.
+        let pairs: [(&str, [TiebreakRecord; 2]); 4] = [
+            ("mCreated", [rec(10, 5, 5, hi), rec(20, 5, 5, lo)]),
+            ("mEpoch", [rec(100, 1, 7, hi), rec(100, 2, 7, lo)]),
+            ("mSeq", [rec(200, 3, 1, hi), rec(200, 3, 2, lo)]),
+            ("mValue", [rec(300, 4, 6, lo), rec(300, 4, 6, hi)]),
+        ];
+        let mut segments = Vec::new();
+        let mut key = 0u64;
+        for (metric, records) in pairs {
+            for r in records {
+                let descs = vec![SeriesDesc {
+                    metric: metric.to_string(),
+                    samples: vec![(NS, r.value_bits)],
+                }];
+                segments.push(
+                    write_segment_prov(
+                        &store,
+                        key,
+                        r.created_unix_ns,
+                        r.writer_epoch,
+                        r.writer_seq,
+                        0,
+                        100,
+                        &descs,
+                    )
+                    .await,
+                );
+                key += 1;
+            }
+        }
+        // cap 1 forces all eight segments into one slice; the merge (and its
+        // tie-break) runs over the full pool, identical to local.
+        assert_distributed_matches_local(store, segments, 1).await;
     });
 }
 
@@ -408,6 +658,160 @@ fn coordinator_reenforces_series_budget_over_honest_worker() {
     });
 }
 
+/// ADR-0061/ADR-0071 worker-side budget: a worker enforces the request's
+/// per-segment bytes-scanned budget itself (finding 1), tripping the moment a
+/// completed segment fetch pushes the slice over, and returns a
+/// `BudgetExceeded` summary that still carries the real accounting spent so far
+/// (so the coordinator folds the cost before failing, not a lost double-spend).
+/// Driving the worker directly (not through the coordinator) isolates the
+/// worker's own check: deleting the `bytes_scanned_exceeded` block in
+/// `run_slice_inner` (`service.rs`) makes the worker return `Ok` instead, and
+/// the `BudgetExceeded` assertion below fails.
+#[test]
+fn worker_trips_bytes_budget_per_segment() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let descs = vec![SeriesDesc {
+            metric: "m0".to_string(),
+            samples: vec![(NS, 1.0f64.to_bits()), (2 * NS, 2.0f64.to_bits())],
+        }];
+        let seg = write_segment(&store, 0, 0, 100, &descs).await;
+        let segments = vec![seg.clone()];
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments).await;
+
+        // A one-byte budget trips on the first completed segment fetch (a real
+        // fetch always scans more than one byte).
+        let request = pb::FetchRequest {
+            protocol_version: crate::distrib::codec::PROTOCOL_VERSION,
+            query_id: Vec::new(),
+            tenant_hash: TENANT.0.to_vec(),
+            signal: crate::distrib::codec::signal_to_u32(Signal::Metrics),
+            scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+                segments: vec![crate::distrib::codec::encode_segment_identity(&seg)],
+            })),
+            matchers: Vec::new(),
+            window_start_ns: 0,
+            window_end_ns: 0,
+            budgets: Some(pb::Budgets {
+                max_series: u64::MAX,
+                max_samples: u64::MAX,
+                max_bytes_scanned: 1,
+                max_segments: u64::MAX,
+            }),
+            deadline_unix_ns: 0,
+            erasure: Vec::new(),
+            trace_context: String::new(),
+        };
+        let response = SliceFetcher::fetch(&fetcher, request)
+            .await
+            .expect("worker responds");
+        server.abort();
+        assert_eq!(
+            response.status,
+            pb::status::Code::BudgetExceeded,
+            "worker must trip its own per-segment bytes budget"
+        );
+        assert!(
+            response.accounting.total_s3_bytes() > 0,
+            "the BudgetExceeded summary must carry the real spend, not zeros"
+        );
+    });
+}
+
+/// A [`SliceFetcher`] double that reports `Ok` while claiming (via its
+/// accounting snapshot) to have scanned `spend_bytes` -- a worker that
+/// under-enforces or lies about its own budget. Used to prove the coordinator
+/// re-enforces the bytes-scanned cap independently (finding 2).
+struct LyingBudgetWorker {
+    spend_bytes: u64,
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for LyingBudgetWorker {
+    async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let acct = QueryAccounting::new();
+        acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spend_bytes);
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            accounting: acct.snapshot(),
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status: pb::status::Code::Ok,
+            status_message: String::new(),
+        })
+    }
+}
+
+/// ADR-0071: the coordinator re-enforces the bytes-scanned budget over the
+/// folded per-slice accounting, so a worker that returns `Ok` while reporting a
+/// spend above the query's cap still fails the query with the typed
+/// `TooManyBytesScanned` -- a distributed query is bounded as tightly as a local
+/// one even if a worker under-reports its own trip (finding 2). Deleting the
+/// coordinator's `bytes_scanned_exceeded` check in the `Ok` arm (`mod.rs`) lets
+/// the over-spend through as `Ok(Some(..))` and the `expect_err` below fails.
+#[test]
+fn coordinator_reenforces_bytes_budget_over_lying_worker() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let seg = write_segment(
+            &store,
+            0,
+            0,
+            100,
+            &[SeriesDesc {
+                metric: "m0".to_string(),
+                samples: vec![(NS, 1.0f64.to_bits())],
+            }],
+        )
+        .await;
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let distributed = Distributed::new(
+            Arc::new(LyingBudgetWorker {
+                spend_bytes: 10_000,
+            }),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(100),
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        let err = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+            )
+            .await
+            .expect_err("coordinator must re-enforce the bytes budget");
+        assert!(
+            matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
+            "expected TooManyBytesScanned, got {err:?}"
+        );
+        // The lying worker's spend was still folded into the query's reported
+        // cost before the failure (never silently dropped).
+        assert!(
+            accounting.snapshot().total_s3_bytes() >= 10_000,
+            "the folded spend must survive on the live accounting handle"
+        );
+    });
+}
+
 // --- snapshot invalidation collapses to one retryable error ----------------
 
 /// A [`SliceFetcher`] double that returns a `SnapshotInvalidated` summary for
@@ -425,6 +829,7 @@ impl SliceFetcher for AlwaysInvalidated {
         Ok(SliceResponse {
             scalar: Vec::new(),
             accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+            stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
             samples_returned: 0,
             status: pb::status::Code::SnapshotInvalidated,
