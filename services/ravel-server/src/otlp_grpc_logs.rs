@@ -82,6 +82,11 @@ impl LogsService for GrpcLogsService {
                 Status::invalid_argument(err.to_string())
             }
             LogIngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),
+            // Buffer-budget shed (ADR-0069): RESOURCE_EXHAUSTED, not the
+            // UNAVAILABLE the other retryable write failures take.
+            LogIngestRequestError::Write(write_err @ ravel_ingest::LogWriteError::BufferBudgetExceeded) => {
+                Status::resource_exhausted(write_err.to_string())
+            }
             LogIngestRequestError::Write(write_err) if write_err.is_retryable() => {
                 Status::unavailable(write_err.to_string())
             }

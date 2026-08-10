@@ -127,6 +127,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
         indexed_fields: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
@@ -321,6 +322,7 @@ async fn spans_of_one_trace_land_under_one_shard_directory() {
         indexed_fields: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),

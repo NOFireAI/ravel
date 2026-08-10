@@ -186,6 +186,9 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
             crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
         ),
+        ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        ),
     });
 
     Harness {

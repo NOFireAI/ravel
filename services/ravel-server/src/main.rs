@@ -381,6 +381,9 @@ async fn main() -> anyhow::Result<()> {
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,
+        ingest_buffer_budget_limit: cli
+            .parse_ingest_buffer_budget()
+            .context("failed to parse --max-ingest-buffer-bytes")?,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;

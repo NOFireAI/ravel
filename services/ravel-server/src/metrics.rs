@@ -982,6 +982,61 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
     );
 }
 
+/// The process-wide ingest buffer byte budget family (ADR-0069 decision 1,
+/// issue #819): the current gauge of estimated buffered bytes, the configured
+/// ceiling, and the cumulative shed counter. Mode-only labeled like
+/// `render_ingest_concurrency_family` above: the budget is a single gauge
+/// shared across metrics/logs/traces with no per-signal breakdown.
+///
+/// `ravel_ingest_buffer_bytes_limit` is `0` when the ceiling is unlimited
+/// (`--max-ingest-buffer-bytes 0`), matching the flag's own "0 = unlimited"
+/// convention; a scraper reads a `0` limit as "no ceiling", not "reject
+/// everything".
+fn render_ingest_buffer_budget_family(
+    out: &mut String,
+    mode: Mode,
+    in_flight_bytes: u64,
+    ceiling: u64,
+    shed_total: u64,
+) {
+    write_header(
+        out,
+        "ravel_ingest_buffer_bytes",
+        "Estimated buffered ingest bytes currently held across all tenants and signals (the process-wide ingest byte budget gauge, ADR-0069).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_buffer_bytes",
+        &[Label::Mode(mode)],
+        in_flight_bytes,
+    );
+    write_header(
+        out,
+        "ravel_ingest_buffer_bytes_limit",
+        "Configured ingest buffer byte budget ceiling (--max-ingest-buffer-bytes); 0 means unlimited.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_buffer_bytes_limit",
+        &[Label::Mode(mode)],
+        ceiling,
+    );
+    write_header(
+        out,
+        "ravel_ingest_buffer_shed_total",
+        "Ingest requests shed before buffering by the process-wide ingest byte budget ceiling (--max-ingest-buffer-bytes).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_buffer_shed_total",
+        &[Label::Mode(mode)],
+        shed_total,
+    );
+}
+
 /// The logs prune-selectivity family (ADR-0049, issue #511 deliverable 2):
 /// blocks the logs scans saw, survived, and pruned by postings, cumulative
 /// across queries. Reads the `LogsScanExec` DataFusion counters (#544) that
@@ -2058,6 +2113,7 @@ pub fn render(
     admission: &AdmissionCountersSnapshot,
     query_accounting: &[QueryAccountingRow],
     ingest_concurrency_shed_total: u64,
+    ingest_buffer_budget: IngestBufferBudgetSnapshot,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -2094,7 +2150,24 @@ pub fn render(
     render_admission_family(&mut out, mode, admission);
     render_query_family(&mut out, mode, query_accounting);
     render_ingest_concurrency_family(&mut out, mode, ingest_concurrency_shed_total);
+    render_ingest_buffer_budget_family(
+        &mut out,
+        mode,
+        ingest_buffer_budget.in_flight_bytes,
+        ingest_buffer_budget.ceiling,
+        ingest_buffer_budget.shed_total,
+    );
     out
+}
+
+/// The three process-wide ingest byte budget readings the `/metrics` handler
+/// snapshots from [`ravel_ingest::IngestByteBudget`] at scrape time (ADR-0069).
+/// `ceiling` is `0` for unlimited, matching the flag's convention.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IngestBufferBudgetSnapshot {
+    pub in_flight_bytes: u64,
+    pub ceiling: u64,
+    pub shed_total: u64,
 }
 
 /// Router state for `GET /metrics`. Every field is a handle already built by
@@ -2148,6 +2221,10 @@ pub struct MetricsState {
     /// and mTLS listeners. Always present; its `shed_total` is simply `0`
     /// until the ceiling first rejects a request.
     pub ingest_concurrency: Arc<crate::ingest_concurrency::IngestConcurrencyController>,
+    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1), read
+    /// at scrape time for the `ravel_ingest_buffer_bytes` gauge, its limit, and
+    /// the `ravel_ingest_buffer_shed_total` counter.
+    pub ingest_buffer_budget: Arc<ravel_ingest::IngestByteBudget>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -2245,6 +2322,12 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
 
     let ingest_concurrency_shed_total = state.ingest_concurrency.shed_total();
 
+    let ingest_buffer_budget = IngestBufferBudgetSnapshot {
+        in_flight_bytes: state.ingest_buffer_budget.in_flight_bytes(),
+        ceiling: state.ingest_buffer_budget.ceiling().unwrap_or(0),
+        shed_total: state.ingest_buffer_budget.shed_total(),
+    };
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -2258,6 +2341,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &admission_snapshot,
         &query_rows,
         ingest_concurrency_shed_total,
+        ingest_buffer_budget,
     );
     (
         StatusCode::OK,
@@ -2324,6 +2408,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(
@@ -2452,6 +2537,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         let postings_lines: Vec<&str> = body
@@ -2577,6 +2663,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -2728,6 +2815,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(
@@ -2751,6 +2839,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -2806,6 +2895,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(
@@ -2847,6 +2937,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(
@@ -2880,6 +2971,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -2932,6 +3024,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(
@@ -3009,6 +3102,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(
@@ -3083,6 +3177,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -3125,6 +3220,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         for line in body.lines() {
@@ -3192,6 +3288,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -3287,6 +3384,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -3315,6 +3413,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert!(
@@ -3393,6 +3492,7 @@ mod tests {
             &snapshot,
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         assert_eq!(
@@ -3460,6 +3560,7 @@ mod tests {
             &snapshot,
             &[],
             0,
+            IngestBufferBudgetSnapshot::default(),
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -3534,6 +3635,7 @@ mod tests {
             &AdmissionCountersSnapshot::default(),
             &metrics.snapshot(),
             0,
+            IngestBufferBudgetSnapshot::default(),
         )
     }
 

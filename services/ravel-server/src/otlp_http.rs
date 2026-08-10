@@ -17,7 +17,9 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
-use ravel_ingest::{AdmissionController, RequestRejection, WriteMode};
+use ravel_ingest::{
+    AdmissionController, LogWriteError, RequestRejection, SpanWriteError, WriteError, WriteMode,
+};
 use ravel_query::http::TenantResolver;
 use ravel_types::Signal;
 
@@ -116,6 +118,28 @@ fn ingest_concurrency_shed_response() -> Response {
     )
         .into_response();
     if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// A fixed `Retry-After` for the process-wide ingest buffer byte budget shed
+/// (ADR-0069): like the in-flight shed above, the budget tracks no per-caller
+/// refill time -- a buffer slot frees as soon as any in-flight flush completes
+/// -- so a short fixed wait is the right shape.
+const INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// 429 for a request shed by the process-wide ingest buffer byte budget
+/// (ADR-0069 decision 1): the write was rejected before any buffering, so no
+/// shard was touched and no commit token issued. Same 429 + `Retry-After`
+/// shape as the byte-rate rejection and the in-flight shed.
+fn ingest_buffer_budget_shed_response() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "ingest buffer byte budget reached",
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
@@ -262,6 +286,12 @@ async fn export_metrics(
         Err(err @ IngestRequestError::Provisioning(_)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
+        // The buffer-budget shed (ADR-0069) is a 429, not the 503 the other
+        // write failures take: it is an admission backpressure signal, not a
+        // durability failure, and the client should retry with backoff.
+        Err(IngestRequestError::Write(WriteError::BufferBudgetExceeded)) => {
+            ingest_buffer_budget_shed_response()
+        }
         Err(err @ IngestRequestError::Write(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
@@ -332,6 +362,9 @@ async fn export_logs(
         Err(err @ LogIngestRequestError::Provisioning(_)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
+        Err(LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)) => {
+            ingest_buffer_budget_shed_response()
+        }
         Err(err @ LogIngestRequestError::Write(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
@@ -401,6 +434,9 @@ async fn export_traces(
         }
         Err(err @ SpanIngestRequestError::Provisioning(_)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
+        Err(SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)) => {
+            ingest_buffer_budget_shed_response()
         }
         Err(err @ SpanIngestRequestError::Write(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
