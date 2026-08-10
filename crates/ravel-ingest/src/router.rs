@@ -12,6 +12,7 @@ use ravel_otlp::NormalizedPoint;
 use ravel_types::{CommitToken, Signal, TenantId, shard_for};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::error::WriteError;
@@ -60,6 +61,13 @@ pub struct IngestRouter {
     clock: Arc<dyn Clock>,
     metrics: Arc<IngestMetrics>,
     config: IngestConfig,
+    /// Process-wide ingest buffer byte budget (ADR-0069 decision 1, issue
+    /// #819). Shared by `Arc` with the log and span routers so one ceiling
+    /// bounds the sum across all signals. Defaults to `Unlimited` for callers
+    /// (chiefly tests) that build a router without one via [`IngestRouter::new`];
+    /// `services/ravel-server` installs the configured budget with
+    /// [`IngestRouter::with_budget`].
+    budget: Arc<IngestByteBudget>,
 }
 
 impl IngestRouter {
@@ -132,7 +140,19 @@ impl IngestRouter {
             clock,
             metrics,
             config,
+            budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
         }
+    }
+
+    /// Installs the process-wide ingest buffer byte budget (ADR-0069 decision
+    /// 1). `services/ravel-server` builds one [`IngestByteBudget`] at startup
+    /// and calls this on each of the metrics, log, and span routers with the
+    /// same `Arc`, so a single `--max-ingest-buffer-bytes` ceiling bounds the
+    /// buffered-byte sum across every signal.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
+        self.budget = budget;
+        self
     }
 
     pub fn metrics(&self) -> &IngestMetrics {
@@ -255,6 +275,34 @@ impl IngestRouter {
         if points.is_empty() && exemplars.is_empty() {
             return Ok(WriteReceipt::default());
         }
+
+        // Global ingest byte budget (ADR-0069 decision 1). Charge the estimated
+        // buffered bytes here -- after decode/normalize/admission (the caller
+        // hands us the admitted points), before any shard buffer is touched --
+        // and shed at the ceiling before routing so a shed request touches no
+        // shard and mints no commit token. The charge is refunded when the
+        // flush(es) holding these bytes complete or fail: the guard is cloned
+        // into every shard message below, each shard buffer holds its clone
+        // until it flushes, and `IngestByteCharge::drop` refunds the exact
+        // amount once the last clone is dropped. On any early return from here
+        // on (a stale provisioning view, a dead shard) the clones not yet
+        // handed to a live shard drop with this frame, so nothing leaks.
+        let estimate: u64 = points
+            .iter()
+            .map(IngestPoint::est_charge_bytes)
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(
+                exemplars
+                    .iter()
+                    .map(|e| e.est_bytes() as u64)
+                    .fold(0u64, u64::saturating_add),
+            );
+        let charge = Arc::new(
+            self.budget
+                .try_charge(estimate)
+                .map_err(|_| WriteError::BufferBudgetExceeded)?,
+        );
+
         // Route this write against the tenant's current generation view,
         // re-reading the provisioning record when the cache is older than `C`
         // and failing closed if that read cannot complete (ADR-0052 section 3).
@@ -311,6 +359,7 @@ impl IngestRouter {
                 points,
                 exemplars: exemplars_by_shard.remove(&shard).unwrap_or_default(),
                 ack,
+                charge: Some(Arc::clone(&charge)),
             };
             if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver

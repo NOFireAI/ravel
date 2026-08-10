@@ -129,3 +129,25 @@ impl IngestValue {
         }
     }
 }
+
+impl IngestPoint {
+    /// Estimated buffered byte cost of this one point, for the process-wide
+    /// ingest byte budget's admission charge (ADR-0069, [`crate::IngestByteBudget`]).
+    ///
+    /// Mirrors `TenantBuf::merge`'s `est_bytes` rule -- 16 bytes per sample plus
+    /// the label name/value bytes -- but counts label bytes for *every* point,
+    /// not only the first sighting of a series in a buffer: the charge happens
+    /// before routing, without the shard's buffer state, so it cannot know
+    /// which series are already present. That makes the charge a deliberate
+    /// slight over-estimate of what finally lands in the buffer, which is the
+    /// safe direction for a memory ceiling (it sheds a touch early rather than
+    /// a touch late).
+    pub(crate) fn est_charge_bytes(&self) -> u64 {
+        let label_bytes: u64 = self
+            .labels
+            .iter()
+            .map(|l| (l.name.len() + l.value.len()) as u64)
+            .sum();
+        16 + label_bytes
+    }
+}

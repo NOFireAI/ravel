@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use uuid::Uuid;
 
+use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{IngestConfig, SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
 use crate::metrics::FlushTrigger;
@@ -49,6 +50,12 @@ pub(crate) enum SpanShardMsg {
         tenant: TenantId,
         spans: Vec<NormalizedSpan>,
         ack: Option<SpanAck>,
+        /// This request's global ingest-byte-budget charge (ADR-0069), held in
+        /// the tenant buffer until it flushes, then dropped -- refunding the
+        /// bytes -- at the flush's outcome. `None` only for a test write that
+        /// bypasses the budget; production charges via
+        /// [`crate::SpanIngestRouter`].
+        charge: Option<Arc<IngestByteCharge>>,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
     FlushNow { done: oneshot::Sender<()> },
@@ -62,7 +69,7 @@ pub(crate) enum SpanShardMsg {
 /// covering the two i64 timestamps, the 16-byte trace id, the two 8-byte span
 /// ids, and the status code. A `target_bytes` flush-trigger estimate, not a
 /// byte-exact accounting of the RSPAN output.
-fn est_span_bytes(span: &NormalizedSpan) -> usize {
+pub(crate) fn est_span_bytes(span: &NormalizedSpan) -> usize {
     let attr_bytes: usize = span.attrs.iter().map(|(k, v)| k.len() + v.len()).sum();
     span.name.len() + span.status_message.as_ref().map(String::len).unwrap_or(0) + attr_bytes + 64
 }
@@ -96,6 +103,10 @@ struct SpanTenantBuf {
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
     waiters: Vec<SpanAck>,
+    /// Global ingest-byte-budget charges (ADR-0069) for every request whose
+    /// spans this buffer holds. Dropped -- refunding the bytes -- when the
+    /// buffer flushes (or its flush fails), never before.
+    charges: Vec<Arc<IngestByteCharge>>,
 }
 
 impl SpanTenantBuf {
@@ -180,8 +191,8 @@ impl SpanShardActor {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(SpanShardMsg::Write { tenant, spans, ack }) => {
-                            self.handle_write(tenant, spans, ack).await;
+                        Some(SpanShardMsg::Write { tenant, spans, ack, charge }) => {
+                            self.handle_write(tenant, spans, ack, charge).await;
                         }
                         Some(SpanShardMsg::FlushNow { done }) => {
                             self.flush_all(FlushTrigger::Manual).await;
@@ -227,8 +238,10 @@ impl SpanShardActor {
         tenant: TenantId,
         spans: Vec<NormalizedSpan>,
         ack: Option<SpanAck>,
+        charge: Option<Arc<IngestByteCharge>>,
     ) {
         if spans.is_empty() && ack.is_none() {
+            // Nothing buffered: dropping `charge` here refunds its bytes.
             return;
         }
         let arrival_ns = self.clock.now_ns();
@@ -237,6 +250,11 @@ impl SpanShardActor {
 
         let buf = self.tenants.entry(tenant.clone()).or_default();
         let bytes_added = buf.merge(spans, arrival_ns);
+        // The spans are now buffered: hold their budget charge with the buffer
+        // until it flushes (ADR-0069).
+        if let Some(charge) = charge {
+            buf.charges.push(charge);
+        }
         if let Some(ack) = ack {
             buf.waiters.push(ack);
         }
@@ -318,11 +336,17 @@ impl SpanShardActor {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
+            charges,
             ..
         } = buf;
         if spans.is_empty() {
+            // Dropping `charges` here refunds their bytes: no object is written.
             return;
         }
+        // The span flush runs inline (not pipelined): holding `charges` in this
+        // scope refunds the budget (ADR-0069) exactly at this flush's terminal
+        // outcome, whichever `return` below it takes.
+        let _charges = charges;
         self.metrics.record_flush(trigger);
 
         let tenant_hash = tenant.hash();
@@ -773,6 +797,7 @@ mod tests {
             tenant: tenant.clone(),
             spans,
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -820,6 +845,7 @@ mod tests {
             tenant: tenant.clone(),
             spans: vec![span],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -842,6 +868,7 @@ mod tests {
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -873,6 +900,7 @@ mod tests {
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: None,
+            charge: None,
         })
         .await
         .expect("send write");
@@ -912,6 +940,7 @@ mod tests {
                 tenant: tenant.clone(),
                 spans: vec![norm_span(i as u8 + 1, 1, 1_000, "op")],
                 ack: Some(ack_tx),
+                charge: None,
             })
             .await
             .expect("send write");
@@ -958,6 +987,7 @@ mod tests {
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -996,6 +1026,7 @@ mod tests {
             tenant: TenantId::new("acme"),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -1059,6 +1090,7 @@ mod tests {
             tenant: tenant.clone(),
             spans: vec![norm_span(1, 1, 1_000, "op")],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");

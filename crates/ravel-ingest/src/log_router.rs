@@ -17,12 +17,13 @@ use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_types::{CommitToken, TenantHash, shard_for_log};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
-use crate::log_shard::{LogShardActor, LogShardMsg};
+use crate::log_shard::{LogShardActor, LogShardMsg, est_record_bytes};
 use crate::router::WriteMode;
 
 /// Resolves the POSTINGS indexed-field list for a tenant at flush time
@@ -80,6 +81,11 @@ pub struct LogIngestRouter {
     clock: Arc<dyn Clock>,
     metrics: Arc<LogIngestMetrics>,
     config: IngestConfig,
+    /// Process-wide ingest buffer byte budget (ADR-0069 decision 1), shared by
+    /// `Arc` with the metrics and span routers. Defaults to `Unlimited`;
+    /// `services/ravel-server` installs the configured budget via
+    /// [`LogIngestRouter::with_budget`].
+    budget: Arc<IngestByteBudget>,
 }
 
 impl LogIngestRouter {
@@ -154,7 +160,15 @@ impl LogIngestRouter {
             clock,
             metrics,
             config,
+            budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
         }
+    }
+
+    /// Installs the shared process-wide ingest buffer byte budget (ADR-0069).
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<IngestByteBudget>) -> Self {
+        self.budget = budget;
+        self
     }
 
     pub fn metrics(&self) -> &LogIngestMetrics {
@@ -219,6 +233,23 @@ impl LogIngestRouter {
         if records.is_empty() {
             return Ok(LogWriteReceipt::default());
         }
+
+        // Global ingest byte budget (ADR-0069 decision 1): charge the estimated
+        // buffered bytes and shed at the ceiling before routing, so a shed
+        // request touches no shard and mints no commit token. The charge is
+        // cloned into every shard message below and refunded when the flush(es)
+        // holding these bytes complete or fail; any early return from here on
+        // drops the not-yet-handed-off clones, so nothing leaks.
+        let estimate: u64 = records
+            .iter()
+            .map(|r| est_record_bytes(r) as u64)
+            .fold(0u64, u64::saturating_add);
+        let charge = Arc::new(
+            self.budget
+                .try_charge(estimate)
+                .map_err(|_| LogWriteError::BufferBudgetExceeded)?,
+        );
+
         // Route against the tenant's current generation view, re-reading the
         // provisioning record when the cache is older than `C` and failing
         // closed if that read cannot complete (ADR-0052 section 3).
@@ -256,6 +287,7 @@ impl LogIngestRouter {
                 tenant: tenant.clone(),
                 records,
                 ack,
+                charge: Some(Arc::clone(&charge)),
             };
             if set[shard as usize].tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver

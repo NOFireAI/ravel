@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use uuid::Uuid;
 
+use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
 use crate::log_error::LogWriteError;
@@ -50,6 +51,12 @@ pub(crate) enum LogShardMsg {
         tenant: TenantId,
         records: Vec<NormalizedLogRecord>,
         ack: Option<LogAck>,
+        /// This request's global ingest-byte-budget charge (ADR-0069), held in
+        /// the tenant buffer until it flushes, then dropped -- refunding the
+        /// bytes -- when the flush's outcome is reached. `None` only for a test
+        /// write that bypasses the budget; production charges via
+        /// [`crate::LogIngestRouter`].
+        charge: Option<Arc<IngestByteCharge>>,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
     FlushNow { done: oneshot::Sender<()> },
@@ -80,7 +87,7 @@ fn attr_value_len(value: &AttrValue) -> usize {
 /// encoded length, plus a fixed 32 covering the two i64 timestamps,
 /// severity_num, flags, and the optional trace/span ids. A `target_bytes`
 /// flush-trigger estimate, not a byte-exact accounting of the RLOG output.
-fn est_record_bytes(rec: &NormalizedLogRecord) -> usize {
+pub(crate) fn est_record_bytes(rec: &NormalizedLogRecord) -> usize {
     let attr_bytes: usize = rec
         .attrs
         .iter()
@@ -121,6 +128,10 @@ struct LogTenantBuf {
     min_ingest_ts_ns: Option<i64>,
     max_ingest_ts_ns: Option<i64>,
     waiters: Vec<LogAck>,
+    /// Global ingest-byte-budget charges (ADR-0069) for every request whose
+    /// records this buffer holds. Dropped -- refunding the bytes -- when the
+    /// buffer flushes (or its flush fails), never before.
+    charges: Vec<Arc<IngestByteCharge>>,
 }
 
 impl LogTenantBuf {
@@ -211,8 +222,8 @@ impl LogShardActor {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(LogShardMsg::Write { tenant, records, ack }) => {
-                            self.handle_write(tenant, records, ack).await;
+                        Some(LogShardMsg::Write { tenant, records, ack, charge }) => {
+                            self.handle_write(tenant, records, ack, charge).await;
                         }
                         Some(LogShardMsg::FlushNow { done }) => {
                             self.flush_all(FlushTrigger::Manual).await;
@@ -258,8 +269,10 @@ impl LogShardActor {
         tenant: TenantId,
         records: Vec<NormalizedLogRecord>,
         ack: Option<LogAck>,
+        charge: Option<Arc<IngestByteCharge>>,
     ) {
         if records.is_empty() && ack.is_none() {
+            // Nothing buffered: dropping `charge` here refunds its bytes.
             return;
         }
         let arrival_ns = self.clock.now_ns();
@@ -268,6 +281,11 @@ impl LogShardActor {
 
         let buf = self.tenants.entry(tenant.clone()).or_default();
         let bytes_added = buf.merge(records, arrival_ns);
+        // The records are now buffered: hold their budget charge with the buffer
+        // until it flushes (ADR-0069).
+        if let Some(charge) = charge {
+            buf.charges.push(charge);
+        }
         if let Some(ack) = ack {
             buf.waiters.push(ack);
         }
@@ -357,11 +375,18 @@ impl LogShardActor {
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
+            charges,
             ..
         } = buf;
         if records.is_empty() {
+            // Dropping `charges` here refunds their bytes: no object is written.
             return;
         }
+        // The log flush runs inline (not pipelined, docs/ingest.md): holding
+        // `charges` in this scope refunds the budget (ADR-0069) exactly when
+        // this flush reaches its terminal outcome, whichever `return` below it
+        // takes -- a build/publish failure or a successful commit.
+        let _charges = charges;
         self.metrics.record_flush(trigger);
 
         let tenant_hash = tenant.hash();
@@ -851,6 +876,7 @@ mod tests {
             tenant: tenant.clone(),
             records,
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -889,6 +915,7 @@ mod tests {
             tenant: tenant.clone(),
             records,
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -920,6 +947,7 @@ mod tests {
             tenant: tenant.clone(),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: None,
+            charge: None,
         })
         .await
         .expect("send write");
@@ -954,6 +982,7 @@ mod tests {
                 tenant: tenant.clone(),
                 records: vec![norm_record(&[("service.name", name)], "scope", 1_000, "x")],
                 ack: Some(ack_tx),
+                charge: None,
             })
             .await
             .expect("send write");
@@ -987,6 +1016,7 @@ mod tests {
             tenant: tenant.clone(),
             records: vec![good, collider],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -1025,6 +1055,7 @@ mod tests {
             tenant: tenant.clone(),
             records: vec![first, second],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -1074,6 +1105,7 @@ mod tests {
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -1112,6 +1144,7 @@ mod tests {
             tenant: TenantId::new("acme"),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");
@@ -1175,6 +1208,7 @@ mod tests {
             tenant: tenant.clone(),
             records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
             ack: Some(ack_tx),
+            charge: None,
         })
         .await
         .expect("send write");

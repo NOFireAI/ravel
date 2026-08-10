@@ -45,6 +45,14 @@ pub enum LogWriteError {
     /// (ADR-0052 section 3). Retryable once the background refresher re-reads.
     #[error("provisioning view stale: refusing to route on a view older than the refresh interval")]
     StaleProvisioningView,
+    /// The process-wide ingest buffer byte budget is at its ceiling
+    /// (`--max-ingest-buffer-bytes`, ADR-0069 decision 1): charging this
+    /// request's estimated buffered bytes would exceed it, so it is shed before
+    /// any buffering, with no shard touched and no commit token issued.
+    /// Retryable: a buffer slot frees as soon as any in-flight flush completes.
+    /// The gateway maps it to HTTP 429 / gRPC `RESOURCE_EXHAUSTED`.
+    #[error("ingest buffer byte budget reached")]
+    BufferBudgetExceeded,
 }
 
 impl LogWriteError {
@@ -58,6 +66,7 @@ impl LogWriteError {
                 | LogWriteError::AckTimeout
                 | LogWriteError::Abandoned(_)
                 | LogWriteError::StaleProvisioningView
+                | LogWriteError::BufferBudgetExceeded
         )
     }
 }

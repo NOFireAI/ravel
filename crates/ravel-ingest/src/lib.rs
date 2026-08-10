@@ -6,6 +6,7 @@
 //! everywhere; no task-per-sample; backpressure to the gateway.
 
 mod admission;
+mod budget;
 mod clock;
 mod config;
 mod error;
@@ -30,6 +31,7 @@ pub use admission::{
     AdmissionController, AdmissionLimits, CountLimit, IdentityAdmission, RateLimit,
     RequestRejection, RequestRejectionReason, TenantUsage,
 };
+pub use budget::{IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge, IngestByteShed};
 pub use clock::{Clock, SystemClock};
 pub use config::{
     IngestConfig, LOG_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
