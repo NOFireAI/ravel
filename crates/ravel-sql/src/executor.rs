@@ -220,7 +220,22 @@ pub struct SqlExecutor {
     /// that intentionally outlives a query, and it holds no query, plan, or
     /// catalog data -- only a byte counter per tenant, so it cannot carry
     /// data across the tenant boundary.
-    tenants: Mutex<HashMap<TenantHash, Arc<TenantMemoryAccountant>>>,
+    ///
+    /// Each entry also carries the tenant's last-touch (`now_ns` of its most
+    /// recent query resolve), so the server's idle-tenant sweep can evict the
+    /// accountants of tenants idle past a threshold (ADR-0069 decision 2, issue
+    /// #820). Eviction is re-derivable: a `TenantMemoryAccountant` is pure
+    /// process-local byte-counter state, rebuilt on the tenant's next query, so
+    /// dropping an idle one with no outstanding reservations changes no result.
+    tenants: Mutex<HashMap<TenantHash, TenantAccountantEntry>>,
+}
+
+/// One tenant's memory accountant plus the last-touch stamp idle-tenant
+/// eviction reads (ADR-0069 decision 2). `last_touch_ns` is the injected
+/// `now_ns` of the tenant's most recent resolve; no clock is read here.
+struct TenantAccountantEntry {
+    accountant: Arc<TenantMemoryAccountant>,
+    last_touch_ns: i64,
 }
 
 impl SqlExecutor {
@@ -248,24 +263,79 @@ impl SqlExecutor {
         &self.config
     }
 
+    /// Lock the tenant map, recovering a poisoned guard. A poisoned lock means
+    /// another thread panicked while holding it; the map is a plain HashMap of
+    /// Arc counters with no torn-state hazard, so recovering is safe and
+    /// strictly better than failing every subsequent query for the process's
+    /// life.
+    fn lock_tenants(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<TenantHash, TenantAccountantEntry>> {
+        match self.tenants.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// The accountant for `tenant`, creating it on first use.
     ///
     /// Exposed so the endpoint and the tenancy tests can read a tenant's
-    /// reserved bytes without running a query through it.
+    /// reserved bytes without running a query through it. A first-use creation
+    /// here stamps the entry's last-touch at [`i64::MIN`] so an accountant
+    /// created only to read a budget (never touched by a resolve) is a
+    /// candidate for the idle sweep as soon as it holds no reservations; a
+    /// query path always stamps a real `now_ns` first via [`Self::touch_tenant`].
     pub fn tenant_budget(&self, tenant: TenantHash) -> Arc<TenantMemoryAccountant> {
-        let mut tenants = match self.tenants.lock() {
-            Ok(guard) => guard,
-            // A poisoned lock means another thread panicked while holding
-            // it. The map is a plain HashMap of Arc counters with no
-            // torn-state hazard, so recovering is safe and strictly better
-            // than failing every subsequent query for the process's life.
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut tenants = self.lock_tenants();
         Arc::clone(
-            tenants
+            &tenants
                 .entry(tenant)
-                .or_insert_with(|| TenantMemoryAccountant::new(self.max_tenant_bytes)),
+                .or_insert_with(|| TenantAccountantEntry {
+                    accountant: TenantMemoryAccountant::new(self.max_tenant_bytes),
+                    last_touch_ns: i64::MIN,
+                })
+                .accountant,
         )
+    }
+
+    /// Stamp `tenant`'s last-touch at `now_ns`, creating its accountant on
+    /// first use (ADR-0069 decision 2). Called from [`Self::resolve`], the one
+    /// funnel every query's snapshot resolve passes through (HTTP SQL and
+    /// Flight SQL alike), so a tenant running any query is never a candidate
+    /// for the idle sweep. `now_ns` is the request's injected clock reading;
+    /// this reads no clock itself.
+    fn touch_tenant(&self, tenant: TenantHash, now_ns: i64) {
+        let mut tenants = self.lock_tenants();
+        let entry = tenants
+            .entry(tenant)
+            .or_insert_with(|| TenantAccountantEntry {
+                accountant: TenantMemoryAccountant::new(self.max_tenant_bytes),
+                last_touch_ns: now_ns,
+            });
+        entry.last_touch_ns = now_ns;
+    }
+
+    /// Evict the memory accountant of every tenant last touched before
+    /// `now_ns - ttl_ns` that also holds zero outstanding reservations
+    /// (ADR-0069 decision 2, issue #820). Returns the number evicted.
+    ///
+    /// The zero-reservation guard is load-bearing: an accountant with live
+    /// reservations is backing an in-flight query's memory budget, and dropping
+    /// the map entry would let a concurrent query for the same tenant build a
+    /// second accountant, so the tenant's ceiling would stop being shared
+    /// across its concurrent queries. A tenant reserves bytes only for the
+    /// duration of a query, so a zero reservation means no query is currently
+    /// accounting against it, and a re-created accountant on the next query is
+    /// byte-for-byte equivalent (pure process-local counter state). Both
+    /// `now_ns` and `ttl_ns` are caller-supplied (the sweep loop); this reads
+    /// no clock.
+    pub fn evict_idle_accountants(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        let mut tenants = self.lock_tenants();
+        let before = tenants.len();
+        tenants.retain(|_, entry| {
+            entry.accountant.reserved() > 0 || now_ns.saturating_sub(entry.last_touch_ns) <= ttl_ns
+        });
+        before - tenants.len()
     }
 
     /// Validate, resolve, plan, and execute `req` for `tenant_hash`.
@@ -428,6 +498,12 @@ impl SqlExecutor {
         req: &SqlRequest,
         accounting: &QueryAccounting,
     ) -> Result<(Snapshot, CostEstimate), SqlError> {
+        // Idle-tenant eviction last-touch (ADR-0069 decision 2): stamp this
+        // tenant's activity with the request's injected clock before resolving.
+        // This is the one funnel both the HTTP (`execute`/`run`) and Flight SQL
+        // (`resolve_snapshot`) paths pass through, so any tenant running a query
+        // is kept out of the idle sweep.
+        self.touch_tenant(tenant_hash, req.now_ns);
         let target = Self::target_signal(&req.sql)?;
         // Postings pruning by the equality `__name__` predicate pushed down
         // from the query's WHERE clause (#278 item 4). Without this the SQL
@@ -1240,6 +1316,92 @@ mod tests {
         let err = execution_error(df);
         assert!(matches!(err, SqlError::ResourcesExhausted(_)));
         assert!(err.client_message().contains("limit 8"));
+    }
+
+    /// An executor over an empty store, for the idle-accountant eviction tests.
+    fn eviction_test_executor() -> SqlExecutor {
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("cat"));
+        let fetcher = SegmentFetcher::new(store.clone());
+        let log_fetcher = LogSegmentFetcher::new(store.clone());
+        SqlExecutor::new(catalog, fetcher, log_fetcher, SqlConfig::default(), 1 << 30)
+    }
+
+    /// ADR-0069 decision 2 (issue #820): a tenant idle past the TTL has its
+    /// memory accountant evicted, a subsequent access re-derives a fresh one,
+    /// and a tenant still running queries (recently touched) survives the same
+    /// sweep. Deterministic via injected `now_ns` (touch_tenant, the resolve
+    /// funnel's stamp, is driven directly here so no store I/O is needed).
+    #[test]
+    fn idle_sql_accountant_evicted_and_rederived() {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let exec = eviction_test_executor();
+        let idle = TenantHash([1; 16]);
+        let active = TenantHash([2; 16]);
+        let ttl_ns = 100 * NS_PER_HOUR;
+
+        let t0 = 1_000 * NS_PER_HOUR;
+        exec.touch_tenant(idle, t0);
+        exec.touch_tenant(active, t0);
+
+        // The active tenant runs another query right before the sweep.
+        let sweep_ns = t0 + ttl_ns + 1;
+        exec.touch_tenant(active, sweep_ns);
+
+        // Both accountants hold zero reservations, so only last-touch decides:
+        // the idle one is evicted, the active one survives.
+        let evicted = exec.evict_idle_accountants(sweep_ns, ttl_ns);
+        assert_eq!(evicted, 1, "only the idle tenant's accountant is evicted");
+
+        // Re-derivation: the evicted tenant's next access rebuilds a fresh
+        // accountant with zero reserved bytes, at the configured ceiling.
+        let rebuilt = exec.tenant_budget(idle);
+        assert_eq!(rebuilt.reserved(), 0);
+        assert_eq!(rebuilt.limit(), 1 << 30);
+    }
+
+    /// The zero-reservation guard: an accountant with outstanding reservations
+    /// is never evicted, even when idle past the TTL, because a live query is
+    /// still accounting against it (ADR-0069 decision 2). Dropping it would let
+    /// a concurrent query build a second accountant and stop sharing the
+    /// tenant ceiling.
+    #[test]
+    fn sql_accountant_with_outstanding_reservation_survives_sweep() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        use crate::memory::{CeilingBreach, TenantDelegatingPool};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let exec = eviction_test_executor();
+        let tenant = TenantHash([7; 16]);
+        let ttl_ns = 100 * NS_PER_HOUR;
+
+        // Create the accountant (last-touch i64::MIN, so idle by any clock) and
+        // hold an outstanding reservation against it through a query pool.
+        let accountant = exec.tenant_budget(tenant);
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&accountant),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let reservation = MemoryConsumer::new("live-query").register(&pool);
+        reservation.grow(4096);
+        assert!(accountant.reserved() > 0);
+
+        let evicted = exec.evict_idle_accountants(10 * NS_PER_HOUR, ttl_ns);
+        assert_eq!(
+            evicted, 0,
+            "an accountant with outstanding reservations is never evicted"
+        );
+
+        // Once the reservation drops and the tenant is idle, the sweep reclaims it.
+        drop(reservation);
+        assert_eq!(accountant.reserved(), 0);
+        assert_eq!(exec.evict_idle_accountants(10 * NS_PER_HOUR, ttl_ns), 1);
     }
 
     /// ADR-0044 acceptance test (issue #424): one `execute` call, checked

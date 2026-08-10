@@ -355,6 +355,21 @@ pub struct Cli {
     #[arg(long = "scrub-period", value_name = "DURATION")]
     pub scrub_period: Option<String>,
 
+    /// How long re-derivable per-tenant state may sit idle before a background
+    /// sweep evicts it (ADR-0069 decision 2, issue #820), as a humantime
+    /// duration (e.g. `1h`). The sweep evicts idle generation-switch views,
+    /// catalog per-tenant caches, and SQL memory accountants with zero
+    /// outstanding reservations; every evicted entry is re-derived on the
+    /// tenant's next access. Admission-controller state is explicitly excluded
+    /// (its caps are correctness-bearing). Matches the humantime-duration
+    /// convention of `--store-probe-interval`. Omitted defaults to
+    /// [`crate::idle_tenant_state::DEFAULT_IDLE_TENANT_STATE_TTL`] (1 hour);
+    /// unlike the sibling interval knobs, `0` is a valid, documented value that
+    /// disables the sweep entirely (the maps then grow with tenant count, as
+    /// they did before ADR-0069).
+    #[arg(long = "idle-tenant-state-ttl", value_name = "DURATION")]
+    pub idle_tenant_state_ttl: Option<String>,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -846,6 +861,20 @@ impl Cli {
                 }
                 Ok(dur)
             }
+        }
+    }
+
+    /// Parse `--idle-tenant-state-ttl` into a duration (ADR-0069 decision 2),
+    /// defaulting to [`crate::idle_tenant_state::DEFAULT_IDLE_TENANT_STATE_TTL`]
+    /// when unset. Unlike the sibling interval knobs, a zero duration is
+    /// accepted and returned verbatim: it is the documented "disable the sweep"
+    /// value ([`crate::start`] spawns no task for a zero TTL), not a
+    /// tight-loop footgun. Only an unparseable duration fails startup.
+    pub fn parse_idle_tenant_state_ttl(&self) -> anyhow::Result<Duration> {
+        match self.idle_tenant_state_ttl.as_deref() {
+            None => Ok(crate::idle_tenant_state::DEFAULT_IDLE_TENANT_STATE_TTL),
+            Some(s) => humantime::parse_duration(s)
+                .map_err(|e| anyhow::anyhow!("invalid --idle-tenant-state-ttl '{s}': {e}")),
         }
     }
 

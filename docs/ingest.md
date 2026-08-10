@@ -516,6 +516,38 @@ So an operator sizes ingest RSS as
 tightens term 1 directly, trading a lower memory ceiling for earlier shedding
 under a many-tenant burst.
 
+### Idle-tenant state eviction (ADR-0069 decision 2)
+
+The buffer budget above bounds *buffered* bytes, but several per-tenant maps
+grew monotonically over process lifetime regardless of buffering: the
+generation-switch views (one per tenant that ever wrote), the catalog's
+per-tenant decoded caches, and the SQL per-tenant memory accountants. A single
+background sweep bounds all three. Every `--idle-tenant-state-ttl` (default
+`1h`; `0` disables the sweep) it evicts per-tenant state last touched more than
+that long ago, on a jittered cadence, from the same worker-loop shape every
+other background task uses:
+
+- **Generation views** — re-read from the provisioning record on the tenant's
+  next write (the evicted view reports stale exactly as a first-touch tenant
+  does), so the cost is one provisioning-record GET on the next write.
+- **Catalog per-tenant caches** — the decoded commit-record, compaction-record,
+  HEAD, part, and postings caches; all immutable, content-addressed, or
+  TTL-revalidated, so an evicted entry is re-read on the next resolve.
+- **SQL memory accountants** — only those with zero outstanding reservations
+  (an accountant backing a live query is never evicted); a re-created one is a
+  byte-for-byte-equivalent counter.
+
+"Last touched" is stamped from an injected clock at each tenant's write
+(generation views), resolve (catalog caches), or query resolve (SQL
+accountants), so eviction is deterministic and reads no clock in the library
+layers — only the sweep loop reads the wall clock.
+
+**Admission-controller state is explicitly excluded.** Its active-series and
+active-stream counts are correctness-bearing caps; silently resetting a
+tenant's cap consumption on a memory-pressure sweep is never a valid trade-off
+(ADR-0069 decision 2). That map therefore still grows with tenant count, a
+documented gap with a named follow-up, not an unsafe eviction.
+
 ## Modes
 
 `mode=strict` (default): ack after step 3 for every flush the request's
@@ -539,6 +571,7 @@ carries max token per shard).
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
 | max_inflight_flushes (per shard, metrics pipeline only) | 1 (`--max-inflight-flushes`, rejects 0) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
+| idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
 
 ## Metrics (self-observability)
 

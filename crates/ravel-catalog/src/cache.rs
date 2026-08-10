@@ -107,6 +107,14 @@ impl RecordCache {
             cache.order.retain(|k| !k.starts_with(prefix));
         }
     }
+
+    /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
+    /// decision 2, idle-tenant state eviction). Returns whether an entry was
+    /// present. Safe because commit records are immutable and re-derivable: a
+    /// later access re-GETs and re-decodes on a miss, never wrong data.
+    pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> bool {
+        self.tenants.lock().remove(tenant).is_some()
+    }
 }
 
 #[derive(Default)]
@@ -195,6 +203,13 @@ impl CompactionRecordCache {
             cache.order.retain(|k| !k.starts_with(prefix));
         }
     }
+
+    /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
+    /// decision 2). Returns whether an entry was present. Compaction records
+    /// are immutable and re-derivable, so a later miss re-GETs and re-decodes.
+    pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> bool {
+        self.tenants.lock().remove(tenant).is_some()
+    }
 }
 
 struct HeadCacheEntry {
@@ -282,6 +297,18 @@ impl HeadCache {
             }
         }
     }
+
+    /// Drop every `(tenant, signal)` entry for `tenant` (ADR-0069 decision 2,
+    /// idle-tenant state eviction). Returns the number of entries removed (one
+    /// per signal held). A decoded HEAD is TTL-revalidated and re-read on a
+    /// miss, so eviction only costs a re-read, never correctness.
+    pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> usize {
+        let mut state = self.state.lock();
+        let before = state.entries.len();
+        state.entries.retain(|(t, _), _| t != tenant);
+        state.order.retain(|(t, _)| t != tenant);
+        before - state.entries.len()
+    }
 }
 
 #[derive(Default)]
@@ -354,6 +381,14 @@ impl PartCache {
             .or_default()
             .insert(key, part, bytes, capacity);
     }
+
+    /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
+    /// decision 2). Returns whether an entry was present. Parts are
+    /// content-addressed and immutable, so a later miss re-fetches and
+    /// re-decodes.
+    pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> bool {
+        self.tenants.lock().remove(tenant).is_some()
+    }
 }
 
 #[derive(Default)]
@@ -425,6 +460,14 @@ impl PostingsCache {
             .entry(tenant)
             .or_default()
             .insert(key, postings, bytes, capacity);
+    }
+
+    /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
+    /// decision 2). Returns whether an entry was present. Postings objects are
+    /// content-addressed and immutable, so a later miss re-fetches and
+    /// re-decodes.
+    pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> bool {
+        self.tenants.lock().remove(tenant).is_some()
     }
 }
 

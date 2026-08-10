@@ -384,6 +384,9 @@ async fn main() -> anyhow::Result<()> {
         ingest_buffer_budget_limit: cli
             .parse_ingest_buffer_budget()
             .context("failed to parse --max-ingest-buffer-bytes")?,
+        idle_tenant_state_ttl: cli
+            .parse_idle_tenant_state_ttl()
+            .context("failed to parse --idle-tenant-state-ttl")?,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;
