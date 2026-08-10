@@ -1021,6 +1021,13 @@ impl QueryEngine {
                 }
                 // `None`: a worker asked for local fallback (version skew, a
                 // histogram-bearing slice). Fall through to the local path.
+                // The distributed attempt's real S3 spend was already folded
+                // into `accounting` (ADR-0071: cost is exact and visible), so
+                // the local path below re-enforces `max_bytes_scanned` against
+                // a handle that carries the remote spend too. Consequence: a
+                // fallback query can trip the byte budget with distribution
+                // enabled where the identical query succeeds without it --
+                // that is the true total cost, not a double-count.
             }
         }
         self.fetch_all_samples_and_histograms(

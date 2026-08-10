@@ -911,3 +911,298 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
         );
     });
 }
+
+/// ADR-0071 protocol: the worker validates `request.signal` before touching
+/// storage. A known non-metrics signal (logs, spans, ...) is answered with an
+/// `Unsupported` summary so the coordinator falls back to the local path, and
+/// an unknown discriminant is `BadData` (a broken or newer peer, not a
+/// capability gap). Deleting the signal-validation block in `run_slice_inner`
+/// (`service.rs`) makes both requests fetch and return `Ok` scalar frames, and
+/// the status assertions below fail.
+#[test]
+fn worker_rejects_non_metrics_and_unknown_signals() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let seg = write_segment(
+            &store,
+            0,
+            0,
+            100,
+            &[SeriesDesc {
+                metric: "m0".to_string(),
+                samples: vec![(NS, 1.0f64.to_bits())],
+            }],
+        )
+        .await;
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg.clone()]).await;
+
+        let request = |signal: u32| pb::FetchRequest {
+            protocol_version: crate::distrib::codec::PROTOCOL_VERSION,
+            query_id: Vec::new(),
+            tenant_hash: TENANT.0.to_vec(),
+            signal,
+            scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+                segments: vec![crate::distrib::codec::encode_segment_identity(&seg)],
+            })),
+            matchers: Vec::new(),
+            window_start_ns: 0,
+            window_end_ns: 0,
+            budgets: None,
+            deadline_unix_ns: 0,
+            erasure: Vec::new(),
+            trace_context: String::new(),
+        };
+
+        let logs = SliceFetcher::fetch(
+            &fetcher,
+            request(crate::distrib::codec::signal_to_u32(Signal::Logs)),
+        )
+        .await
+        .expect("worker responds to a logs request");
+        assert_eq!(
+            logs.status,
+            pb::status::Code::Unsupported,
+            "a known non-metrics signal must be Unsupported, not silently answered with metrics"
+        );
+
+        let unknown = SliceFetcher::fetch(&fetcher, request(u32::MAX))
+            .await
+            .expect("worker responds to an unknown discriminant");
+        assert_eq!(
+            unknown.status,
+            pb::status::Code::BadData,
+            "an unknown signal discriminant must be BadData"
+        );
+        server.abort();
+    });
+}
+
+/// A [`SliceFetcher`] double whose reported spend is keyed on the slice's
+/// shard, with the overflow-sized report delayed so it always completes (and
+/// folds) second -- the one completion order a wrapping fold is blind to.
+struct OverflowingLyingWorker;
+
+#[async_trait::async_trait]
+impl SliceFetcher for OverflowingLyingWorker {
+    async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let shard = match &request.scope {
+            Some(pb::fetch_request::Scope::Pinned(p)) => p.segments[0].shard,
+            _ => panic!("pinned scope expected"),
+        };
+        let spend = if shard == 0 {
+            500
+        } else {
+            // Delay so the honest-looking small report folds first: 500
+            // wrapping_add (u64::MAX - 100) == 399, under the cap, which is
+            // exactly the blindness this test exists to rule out.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            u64::MAX - 100
+        };
+        let acct = QueryAccounting::new();
+        acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, spend);
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            accounting: acct.snapshot(),
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status: pb::status::Code::Ok,
+            status_message: String::new(),
+        })
+    }
+}
+
+/// The coordinator's per-slice fold must SATURATE, not wrap (finding 3): two
+/// slices reporting 500 and `u64::MAX - 100` bytes wrap to 399 under a
+/// `wrapping_add` fold -- below the 1_000-byte cap, so the incremental check
+/// never trips and the query sails through. Under `saturating_merge` the fold
+/// clamps to `u64::MAX` and trips `TooManyBytesScanned` on the second slice.
+/// This drives `Distributed::fetch` directly, so the engine's final backstop
+/// (which saturates independently) cannot mask the coordinator fold: swapping
+/// `saturating_merge` back to a wrapping per-field add makes this test fail.
+/// The worker delays the overflow-sized report so it always folds second,
+/// making the wrap-blind completion order deterministic.
+#[test]
+fn coordinator_fold_saturates_overflowing_worker_reports() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for shard in 0..2u32 {
+            segments.push(
+                write_segment(
+                    &store,
+                    u64::from(shard),
+                    shard,
+                    100,
+                    &[SeriesDesc {
+                        metric: format!("m{shard}"),
+                        samples: vec![(NS, 1.0f64.to_bits())],
+                    }],
+                )
+                .await,
+            );
+        }
+        let snapshot = Snapshot {
+            segments,
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let distributed = Distributed::new(
+            Arc::new(OverflowingLyingWorker),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(1_000),
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        let err = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+            )
+            .await
+            .expect_err("a wrapped fold would let the overflowing report through");
+        assert!(
+            matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
+            "expected TooManyBytesScanned, got {err:?}"
+        );
+    });
+}
+
+/// ADR-0071 scalar-only distribution (finding 5): a histogram-bearing slice is
+/// handed back to the coordinator as `Unsupported` -- but its S3 spend is real,
+/// so the worker's summary carries the slice's true accounting and stats, and
+/// the coordinator folds them into the query's accounting handle BEFORE
+/// signalling local fallback (`Ok(None)`). Without the fold, a histogram query
+/// pays for the distributed fetch twice and reports it once. This also pins the
+/// documented consequence: post-fallback, the local path re-enforces
+/// `max_bytes_scanned` against a handle that already carries the remote spend,
+/// so distributed-then-fallback reports (and bounds against) TRUE total cost.
+/// Deleting the worker's `any_histograms` Unsupported branch, or the
+/// coordinator's pre-fallback fold, fails the assertions below.
+#[test]
+fn histogram_slice_falls_back_with_spend_folded() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        use ravel_segment::{
+            HistogramCounts, HistogramSample, HistogramValue, ResetHint, SeriesInputV3,
+            SeriesValues,
+        };
+
+        let store = Arc::new(MemoryStore::new());
+        let metric = "h0";
+        let label_set = labels(metric);
+        let series_id = SeriesId::compute(&tenant_id(), metric, &label_set).expect("series id");
+        let hist = HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: Some(1.0),
+            custom_values: None,
+            positive_spans: vec![ravel_segment::HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: Vec::new(),
+            },
+            reset_hint: ResetHint::Unknown,
+        };
+        let identity = SegmentIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 0,
+        };
+        let written = SegmentWriter::write_histograms(
+            vec![SeriesInputV3 {
+                series_id,
+                labels: label_set,
+                values: SeriesValues::Histogram(vec![HistogramSample {
+                    ts_ns: NS,
+                    value: hist,
+                }]),
+            }],
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write histogram segment");
+        let object_key = "seg/hist0.rseg".to_string();
+        store
+            .put(&object_key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment");
+        let seg = SegmentRef {
+            data_object_key: object_key,
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 100,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 0,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        };
+        let snapshot = Snapshot {
+            segments: vec![seg.clone()],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg]).await;
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        let accounting = QueryAccounting::new();
+        let result = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+            )
+            .await
+            .expect("unsupported must not be an error");
+        assert!(
+            result.is_none(),
+            "a histogram-bearing snapshot signals local fallback (Ok(None))"
+        );
+        assert!(
+            accounting.snapshot().total_s3_bytes() > 0,
+            "the worker's real spend must be folded into the query accounting before fallback"
+        );
+        server.abort();
+    });
+}
