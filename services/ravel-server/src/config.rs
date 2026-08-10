@@ -301,6 +301,19 @@ pub struct Cli {
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
 
+    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1, issue
+    /// #819): a ceiling on the sum of estimated buffered ingest bytes held
+    /// across every tenant and signal (metrics, logs, traces) at once. A
+    /// request whose estimated buffered bytes would push the gauge past this
+    /// ceiling is shed before any buffering -- HTTP 429 with `Retry-After`,
+    /// gRPC `RESOURCE_EXHAUSTED` -- so a burst of active tenants can no longer
+    /// grow resident memory without bound (the per-tenant buffer caps bound
+    /// each tenant, not their sum). Like `--max-inflight-ingest-requests` this
+    /// is a per-process local bound, never fleet-reconciled. Default 512 MiB;
+    /// `0` disables the ceiling (the gauge is still tracked for `/metrics`).
+    #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
+    pub max_ingest_buffer_bytes: u64,
+
     /// Per-shard bound on concurrently in-flight flushes for the metrics
     /// ingest pipeline (ADR-0067 decision 2, issue #814). Each shard's flush
     /// runs in a spawned task the shard actor no longer waits on; this caps
@@ -801,6 +814,18 @@ impl Cli {
         })
     }
 
+    /// Parse `--max-ingest-buffer-bytes` into a
+    /// [`ravel_ingest::IngestByteBudgetLimit`] (ADR-0069 decision 1, issue
+    /// #819), mapping `0` to `Unlimited` like `--max-inflight-ingest-requests`
+    /// above. Always `Ok`: `0` is a deliberate, documented "no ceiling", not a
+    /// footgun worth rejecting.
+    pub fn parse_ingest_buffer_budget(&self) -> anyhow::Result<ravel_ingest::IngestByteBudgetLimit> {
+        Ok(match self.max_ingest_buffer_bytes {
+            0 => ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            n => ravel_ingest::IngestByteBudgetLimit::Bounded(n),
+        })
+    }
+
     /// Parse `--scrub-period` into a duration (ADR-0059 decision 1), defaulting
     /// to [`crate::scrub::DEFAULT_SCRUB_PERIOD`] when unset. Rejects a zero or
     /// unparseable duration rather than rotating the scrubber in a tight loop,
@@ -842,6 +867,10 @@ impl Cli {
         // so a malformed future extension of this flag fails startup rather
         // than at the first ingest request.
         self.parse_ingest_concurrency_limit()?;
+
+        // Same rationale as above: `0` is a deliberate "unlimited", but parse
+        // it so a malformed future extension fails startup, not first ingest.
+        self.parse_ingest_buffer_budget()?;
 
         if self.max_inflight_flushes == 0 {
             anyhow::bail!(

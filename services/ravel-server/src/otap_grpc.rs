@@ -214,11 +214,15 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
                 Err(IngestRequestError::Write(err)) => {
                     // Same retry classification the OTLP gRPC path applies: a
                     // retryable write is RESOURCE_EXHAUSTED/UNAVAILABLE-shaped
-                    // backpressure, anything else is an internal fault.
-                    let code = if err.is_retryable() {
-                        StatusCode::Unavailable
-                    } else {
-                        StatusCode::Internal
+                    // backpressure, anything else is an internal fault. The
+                    // buffer-budget shed (ADR-0069) is specifically
+                    // RESOURCE_EXHAUSTED, matching the byte-rate rejection.
+                    let code = match err {
+                        ravel_ingest::WriteError::BufferBudgetExceeded => {
+                            StatusCode::ResourceExhausted
+                        }
+                        _ if err.is_retryable() => StatusCode::Unavailable,
+                        _ => StatusCode::Internal,
                     };
                     (nack(batch_id, code, err.to_string()), false)
                 }

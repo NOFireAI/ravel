@@ -199,6 +199,19 @@ fn negotiate_version(headers: &HeaderMap) -> Option<RemoteWriteVersion> {
 }
 
 fn write_error_response(err: WriteError) -> Response {
+    // The buffer-budget shed (ADR-0069) is admission backpressure, not a
+    // durability failure: 429 + `Retry-After`, matching the byte-rate
+    // rejection and the in-flight shed, rather than the 503 the other
+    // retryable write failures take.
+    if matches!(err, WriteError::BufferBudgetExceeded) {
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, err.to_string()).into_response();
+        if let Ok(value) =
+            HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string())
+        {
+            response.headers_mut().insert(RETRY_AFTER_HEADER, value);
+        }
+        return response;
+    }
     if err.is_retryable() {
         let mut response = (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response();
         if let Ok(value) = HeaderValue::from_str(&RETRY_AFTER_SECONDS.to_string()) {

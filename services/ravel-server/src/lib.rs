@@ -67,6 +67,10 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub use alerting::AlertEvalConfig;
+/// Re-exported so callers building a [`ServerConfig`] can name the ingest
+/// buffer byte budget ceiling (ADR-0069) without depending on `ravel-ingest`
+/// directly, the same way [`ingest_concurrency`] surfaces its limit type.
+pub use ravel_ingest::IngestByteBudgetLimit;
 pub use config::limits::{LimitsConfig, QueryLimits};
 pub use config::{Cli, Mode, StoreKind};
 pub use fold::FoldTaskConfig;
@@ -284,6 +288,14 @@ pub struct ServerConfig {
     /// `query_concurrency_limit` above, this is never reconciled fleet-wide:
     /// each process sheds independently against its own local bound.
     pub ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit,
+    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1, issue
+    /// #819), from `--max-ingest-buffer-bytes` (default `Bounded(512 MiB)`, `0`
+    /// maps to `Unlimited`). [`start`] builds one shared
+    /// [`ravel_ingest::IngestByteBudget`] from this and installs it on the
+    /// metrics, log, and span routers via `with_budget`, so a single ceiling
+    /// bounds the sum of buffered ingest bytes across every signal. Like
+    /// `ingest_concurrency_limit`, a per-process local bound, never reconciled.
+    pub ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -458,18 +470,28 @@ pub async fn start(
     store_metrics: Arc<StoreMetrics>,
     cache: Option<Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>>,
 ) -> anyhow::Result<Running> {
+    // The process-wide ingest buffer byte budget (ADR-0069 decision 1). One
+    // gauge shared by `Arc` across the metrics, log, and span routers so a
+    // single `--max-ingest-buffer-bytes` ceiling bounds the sum of buffered
+    // ingest bytes across every signal. Built unconditionally (cheap, and the
+    // `/metrics` exporter reads its gauge and shed counter regardless of mode).
+    let ingest_buffer_budget = ravel_ingest::IngestByteBudget::shared(config.ingest_buffer_budget_limit);
+
     let ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
-        Some(Arc::new(IngestRouter::new(
-            IngestConfig {
-                shard_count: config.shard_count,
-                max_inflight_flushes: config.max_inflight_flushes,
-                adaptive_flush_delay: config.adaptive_flush_delay,
-                ..IngestConfig::default()
-            },
-            store.clone(),
-            Signal::Metrics,
-            Arc::new(SystemClock),
-        )))
+        Some(Arc::new(
+            IngestRouter::new(
+                IngestConfig {
+                    shard_count: config.shard_count,
+                    max_inflight_flushes: config.max_inflight_flushes,
+                    adaptive_flush_delay: config.adaptive_flush_delay,
+                    ..IngestConfig::default()
+                },
+                store.clone(),
+                Signal::Metrics,
+                Arc::new(SystemClock),
+            )
+            .with_budget(ingest_buffer_budget.clone()),
+        ))
     } else {
         None
     };
@@ -484,15 +506,18 @@ pub async fn start(
         // `fields_for(tenant_hash)` at flush time.
         let indexed_fields: Arc<dyn ravel_ingest::LogIndexedFields> =
             Arc::new(config.indexed_fields.clone());
-        Some(Arc::new(LogIngestRouter::new_with_indexed_fields(
-            IngestConfig {
-                shard_count: config.shard_count,
-                ..IngestConfig::default()
-            },
-            store.clone(),
-            Arc::new(SystemClock),
-            indexed_fields,
-        )))
+        Some(Arc::new(
+            LogIngestRouter::new_with_indexed_fields(
+                IngestConfig {
+                    shard_count: config.shard_count,
+                    ..IngestConfig::default()
+                },
+                store.clone(),
+                Arc::new(SystemClock),
+                indexed_fields,
+            )
+            .with_budget(ingest_buffer_budget.clone()),
+        ))
     } else {
         None
     };
@@ -503,14 +528,17 @@ pub async fn start(
     // (ADR-0041). It exists in exactly the modes that serve ingest, so all
     // three options are always Some together.
     let span_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
-        Some(Arc::new(SpanIngestRouter::new(
-            IngestConfig {
-                shard_count: config.shard_count,
-                ..IngestConfig::default()
-            },
-            store.clone(),
-            Arc::new(SystemClock),
-        )))
+        Some(Arc::new(
+            SpanIngestRouter::new(
+                IngestConfig {
+                    shard_count: config.shard_count,
+                    ..IngestConfig::default()
+                },
+                store.clone(),
+                Arc::new(SystemClock),
+            )
+            .with_budget(ingest_buffer_budget.clone()),
+        ))
     } else {
         None
     };
@@ -751,6 +779,7 @@ pub async fn start(
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
+        ingest_buffer_budget: ingest_buffer_budget.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 

@@ -7,7 +7,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use ravel_ingest::RequestRejection;
+use ravel_ingest::{RequestRejection, WriteError};
 use ravel_types::Signal;
 use tonic::metadata::{KeyAndValueRef, MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status};
@@ -105,6 +105,12 @@ impl MetricsService for GrpcMetricsService {
         .map_err(|err| match err {
             IngestRequestError::Admission(rejection) => admission_rejection_status(rejection),
             IngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),
+            // The buffer-budget shed (ADR-0069) is RESOURCE_EXHAUSTED, the same
+            // status the byte-rate and in-flight sheds use, not the UNAVAILABLE
+            // the other retryable write failures take.
+            IngestRequestError::Write(WriteError::BufferBudgetExceeded) => {
+                Status::resource_exhausted(WriteError::BufferBudgetExceeded.to_string())
+            }
             IngestRequestError::Write(write_err) if write_err.is_retryable() => {
                 Status::unavailable(write_err.to_string())
             }
