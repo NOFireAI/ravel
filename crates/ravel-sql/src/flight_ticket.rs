@@ -64,10 +64,12 @@
 //!
 //! ```text
 //! magic         4   b"RFT1"
-//! version       1   = 3
+//! version       1   = 4
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
+//! slice_index   4   u32   (this slice's 0-based index in the fan-out)
+//! slice_count   4   u32   (number of slices; 1 for a whole-snapshot ticket)
 //! token_count   4   u32
 //!   per token:  4 + N   len-prefixed CommitToken::encode() (ASCII)
 //! seg_count     4   u32
@@ -144,6 +146,22 @@
 //! replaces the unkeyed FNV-1a-64 checksum with a keyed BLAKE3 MAC; see
 //! "Integrity: a keyed MAC, not a checksum" above.
 //!
+//! Version 4 (issue #866, ADR-0071 distributed read fan-out) carries a
+//! [`slice_index`](FlightTicket::slice_index) /
+//! [`slice_count`](FlightTicket::slice_count) pair so a ticket can pin a
+//! *slice* of the resolved snapshot (a subset of segments) rather than the
+//! whole set: `GetFlightInfo` fans a distributed query out to N endpoints,
+//! each carrying one slice's segments and its `(index, count)` position in
+//! the fan-out. A whole-snapshot ticket sets `slice_index = 0`,
+//! `slice_count = 1`. The pair also gives a mixed-version rolling deploy the
+//! reject-unknown safety ADR-0071 requires: a coordinator minting v4 slice
+//! tickets and a worker still on the v3 codec cannot silently misread one
+//! layout as the other, because the version byte differs and each side
+//! rejects the other's version rather than reinterpreting its bytes. The
+//! envelope stays a transient wire token bounded by `deadline_ns`, never a
+//! persisted format, so the field is threaded into the layout under a bumped
+//! version byte exactly as the earlier extensions were.
+//!
 //! Because a ticket is ephemeral and never persisted, a new [`SegmentRef`]
 //! field is threaded into the current version's layout in place rather than
 //! behind a fresh version byte: there is no older-version ticket in flight to
@@ -163,7 +181,7 @@ use uuid::Uuid;
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
 const MAC_LEN: usize = 32;
@@ -181,9 +199,10 @@ pub const TICKET_KEY_LEN: usize = 32;
 /// to outlive the process that minted it.
 pub type TicketKey = [u8; TICKET_KEY_LEN];
 
-/// Smallest possible encoded ticket: the fixed header plus the trailing MAC,
-/// with zero tokens, zero segments, and an empty statement.
-const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + MAC_LEN;
+/// Smallest possible encoded ticket: the fixed header (including the
+/// `slice_index`/`slice_count` pair) plus the trailing MAC, with zero tokens,
+/// zero segments, and an empty statement.
+const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + MAC_LEN;
 
 /// One pinned segment inside a [`FlightTicket`]: the wire mirror of a
 /// resolved [`SegmentRef`].
@@ -304,6 +323,16 @@ pub struct FlightTicket {
     /// is expired. Always set by the minter to at most the GC protection
     /// horizon (see module docs).
     pub deadline_ns: i64,
+    /// This ticket's 0-based position in a distributed fan-out (ADR-0071,
+    /// issue #866). A whole-snapshot ticket carries `0`. Carried so a
+    /// coordinator/worker can identify and log which slice a ticket pins; it
+    /// is not a trust boundary and `snapshot()` ignores it.
+    pub slice_index: u32,
+    /// Number of slices the resolved snapshot was fanned out into; `1` for a
+    /// whole-snapshot ticket. With [`slice_index`](Self::slice_index) this
+    /// makes `segments` an identified *slice* of the pinned set rather than
+    /// the whole set.
+    pub slice_count: u32,
 }
 
 impl FlightTicket {
@@ -328,6 +357,8 @@ impl FlightTicket {
         buf.extend_from_slice(&self.tenant.0);
         buf.extend_from_slice(&self.now_ns.to_le_bytes());
         buf.extend_from_slice(&self.deadline_ns.to_le_bytes());
+        write_u32(&mut buf, self.slice_index);
+        write_u32(&mut buf, self.slice_count);
 
         write_u32(&mut buf, u32_len(self.min_commit_tokens.len())?);
         for token in &self.min_commit_tokens {
@@ -386,6 +417,8 @@ impl FlightTicket {
         let tenant = TenantHash(cur.read_array::<16>()?);
         let now_ns = i64::from_le_bytes(cur.read_array::<8>()?);
         let deadline_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+        let slice_index = cur.read_u32()?;
+        let slice_count = cur.read_u32()?;
 
         let token_count = cur.read_u32()?;
         // Do not pre-allocate from the untrusted count; push and grow.
@@ -457,6 +490,8 @@ impl FlightTicket {
             min_commit_tokens,
             now_ns,
             deadline_ns,
+            slice_index,
+            slice_count,
         })
     }
 
@@ -716,6 +751,8 @@ mod tests {
             min_commit_tokens: vec![sample_token(1), sample_token(2)],
             now_ns: 1_700_000_000_000_000_000,
             deadline_ns: 1_700_000_030_000_000_000,
+            slice_index: 0,
+            slice_count: 1,
         }
     }
 
@@ -797,6 +834,8 @@ mod tests {
         body.extend_from_slice(&[0u8; 16]);
         body.extend_from_slice(&0i64.to_le_bytes());
         body.extend_from_slice(&0i64.to_le_bytes());
+        write_u32(&mut body, 0); // slice_index
+        write_u32(&mut body, 0); // slice_count
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
@@ -808,6 +847,67 @@ mod tests {
             FlightTicket::decode(&body, &key),
             Err(FlightTicketError::UnsupportedVersion(_))
         ));
+    }
+
+    /// The predecessor envelope version (v3, before ADR-0071 added the slice
+    /// pair) is rejected with the existing typed `UnsupportedVersion`, never
+    /// reinterpreted under the v4 layout. This is the rolling-deploy safety a
+    /// coordinator minting v4 slice tickets relies on: a v3 ticket carrying a
+    /// valid MAC under this process's key (so the MAC is not what rejects it)
+    /// still fails on the version byte, so no v3 bytes are ever read as a v4
+    /// slice.
+    #[test]
+    fn a_v3_envelope_is_rejected_as_unsupported_version() {
+        let key = test_key();
+        // A v4-sized body (>= MIN_ENCODED_LEN) so the length guard passes and
+        // the version check is what fires, but with the v3 version byte.
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC);
+        body.push(3); // the predecessor version
+        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0i64.to_le_bytes());
+        write_u32(&mut body, 0); // slice_index
+        write_u32(&mut body, 0); // slice_count
+        write_u32(&mut body, 0); // tokens
+        write_u32(&mut body, 0); // segments
+        write_u32(&mut body, 0); // stmt_len
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
+        assert_eq!(
+            FlightTicket::decode(&body, &key),
+            Err(FlightTicketError::UnsupportedVersion(3))
+        );
+    }
+
+    /// A slice ticket (a subset of the pinned set with a non-trivial
+    /// `(slice_index, slice_count)`) round-trips bit-for-bit, and `snapshot()`
+    /// rebuilds exactly that slice's segments: the slice fields are carried but
+    /// do not perturb the reconstructed segment set.
+    #[test]
+    fn a_slice_ticket_round_trips_and_rebuilds_its_slice() {
+        let ticket = FlightTicket {
+            segments: vec![
+                sample_pin(5, "t/aa/metrics/l0/0002/w.7.8.ghi.rseg"),
+                sample_pin(6, "t/aa/metrics/l0/0003/w.9.a.jkl.rseg"),
+            ],
+            slice_index: 2,
+            slice_count: 5,
+            ..sample_ticket()
+        };
+        let bytes = ticket.encode(&test_key()).expect("encode");
+        let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
+        assert_eq!(decoded, ticket);
+        assert_eq!(decoded.slice_index, 2);
+        assert_eq!(decoded.slice_count, 5);
+        assert_eq!(
+            decoded.snapshot().segments,
+            ticket
+                .segments
+                .iter()
+                .map(SegmentPin::to_segment_ref)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -827,6 +927,8 @@ mod tests {
             min_commit_tokens: vec![],
             now_ns: 0,
             deadline_ns: 0,
+            slice_index: 0,
+            slice_count: 1,
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(bytes.len(), MIN_ENCODED_LEN);
@@ -860,6 +962,8 @@ mod tests {
             min_commit_tokens: (0..8).map(sample_token).collect(),
             now_ns: 42,
             deadline_ns: 99,
+            slice_index: 3,
+            slice_count: 8,
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(
@@ -899,6 +1003,8 @@ mod tests {
         body.extend_from_slice(&[0u8; 16]); // tenant
         body.extend_from_slice(&0i64.to_le_bytes()); // now
         body.extend_from_slice(&0i64.to_le_bytes()); // deadline
+        write_u32(&mut body, 0); // slice_index
+        write_u32(&mut body, 0); // slice_count
         write_u32(&mut body, 0); // tokens
         write_u32(&mut body, 0); // segments
         write_u32(&mut body, (MAX_STATEMENT_LEN + 1) as u32); // stmt_len
@@ -1009,13 +1115,16 @@ mod tests {
             min_commit_tokens: vec![],
             now_ns: 5,
             deadline_ns: 6,
+            slice_index: 0,
+            slice_count: 1,
         };
         let mut bytes = ticket.encode(&key).expect("encode");
         // The level tag sits right after the per-segment fixed fields and the
         // length-prefixed key: header (magic 4 + version 1 + tenant 16 + now 8
-        // + deadline 8 = 37) + token_count (4) + seg_count (4) + the segment's
-        // 120 fixed bytes + key_len (4) + the key bytes.
-        let level_offset = 37 + 4 + 4 + 120 + 4 + object_key.len();
+        // + deadline 8 + slice_index 4 + slice_count 4 = 45) + token_count (4)
+        // + seg_count (4) + the segment's 120 fixed bytes + key_len (4) + the
+        // key bytes.
+        let level_offset = 45 + 4 + 4 + 120 + 4 + object_key.len();
         assert_eq!(bytes[level_offset], 0, "expected the L0 level tag here");
         bytes[level_offset] ^= 0x01;
         assert_eq!(
@@ -1132,6 +1241,8 @@ mod tests {
             tokens in prop::collection::vec(token_strategy(), 0..8),
             now_ns in any::<i64>(),
             deadline_ns in any::<i64>(),
+            slice_index in any::<u32>(),
+            slice_count in any::<u32>(),
         ) {
             let ticket = FlightTicket {
                 tenant: TenantHash(tenant),
@@ -1140,6 +1251,8 @@ mod tests {
                 min_commit_tokens: tokens,
                 now_ns,
                 deadline_ns,
+                slice_index,
+                slice_count,
             };
             let key = test_key();
             let bytes = ticket.encode(&key).expect("encode");

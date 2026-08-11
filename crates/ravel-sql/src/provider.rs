@@ -49,6 +49,17 @@ use crate::pushdown::{Pushdown, extract};
 use crate::scan::RsegScanExec;
 use crate::schema::public_schema;
 
+/// A coordinator-side distributed scan context (ADR-0071, issue #866): the
+/// worker endpoints one query fans out to, and the client that fetches each
+/// slice. Present only on a coordinator provider built via
+/// [`RavelTableProvider::with_distributed_scan`]; absent (the default) means
+/// the local scan path.
+#[cfg(feature = "flight-sql")]
+struct DistributedScanContext {
+    endpoints: Vec<crate::distributed::WorkerSlice>,
+    client: Arc<dyn crate::distributed::WorkerSliceClient>,
+}
+
 /// The `samples` table provider for one tenant over one pinned snapshot.
 pub struct RavelTableProvider {
     snapshot: Arc<Snapshot>,
@@ -60,6 +71,11 @@ pub struct RavelTableProvider {
     /// `RsegScanExec` the provider builds so every store fetch the scan
     /// issues on this query's behalf is recorded against it.
     accounting: QueryAccounting,
+    /// The coordinator-side distributed fan-out, if this provider is acting as
+    /// a distributed coordinator (ADR-0071, issue #866). `None` -- the default,
+    /// and every non-Flight build -- is the local scan path unchanged.
+    #[cfg(feature = "flight-sql")]
+    distributed: Option<DistributedScanContext>,
 }
 
 impl RavelTableProvider {
@@ -82,7 +98,25 @@ impl RavelTableProvider {
             config: config.into(),
             schema: public_schema(),
             accounting,
+            #[cfg(feature = "flight-sql")]
+            distributed: None,
         }
+    }
+
+    /// Install a coordinator-side distributed scan context (ADR-0071, issue
+    /// #866). With it, [`TableProvider::scan`] fans the samples scan out to the
+    /// given worker endpoints -- one `DistributedScanExec` partition per slice,
+    /// feeding the same merge -> dedup pair -- instead of scanning the local
+    /// snapshot. Without it, the provider is unchanged. Only compiled with the
+    /// Flight transport, which is the only thing that can carry a slice ticket.
+    #[cfg(feature = "flight-sql")]
+    pub fn with_distributed_scan(
+        mut self,
+        endpoints: Vec<crate::distributed::WorkerSlice>,
+        client: Arc<dyn crate::distributed::WorkerSliceClient>,
+    ) -> Self {
+        self.distributed = Some(DistributedScanContext { endpoints, client });
+        self
     }
 
     /// Build the full scan -> merge -> dedup physical pipeline over every
@@ -103,6 +137,24 @@ impl RavelTableProvider {
     /// the caller; the `max_segments` budget is checked against what will
     /// actually be scanned.
     fn build_pipeline(
+        &self,
+        target_partitions: usize,
+        segments: &[SegmentRef],
+        matchers: Arc<Vec<LabelMatcher>>,
+        series_ids: Option<Arc<HashSet<[u8; 16]>>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let merge = self.build_merge(target_partitions, segments, matchers, series_ids)?;
+        let dedup = RsegDedupExec::new(merge, self.config.engine.max_samples)?;
+        Ok(Arc::new(dedup))
+    }
+
+    /// Build the pre-dedup half of the pipeline: `RsegScanExec ->
+    /// SortPreservingMergeExec (series_id, ts)`, internal schema, one output
+    /// partition, sorted by `(series_id, ts)`. The full pipeline wraps this in
+    /// [`RsegDedupExec`]; the distributed worker fragment
+    /// ([`Self::worker_fragment`]) returns it as-is, because dedup stays
+    /// authoritative at the coordinator (ADR-0071, crate::distributed).
+    fn build_merge(
         &self,
         target_partitions: usize,
         segments: &[SegmentRef],
@@ -141,9 +193,50 @@ impl RavelTableProvider {
         let ordering = LexOrdering::new(merge_exprs)
             .ok_or_else(|| DataFusionError::Internal("empty merge ordering".into()))?;
         let merge: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(ordering, scan));
+        Ok(merge)
+    }
 
-        let dedup = RsegDedupExec::new(merge, self.config.engine.max_samples)?;
-        Ok(Arc::new(dedup))
+    /// The worker-side fragment for a distributed SQL scan (ADR-0071, issue
+    /// #866): the internal-schema, `(series_id, ts)`-sorted `RsegScanExec ->
+    /// SortPreservingMergeExec` pipeline over `segments`, with no pushdown and
+    /// NO dedup.
+    ///
+    /// A worker executes this over its slice and streams the result to the
+    /// coordinator, whose `DistributedScanExec` exposes each worker stream as
+    /// one sorted partition feeding the SAME merge -> dedup pair
+    /// (crate::distributed). The provenance columns are retained and dedup is
+    /// deliberately absent, because the winner for a `(series_id, ts)` sample
+    /// is only decidable once every slice's candidates meet at the
+    /// coordinator's authoritative dedup.
+    pub fn worker_fragment(
+        &self,
+        target_partitions: usize,
+        segments: &[SegmentRef],
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.build_merge(target_partitions, segments, Arc::new(Vec::new()), None)
+    }
+
+    /// Apply projection pushdown (column selection only) above `plan`. Shared
+    /// by the local scan path and the distributed scan path so both project
+    /// identically; see the note in [`TableProvider::scan`].
+    fn apply_projection(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        projection: Option<&Vec<usize>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        match projection {
+            Some(proj) => {
+                let exprs = proj
+                    .iter()
+                    .map(|&i| {
+                        let name = self.schema.field(i).name();
+                        Ok((col(name, &self.schema)?, name.to_string()))
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+                Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+            }
+            None => Ok(plan),
+        }
     }
 
     /// Segments overlapping the extracted ts bounds. Widen-only: a segment is
@@ -195,6 +288,28 @@ impl TableProvider for RavelTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Distributed coordinator path (ADR-0071, issue #866): fan out to
+        // worker slices instead of scanning locally. The scan's `_limit` is
+        // honored here as a fetch-stop hint across the distributed partitions,
+        // with the exact limit re-applied above the dedup (over-fetch is safe,
+        // under-fetch is not; crate::distributed). Filters are re-applied above
+        // the returned plan by DataFusion (the provider reports `Inexact`), so
+        // not pushing them to workers only widens each worker's read, never
+        // changes a row. Aggregation, when the session plans it, sits above the
+        // dedup's single partition, so the SQL determinism ban is untouched.
+        #[cfg(feature = "flight-sql")]
+        if let Some(dist) = &self.distributed {
+            let plan = crate::distributed::distributed_samples_plan(
+                dist.endpoints.clone(),
+                Arc::clone(&dist.client),
+                self.config.engine.max_samples,
+                _limit,
+                self.accounting.clone(),
+                self.config.engine.max_bytes_scanned,
+            )?;
+            return self.apply_projection(plan, projection);
+        }
+
         let target_partitions = state.config().target_partitions();
 
         // Extract widen-only pushdown from the filters and prune with it.
@@ -216,18 +331,6 @@ impl TableProvider for RavelTableProvider {
         // regardless (review F8): it is valid only when the post-dedup row
         // count provably equals SERIES_TABLE `sample_count` for the exact
         // pruned case, which is not proven, so correctness keeps the GETs.
-        match projection {
-            Some(proj) => {
-                let exprs = proj
-                    .iter()
-                    .map(|&i| {
-                        let name = self.schema.field(i).name();
-                        Ok((col(name, &self.schema)?, name.to_string()))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?;
-                Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
-            }
-            None => Ok(plan),
-        }
+        self.apply_projection(plan, projection)
     }
 }

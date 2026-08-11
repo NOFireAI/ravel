@@ -121,6 +121,12 @@ flight-sql = [
 proptest = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+# Dev-only: the distributed Flight acceptance test
+# (tests/flight_distributed.rs, issue #866) hand-crafts an old-version (v3)
+# ticket envelope with a MAC that is valid under the service's in-process key,
+# so the decode rejects it on the version byte (not the MAC). Computing that MAC
+# needs the same keyed BLAKE3 the codec uses; blake3 is already a workspace pin.
+blake3 = { workspace = true }
 # Dev-only: the Flight SQL request-span test (tests/flight_span.rs) captures
 # `tracing` output through a `MakeWriter` and asserts the `flight_sql_statement`
 # span's bounded fields (ADR-0044 section 5), the same way

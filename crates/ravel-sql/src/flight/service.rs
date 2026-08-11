@@ -49,7 +49,7 @@ use rand::Rng as _;
 
 use crate::executor::SqlExecutor;
 use crate::flight::request::{sql_request, status_from_sql};
-use crate::flight::stream::{DoGetStream, audited_stream, statement_stream};
+use crate::flight::stream::{DoGetStream, audited_stream, fragment_stream, statement_stream};
 use crate::flight::{ClockRef, FlightAuth, FlightClock, FlightSqlConfig, metadata};
 use crate::flight_ticket::{FlightTicket, SegmentPin, TicketKey};
 use crate::validate::validate;
@@ -201,6 +201,29 @@ impl RavelFlightSqlService {
             .with_descriptor(descriptor);
         Ok(Response::new(info))
     }
+
+    /// Encode `ticket` into the opaque Flight `Ticket` a statement endpoint
+    /// carries: sign it with the in-process key and wrap it in the
+    /// `TicketStatementQuery` the `do_get` dispatcher routes on.
+    fn encode_statement_ticket(
+        &self,
+        tenant: TenantHash,
+        ticket: FlightTicket,
+    ) -> Result<Ticket, Status> {
+        let handle = ticket.encode(&self.ticket_key).map_err(|err| {
+            // The only reachable case is an over-long statement, which is the
+            // caller's own input.
+            tracing::debug!(tenant = %tenant.to_hex(), error = %err, "flight ticket encode failed");
+            Status::invalid_argument(err.to_string())
+        })?;
+        Ok(Ticket::new(
+            TicketStatementQuery {
+                statement_handle: handle.into(),
+            }
+            .as_any()
+            .encode_to_vec(),
+        ))
+    }
 }
 
 #[tonic::async_trait]
@@ -301,37 +324,44 @@ impl FlightSqlService for RavelFlightSqlService {
             QueryWorkloadClass::Interactive,
         );
 
+        let deadline_ns = self.config.ticket_deadline_ns(now_ns, req.deadline);
+
+        let info = FlightInfo::new()
+            .try_with_schema(schema.as_ref())
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to encode flight sql result schema");
+                Status::internal("failed to build query plan")
+            })?;
+
+        // ADR-0071 (issue #866): an external Flight SQL client ALWAYS receives
+        // exactly ONE endpoint, distribution installed or not. Arrow Flight's
+        // two-RPC contract makes the N endpoints of one FlightInfo the
+        // partitions of a SINGLE result set that a client unions; a cross-shard
+        // scan fan-out is not that (unioning N per-slice partial scans would
+        // return cross-slice duplicates undeduped, N partial aggregates, and up
+        // to n*N rows for a LIMIT n). Distribution is instead an internal
+        // coordinator-to-worker concern: the coordinator (issue #868) mints
+        // slice tickets with [`crate::distributed::plan_distributed_slices`] and
+        // redeems them against workers' `do_get` slice-fragment path
+        // (`slice_count > 1`, served by [`do_get_statement`]). This client-facing
+        // endpoint is therefore always the whole pinned set, redeemed on this
+        // coordinator itself (no location); `slice_index`/`slice_count` mark it
+        // as the whole snapshot (0 of 1).
         let ticket = FlightTicket {
             tenant,
             statement: query.query.clone(),
             segments,
             min_commit_tokens: req.min_tokens.clone(),
             now_ns,
-            deadline_ns: self.config.ticket_deadline_ns(now_ns, req.deadline),
+            deadline_ns,
+            slice_index: 0,
+            slice_count: 1,
         };
-        let handle = ticket.encode(&self.ticket_key).map_err(|err| {
-            // The only reachable case is an over-long statement, which is the
-            // caller's own input.
-            tracing::debug!(tenant = %tenant.to_hex(), error = %err, "flight ticket encode failed");
-            Status::invalid_argument(err.to_string())
-        })?;
-
-        let ticket = Ticket::new(
-            TicketStatementQuery {
-                statement_handle: handle.into(),
-            }
-            .as_any()
-            .encode_to_vec(),
+        let info = info.with_endpoint(
+            FlightEndpoint::new().with_ticket(self.encode_statement_ticket(tenant, ticket)?),
         );
-        let info = FlightInfo::new()
-            .try_with_schema(schema.as_ref())
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to encode flight sql result schema");
-                Status::internal("failed to build query plan")
-            })?
-            .with_endpoint(FlightEndpoint::new().with_ticket(ticket))
-            .with_descriptor(request.into_inner());
-        Ok(Response::new(info))
+
+        Ok(Response::new(info.with_descriptor(request.into_inner())))
     }
 
     /// Redeem a statement ticket against its pinned snapshot.
@@ -382,6 +412,43 @@ impl FlightSqlService for RavelFlightSqlService {
         let permit = self.query_admission.try_admit().map_err(|_| {
             Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
         })?;
+
+        // ADR-0071 (issue #866): a slice ticket (`slice_count > 1`) is an
+        // INTERNAL coordinator-to-worker request, never something an external
+        // client holds -- `get_flight_info_statement` only ever mints the
+        // whole-set ticket (`slice_count == 1`). When one arrives, serve the raw
+        // scan fragment over this slice's pinned segments: the internal-schema,
+        // `(series_id, ts)`-sorted rows with provenance retained, scan-only, with
+        // no statement planning (a slice ticket carries `statement: String::new()`,
+        // so there is nothing to `validate`), no aggregation, and no dedup. The
+        // authoritative cross-slice dedup and any aggregate stay at the
+        // coordinator (crate::distributed). A slice fetch is internal fan-out,
+        // not a distinct auditable query, so it is not audit-wrapped; the audited
+        // unit is the client-facing statement the coordinator serves. The tenant
+        // check above still gates it: a slice ticket carries the coordinator's
+        // resolved tenant, and only this deployment's own ticket key MACs it.
+        if decoded.slice_count > 1 {
+            let span = tracing::info_span!(
+                "flight_sql_slice_fragment",
+                tenant_hash = %tenant.to_hex(),
+                workload_class = "interactive",
+                s3_requests = tracing::field::Empty,
+                s3_bytes = tracing::field::Empty,
+            );
+            let stream = fragment_stream(
+                &self.executor,
+                Arc::clone(&self.clock),
+                tenant,
+                decoded,
+                &self.config,
+                Arc::clone(&self.recorder),
+                span.clone(),
+                permit,
+            )
+            .instrument(span)
+            .await?;
+            return Ok(Response::new(stream));
+        }
 
         // The statement now reaches execution against its pinned snapshot for a
         // resolved tenant, so it is auditable (ADR-0042 decision 4, ADR-0062

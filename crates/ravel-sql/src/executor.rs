@@ -482,6 +482,61 @@ impl SqlExecutor {
         })
     }
 
+    /// Execute the worker-side scan fragment for one distributed slice (ADR-0071,
+    /// issue #866), returning its internal-schema, `(series_id, ts)`-sorted
+    /// stream.
+    ///
+    /// This is the worker half of the SQL distributed lane: a coordinator's
+    /// `do_get` receives a slice ticket (`slice_count > 1`) and serves this
+    /// fragment over the pinned slice rather than planning the statement. There
+    /// is deliberately NO SQL text, no aggregation, and no dedup here
+    /// ([`RavelTableProvider::worker_fragment`]): the provenance columns are
+    /// retained and the authoritative cross-slice dedup stays at the coordinator
+    /// (crate::distributed). The result reuses [`PinnedStream`] so the same
+    /// memory ceiling and drop-cancellation apply as on the local path.
+    ///
+    /// `target_partitions` follows the segment count so the fragment's internal
+    /// merge fans out over the slice's segments exactly as the local scan does;
+    /// the coordinator re-merges and deduplicates above the union of slices.
+    #[cfg(feature = "flight-sql")]
+    pub async fn worker_fragment_stream(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedStream, SqlError> {
+        let (pool, breach) = self
+            .config
+            .query_pool(self.tenant_budget(tenant_hash), accounting.clone());
+        let segments = snapshot.segments.clone();
+        let target_partitions = segments.len().max(1);
+        let provider = Arc::new(RavelTableProvider::new(
+            snapshot,
+            tenant_hash,
+            self.fetcher.clone(),
+            self.config,
+            accounting.clone(),
+        ));
+        let plan = provider
+            .worker_fragment(target_partitions, &segments)
+            .map_err(plan_error)?;
+        let ctx = build_session(
+            &self.config,
+            pool,
+            SessionTable::Metrics(Arc::clone(&provider)),
+        )
+        .map_err(plan_error)?;
+        let schema = plan.schema();
+        let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
+        Ok(PinnedStream {
+            _ctx: ctx,
+            inner,
+            schema,
+            breach,
+            plan,
+        })
+    }
+
     /// One `Catalog::resolve` plus the `max_segments` budget check. Resolves
     /// the signal the query's `FROM` clause targets ([`Self::target_signal`]),
     /// so a metrics-only query never lists the logs keyspace and vice versa.

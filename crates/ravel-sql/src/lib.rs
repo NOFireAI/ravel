@@ -51,6 +51,8 @@ mod config;
 pub mod conformance;
 mod cost;
 mod dedup;
+#[cfg(feature = "flight-sql")]
+pub mod distributed;
 mod error;
 mod executor;
 #[cfg(feature = "flight-sql")]
@@ -94,6 +96,11 @@ pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
 pub use config::{DEFAULT_MAX_QUERY_BYTES, SqlConfig};
+#[cfg(feature = "flight-sql")]
+pub use distributed::{
+    DistributedFlightConfig, DistributedScanExec, StaticWorkerEndpoints, WorkerEndpoints,
+    WorkerSlice, WorkerSliceClient, distributed_samples_plan, plan_distributed_slices,
+};
 pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_UNAVAILABLE,
     MSG_UNSATISFIABLE, SqlError,
