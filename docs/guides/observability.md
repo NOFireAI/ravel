@@ -262,17 +262,23 @@ explosion. It renders only when the process runs with `--distributed-query`
 | `ravel_distrib_fragment_auth_failures_total` | Inbound fragment requests refused for a missing or invalid cluster bearer token. |
 | `ravel_distrib_fragment_inflight` | Gauge. Fragment requests currently holding a fragment-admission permit. |
 | `ravel_distrib_slices_local_total` | Slices this coordinator executed locally because it owns them (self-mapped, no network hop). |
-| `ravel_distrib_slices_remote_total` | Slices this coordinator dispatched to a remote worker and read back over the wire. |
-| `ravel_distrib_slices_fallback_total` | Slices whose remote dispatch failed at transport and fell back to local execution rather than failing the query. |
+| `ravel_distrib_slices_remote_total` | Slices this coordinator dispatched to a remote worker and read back over the wire (counts the attempt that produced the usable result, whether the primary or the re-dispatch). |
+| `ravel_distrib_slices_redispatched_total` | Slices whose rendezvous-primary worker was lost at transport or returned `Unavailable`, so the coordinator re-dispatched the slice once to the next rendezvous worker (ADR-0071 deliverable 1). |
+| `ravel_distrib_slices_fallback_total` | Slices that fell back to coordinator-local execution after the primary and its one re-dispatch both failed re-dispatchably (transport loss or `Unavailable`), rather than failing the query. |
 | `ravel_distrib_slice_fetch_seconds` | Per-slice fetch latency histogram, covering both locally-run and remote slices. |
 
 Fragment admission is a distinct workload class from client-query admission
 (`--max-inflight-fragments`, separate from the query concurrency limit), so a
 burst of inbound fragments cannot starve the coordinator's own client queries
-and vice versa. A rising `ravel_distrib_slices_fallback_total` means a worker
-named in the live set is unreachable: the query still returns correct results
-(the coordinator can read any slice itself), but the fan-out is degrading to
-local execution and latency will climb.
+and vice versa. A rising `ravel_distrib_slices_redispatched_total` means a
+rendezvous-primary worker is being lost or returning `Unavailable` and slices
+are retrying on their next owner; if `ravel_distrib_slices_fallback_total` also
+rises, both the primary and its failover are unreachable and the fan-out is
+degrading to local execution. In every case the query still returns correct
+results (the coordinator can read any slice itself), but latency will climb.
+A worker-reported `CORRUPT` status is never re-dispatched or masked by
+fallback: it fails the query typed so the corruption is not silently papered
+over.
 
 ## Reading estimate against actual
 

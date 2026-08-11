@@ -226,6 +226,32 @@ impl Distributed {
                         reason: format!("slice tripped its budget: {}", response.status_message),
                     }));
                 }
+                pb::status::Code::Corrupt => {
+                    // ADR-0071 deliverable 3: a worker-reported corruption is a
+                    // real defect, terminal and typed. The SliceFetcher never
+                    // retries or falls back around it (that would mask the
+                    // corruption behind a possibly-clean local read), so it
+                    // arrives here directly and fails the query typed.
+                    return Err(QueryError::Distrib {
+                        reason: format!(
+                            "slice reported a corrupt segment: {}",
+                            response.status_message
+                        ),
+                    });
+                }
+                pb::status::Code::Unavailable => {
+                    // Terminal only. The RoutingSliceFetcher already
+                    // re-dispatched to the next rendezvous worker and then ran
+                    // the slice coordinator-local (ADR-0071 deliverable 1);
+                    // reaching here means every attempt, local included, was
+                    // unavailable. Fail typed, never with a partial merge.
+                    return Err(QueryError::Distrib {
+                        reason: format!(
+                            "slice unavailable after re-dispatch and local execution: {}",
+                            response.status_message
+                        ),
+                    });
+                }
                 other => {
                     return Err(QueryError::Distrib {
                         reason: format!("slice returned {other:?}: {}", response.status_message),
