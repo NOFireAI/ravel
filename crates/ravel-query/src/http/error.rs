@@ -122,6 +122,11 @@ impl From<QueryError> for ApiError {
             // response); its `reason` may carry internal detail, so it is
             // redacted to the same retryable 503 as the other storage faults.
             | QueryError::Distrib { .. }
+            // A federated fetch failure (a remote cluster was unavailable with
+            // skip_unavailable off, or framed a bad response) is a server-side
+            // outage from the client's view; its `reason` may name an internal
+            // cluster, so it is redacted to the same retryable 503.
+            | QueryError::Federation { .. }
             | QueryError::NonMonotonicSamples { .. } => {
                 ApiError::Unavailable(MSG_UNAVAILABLE.to_string())
             }

@@ -55,7 +55,7 @@ enum EvalWindow {
 /// entirely by listing/`min_token` lookup, both structurally unprunable
 /// (docs/metric-index-plan.md P5b, `SnapshotWindow::extract_into`). This is
 /// an exact count, never an estimate.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueryStats {
     /// Segments actually fetched (the post-pruning snapshot size).
     pub segments_fetched: u64,
@@ -74,6 +74,18 @@ pub struct QueryStats {
     /// Upper-envelope cost estimate computed after snapshot resolution and
     /// before any page fetch (ADR-0044 decision 3).
     pub estimate: CostEstimate,
+    /// True when the query's coverage is partial: at least one federated
+    /// remote cluster was skipped because it was unavailable and its
+    /// `skip_unavailable` was set (ADR-0071, issue #868). Always false for a
+    /// fully cluster-local query. Set after construction, in `prefetch`, once
+    /// the federation fan-out has run.
+    pub partial: bool,
+    /// Prometheus-compatible `warnings` accumulated by the federation fan-out:
+    /// one message per skipped remote cluster (ADR-0071, issue #868). Empty for
+    /// a fully cluster-local query, or a federated query with every remote
+    /// healthy. Surfaced into the query response's `warnings` array alongside
+    /// the evaluator's own [`Annotations`] warnings.
+    pub warnings: Vec<String>,
 }
 
 impl QueryStats {
@@ -90,6 +102,8 @@ impl QueryStats {
             page_stats,
             accounting,
             estimate,
+            partial: false,
+            warnings: Vec::new(),
         }
     }
 }
@@ -105,6 +119,8 @@ impl Default for QueryStats {
             page_stats: FetchStats::default(),
             accounting: QueryAccountingSnapshot::default(),
             estimate: CostEstimate::new(0, 0, 0, 0, 0),
+            partial: false,
+            warnings: Vec::new(),
         }
     }
 }
@@ -229,6 +245,12 @@ pub struct QueryEngine {
     /// into cost-gated fan-out to slice workers; see
     /// [`QueryEngine::with_distributed`].
     distributed: Option<Arc<crate::distrib::Distributed>>,
+    /// ADR-0071 cross-cluster federation (issue #868). `None` is the default:
+    /// no remote clusters, a fully cluster-local query. `Some` opts this engine
+    /// into fanning each query's matchers/window out to the configured remote
+    /// clusters and unioning their series into the merge pool; see
+    /// [`QueryEngine::with_federation`].
+    federation: Option<Arc<crate::distrib::Federation>>,
 }
 
 impl QueryEngine {
@@ -242,6 +264,7 @@ impl QueryEngine {
             fetcher: SegmentFetcher::new(store),
             config,
             distributed: None,
+            federation: None,
         }
     }
 
@@ -253,6 +276,18 @@ impl QueryEngine {
     #[must_use]
     pub fn with_distributed(mut self, distributed: Arc<crate::distrib::Distributed>) -> Self {
         self.distributed = Some(distributed);
+        self
+    }
+
+    /// Opts this engine into ADR-0071 cross-cluster federation (issue #868).
+    /// Mirrors [`Self::with_distributed`]: off by default, and with no
+    /// federation context every query runs the cluster-local path untouched.
+    /// When set, a query fans its matchers/window out to each configured remote
+    /// cluster, unions the returned series into the merge pool, and surfaces
+    /// any skipped-cluster warnings and partial-coverage flag.
+    #[must_use]
+    pub fn with_federation(mut self, federation: Arc<crate::distrib::Federation>) -> Self {
+        self.federation = Some(federation);
         self
     }
 
@@ -616,6 +651,10 @@ impl QueryEngine {
         // N times, so the pre-fetch cost estimate must scale by this same
         // factor to stay a genuine upper bound.
         let fetch_multiplier = plans.len() as u64;
+        // Captured by reference (like `plans`), so the `FnMut` attempt copies
+        // the reference on each retry rather than moving the owned `Vec` out of
+        // its environment. The per-plan futures below build owned pairs from it.
+        let windows_ref = &windows;
         let attempt = |snapshot: Snapshot, accounting: QueryAccounting| async move {
             // Owned clones, not borrowed slice items: a closure capturing a
             // reference into `plans` through this combinator chain makes
@@ -624,19 +663,26 @@ impl QueryEngine {
             // blanket impl ("implementation of FnOnce is not general
             // enough") at the router call site in `http/mod.rs`. Cloning
             // each `SelectorPlan` into the future sidesteps that entirely.
-            type PerPlan = (Vec<SeriesData>, Vec<HistogramSeriesData>, FetchStats);
+            // Per-plan local result: this selector's raw scalar runs (kept
+            // un-merged so cross-cluster federation runs can join the same
+            // pool and merge once, below), the merged native-histogram series
+            // (federation contributes no histograms), and the page stats.
+            type PerPlan = (
+                Vec<Vec<FetchedSeriesSoa>>,
+                Vec<HistogramSeriesData>,
+                FetchStats,
+            );
             let results: Vec<Result<PerPlan, QueryError>> = stream::iter(plans.to_vec())
                 .map(|plan| {
                     let snapshot = &snapshot;
                     let accounting = &accounting;
                     async move {
                         // A selector's segments carry scalar and/or
-                        // native-histogram series; fetch and merge both kinds
-                        // (a series is one kind for its whole life, so the two
-                        // sets never overlap) and hand both to the source. The
-                        // two kinds come off each segment in one open+decode
-                        // pass (#278 item 1), not two independent segment
-                        // opens.
+                        // native-histogram series; fetch both kinds (a series is
+                        // one kind for its whole life, so the two sets never
+                        // overlap). The two kinds come off each segment in one
+                        // open+decode pass (#278 item 1), not two independent
+                        // segment opens.
                         // The bytes-scanned budget (ADR-0061 decision 1) is
                         // enforced inside `fetch_all_samples_and_histograms`
                         // itself, once per completed segment fetch, against the
@@ -653,62 +699,32 @@ impl QueryEngine {
                                 max_bytes_scanned,
                             )
                             .await?;
-                        let scalar = merge_soa_runs(scalar_fetched, max_series, max_samples)?;
                         let histograms =
                             merge_histogram_soa_runs(hist_fetched, max_series, max_samples)?;
-                        Ok::<PerPlan, QueryError>((scalar, histograms, page_stats))
+                        Ok::<PerPlan, QueryError>((scalar_fetched, histograms, page_stats))
                     }
                 })
                 .buffer_unordered(concurrency)
                 .collect()
                 .await;
 
-            // Reachability analysis (issue #801): two plans in one query CAN
-            // target the same `LabelSet` -- `plan_selectors`
-            // (crates/ravel-promql/src/plan.rs) walks `Expr::Binary`,
-            // `Expr::Aggregate`, and `Expr::Call` and reports one
-            // `SelectorPlan` per operand/arg/param, so e.g. `up + up offset
-            // 5m` yields two plans with identical matchers and different
-            // `offset_ns`/`range_ns` (proven by
-            // `binary_expression_reports_both_operands_selectors` in
-            // ravel-promql). `or_insert` below lets whichever plan's fetch
-            // future completes first, per `buffer_unordered`'s arrival
-            // order, become the resident entry for a shared `LabelSet`.
-            //
-            // That resident choice can never differ in *content*, though,
-            // given how this fetch is built: every plan in this call shares
-            // one `Snapshot` resolved once against the padded union of all
-            // plans' windows (`padded` above), and
-            // `fetch_all_samples_and_histograms` scans that same
-            // `snapshot.segments` list for every plan with no per-plan
-            // sample-level window trim (`SegmentFetcher::
-            // fetch_soa_and_histograms_accounted` takes matchers only, no
-            // start/end bound). Decoding a given series from a given segment
-            // is a pure function of segment bytes + series id, independent
-            // of which plan's matchers selected it, so two plans that both
-            // match the same series decode byte-identical raw runs; feeding
-            // identical runs through the deterministic `merge_soa_runs`
-            // total order (`is_greater`) yields byte-identical `SeriesData`.
-            // Per-selector window clipping happens downstream, once, in
-            // `MergedSource::query`/`query_histograms` against this same
-            // flat pool -- documented in docs/query-engine.md ("later
-            // selectors sharing a series id keep the first merge seen ...
-            // does not affect any single selector's result").
-            //
-            // So `or_insert` is reachable but not data-lossy today: it can
-            // only ever resolve a tie between two identical values. What it
-            // does leak is iteration order -- `HashMap`'s `RandomState`
-            // makes `into_values()` order vary run to run for the same
-            // input, which this stage fixes below with an explicit sort
-            // instead of a merge (there is nothing to merge).
-            let mut combined: HashMap<LabelSet, SeriesData> = HashMap::new();
+            // Collect every plan's raw scalar runs into one pool and every
+            // plan's histogram series into one deduplicated map. Scalar runs
+            // are merged once, below, after federation has appended its runs,
+            // so a single k-way `merge_soa_runs` unions across selectors,
+            // segments, AND clusters with the one deterministic `is_greater`
+            // total order. Two plans that select the same series decode
+            // byte-identical raw runs (the decode is a pure function of
+            // segment bytes + series id, no per-plan window trim; per-selector
+            // window clipping happens downstream in `MergedSource::query`), so
+            // pooling their runs is loss-free -- documented in
+            // docs/query-engine.md.
+            let mut all_scalar_runs: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
             let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
             let mut page_stats = FetchStats::default();
             for r in results {
-                let (scalar, histograms, per_plan_stats) = r?;
-                for series in scalar {
-                    combined.entry(series.labels.clone()).or_insert(series);
-                }
+                let (scalar_runs, histograms, per_plan_stats) = r?;
+                all_scalar_runs.extend(scalar_runs);
                 for series in histograms {
                     combined_histograms
                         .entry(series.labels.clone())
@@ -717,30 +733,72 @@ impl QueryEngine {
                 page_stats.raw_f64_pages += per_plan_stats.raw_f64_pages;
                 page_stats.raw_f64_bytes += per_plan_stats.raw_f64_bytes;
             }
-            let mut series: Vec<SeriesData> = combined.into_values().collect();
+
+            // Cross-cluster federation (ADR-0071, issue #868): fan each
+            // selector's matchers and window out to every configured remote
+            // cluster and append the returned runs to the same pool the local
+            // fetch produced, so the k-way merge below unions across cluster
+            // boundaries exactly as it unions across segments. Each remote
+            // resolves its own snapshot and enforces its own
+            // admission/limits/erasure, so the coordinator sends no erasure
+            // predicates and no cluster-local commit tokens across the
+            // boundary (the remote's tenant identity comes from its own auth
+            // over the operator credential baked into the fetcher, never from
+            // the wire and never a client credential). Run sequentially,
+            // outside the `buffer_unordered` above: an `async_trait` fetch
+            // future nested inside that combinator makes the whole query
+            // future fail the higher-ranked `Send` bound axum's `Handler`
+            // blanket impl requires.
+            // Owned `(matchers, start, end)` tuples: the fan-out runs in a
+            // named `async fn` (below), whose future is higher-ranked over its
+            // input lifetimes; passing owned data avoids tying this query
+            // future to the borrowed `plans` fn-param, which would fail axum's
+            // `Handler` `Send` bound (the same reason the local fetch clones
+            // each `SelectorPlan`).
+            let fed_plans: Vec<(Vec<LabelMatcher>, i64, i64)> = plans
+                .iter()
+                .zip(windows_ref.iter())
+                .map(|(plan, w)| (plan.matchers.clone(), w.start_ns, w.end_ns))
+                .collect();
+            let (fed_runs, fed_stats, fed_warnings, fed_partial) = self
+                .federate_scalar(tenant_hash, fed_plans, &accounting)
+                .await?;
+            all_scalar_runs.extend(fed_runs);
+            page_stats.raw_f64_pages += fed_stats.raw_f64_pages;
+            page_stats.raw_f64_bytes += fed_stats.raw_f64_bytes;
+
+            let mut series = merge_soa_runs(all_scalar_runs, max_series, max_samples)?;
             series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
             let mut histogram_series: Vec<HistogramSeriesData> =
                 combined_histograms.into_values().collect();
             histogram_series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
             Ok((
-                MergedSource {
-                    series,
-                    histogram_series,
-                },
+                (
+                    MergedSource {
+                        series,
+                        histogram_series,
+                    },
+                    fed_warnings,
+                    fed_partial,
+                ),
                 page_stats,
             ))
         };
 
-        self.resolve_snapshot_with_retry(
-            tenant_hash,
-            padded,
-            min_tokens,
-            now_ns,
-            name_filter.as_deref(),
-            fetch_multiplier,
-            attempt,
-        )
-        .await
+        let ((source, warnings, partial), mut stats) = self
+            .resolve_snapshot_with_retry(
+                tenant_hash,
+                padded,
+                min_tokens,
+                now_ns,
+                name_filter.as_deref(),
+                fetch_multiplier,
+                attempt,
+            )
+            .await?;
+        stats.partial = partial;
+        stats.warnings = warnings;
+        Ok((source, stats))
     }
 
     /// Resolves a snapshot, enforces `max_segments`, runs `attempt` once,
@@ -1040,6 +1098,76 @@ impl QueryEngine {
         .await
     }
 
+    /// Cross-cluster federation fan-out for the scalar-sample path (ADR-0071).
+    ///
+    /// Returns the remote series runs (to be unioned into the local pool and
+    /// merged once, since [`merge_soa_runs`] keys by canonical `SeriesId`),
+    /// the folded remote `FetchStats`, the deduplicated `skip_unavailable`
+    /// warnings, and whether any cluster was skipped (partial coverage).
+    ///
+    /// This is a named `async fn` on purpose: its future is higher-ranked over
+    /// its input lifetimes, so borrows taken across the inner `SliceFetcher`
+    /// await stay encapsulated here instead of leaking into the generic
+    /// snapshot-resolution future, which must satisfy axum's `Handler` `Send`
+    /// bound. The `plan_matchers_windows` argument is owned for the same
+    /// reason. No federation configured is a cheap empty result.
+    async fn federate_scalar(
+        &self,
+        tenant_hash: TenantHash,
+        plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
+        accounting: &QueryAccounting,
+    ) -> Result<(Vec<Vec<FetchedSeriesSoa>>, FetchStats, Vec<String>, bool), QueryError> {
+        let mut runs: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
+        let mut stats = FetchStats::default();
+        let mut warnings: Vec<String> = Vec::new();
+        let mut partial = false;
+        let Some(federation) = &self.federation else {
+            return Ok((runs, stats, warnings, partial));
+        };
+        for (matchers, start_ns, end_ns) in plan_matchers_windows {
+            // Empty erasure and empty min-commit-tokens cross the boundary: the
+            // remote resolves its own snapshot and enforces its own erasure,
+            // and commit tokens are cluster-local (also structurally prevents
+            // leaking this cluster's tokens). The operator credential is baked
+            // into the fetcher, so no client credential is threaded here.
+            // Owned args (accounting is an `Arc` clone that folds into the same
+            // handle) keep the fan-out future higher-ranked `Send`.
+            let outcome = federation
+                .fetch(
+                    tenant_hash,
+                    Signal::Metrics,
+                    matchers,
+                    Vec::new(),
+                    start_ns,
+                    end_ns,
+                    Vec::new(),
+                    accounting.clone(),
+                    self.config,
+                )
+                .await?;
+            // Re-enforce the coordinator's bytes-scanned budget over the
+            // combined local+remote spend now folded into `accounting`, so a
+            // tight cap trips typed on the union of both clusters' frames. A
+            // budget trip is never masked by skip_unavailable.
+            if let Some(err) = bytes_scanned_exceeded(
+                accounting.snapshot().total_s3_bytes(),
+                self.config.max_bytes_scanned,
+            ) {
+                return Err(err);
+            }
+            stats.raw_f64_pages += outcome.stats.raw_f64_pages;
+            stats.raw_f64_bytes += outcome.stats.raw_f64_bytes;
+            partial |= outcome.partial;
+            for w in outcome.warnings {
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            runs.extend(outcome.series);
+        }
+        Ok((runs, stats, warnings, partial))
+    }
+
     async fn fetch_all_series(
         &self,
         tenant_hash: TenantHash,
@@ -1115,7 +1243,7 @@ impl QueryEngine {
 ///
 /// Returns an empty vec when the snapshot carries no pending erasure, which is
 /// the common case and makes every call site below a no-op.
-fn snapshot_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate> {
+pub fn snapshot_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate> {
     snapshot
         .pending_erasure
         .iter()

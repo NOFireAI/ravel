@@ -187,6 +187,7 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         None,
+        None,
     );
     let app: Router = router(state);
 

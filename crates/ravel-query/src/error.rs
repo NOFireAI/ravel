@@ -43,6 +43,8 @@ pub enum QueryError {
     SnapshotInvalidated,
     #[error("distributed slice fetch failed: {reason}")]
     Distrib { reason: String },
+    #[error("federated fetch from remote cluster {cluster:?} failed: {reason}")]
+    Federation { cluster: String, reason: String },
     #[error("decoded segment run is not ascending by timestamp: {prev} was followed by {next}")]
     NonMonotonicSamples { prev: i64, next: i64 },
 }

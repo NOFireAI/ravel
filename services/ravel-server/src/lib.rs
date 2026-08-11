@@ -38,6 +38,8 @@ pub mod remote_write;
 pub mod scrub;
 #[cfg(feature = "sql")]
 pub mod sql;
+#[cfg(feature = "flight-sql")]
+pub mod sql_distrib;
 pub mod store;
 pub mod store_probe;
 pub mod tenancy;
@@ -320,6 +322,16 @@ pub struct ServerConfig {
     /// engine. `None` (the default) leaves every query on the byte-identical
     /// local path and never binds the fragment surface.
     pub distrib: Option<crate::config::DistribSettings>,
+    /// The resolved ADR-0071 cross-cluster federation remotes (issue #868), from
+    /// the repeatable `--remote-cluster` flag. Empty (the default) leaves the
+    /// query engine with no federation seam, so every query resolves only local
+    /// data. In a query-serving mode ([`Mode::All`]/[`Mode::Query`]) [`start`]
+    /// builds one gRPC federation client per remote and installs a
+    /// [`ravel_query::distrib::Federation`] on the engine; a federated query then
+    /// sends its matchers and window to each remote under the operator credential
+    /// configured here, never the calling client's. Independent of `distrib`
+    /// above: federation is coordinator-side and needs no local fragment surface.
+    pub remote_clusters: Vec<crate::config::RemoteClusterConfig>,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -910,6 +922,26 @@ pub async fn start(
             max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
             ..ravel_query::EngineConfig::default()
         };
+        // ADR-0071 cross-cluster federation (issue #868): build one gRPC
+        // federation client per configured remote and install a `Federation` on
+        // the engine. `None` when no `--remote-cluster` is set, leaving the
+        // engine to resolve only local data. Independent of `--distributed-query`:
+        // federation is coordinator-side and needs no local fragment surface.
+        let federation = if config.remote_clusters.is_empty() {
+            None
+        } else {
+            let mut remotes = Vec::with_capacity(config.remote_clusters.len());
+            for rc in &config.remote_clusters {
+                let fetcher = distrib::FederationSliceFetcher::connect(rc)?;
+                remotes.push(ravel_query::distrib::RemoteCluster {
+                    name: rc.name.clone(),
+                    fetcher: Arc::new(fetcher),
+                    skip_unavailable: rc.skip_unavailable,
+                    soft_timeout: rc.soft_timeout,
+                });
+            }
+            Some(Arc::new(ravel_query::distrib::Federation::new(remotes)))
+        };
         let app_state = query::build_app_state(
             catalog.clone(),
             store.clone(),
@@ -919,6 +951,7 @@ pub async fn start(
             query_accounting.clone(),
             query_admission.clone(),
             distributed.clone(),
+            federation,
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default

@@ -74,7 +74,14 @@ tokio = { workspace = true }
 # to dispatch slices, so the client transport is production code here, not just
 # a test dependency (the dev-dependency below keeps the same feature for the
 # Flight startup test).
-tonic = { workspace = true, features = ["channel"] }
+#
+# `tls-ring` + `tls-native-roots` add the client TLS transport the ADR-0071
+# cross-cluster federation client (issue #868) dials a `tls=on` remote cluster
+# over (`--remote-cluster ...,tls=on`): `ClientTlsConfig`/`with_native_roots`
+# come from these features. They are additive over `channel` and inert for a
+# plaintext (`tls=off`) remote and for the intra-cluster coordinator, which
+# stays plaintext `http://`.
+tonic = { workspace = true, features = ["channel", "tls-ring", "tls-native-roots"] }
 tonic-prost = { workspace = true }
 # The ADR-0071 `SliceFetcher` trait (ravel_query::distrib::client) is an
 # `#[async_trait]` trait the coordinator's routing fetcher implements, so
