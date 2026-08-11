@@ -113,6 +113,15 @@ and test gates on every push. Where cargo-nextest is installed, `cargo
 nextest run` is an accepted equivalent of `cargo test` (CI's check job
 runs it with the `ci` profile); doctests still need `cargo test --doc`.
 
+One narrowing for commits that can only land through a PR on protected
+`main` (every commit since 2026-07-30): when the exact tree was already
+taken through the full gate list once this session, later mechanical
+steps on that same tree (the merge script's pre-flight, a re-push) may
+skip the repeat run and let the PR's required checks enforce it —
+that is what `FLEET_MERGE_SKIP_GATES=1` above is for. The full list
+still runs at least once locally before the commit exists; protection
+makes the repeats redundant, not the first run.
+
 ### Long commands and the Bash tool
 
 The Bash tool stops a foreground command after 2 minutes by default. Its
@@ -176,6 +185,13 @@ connection, a pushed-but-broken main).
   body starts at line 3); this script does not construct one for you.
   Run `fleet-result-inspect.sh` first — this script does not pause for
   review, it assumes you already decided the scope is correct.
+  `FLEET_MERGE_SKIP_GATES=1` skips the local `gates.sh` run and lets the
+  PR's required checks be the gate. Use it only when the tree being
+  merged is byte-identical to one that already passed the full gates
+  this session (the common case: the orchestrator gated the result
+  branch minutes earlier); the cost is learning about a red PR from CI
+  instead of immediately. Never combine it with a conflict resolution
+  or any manual edit to the branch.
 - `scripts/verify-dispatch-gates.sh <ref> <scratchpad-dir>` — the tier-1
   gate check behind the `verify-dispatch` skill: an isolated worktree
   outside the repo, a cold `CARGO_TARGET_DIR`, and the full workspace
