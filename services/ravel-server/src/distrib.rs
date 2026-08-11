@@ -841,13 +841,17 @@ impl RoutingSliceFetcher {
         // next rendezvous worker, skipping the failed primary. If the next
         // owner is this coordinator (ranked second), fall straight to local:
         // that is the coordinator-local step, not an extra remote hop.
-        self.metrics.record_slice_redispatched();
+        // The counter increments only when a second remote dispatch is
+        // actually sent, so a 2-node cluster whose failover is the coordinator
+        // itself records a fallback, not a phantom re-dispatch.
         if let Some(Owner::Remote(next)) = ranked.get(1)
             && *next != primary
-            && let Attempt::Keep(result) = self.try_remote(next, &request).await
         {
-            self.metrics.record_slice_remote();
-            return (*result, next.clone(), false);
+            self.metrics.record_slice_redispatched();
+            if let Attempt::Keep(result) = self.try_remote(next, &request).await {
+                self.metrics.record_slice_remote();
+                return (*result, next.clone(), false);
+            }
         }
 
         // Primary and its one re-dispatch both failed (or there was no next
