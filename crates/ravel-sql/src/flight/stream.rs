@@ -56,7 +56,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arrow_flight::FlightData;
-use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use futures::{Stream, StreamExt};
@@ -194,6 +194,125 @@ pub(super) async fn statement_stream(
             // lifetime to the stream: when the stream is exhausted or dropped,
             // this closure drops and the guard folds the final cost. The
             // reference keeps the move explicit without touching the value.
+            let _keep = &record_guard;
+            item.map_err(flight_error_to_status)
+        });
+
+    Ok(Box::pin(encoded))
+}
+
+/// Serve one distributed slice's worker fragment for `DoGet` (ADR-0071, issue
+/// #866) and return the encoded, internal-schema `FlightData` stream.
+///
+/// This is the worker half of the SQL distributed lane, engaged only when the
+/// redeemed ticket is a slice ticket (`slice_count > 1`). It differs from
+/// [`statement_stream`] in exactly the ways ADR-0071 requires, and no others:
+///
+/// - No [`validate`]: a slice ticket carries no SQL statement
+///   (`statement: String::new()`), so there is nothing to re-gate. The ticket
+///   MAC already authenticated that this coordinator minted it; only the
+///   coordinator, never an external client, ever holds one.
+/// - No statement planning, aggregation, or dedup: the fragment is the
+///   internal-schema, `(series_id, ts)`-sorted scan over this slice's pinned
+///   segments ([`SqlExecutor::worker_fragment_stream`]). Cross-slice dedup and
+///   any aggregate stay authoritative at the coordinator (crate::distributed).
+/// - No audit wrap: the audited unit is the client-facing statement the
+///   coordinator serves, recorded once on its own `do_get`; a per-slice fetch
+///   is internal fan-out, not a distinct auditable query.
+///
+/// The deadline clamp, the per-batch deadline re-check, the segment-vanished to
+/// `SnapshotInvalidated` mapping, and the cost fold on stream end are identical
+/// to the statement path, so a slice fetch is accounted and bounded exactly as
+/// a local scan is.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fragment_stream(
+    executor: &SqlExecutor,
+    clock: ClockRef,
+    tenant: TenantHash,
+    ticket: FlightTicket,
+    config: &FlightSqlConfig,
+    recorder: Arc<dyn QueryCostRecorder>,
+    span: tracing::Span,
+    permit: QueryPermit,
+) -> Result<DoGetStream, Status> {
+    let now_ns = clock.now_ns();
+    // Same deadline discipline as the statement path: the ticket's embedded
+    // deadline can only shorten the effective budget, never lengthen it past
+    // what this deployment would mint today (issue #186). An expired slice
+    // ticket is a replay after its pin's GC protection closed: never different
+    // data, always SnapshotInvalidated.
+    let deadline_ns = config.clamp_ticket_deadline_ns(ticket.deadline_ns, now_ns);
+    if now_ns >= deadline_ns {
+        return Err(status_from_sql(&SqlError::SnapshotInvalidated, tenant));
+    }
+    let budget = remaining(now_ns, deadline_ns);
+
+    let snapshot = ticket.snapshot();
+    // A fresh accounting handle, folded into the coordinator's aggregator when
+    // this slice's stream ends, exactly as the statement path folds its own
+    // (issue #425). The executing fragment holds clones of it, so its counters
+    // keep rising as batches are pulled.
+    let accounting = QueryAccounting::new();
+    let stream = tokio::time::timeout(
+        budget,
+        executor.worker_fragment_stream(tenant, snapshot, &accounting),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(SqlError::DeadlineExceeded {
+            millis: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        })
+    })
+    .map_err(|err| status_from_sql(&err, tenant))?;
+    let schema = stream.schema();
+
+    // The cost/permit guard, dropped at stream end or client abandonment, folds
+    // this slice's fetched bytes into the aggregator and releases the
+    // concurrency slot in the same `Drop` (ADR-0061 decision 2, ADR-0044).
+    let record_guard = RecordOnStreamEnd {
+        recorder,
+        accounting,
+        tenant,
+        span,
+        _permit: permit,
+    };
+
+    let batches = stream
+        .map(|item| {
+            item.map_err(|err| {
+                if err.is_segment_not_found() {
+                    SqlError::SnapshotInvalidated
+                } else {
+                    err
+                }
+            })
+        })
+        .map(move |item| {
+            item.and_then(|batch| {
+                if clock.now_ns() >= deadline_ns {
+                    Err(SqlError::SnapshotInvalidated)
+                } else {
+                    Ok(batch)
+                }
+            })
+            .map_err(|err| FlightError::Tonic(Box::new(status_from_sql(&err, tenant))))
+        });
+
+    // Resend dictionaries rather than hydrating them (the encoder default).
+    // A slice fragment's consumer is the coordinator's `DistributedScanExec`,
+    // which declares `internal_schema()` and hands the decoded batches straight
+    // into `SortPreservingMergeExec`; DataFusion validates each batch against
+    // that schema. `internal_schema()` dictionary-encodes the `labels` column
+    // (`Dictionary(Int32, Map)`, crate::schema), so hydrating it to a plain
+    // `Map` on the wire would make every decoded batch fail the coordinator's
+    // schema check. The public statement path (`statement_stream`) can keep the
+    // hydrating default because its consumer is an external client with no
+    // downstream plan to satisfy; this internal fan-out cannot.
+    let encoded = FlightDataEncoderBuilder::new()
+        .with_dictionary_handling(DictionaryHandling::Resend)
+        .with_schema(schema)
+        .build(batches)
+        .map(move |item| {
             let _keep = &record_guard;
             item.map_err(flight_error_to_status)
         });
