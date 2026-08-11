@@ -67,6 +67,7 @@ fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
+        remote_clusters: Vec::new(),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),

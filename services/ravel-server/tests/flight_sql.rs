@@ -36,6 +36,7 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
+use ravel_fleet::query_workers::QueryWorkerRecord;
 use ravel_ingest::Clock;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -43,6 +44,7 @@ use ravel_query::http::StaticBearerTokenResolver;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::sql::SqlState;
+use ravel_server::sql_distrib::distributed_flight_config;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_sql::{SqlConfig, SqlExecutor};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
@@ -485,6 +487,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
+        remote_clusters: Vec::new(),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
@@ -552,6 +555,111 @@ async fn a_garbage_ticket_is_refused() {
         .await
         .expect_err("garbage is refused");
     assert_ne!(status.code(), tonic::Code::Ok);
+
+    server.stop().await;
+}
+
+/// Deliverable 5 (issue #868), the reachable half of the ADR-0071 SQL lane.
+///
+/// This proves what is installable read-only:
+///
+/// 1. The Flight SQL surface is reachable end to end under the `flight-sql`
+///    feature: `GetFlightInfo` returns exactly ONE endpoint (the coordinator
+///    itself), `DoGet` streams the published rows back over a real channel, and
+///    a second identical run is byte-for-byte identical (the result never
+///    depends on whether distribution is engaged).
+/// 2. The SQL lane's worker roster surface -- this crate's
+///    [`ravel_sql::WorkerEndpoints`] impl over the ravel-fleet query-worker
+///    registry ([`ravel_server::sql_distrib::FleetWorkerEndpoints`]) -- resolves
+///    a live worker to its Flight location (the fragment gRPC listener, which
+///    also hosts Flight SQL), and [`distributed_flight_config`] carries that
+///    roster plus the cost thresholds a coordinator would install.
+///
+/// What it deliberately does NOT assert is "distributed scan engages": ravel-sql
+/// (out of scope, read-only) exposes no seam to install the
+/// [`ravel_sql::DistributedFlightConfig`] built here onto its Flight SQL service
+/// -- `SqlExecutor::plan_pinned` never calls `RavelTableProvider::with_distributed_scan`
+/// and `RavelFlightSqlService::new`/`with_audit_sink` accept no distributed
+/// config. That install is a ravel-sql change; see the task report. Because the
+/// scan cannot engage, "byte-identical to distribution off" holds trivially
+/// (there is only the local path), which is exactly what the two-run assertion
+/// records.
+#[tokio::test]
+async fn distributed_flight_sql_reachable_end_to_end() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let samples = [(100i64, 1.5f64), (200, 2.5), (300, -0.0)];
+    publish_segment(store.as_ref(), &tenant, "cpu", &samples).await;
+
+    let mut tokens = HashMap::new();
+    tokens.insert("acme-token".to_string(), tenant);
+    let state = sql_state(store, tokens);
+    let server = FlightServer::start(&state).await;
+    let client = server.client().await;
+
+    let command = CommandStatementQuery {
+        query: QUERY.to_string(),
+        transaction_id: None,
+    };
+
+    // One statement query, twice: the result must not depend on distribution.
+    let run = |mut client: FlightServiceClient<tonic::transport::Channel>| {
+        let command = command.clone();
+        async move {
+            let info = client
+                .get_flight_info(authed(descriptor(&command), "acme-token"))
+                .await
+                .expect("flight info")
+                .into_inner();
+            assert_eq!(
+                info.endpoint.len(),
+                1,
+                "a Flight SQL client must see exactly one endpoint (the coordinator)"
+            );
+            let ticket = info.endpoint[0]
+                .ticket
+                .clone()
+                .expect("the single endpoint carries a ticket");
+            let stream = client
+                .do_get(authed(ticket, "acme-token"))
+                .await
+                .expect("do get")
+                .into_inner();
+            decode(stream).await.expect("decode")
+        }
+    };
+
+    let first = run(client.clone()).await;
+    let second = run(client.clone()).await;
+    assert_eq!(first.0, samples.len(), "every published sample comes back");
+    assert_eq!(first.1, vec!["ts".to_string(), "value".to_string()]);
+    assert_eq!(
+        first, second,
+        "the result is byte-identical run to run (distribution off is the only path)"
+    );
+
+    // The SQL-lane worker roster surface: a live worker resolves to its Flight
+    // location (its fragment gRPC listener, which also hosts Flight SQL).
+    let worker_endpoint = server.addr.to_string();
+    let live_workers = Arc::new(parking_lot::RwLock::new(Arc::new(vec![
+        QueryWorkerRecord {
+            process_id: "worker-a".to_string(),
+            fragment_endpoint: worker_endpoint.clone(),
+            protocol_version: ravel_query::distrib::codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+    ])));
+    let thresholds = ravel_query::distrib::partition::DistribThresholds {
+        min_store_bytes: 0,
+        min_segments: 0,
+        max_parallel_slices: 8,
+    };
+    let config = distributed_flight_config(live_workers, thresholds);
+    assert_eq!(
+        config.workers.endpoints(),
+        vec![format!("http://{worker_endpoint}")],
+        "the fleet-backed WorkerEndpoints resolves the live worker to its Flight location"
+    );
 
     server.stop().await;
 }

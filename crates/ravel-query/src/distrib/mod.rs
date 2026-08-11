@@ -16,8 +16,11 @@
 
 pub mod client;
 pub mod codec;
+pub mod federation;
 pub mod partition;
 pub mod service;
+
+pub use federation::{DEFAULT_REMOTE_SOFT_TIMEOUT, Federation, FederationOutcome, RemoteCluster};
 
 #[cfg(test)]
 mod tests;

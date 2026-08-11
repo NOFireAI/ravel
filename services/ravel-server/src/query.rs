@@ -135,6 +135,7 @@ pub fn build_app_state(
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     distributed: Option<Arc<ravel_query::distrib::Distributed>>,
+    federation: Option<Arc<ravel_query::distrib::Federation>>,
 ) -> AppState {
     let mut engine = QueryEngine::new(catalog, store, engine_config);
     if let Some(cache) = cache {
@@ -145,6 +146,12 @@ pub fn build_app_state(
     // byte-identical local path (`with_distributed` is the sole opt-in seam).
     if let Some(distributed) = distributed {
         engine = engine.with_distributed(distributed);
+    }
+    // ADR-0071 cross-cluster federation (issue #868): attach the remote-cluster
+    // fan-out only when `--remote-cluster` was configured. Absent it, the engine
+    // resolves only local data (`with_federation` is the sole opt-in seam).
+    if let Some(federation) = federation {
+        engine = engine.with_federation(federation);
     }
     // Fold every completed Prometheus-shaped query into the same process
     // aggregator the SQL and analytics paths use (ADR-0044 section 4, issue
@@ -267,6 +274,7 @@ mod catalog_cache_tests {
                 std::collections::HashSet::new(),
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
             None,
         );
         assert_eq!(

@@ -394,6 +394,9 @@ async fn main() -> anyhow::Result<()> {
         distrib: cli
             .parse_distrib_settings()
             .context("failed to resolve --distributed-query settings")?,
+        remote_clusters: cli
+            .parse_remote_clusters()
+            .context("failed to resolve --remote-cluster settings")?,
     };
 
     let running = ravel_server::start(config, store, store_metrics, cache).await?;

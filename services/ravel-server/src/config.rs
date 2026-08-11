@@ -569,6 +569,41 @@ pub struct Cli {
     /// 8 (`ravel_query::distrib::partition::DEFAULT_MAX_PARALLEL_SLICES`).
     #[arg(long = "max-parallel-slices", default_value_t = 8)]
     pub max_parallel_slices: usize,
+
+    /// A remote cluster this coordinator federates a query out to (ADR-0071
+    /// cross-cluster federation, issue #868). Repeatable: one flag per remote.
+    ///
+    /// The value is a comma-separated `key=value` spec. Required keys: `name`
+    /// (the cluster's stable label, surfaced in the `warnings` field when it is
+    /// skipped), `endpoint` (`host:port` of the remote's fragment `SeriesFetch`
+    /// surface), and `credential-file` (a file holding the bearer token this
+    /// coordinator presents to the remote). Optional keys: `tls` (`on`/`off`,
+    /// default `off`), `tls-ca-file` (a CA bundle for the remote's server
+    /// certificate, meaningful only with `tls=on`), `skip-unavailable`
+    /// (`true`/`false`, default `false`), and `soft-timeout` (a per-remote
+    /// override of `--remote-cluster-soft-timeout`).
+    ///
+    /// The credential is an OPERATOR secret read from a file, never an inline
+    /// value: it is the principal the remote sees, resolved through the remote's
+    /// ordinary tenant auth. A federated query never forwards the calling
+    /// client's credential across a cluster boundary; the remote only ever sees
+    /// this configured principal. Remotes are operator configuration only and
+    /// never appear in query text.
+    ///
+    /// Example:
+    /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tls=on,skip-unavailable=true`
+    #[arg(long = "remote-cluster", value_name = "SPEC")]
+    pub remote_clusters: Vec<String>,
+
+    /// The default per-remote soft timeout for a federated fetch (ADR-0071,
+    /// issue #868): a remote cluster that does not answer within this bound is
+    /// treated as unavailable (failing the query, or skipped, per that remote's
+    /// `skip-unavailable`). A `soft-timeout` key on an individual
+    /// `--remote-cluster` overrides it for that remote. Accepts a humantime
+    /// duration (e.g. `10s`, `500ms`). Defaults to
+    /// `ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT` when unset.
+    #[arg(long = "remote-cluster-soft-timeout", value_name = "DURATION")]
+    pub remote_cluster_soft_timeout: Option<String>,
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
@@ -612,6 +647,46 @@ pub struct DistribSettings {
     pub max_inflight_fragments: usize,
     /// The cost gate and fan-out width (`DistribThresholds`).
     pub thresholds: ravel_query::distrib::partition::DistribThresholds,
+}
+
+/// One resolved `--remote-cluster` (ADR-0071 cross-cluster federation, issue
+/// #868). The credential has already been read from its file and trimmed, so
+/// this struct carries the operator principal directly; the secret never
+/// appears in a process listing because the flag names a file, not a value.
+#[derive(Debug, Clone)]
+pub struct RemoteClusterConfig {
+    /// The remote's stable label, surfaced by name in the Prometheus-compatible
+    /// `warnings` field when the cluster is skipped.
+    pub name: String,
+    /// `host:port` of the remote's fragment `SeriesFetch` surface.
+    pub endpoint: String,
+    /// The bearer token this coordinator presents to the remote, read from the
+    /// `credential-file`. This is the ONLY principal the remote sees for a
+    /// federated fetch: the calling client's credential is never forwarded.
+    pub credential: String,
+    /// Whether to dial the remote over TLS.
+    pub tls: bool,
+    /// A CA bundle for the remote's server certificate, `Some` only when a
+    /// `tls-ca-file` key was given (meaningful only with `tls`).
+    pub tls_ca_file: Option<PathBuf>,
+    /// `false` (the default) fails the whole query typed when this remote is
+    /// unavailable or times out; `true` continues, marking this cluster by name
+    /// in `warnings` and recording partial coverage in the stats block.
+    pub skip_unavailable: bool,
+    /// The soft timeout beyond which this remote is treated as unavailable.
+    pub soft_timeout: Duration,
+}
+
+/// Parse a `true`/`false` value from a `--remote-cluster` boolean field,
+/// erroring with the spec and key in context rather than a bare parse failure.
+fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => anyhow::bail!(
+            "invalid --remote-cluster '{spec}': {key} must be 'true' or 'false', got '{other}'"
+        ),
+    }
 }
 
 impl Cli {
@@ -959,6 +1034,147 @@ impl Cli {
         }))
     }
 
+    /// The default per-remote soft timeout for federated fetches
+    /// (`--remote-cluster-soft-timeout`, ADR-0071 issue #868), or
+    /// [`ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT`] when unset. Rejects
+    /// a zero or unparseable duration: a zero timeout would treat every remote
+    /// as instantly unavailable.
+    pub fn parse_remote_cluster_soft_timeout(&self) -> anyhow::Result<Duration> {
+        match self.remote_cluster_soft_timeout.as_deref() {
+            None => Ok(ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT),
+            Some(s) => {
+                let dur = humantime::parse_duration(s).map_err(|e| {
+                    anyhow::anyhow!("invalid --remote-cluster-soft-timeout '{s}': {e}")
+                })?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--remote-cluster-soft-timeout '{s}' must be positive: a zero timeout \
+                         would treat every remote cluster as instantly unavailable"
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse every `--remote-cluster` spec into a resolved
+    /// [`RemoteClusterConfig`] (ADR-0071 cross-cluster federation, issue #868).
+    ///
+    /// Each spec is a comma-separated `key=value` list. `name`, `endpoint`, and
+    /// `credential-file` are required; `tls`, `tls-ca-file`, `skip-unavailable`,
+    /// and `soft-timeout` are optional. The credential file is read and trimmed
+    /// here (failing startup on an unreadable or empty file), so the operator
+    /// principal is validated at the same point every other credential file is.
+    /// Cluster names must be unique: a duplicate name would make the `warnings`
+    /// field ambiguous about which remote was skipped.
+    pub fn parse_remote_clusters(&self) -> anyhow::Result<Vec<RemoteClusterConfig>> {
+        let default_timeout = self.parse_remote_cluster_soft_timeout()?;
+        let mut clusters = Vec::with_capacity(self.remote_clusters.len());
+        let mut seen_names: HashSet<String> = HashSet::new();
+        for spec in &self.remote_clusters {
+            let mut name = None;
+            let mut endpoint = None;
+            let mut credential_file = None;
+            let mut tls = false;
+            let mut tls_ca_file = None;
+            let mut skip_unavailable = false;
+            let mut soft_timeout = default_timeout;
+
+            for field in spec.split(',') {
+                let field = field.trim();
+                if field.is_empty() {
+                    continue;
+                }
+                let (key, value) = field.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid --remote-cluster '{spec}': field '{field}' is not KEY=VALUE"
+                    )
+                })?;
+                let value = value.trim();
+                match key.trim() {
+                    "name" => name = Some(value.to_string()),
+                    "endpoint" => endpoint = Some(value.to_string()),
+                    "credential-file" => credential_file = Some(PathBuf::from(value)),
+                    "tls" => tls = parse_bool_field(spec, "tls", value)?,
+                    "tls-ca-file" => tls_ca_file = Some(PathBuf::from(value)),
+                    "skip-unavailable" => {
+                        skip_unavailable = parse_bool_field(spec, "skip-unavailable", value)?
+                    }
+                    "soft-timeout" => {
+                        let dur = humantime::parse_duration(value).map_err(|e| {
+                            anyhow::anyhow!(
+                                "invalid --remote-cluster '{spec}': soft-timeout '{value}': {e}"
+                            )
+                        })?;
+                        if dur.is_zero() {
+                            anyhow::bail!(
+                                "invalid --remote-cluster '{spec}': soft-timeout must be positive"
+                            );
+                        }
+                        soft_timeout = dur;
+                    }
+                    other => anyhow::bail!(
+                        "invalid --remote-cluster '{spec}': unknown key '{other}' (expected name, \
+                         endpoint, credential-file, tls, tls-ca-file, skip-unavailable, \
+                         soft-timeout)"
+                    ),
+                }
+            }
+
+            let name = name.filter(|n| !n.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!("invalid --remote-cluster '{spec}': missing required key 'name'")
+            })?;
+            let endpoint = endpoint.filter(|e| !e.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --remote-cluster '{spec}': missing required key 'endpoint'"
+                )
+            })?;
+            let credential_file = credential_file.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --remote-cluster '{spec}': missing required key 'credential-file'"
+                )
+            })?;
+            if tls_ca_file.is_some() && !tls {
+                anyhow::bail!(
+                    "invalid --remote-cluster '{spec}': tls-ca-file was set but tls is off; the CA \
+                     bundle would be inert"
+                );
+            }
+            if !seen_names.insert(name.clone()) {
+                anyhow::bail!(
+                    "invalid --remote-cluster '{spec}': duplicate cluster name '{name}'; remote \
+                     cluster names must be unique so the warnings field names one remote"
+                );
+            }
+
+            let raw = std::fs::read_to_string(&credential_file).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read --remote-cluster '{name}' credential-file {}: {e}",
+                    credential_file.display()
+                )
+            })?;
+            let credential = raw.trim().to_string();
+            if credential.is_empty() {
+                anyhow::bail!(
+                    "--remote-cluster '{name}' credential-file {} is empty; the operator bearer \
+                     token must be non-empty",
+                    credential_file.display()
+                );
+            }
+
+            clusters.push(RemoteClusterConfig {
+                name,
+                endpoint,
+                credential,
+                tls,
+                tls_ca_file,
+                skip_unavailable,
+                soft_timeout,
+            });
+        }
+        Ok(clusters)
+    }
+
     /// Parse `--max-ingest-buffer-bytes` into a
     /// [`ravel_ingest::IngestByteBudgetLimit`] (ADR-0069 decision 1, issue
     /// #819), mapping `0` to `Unlimited` like `--max-inflight-ingest-requests`
@@ -1119,6 +1335,13 @@ impl Cli {
         if self.max_parallel_slices == 0 {
             anyhow::bail!("--max-parallel-slices must be at least 1");
         }
+
+        // ADR-0071 cross-cluster federation (issue #868): parse every
+        // `--remote-cluster` spec (and the shared soft-timeout default) here so
+        // a malformed spec, a duplicate name, or an unreadable/empty credential
+        // file fails startup, at the same point every other credential file is
+        // validated, rather than at the first federated query.
+        self.parse_remote_clusters()?;
 
         // The disk tier has no attachment point in the fetcher funnels this
         // process calls (`SegmentFetcher::with_cache` /

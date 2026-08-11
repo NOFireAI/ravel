@@ -17,7 +17,7 @@ pub use config::{
     ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SAMPLES,
     DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig,
 };
-pub use engine::{QueryEngine, QueryStats};
+pub use engine::{QueryEngine, QueryStats, snapshot_erasure_predicates};
 pub use error::QueryError;
 pub use fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SegmentFetcher,

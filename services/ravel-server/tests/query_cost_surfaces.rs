@@ -171,6 +171,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         None,
+        None,
     );
     let promql = promql_router(app_state);
 

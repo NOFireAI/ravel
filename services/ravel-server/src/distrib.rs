@@ -415,11 +415,90 @@ impl FragmentService {
         }
     }
 
+    /// Rewrite a cross-cluster resolve-scope request into a pinned one over this
+    /// cluster's own snapshot (ADR-0071 federation, issue #868).
+    ///
+    /// A federated coordinator ships matchers and a time window with an empty
+    /// [`pb::fetch_request::Scope::Resolve`] scope; the remote resolves its OWN
+    /// snapshot over that window, applies its OWN erasure, and enforces its own
+    /// budgets. This is not a trust shortcut: the request's `tenant_hash` is the
+    /// ordinary tenant identity, resolved through the same catalog path a local
+    /// query takes, so a federated fetch reads exactly what a local query on this
+    /// cluster would. We turn the resolve scope into the pinned scope the in-crate
+    /// [`SeriesFetchService`] already fetches from, pinning every segment of the
+    /// resolved snapshot and attaching the snapshot's own erasure predicates
+    /// (the coordinator never sends erasure for a resolve scope, and never
+    /// re-applies it: the remote is authoritative for its own erasure).
+    ///
+    /// Returns the rewritten request paired with a resolver over the same
+    /// snapshot. On any decode or resolve failure the request is returned
+    /// unchanged (still resolve scope) with an empty resolver, so the delegate
+    /// yields `Unsupported` and the coordinator fails the query typed, never a
+    /// silent empty result. A snapshot with no segments is a valid empty-OK
+    /// answer (this cluster holds no data for the tenant in that window).
+    async fn resolve_scope(
+        &self,
+        mut request: pb::FetchRequest,
+    ) -> (pb::FetchRequest, Arc<SnapshotSegmentResolver>) {
+        let empty = || Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
+        let Some(tenant_hash) = decode_tenant_hash(&request.tenant_hash) else {
+            return (request, empty());
+        };
+        // Only metrics are distributed; any other signal is left as resolve
+        // scope, which the delegate maps to Unsupported.
+        if codec::signal_from_u32(request.signal) != Ok(Signal::Metrics) {
+            return (request, empty());
+        }
+        let window = TimeRange {
+            start_ns: request.window_start_ns,
+            end_ns: request.window_end_ns,
+        };
+        let now_ns = self.inner.clock.now_ns();
+        let snapshot = match self
+            .inner
+            .catalog
+            .resolve(&tenant_hash, Signal::Metrics, window, &[], now_ns)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            // Leave the scope as Resolve: the delegate returns Unsupported and
+            // the coordinator fails the federated query typed rather than
+            // treating this cluster as having contributed an empty result.
+            Err(err) => {
+                tracing::warn!(error = %err, "federated resolve-scope snapshot resolve failed; leaving resolve scope for typed fallback");
+                return (request, empty());
+            }
+        };
+        // The remote is authoritative for its own erasure: derive it from this
+        // cluster's snapshot, not from anything the coordinator sent.
+        let erasure = ravel_query::snapshot_erasure_predicates(&snapshot);
+        let identities = snapshot
+            .segments
+            .iter()
+            .map(codec::encode_segment_identity)
+            .collect();
+        request.scope = Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+            segments: identities,
+        }));
+        request.erasure = codec::encode_erasure(&erasure);
+        let resolver = Arc::new(SnapshotSegmentResolver::new(snapshot.segments));
+        (request, resolver)
+    }
+
     /// Resolve the request's snapshot and run the slice through the in-crate
     /// [`SeriesFetchService`], collecting its frames. Shared by the gRPC handler
     /// (after auth and admission) and the coordinator's no-hop local path.
     async fn resolve_and_run(&self, request: pb::FetchRequest) -> Vec<pb::FetchResponse> {
-        let resolver = self.build_resolver(&request).await;
+        // A cross-cluster resolve scope is rewritten to a pinned scope over this
+        // cluster's own snapshot; a pinned scope (intra-cluster) uses the
+        // full-window content-hash resolver unchanged.
+        let (request, resolver) = match &request.scope {
+            Some(pb::fetch_request::Scope::Resolve(_)) => self.resolve_scope(request).await,
+            _ => {
+                let resolver = self.build_resolver(&request).await;
+                (request, resolver)
+            }
+        };
         let mut fetcher = SegmentFetcher::new(self.inner.store.clone());
         if let Some(cache) = &self.inner.cache {
             fetcher = fetcher.with_cache(Arc::clone(cache));
@@ -960,6 +1039,103 @@ pub fn spawn_heartbeat(
             tokio::time::sleep(interval).await;
         }
     })
+}
+
+/// A [`SliceFetcher`] over one remote cluster's fragment `SeriesFetch` surface
+/// (ADR-0071 cross-cluster federation, issue #868).
+///
+/// Unlike [`RoutingSliceFetcher`], which rendezvous-maps intra-cluster slices
+/// across the local worker set, this always dials one fixed remote endpoint and
+/// presents the OPERATOR credential configured for that remote. The calling
+/// client's credential is never forwarded: it never crosses a cluster boundary,
+/// so the remote only ever authenticates the operator principal. The remote
+/// resolves its own snapshot over the request's window, and enforces its own
+/// admission, limits, and erasure through its ordinary tenant-auth path; this
+/// coordinator only decodes and folds the frames it returns, counting them
+/// against its own budgets. The request carries a resolve scope (the coordinator
+/// never pins another cluster's segments), which the remote rewrites to a pinned
+/// fetch over its own snapshot (see [`FragmentService::resolve_scope`]).
+pub struct FederationSliceFetcher {
+    /// The remote's stable name, for error and warning context.
+    cluster: String,
+    /// A lazily-connecting channel to the remote's fragment endpoint. Lazy so a
+    /// remote that is down at startup does not fail process start; it surfaces
+    /// as an unavailable remote at query time (handled per its skip_unavailable).
+    channel: Channel,
+    /// The operator bearer token presented to the remote. This is the only
+    /// principal the remote sees for a federated fetch.
+    credential: String,
+}
+
+impl FederationSliceFetcher {
+    /// Build a federation client for one resolved `--remote-cluster`. The
+    /// channel connects lazily (see [`FederationSliceFetcher::channel`]).
+    pub fn connect(config: &crate::config::RemoteClusterConfig) -> anyhow::Result<Self> {
+        let scheme = if config.tls { "https" } else { "http" };
+        let uri = format!("{scheme}://{}", config.endpoint);
+        let mut endpoint = Channel::from_shared(uri)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid --remote-cluster {} endpoint {}: {e}",
+                    config.name,
+                    config.endpoint
+                )
+            })?
+            .connect_timeout(REMOTE_CONNECT_TIMEOUT);
+        if config.tls {
+            let mut tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
+            if let Some(ca_file) = &config.tls_ca_file {
+                let pem = std::fs::read(ca_file).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to read --remote-cluster {} tls-ca-file {}: {e}",
+                        config.name,
+                        ca_file.display()
+                    )
+                })?;
+                tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
+            }
+            endpoint = endpoint.tls_config(tls).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to configure TLS for --remote-cluster {}: {e}",
+                    config.name
+                )
+            })?;
+        }
+        Ok(FederationSliceFetcher {
+            cluster: config.name.clone(),
+            channel: endpoint.connect_lazy(),
+            credential: config.credential.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl SliceFetcher for FederationSliceFetcher {
+    async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let mut tonic_request = tonic::Request::new(request);
+        // Present the operator credential, never the calling client's: the
+        // client credential never crosses a cluster boundary (ADR-0071 trust
+        // boundary, issue #868).
+        let value = format!("Bearer {}", self.credential).parse().map_err(|_| {
+            DistribError::Transport("invalid federation bearer token metadata".to_string())
+        })?;
+        tonic_request.metadata_mut().insert("authorization", value);
+        let mut client = SeriesFetchClient::new(self.channel.clone());
+        let response = client.fetch(tonic_request).await.map_err(|s| {
+            DistribError::Transport(format!("federated fetch to cluster {}: {s}", self.cluster))
+        })?;
+        let mut frames = Vec::new();
+        let mut stream = response.into_inner();
+        while let Some(frame) = stream.message().await.map_err(|s| {
+            DistribError::Transport(format!("federated fetch to cluster {}: {s}", self.cluster))
+        })? {
+            frames.push(frame);
+        }
+        // A remote's frames get the same decode validation as an intra-cluster
+        // slice's (ADR-0071 trust boundary): a malformed frame is a typed
+        // DistribError, never a panic and never silently dropped data.
+        decode_frames(frames)
+    }
 }
 
 #[cfg(test)]
