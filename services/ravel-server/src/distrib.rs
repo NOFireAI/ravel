@@ -1221,55 +1221,13 @@ mod tests {
         );
     }
 
-    /// The real no-deadlock property (ADR-0071 deliverable 2): a coordinator
-    /// holding the only client-query permit while it awaits the fragments it
-    /// dispatched still makes progress, because the worker serving those
-    /// fragments admits them against the INDEPENDENT fragment class, not the
-    /// saturated client cap. [`fragment_admission_bounds_and_releases`] above
-    /// only exercised the fragment semaphore in isolation; this drives the two
-    /// caps together, which is where a shared bound would deadlock.
-    #[tokio::test]
-    async fn coordinator_awaiting_fragments_does_not_deadlock_behind_client_cap() {
-        // Client-query cap and fragment class, each size 1, so a single
-        // in-flight coordinator saturates the client cap.
-        let client_cap = Arc::new(tokio::sync::Semaphore::new(1));
-        let metrics = Arc::new(FragmentMetrics::new());
-        let fragment_admission = FragmentAdmission::new(1, metrics.clone());
-
-        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
-            // The coordinator query admits against the client cap and holds its
-            // only permit for its whole lifetime, including while it awaits the
-            // fragments it dispatched.
-            let _client_permit = client_cap
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("coordinator admits against the client cap");
-
-            // The worker serving the coordinator's fragment admits it here, on
-            // the independent class, so the permit is granted even though the
-            // client cap is fully held by this same coordinator.
-            //
-            // NON-VACUITY (finding 3): point fragment admission at the client
-            // cap by replacing the next statement with
-            //     let _fragment_permit = client_cap.clone().acquire_owned().await;
-            // The coordinator then waits for a client permit it is itself
-            // holding -- a deadlock -- and the 30s timeout fires. Reverting
-            // restores the independent class and the test passes at once.
-            let _fragment_permit = fragment_admission
-                .acquire()
-                .await
-                .expect("fragment admitted against its own class");
-        })
-        .await;
-
-        assert!(
-            outcome.is_ok(),
-            "a coordinator holding the only client-cap permit must still acquire \
-             a fragment permit from the independent class; a timeout here means \
-             the two admission classes share a bound and deadlock"
-        );
-    }
+    // The no-deadlock property itself (ADR-0071 deliverable 2) is proven
+    // end to end in tests/distributed_query_e2e.rs
+    // (`fragment_admits_while_client_cap_saturated_no_deadlock`), against the
+    // server's real `QueryAdmissionController` and `FragmentAdmission` wiring.
+    // A unit test here could only re-assert that two semaphores this module
+    // constructed itself are independent, which is true by construction of
+    // the test and can never fail for a production-code reason.
 
     /// A distributed query's per-slice fragment stats (ADR-0071
     /// `stats.fragments[]`, finding 4) are collected through the task-local

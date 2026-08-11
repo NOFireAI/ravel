@@ -23,6 +23,14 @@
 //!    `Unauthenticated`, accepts the configured cluster token, and is absent
 //!    entirely (`Unimplemented`) on a process started without
 //!    `--distributed-query`.
+//!
+//! 3. `fragment_admits_while_client_cap_saturated_no_deadlock`: with the
+//!    server's client-query cap (`QueryAdmissionController`, size 1) held by
+//!    a genuinely in-flight `/api/v1/query_range` request, an inbound
+//!    fragment still admits and completes, because fragment admission is a
+//!    distinct workload class (`--max-inflight-fragments`) and never draws
+//!    from the client cap. This is the ADR-0071 deliverable-2 no-deadlock
+//!    property driven through the real wiring, not a semaphore unit test.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -34,7 +42,10 @@ use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+};
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_query::distrib::partition::DistribThresholds;
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
@@ -162,6 +173,19 @@ async fn start_server(
     store: Arc<dyn ObjectStoreBackend>,
     distrib: Option<DistribSettings>,
 ) -> ravel_server::Running {
+    start_server_with_query_cap(
+        store,
+        distrib,
+        ravel_query::QueryConcurrencyLimit::Unlimited,
+    )
+    .await
+}
+
+async fn start_server_with_query_cap(
+    store: Arc<dyn ObjectStoreBackend>,
+    distrib: Option<DistribSettings>,
+    query_concurrency_limit: ravel_query::QueryConcurrencyLimit,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -190,7 +214,7 @@ async fn start_server(
         query_deadline: ravel_query::EngineConfig::default().deadline,
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
         admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
-        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        query_concurrency_limit,
         scrub_period: std::time::Duration::from_secs(7 * 86_400),
         indexed_fields: Default::default(),
         disable_cache: false,
@@ -573,4 +597,214 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     );
 
     server_a.shutdown().await.expect("A shuts down");
+}
+
+/// A store wrapper that can hold non-`sys/` `get` reads shut, so a real
+/// client query can be pinned in flight -- admitted, permit held -- for as
+/// long as a test needs. `sys/`-prefixed keys (worker heartbeats, probes) and
+/// every other operation pass straight through, so the server's background
+/// tasks never wedge on the gate.
+struct GatedStore {
+    inner: MemoryStore,
+    armed: std::sync::atomic::AtomicBool,
+    blocked: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+impl GatedStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            blocked: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many `get` calls are currently parked on the gate.
+    fn blocked(&self) -> usize {
+        self.blocked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release_all(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for GatedStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        if !key.starts_with("sys/") {
+            loop {
+                use std::sync::atomic::Ordering;
+                if !self.armed.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Register the waiter before re-checking, so a release between
+                // the check and the await still wakes it.
+                let notified = self.release.notified();
+                if !self.armed.load(Ordering::SeqCst) {
+                    break;
+                }
+                self.blocked.fetch_add(1, Ordering::SeqCst);
+                notified.await;
+                self.blocked.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// The ADR-0071 deliverable-2 no-deadlock property, driven through the real
+/// server wiring: with the client-query cap (`QueryAdmissionController`,
+/// bounded at 1) held by a genuinely in-flight `/api/v1/query_range` request,
+/// an inbound fragment still admits and completes, because fragment admission
+/// (`--max-inflight-fragments`) is a distinct workload class that never draws
+/// from the client cap.
+///
+/// The saturation is real, not simulated: Q1 admits against the server's own
+/// controller and then blocks inside a store read the test holds shut, so its
+/// permit stays held; a second client query is rejected 503 (proving the cap
+/// is exhausted) before the fragment probe is sent.
+///
+/// NON-VACUITY: pre-exhaust the fragment class in the production wiring --
+/// `FragmentAdmission::new` (services/ravel-server/src/distrib.rs) minting
+/// `Semaphore::new(0)` instead of the clamped cap -- and the probe below
+/// never admits: the 10s timeout fires and this test fails. The saturation
+/// premise is separately pinned by the 503 assertion.
+#[tokio::test]
+async fn fragment_admits_while_client_cap_saturated_no_deadlock() {
+    let gated = Arc::new(GatedStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = gated.clone();
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+    let (start, end) = ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC);
+
+    let server = start_server_with_query_cap(
+        Arc::clone(&store),
+        Some(always_distribute_settings()),
+        ravel_query::QueryConcurrencyLimit::Bounded(1),
+    )
+    .await;
+    let base = format!("http://{}", server.http_addr);
+    let grpc = server.grpc_addr.expect("gRPC listener binds in All mode");
+
+    // Q1: a real client query. It admits (taking the only permit) and then
+    // parks on the gated store read, holding the permit for the rest of the
+    // test.
+    gated.arm();
+    let q1 = tokio::spawn({
+        let base = base.clone();
+        async move { query_range(&base, start, end).await }
+    });
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while gated.blocked() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        parked.is_ok(),
+        "the client query must reach the gated store read while holding its permit"
+    );
+
+    // Q2: the cap really is saturated -- a second client query is rejected
+    // with the admission 503, not queued.
+    let q2 = reqwest::Client::new()
+        .get(format!("{base}/api/v1/query_range"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[
+            ("query", METRIC.to_string()),
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("step", "60s".to_string()),
+        ])
+        .send()
+        .await
+        .expect("second query request completes");
+    assert_eq!(
+        q2.status(),
+        503,
+        "with the single client permit held, a second client query must be \
+         rejected by admission"
+    );
+
+    // The fragment probe: admitted against the independent fragment class and
+    // served while the client cap is fully held. A shared bound would leave
+    // this waiting on the permit Q1 holds.
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut client = SeriesFetchClient::connect(format!("http://{grpc}"))
+            .await
+            .expect("connect to fragment gRPC");
+        let mut request = tonic::Request::new(pb::FetchRequest::default());
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {FRAGMENT_TOKEN}")
+                .parse()
+                .expect("valid metadata"),
+        );
+        client.fetch(request).await
+    })
+    .await;
+    assert!(
+        probe.is_ok(),
+        "a fragment must admit within its own class while the client cap is \
+         saturated; a timeout here means the two admission classes share a bound"
+    );
+    assert!(
+        probe.expect("probe completed").is_ok(),
+        "the admitted fragment request must be served, not rejected"
+    );
+
+    // Release the gate: Q1 completes normally (query_range asserts its 200).
+    gated.release_all();
+    let body = q1.await.expect("Q1 join");
+    assert_eq!(
+        body["status"], "success",
+        "the parked client query must complete once the store read is released"
+    );
+
+    server.shutdown().await.expect("server shuts down");
 }
