@@ -17,9 +17,15 @@
 //!   query-worker set: a slice this process owns runs locally with no network
 //!   hop (through the same [`FragmentService`] the gRPC surface exposes), and a
 //!   slice another worker owns is dispatched over an authed `tonic` channel.
-//!   A transport failure to a remote worker falls back to local execution
-//!   rather than failing the query, since the coordinator can always read any
-//!   slice itself.
+//!
+//!   The ADR-0071 failure matrix is enforced here (deliverable 1, 3, 4). A
+//!   version-skewed worker is dropped at routing time, so a protocol mismatch
+//!   costs no round trip (subsumes issue #885 item 3). A first remote attempt
+//!   lost at transport or answered `Unavailable` is re-dispatched exactly once
+//!   to the next rendezvous worker, then executed coordinator-local; a typed
+//!   failure surfaces only if local execution also fails. A worker-reported
+//!   corruption, or any decode/framing fault, is terminal and typed straight
+//!   through: it is never retried and never masked by a local fallback.
 //! * [`spawn_heartbeat`] -- the membership loop. It writes this process's
 //!   `sys/query/workers/<uuid>` heartbeat every interval and refreshes the
 //!   shared live-worker set the router reads.
@@ -98,6 +104,11 @@ pub struct FragmentMetrics {
     slices_local_total: AtomicU64,
     /// Slices this coordinator dispatched to a remote worker successfully.
     slices_remote_total: AtomicU64,
+    /// Slices whose first remote attempt was lost or `Unavailable` and were
+    /// re-dispatched once to the next rendezvous worker (ADR-0071 deliverable
+    /// 1). Counted once per slice that entered re-dispatch, whether the next
+    /// worker then succeeded or the slice went on to fall back local.
+    slices_redispatched_total: AtomicU64,
     /// Slices whose remote dispatch failed at transport and fell back to local.
     slices_fallback_total: AtomicU64,
     /// Per-slice fetch latency, bucketed like the store-latency histogram.
@@ -114,6 +125,7 @@ impl Default for FragmentMetrics {
             fragment_inflight: AtomicU64::new(0),
             slices_local_total: AtomicU64::new(0),
             slices_remote_total: AtomicU64::new(0),
+            slices_redispatched_total: AtomicU64::new(0),
             slices_fallback_total: AtomicU64::new(0),
             slice_fetch_micros_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             slice_fetch_nanos_total: AtomicU64::new(0),
@@ -157,6 +169,11 @@ impl FragmentMetrics {
         self.slices_remote_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_slice_redispatched(&self) {
+        self.slices_redispatched_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_slice_fallback(&self) {
         self.slices_fallback_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -188,6 +205,10 @@ impl FragmentMetrics {
 
     pub fn slices_remote_total(&self) -> u64 {
         self.slices_remote_total.load(Ordering::Relaxed)
+    }
+
+    pub fn slices_redispatched_total(&self) -> u64 {
+        self.slices_redispatched_total.load(Ordering::Relaxed)
     }
 
     pub fn slices_fallback_total(&self) -> u64 {
@@ -566,12 +587,29 @@ fn pinned_segment_count(request: &pb::FetchRequest) -> u64 {
     }
 }
 
-/// Where a slice is routed after rendezvous mapping.
-enum Route {
-    /// Execute locally, with no network hop.
-    Local,
-    /// Dispatch to a remote worker at this `host:port` fragment endpoint.
+/// One rendezvous-ranked owner of a slice's unit: either this coordinator
+/// (execute locally, no hop) or a remote worker at a `host:port` fragment
+/// endpoint. Produced in descending rendezvous rank by
+/// [`RoutingSliceFetcher::ranked_owners`], version-skewed workers already
+/// removed (ADR-0071: a protocol-version mismatch costs no round trip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Owner {
+    /// This process owns (or is the failover for) the slice: run it locally.
+    SelfLocal,
+    /// A remote worker owns the slice; dispatch to this fragment endpoint.
     Remote(String),
+}
+
+/// The classification of one remote dispatch attempt (ADR-0071 deliverable 1).
+enum Attempt {
+    /// A terminal outcome: a decoded response with a non-`Unavailable` status,
+    /// or a non-transport error (a decode/framing/corruption fault). Return it
+    /// as the slice's result; do not re-dispatch or fall back around it. Boxed
+    /// because a `SliceResponse` is large relative to the `Retry` variant.
+    Keep(Box<Result<SliceResponse, DistribError>>),
+    /// Transport loss or an `Unavailable` summary. Re-dispatch may skip past
+    /// this attempt to the next rendezvous worker, then coordinator-local.
+    Retry,
 }
 
 /// The coordinator's [`SliceFetcher`] (ADR-0071 deliverable 3). Rendezvous-maps
@@ -613,32 +651,78 @@ impl RoutingSliceFetcher {
         }
     }
 
-    /// Rendezvous-map a slice onto the live worker set. A slice this process
-    /// owns (or that cannot be routed, or whose owner has no live record) runs
-    /// local; otherwise it dispatches to the owner's endpoint.
-    fn route(&self, request: &pb::FetchRequest) -> Route {
+    /// Rendezvous-rank the live worker set for a slice, top owner first.
+    ///
+    /// Only workers whose `protocol_version` equals the coordinator's are
+    /// considered: a version-skewed worker is dropped here, at routing time, so
+    /// the mismatch never costs a dispatch round trip (ADR-0071 failure
+    /// semantics; subsumes issue #885 item 3). The ranking is produced by
+    /// repeatedly asking [`worker_set::owner`] for the top owner of the
+    /// remaining candidate set, so it matches the single-owner mapping the rest
+    /// of the cluster computes, extended to a deterministic failover order.
+    ///
+    /// An empty result (no pinned scope, an undecodable unit, or no
+    /// version-matched worker) means "run local": the caller executes the slice
+    /// on the coordinator with no hop.
+    fn ranked_owners(&self, request: &pb::FetchRequest) -> Vec<Owner> {
         let Some((tenant_hash, signal, shard)) = rendezvous_unit(request) else {
-            return Route::Local;
+            return Vec::new();
         };
         let live = Arc::clone(&self.live_workers.read());
-        let ids: Vec<Uuid> = live
+        // Version-matched records with a parseable process id, paired with the
+        // id so ranking and endpoint lookup share one filtered view.
+        let candidates: Vec<(Uuid, &QueryWorkerRecord)> = live
             .iter()
-            .filter_map(|record| Uuid::parse_str(&record.process_id).ok())
+            .filter(|record| record.protocol_version == codec::PROTOCOL_VERSION)
+            .filter_map(|record| {
+                Uuid::parse_str(&record.process_id)
+                    .ok()
+                    .map(|id| (id, record))
+            })
             .collect();
         let unit_key = worker_set::unit_key(&tenant_hash, signal, shard);
-        match worker_set::owner(&unit_key, &ids) {
-            None => Route::Local,
-            Some(owner) if Some(owner) == self.self_id.get().copied() => Route::Local,
-            Some(owner) => match live
-                .iter()
-                .find(|record| record.process_id == owner.to_string())
-            {
-                Some(record) => Route::Remote(record.fragment_endpoint.clone()),
-                // Owner in the id list but no record: should not happen (the ids
-                // are derived from the same records), but route local rather
-                // than fail.
-                None => Route::Local,
-            },
+        let self_id = self.self_id.get().copied();
+        let mut ids: Vec<Uuid> = candidates.iter().map(|(id, _)| *id).collect();
+        let mut ranked = Vec::new();
+        // Peel the top owner off the remaining candidate set until it empties,
+        // giving every version-matched worker in descending rendezvous rank.
+        while let Some(owner) = worker_set::owner(&unit_key, &ids) {
+            if Some(owner) == self_id {
+                ranked.push(Owner::SelfLocal);
+            } else if let Some((_, record)) = candidates.iter().find(|(id, _)| *id == owner) {
+                ranked.push(Owner::Remote(record.fragment_endpoint.clone()));
+            }
+            ids.retain(|id| *id != owner);
+        }
+        ranked
+    }
+
+    /// Attempt one remote dispatch and classify the outcome for re-dispatch
+    /// (ADR-0071 deliverable 1). Transport loss and an `Unavailable` summary are
+    /// [`Attempt::Retry`] (re-dispatchable); every other outcome, success or a
+    /// hard decode/framing error, is [`Attempt::Keep`] and terminal.
+    async fn try_remote(&self, endpoint: &str, request: &pb::FetchRequest) -> Attempt {
+        match self.remote_fetch(endpoint, request.clone()).await {
+            Ok(response) if response.status == pb::status::Code::Unavailable => {
+                tracing::warn!(
+                    %endpoint,
+                    "remote slice reported Unavailable; re-dispatching to next worker"
+                );
+                Attempt::Retry
+            }
+            Ok(response) => Attempt::Keep(Box::new(Ok(response))),
+            Err(DistribError::Transport(message)) => {
+                tracing::warn!(
+                    %endpoint,
+                    error = %message,
+                    "remote slice fetch failed at transport; re-dispatching to next worker"
+                );
+                Attempt::Retry
+            }
+            // A decode, framing, or worker-reported corruption error is a real
+            // defect, not a routing miss: propagate it typed rather than mask it
+            // with a retry or a local fallback (ADR-0071 deliverable 3).
+            Err(other) => Attempt::Keep(Box::new(Err(other))),
         }
     }
 
@@ -698,39 +782,80 @@ impl SliceFetcher for RoutingSliceFetcher {
     async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
         let start = Instant::now();
         let segment_count = pinned_segment_count(&request);
-        let (result, worker_endpoint, fell_back) = match self.route(&request) {
-            Route::Local => {
-                self.metrics.record_slice_local();
-                (
-                    self.local.run_local(request).await,
-                    "local".to_string(),
-                    false,
-                )
-            }
-            Route::Remote(endpoint) => match self.remote_fetch(&endpoint, request.clone()).await {
-                Ok(response) => {
-                    self.metrics.record_slice_remote();
-                    (Ok(response), endpoint, false)
-                }
-                // A transport failure to a remote worker is not fatal: the
-                // coordinator has the same store access and can read the slice
-                // itself, byte-identically. Any non-transport error (a decode or
-                // framing fault) is a real defect and propagates.
-                Err(DistribError::Transport(message)) => {
-                    tracing::warn!(
-                        %endpoint,
-                        error = %message,
-                        "remote slice fetch failed at transport; falling back to local"
-                    );
-                    self.metrics.record_slice_fallback();
-                    (self.local.run_local(request).await, endpoint, true)
-                }
-                Err(other) => (Err(other), endpoint, false),
-            },
-        };
+        let ranked = self.ranked_owners(&request);
+        let (result, worker_endpoint, fell_back) = self.dispatch(ranked, request).await;
         self.metrics.observe_slice_fetch(start.elapsed());
         record_fragment_stat(&result, worker_endpoint, segment_count, fell_back);
         result
+    }
+}
+
+impl RoutingSliceFetcher {
+    /// Execute one slice against its rendezvous-ranked owners, applying the
+    /// ADR-0071 failure sequence exactly (deliverable 1):
+    ///
+    /// * The top owner is this coordinator (or the unit is unroutable / has no
+    ///   version-matched worker): run local, no hop, no fallback needed.
+    /// * The top owner is remote: dispatch to it. On a terminal outcome
+    ///   (success, or a hard decode/corruption error) return it. On transport
+    ///   loss or an `Unavailable` summary, re-dispatch EXACTLY once to the next
+    ///   rendezvous worker (skipping the failed one). If that next worker is
+    ///   this coordinator, or is absent, or also fails re-dispatchably, execute
+    ///   the slice coordinator-local. A typed failure surfaces only if local
+    ///   execution fails too.
+    ///
+    /// Slice atomicity holds by construction: each attempt is decoded whole
+    /// before it is returned, so partial frames from a failed attempt are
+    /// discarded and never merged.
+    ///
+    /// Returns the slice result, the endpoint label for its `fragments[]` stats
+    /// entry, and whether it fell back to local after a failed remote attempt.
+    async fn dispatch(
+        &self,
+        ranked: Vec<Owner>,
+        request: pb::FetchRequest,
+    ) -> (Result<SliceResponse, DistribError>, String, bool) {
+        let primary = match ranked.first() {
+            // Self-mapped or unroutable: local, the normal no-hop path.
+            None | Some(Owner::SelfLocal) => {
+                self.metrics.record_slice_local();
+                return (
+                    self.local.run_local(request).await,
+                    "local".to_string(),
+                    false,
+                );
+            }
+            Some(Owner::Remote(endpoint)) => endpoint.clone(),
+        };
+
+        // First remote attempt against the top owner.
+        match self.try_remote(&primary, &request).await {
+            Attempt::Keep(result) => {
+                self.metrics.record_slice_remote();
+                return (*result, primary, false);
+            }
+            Attempt::Retry => {}
+        }
+
+        // The primary was lost or Unavailable. Re-dispatch EXACTLY once to the
+        // next rendezvous worker, skipping the failed primary. If the next
+        // owner is this coordinator (ranked second), fall straight to local:
+        // that is the coordinator-local step, not an extra remote hop.
+        self.metrics.record_slice_redispatched();
+        if let Some(Owner::Remote(next)) = ranked.get(1)
+            && *next != primary
+            && let Attempt::Keep(result) = self.try_remote(next, &request).await
+        {
+            self.metrics.record_slice_remote();
+            return (*result, next.clone(), false);
+        }
+
+        // Primary and its one re-dispatch both failed (or there was no next
+        // remote worker): the coordinator reads the slice itself. Its store
+        // access is the same, so a successful local read is byte-identical to
+        // the remote result; only if local also fails does the slice fail typed.
+        self.metrics.record_slice_fallback();
+        (self.local.run_local(request).await, primary, true)
     }
 }
 

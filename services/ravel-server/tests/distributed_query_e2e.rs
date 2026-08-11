@@ -35,7 +35,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ravel_commit::publish::RetryPolicy;
@@ -807,4 +809,840 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock() {
     );
 
     server.shutdown().await.expect("server shuts down");
+}
+
+/// The deliverable-2 no-deadlock property at the tightest fragment bound: the
+/// same real-wiring proof as its sibling above, but with
+/// `--max-inflight-fragments 1`. A shared bound, or a coordinator that held a
+/// fragment permit across its own client work, wedges at cap 1 specifically:
+/// with only one fragment permit and the single client permit already held by
+/// a parked query, the inbound fragment has nowhere to draw from unless the two
+/// classes are genuinely independent. The 32-permit sibling can mask an
+/// off-by-one that only bites when the fragment class is saturated down to its
+/// last permit.
+///
+/// NON-VACUITY: identical to the sibling -- mint `Semaphore::new(0)` in
+/// `FragmentAdmission::new` and the probe times out. The 503 assertion
+/// separately pins that the client cap really is exhausted.
+#[tokio::test]
+async fn fragment_admits_while_client_cap_saturated_no_deadlock_single_fragment_permit() {
+    let gated = Arc::new(GatedStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = gated.clone();
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+    let (start, end) = ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC);
+
+    // One fragment permit, one client permit: both classes saturated to their
+    // last slot, so any shared bound deadlocks.
+    let mut distrib = always_distribute_settings();
+    distrib.max_inflight_fragments = 1;
+    let server = start_server_with_query_cap(
+        Arc::clone(&store),
+        Some(distrib),
+        ravel_query::QueryConcurrencyLimit::Bounded(1),
+    )
+    .await;
+    let base = format!("http://{}", server.http_addr);
+    let grpc = server.grpc_addr.expect("gRPC listener binds in All mode");
+
+    // Q1 holds the single client permit, parked on the gated store read.
+    gated.arm();
+    let q1 = tokio::spawn({
+        let base = base.clone();
+        async move { query_range(&base, start, end).await }
+    });
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while gated.blocked() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        parked.is_ok(),
+        "the client query must reach the gated store read while holding its permit"
+    );
+
+    // The client cap is saturated: a second client query is rejected 503.
+    let q2 = reqwest::Client::new()
+        .get(format!("{base}/api/v1/query_range"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[
+            ("query", METRIC.to_string()),
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("step", "60s".to_string()),
+        ])
+        .send()
+        .await
+        .expect("second query request completes");
+    assert_eq!(
+        q2.status(),
+        503,
+        "with the single client permit held, a second client query must be rejected"
+    );
+
+    // The fragment probe admits against the single-permit fragment class and is
+    // served while the client cap is fully held.
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut client = SeriesFetchClient::connect(format!("http://{grpc}"))
+            .await
+            .expect("connect to fragment gRPC");
+        let mut request = tonic::Request::new(pb::FetchRequest::default());
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {FRAGMENT_TOKEN}")
+                .parse()
+                .expect("valid metadata"),
+        );
+        client.fetch(request).await
+    })
+    .await;
+    assert!(
+        probe.is_ok(),
+        "a fragment must admit within its own single-permit class while the client \
+         cap is saturated; a timeout here means the two classes share a bound"
+    );
+    assert!(
+        probe.expect("probe completed").is_ok(),
+        "the admitted fragment request must be served, not rejected"
+    );
+
+    gated.release_all();
+    let body = q1.await.expect("Q1 join");
+    assert_eq!(body["status"], "success");
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+// ---------------------------------------------------------------------------
+// Fault-matrix coverage (ADR-0071 failure semantics, issue #867).
+//
+// A configurable in-process mock `SeriesFetch` worker lets a coordinator's
+// re-dispatch and slice-atomicity behavior be driven deterministically: each
+// mock counts the dispatches it receives and returns a scripted outcome
+// (transport loss, an Unavailable summary, a mid-stream death, or a clean
+// series), so the exact attempt sequence and what each attempt contributes to
+// the merged result are both observable.
+// ---------------------------------------------------------------------------
+
+/// The boxed frame stream a mock `SeriesFetch` worker streams back.
+type MockStream =
+    Pin<Box<dyn futures::Stream<Item = Result<pb::FetchResponse, tonic::Status>> + Send + 'static>>;
+
+/// What a mock worker does with a dispatched slice.
+#[derive(Clone)]
+enum MockBehavior {
+    /// Fail at the gRPC layer, which the coordinator sees as transport loss.
+    TransportError,
+    /// Stream a single terminal summary carrying an `Unavailable` status.
+    UnavailableSummary,
+    /// Stream one series frame, then abort the stream before any summary: a
+    /// mid-frame death whose partial frame the coordinator must discard whole.
+    PartialThenError([u8; 16]),
+    /// Stream one clean series frame plus an OK summary.
+    OkSeries([u8; 16]),
+}
+
+/// A mock `SeriesFetch` gRPC worker that counts dispatches and returns a
+/// scripted [`MockBehavior`].
+struct MockWorker {
+    behavior: MockBehavior,
+    hits: Arc<AtomicU64>,
+}
+
+#[tonic::async_trait]
+impl ravel_query::distrib::proto::series_fetch_server::SeriesFetch for MockWorker {
+    type FetchStream = MockStream;
+
+    async fn fetch(
+        &self,
+        _request: tonic::Request<pb::FetchRequest>,
+    ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        let frames: Vec<Result<pb::FetchResponse, tonic::Status>> = match &self.behavior {
+            MockBehavior::TransportError => {
+                return Err(tonic::Status::unavailable(
+                    "mock worker: simulated transport loss",
+                ));
+            }
+            MockBehavior::UnavailableSummary => {
+                vec![Ok(summary_frame(pb::status::Code::Unavailable))]
+            }
+            MockBehavior::PartialThenError(series_id) => vec![
+                Ok(series_frame(*series_id)),
+                Err(tonic::Status::unavailable("mock worker: mid-stream death")),
+            ],
+            MockBehavior::OkSeries(series_id) => vec![
+                Ok(series_frame(*series_id)),
+                Ok(summary_frame(pb::status::Code::Ok)),
+            ],
+        };
+        Ok(tonic::Response::new(Box::pin(futures::stream::iter(
+            frames,
+        ))))
+    }
+}
+
+/// One decodable scalar series frame carrying `series_id` and a single sample.
+fn series_frame(series_id: [u8; 16]) -> pb::FetchResponse {
+    pb::FetchResponse {
+        frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame {
+            series_id: series_id.to_vec(),
+            labels: vec![pb::Label {
+                name: "__name__".to_string(),
+                value: METRIC.to_string(),
+            }],
+            runs: vec![pb::Run {
+                created_unix_ns: 0,
+                writer_epoch: 1,
+                writer_seq: 1,
+                ts_delta: vec![0],
+                value_bits: vec![1.0f64.to_bits()],
+            }],
+        })),
+    }
+}
+
+/// A terminal summary frame with the given typed status and no accounting.
+fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
+    pb::FetchResponse {
+        frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+            accounting: None,
+            series_returned: 0,
+            samples_returned: 0,
+            status: Some(pb::Status {
+                code: code as i32,
+                message: String::new(),
+            }),
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        })),
+    }
+}
+
+/// Bind a mock `SeriesFetch` worker on loopback, returning its `host:port`
+/// endpoint, a live dispatch counter, and a shutdown trigger (kept alive by the
+/// caller for the worker's lifetime).
+async fn spawn_mock_worker(
+    behavior: MockBehavior,
+) -> (String, Arc<AtomicU64>, tokio::sync::oneshot::Sender<()>) {
+    use ravel_query::distrib::proto::series_fetch_server::SeriesFetchServer;
+
+    let hits = Arc::new(AtomicU64::new(0));
+    let worker = MockWorker {
+        behavior,
+        hits: Arc::clone(&hits),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock worker");
+    let addr = listener.local_addr().expect("mock worker local addr");
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SeriesFetchServer::new(worker))
+            .serve_with_incoming_shutdown(
+                tonic::transport::server::TcpIncoming::from(listener),
+                async {
+                    let _ = rx.await;
+                },
+            )
+            .await
+            .expect("mock worker serves");
+    });
+    (addr.to_string(), hits, tx)
+}
+
+/// Rank a pool of candidate worker ids for one rendezvous unit, top owner
+/// first, using the same public `worker_set` mapping the router uses. Returns
+/// the two highest-ranked ids: the rendezvous primary and its failover.
+fn top_two_owners(unit_key: &[u8]) -> (uuid::Uuid, uuid::Uuid) {
+    use ravel_fleet::worker_set;
+    let mut ids: Vec<uuid::Uuid> = (0..16u128).map(uuid::Uuid::from_u128).collect();
+    let mut ranked = Vec::new();
+    while let Some(owner) = worker_set::owner(unit_key, &ids) {
+        ranked.push(owner);
+        ids.retain(|id| *id != owner);
+    }
+    (ranked[0], ranked[1])
+}
+
+/// ADR-0071 deliverable 1: a first remote attempt lost at transport re-dispatches
+/// EXACTLY once to the next rendezvous worker; if that attempt is also
+/// unavailable the slice runs coordinator-local; and if the local read fails too
+/// the query fails typed. The attempt sequence is asserted precisely: mock A
+/// (primary) and mock B (next) each receive exactly one dispatch, and the
+/// coordinator-local read faults through a `FaultStore` whose counter proves the
+/// third attempt fired.
+///
+/// NON-VACUITY: delete the re-dispatch block in `RoutingSliceFetcher::dispatch`
+/// (`services/ravel-server/src/distrib.rs`) -- the `if let Some(Owner::Remote(next))`
+/// arm that calls `try_remote` a second time -- so a lost primary falls straight
+/// to local (the pre-#867 one-attempt-then-local behavior). Mock B then receives
+/// zero dispatches and `assert_eq!(b_hits, 1)` fails.
+#[tokio::test]
+async fn worker_loss_redispatches_once_then_fails_typed() {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_fleet::worker_set;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+
+    // Publish real data into a plain store, then wrap it so only data-object
+    // (.rseg) GETs fault transiently. The coordinator's snapshot resolve (which
+    // reads commit records, not .rseg) still succeeds, but the coordinator-local
+    // fallback -- the third and final attempt -- fails with a typed store error.
+    let mem = MemoryStore::new();
+    publish_segment(&mem, &tenant, now - 10 * NS_PER_MIN).await;
+    let store_fault = Arc::new(FaultStore::new(
+        mem,
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("distributed local fallback read faulted".to_string()),
+            )
+            .with_key_contains(".rseg"),
+        ),
+    ));
+    let store: Arc<dyn ObjectStoreBackend> = store_fault.clone();
+
+    // The single slice's rendezvous unit is fixed (one tenant, metrics, shard 0).
+    // Rank a candidate pool for it and make the top owner mock A (transport loss)
+    // and its failover mock B (Unavailable summary).
+    let tenant_hash = tenant.hash();
+    let unit = worker_set::unit_key(&tenant_hash, Signal::Metrics, 0);
+    let (a_id, b_id) = top_two_owners(&unit);
+    let (a_endpoint, a_hits, _a_tx) = spawn_mock_worker(MockBehavior::TransportError).await;
+    let (b_endpoint, b_hits, _b_tx) = spawn_mock_worker(MockBehavior::UnavailableSummary).await;
+
+    let live = Arc::new(RwLock::new(Arc::new(vec![
+        QueryWorkerRecord {
+            process_id: a_id.to_string(),
+            fragment_endpoint: a_endpoint.clone(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+        QueryWorkerRecord {
+            process_id: b_id.to_string(),
+            fragment_endpoint: b_endpoint.clone(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+    ])));
+
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = FragmentAdmission::new(8, metrics.clone());
+    let local_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        FRAGMENT_TOKEN.to_string(),
+        admission,
+        local_catalog,
+        store.clone(),
+        None,
+        clock,
+        metrics.clone(),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    // A self id absent from the worker set, so every slice maps to a remote.
+    self_cell
+        .set(uuid::Uuid::from_u128(0xFFFF_FFFF))
+        .expect("set self id");
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        FRAGMENT_TOKEN.to_string(),
+        local_service,
+        metrics.clone(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+    let coordinator_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
+        .with_distributed(distributed);
+
+    let (start_ms, end_ms, step_ms) = (
+        (now - 15 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        now / NS_PER_SEC * 1000,
+        60_000,
+    );
+    let result = coordinator
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "primary, next-worker, and coordinator-local all fail, so the query fails typed: {result:?}"
+    );
+    assert_eq!(
+        a_hits.load(Ordering::SeqCst),
+        1,
+        "the rendezvous primary A is dispatched exactly once"
+    );
+    assert_eq!(
+        b_hits.load(Ordering::SeqCst),
+        1,
+        "the next rendezvous worker B receives exactly one re-dispatch"
+    );
+    assert_eq!(
+        metrics.slices_redispatched_total(),
+        1,
+        "the slice entered re-dispatch exactly once"
+    );
+    assert_eq!(
+        metrics.slices_remote_total(),
+        0,
+        "neither remote attempt produced a usable result"
+    );
+    assert_eq!(
+        metrics.slices_fallback_total(),
+        1,
+        "after both remotes failed, the slice fell back to coordinator-local"
+    );
+    assert!(
+        store_fault.fault_count(Op::Get, FaultKind::Transient) >= 1,
+        "the coordinator-local fallback read hit the injected store fault"
+    );
+}
+
+/// ADR-0071 deliverable 4 (subsumes issue #885 item 3): a live worker whose
+/// `protocol_version` is skewed from the coordinator's receives no slices. The
+/// mismatch is caught at routing time, so the skewed worker is never dialed --
+/// the query silently runs fully local and is byte-identical to a non-distributed
+/// engine, and neither the remote nor the fallback counter moves.
+///
+/// The skewed worker points at an unreachable TEST-NET endpoint: were it not
+/// filtered at routing time, the slice would dial it, time out, and fall back
+/// (`slices_fallback_total == 1`). Asserting the fallback counter stays zero is
+/// what proves the mismatch cost no round trip.
+#[tokio::test]
+async fn version_mismatch_falls_back_to_local() {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+
+    // One live worker, version-skewed, at an unreachable endpoint. Self is
+    // absent from the set, so absent the version filter every slice would map to
+    // this worker and dial it.
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = FragmentAdmission::new(8, metrics.clone());
+    let local_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        FRAGMENT_TOKEN.to_string(),
+        admission,
+        local_catalog,
+        store.clone(),
+        None,
+        clock,
+        metrics.clone(),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell
+        .set(uuid::Uuid::from_u128(0xF00D))
+        .expect("set self id");
+    let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+        process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
+        // Reserved TEST-NET address that never accepts a connection.
+        fragment_endpoint: "192.0.2.1:9".to_string(),
+        protocol_version: codec::PROTOCOL_VERSION + 1,
+        started_unix_ns: 0,
+    }])));
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        FRAGMENT_TOKEN.to_string(),
+        local_service,
+        metrics.clone(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+    let coordinator_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
+        .with_distributed(distributed);
+    let plain_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let plain = QueryEngine::new(plain_catalog, store.clone(), EngineConfig::default());
+
+    let tenant_hash = tenant.hash();
+    let (start_ms, end_ms, step_ms) = (
+        (now - 15 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        now / NS_PER_SEC * 1000,
+        60_000,
+    );
+    let deadline = EngineConfig::default().deadline;
+    let (distributed_value, _) = coordinator
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            deadline,
+        )
+        .await
+        .expect("distributed query completes fully local");
+    let (local_value, _) = plain
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            deadline,
+        )
+        .await
+        .expect("local query completes");
+
+    assert_eq!(
+        distributed_value, local_value,
+        "a query with only a version-skewed worker must be byte-identical to local"
+    );
+    assert_eq!(
+        metrics.slices_remote_total(),
+        0,
+        "a version-skewed worker must receive no slices"
+    );
+    assert_eq!(
+        metrics.slices_fallback_total(),
+        0,
+        "the skew is caught at routing time, so no slice is dialed and falls back"
+    );
+    assert!(
+        metrics.slices_local_total() > 0,
+        "every slice ran on the coordinator with no hop"
+    );
+}
+
+/// ADR-0071 slice atomicity: a slice whose first attempt dies mid-frames
+/// contributes nothing from that dead attempt, even when the re-dispatch then
+/// succeeds. Mock A streams one series frame then aborts before any summary;
+/// mock B (the failover) returns a clean, different series. The merged slice
+/// result must contain only B's series -- A's partial frame is discarded whole.
+///
+/// NON-VACUITY: in `RoutingSliceFetcher::remote_fetch`
+/// (`services/ravel-server/src/distrib.rs`), change the frame-collection loop
+/// from propagating the stream error (`.map_err(...)?`) to breaking and
+/// decoding whatever frames arrived. A's partial `[series frame, no summary]`
+/// then decodes to a `NoSummary` error that is treated as terminal, the
+/// re-dispatch to B never happens, and the assertions below (status OK, B's
+/// series present) fail.
+#[tokio::test]
+async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_fleet::worker_set;
+    use ravel_query::distrib::client::SliceFetcher;
+    use ravel_query::distrib::codec;
+    use ravel_server::distrib::{
+        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+    const SERIES_A: [u8; 16] = [0xAA; 16];
+    const SERIES_B: [u8; 16] = [0xBB; 16];
+
+    // A fixed rendezvous unit; rank a candidate pool for it and make its top
+    // owner the mid-death worker A and its failover the clean worker B.
+    let tenant_hash = [7u8; 16];
+    let unit = worker_set::unit_key(&ravel_types::TenantHash(tenant_hash), Signal::Metrics, 0);
+    let (a_id, b_id) = top_two_owners(&unit);
+    let (a_endpoint, a_hits, _a_tx) =
+        spawn_mock_worker(MockBehavior::PartialThenError(SERIES_A)).await;
+    let (b_endpoint, b_hits, _b_tx) = spawn_mock_worker(MockBehavior::OkSeries(SERIES_B)).await;
+
+    let live = Arc::new(RwLock::new(Arc::new(vec![
+        QueryWorkerRecord {
+            process_id: a_id.to_string(),
+            fragment_endpoint: a_endpoint,
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+        QueryWorkerRecord {
+            process_id: b_id.to_string(),
+            fragment_endpoint: b_endpoint,
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+    ])));
+
+    // The local fallback is never reached (B succeeds), so an empty store is fine.
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = FragmentAdmission::new(8, metrics.clone());
+    let local_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        FRAGMENT_TOKEN.to_string(),
+        admission,
+        local_catalog,
+        store.clone(),
+        None,
+        clock,
+        metrics.clone(),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell
+        .set(uuid::Uuid::from_u128(0xFFFF_FFFF))
+        .expect("set self id");
+    let fetcher = RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        FRAGMENT_TOKEN.to_string(),
+        local_service,
+        metrics.clone(),
+    );
+
+    let request = pb::FetchRequest {
+        protocol_version: codec::PROTOCOL_VERSION,
+        tenant_hash: tenant_hash.to_vec(),
+        signal: codec::signal_to_u32(Signal::Metrics),
+        scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+            segments: vec![pb::SegmentIdentity {
+                shard: 0,
+                content_hash: vec![0u8; 32],
+                ..Default::default()
+            }],
+        })),
+        ..Default::default()
+    };
+
+    let response = fetcher
+        .fetch(request)
+        .await
+        .expect("the re-dispatch to B yields a clean slice");
+
+    assert_eq!(
+        response.status,
+        pb::status::Code::Ok,
+        "the successful retry's OK summary is the slice's terminal status"
+    );
+    let returned: Vec<[u8; 16]> = response.scalar.iter().map(|s| s.series_id.0).collect();
+    assert!(
+        returned.contains(&SERIES_B),
+        "the clean series from the successful retry is present"
+    );
+    assert!(
+        !returned.contains(&SERIES_A),
+        "no partial series from the dead first attempt leaks into the result"
+    );
+    assert_eq!(
+        response.scalar.len(),
+        1,
+        "only the retry contributed; the dead attempt contributed nothing"
+    );
+    assert_eq!(a_hits.load(Ordering::SeqCst), 1, "A dispatched once");
+    assert_eq!(b_hits.load(Ordering::SeqCst), 1, "B re-dispatched once");
+    assert_eq!(metrics.slices_redispatched_total(), 1);
+    assert_eq!(metrics.slices_remote_total(), 1, "B's clean result counted");
+    assert_eq!(
+        metrics.slices_fallback_total(),
+        0,
+        "local was never reached"
+    );
+}
+
+/// ADR-0071 deliverable 5: tearing down the coordinator's stream cancels the
+/// in-flight fragment on the worker and frees its admission permit. A worker Y
+/// admits a dispatched fragment (its `fragment_inflight` gauge reads 1) and then
+/// parks on a gated store read while holding the permit; aborting the
+/// coordinator drops the client stream, tonic cancels Y's handler, and the
+/// permit's `Drop` returns the gauge to zero.
+///
+/// NON-VACUITY: the gauge is asserted to reach 1 first (the fragment genuinely
+/// admitted), so the return-to-zero cannot pass vacuously. Were the permit not
+/// released on cancellation, the gauge would stay at 1 and the poll below would
+/// time out.
+#[tokio::test]
+async fn cancelled_distributed_query_frees_fragment_permits() {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+
+    // Worker Y over a gated store: an armed gate holds every non-`sys/` read
+    // (the fragment's snapshot resolve and data read) shut, so Y admits the
+    // fragment -- taking a permit and incrementing the in-flight gauge -- and
+    // then parks with the permit held.
+    let gated = Arc::new(GatedStore::new());
+    let y_store: Arc<dyn ObjectStoreBackend> = gated.clone();
+    publish_segment(y_store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+    let server_y = start_server(Arc::clone(&y_store), Some(always_distribute_settings())).await;
+    let y_grpc = server_y.grpc_addr.expect("gRPC listener binds in All mode");
+    let y_http = format!("http://{}", server_y.http_addr);
+
+    // Coordinator over its own ungated store (same published data), so its own
+    // snapshot resolve is not gated: it resolves, dispatches the slice to Y, and
+    // waits on Y's stream.
+    let coord_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(coord_store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = FragmentAdmission::new(8, metrics.clone());
+    let local_catalog =
+        ravel_server::query::build_catalog(coord_store.clone(), 1, false, CACHE_BYTES)
+            .expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        FRAGMENT_TOKEN.to_string(),
+        admission,
+        local_catalog,
+        coord_store.clone(),
+        None,
+        clock,
+        metrics.clone(),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell
+        .set(uuid::Uuid::from_u128(0xF00D))
+        .expect("set self id");
+    let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+        process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
+        fragment_endpoint: y_grpc.to_string(),
+        protocol_version: codec::PROTOCOL_VERSION,
+        started_unix_ns: 0,
+    }])));
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        FRAGMENT_TOKEN.to_string(),
+        local_service,
+        metrics.clone(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+    let coordinator_catalog =
+        ravel_server::query::build_catalog(coord_store.clone(), 1, false, CACHE_BYTES)
+            .expect("catalog");
+    let coordinator = QueryEngine::new(
+        coordinator_catalog,
+        coord_store.clone(),
+        EngineConfig::default(),
+    )
+    .with_distributed(distributed);
+
+    let tenant_hash = tenant.hash();
+    let (start_ms, end_ms, step_ms) = (
+        (now - 15 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        now / NS_PER_SEC * 1000,
+        60_000,
+    );
+
+    gated.arm();
+    let query = tokio::spawn(async move {
+        coordinator
+            .range_with_stats(
+                tenant_hash,
+                METRIC,
+                start_ms,
+                end_ms,
+                step_ms,
+                &[],
+                now,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+    });
+
+    // The fragment admits on Y and parks: its in-flight gauge reaches 1.
+    let admitted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let m = scrape_metrics(&y_http).await;
+            if metric_value(&m, "ravel_distrib_fragment_inflight") >= 1.0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "the dispatched fragment must admit on the worker and hold a permit \
+         (in-flight gauge reaches 1)"
+    );
+
+    // Tear down the coordinator's stream: tonic cancels Y's handler.
+    query.abort();
+    let _ = query.await;
+
+    // The permit's Drop must return the gauge to zero.
+    let freed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let m = scrape_metrics(&y_http).await;
+            if metric_value(&m, "ravel_distrib_fragment_inflight") == 0.0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        freed.is_ok(),
+        "cancelling the coordinator must free the worker's fragment permit; \
+         the in-flight gauge must return to zero"
+    );
+
+    gated.release_all();
+    server_y.shutdown().await.expect("Y shuts down");
 }

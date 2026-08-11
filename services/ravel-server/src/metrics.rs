@@ -2097,6 +2097,7 @@ pub struct DistribSnapshot {
     pub fragment_inflight: u64,
     pub slices_local_total: u64,
     pub slices_remote_total: u64,
+    pub slices_redispatched_total: u64,
     pub slices_fallback_total: u64,
     pub slice_fetch_micros_buckets: [u64; LATENCY_BUCKET_COUNT],
     pub slice_fetch_nanos_total: u64,
@@ -2172,6 +2173,19 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
         "ravel_distrib_slices_remote_total",
         &[Label::Mode(mode)],
         snapshot.slices_remote_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_slices_redispatched_total",
+        "Query slices re-dispatched once to the next rendezvous worker after a lost or unavailable first attempt.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_slices_redispatched_total",
+        &[Label::Mode(mode)],
+        snapshot.slices_redispatched_total,
     );
 
     write_header(
@@ -2474,6 +2488,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         fragment_inflight: metrics.fragment_inflight(),
         slices_local_total: metrics.slices_local_total(),
         slices_remote_total: metrics.slices_remote_total(),
+        slices_redispatched_total: metrics.slices_redispatched_total(),
         slices_fallback_total: metrics.slices_fallback_total(),
         slice_fetch_micros_buckets: metrics.slice_fetch_buckets(),
         slice_fetch_nanos_total: metrics.slice_fetch_nanos_total(),
@@ -3244,6 +3259,7 @@ mod tests {
             fragment_inflight: 1,
             slices_local_total: 7,
             slices_remote_total: 4,
+            slices_redispatched_total: 2,
             slices_fallback_total: 1,
             slice_fetch_micros_buckets: buckets,
             slice_fetch_nanos_total: 123_000,
@@ -3271,6 +3287,7 @@ mod tests {
             "ravel_distrib_fragment_inflight{mode=\"query\"} 1",
             "ravel_distrib_slices_local_total{mode=\"query\"} 7",
             "ravel_distrib_slices_remote_total{mode=\"query\"} 4",
+            "ravel_distrib_slices_redispatched_total{mode=\"query\"} 2",
             "ravel_distrib_slices_fallback_total{mode=\"query\"} 1",
         ] {
             assert!(body.contains(expected), "missing `{expected}`:\n{body}");
