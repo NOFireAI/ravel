@@ -942,6 +942,10 @@ enum MockBehavior {
     PartialThenError([u8; 16]),
     /// Stream one clean series frame plus an OK summary.
     OkSeries([u8; 16]),
+    /// Stream a single terminal summary carrying a `Corrupt` status: a
+    /// worker-reported corruption that must fail typed with no retry and no
+    /// local fallback masking it.
+    CorruptSummary,
 }
 
 /// A mock `SeriesFetch` gRPC worker that counts dispatches and returns a
@@ -977,6 +981,9 @@ impl ravel_query::distrib::proto::series_fetch_server::SeriesFetch for MockWorke
                 Ok(series_frame(*series_id)),
                 Ok(summary_frame(pb::status::Code::Ok)),
             ],
+            MockBehavior::CorruptSummary => {
+                vec![Ok(summary_frame(pb::status::Code::Corrupt))]
+            }
         };
         Ok(tonic::Response::new(Box::pin(futures::stream::iter(
             frames,
@@ -1056,8 +1063,9 @@ async fn spawn_mock_worker(
 
 /// Rank a pool of candidate worker ids for one rendezvous unit, top owner
 /// first, using the same public `worker_set` mapping the router uses. Returns
-/// the two highest-ranked ids: the rendezvous primary and its failover.
-fn top_two_owners(unit_key: &[u8]) -> (uuid::Uuid, uuid::Uuid) {
+/// the three highest-ranked ids: the rendezvous primary, its failover, and the
+/// third-ranked worker (which a correct EXACTLY-once ladder must never reach).
+fn top_three_owners(unit_key: &[u8]) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
     use ravel_fleet::worker_set;
     let mut ids: Vec<uuid::Uuid> = (0..16u128).map(uuid::Uuid::from_u128).collect();
     let mut ranked = Vec::new();
@@ -1065,7 +1073,7 @@ fn top_two_owners(unit_key: &[u8]) -> (uuid::Uuid, uuid::Uuid) {
         ranked.push(owner);
         ids.retain(|id| *id != owner);
     }
-    (ranked[0], ranked[1])
+    (ranked[0], ranked[1], ranked[2])
 }
 
 /// ADR-0071 deliverable 1: a first remote attempt lost at transport re-dispatches
@@ -1123,9 +1131,14 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
     // and its failover mock B (Unavailable summary).
     let tenant_hash = tenant.hash();
     let unit = worker_set::unit_key(&tenant_hash, Signal::Metrics, 0);
-    let (a_id, b_id) = top_two_owners(&unit);
+    let (a_id, b_id, c_id) = top_three_owners(&unit);
     let (a_endpoint, a_hits, _a_tx) = spawn_mock_worker(MockBehavior::TransportError).await;
     let (b_endpoint, b_hits, _b_tx) = spawn_mock_worker(MockBehavior::UnavailableSummary).await;
+    // A third ranked worker distinguishes "re-dispatch EXACTLY once" from
+    // "walk the ranked list until it is exhausted": with only two workers the
+    // two behaviors are indistinguishable, and an unbounded-ladder mutation
+    // survives. C must never be dialed.
+    let (c_endpoint, c_hits, _c_tx) = spawn_mock_worker(MockBehavior::UnavailableSummary).await;
 
     let live = Arc::new(RwLock::new(Arc::new(vec![
         QueryWorkerRecord {
@@ -1137,6 +1150,12 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         QueryWorkerRecord {
             process_id: b_id.to_string(),
             fragment_endpoint: b_endpoint.clone(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+        QueryWorkerRecord {
+            process_id: c_id.to_string(),
+            fragment_endpoint: c_endpoint.clone(),
             protocol_version: codec::PROTOCOL_VERSION,
             started_unix_ns: 0,
         },
@@ -1208,6 +1227,12 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         b_hits.load(Ordering::SeqCst),
         1,
         "the next rendezvous worker B receives exactly one re-dispatch"
+    );
+    assert_eq!(
+        c_hits.load(Ordering::SeqCst),
+        0,
+        "the third-ranked worker C is never dialed: the ladder is exactly \
+         primary, one re-dispatch, local -- not the whole ranked list"
     );
     assert_eq!(
         metrics.slices_redispatched_total(),
@@ -1394,7 +1419,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     // owner the mid-death worker A and its failover the clean worker B.
     let tenant_hash = [7u8; 16];
     let unit = worker_set::unit_key(&ravel_types::TenantHash(tenant_hash), Signal::Metrics, 0);
-    let (a_id, b_id) = top_two_owners(&unit);
+    let (a_id, b_id, _c_id) = top_three_owners(&unit);
     let (a_endpoint, a_hits, _a_tx) =
         spawn_mock_worker(MockBehavior::PartialThenError(SERIES_A)).await;
     let (b_endpoint, b_hits, _b_tx) = spawn_mock_worker(MockBehavior::OkSeries(SERIES_B)).await;
@@ -1645,4 +1670,143 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
 
     gated.release_all();
     server_y.shutdown().await.expect("Y shuts down");
+}
+
+/// ADR-0071 deliverable 3: a worker-reported corruption is terminal and typed.
+/// No retry reaches the failover worker, no coordinator-local fallback masks
+/// the corruption behind a possibly-clean local read, and the query fails with
+/// the corruption in its error.
+///
+/// The setup makes any masking observable: real data is published, so a wrong
+/// local fallback WOULD succeed, and failover worker B would return a clean
+/// series if it were wrongly re-dispatched -- either wrong path flips
+/// `result.is_err()` or a counter assertion below.
+///
+/// NON-VACUITY: in `crates/ravel-query/src/distrib/mod.rs`, route the
+/// `pb::status::Code::Corrupt` arm to the `Unavailable` handling (or in
+/// `services/ravel-server/src/distrib.rs` `try_remote`, classify a Corrupt
+/// summary as `Attempt::Retry`); B then receives the re-dispatch, returns a
+/// clean slice, the query succeeds, and the `result.is_err()` and
+/// `b_hits == 0` assertions both fail.
+#[tokio::test]
+async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_fleet::worker_set;
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        FragmentAdmission, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    let mem = MemoryStore::new();
+    publish_segment(&mem, &tenant, now - 10 * NS_PER_MIN).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+
+    // Primary A reports Corrupt; failover B would serve a clean slice if the
+    // ladder wrongly continued past the corruption.
+    let tenant_hash = tenant.hash();
+    let unit = worker_set::unit_key(&tenant_hash, Signal::Metrics, 0);
+    let (a_id, b_id, _c_id) = top_three_owners(&unit);
+    let (a_endpoint, a_hits, _a_tx) = spawn_mock_worker(MockBehavior::CorruptSummary).await;
+    let (b_endpoint, b_hits, _b_tx) = spawn_mock_worker(MockBehavior::OkSeries([0xCC; 16])).await;
+
+    let live = Arc::new(RwLock::new(Arc::new(vec![
+        QueryWorkerRecord {
+            process_id: a_id.to_string(),
+            fragment_endpoint: a_endpoint.clone(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+        QueryWorkerRecord {
+            process_id: b_id.to_string(),
+            fragment_endpoint: b_endpoint.clone(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        },
+    ])));
+
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = FragmentAdmission::new(8, metrics.clone());
+    let local_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        FRAGMENT_TOKEN.to_string(),
+        admission,
+        local_catalog,
+        store.clone(),
+        None,
+        clock,
+        metrics.clone(),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell
+        .set(uuid::Uuid::from_u128(0xFFFF_FFFF))
+        .expect("set self id");
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        FRAGMENT_TOKEN.to_string(),
+        local_service,
+        metrics.clone(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+    let coordinator_catalog =
+        ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
+    let coordinator = QueryEngine::new(coordinator_catalog, store.clone(), EngineConfig::default())
+        .with_distributed(distributed);
+
+    let (start_ms, end_ms, step_ms) = (
+        (now - 15 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        now / NS_PER_SEC * 1000,
+        60_000,
+    );
+    let result = coordinator
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+    let err = result.expect_err("a worker-reported corruption fails the query");
+    assert!(
+        err.to_string().to_lowercase().contains("corrupt"),
+        "the typed error names the corruption, got: {err}"
+    );
+    assert_eq!(
+        a_hits.load(Ordering::SeqCst),
+        1,
+        "the corrupt-reporting primary is dispatched exactly once"
+    );
+    assert_eq!(
+        b_hits.load(Ordering::SeqCst),
+        0,
+        "corruption is never re-dispatched to the failover worker"
+    );
+    assert_eq!(
+        metrics.slices_redispatched_total(),
+        0,
+        "the corrupt slice never enters re-dispatch"
+    );
+    assert_eq!(
+        metrics.slices_fallback_total(),
+        0,
+        "no coordinator-local fallback masks the corruption"
+    );
 }
