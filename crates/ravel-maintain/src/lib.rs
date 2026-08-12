@@ -110,7 +110,7 @@ pub use scrub::{
 };
 pub use sweep::{
     CatalogSweepOutcome, IdemSweepOutcome, LeaseCheck, NoLeases, OrphanSweepOutcome, SweepReport,
-    sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_superseded,
+    sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
     sweep_unreferenced_catalog_objects, sweep_unreferenced_parts,
 };
 

@@ -86,6 +86,14 @@
 //! the consistency-model's "not lease-protected" precondition is then
 //! vacuously satisfied everywhere. It is a seam for future slow-consumer work
 //! (plan §5, Q3), not live logic; no lease machinery is built behind it.
+//!
+//! [`sweep_shard_zoned`] scopes rules 2 and 3 to a given hour set, mirroring
+//! the unit scan's zone split (ADR-0065 decision 3): the caller's per-tick
+//! pass lists only its head+tail hours, and a full pass on the slow
+//! safety-net cadence still uses [`sweep_shard`] to eventually cover every
+//! hour. Rule 1 cannot be scoped this way and always lists the whole shard
+//! (L0 keys carry no ingest-hour component); see [`sweep_shard_zoned`]'s doc
+//! for that deviation.
 
 use std::collections::{HashMap, HashSet};
 
@@ -152,6 +160,14 @@ pub struct SweepReport {
     /// decision 4's one-shot operator override). Always `false` when
     /// `orphan_breaker_tripped` is `true`.
     pub orphan_breaker_overridden: bool,
+    /// `true` if this pass listed the whole shard (rule 1 always does; rules
+    /// 2 and 3 did here too, either because the caller used [`sweep_shard`]
+    /// or because [`sweep_shard_zoned`] was asked to widen to every hour).
+    /// `false` for a [`sweep_shard_zoned`] pass scoped to a hour subset.
+    /// Counter seam for EI-T5's `ravel_maintain_full_sweep_passes_total`: a
+    /// caller running the slow safety-net cadence increments its own counter
+    /// when this is `true`.
+    pub full_pass: bool,
 }
 
 /// Run all three sweep rules over one `(tenant, signal, shard)` and report
@@ -192,6 +208,78 @@ pub async fn sweep_shard(
         orphan_breaker_tripped,
         orphans_withheld,
         orphan_breaker_overridden,
+        full_pass: true,
+    })
+}
+
+/// Zone-scoped sweep pass (ADR-0065 decision 3): rules 2 and 3 list only the
+/// given `hours`' commit and L1 prefixes instead of the whole shard,
+/// mirroring the unit scan's zone split so a per-tick pass never re-lists
+/// interior hours a tick's zone recomputation already decided to skip.
+/// `hours` is the caller's current head+tail set for this unit.
+///
+/// Rule 1 (orphan GC) always lists the whole shard regardless of `hours`: L0
+/// data keys carry no ingest-hour component (`ravel_commit::keys::data_key`),
+/// so there is no hour-scoped prefix to list. This is a structural limit, not
+/// an oversight -- flagged as a deviation from a literal reading of the ADR,
+/// which does not distinguish rule 1 from rules 2 and 3 when describing the
+/// per-tick sweep as hour-scoped.
+///
+/// The caller is responsible for the slow safety-net cadence: call
+/// [`sweep_shard`] instead of this function on that cadence so rules 2 and 3
+/// eventually cover every hour, including one a bug or a missed invalidation
+/// left permanently out of `hours`. [`SweepReport::full_pass`] is always
+/// `false` on the report this function returns.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_shard_zoned(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: &[u32],
+) -> Result<SweepReport> {
+    let (superseded_records_deleted, superseded_data_deleted) = sweep_superseded_impl(
+        store,
+        clock,
+        config,
+        lease,
+        tenant,
+        signal,
+        shard,
+        Some(hours),
+    )
+    .await?;
+    let unreferenced_parts_deleted = sweep_unreferenced_parts_impl(
+        store,
+        clock,
+        config,
+        lease,
+        tenant,
+        signal,
+        shard,
+        Some(hours),
+    )
+    .await?;
+    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
+        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
+            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+                (0, true, candidates, false)
+            }
+            Err(e) => return Err(e),
+        };
+    Ok(SweepReport {
+        orphans_deleted,
+        superseded_records_deleted,
+        superseded_data_deleted,
+        unreferenced_parts_deleted,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
+        full_pass: false,
     })
 }
 
@@ -352,8 +440,24 @@ pub async fn sweep_superseded(
     signal: Signal,
     shard: u32,
 ) -> Result<(usize, usize)> {
+    sweep_superseded_impl(store, clock, config, lease, tenant, signal, shard, None).await
+}
+
+/// Shared implementation behind [`sweep_superseded`] (whole-shard, `hours:
+/// None`) and [`sweep_shard_zoned`] (hour-scoped, `hours: Some(_)`).
+#[allow(clippy::too_many_arguments)]
+async fn sweep_superseded_impl(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+) -> Result<(usize, usize)> {
     let now = clock.now_ns();
-    let entries = list_commit_entries(store, tenant, signal, shard).await?;
+    let entries = list_commit_entries_scoped(store, tenant, signal, shard, hours).await?;
 
     let mut records_deleted = 0usize;
     let mut data_deleted = 0usize;
@@ -454,12 +558,31 @@ pub async fn sweep_unreferenced_parts(
     signal: Signal,
     shard: u32,
 ) -> Result<usize> {
+    sweep_unreferenced_parts_impl(store, clock, config, lease, tenant, signal, shard, None).await
+}
+
+/// Shared implementation behind [`sweep_unreferenced_parts`] (whole-shard,
+/// `hours: None`) and [`sweep_shard_zoned`] (hour-scoped, `hours: Some(_)`).
+/// When scoped, both the commit-prefix listing that builds the reference map
+/// and the `l1/` listing are restricted to `hours`: an interior bucket this
+/// tick's zone recomputation skipped is never listed by either.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_unreferenced_parts_impl(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+) -> Result<usize> {
     let now = clock.now_ns();
     let gate = config.unreferenced_part_age_gate_ns();
-    let (referenced, tombstoned) = bucket_reference_map(store, tenant, signal, shard).await?;
+    let (referenced, tombstoned) =
+        bucket_reference_map_scoped(store, tenant, signal, shard, hours).await?;
 
-    let prefix = l1_prefix(tenant, signal, shard)?;
-    let objects = list_all(store, &prefix).await?;
+    let objects = list_l1_scoped(store, tenant, signal, shard, hours).await?;
     let mut deleted = 0usize;
     for meta in objects {
         let parsed = keys::parse_l1_part_key(&meta.key)?;
@@ -480,7 +603,8 @@ pub async fn sweep_unreferenced_parts(
         // bucket's compaction record vanished between the two listings, the
         // fresh classification is no longer `UnreferencedWithRecord`, so the
         // delete is skipped.
-        let (fresh_ref, fresh_tomb) = bucket_reference_map(store, tenant, signal, shard).await?;
+        let (fresh_ref, fresh_tomb) =
+            bucket_reference_map_scoped(store, tenant, signal, shard, hours).await?;
         if classify_part(&meta.key, bucket, &fresh_ref, &fresh_tomb) != Some(branch) {
             continue;
         }
@@ -535,13 +659,14 @@ fn classify_part(
 /// tombstone. A bucket in neither collection has no compaction record and no
 /// tombstone, so its `l1/` objects are never swept by rule 3 (a future
 /// compaction may still publish a record naming them; issue #273).
-async fn bucket_reference_map(
+async fn bucket_reference_map_scoped(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
     shard: u32,
+    hours: Option<&[u32]>,
 ) -> Result<(HashMap<u32, HashSet<String>>, HashSet<u32>)> {
-    let entries = list_commit_entries(store, tenant, signal, shard).await?;
+    let entries = list_commit_entries_scoped(store, tenant, signal, shard, hours).await?;
     let mut referenced: HashMap<u32, HashSet<String>> = HashMap::new();
     let mut tombstoned: HashSet<u32> = HashSet::new();
     for (key, entry) in &entries {
@@ -946,16 +1071,34 @@ fn catalog_idx_prefix(tenant: &TenantHash, signal: Signal) -> String {
 // --- shared helpers --------------------------------------------------------
 
 /// List a shard's commit prefix and classify every key by shape, failing loud
-/// on any unknown shape (plan §3.1). Returns `(key, entry)` pairs across all
-/// hours of the shard.
-async fn list_commit_entries(
+/// on any unknown shape (plan §3.1). Returns `(key, entry)` pairs.
+///
+/// `hours: None` lists the whole shard, across every hour, in one LIST (the
+/// pre-zone-split behavior). `hours: Some(hs)` issues one LIST per hour in
+/// `hs` against [`keys::commit_shard_hour_prefix`] instead, and concatenates
+/// the results: an hour not in `hs` is never listed, which is the request-
+/// count saving the zone split (ADR-0065 decision 3) exists for.
+async fn list_commit_entries_scoped(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
     shard: u32,
+    hours: Option<&[u32]>,
 ) -> Result<Vec<(String, BucketEntry)>> {
-    let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
-    let metas = list_all(store, &prefix).await?;
+    let metas = match hours {
+        None => {
+            let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+            list_all(store, &prefix).await?
+        }
+        Some(hs) => {
+            let mut metas = Vec::new();
+            for hour in hs {
+                let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, *hour)?;
+                metas.extend(list_all(store, &prefix).await?);
+            }
+            metas
+        }
+    };
     let mut out = Vec::with_capacity(metas.len());
     for meta in metas {
         match keys::partition_bucket_entry(&meta.key) {
@@ -967,6 +1110,32 @@ async fn list_commit_entries(
         }
     }
     Ok(out)
+}
+
+/// List a shard's `l1/` objects. `hours: None` lists the whole shard in one
+/// LIST via [`l1_prefix`] (the pre-zone-split behavior); `hours: Some(hs)`
+/// issues one LIST per hour in `hs` against an hour-scoped prefix instead.
+async fn list_l1_scoped(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+) -> Result<Vec<ObjectMeta>> {
+    match hours {
+        None => {
+            let prefix = l1_prefix(tenant, signal, shard)?;
+            Ok(list_all(store, &prefix).await?)
+        }
+        Some(hs) => {
+            let mut metas = Vec::new();
+            for hour in hs {
+                let prefix = l1_hour_prefix(tenant, signal, shard, *hour)?;
+                metas.extend(list_all(store, &prefix).await?);
+            }
+            Ok(metas)
+        }
+    }
 }
 
 /// GET, decode, and key-verify a compaction record (ADR-0010 §7).
@@ -1022,6 +1191,19 @@ fn l1_prefix(tenant: &TenantHash, signal: Signal, shard: u32) -> Result<String> 
         signal.key_prefix(),
         keys::L1_DIR,
         format_shard(shard)?
+    ))
+}
+
+/// `t/<tenant_hash_hex>/<signal>/l1/<shard>/<hour>/` -- the prefix covering
+/// one hour's L1 part objects. L1 keys are hour-bucketed (unlike L0), so this
+/// is the zone-scoped sweep's narrower alternative to [`l1_prefix`]; composed
+/// from existing `pub` pieces (`l1_prefix`, `keys::ingest_hour_string`), no
+/// new ravel-commit API needed.
+fn l1_hour_prefix(tenant: &TenantHash, signal: Signal, shard: u32, hour: u32) -> Result<String> {
+    Ok(format!(
+        "{}{}/",
+        l1_prefix(tenant, signal, shard)?,
+        keys::ingest_hour_string(hour)
     ))
 }
 

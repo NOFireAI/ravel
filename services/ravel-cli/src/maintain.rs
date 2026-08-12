@@ -138,6 +138,7 @@ pub async fn sweep(
         orphan_breaker_tripped,
         orphans_withheld,
         orphan_breaker_overridden,
+        full_pass,
     } = sweep_shard(
         store.as_ref(),
         &clock,
@@ -156,6 +157,7 @@ pub async fn sweep(
     println!("superseded_records ({verb}): {superseded_records_deleted}");
     println!("superseded_data ({verb}): {superseded_data_deleted}");
     println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
+    println!("full_pass: {full_pass}");
     if orphan_breaker_tripped {
         println!(
             "orphan breaker: TRIPPED, {orphans_withheld} candidates withheld, deleted nothing \

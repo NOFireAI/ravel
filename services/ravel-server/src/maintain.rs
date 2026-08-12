@@ -80,7 +80,8 @@ use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
     Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, LegalHoldCheck, MaintainError,
     QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, read_all_memo_snapshots, scan_and_compact,
-    sweep_audit_retention, sweep_idempotency_markers, sweep_shard, write_memo_snapshot,
+    sweep_audit_retention, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned,
+    write_memo_snapshot,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash};
@@ -372,7 +373,13 @@ async fn run_loop(
     // tenant this supervisor discovers. Cold on the first tick, so that tick
     // is a full rescan identical to the pre-memo behavior -- unless warm start
     // (below) seeds it from durable snapshots first.
-    let mut memo = MaintainMemo::with_default_interval();
+    //
+    // The memo's re-verify interval now governs only the interior zone
+    // (ADR-0065 decision 3): head and tail hours bypass the memo and
+    // evaluate every tick regardless of this value
+    // (`scan::scan_and_maintain_with_memo`), so this is
+    // `compactor.interior_reverify_ns`, not the crate's flat 1 h default.
+    let mut memo = MaintainMemo::new(compactor.interior_reverify_ns);
 
     // Durable memo snapshot state (ADR-0065 decision 3, issue #747).
     //
@@ -763,8 +770,51 @@ pub async fn run_tick(
                     shard,
                 )
                 .await;
-                let sweep =
-                    sweep_shard(store, clock_ref, compactor, hold_ref, tenant, signal, shard).await;
+                // Zone-scoped sweep on most ticks (ADR-0065 decision 3): rules
+                // 2 and 3 list only the head+tail hours this tick's scan just
+                // classified, reusing that classification instead of a second
+                // hour-discovery LIST. The slow safety-net cadence -- due on
+                // this unit's first tick (cold memo) and every
+                // `interior_reverify_ns` after -- runs the unscoped
+                // `sweep_shard` instead, so every hour, including one an
+                // interior-only invalidation gap or a bug in the zone split
+                // itself left permanently unswept, still gets a full pass. A
+                // failed scan carries no head+tail set to scope by, so it also
+                // falls back to a full pass rather than sweeping nothing.
+                let now = clock_ref.now_ns();
+                let sweep = match &scan {
+                    Ok(report)
+                        if !unit_memo.full_sweep_due(
+                            *tenant,
+                            signal,
+                            shard,
+                            now,
+                            compactor.interior_reverify_ns,
+                        ) =>
+                    {
+                        sweep_shard_zoned(
+                            store,
+                            clock_ref,
+                            compactor,
+                            hold_ref,
+                            tenant,
+                            signal,
+                            shard,
+                            &report.head_tail_hours,
+                        )
+                        .await
+                    }
+                    _ => {
+                        let outcome = sweep_shard(
+                            store, clock_ref, compactor, hold_ref, tenant, signal, shard,
+                        )
+                        .await;
+                        if outcome.is_ok() {
+                            unit_memo.record_full_sweep(*tenant, signal, shard, now);
+                        }
+                        outcome
+                    }
+                };
                 (shard, unit_memo, scan, sweep)
             },
         )

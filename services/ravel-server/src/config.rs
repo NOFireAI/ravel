@@ -113,6 +113,20 @@ pub struct Cli {
     #[arg(long, default_value_t = 4)]
     pub maintain_unit_concurrency: usize,
 
+    /// Slow safety-net re-verify cadence for the maintenance loop's interior
+    /// zone (ADR-0065 decision 3), as a humantime duration (e.g. `6h`). A
+    /// terminal interior-zone bucket -- below the frontier, outside the
+    /// tail -- is re-evaluated no later than this after its last
+    /// verification, or sooner if its computed retention expiry arrives
+    /// first; head and tail hours always evaluate every tick regardless of
+    /// this value. Matches the humantime-duration convention of
+    /// `--store-probe-interval`. Omitted defaults to
+    /// [`ravel_maintain::config::DEFAULT_INTERIOR_REVERIFY_NS`] (6 h); a zero
+    /// duration disables the safety net (every interior bucket is always
+    /// due, the pre-ADR-0065 behavior for that zone).
+    #[arg(long = "maintain-interior-reverify", value_name = "DURATION")]
+    pub maintain_interior_reverify: Option<String>,
+
     /// Default age-based retention window applied to every tenant with no
     /// explicit `--retention-tenant` override, as a humantime duration
     /// (e.g. `30d`, `720h`). Omitted means no default retention: nothing is
@@ -976,6 +990,27 @@ impl Cli {
                     );
                 }
                 Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--maintain-interior-reverify` into nanoseconds (ADR-0065
+    /// decision 3), defaulting to
+    /// [`ravel_maintain::config::DEFAULT_INTERIOR_REVERIFY_NS`] (6 h) when
+    /// unset. Like `--idle-tenant-state-ttl`, a zero duration is accepted and
+    /// returned verbatim: it is the documented "disable the interior safety
+    /// net" value (every interior bucket is always due, the pre-ADR-0065
+    /// behavior for that zone), not a tight-loop footgun -- the interior zone
+    /// has no tick-cadence caller to spin. Only an unparseable duration fails
+    /// startup.
+    pub fn parse_maintain_interior_reverify(&self) -> anyhow::Result<i64> {
+        match self.maintain_interior_reverify.as_deref() {
+            None => Ok(ravel_maintain::config::DEFAULT_INTERIOR_REVERIFY_NS),
+            Some(s) => {
+                let dur = humantime::parse_duration(s).map_err(|e| {
+                    anyhow::anyhow!("invalid --maintain-interior-reverify '{s}': {e}")
+                })?;
+                Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
             }
         }
     }

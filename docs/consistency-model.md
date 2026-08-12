@@ -327,6 +327,40 @@ upper bound: this protects a reader whose clock lags the sweeper's by up
 to that much from ever finding a marker gone that `read_marker`'s own
 window would still call a Hit.
 
+### Zone-scheduled maintenance (ADR-0065 decision 3)
+
+The unit scan and the sweeper both split a unit's ingest hours into three
+zones, recomputed every tick from the seal margin and the tenant's
+retention config, never stored: **head** (newer than the seal margin plus
+one hour's slack) and **tail** (from a bucket's computed retention expiry
+through the protection horizon past it) are evaluated every tick, exactly
+as before this split; **interior** (everything else) is memo-gated,
+re-verified only every `maintain_interior_reverify` (default 6 h) or
+immediately on the natural zone transition into tail at the bucket's
+computed expiry. The sweeper mirrors this: its per-tick pass lists only
+the head and tail hour prefixes for the superseded-input and
+unreferenced-part rules, and a full-keyspace pass on the same
+`maintain_interior_reverify` cadence is the safety net that eventually
+covers every hour, including one an invalidation gap or a scheduling bug
+left permanently out of the per-tick set.
+
+This bounds, not eliminates, promptness for the affected rules: a
+tombstoned interior bucket's physical sweep, and an operator hold's
+effect on interior buckets, land no later than `maintain_interior_reverify`
+after they become eligible, rather than on the next tick. This is a
+documented latency, never a correctness gap -- retention and legal-hold
+checks in `maintain_bucket` still run whenever a bucket is actually
+evaluated, and the safety-net pass guarantees every hour is eventually
+re-evaluated. Orphan GC is never zone-scoped: L0 data keys carry no
+ingest-hour component, so there is no hour-scoped prefix to restrict its
+listing to, and it always lists the whole shard on every pass, per-tick or
+safety-net alike.
+
+`maintain_interior_reverify` is one operator knob shared by both halves of
+the split (the scan's interior re-verify interval and the sweeper's
+full-pass cadence): setting it to a non-positive value disables the
+skip in both, reproducing the pre-split full-scan-every-tick behavior.
+
 - Orphan GC (data objects with no commit record) considers only objects
   with last_modified age > grace + max_flush_lifetime. Writers abandon any
   flush older than max_flush_lifetime and never publish it afterward; the
